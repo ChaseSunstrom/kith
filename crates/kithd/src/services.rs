@@ -19,9 +19,10 @@
 // redirected segment through a worker): 74k kept requests a second where this has 81k.
 
 mod connect;
-// (Not wired yet: the trial in `tests` runs through it; T-0326's next step asks it of the nodes.)
+// (Its receiving end is wired in `receive`; nothing opens a link yet: T-0326's sending side.)
 #[allow(dead_code)]
 mod link;
+mod receive;
 
 use crate::Shared;
 use crate::ingress::{Idle, Limits, Place};
@@ -386,6 +387,8 @@ struct Proxy {
     /// The connections to each other node's kithd that no client's is on now, and since when.
     /// (As the kernel's, on no thread's runtime: the next client's may be on another.)
     kept: Mutex<BTreeMap<String, Vec<(std::net::TcpStream, Instant)>>>,
+    /// What a link from another node may hold ([`receive`]).
+    links: receive::Bounds,
 }
 
 /// What [`Proxy::reach`] reached.
@@ -572,19 +575,25 @@ impl Proxy {
         let IpAddr::V6(caller) = from.peer_addr().ok()?.ip() else {
             return None;
         };
-        let find = |port, workload: String, replica| async move {
-            let asked_for = {
-                let table = self.table.lock().expect("nothing panics holding the table");
-                let mut backends = table.values().flatten();
-                let asked = (self.me(), port, workload.as_str(), replica);
-                backends.any(|(node, port, of, which)| (node.as_str(), *port, of.as_str(), *which) == asked)
-            };
-            if !asked_for || !self.admits(&workload, caller, port) {
-                return None;
-            }
-            self.local(&workload, replica, port).await.ok()
+        // (Each asking, of a connection or of a stream of a link, is found for by itself.)
+        let find = move |port, workload, replica| self.find(caller, port, workload, replica);
+        let link = move |io, relaying, caller: IpAddr| receive::serve(io, relaying, caller, self.links, find);
+        admit_or_link(&self.relaying, &self.spares, caller.into(), from, find, link).await
+    }
+
+    /// The replica `caller` asks for, if this node's table asks for it and the Workload's
+    /// NetworkPolicies let `caller` in: a connection to it.
+    async fn find(&self, caller: Ipv6Addr, port: u16, workload: String, replica: Option<u32>) -> Option<TcpStream> {
+        let asked_for = {
+            let table = self.table.lock().expect("nothing panics holding the table");
+            let mut backends = table.values().flatten();
+            let asked = (self.me(), port, workload.as_str(), replica);
+            backends.any(|(node, port, of, which)| (node.as_str(), *port, of.as_str(), *which) == asked)
         };
-        admit(&self.relaying, &self.spares, caller.into(), from, find).await
+        if !asked_for || !self.admits(&workload, caller, port) {
+            return None;
+        }
+        self.local(&workload, replica, port).await.ok()
     }
 
     /// A replica on this machine, wherever it listens: on the machine's own loopback, or
@@ -675,10 +684,17 @@ async fn ask(relay: &mut Relay, line: &str, early: &[u8]) -> std::io::Result<boo
 /// as they are, or it is hung up on. Over the limit (no place for it at this asking) nothing
 /// is looked for: each kept asking is said no to in the same way, and a node of before is
 /// hung up on. Each asking looks for a place again ([`Hold::room`]).
-async fn taken<F, Fut>(from: TcpStream, mut hold: Hold<'_>, find: F) -> Option<()>
+///
+/// A first line of `link` alone makes the connection a link between the two kithds
+/// instead: what `link` does with it ([`receive::serve`]), which holds the place the
+/// connection has for as long as the link lasts. Its streams each ask for a replica by
+/// themselves and take places of their own.
+async fn taken<F, Fut, L, LFut>(from: TcpStream, mut hold: Hold<'_>, find: F, link: L) -> Option<()>
 where
     F: Fn(u16, String, Option<u32>) -> Fut,
     Fut: Future<Output = Option<TcpStream>>,
+    L: FnOnce(Relay, Limits, IpAddr) -> LFut,
+    LFut: Future<Output = Option<()>>,
 {
     let mut relay = Relay::new(from);
     let mut wait = CONNECT;
@@ -694,6 +710,13 @@ where
             .await
             .ok()?;
         let line = std::str::from_utf8(&line).ok()?.strip_suffix('\n')?;
+        if line == "link" && wait == CONNECT {
+            // (A node with no place to relay for gets no link: it is hung up on, as at the limit.)
+            return match hold.room() {
+                true => link(relay, hold.relaying.clone(), hold.caller).await,
+                false => None,
+            };
+        }
         let mut words = line.split(' ').peekable();
         let kept = words.next_if_eq(&"kept").is_some();
         let (port, workload) = (words.next()?.parse::<u16>().ok()?, words.next()?);
@@ -791,10 +814,31 @@ fn over_limit(caller: IpAddr) {
 /// [`taken`] for a connection from node `caller`, with a place for relaying if one is free,
 /// else a spare ([`SPARE`]) to say no with. Past the spares, the connection is dropped at once:
 /// nothing is read from it, and no answer is given.
+#[cfg(test)]
 async fn admit<F, Fut>(relaying: &Limits, spares: &Limits, caller: IpAddr, from: TcpStream, find: F) -> Option<()>
 where
     F: Fn(u16, String, Option<u32>) -> Fut,
     Fut: Future<Output = Option<TcpStream>>,
+{
+    // (A node with no links: one that says `link` is hung up on, as a line it does not know.)
+    let link = |_, _, _| async { None };
+    admit_or_link(relaying, spares, caller, from, find, link).await
+}
+
+/// [`admit`] for a node that takes links too ([`taken`]).
+async fn admit_or_link<F, Fut, L, LFut>(
+    relaying: &Limits,
+    spares: &Limits,
+    caller: IpAddr,
+    from: TcpStream,
+    find: F,
+    link: L,
+) -> Option<()>
+where
+    F: Fn(u16, String, Option<u32>) -> Fut,
+    Fut: Future<Output = Option<TcpStream>>,
+    L: FnOnce(Relay, Limits, IpAddr) -> LFut,
+    LFut: Future<Output = Option<()>>,
 {
     let place = relaying.take(caller);
     let spare = match place.is_some() {
@@ -813,6 +857,7 @@ where
             spare,
         },
         find,
+        link,
     )
     .await
 }
@@ -922,6 +967,7 @@ pub async fn run(
         relaying: Limits::new(RELAYING, RELAYING_PER_NODE).per_node(),
         spares: Limits::new(SPARE, SPARE_PER_NODE).per_node(),
         kept: Mutex::default(),
+        links: receive::BOUNDS,
     });
     let me = kith_mesh::node_address(prefix, proxy.me());
     // (False again if the ingress gives up: then the ports are ours after all.)
@@ -1731,7 +1777,7 @@ spec:
 
     /// A replica: it answers what each connection says (all of it, to its end) with `a:`
     /// before it, then hangs up. Where it listens, and how many connections it has had.
-    async fn replica() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    pub(super) async fn replica() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::AsyncReadExt;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (at, had) = (
@@ -1808,6 +1854,154 @@ spec:
             heard
         };
         tokio::join!(carry(held, relay, Duration::from_secs(60)), asking)
+    }
+
+    /// A client's connection to [`Proxy::take`] from loopback, as an IPv4-mapped V6 address:
+    /// (the client's end, the one held). Not `[::1]`: where loopback has no IPv6 that bind
+    /// fails, and the whole workspace gate with it. The mapped address is still a V6 caller to
+    /// `take`, and `Limits` canonicalizes it to the V4 key. (Needs `net.ipv6.bindv6only=0`, the
+    /// kernel's default, so `[::]` takes V4 connections.)
+    pub(super) async fn pair_from_ipv6() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("[::]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ours = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))
+            .await
+            .unwrap();
+        (ours, listener.accept().await.unwrap().0)
+    }
+
+    /// Applies the resources of `source` to `shared`'s store.
+    pub(super) fn apply(shared: &Shared, source: &str) {
+        let mut state = shared.store.lock().unwrap();
+        for resource in Resource::from_source(source).unwrap() {
+            state.store.apply(resource.unwrap()).unwrap();
+        }
+    }
+
+    const WEB: &str = "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: web, labels: { app: web } }
+spec:
+  template:
+    containers: [{ name: main, image: example.org/web, ports: [{ name: http, port: 8080 }] }]
+";
+
+    /// A node `a` whose store has the Workload `web` in it, and nothing else.
+    pub(super) async fn state_with_web(tag: &str) -> Arc<Shared> {
+        let ca = crate::pki::Ca::create().unwrap();
+        let shared =
+            crate::cluster::pinned_peer::shared_with(tag, crate::cluster::pinned_peer::node(&ca, "a"), &[]).await;
+        apply(&shared, WEB);
+        shared
+    }
+
+    /// A Proxy as [`run`] makes one on `shared`, its table one backend: this node's Workload `of`
+    /// on `port`, and `replica` of it where it is a pod's.
+    pub(super) fn proxy_of(shared: Arc<Shared>, port: u16, of: &str, replica: Option<u32>) -> Proxy {
+        let cluster = shared.cluster.as_ref().expect("a cluster");
+        let backend = (shared.members.me().to_string(), port, of.to_string(), replica);
+        Proxy {
+            prefix: crate::mesh::prefix(&cluster.me.ca),
+            table: Mutex::new(BTreeMap::from([((Ipv6Addr::LOCALHOST, 80), vec![backend])])),
+            turns: Turns::default(),
+            serving: Limits::new(SERVING, SERVING),
+            relaying: Limits::new(RELAYING, RELAYING_PER_NODE).per_node(),
+            spares: Limits::new(SPARE, SPARE_PER_NODE).per_node(),
+            kept: Mutex::default(),
+            links: receive::BOUNDS,
+            shared,
+        }
+    }
+
+    /// Says `says` to `proxy`'s take over loopback: what take passed on, and what the client heard.
+    async fn take_says(proxy: &Proxy, says: &str) -> (Option<()>, Vec<u8>) {
+        let (mut client, held) = pair_from_ipv6().await;
+        let asking = async {
+            client.write_all(says.as_bytes()).await.unwrap();
+            // Said all: a replica it reaches answers once the client's side ends.
+            client.shutdown().await.unwrap();
+            let mut heard = Vec::new();
+            client.read_to_end(&mut heard).await.unwrap();
+            heard
+        };
+        // A take that never closes must fail the test, not hang it.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(proxy.take(held), asking)
+        })
+        .await
+        .expect("take ends")
+    }
+
+    /// What the table asks for over loopback (this node's `web` on `port`, no replica) reaches the
+    /// replica, which answers `a:`; the place it holds is held while the connection lasts and
+    /// given back when it ends.
+    #[tokio::test]
+    async fn take_passes_on_what_the_table_asks_for_to_the_replica() {
+        let (replica, replicas) = replica().await;
+        let port = replica.port();
+        let mut proxy = proxy_of(state_with_web("take-asked").await, port, "Workload/default/web", None);
+        // One place, so that a second one can be seen to be held.
+        proxy.relaying = Limits::new(1, 1).per_node();
+        let caller = IpAddr::V6(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+        let (mut client, held) = pair_from_ipv6().await;
+        let asking = async {
+            client
+                .write_all(format!("{port} Workload/default/web\n").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(client.read_u8().await.unwrap(), b'+');
+            assert!(proxy.relaying.take(caller).is_none(), "held while the connection lasts");
+            client.write_all(b"q").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut heard = String::new();
+            client.read_to_string(&mut heard).await.unwrap();
+            heard
+        };
+        let (passed, heard) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(proxy.take(held), asking)
+        })
+        .await
+        .expect("take ends");
+        assert_eq!((passed, heard.as_str()), (Some(()), "a:q"));
+        assert!(proxy.relaying.take(caller).is_some(), "given back when it ends");
+        assert_eq!(replicas.load(Ordering::Relaxed), 1);
+    }
+
+    /// What the table does not ask for is closed with no byte, and no replica is connected: the
+    /// same Workload on the same port, but a replica the table has none of.
+    #[tokio::test]
+    async fn take_closes_what_the_table_does_not_ask_for_with_no_byte() {
+        let (replica, replicas) = replica().await;
+        let port = replica.port();
+        let proxy = proxy_of(state_with_web("take-unasked").await, port, "Workload/default/web", None);
+        let said = take_says(&proxy, &format!("{port} Workload/default/web 0\n")).await;
+        assert_eq!(said, (None, Vec::new()));
+        assert_eq!(replicas.load(Ordering::Relaxed), 0);
+    }
+
+    /// A NetworkPolicy that does not let loopback in closes what the table asks for the same way:
+    /// no byte, and no replica is connected. The same policy naming the caller's own address
+    /// lets it through, so it is the cidr that refuses, not a policy that never matches.
+    #[tokio::test]
+    async fn take_closes_what_a_network_policy_refuses_with_no_byte() {
+        let policy = |cidr: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: {{ name: web }}\n\
+                 spec:\n  selector: {{ app: web }}\n  ingress: [{{ action: allow, peers: [{{ cidr: '{cidr}' }}] }}]\n"
+            )
+        };
+        for (cidr, passes) in [("fd00::/64", false), ("::ffff:127.0.0.1/128", true)] {
+            let (replica, replicas) = replica().await;
+            let port = replica.port();
+            let shared = state_with_web(if passes { "take-let-in" } else { "take-refused" }).await;
+            apply(&shared, &policy(cidr));
+            let proxy = proxy_of(shared, port, "Workload/default/web", None);
+            let (passed, heard) = take_says(&proxy, &format!("{port} Workload/default/web\n")).await;
+            assert_eq!(passed.is_some(), passes, "{cidr}");
+            assert_eq!(heard.is_empty(), !passes, "{cidr}: no byte when refused");
+            assert_eq!(replicas.load(Ordering::Relaxed), usize::from(passes), "{cidr}");
+        }
     }
 
     /// One connection between two nodes passes on one client's connection after another,

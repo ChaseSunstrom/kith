@@ -450,6 +450,33 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **An encrypted disk or Volume** cannot be read by whoever takes it out of its machine:
   the key is with the other nodes.
 
+## What splitting kithd in two would and would not change
+
+Design in `docs/adr-privilege.md` (T-0334). Built today: the node's own policy and the
+typed request list's seam (`crates/kithd/src/root_part.rs`, listeners only), in one
+process. There is no second process yet, so everything below is what the split is for,
+not what a node has.
+
+**What the split does not change.** The part that reads the network still reads the
+store: every Secret of every namespace, and on a node that holds it the cluster's CA key.
+A hole there is still the cluster: it can write any object as anyone, and so ask the
+root part for whatever the store may ask of the node (a privileged pod, a host path, a
+VM's disks, each only where the node's own policy allows it). The split does not make
+Secrets safer from that part.
+
+**A hole in the part that reads the network** (TLS, HTTP, the APIs, DNS, ingress, the
+Service proxy) is, after the split, the cluster's data and every request on the root
+part's list, no longer uid 0 on the node: no capability, a filtered set of system calls,
+no sight of other processes, and no disk or key of the node in its memory. What the root
+part refuses for what is asked (kithd's own ports, a layer that is not the digest named)
+holds whoever asks.
+
+**A hole in the root part** is the node, as kithd is today: its disks, its kernel, every
+container. The root part reads little (typed requests of at most 256 KiB, no unknown
+field, no async runtime, no network but the DHCP client's socket), so the bytes it parses
+are few; that is the whole of what the split buys it, and a request it accepts is still
+done as root.
+
 ## What is not defended
 
 These are how kith is today. Each is a decision or a gap that is known; plan around it.

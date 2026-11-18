@@ -1469,6 +1469,63 @@ fn forgotten_key_kept_from_before_is_cut_at_open() {
     });
 }
 
+/// A store that has Node/a at `address`, and one change of its kind.
+fn node_at(address: &str) -> Store {
+    let mut store = Store::default();
+    store.put(
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kith.dev/v1", "kind": "Node",
+            "metadata": { "name": "a" }, "spec": {}, "status": { "address": address },
+        }))
+        .unwrap(),
+    );
+    store
+}
+
+/// A snapshot another node sends, at `index`, with `store` as its state.
+async fn install(machine: &mut Machine, store: &Store, index: u64) {
+    use openraft::storage::RaftStateMachine;
+    let meta = openraft::SnapshotMeta {
+        last_log_id: Some(openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index)),
+        last_membership: Default::default(),
+        snapshot_id: format!("sent-{index}"),
+    };
+    let mut state = serde_json::to_value(crate::State::default()).unwrap();
+    state["store"] = serde_json::to_value(store).unwrap();
+    let sent = std::io::Cursor::new(serde_json::to_vec(&state).unwrap());
+    machine.install_snapshot(&meta, Box::new(sent)).await.unwrap();
+}
+
+/// A store brought in whole (Import, or a snapshot) counts the kinds it changes on from the store
+/// it replaces: a reader that kept the counts sees a changed Node come in.
+#[test]
+fn a_brought_in_store_moves_the_counts_of_the_kinds_it_changes() {
+    let mut store = node_at("10.1.2.3:7443");
+    let before = store.changes("Node");
+    run(
+        &mut store,
+        Command::Import {
+            store: node_at("10.9.9.9:7443"),
+        },
+    )
+    .unwrap();
+    assert!(
+        store.changes("Node") > before,
+        "Import: {before} then {}",
+        store.changes("Node")
+    );
+
+    let dir = Scratch::new();
+    block(async {
+        let mut machine = Machine::open(&dir.0, Arc::new(|| {}), any()).unwrap();
+        install(&mut machine, &node_at("10.1.2.3:7443"), 3).await;
+        let before = machine.state.lock().unwrap().store.changes("Node");
+        install(&mut machine, &node_at("10.9.9.9:7443"), 4).await;
+        let after = machine.state.lock().unwrap().store.changes("Node");
+        assert!(after > before, "a snapshot: {before} then {after}");
+    });
+}
+
 /// The same of a snapshot another node sends, and of a store brought in whole.
 #[test]
 fn forgotten_key_kept_from_before_is_cut_as_it_comes_in() {

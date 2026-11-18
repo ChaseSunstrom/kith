@@ -91,13 +91,48 @@ fn records_of(record: &DnsRecordSpec, domain: &str, ttl: u32) -> Result<Vec<Reco
     record.values.iter().map(one).collect()
 }
 
+/// The kinds the zones are made of (see [`zones_made_of`]).
+const ZONE_KINDS: [&str; 6] = ["Node", "Service", "Workload", "DNSZone", "DNSRecord", "Namespace"];
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`zones_made_of`] has read a store on this thread: a test counts them.
+    static ZONE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What the zones were last built from, and the store's change counts of [`ZONE_KINDS`] when
+/// that was last looked at: a store whose counts have not moved is not read at all.
+#[derive(Default)]
+pub(crate) struct Built {
+    counts: Option<[u64; 6]>,
+    from: Option<Vec<(String, Value, Option<Value>)>>,
+}
+
+impl Built {
+    /// Whether the zones now differ from the ones last built. The zone kinds are read only when
+    /// one of their counts moved, so a write to any other kind costs six counter reads.
+    pub(crate) fn changed(&mut self, store: &Store) -> bool {
+        let counts = ZONE_KINDS.map(|kind| store.changes(kind));
+        if self.counts == Some(counts) {
+            return false;
+        }
+        self.counts = Some(counts);
+        let from = zones_made_of(store);
+        let changed = self.from.as_ref() != Some(&from);
+        self.from = Some(from);
+        changed
+    }
+}
+
 /// What the zones are made of, as `run` compares it with the last build: each resource's key and
 /// spec, and a Node's address, what it serves and its state (the ingress addresses come from
 /// those); a Workload's labels (which Services pick it) and each replica's node, readiness and
 /// address (the names come from those). Not the revision: deleted and made again, it starts over.
 fn zones_made_of(store: &Store) -> Vec<(String, Value, Option<Value>)> {
-    let kinds = ["Node", "Service", "Workload", "DNSZone", "DNSRecord", "Namespace"].into_iter();
-    kinds
+    #[cfg(test)]
+    ZONE_READS.with(|reads| reads.set(reads.get() + 1));
+    ZONE_KINDS
+        .into_iter()
         .flat_map(|kind| store.list(Some(kind)))
         .map(|r| {
             let status = r.status.as_ref().map(|s| {
@@ -597,16 +632,13 @@ pub async fn run(
     let feed = async {
         let mut generation = shared.generation.subscribe();
         // What the zones were last built from: most changes to the store are not about DNS.
-        // ponytail: finding that out reads five kinds on every change; index them if stores get large.
-        let mut built_from = None;
+        let mut built = Built::default();
         loop {
             let reports = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
                 let home = crate::home::configured(&state.store).map(|home| home.address);
                 house_wants.send_if_modified(|was| std::mem::replace(was, home) != home);
-                let from = zones_made_of(&state.store);
-                (built_from.as_ref() != Some(&from)).then(|| {
-                    built_from = Some(from);
+                built.changed(&state.store).then(|| {
                     let mesh = shared
                         .cluster
                         .as_ref()
@@ -633,11 +665,11 @@ pub async fn run(
                 // follower's would be passed on as its own write, and refused.)
                 if !leads(&shared) {
                     // Said again at the next change to the store, which may find this node leading.
-                    built_from = None;
+                    built = Built::default();
                 } else if let Err(e) = shared.submit(kith_store::Command::Status { statuses }).await {
                     eprintln!("kithd: reporting on DNS records: {e}");
                     // Tried again at the next change to the store.
-                    built_from = None;
+                    built = Built::default();
                 }
             }
             if generation.changed().await.is_err() {
@@ -1142,6 +1174,44 @@ spec: {}
         assert_ne!(zones_made_of(&store), built);
         let (zones, _) = zones_of(&store, None);
         assert_eq!(ask(&zones, OUTSIDE, "www.example.test"), Err(Some(3)));
+    }
+
+    /// A write to a kind the zones are not made of: the counts of the zone kinds do not move, so
+    /// nothing is read, and nothing is built.
+    #[test]
+    fn dns_a_write_to_a_kind_the_zones_are_not_made_of_builds_nothing() {
+        let mut store = store(EXPOSED);
+        expose_nodes(&mut store);
+        let mut built = Built::default();
+        assert!(built.changed(&store), "the first look builds");
+        let reads = zone_reads();
+        let config =
+            "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: motd }\nspec: { data: { text: hi } }\n";
+        store
+            .apply(Resource::from_source(config).unwrap().remove(0).unwrap())
+            .unwrap();
+        assert!(!built.changed(&store), "nothing to build");
+        assert_eq!(zone_reads(), reads, "zones_made_of was not called");
+    }
+
+    /// A Service is one of the kinds the zones are made of: its addition builds again.
+    #[test]
+    fn dns_a_service_change_still_rebuilds() {
+        let mut store = store(EXPOSED);
+        expose_nodes(&mut store);
+        let mut built = Built::default();
+        built.changed(&store);
+        let reads = zone_reads();
+        let service = "apiVersion: kith.dev/v1\nkind: Service\nmetadata: { name: cache, namespace: shop }\nspec:\n  selector: { app: cache }\n  ports: [{ port: 8080 }]\n";
+        store
+            .apply(Resource::from_source(service).unwrap().remove(0).unwrap())
+            .unwrap();
+        assert!(built.changed(&store), "a Service's addition builds");
+        assert_eq!(zone_reads(), reads + 1, "read once");
+    }
+
+    fn zone_reads() -> usize {
+        ZONE_READS.with(std::cell::Cell::get)
     }
 
     /// `EXPOSED` with more documents after it.
