@@ -11,6 +11,9 @@
 //!                              PASSWORD says, writing nowhere (its root may take no file)
 //!   pod ask HOST PORT [...]    ask each 40 times, and say each different answer's first
 //!                              and last line once, to /dev/stdout opened by that name
+//!   pod once HOST PORT [...]   knock each once (two seconds): say "HOST:PORT answered: FIRST
+//!                              LAST" (then one request's first and last line), "refused" (a
+//!                              reset), or "silent" (nothing back), one line each
 //!   pod seen DIR [SOCKET]      for as long as it runs, say the names in DIR each time they
 //!                              change: those it can open with a `+`, the others with a `-`;
 //!                              and answer whoever connects to SOCKET (a path) with a line
@@ -229,11 +232,7 @@ fn turns(to: (&str, u16), count: u64) -> Result<f64, String> {
 }
 
 fn asked(host: &str, port: &str) -> std::io::Result<String> {
-    // A policy that drops the SYN leaves the connect hanging; 2 s is the answer a dropped one gets.
-    let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port.parse::<u16>().expect("a port")))?
-        .next()
-        .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "no address"))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    let mut stream = TcpStream::connect((host, port.parse::<u16>().expect("a port")))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(b"GET / HTTP/1.0\r\n\r\n")?;
     let mut answer = String::new();
@@ -597,6 +596,28 @@ fn main() {
             let mut out = out.expect("/dev/stdout, by its name");
             for line in heard {
                 writeln!(out, "{line}").expect("a line out");
+            }
+        }
+        // Once each, two seconds at most (knocked): the egress cases, where a denied packet
+        // hangs and asking forty times would take minutes.
+        ["once", pairs @ ..] if !pairs.is_empty() && pairs.len() % 2 == 0 => {
+            let out = std::fs::OpenOptions::new().write(true).open("/dev/stdout");
+            let mut out = out.expect("/dev/stdout, by its name");
+            for pair in pairs.chunks(2) {
+                let resolved = std::net::ToSocketAddrs::to_socket_addrs(&(pair[0], pair[1].parse::<u16>().expect("a port")))
+                    .ok()
+                    .and_then(|mut found| found.next());
+                let said = match resolved {
+                    None => "unresolved".to_string(),
+                    Some(addr) => match knocked(addr) {
+                        "answered" => match asked(pair[0], pair[1]) {
+                            Ok(first_last) => format!("answered: {first_last}"),
+                            Err(e) => format!("answered, then failed: {e}"),
+                        },
+                        state => state.to_string(),
+                    },
+                };
+                writeln!(out, "{}:{} {said}", pair[0], pair[1]).expect("a line out");
             }
         }
         // NAME...: the addresses this container's resolver gives each (what /etc/resolv.conf
