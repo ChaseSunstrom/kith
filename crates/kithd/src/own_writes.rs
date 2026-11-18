@@ -75,25 +75,83 @@ fn kind_of(key: &str) -> &str {
 /// writes that id again, and a follower forwards the write to the leader, which would otherwise
 /// hold it as the node's own write), and no mesh key another node holds (as a worker's may not).
 fn own_node(store: &Store, name: &str, key: &str, fields: &Fields) -> Result<(), String> {
+    raft_id(name, key, fields)?;
+    worker::mesh_key_elsewhere(store, name, key, fields)
+}
+
+/// A Node's raft id, if it says one, is the one its name gives (`kith_store::node_id`).
+fn raft_id(name: &str, key: &str, fields: &Fields) -> Result<(), String> {
     let id = kith_store::node_id(name).to_string();
     match fields.get("raftId") {
         Some(said) if said.as_str() != Some(id.as_str()) => Err(refused(key, "the raft id is the one its name gives")),
-        _ => worker::mesh_key_elsewhere(store, name, key, fields),
+        _ => Ok(()),
     }
 }
 
+/// Whether `who` holds the CA: its own Node's status says so (`ca`, which the node that makes
+/// the CA writes at its start, `main.rs`). The store records which node that is.
+fn holds_ca(store: &Store, who: &Worker) -> bool {
+    let status = store
+        .get(&format!("Node/{}", who.name))
+        .and_then(|node| node.status.as_ref());
+    status.is_some_and(|status| status["ca"] == true)
+}
+
+/// A Node the CA-holding control node `who` admits by its join (`cluster.rs` `join`): a new name,
+/// with the spec the join gives it and no other field. Admitting a node by a signed write is
+/// layer 3's (`docs/adr-taken-node.md`, "What stays open").
+fn admits(store: &Store, who: &Worker, resource: &Resource) -> bool {
+    let spec = resource.spec.as_object().is_some_and(|spec| {
+        spec.iter().all(|(field, value)| match field.as_str() {
+            "roaming" | "ingress" => value.as_bool() == Some(true),
+            "trust" => value.as_str() == Some("worker"),
+            _ => false,
+        })
+    });
+    let new = store.get(&format!("Node/{}", resource.metadata.name)).is_none();
+    holds_ca(store, who) && new && resource.metadata.name != who.name && spec
+}
+
+/// What `cluster.rs` `register` says of a Node the CA-holding control node `who` admits: its
+/// address, its raft id, its certificate's print, its mesh key and whether it is a view. Once only:
+/// a Node that has a certificate is not changed this way.
+fn registers(store: &Store, who: &Worker, name: &str, key: &str, fields: &Fields) -> Result<(), String> {
+    let node = store.get(key);
+    let registered = node
+        .and_then(|node| node.status.as_ref())
+        .is_some_and(|status| status.get("certificate").is_some());
+    if !holds_ca(store, who) || node.is_none() || registered {
+        return Err(refused(
+            key,
+            "a Node is registered by its join, once, by the control node that holds the CA",
+        ));
+    }
+    let fields_ok = fields
+        .keys()
+        .all(|field| ["address", "raftId", "certificate", "mesh", "view"].contains(&field.as_str()));
+    if !fields_ok {
+        return Err(refused(
+            key,
+            "a join gives a Node its address, raft id, certificate, mesh and view alone",
+        ));
+    }
+    raft_id(name, key, fields)?;
+    worker::mesh_key_elsewhere(store, name, key, fields)
+}
+
 /// A resource the control node `who` applies as its own: its own Node only where it has none
-/// yet (and no spec), else what a worker may apply of its own.
+/// yet (and no spec), or a Node it admits by its join; else what a worker may apply of its own.
 fn applied(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), String> {
     class(&resource.kind)?;
     if resource.kind == "Node" {
         let none = store.get(&format!("Node/{}", who.name)).is_none();
         let empty = resource.spec.as_object().is_some_and(|spec| spec.is_empty());
-        return match resource.metadata.name == who.name && none && empty {
+        let own = resource.metadata.name == who.name && none && empty;
+        return match own || admits(store, who, resource) {
             true => Ok(()),
             false => Err(refused(
                 "a Node",
-                "a control node makes its own Node only where it has none",
+                "a control node makes its own Node only where it has none, or admits a new one by its join",
             )),
         };
     }
@@ -124,6 +182,8 @@ pub fn checked(shared: &crate::Shared, name: &str, command: Command) -> Result<C
             for (key, fields) in &statuses {
                 if *key == mine {
                     own_node(store, name, key, fields)?;
+                } else if let Some(joined) = key.strip_prefix("Node/") {
+                    registers(store, &who, joined, key, fields)?;
                 } else {
                     class(kind_of(key))?;
                     worker::patch(store, &who, key, fields)?;
@@ -365,5 +425,174 @@ mod tests {
         };
         assert!(checked(&shared, "mesh-c", own("QUFB")).is_err());
         assert!(checked(&shared, "mesh-c", own("TkVX")).is_ok());
+    }
+
+    /// The join a control node that holds the CA makes (`cluster.rs` `join` and `register`), not
+    /// the leader: a new name's Node and its status pass; a Node already there is not made again
+    /// or patched once registered; a node that holds no CA, and any other field, are refused.
+    #[tokio::test]
+    async fn own_writes_let_the_ca_node_join_a_new_node_and_not_change_a_registered_one() {
+        let ca = pki::Ca::create().unwrap();
+        let shared: Arc<Shared> = shared_with("own-join", node(&ca, "join-c"), &[]).await;
+        let resource = |name: &str, spec: serde_json::Value| {
+            let node = serde_json::json!({
+                "apiVersion": kith_api::API_VERSION, "kind": "Node", "metadata": { "name": name }, "spec": spec,
+            });
+            serde_json::from_value::<kith_api::Resource>(node).unwrap()
+        };
+        let apply = |name: &str, spec: serde_json::Value| Command::Apply {
+            resources: vec![resource(name, spec)],
+            at: kith_api::store::now(),
+        };
+        let patch = |name: &str, fields: serde_json::Value| Command::Patch {
+            statuses: vec![(format!("Node/{name}"), fields.as_object().unwrap().clone())],
+        };
+        let register = |print: &str| {
+            serde_json::json!({
+                "address": "10.0.0.7:7", "raftId": kith_store::node_id("join-n").to_string(), "certificate": print,
+            })
+        };
+        {
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(resource("join-c", serde_json::json!({}))).unwrap();
+            store
+                .set_status("Node/join-c", Some(serde_json::json!({ "ca": true })))
+                .unwrap();
+            store.apply(resource("join-o", serde_json::json!({}))).unwrap();
+        }
+
+        // `join`: the Node with the spec it gives, then `register`'s Node when it is not there yet.
+        assert!(
+            checked(
+                &shared,
+                "join-c",
+                apply("join-n", serde_json::json!({ "roaming": true }))
+            )
+            .is_ok()
+        );
+        assert!(checked(&shared, "join-c", apply("join-n", serde_json::json!({}))).is_ok());
+        assert!(
+            checked(
+                &shared,
+                "join-c",
+                apply("join-x", serde_json::json!({ "trust": "admin" }))
+            )
+            .is_err()
+        );
+        assert!(
+            checked(&shared, "join-c", apply("join-o", serde_json::json!({}))).is_err(),
+            "a Node there is not made again"
+        );
+        // Its status, once: the address, the raft id its name gives, and the certificate's print.
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .apply(resource("join-n", serde_json::json!({ "roaming": true })))
+            .unwrap();
+        assert!(checked(&shared, "join-c", patch("join-n", register("PRINT"))).is_ok());
+        assert!(checked(&shared, "join-c", patch("join-o", serde_json::json!({ "os": "x" }))).is_err());
+        let other_id = serde_json::json!({ "address": "10.0.0.7:7", "raftId": "1", "certificate": "PRINT" });
+        assert!(
+            checked(&shared, "join-c", patch("join-n", other_id)).is_err(),
+            "a raft id its name does not give"
+        );
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .set_status("Node/join-n", Some(register("PRINT")))
+            .unwrap();
+        assert!(
+            checked(&shared, "join-c", patch("join-n", register("OTHER"))).is_err(),
+            "a registered Node is not changed this way"
+        );
+
+        // Held to the CA: a control node that holds none admits no node.
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .apply(resource("join-f", serde_json::json!({})))
+            .unwrap();
+        assert!(checked(&shared, "join-f", apply("join-m", serde_json::json!({}))).is_err());
+    }
+
+    /// Through the write route: a write a node passes on for an admin (`x-kith-for: local
+    /// socket`, the local socket's) is checked as the admin's and not as the node's own, so an
+    /// Identity, or another node's NodeKey, that a control node could not write as itself goes
+    /// through when the admin asked for it (`certificate`, `claim`, the lock and duress routes).
+    #[tokio::test]
+    async fn own_writes_let_an_admin_write_a_node_passes_on_go_through_as_the_admin() {
+        let ca = pki::Ca::create().unwrap();
+        let (c, k) = (node(&ca, "fwd-c"), node(&ca, "fwd-k"));
+        let shared: Arc<Shared> = shared_with("own-fwd", c.clone(), &[]).await;
+        {
+            let store = &mut shared.store.lock().unwrap().store;
+            for (name, spec) in [("fwd-k", "{}"), ("fwd-w", "{trust: worker}")] {
+                let text = format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: {name}}}\nspec: {spec}\n");
+                store
+                    .apply(kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap())
+                    .unwrap();
+                let joined = serde_json::json!({ "raftId": kith_store::node_id(name).to_string() });
+                store.set_status(&format!("Node/{name}"), Some(joined)).unwrap();
+            }
+            let key = "apiVersion: kith.dev/v1\nkind: NodeKey\nmetadata: {name: fwd-w}\nspec: {id: QUFB}\n";
+            store
+                .apply(kith_api::Resource::from_source(key).unwrap().remove(0).unwrap())
+                .unwrap();
+        }
+        let id = shared.raft.metrics().borrow().id;
+        shared
+            .raft
+            .initialize(BTreeMap::from([(id, BasicNode::new(""))]))
+            .await
+            .unwrap();
+        let leads = shared.raft.wait(Some(Duration::from_secs(30)));
+        leads.current_leader(id, "leads").await.unwrap();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        let listener = listen(tcp, pki::server_config(&c).unwrap()).unwrap();
+        let app = node_router(shared.clone()).into_make_service_with_connect_info::<Peer>();
+        tokio::spawn(async move { drop(axum::serve(listener, app).await) });
+        let to_k = Cluster::new(k.clone(), None)
+            .unwrap()
+            .to(&at("fwd-c", &address, None))
+            .unwrap();
+        let url = format!("https://{address}/v1/raft/write");
+        let own = |command: &Command| to_k.post(&url).json(command);
+        let forwarded = |command: &Command| own(command).header(crate::access::FOR, "local socket");
+        let said = |call: reqwest::RequestBuilder| async move { call.send().await.unwrap().text().await.unwrap() };
+
+        let identity = "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: fwd-user}\nspec: {}\n";
+        let identity = Command::Apply {
+            resources: vec![kith_api::Resource::from_source(identity).unwrap().remove(0).unwrap()],
+            at: kith_api::store::now(),
+        };
+        assert!(
+            said(own(&identity)).await.contains("Err"),
+            "a node's own Identity is refused"
+        );
+        assert!(
+            said(forwarded(&identity)).await.contains("Ok"),
+            "an admin's, passed on, is let through"
+        );
+
+        let key = "apiVersion: kith.dev/v1\nkind: NodeKey\nmetadata: {name: fwd-w}\nspec: {id: QUFB, locked: true}\n";
+        let key = Command::Apply {
+            resources: vec![kith_api::Resource::from_source(key).unwrap().remove(0).unwrap()],
+            at: kith_api::store::now(),
+        };
+        assert!(
+            said(own(&key)).await.contains("Err"),
+            "a node's own write of another node's NodeKey is refused"
+        );
+        assert!(
+            said(forwarded(&key)).await.contains("Ok"),
+            "an admin's lock of it, passed on, is let through"
+        );
     }
 }
