@@ -1094,7 +1094,12 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();
         let taken = args.ingress.then_some(taken);
         // (Without a mesh too: a node's Services answer its pods there as well, T-0723.)
-        let proxy = services::run(shared.clone(), args.mesh, taken, stopping.clone());
+        let services = services::run(shared.clone(), args.mesh, taken, stopping.clone());
+        // (What each pod may reach, kept in step with its policies: on a node alone too.)
+        let held = pods::keep_held(shared.clone(), stopping.clone());
+        let proxy = async {
+            tokio::join!(services, held);
+        };
         let ingress = async {
             // (A control node with --acme alone orders for the workers that serve ingress.)
             if args.ingress || args.acme.is_some() {

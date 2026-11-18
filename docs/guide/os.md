@@ -115,6 +115,7 @@ card the catalogue does not list yet) is chosen by hand, as above.
 ```sh
 KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
 KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
+sh ci/vm.sh --test modules   # the same image: drivers load at start, on a device added, and a bad signature is refused
 ```
 
 For a node whose hardware is not known when the image is built, `features: [all]` turns on
@@ -141,12 +142,12 @@ of paths there (`amdgpu/*`) is those files, and in both cases the files each mod
   node installed from a plain image has slots too small to be updated to this one.
 - **Sizes** (the plain image is 295,715,328 bytes, as before, and its kernel the same bytes):
   kernel 13 MB; modules 77 MB (170 of them) and firmware 1,992 MB, both before compression; the
-  root 931 MB squashfs; the raw disk image 2,576 MB (953 MB as qcow2), the update file 965 MB. The check for it is 4 GB,
-  not the plain 300 MB. The installer's memory disk carries the payload and not the modules.
-- **Not yet.** kithd does not load modules (`finit_module`): this installs them, so a node of
-  this image has its drivers on disk and loads none yet. The NVIDIA open modules are a later
-  slice: built out of tree against this kernel and signed with the same throwaway key in the
-  same build. A spec naming both `all` and `gpu-amd-phoenix` is refused (the same driver, built in there).
+  root 931 MB squashfs; the raw disk image 2,576 MB (954 MB as qcow2); the update file 966 MB.
+  `build.sh --check` allows the `all` image 4 GB, not the plain 300 MB. The installer's memory
+  disk carries the payload and not the modules.
+- **Not in it yet.** The NVIDIA open modules: a later slice, built out of tree against this
+  kernel and signed with the same throwaway key in the same build. A spec naming both `all` and
+  `gpu-amd-phoenix` is refused (the same driver, built in there).
 
 A cluster runs plain and GPU nodes side by side: sign each image's update as its own
 `OSRelease` and roll each with its own `UpdatePlan`, the GPU one with a `selector` on a label

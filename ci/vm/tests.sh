@@ -11,6 +11,8 @@
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     # (KITH_OS_SPEC=os/examples/all.yaml tries the image of a spec instead of the plain one.)
+    # (modules: the 'all' image, whose drivers are modules.)
+    [ "$test" != modules ] || KITH_OS_SPEC=os/examples/all.yaml
     osdir=$root/target/os
     [ -z "${KITH_OS_SPEC:-}" ] || osdir=$root/target/os-spec
     sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC" --out "$osdir"} >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
@@ -63,6 +65,9 @@
 
     if [ "$test" = update ]; then
         . "$root/ci/vm/update.sh"
+    fi
+    if [ "$test" = modules ]; then
+        . "$root/ci/vm/modules.sh"
     fi
 
     # (The disk is longer than the image written to it, as a real one is: 40 GB, of which
