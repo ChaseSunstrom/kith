@@ -222,6 +222,22 @@ A refused write is said in the audit log with the node's name. The leader's own 
 not go through `/v1/raft/write`, so the list does not touch the controllers (door 6): that
 is layer 3's.
 
+Built (T-0746). The list is `CLASSES` in crates/kithd/src/own_writes.rs: the 38 kinds of
+`kith_api::KINDS`, each marked yes or no, and `every_kind_is_classified` fails on a kind
+left out. Eleven are yes (Node, Workload, NodeWorkload, Job, Volume, Blob, Backup, Image,
+Seat, Device, NodeKey); what they may hold is the worker's own check (worker.rs `patch`,
+`status`, `report`, `apply`, `delete`), with the control node's own Node open to any status
+field and its raft id only as its name gives it. Rollback, Import and Mark are refused
+whatever they name. `held` in raft.rs makes the one call per write, and a refusal is said
+on the console (`kithd: refused a control node's own write: NODE: WHY`) and audited under
+the node's name.
+
+Open in this layer: under `spec.signing: open` a taken control node can skip the list. It
+sends `x-kith-for: local socket` (the admin hand-off, accepted from any node peer) or
+`x-kith-worker: NAME` (a worker's write it passes on, taken for any name that is a
+worker), and either header takes the write off the control node's own path. Layer 3
+(T-0742) closes it, with the signature `required` already refuses both unsigned.
+
 ## Layer 3
 
 Out of this task's build; its own task (captured as T-0742). Written down here so layers 1
@@ -295,9 +311,10 @@ calls them.
    socket" hop refused under `required`, a signed one taken, the same nonce twice refused,
    an expired one refused, one for another target refused, another body refused). About
    +60 KB.
-3. **Layer 2: a control node's own writes held to its list.** The default-deny list and the
-   test over every kind. Test: raft.rs unit tests (a control node's own Secret write
-   refused, its own Report taken). About +20 KB.
+3. **Layer 2: a control node's own writes held to its list (built, T-0746).** The default-deny
+   list and the test over every kind. Test: raft.rs unit tests (a control node's own Secret
+   write refused, its own Report taken). About +20 KB. Open under `spec.signing: open`: the
+   admin hand-off and the worker header are taken on a node peer's word until layer 3.
 
 The VM test for slices 1 to 3 extends `ci/vm.sh --test access` (three nodes, n1 leads):
 
