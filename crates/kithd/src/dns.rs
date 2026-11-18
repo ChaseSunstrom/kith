@@ -368,13 +368,65 @@ fn is_self(upstream: SocketAddr, listen: SocketAddr) -> bool {
     upstream.port() == listen.port() && same_host
 }
 
+/// A UDP socket on `address`, non-blocking. It may share its port with another of ours bound to
+/// a different address (the one on every address and the one on the house address), and an
+/// address not yet on any card can be bound: the house address comes and goes with the leader.
+fn udp_socket(address: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, SockaddrStorage, bind, setsockopt, socket, sockopt};
+    let family = if address.is_ipv4() { AddressFamily::Inet } else { AddressFamily::Inet6 };
+    let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
+    let fd = socket(family, SockType::Datagram, flags, None)?;
+    setsockopt(&fd, sockopt::ReuseAddr, &true)?;
+    if address.is_ipv4() {
+        setsockopt(&fd, sockopt::IpFreebind, &true)?;
+    }
+    bind(std::os::fd::AsRawFd::as_raw_fd(&fd), &SockaddrStorage::from(address))?;
+    Ok(fd.into())
+}
+
+/// Answers on the house address, on `port`, while the store names one (`serve_udp_on`).
+async fn house(
+    port: u16,
+    mut wanted: watch::Receiver<Option<Ipv4Addr>>,
+    zones: watch::Receiver<Arc<Zones>>,
+    upstreams: watch::Receiver<Arc<[SocketAddr]>>,
+    forwarders: Vec<Cidr>,
+    cache: Arc<kith_dns::Cache>,
+) {
+    loop {
+        let now = *wanted.borrow_and_update();
+        let serving = async {
+            let Some(address) = now else {
+                return std::future::pending::<()>().await;
+            };
+            let at = SocketAddr::from((address, port));
+            match udp_socket(at).and_then(UdpSocket::from_std) {
+                Ok(udp) => {
+                    eprintln!("kithd: serving DNS on the house address {at}");
+                    kith_dns::serve_udp_on(udp, zones.clone(), upstreams.clone(), forwarders.clone(), cache.clone()).await;
+                }
+                Err(e) => eprintln!("kithd: serving DNS on the house address {at}: {e}"),
+            }
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            () = serving => {}
+            changed = wanted.changed() => {
+                if changed.is_err() {
+                    return std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+}
+
 /// UDP and TCP on the same address; with port 0, on the same free port.
 pub async fn bind(listen: SocketAddr) -> Result<(UdpSocket, TcpListener), String> {
     let failed = |e: std::io::Error| format!("serving DNS on {listen}: {e}");
     for _ in 0..20 {
         let tcp = TcpListener::bind(listen).await.map_err(failed)?;
         let address = tcp.local_addr().map_err(failed)?;
-        match UdpSocket::bind(address).await {
+        match udp_socket(address).and_then(UdpSocket::from_std) {
             Ok(udp) => return Ok((udp, tcp)),
             // Someone else has that port on UDP: with port 0, take another.
             Err(_) if listen.port() == 0 => {}
@@ -435,6 +487,7 @@ pub async fn run(
             zones.send_modify(|zones| Arc::make_mut(zones).blocks = blocks);
         }
     };
+    let (house_wants, house_wanted) = watch::channel(None::<Ipv4Addr>);
     let feed = async {
         let mut generation = shared.generation.subscribe();
         // What the zones were last built from: most changes to the store are not about DNS.
@@ -443,6 +496,8 @@ pub async fn run(
         loop {
             let reports = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
+                let home = crate::home::configured(&state.store).map(|home| home.address);
+                house_wants.send_if_modified(|was| std::mem::replace(was, home) != home);
                 let from = zones_made_of(&state.store);
                 (built_from.as_ref() != Some(&from)).then(|| {
                     built_from = Some(from);
@@ -486,6 +541,14 @@ pub async fn run(
         tokio::runtime::Handle::current()
     });
     let sockets = udp.into_std().and_then(|udp| Ok((udp, tcp.into_std()?)));
+    let at_home = thread.spawn(house(
+        listen.port(),
+        house_wanted,
+        served.clone(),
+        asked.clone(),
+        forwarders.clone(),
+        cache.clone(),
+    ));
     let answering = thread.spawn(async move {
         let (udp, tcp) = sockets?;
         let (udp, tcp) = (UdpSocket::from_std(udp)?, TcpListener::from_std(tcp)?);
@@ -506,11 +569,22 @@ pub async fn run(
         _ = stopping.changed() => {}
     }
     stop.abort();
+    at_home.abort();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The socket on every address and the one on the house address share a port, and the
+    /// second binds an address no card has yet.
+    #[test]
+    fn house_socket_shares_the_port() {
+        let all = udp_socket("0.0.0.0:0".parse().unwrap()).unwrap();
+        let port = all.local_addr().unwrap().port();
+        let house = udp_socket(SocketAddr::from(([10, 9, 0, 100], port))).unwrap();
+        assert_eq!(house.local_addr().unwrap().port(), port);
+    }
 
     /// A node's resolvers can be written after kithd started (its lease comes while it serves).
     #[tokio::test]

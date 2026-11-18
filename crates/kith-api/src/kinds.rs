@@ -209,6 +209,20 @@ spec! {
         /// longest prefix an image is under is the one it is held to.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub images: Vec<ImageRule>,
+        /// The house's one address on its LAN: whichever control node leads holds it, and
+        /// answers DNS at it, so a router can name it once (DHCP option 6) and forward to it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub home: Option<HomeSpec>,
+    }
+
+    pub struct HomeSpec {
+        /// The address with its prefix length, as the LAN has it (`192.168.1.250/24`): an IPv4
+        /// address no other machine there has, in the network of a card of the node that holds it.
+        pub address: String,
+        /// How the outside reaches the house: a name, or an address, with a port
+        /// (`house.example.org:51820`). Kept and not acted on: the router forwards to `address`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub endpoint: Option<String>,
     }
 
     pub struct ImageRule {
