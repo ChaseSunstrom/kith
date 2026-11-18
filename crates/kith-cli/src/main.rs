@@ -1912,7 +1912,12 @@ fn watch_get(kithd: &Kithd, kind: Option<&str>, keep: impl Fn(&Resource) -> bool
             Ok(now) => now,
             // A kithd too busy to answer in time has not changed anything we would miss: ask again.
             Err(e) if after.is_some() && e.contains("has not answered") => continue,
-            Err(e) if after.is_some() && (e.contains("cannot reach kithd") || e.contains("sent no reply")) => {
+            Err(e)
+                if after.is_some()
+                    && (e.contains("cannot reach kithd")
+                        || e.contains("sent no reply")
+                        || e.contains("without closing TLS")) =>
+            {
                 return fail("kithd stopped");
             }
             Err(e) => return Err(e),

@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
@@ -88,12 +88,14 @@ type Log = Arc<Mutex<Vec<String>>>;
 enum Reply {
     Json(&'static str),
     Tunnel,
+    /// A reply with no length, cut off after its first bytes and dropped with no close_notify.
+    Cut,
     Stop,
 }
 
-/// Reads one request: its request line and its body (Content-Length bytes). None if the
-/// handshake or the read failed, which is a refused connection and not a request.
-fn read_request(tls: &mut impl Read) -> Option<(String, String)> {
+/// Reads one request's head: its request line, and its Content-Length. None if the handshake or
+/// the read failed, which is a refused connection and not a request.
+fn read_head(tls: &mut impl Read) -> Option<(String, usize)> {
     let mut head = Vec::new();
     let mut one = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -111,21 +113,20 @@ fn read_request(tls: &mut impl Read) -> Option<(String, String)> {
                 .then(|| value.trim().parse::<usize>().unwrap())
         })
         .unwrap_or(0);
-    let mut body = vec![0; length];
-    tls.read_exact(&mut body).ok()?;
-    Some((
-        head.lines().next()?.to_string(),
-        String::from_utf8_lossy(&body).into_owned(),
-    ))
+    Some((head.lines().next()?.to_string(), length))
 }
 
-/// A kithd on 127.0.0.1 with `node` as its certificate. It asks clients for theirs, as kithd
-/// does (`allow_unauthenticated`), and checks it against `cluster`. One connection at a time.
-fn start(
-    cluster: &Ca,
-    node: &(rcgen::Certificate, KeyPair),
-    mut answer: impl FnMut(&str, &str) -> Reply + Send + 'static,
-) -> (SocketAddr, Log) {
+/// Reads one request: its request line and its body (Content-Length bytes).
+fn read_request(tls: &mut impl Read) -> Option<(String, String)> {
+    let (line, length) = read_head(tls)?;
+    let mut body = vec![0; length];
+    tls.read_exact(&mut body).ok()?;
+    Some((line, String::from_utf8_lossy(&body).into_owned()))
+}
+
+/// A kithd's TLS side: `node` as its certificate, and it asks clients for theirs, as kithd does
+/// (`allow_unauthenticated`), and checks it against `cluster`.
+fn server_config(cluster: &Ca, node: &(rcgen::Certificate, KeyPair)) -> Arc<ServerConfig> {
     let mut roots = RootCertStore::empty();
     roots.add(cluster.cert.der().clone()).unwrap();
     let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
@@ -133,12 +134,22 @@ fn start(
         .build()
         .unwrap();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(node.1.serialize_der()));
-    let config = Arc::new(
+    Arc::new(
         ServerConfig::builder()
             .with_client_cert_verifier(verifier)
             .with_single_cert(vec![node.0.der().clone()], key)
             .unwrap(),
-    );
+    )
+}
+
+/// A kithd on 127.0.0.1 with `node` as its certificate, checked against `cluster`. One
+/// connection at a time.
+fn start(
+    cluster: &Ca,
+    node: &(rcgen::Certificate, KeyPair),
+    mut answer: impl FnMut(&str, &str) -> Reply + Send + 'static,
+) -> (SocketAddr, Log) {
+    let config = server_config(cluster, node);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let log = Log::default();
@@ -174,8 +185,38 @@ fn start(
                         .unwrap()
                         .push(format!("through {}", String::from_utf8_lossy(&through)));
                 }
+                Reply::Cut => {
+                    let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npart");
+                    let _ = tls.flush();
+                }
                 Reply::Stop => break,
             }
+        }
+    });
+    (addr, log)
+}
+
+/// A kithd that answers a request with the 101 alone, before it has read the request's body,
+/// and then reads that body to its end. The client must send a large body while kithd is silent.
+fn start_upload(cluster: &Ca, node: &(rcgen::Certificate, KeyPair)) -> (SocketAddr, Log) {
+    let config = server_config(cluster, node);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log = Log::default();
+    let seen = log.clone();
+    std::thread::spawn(move || {
+        for tcp in listener.incoming().flatten() {
+            tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let mut tls = StreamOwned::new(ServerConnection::new(config.clone()).unwrap(), tcp);
+            let Some((line, _)) = read_head(&mut tls) else {
+                continue;
+            };
+            let _ =
+                tls.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: kith-run\r\n\r\n");
+            let _ = tls.flush();
+            let mut body = Vec::new();
+            let _ = tls.read_to_end(&mut body);
+            seen.lock().unwrap().push(format!("{line} uploaded={}", body.len()));
         }
     });
     (addr, log)
@@ -346,26 +387,22 @@ fn remote_tls_run_joins_the_local_client_to_the_tunnel() {
     assert!(seen.iter().any(|l| l == "through dev.kith.run HELLO\n"), "{seen:?}");
 }
 
-#[test]
-fn remote_tls_ui_carries_a_101_tunnel() {
-    let cluster = ca("kith test cluster");
-    let node = node_cert(&cluster, &["kith", "node1.node.kith"]);
-    let (server, log) = start(&cluster, &node, |_, _| Reply::Tunnel);
-    let identity = identity_dir("ui", &cluster);
+/// `kith ui` pointed at `server`, and the port and secret path it printed: its one stdout line
+/// is http://127.0.0.1:PORT/SECRET/ui/.
+fn spawn_ui(server: SocketAddr, identity: &Path) -> (Child, u16, String) {
     let mut ui: Child = Command::new(env!("CARGO_BIN_EXE_kith"))
         .env_remove("KITH_STORE")
         .env_remove("KITH_SOCKET")
         .arg("--server")
         .arg(server.to_string())
         .arg("--identity")
-        .arg(&identity)
+        .arg(identity)
         .args(["--timeout", "5", "ui"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    // The address to open is the one line on stdout: http://127.0.0.1:PORT/SECRET/ui/
     let mut first = String::new();
     let mut stdout = ui.stdout.take().unwrap();
     let mut byte = [0u8; 1];
@@ -379,6 +416,16 @@ fn remote_tls_ui_carries_a_101_tunnel() {
     let mut parts = rest.split('/');
     let port: u16 = parts.next().unwrap().parse().unwrap();
     let secret = parts.next().unwrap().to_string();
+    (ui, port, secret)
+}
+
+#[test]
+fn remote_tls_ui_carries_a_101_tunnel() {
+    let cluster = ca("kith test cluster");
+    let node = node_cert(&cluster, &["kith", "node1.node.kith"]);
+    let (server, log) = start(&cluster, &node, |_, _| Reply::Tunnel);
+    let identity = identity_dir("ui", &cluster);
+    let (mut ui, port, secret) = spawn_ui(server, &identity);
 
     let mut browser = TcpStream::connect(("127.0.0.1", port)).unwrap();
     browser.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -409,6 +456,73 @@ fn remote_tls_ui_carries_a_101_tunnel() {
             .any(|l| l.starts_with("POST /v1/run ") && l.contains("cert=true")),
         "{seen:?}"
     );
+}
+
+#[test]
+fn remote_tls_ui_sends_a_large_body_after_a_bare_101() {
+    let cluster = ca("kith test cluster");
+    let node = node_cert(&cluster, &["kith", "node1.node.kith"]);
+    let (server, log) = start_upload(&cluster, &node);
+    let identity = identity_dir("ui-upload", &cluster);
+    let (mut ui, port, secret) = spawn_ui(server, &identity);
+
+    // Far more than one relay read, so the body reaches kithd in many writes. On loopback it is
+    // a few milliseconds of copying; a writer that waits out kithd's silence takes seconds.
+    let body = "a".repeat(4 * 1024 * 1024);
+    let started = Instant::now();
+    let mut browser = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    browser.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        browser,
+        "POST /{secret}/v1/apply HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: Upgrade\r\nUpgrade: kith-run\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 256];
+    while !reply.ends_with(b"\r\n\r\n") {
+        let n = browser.read(&mut buf).unwrap();
+        assert!(
+            n > 0,
+            "no 101 before the body ended: {}",
+            String::from_utf8_lossy(&reply)
+        );
+        reply.extend_from_slice(&buf[..n]);
+    }
+    let reply = String::from_utf8_lossy(&reply).into_owned();
+    // kithd reads the body to its end, which comes once kith has sent all of it and shut its side.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let seen = loop {
+        let seen = log.lock().unwrap().clone();
+        if seen.iter().any(|l| l.contains("uploaded=")) || Instant::now() > deadline {
+            break seen;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    ui.kill().unwrap();
+    ui.wait().unwrap();
+
+    assert!(reply.starts_with("HTTP/1.1 101 "), "{reply}");
+    assert!(
+        seen.iter()
+            .any(|l| l == &format!("POST /v1/apply HTTP/1.1 uploaded={}", body.len())),
+        "{seen:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the upload took {:?}: kith's writes waited on its reads",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn remote_tls_a_reply_cut_off_without_close_notify_is_an_error() {
+    let cluster = ca("kith test cluster");
+    let node = node_cert(&cluster, &["kith", "node1.node.kith"]);
+    let (server, _log) = start(&cluster, &node, |_, _| Reply::Cut);
+    let identity = identity_dir("cut", &cluster);
+    let err = refused(&kith(&identity, server, &["get"]));
+    assert!(err.contains("without closing TLS"), "{err}");
 }
 
 #[test]
@@ -444,6 +558,32 @@ fn remote_tls_refuses_a_key_readable_by_others() {
     let err = refused(&kith(&identity, server, &["get"]));
     assert!(
         err.contains("readable by others") && err.contains("laptop.key"),
+        "{err}"
+    );
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn remote_tls_ca_crt_holds_exactly_one_certificate() {
+    let cluster = ca("kith test cluster");
+    let other = ca("some other cluster");
+    let node = node_cert(&cluster, &["kith", "node1.node.kith"]);
+    let (server, log) = start(&cluster, &node, |_, _| Reply::Json("[]"));
+    let identity = identity_dir("two-cas", &cluster);
+    std::fs::write(
+        identity.join("ca.crt"),
+        format!("{}{}", cluster.cert.pem(), other.cert.pem()),
+    )
+    .unwrap();
+    let err = refused(&kith(&identity, server, &["get"]));
+    assert!(
+        err.contains("exactly one certificate") && err.contains("found 2"),
+        "{err}"
+    );
+    std::fs::write(identity.join("ca.crt"), "").unwrap();
+    let err = refused(&kith(&identity, server, &["get"]));
+    assert!(
+        err.contains("exactly one certificate") && err.contains("found 0"),
         "{err}"
     );
     assert!(log.lock().unwrap().is_empty());
