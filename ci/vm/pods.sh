@@ -168,13 +168,14 @@ EOF
             grep -q 'node: made -1, read Err' "$work/null.out" || fail "a pod that is root made a device node in a user namespace of its own: $(cat "$work/null.out" "$work/null.err")"
             makes disk b /sys/class/block/vda/dev
             grep -q 'node: made -1, read Err' "$work/disk.out" || fail "a pod that is root was not kept from its node's disk: $(cat "$work/disk.out" "$work/disk.err")"
-            # The allow side of the device filter: a NodeWorkload's copy on each node is in no pod of its
-            # own, so its container keeps the node's users (CAP_MKNOD), and what the filter on its cgroup
-            # allows is all that says what it may make. NAME, the device's class, where /sys has its
-            # numbers, and what each copy's log must say. (A copy never restarts: its /dev/made is made once.)
+            # The device filter, both sides: a NodeWorkload's copy on each node, as a pod that is root
+            # (so it holds CAP_MKNOD, which a plain container that is root does not: only a pod's root
+            # is given the capabilities root keeps). What the filter on its cgroup allows is what it may
+            # make. NAME, the device's class, where /sys has its numbers, and what each copy's log must
+            # say. (A copy never restarts: its /dev/made is made once.)
             hostmakes() {
                 cat >"$work/apply.json" <<EOF
-[{"apiVersion":"kith.dev/v1","kind":"NodeWorkload","metadata":{"name":"$1"},"spec":{"template":{"restartPolicy":"never","containers":[
+[{"apiVersion":"kith.dev/v1","kind":"NodeWorkload","metadata":{"name":"$1"},"spec":{"template":{"pod":true,"restartPolicy":"never","containers":[
   {"name":"node","image":"kith.test/pod:1","runAsUser":0,"command":["/bin/pod","node","$2","$3","/dev/made"]}]}}}]
 EOF
                 any POST /v1/apply "$work/apply.json" >/dev/null || fail "the NodeWorkload $1 was not applied"
@@ -186,12 +187,13 @@ EOF
                         sleep 1
                     done
                     grep -q "$4" "$work/$1-$replica.out" || fail "copy $replica of $1 did not say $4: $(cat "$work/$1-$replica.out")"
+                    grep -q 'caps eff 0*[1-9a-f]' "$work/$1-$replica.out" || fail "copy $replica of $1 holds no capability, so its refusal would prove nothing: $(cat "$work/$1-$replica.out")"
                 done
                 api 1 DELETE "/v1/resources/NodeWorkload/default/$1" >/dev/null || fail "the NodeWorkload $1 was not deleted"
             }
             hostmakes node-null c /sys/class/mem/null/dev 'node: made 0, read Ok(0)'
             hostmakes node-disk b /sys/class/block/vda/dev 'node: made -1, read Err'
-            echo "vm.sh: ok: a NodeWorkload's copy on each node, with no pod of its own, made /dev/null (made 0, read Ok(0)) and was refused its node's disk (made -1, read Err): the device filter allows what it gives and no more" >&2
+            echo "vm.sh: ok: a NodeWorkload's copy on each node, as a root pod with CAP_MKNOD, made /dev/null (made 0, read Ok(0)) and was refused its node's disk (made -1, read Err): the device filter allows what it gives and no more" >&2
 
             # A sandbox inside a container (bubblewrap as this machine has it; Steam's runtime
             # and Flatpak start theirs so): a user namespace of its own, with a /proc and a
