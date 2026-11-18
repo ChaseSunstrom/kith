@@ -52,6 +52,43 @@ sh ci/vm.sh --test image   # boot a copy of it under UEFI in QEMU and check it
 The build is not yet reproducible end to end: kithd is compiled once per run, and systemd's EFI
 stub and boot loader come from the building machine.
 
+### A node that needs more: a spec
+
+The image has no driver for graphics, sound or Wi-Fi, and no kernel modules to add one to a
+running node. A node that needs one runs an image built for it, from a spec:
+
+```yaml
+# os/examples/gpu-amd.yaml
+features: [gpu-amd-phoenix]
+```
+
+```sh
+KITH_OS_VERSION=1.0.1+gpu-amd sh os/build.sh --spec os/examples/gpu-amd.yaml --out target/os-gpu-amd
+```
+
+| | |
+| --- | --- |
+| A feature | a file of its name in `os/features/` (`gpu-amd-phoenix.config`): lines of kernel config merged over `os/kernel.config`, and `# firmware:` lines, what its driver loads. Naming the feature brings both: no file names, no versions |
+| Versions | None to choose: the kernel and linux-firmware (`firmware_date` in `os/build.sh`) are the ones this kith pins, as a distribution's release does |
+| `firmware:` | Paths or globs in linux-firmware for what no feature knows; built into the kernel too |
+| Firmware | Built in, only the files named: a driver starts before any root is mounted, and all of linux-firmware is 640 MB. So a feature is one GPU family, not every GPU of a vendor |
+| Refused | A feature there is no file for (the ones there are are listed), a key other than these two, a firmware path linux-firmware does not have |
+| The rest | The root, the disk and the update are as without a spec; a spec's kernel is built once and kept, beside the plain one |
+
+The features: `gpu-amd-phoenix`, the GPU of a Ryzen 7040, 8040 or 8000G (Radeon 780M, 760M,
+740M), with `/dev/kfd` for compute and the dmem cgroup, so a [GPU share](hardware.md) is a
+ceiling there. It costs the kernel 4.2 MB (17.9 MB against 13.5, firmware included), so the
+update is 43 MB against 34 and the ESP's two kernels 36 of its 64 MB; the root is the same.
+Built and started under UEFI in QEMU, the kernel brings amdgpu up (`amdgpu: Topology: Add CPU
+node`) and kithd serves; on a 780M itself it has not run yet.
+
+A cluster runs plain and GPU nodes side by side: sign each image's update as its own
+`OSRelease` and roll each with its own `UpdatePlan`, the GPU one with a `selector` on a label
+those nodes carry (`gpu: amd`, put on the Node as [any label is](cluster.md#where-work-runs): kithd does not
+set it from the GPU it finds yet; see [Rolling a release through the
+cluster](#rolling-a-release-through-the-cluster)). A plain release given to a GPU node takes its
+driver away until the next GPU one.
+
 ### Updating a node: two slots
 
 ```sh
@@ -530,5 +567,5 @@ kept in the TPM, a duress code that opens a decoy.
 ### Not in kith OS yet
 
 A CD image, starting by BIOS, a watchdog for a slot that hangs without stopping, Secure Boot
-(the image is not signed), drivers for Wi-Fi, sound and graphics, a card plugged in later, IPv6
+(the image is not signed), drivers for Wi-Fi and sound, graphics but by a [spec](#a-node-that-needs-more-a-spec), a card plugged in later, IPv6
 addresses from the network, arm64.

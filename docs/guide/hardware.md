@@ -261,6 +261,6 @@ firmware, claimed with `--claim`, and a desktop Linux PC beside it on the same L
   `exec` unit and a plain container, their logs read through the first node; `kith delete
   node/NAME` then took it out. **A `pod: true` template does not start on a kithd that is not
   root** ("failed to prepare rootfs").
-- **Not working yet:** the GPU has only the firmware's framebuffer (no `amdgpu`: the image
-  builds no driver that needs firmware blobs); a Service has no status and its name reaches
+- **Not working yet:** the GPU has only the firmware's framebuffer (no `amdgpu` in the plain image;
+  the `gpu-amd-phoenix` [spec](os.md#a-node-that-needs-more-a-spec) builds it in, not yet run here); a Service has no status and its name reaches
   nothing on a node started without `--mesh`, which kith OS's default is.
