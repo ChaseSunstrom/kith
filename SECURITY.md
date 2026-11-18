@@ -84,7 +84,8 @@ Only the newest version is fixed. There are no security releases of older ones.
   to the node the app is for on the node-to-node routes, with who asked in the request,
   and checked the same way there.
   **A control node's word for who asked is taken**: one that is taken can name the local
-  socket, so this narrows nothing for it. A worker's word (`spec.trust: worker` on its
+  socket, so this narrows nothing for it, unless the Cluster says `spec.signing:
+  required` (see "A control node that is taken"). A worker's word (`spec.trust: worker` on its
   Node) is not taken: what it passes on is refused whoever it names (see "A node that
   is taken").
 - **Node-to-node routes** (Raft, copies of blobs and volumes, a volume's key, running a
@@ -787,6 +788,32 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - Until its Node is deleted it can do everything: it can name the local socket as the
     one who asked on what nodes pass on to each other, and the node that leads writes to
     the store whatever a node of the cluster sends it to write, unasked.
+  - **Under the Cluster's `spec.signing: required` a node's word for who asked stands only
+    with their signature** (docs/adr-taken-node.md, layer 1). The admin's Ed25519 key is
+    the Cluster's `spec.adminKey`; a caller's `x-kith-signed` header binds the cluster,
+    the node it is for, the method, path, body, who, an expiry at most ten minutes ahead
+    and a nonce each node takes once. What `x-kith-for` names on a passed-on request
+    (a unit's output, a Volume's files, a passphrase, a restore, `kith run`'s hop, a write
+    passed to the leader for an Identity) is refused unsigned, naming the node that passed
+    it, and written in the audit log; the local socket unsigned is the node itself, which
+    reads, and writes nothing. `spec.adminKey`, once set, and `spec.signing` change only by
+    a write the admin signed; the first key is written unsigned (trust on first use), and
+    `open`, the default, takes everything as before. What it does not close: a taken
+    control node still writes into the log as itself (its own writes are held to a list
+    in layer 2), and one that leads still appends what it likes until every node checks
+    what the leader appends (layer 3, T-0742). Nonces are kept in memory: a node that starts
+    again, or a new leader, takes once more a request it took in the ten minutes before, if a
+    node that saw it pass sends it again (layer 3 keeps them in the store). One Cluster that
+    says `required` makes every node require a signature, and every Cluster's `adminKey`
+    signs as the admin. A key whose private half no one has (mistyped), set by a signed write
+    under `required`, leaves no one able to sign as the admin; the CLI that signs (T-0744) is
+    to set only a key it holds. Signed bodies wait for each
+    other while they are checked (128 MiB held at once, 96 MiB the most for one), so a node
+    that sends large ones with bad signatures holds no more than that. Today's hops rewrite what they pass on (a
+    write is passed to the leader as a store command, a restore with its time, `kith run`
+    as a spec), so under `required` those signed by the caller are refused on the next
+    node, not taken: sign the admin's changes to the Cluster at the node that leads, until
+    hops pass the request on unchanged.
   - **A worker that is taken reads what is placed on it and what every node needs, and
     writes only about itself.** A node whose Node
     says `spec.trust: worker` (said by whoever made its join token, `kith node token

@@ -1192,17 +1192,189 @@ fn ca_key_stays_with_the_control_nodes_and_a_worker_never_votes() {
 /// A raw HTTPS request with the node certificate kept in `dir`, and `body` as JSON if there
 /// is one; returns the status code and what was answered.
 fn ask_as_node(address: &str, dir: &Path, method: &str, path: &str, body: Option<&str>) -> (String, String) {
+    ask_as_node_with(address, dir, method, path, &[], body)
+}
+
+/// The same, with `headers`.
+fn ask_as_node_with(
+    address: &str,
+    dir: &Path,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> (String, String) {
     let mut curl = Command::new("curl");
+    curl.arg("--cert").arg(dir.join("node.crt"));
+    curl.arg("--key").arg(dir.join("node.key"));
+    ask(curl, method, &format!("https://{address}{path}"), headers, body)
+}
+
+/// `curl` (its own arguments given) asked `method url`; returns the status code and what was
+/// answered.
+fn ask(mut curl: Command, method: &str, url: &str, headers: &[(&str, &str)], body: Option<&str>) -> (String, String) {
     curl.args(["-sk", "-w", "\n%{http_code}", "--max-time", "15", "-X", method]);
+    for (name, value) in headers {
+        curl.arg("-H").arg(format!("{name}: {value}"));
+    }
     if let Some(body) = body {
         curl.args(["-H", "content-type: application/json", "-d", body]);
     }
-    curl.arg("--cert").arg(dir.join("node.crt"));
-    curl.arg("--key").arg(dir.join("node.key"));
-    let out = curl.arg(format!("https://{address}{path}")).output().unwrap();
+    let out = curl.arg(url).output().unwrap();
     let out = String::from_utf8_lossy(&out.stdout).into_owned();
     let (said, code) = out.rsplit_once('\n').unwrap_or(("", &out));
     (code.to_string(), said.to_string())
+}
+
+/// The admin's `x-kith-signed` (the key of seed [7; 32]) over `method path body`, for the node
+/// `target` of the cluster `id`, with nonce number `nonce` (docs/adr-taken-node.md).
+fn signed_by_admin(id: &str, target: &str, method: &str, path: &str, body: &[u8], nonce: u32) -> String {
+    use base64::Engine;
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let (expires, nonce) = (now.as_secs() + 120, format!("{nonce:032x}"));
+    let body = hex(ring::digest::digest(&ring::digest::SHA256, body).as_ref());
+    let who = "local socket";
+    let message = format!("kith-signed-v1\n{id}\n{target}\n{method}\n{path}\n{body}\n{who}\n{expires}\n{nonce}\n");
+    let sig = admin_key().sign(message.as_bytes());
+    let sig = base64::engine::general_purpose::STANDARD.encode(sig.as_ref());
+    format!("v1; who={who}; target={target}; expires={expires}; nonce={nonce}; sig={sig}")
+}
+
+fn admin_key() -> ring::signature::Ed25519KeyPair {
+    ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap()
+}
+
+/// Under the Cluster's `spec.signing: required` a node's word for who asked stands only with
+/// their signature, made for the node it reaches (docs/adr-taken-node.md). The test plays a
+/// taken beta with beta's certificate, and the admin with the key of seed [7; 32].
+#[test]
+fn signed_hops_alone_stand_once_signing_is_required() {
+    use ring::signature::KeyPair;
+    let (test, signed, by) = ("signed_hop", "x-kith-signed", "x-kith-for");
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    // (The cluster's id, as a signer has it: the print of its CA, the token's third part.)
+    let id = token.trim().split('.').nth(2).unwrap().to_string();
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("beta to have the store", || beta.nodes().len() == 2);
+    let betas = beta.dir.join("state/pki");
+    let logs = "/v1/logs/Workload/default/none?here=true";
+    let hop = |headers: &[(&str, &str)]| ask_as_node_with(&alpha.address(), &betas, "GET", logs, headers, None);
+    // Open: a node's word, as before.
+    let (open, said) = hop(&[(by, "local socket")]);
+    assert_ne!(open, "403", "{said}");
+
+    // The admin's key is written unsigned once (trust on first use); then neither another key
+    // nor `required` is, unsigned.
+    let key = admin_key()
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let cluster = |key: &str, more: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec: {{ adminKey: {key}{more} }}\n"
+        )
+    };
+    std::fs::write(alpha.dir.join("cluster.yaml"), cluster(&key, "")).unwrap();
+    alpha.ok(&["apply", "-f", "cluster.yaml"]);
+    let other = "ab".repeat(32);
+    for (key, more) in [(key.as_str(), ", signing: required"), (other.as_str(), "")] {
+        std::fs::write(alpha.dir.join("cluster.yaml"), cluster(key, more)).unwrap();
+        let (code, _, err) = alpha.kith(&["apply", "-f", "cluster.yaml"]);
+        assert!(
+            code != 0 && err.contains("changed only by a write the admin signed"),
+            "{err}"
+        );
+    }
+    // Signed at the local socket, it is; and that signature is good once.
+    let body = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "Cluster", "metadata": { "name": "home" },
+        "spec": { "adminKey": key, "signing": "required" } }])
+    .to_string();
+    let header = signed_by_admin(&id, "alpha", "POST", "/v1/apply", body.as_bytes(), 1);
+    let local = || {
+        let mut curl = Command::new("curl");
+        curl.current_dir(&alpha.dir).args(["--unix-socket", "kithd.sock"]);
+        ask(curl, "POST", "http://kithd/v1/apply", &[(signed, &header)], Some(&body))
+    };
+    let (code, said) = local();
+    assert_eq!(code, "200", "{said}");
+    let (code, said) = local();
+    assert!(code == "401" && said.contains("used already"), "{code} {said}");
+
+    // Now a node's word alone is refused, naming the node.
+    let (code, said) = hop(&[(by, "local socket")]);
+    assert!(
+        code == "403" && said.contains("an unsigned caller passed on by node beta"),
+        "{code} {said}"
+    );
+    // A node asking for itself, naming no one, signs nothing yet (layers 2 and 3 hold what it
+    // may write): pinned, so a later layer changes it on purpose.
+    let (code, said) = hop(&[]);
+    assert!(!said.contains("unsigned caller"), "{code} {said}");
+    // With the admin's signature for alpha it stands, once.
+    let header = signed_by_admin(&id, "alpha", "GET", logs, b"", 2);
+    let (code, said) = hop(&[(by, "local socket"), (signed, &header)]);
+    assert_eq!(code, open, "{said}");
+    let (code, said) = hop(&[(by, "local socket"), (signed, &header)]);
+    assert!(code == "403" && said.contains("used already"), "{code} {said}");
+    // Signed for beta, for another cluster, over another request, or passed on for someone else:
+    // refused.
+    let zeros = "0".repeat(64);
+    for (header, named, why) in [
+        (
+            signed_by_admin(&id, "beta", "GET", logs, b"", 3),
+            "local socket",
+            "signed for beta, not for alpha",
+        ),
+        (
+            signed_by_admin(&zeros, "alpha", "GET", logs, b"", 4),
+            "local socket",
+            "not local socket's over this request",
+        ),
+        (
+            signed_by_admin(&id, "alpha", "GET", "/v1/logs/Workload/default/other?here=true", b"", 5),
+            "local socket",
+            "not local socket's",
+        ),
+        (
+            signed_by_admin(&id, "alpha", "GET", logs, b"", 6),
+            "someone",
+            "and passed on a signature by",
+        ),
+    ] {
+        let (code, said) = hop(&[(by, named), (signed, &header)]);
+        assert!(code == "403" && said.contains(why), "{why}: {code} {said}");
+    }
+
+    // A write passed on for an Identity, unsigned: refused where the log is led.
+    let write = serde_json::json!({ "Apply": { "resources": [{ "apiVersion": "kith.dev/v1", "kind": "ConfigMap",
+        "metadata": { "name": "forged" }, "spec": { "data": { "a": "b" } } }], "at": 0 } });
+    let write = write.to_string();
+    let (code, said) = ask_as_node_with(
+        &alpha.address(),
+        &betas,
+        "POST",
+        "/v1/raft/write",
+        &[(by, "someone")],
+        Some(&write),
+    );
+    assert!(
+        said.contains("an unsigned caller passed on by node beta"),
+        "{code} {said}"
+    );
+
+    // Unsigned, the local socket reads and writes nothing.
+    assert!(alpha.ok(&["get", "cluster/home"]).contains("home"));
+    let (code, _, err) = alpha.kith(&["apply", "-f", "cluster.yaml"]);
+    assert!(code != 0 && err.contains("requires the admin's signature"), "{err}");
 }
 
 /// A Workload that runs as an Identity: the CA holder signs, for the worker it is placed on

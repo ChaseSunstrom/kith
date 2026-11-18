@@ -7,6 +7,7 @@
 //! a Raft replica either way (`raft.rs`): alone, this node is all of its voters.
 
 mod access;
+mod access_sign;
 mod acme;
 mod api;
 mod audit;
@@ -237,6 +238,8 @@ pub struct Shared {
     /// The order access is decided in, where a change is put in the log: a change to access
     /// holds it alone until applied, an Identity's write shared once decided again (`raft.rs`).
     pub order: tokio::sync::RwLock<()>,
+    /// The nonces of the signed requests this node has taken (`access_sign.rs`).
+    pub nonces: access_sign::Nonces,
     /// On a worker that runs from a view (`view`): the index of the store its view is at.
     /// `None` on every other node, which keeps the store.
     pub view: watch::Sender<Option<u64>>,
@@ -580,6 +583,7 @@ async fn replica(
         exits: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
         order: tokio::sync::RwLock::default(),
+        nonces: access_sign::Nonces::default(),
         view: watch::channel(None).0,
         upstream: Mutex::default(),
         lost_after,
@@ -869,11 +873,12 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             }
         });
         let mut server_stop = stopping.clone();
-        // Whoever can open the socket is the machine's admin.
+        // Whoever can open the socket is the machine's admin: under `spec.signing: required`,
+        // with the admin's signature (`access_sign::local`).
         let local = api::router(shared.clone())
-            .layer(axum::Extension(access::Caller::Admin))
             .merge(cluster::admin_router(shared.clone()))
-            .merge(ui::pages());
+            .merge(ui::pages())
+            .layer(axum::middleware::from_fn_with_state(shared.clone(), access_sign::local));
         let server =
             axum::serve(listener, local).with_graceful_shutdown(async move { drop(server_stop.changed().await) });
         let server = within(server, stopping.clone());
