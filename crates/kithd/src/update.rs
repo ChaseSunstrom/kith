@@ -261,6 +261,48 @@ fn apply_cordon(spec: &mut Value, on: bool) {
     }
 }
 
+/// The spec a Node should have for the update's cordon, given the spec it has now: `None`
+/// when it has that already.
+fn cordoned_spec(spec: &Value, on: bool) -> Option<Value> {
+    let mut next = spec.clone();
+    apply_cordon(&mut next, on);
+    (next != *spec).then_some(next)
+}
+
+/// Set or lift the update's cordon on `name`. Each try re-reads the Node, so a try that lost
+/// a race to another write (a Conflict) is finished by the next one; a bounded number of tries.
+async fn write_cordon(shared: &Shared, name: &str, on: bool) {
+    const TRIES: usize = 3;
+    let key = format!("Node/{name}");
+    for _ in 0..TRIES {
+        let found = {
+            let state = shared.store.lock().expect("nothing panics holding the store");
+            state.store.get(&key).cloned()
+        };
+        let Some(mut node) = found else { return };
+        let Some(spec) = cordoned_spec(&node.spec, on) else {
+            return;
+        };
+        node.spec = spec;
+        let at = kith_api::store::now();
+        let sent = shared
+            .submit(Command::Apply {
+                resources: vec![node],
+                at,
+            })
+            .await;
+        match sent {
+            Ok(_) => return,
+            Err(kith_api::store::Error::Conflict(_)) => {}
+            Err(e) => {
+                eprintln!("kithd: writing an update's cordon on {name}: {e}");
+                return;
+            }
+        }
+    }
+    eprintln!("kithd: {name}'s update cordon was not written in {TRIES} tries");
+}
+
 /// The leader's part: every plan's next step, written down.
 pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     let mut generation = shared.generation.subscribe();
@@ -277,6 +319,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         let voters: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
         let now = std::time::Instant::now();
         let mut commands = Vec::new();
+        let mut cordons = Vec::new();
         {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let store = &state.store;
@@ -300,7 +343,6 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 }
             };
             let nodes: Vec<Node> = store.list(Some("Node")).map(node).collect();
-            let at = kith_api::store::now();
             let seconds = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs());
@@ -319,22 +361,16 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                     let statuses = vec![(plan.key(), decided.status)];
                     commands.push(Command::Patch { statuses });
                 }
-                for (name, cordoned) in decided.cordon {
-                    let Some(mut node) = store.get(&format!("Node/{name}")).cloned() else {
-                        continue;
-                    };
-                    apply_cordon(&mut node.spec, cordoned);
-                    commands.push(Command::Apply {
-                        resources: vec![node],
-                        at,
-                    });
-                }
+                cordons.extend(decided.cordon);
             }
         }
         for command in commands {
             if let Err(e) = shared.submit(command).await {
                 eprintln!("kithd: writing down an update plan's step: {e}");
             }
+        }
+        for (name, cordoned) in cordons {
+            write_cordon(&shared, &name, cordoned).await;
         }
     }
 }
@@ -1724,6 +1760,26 @@ mod tests {
         let mut legacy = json!({ "unschedulable": true });
         apply_cordon(&mut legacy, false);
         assert!(!cordoned(&legacy), "{legacy}");
+    }
+
+    /// A cordon write asks what the Node should be now, so a try that lost a race (Conflict)
+    /// is finished by the next try: a spec already in the state asked for is `None`.
+    #[test]
+    fn cordon_write_is_none_once_the_node_is_in_the_state_asked_for() {
+        let on = cordoned_spec(&json!({}), true).expect("a cordon to set");
+        assert_eq!(cordoned_spec(&on, true), None, "{on}");
+        let off = cordoned_spec(&on, false).expect("a cordon to lift");
+        assert!(off.get("unschedulable").is_none(), "{off}");
+        assert_eq!(cordoned_spec(&off, false), None, "{off}");
+        // A lost cordon-off: the record and the cordon are still there, and the next try lifts them.
+        let stranded =
+            json!({ "unschedulable": true, "taints": [{ "key": "kith.dev/update", "effect": "noSchedule" }] });
+        let lifted = cordoned_spec(&stranded, false).expect("the retry lifts a stranded cordon");
+        assert!(
+            lifted.get("unschedulable").is_none() && lifted["taints"] == json!([]),
+            "{lifted}"
+        );
+        assert_eq!(cordoned_spec(&lifted, false), None, "{lifted}");
     }
 
     #[test]
