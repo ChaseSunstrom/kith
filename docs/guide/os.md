@@ -308,19 +308,20 @@ with `kith.install`: it serves nothing, and asks on the screen and the serial li
 
 ```
 This machine's disks:
-  nvme0n1 (256.1 GB, Samsung SSD 970)
-  sda (2000.4 GB, WDC WD20EZRZ)
-Install kith OS on which (its name)?
+  nvme0n1 (256.1 GB, Samsung SSD 970, serial S4EWNX0R123456)
+  sda (2000.4 GB, WDC WD20EZRZ, serial WD-WCC4M1234567)
+Install kith OS on which (its name, or serial:X)?
 The node's name (empty: one made from its network card's address)?
 Its address, as 10.0.0.5/24,10.0.0.1 (empty: ask the network)?
 Join a cluster? The address of one of its nodes, as 10.0.0.7:7443 (empty: start a new cluster)
 The join token (`kith node token` there)?
-Everything on nvme0n1 (256.1 GB, Samsung SSD 970) will be erased. Type its name again to go on:
+Everything on nvme0n1 (256.1 GB, Samsung SSD 970, serial S4EWNX0R123456) will be erased. Type its name again to go on:
 ```
 
 The disk it was started from is never listed. A removable disk is installed on when named, but
 `only` never means one. The disk's size is read again just before it is written, and a disk of
-another size writes nothing; nor does a name not typed twice the same. It then copies kith OS to
+another size, or a disk named by serial that now gives another, writes nothing; nor does a
+name not typed twice the same. It then copies kith OS to
 the disk, reads it back to check, and powers off: take the stick out and start it.
 
 Without anyone there, put the answers on the stick as `kith-install.yaml` on its first partition
@@ -333,7 +334,7 @@ prints. The installer refuses plain `http` without that pin, and answers that do
 `https` needs no pin.
 
 ```yaml
-disk: nvme0n1        # or `only`: the one disk of a machine that has one, not removable
+disk: "serial:S4EWNX0R123456"  # or nvme0n1, or `only`: the one disk of a machine that has one, not removable
 hostname: alpha
 ip: 10.0.0.5/24,10.0.0.1      # without it the network is asked (DHCP)
 dns: 10.0.0.1
@@ -349,6 +350,13 @@ nodePolicy: hardened          # what the cluster may not have this node do: see 
 Then nothing is asked or confirmed: a stick with answers erases the disk they name in whatever
 machine it starts. A disk that is not there, `only` on a machine with several, or an unknown
 field stops it with the reason on the console and nothing written.
+
+A kernel's name for a disk (`sda`, `nvme0n1`) can change with the order the disks are found
+in; its serial does not. `serial:` names the disk by what the disk itself reports (NVMe,
+virtio, SCSI and SATA disks), as listed above, here or at the console: no disk with it, or two,
+stops the installer the same way. Two can: a USB case that gives every disk in it one serial, or
+an NVMe drive with several namespaces, which all give their controller's. Name such a disk by
+its name.
 
 What it was told goes into a small `config` partition of the new disk, which the node reads at
 every start as more of its kernel command line: name, address, and kithd's arguments (`--listen
