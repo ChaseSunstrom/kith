@@ -1,0 +1,9 @@
+# The image both workloads of session.yaml run. The holder starts session-start.sh; the client
+# runs flatpak in the same image. The name registry.example/me/session:1 is a placeholder: this
+# repository does not build or push the image.
+FROM docker.io/library/alpine:3.20
+RUN apk add --no-cache dbus weston flatpak \
+ && adduser -D -u 1000 -h /home/app app
+COPY session-start.sh /usr/local/bin/session-start.sh
+RUN chmod 755 /usr/local/bin/session-start.sh
+USER 1000
