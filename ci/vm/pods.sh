@@ -7,8 +7,17 @@
             # at 10.0.2.2, and only from an address their card out has (a pod's own is not
             # one the network out there knows).
             mkdir "$work/www"
-            (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
+            (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>"$work/web.err" &
             web=$!
+            # (A port something else holds kills this server at once, and the Jobs that ask it then hear
+            # nothing: so it is said here, with the server's own error, until it answers.)
+            waited=0
+            until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$((port + 9))/"; do
+                kill -0 "$web" 2>/dev/null || fail "the web server on port $((port + 9)) is not running: $(cat "$work/web.err")"
+                waited=$((waited + 1))
+                [ "$waited" -lt 20 ] || fail "the web server on port $((port + 9)) did not answer: $(cat "$work/web.err")"
+                sleep 1
+            done
             # NAME and the rest of its one container: three pods of it on the two nodes, so
             # two of them on one, each listening on port 80, and a Service of that name.
             three() {
@@ -159,6 +168,30 @@ EOF
             grep -q 'node: made -1, read Err' "$work/null.out" || fail "a pod that is root made a device node in a user namespace of its own: $(cat "$work/null.out" "$work/null.err")"
             makes disk b /sys/class/block/vda/dev
             grep -q 'node: made -1, read Err' "$work/disk.out" || fail "a pod that is root was not kept from its node's disk: $(cat "$work/disk.out" "$work/disk.err")"
+            # The allow side of the device filter: a NodeWorkload's copy on each node is in no pod of its
+            # own, so its container keeps the node's users (CAP_MKNOD), and what the filter on its cgroup
+            # allows is all that says what it may make. NAME, the device's class, where /sys has its
+            # numbers, and what each copy's log must say. (A copy never restarts: its /dev/made is made once.)
+            hostmakes() {
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"NodeWorkload","metadata":{"name":"$1"},"spec":{"template":{"restartPolicy":"never","containers":[
+  {"name":"node","image":"kith.test/pod:1","runAsUser":0,"command":["/bin/pod","node","$2","$3","/dev/made"]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the NodeWorkload $1 was not applied"
+                for replica in 0 1; do
+                    waited=0
+                    until any GET "/v1/logs/NodeWorkload/default/$1?replica=$replica" >"$work/$1-$replica.out" 2>/dev/null && grep -q 'node: made' "$work/$1-$replica.out"; do
+                        waited=$((waited + 1))
+                        [ "$waited" -lt 120 ] || fail "waited for copy $replica of $1 to say what it made; it says: $(units NodeWorkload "$1"): $(cat "$work/$1-$replica.out" 2>/dev/null)"
+                        sleep 1
+                    done
+                    grep -q "$4" "$work/$1-$replica.out" || fail "copy $replica of $1 did not say $4: $(cat "$work/$1-$replica.out")"
+                done
+                api 1 DELETE "/v1/resources/NodeWorkload/default/$1" >/dev/null || fail "the NodeWorkload $1 was not deleted"
+            }
+            hostmakes node-null c /sys/class/mem/null/dev 'node: made 0, read Ok(0)'
+            hostmakes node-disk b /sys/class/block/vda/dev 'node: made -1, read Err'
+            echo "vm.sh: ok: a NodeWorkload's copy on each node, with no pod of its own, made /dev/null (made 0, read Ok(0)) and was refused its node's disk (made -1, read Err): the device filter allows what it gives and no more" >&2
 
             # A sandbox inside a container (bubblewrap as this machine has it; Steam's runtime
             # and Flatpak start theirs so): a user namespace of its own, with a /proc and a
@@ -199,7 +232,7 @@ EOF
             # a root pod has no /dev/net/tun to open; with it, it opens.
             tun() { job "$1" "\"pod\":true,$2" "\"image\":\"kith.test/pod:1\",\"command\":[\"/bin/pod\",\"ids\",\"/dev/net/tun\"]" '^[0-9]+ succeeded'; }
             tun notun ''
-            ! grep -q 'opens Ok' "$work/notun.out" || fail "a pod with no claim opened /dev/net/tun: $(cat "$work/notun.out")"
+            grep -q 'ids: /dev/net/tun .* opens Err' "$work/notun.out" || fail "a pod with no claim did not show /dev/net/tun refused: $(cat "$work/notun.out" "$work/notun.err")"
             cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Device","metadata":{"name":"n2-tun","labels":{"kith.dev/namespaces":"default"}},"spec":{"node":"n2","class":"other","path":"/dev/net/tun"}},
  {"apiVersion":"kith.dev/v1","kind":"DeviceClaim","metadata":{"name":"tun"},"spec":{"device":"n2-tun"}}]
@@ -211,7 +244,7 @@ EOF
             # FUSE (the kernel has it, T-0438): /dev/fuse the same way.
             fuse() { job "$1" "\"pod\":true,$2" "\"image\":\"kith.test/pod:1\",\"command\":[\"/bin/pod\",\"ids\",\"/dev/fuse\"]" '^[0-9]+ succeeded'; }
             fuse nofuse ''
-            ! grep -q 'opens Ok' "$work/nofuse.out" || fail "a pod with no claim opened /dev/fuse: $(cat "$work/nofuse.out")"
+            grep -q 'ids: /dev/fuse .* opens Err' "$work/nofuse.out" || fail "a pod with no claim did not show /dev/fuse refused: $(cat "$work/nofuse.out" "$work/nofuse.err")"
             cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Device","metadata":{"name":"n2-fuse","labels":{"kith.dev/namespaces":"default"}},"spec":{"node":"n2","class":"other","path":"/dev/fuse"}},
  {"apiVersion":"kith.dev/v1","kind":"DeviceClaim","metadata":{"name":"fuse"},"spec":{"device":"n2-fuse"}}]
