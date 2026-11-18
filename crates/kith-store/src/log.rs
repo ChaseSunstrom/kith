@@ -90,10 +90,12 @@ impl Log {
             for entry in entries {
                 // (With the entry, or not at all: a build from before cannot read the entry,
                 // and is told the format, not a line of JSON. Never lowered: a Mark after
-                // the store is in format 3 leaves the file in format 3.)
+                // the store is in format 3 leaves the file in format 3. Only the marks raise it:
+                // a signed entry before MarkSigned is refused at apply, and the store stays in
+                // format 2, T-0779.)
                 let format = match &entry.payload {
                     openraft::EntryPayload::Normal(crate::Command::Mark) => 2,
-                    openraft::EntryPayload::Normal(crate::Command::MarkSigned | crate::Command::Signed { .. }) => 3,
+                    openraft::EntryPayload::Normal(crate::Command::MarkSigned) => 3,
                     _ => 0,
                 };
                 if format > 1 {

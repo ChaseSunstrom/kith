@@ -591,6 +591,27 @@ async fn write(
         if !leads {
             return Json(None::<(Reply, u64)>).into_response();
         }
+        // The store's format is the leader's own to change (`tend_format`, where it leads): a
+        // Mark or MarkSigned sent here is taken only as a no-op, the barrier a follower's relayed
+        // write waits for, whoever the headers say it is for. Nor is a signed entry taken before
+        // format 3: a member that reads format 2 could not read it (T-0779).
+        let why = {
+            let state = shared.store.lock().expect("a handler panicked holding the store");
+            match command {
+                Command::Mark if !state.store.marked() => Some("the store's format: only the leader changes it"),
+                Command::MarkSigned if !state.store.signing() => Some("the store's format: only the leader changes it"),
+                Command::Signed { .. } if !state.store.signing() => {
+                    Some("a signed entry before the store is in format 3")
+                }
+                _ => None,
+            }
+        };
+        if let Some(why) = why {
+            let why = why.to_string();
+            eprintln!("kithd: refused {}'s write: {why}", sent_by(&peer));
+            audit(&shared, &sent_by(&peer), why.clone());
+            return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
+        }
         let command = match held(&shared, &peer, &headers, who.as_ref(), command) {
             Ok(Some(command)) => command,
             Ok(None) => return Json(None::<(Reply, u64)>).into_response(),
@@ -2540,6 +2561,88 @@ mod tests {
             "{said:?}"
         );
         assert!(!holds(&shared, "ConfigMap/default/via-4") && holds(&shared, "ConfigMap/default/via-1"));
+    }
+
+    /// The store's format is changed only by the leader's own `tend_format`: a Mark or MarkSigned
+    /// another node sends is refused whoever it says it is for, until the store is in that format
+    /// already (then it is a follower's barrier, a no-op, and taken).
+    #[tokio::test]
+    async fn the_format_is_never_changed_from_outside() {
+        use crate::cluster::pinned_peer::{at, node};
+        use crate::cluster::{Cluster, listen, node_router};
+        let (shared, ca) = leading("format-out", &["format-out-f"]).await;
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        let listener = listen(tcp, pki::server_config(&node(&ca, "format-out-c")).unwrap()).unwrap();
+        let app = node_router(shared.clone()).into_make_service_with_connect_info::<Peer>();
+        tokio::spawn(async move { drop(axum::serve(listener, app).await) });
+        let client = Cluster::new(node(&ca, "format-out-f"), None).unwrap();
+        let client = client.to(&at("format-out-c", &address, None)).unwrap();
+        let url = format!("https://{address}/v1/raft/write");
+        let send = |command: Command, headers: &[(&str, &str)]| {
+            let mut call = client.post(&url).json(&command);
+            for (name, value) in headers {
+                call = call.header(*name, *value);
+            }
+            async move {
+                let said = call.send().await.unwrap().text().await.unwrap();
+                serde_json::from_str::<Option<(Reply, u64)>>(&said).unwrap_or_else(|e| panic!("{e}: {said}"))
+            }
+        };
+        let marks = |shared: &Shared| {
+            let state = shared.store.lock().unwrap();
+            (state.store.marked(), state.store.signing())
+        };
+        let headers: [&[(&str, &str)]; 5] = [
+            &[],
+            &[(access::FOR, "local socket")],
+            &[(access::FOR, "alice")],
+            &[(WORKER, "format-out-f")],
+            &[(access::FOR, "local socket"), (WORKER, "format-out-f")],
+        ];
+        let refused = |said: &Option<(Reply, u64)>| matches!(said, Some((Err(Error::Invalid(why)), 0)) if why.contains("only the leader changes it"));
+        assert_eq!(marks(&shared), (false, false));
+        let index = |shared: &Shared| shared.raft.metrics().borrow().last_log_index;
+        let before = index(&shared);
+        for headers in headers {
+            for command in [Command::Mark, Command::MarkSigned] {
+                let said = send(command, headers).await;
+                assert!(refused(&said), "{headers:?}: {said:?}");
+            }
+            // A signed entry before format 3 is refused before the log, not only at apply: a
+            // member that reads format 2 could not read it there.
+            let signed = Command::Signed {
+                header: String::new(),
+                method: "POST".into(),
+                path: "/v1/apply".into(),
+                body: String::new(),
+                command: Box::new(Command::Mark),
+            };
+            let said = send(signed, headers).await;
+            assert!(
+                matches!(&said, Some((Err(Error::Invalid(why)), 0)) if why.contains("before the store is in format 3")),
+                "{headers:?}: {said:?}"
+            );
+        }
+        assert_eq!(marks(&shared), (false, false));
+        assert_eq!(index(&shared), before, "nothing was written to the log");
+        // Marked by the leader itself: a Mark sent is the barrier a follower's relayed write
+        // waits for, and taken (said to be alice's or a worker's, it is held to what they may
+        // write, and refused); MarkSigned still is not.
+        shared.write(Command::Mark).await.unwrap();
+        for (n, headers) in headers.into_iter().enumerate() {
+            let said = send(Command::Mark, headers).await;
+            match n {
+                2 | 3 => assert!(matches!(said, Some((Err(_), 0))), "{headers:?}: {said:?}"),
+                _ => assert!(
+                    matches!(said, Some((Ok(_), index)) if index > 0),
+                    "{headers:?}: {said:?}"
+                ),
+            }
+            let said = send(Command::MarkSigned, headers).await;
+            assert!(refused(&said), "{headers:?}: {said:?}");
+        }
+        assert_eq!(marks(&shared), (true, false));
     }
 
     /// A write passed on to a node that does not lead (any more) is not decided there, on a

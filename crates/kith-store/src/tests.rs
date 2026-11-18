@@ -599,13 +599,15 @@ fn format_of_the_log_stays_3_after_a_mark_barrier() {
     log.put([entry(4, Command::Mark)]).unwrap();
     drop(log);
     assert_eq!(formats(&scratch.0).0, 3);
-    // A signed entry is format 3 on its own: a format 2 kithd could not read it either.
+    // A signed entry is not: before a MarkSigned it is refused at apply, a no-op, and the log
+    // stays in the store's format (the leader takes none from another node until then, T-0779).
     let other = Scratch::new();
     std::fs::write(other.0.join("snapshot.json"), r#"{"format":1}"#).unwrap();
     let log = Log::open(&other.0.join("log.redb")).unwrap();
-    log.put([entry(1, signed("ann", 1000, 1, Command::Mark))]).unwrap();
+    log.put([entry(1, Command::Mark), entry(2, signed("ann", 1000, 1, Command::Mark))])
+        .unwrap();
     drop(log);
-    assert_eq!(formats(&other.0).0, 3);
+    assert_eq!(formats(&other.0).0, 2);
     // And the store: marked again, still in format 3.
     let mut store = Store::default();
     run(&mut store, Command::MarkSigned).unwrap();
@@ -819,6 +821,26 @@ fn signed_nonce_seen_is_a_no_op() {
     // Below format 3 there is no book: a signed entry is refused, the store left as it was.
     let mut old = Store::default();
     refused(&mut old, signed("ann", 1000, 1, made("a")), "format 3");
+}
+
+/// A signed Import replaces the store, not the signers' book: sent again with the same nonce,
+/// it is refused as seen (the book came across the first), and the store is still in format 3.
+#[test]
+fn signed_import_keeps_the_book() {
+    let mut store = Store::default();
+    run(&mut store, Command::MarkSigned).unwrap();
+    let import = || {
+        let mut imported = Store::default();
+        imported.apply(config("in", "1")).unwrap();
+        signed("ann", 1000, 1, Command::Import { store: imported })
+    };
+    run(&mut store, import()).unwrap();
+    assert!(store.signing() && store.get("ConfigMap/default/in").is_some());
+    let again = run(&mut store, import());
+    assert!(
+        matches!(&again, Err(Error::Invalid(said)) if said.contains("seen")),
+        "{again:?}"
+    );
 }
 
 #[test]
