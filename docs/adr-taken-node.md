@@ -123,7 +123,8 @@ How:
   public key is kept in the Cluster resource (crates/kith-api/src/kinds.rs:190-212), as
   `spec.adminKey`.
 - The admin signs from a machine that is not a node: a laptop or a phone running `kith`
-  over TLS. That client is its own slice; `kith` over TLS is not built yet.
+  over TLS. `kith --server HOST:PORT --identity DIR` (cargo feature `remote`) talks to a node
+  over TLS with a client certificate; it does not sign yet. Signing is its own slice.
 - At a node's console, `kith` may still sign: it asks for the passphrase, signs that one
   command, and drops the key. **That key is exposed to that node.** If the node is taken,
   or is taken later while the passphrase is still the same, the admin key is taken. The

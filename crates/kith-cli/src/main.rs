@@ -1,7 +1,8 @@
 //! `kith`: the command line for kith.
 //!
-//! Commands talk to kithd over its unix socket, or with `--store` work on a
-//! store file directly (no daemon, nothing runs).
+//! Commands talk to kithd over its unix socket, or with `--server` over TLS to a node
+//! (cargo feature `remote`), or with `--store` work on a store file directly (no daemon,
+//! nothing runs).
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use kith_api::store::{self, Action, Change, FileStore, Revision, Store, rfc3339};
@@ -13,6 +14,9 @@ use std::process::ExitCode;
 mod import;
 mod remote;
 mod ui;
+mod wire;
+
+use wire::{Route, Wire};
 
 #[derive(Parser)]
 #[command(
@@ -34,9 +38,15 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     timeout: u64,
-    /// Work on a store file directly instead of talking to kithd (wins over --socket)
+    /// Work on a store file directly instead of talking to kithd (wins over --server and --socket)
     #[arg(long, env = "KITH_STORE", global = true, value_name = "FILE")]
     store: Option<PathBuf>,
+    /// kithd on a node, over TLS: the node's --listen address (wins over --socket; needs --identity)
+    #[arg(long, env = "KITH_SERVER", global = true, value_name = "HOST:PORT")]
+    server: Option<String>,
+    /// The identity directory to show the node: its ca.crt, and NAME.crt with NAME.key
+    #[arg(long, env = "KITH_IDENTITY", global = true, value_name = "DIR")]
+    identity: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -657,7 +667,7 @@ impl Backend {
 }
 
 struct Kithd {
-    socket: PathBuf,
+    route: Route,
     /// How long it may stay silent.
     timeout: std::time::Duration,
 }
@@ -710,17 +720,13 @@ fn secret(prompt: &str) -> Result<String, String> {
     Ok(first)
 }
 
-/// kithd's socket, open.
-fn connect(kithd: &Kithd) -> Result<std::os::unix::net::UnixStream, String> {
-    let socket = &kithd.socket;
-    let stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| {
-        let socket = socket.display();
-        format!("error: cannot reach kithd at {socket}: {e}\nStart kithd, or work on a store file with --store FILE.")
-    })?;
+/// kithd, open: its socket, or a node over TLS.
+fn connect(kithd: &Kithd) -> Result<Wire, String> {
     // A kithd that accepts and then says nothing must not hang a script forever.
-    let timeout = Some(kithd.timeout);
-    let _ = stream.set_read_timeout(timeout).and(stream.set_write_timeout(timeout));
-    Ok(stream)
+    Wire::connect(&kithd.route, Some(kithd.timeout)).map_err(|e| {
+        let name = kithd.route.name();
+        format!("error: cannot reach kithd at {name}: {e}\nStart kithd, or work on a store file with --store FILE.")
+    })
 }
 
 /// What a reply that is not a yes says: API errors are `{"error": "..."}`; anything else
@@ -933,13 +939,28 @@ fn raw(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, 
 }
 
 fn run(cli: Cli) -> Result<ExitCode, String> {
-    let backend = || match (&cli.store, cli.socket.clone().or_else(kith_api::default_socket)) {
-        (Some(path), _) => Ok(Backend::Local(path.clone())),
-        (None, Some(socket)) => Ok(Backend::Daemon(Kithd {
-            socket,
-            timeout: std::time::Duration::from_secs(cli.timeout),
+    let timeout = std::time::Duration::from_secs(cli.timeout);
+    let backend = || match (
+        &cli.store,
+        &cli.server,
+        cli.socket.clone().or_else(kith_api::default_socket),
+    ) {
+        (Some(path), _, _) => Ok(Backend::Local(path.clone())),
+        (None, Some(server), _) => match &cli.identity {
+            Some(identity) => Ok(Backend::Daemon(Kithd {
+                route: Route::Node {
+                    server: server.clone(),
+                    identity: identity.clone(),
+                },
+                timeout,
+            })),
+            None => fail("--server needs --identity DIR: the identity kithd is to see (kith identity makes one)"),
+        },
+        (None, None, Some(socket)) => Ok(Backend::Daemon(Kithd {
+            route: Route::Socket(socket),
+            timeout,
         })),
-        (None, None) => fail("no kithd socket: set --socket, or --store for a store file"),
+        (None, None, None) => fail("no kithd socket: set --socket or --server, or --store for a store file"),
     };
     match cli.command {
         Command::Import { command } => return import::run(command),
@@ -1578,7 +1599,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("the web UI is kithd's: leave out --store");
             };
-            ui::serve(&kithd.socket, port)?;
+            ui::serve(&kithd.route, port)?;
         }
         Command::Audit { tail } => {
             let Backend::Daemon(kithd) = backend()? else {
@@ -1903,7 +1924,12 @@ fn watch_get(kithd: &Kithd, kind: Option<&str>, keep: impl Fn(&Resource) -> bool
             Ok(now) => now,
             // A kithd too busy to answer in time has not changed anything we would miss: ask again.
             Err(e) if after.is_some() && e.contains("has not answered") => continue,
-            Err(e) if after.is_some() && (e.contains("cannot reach kithd") || e.contains("sent no reply")) => {
+            Err(e)
+                if after.is_some()
+                    && (e.contains("cannot reach kithd")
+                        || e.contains("sent no reply")
+                        || e.contains("without closing TLS")) =>
+            {
                 return fail("kithd stopped");
             }
             Err(e) => return Err(e),
