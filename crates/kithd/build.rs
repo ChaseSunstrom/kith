@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    features_table();
     println!("cargo::rerun-if-changed=../kith-cli/no-unwind.ld");
     println!("cargo::rerun-if-changed=kithd.order");
     println!("cargo::rerun-if-changed=no-unwind-lld.ld");
@@ -58,6 +59,65 @@ fn main() {
     arg(format!("-Wl,-T,{}", script.display()));
     arg("-Wl,--no-eh-frame-hdr".into());
     arg("-Wl,-z,pack-relative-relocs".into());
+}
+
+/// os/features' `# pci:` lines as `OS_FEATURES` (devices.rs matches the PCI bus against it): each
+/// feature that has some, by name, with its vendor and device ids as sysfs writes them. A line
+/// that is not `vendor:device` in hex, or a `#pci:`/`# PCI:` line not written `# pci:`, stops the
+/// build, so a typo is not a card never matched. kithd is only built in this repository, so a
+/// missing os/features stops it too (a kithd that matches nothing would say so to nobody).
+fn features_table() {
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("os_features.rs");
+    let dir = Path::new("../../os/features");
+    // (A directory: cargo looks at every file in it.)
+    println!("cargo::rerun-if-changed=../../os/features");
+    let listed = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    let mut files: Vec<PathBuf> = listed
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "config"))
+        .collect();
+    files.sort();
+    let mut table = String::from("pub const OS_FEATURES: &[(&str, &[(&str, &str)])] = &[\n");
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        let name = file.file_stem().unwrap().to_str().unwrap();
+        let ids: Vec<(String, String)> = text
+            .lines()
+            .filter(|line| {
+                let loose: String = line.split_whitespace().collect();
+                // (`#pci:`, `# PCI :`, …; not `# PCIe …`, a comment's word.)
+                loose.to_ascii_lowercase().starts_with("#pci:")
+            })
+            .map(|line| {
+                line.strip_prefix("# pci:")
+                    .unwrap_or_else(|| panic!("{}: '{line}' is not written `# pci: vendor:device …`", file.display()))
+            })
+            .flat_map(str::split_whitespace)
+            .map(|pair| {
+                let hex = |id: &str| id.len() == 4 && id.bytes().all(|b| b.is_ascii_hexdigit());
+                match pair.split_once(':') {
+                    Some((vendor, device)) if hex(vendor) && hex(device) => {
+                        (vendor.to_ascii_lowercase(), device.to_ascii_lowercase())
+                    }
+                    _ => panic!(
+                        "{}: '{pair}' in a `# pci:` line is not vendor:device in hex",
+                        file.display()
+                    ),
+                }
+            })
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let pairs: Vec<String> = ids
+            .iter()
+            .map(|(vendor, device)| format!("(\"{vendor}\", \"{device}\")"))
+            .collect();
+        table.push_str(&format!("    ({name:?}, &[{}]),\n", pairs.join(", ")));
+    }
+    table.push_str("];\n");
+    std::fs::write(&out, table).unwrap();
 }
 
 /// The directory of the toolchain's `ld.lld` (the one rustc itself links with where lld is

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Screenshots of the website (docs/index.html), to look at before it is published.
 
-    python3 ci/site_shots.py [OUT]   the whole page at 360, 768 and 1440 px, light and dark,
+    python3 ci/site_shots.py [OUT [PAGE]]   (PAGE is index.html, or install.html: named install-... and
+                                     whose form's yaml is checked against the page's own examples)
+                                     the whole page at 360, 768 and 1440 px, light and dark,
                                      as OUT/site-WIDTH-SCHEME.png (OUT is docs/shots), with
                                      reduced motion (so every part is drawn), each cut into
                                      pieces to read, and the first screen of each in OUT/top/
@@ -29,7 +31,7 @@ PIECE = 2000  # px of page in one piece
 # The page in a frame of the width asked, and what sticks out of it: anything whose right edge is
 # past the frame and that no scrolling box of its own (a <pre>) holds. body hides sideways overflow,
 # so a screenshot cannot show it: this is how "no horizontal scroll" is held.
-PROBE = """<!doctype html><iframe id=f src="index.html" style="width:%dpx;height:900px;border:0"></iframe>
+PROBE = """<!doctype html><iframe id=f src="%s" style="width:%dpx;height:900px;border:0"></iframe>
 <script>f.onload = () => setTimeout(() => {
   const d = f.contentDocument, w = d.documentElement.clientWidth, out = [];
   const held = el => { for (let p = el.parentElement; p && p !== d.body; p = p.parentElement) if (/auto|scroll|hidden/.test(f.contentWindow.getComputedStyle(p).overflowX)) return true; return false; };
@@ -37,9 +39,40 @@ PROBE = """<!doctype html><iframe id=f src="index.html" style="width:%dpx;height
   document.body.textContent = "WIDE " + w + " " + d.documentElement.scrollHeight + " " + JSON.stringify(out.slice(0, 8));
 }, 600);</script>"""
 
+# docs/install.html: its form's yaml for the default and for the example (what its button fills in) must be
+# the text of the page's own <pre data-answers> blocks, which a kithd test parses with the installer's parser.
+YAML = """<!doctype html><iframe id=f src="install.html" style="width:1440px;height:900px;border:0"></iframe>
+<script>f.onload = async () => {
+  const d = f.contentDocument, shown = () => d.getElementById("yaml").textContent;
+  const source = new DOMParser().parseFromString(await (await fetch("install.html")).text(), "text/html");
+  const wanted = name => source.querySelector("pre[data-answers=" + name + "]").textContent;
+  const out = { default: shown() === wanted("default") };
+  d.getElementById("example").click();
+  out.example = shown() === wanted("example") && d.getElementById("get").disabled === false;
+  d.getElementById("reset").click();
+  out.reset = shown() === wanted("default");
+  // the form filled in by hand (the page's data-fields), as a person would: a fixed address, a join, a policy of its own words
+  const fill = fields => { for (const [name, value] of Object.entries(fields)) {
+    const radio = d.querySelector('input[name="' + name + '"][type=radio][value="' + value + '"]');
+    if (radio) radio.click();
+    else { const input = d.getElementById(name); input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); }
+  } };
+  fill(JSON.parse(source.querySelector("pre[data-answers=custom]").dataset.fields));
+  out.custom = shown() === wanted("custom") && d.getElementById("get").disabled === false;
+  // and what must not say Ready: a third piece in the address, a half address, a half join address
+  const refused = (fields, ok) => { d.getElementById("reset").click(); fill(fields); return d.getElementById("get").disabled === !ok; };
+  out.refuses = refused({ ipKind: "static", ipAddress: "10.0.0.5/24/3" }, false) && refused({ ipKind: "static", ipAddress: "10.0.0.5/24" }, true)
+    && refused({ dns: "1:2" }, false) && refused({ dns: "fe80::1" }, true)
+    && refused({ clusterKind: "join", joinAddress: "10.0.0.7:", joinToken: "abc.def" }, false) && refused({ clusterKind: "join", joinAddress: "10.0.0.7:7443", joinToken: "abc.def" }, true);
+  d.getElementById("reset").click();
+  setTimeout(() => document.body.textContent = "YAML " + JSON.stringify(out), 300);
+};</script>"""
+
 
 def main():
     out = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "docs/shots"
+    page_name = sys.argv[2] if len(sys.argv) > 2 else "index.html"
+    stem = "site" if page_name == "index.html" else pathlib.Path(page_name).stem
     (out / "top").mkdir(parents=True, exist_ok=True)
     found = glob.glob(os.path.expanduser("~/.cache/ms-playwright/chromium_headless_shell-*/*/chrome-headless-shell"))
     chrome = os.environ.get("CHROME") or (found[-1] if found else sys.exit("no Chromium: set CHROME"))
@@ -48,9 +81,9 @@ def main():
             pass
 
         def do_GET(self):
-            if self.path.startswith("/probe-"):
+            if self.path.startswith("/probe-") or self.path == "/yaml-check.html":
                 try:
-                    body = (PROBE % int(self.path[len("/probe-"):].split(".")[0])).encode()
+                    body = (YAML if self.path == "/yaml-check.html" else PROBE % (page_name, int(self.path[len("/probe-"):].split(".")[0]))).encode()
                 except ValueError:
                     return self.send_error(404)
                 self.send_response(200)
@@ -64,17 +97,25 @@ def main():
     serve = functools.partial(Quiet, directory=ROOT / "docs")
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), serve)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    address = f"http://127.0.0.1:{server.server_address[1]}/index.html"
+    base = f"http://127.0.0.1:{server.server_address[1]}/"
+    address = base + page_name
     failed = False
+    if page_name == "install.html":
+        said = subprocess.run([chrome, "--no-sandbox", "--disable-gpu", "--virtual-time-budget=4000", "--dump-dom", base + "yaml-check.html"], check=True, capture_output=True, text=True, timeout=120).stdout
+        checked = re.search(r"YAML (\{.*?\})", said)
+        print(f"the form's yaml is the page's own examples: {checked.group(1) if checked else said[:200]}")
+        yaml_failed = not (checked and "false" not in checked.group(1))
+    else:
+        yaml_failed = False
     for width in (360, 768, 1440):
         # first what sticks out and how tall the page is: the window below is made that tall
-        said = subprocess.run([chrome, "--no-sandbox", "--disable-gpu", "--force-prefers-reduced-motion", "--virtual-time-budget=4000", "--dump-dom", address.replace("index.html", f"probe-{width}.html")], check=True, capture_output=True, text=True, timeout=120).stdout
+        said = subprocess.run([chrome, "--no-sandbox", "--disable-gpu", "--force-prefers-reduced-motion", "--virtual-time-budget=4000", "--dump-dom", base + f"probe-{width}.html"], check=True, capture_output=True, text=True, timeout=120).stdout
         wide = re.search(r"WIDE \d+ (\d+) (\[.*?\])", said)
         print(f"{width} px: {'no sideways overflow' if wide and wide.group(2) == '[]' else 'STICKS OUT ' + (wide.group(2) if wide else said[:200])}")
         failed |= not (wide and wide.group(2) == "[]")
         tall = int(wide.group(1)) + 200 if wide else 16000
         for scheme in ("light", "dark"):
-            shot = out / f"site-{width}-{scheme}.png"
+            shot = out / f"{stem}-{width}-{scheme}.png"
             # ponytail: a window taller than the page, cut back to it after; a real page height takes the devtools protocol
             flags = ["--no-sandbox", "--disable-gpu", "--hide-scrollbars", "--force-prefers-reduced-motion", f"--window-size={width},{tall}", "--virtual-time-budget=4000", f"--screenshot={shot}"]
             if scheme == "dark":
@@ -87,11 +128,13 @@ def main():
             page.save(shot)
             page.crop((0, 0, width, 780 if width < 768 else 900)).save(out / "top" / shot.name)
             for i, top in enumerate(range(0, page.height, PIECE)):
-                page.crop((0, top, width, min(page.height, top + PIECE))).save(out / f"site-{width}-{scheme}.{i}.png")
+                page.crop((0, top, width, min(page.height, top + PIECE))).save(out / f"{stem}-{width}-{scheme}.{i}.png")
             print(shot, page.size)
         # and the first screen as it moves, five seconds in (no reduced motion: the map is running)
-        live = out / "top" / f"live-{width}.png"
+        live = out / "top" / f"{'live' if stem == 'site' else stem + '-live'}-{width}.png"
         subprocess.run([chrome, "--no-sandbox", "--disable-gpu", "--hide-scrollbars", f"--window-size={width},{780 if width < 768 else 900}", "--virtual-time-budget=5000", f"--screenshot={live}", address], check=True, capture_output=True, timeout=120)
+    if yaml_failed:
+        sys.exit("the form's yaml is not the page's own examples (a false above): fix the form or the examples" + ("; and something is wider than the screen" if failed else ""))
     if failed:
         sys.exit("something is wider than the screen: see above")
 
