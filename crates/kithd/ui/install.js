@@ -239,7 +239,7 @@ export function installPart({ $, h, api, ask, toast, say, state, may }) {
     const node = h('select', { id: 'peer-node' }, nodesWithPeople.map((one) => h('option', { value: one.metadata.name }, `${one.metadata.name}  (${one.status.people.endpoint})`)));
     const level = h('select', { id: 'peer-level' }, levels.map((one) => h('option', { value: one }, one)));
     const field = (id, label, control, hint) => h('div', { class: 'field' }, h('label', { for: id }, label), control, h('span', { class: 'hint' }, hint));
-    const made = await ask({
+    const asked = await ask({
       title: 'Add a peer',
       body: h('div', { class: 'peer' },
         h('p', {}, 'Makes a key for the new peer here, lets it in at the level you choose, and shows its WireGuard configuration once, as a picture for the phone\'s WireGuard app to scan. Its private key is kept nowhere: not by kithd, not by this page.'),
@@ -253,10 +253,24 @@ export function installPart({ $, h, api, ask, toast, say, state, may }) {
       act: () => {
         if (!name.value.trim()) throw new Error('Name the peer.');
         if (!node.value || !level.value) throw new Error('Choose the node it connects to and a level.');
-        return api('POST', 'peers', { name: name.value.trim(), node: node.value, level: level.value });
+        const body = { name: name.value.trim(), node: node.value, level: level.value };
+        // A name that is a RemotePeer already has a key: a new one ends the old, so it is asked for first.
+        if (names('RemotePeer').includes(body.name)) return { taken: body };
+        return api('POST', 'peers', body);
       },
     });
-    if (!made) return;
+    if (!asked) return;
+    let made = asked;
+    if (asked.taken) {
+      made = await ask({
+        title: `A new key for ${asked.taken.name}?`,
+        body: h('p', {}, `${asked.taken.name} is a peer already, with a key. A new key ends the old at once: the phone that holds it stops reaching the mesh until it has the new configuration, shown once.`),
+        yes: 'Give it a new key',
+        danger: true,
+        act: () => api('POST', 'peers', { ...asked.taken, replace: true }),
+      });
+      if (!made) return;
+    }
     let picture;
     try {
       picture = h('canvas', { class: 'qr', role: 'img', 'aria-label': `The WireGuard configuration of ${made.name}, as a QR code: scan it in the WireGuard app` });

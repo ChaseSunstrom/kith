@@ -140,6 +140,20 @@ const filled = (name, node, level) => (body, find) => {
   assert.ok(!JSON.stringify(calls).includes(PRIVATE));
 }
 
+// A name that is a peer already is asked about first: one call, with replace, only after the yes.
+{
+  const { calls, dialogs, toasts, find } = await peerDialog({ fill: filled('old', 'a', 'guest'), answer: { name: 'old', node: 'a', level: 'guest', config: WIREGUARD } });
+  assert.deepEqual(calls, [['POST', 'peers', { name: 'old', node: 'a', level: 'guest', replace: true }]], 'no call is made before the confirm');
+  assert.equal(dialogs.length, 3, 'the question, the confirm, then the answer');
+  const [, confirm, shown] = dialogs;
+  assert.ok(confirm.title.includes('new key for old') && confirm.danger === true && confirm.yes === 'Give it a new key');
+  assert.ok(confirm.text.includes('ends the old'));
+  assert.ok(!confirm.text.includes(PRIVATE));
+  assert.ok(shown.text.includes(PRIVATE));
+  assert.deepEqual(toasts, [{ words: 'old is a peer of a.', bad: false }]);
+  assert.equal(find(shown.body, (one) => one.tag === 'pre').length, 1);
+}
+
 // A configuration too long for a picture is still shown, as text.
 {
   const { dialogs, find } = await peerDialog({ fill: filled('phone', 'a', 'guest'), answer: { name: 'phone', node: 'a', level: 'guest', config: 'x'.repeat(MOST + 1) } });

@@ -418,6 +418,9 @@ enum PeerCommand {
         /// The AccessLevel it gets: what it may reach
         #[arg(long)]
         level: String,
+        /// The name already has a key: give it a new one, which ends the old (its phone stops)
+        #[arg(long)]
+        replace: bool,
     },
 }
 
@@ -1610,12 +1613,18 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             );
         }
         Command::Peer {
-            command: PeerCommand::Add { name, node, level },
+            command:
+                PeerCommand::Add {
+                    name,
+                    node,
+                    level,
+                    replace,
+                },
         } => {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("keys are made by kithd: leave out --store");
             };
-            let body = serde_json::json!({"name": name, "node": node, "level": level});
+            let body = serde_json::json!({"name": name, "node": node, "level": level, "replace": replace});
             let made = request::<serde_json::Value>(&kithd, "POST", "/v1/peers", body.to_string().as_bytes())?;
             print!("{}", peer_text(&made)?);
         }
@@ -2521,6 +2530,20 @@ mod peer_tests {
         assert!(cli.is_ok());
         assert!(Cli::try_parse_from(["kith", "peer", "add", "phone", "--node", "n1"]).is_err());
         assert!(Cli::try_parse_from(["kith", "peer", "add", "--node", "n1", "--level", "family"]).is_err());
+    }
+
+    #[test]
+    fn peer_add_replace_is_a_flag_and_off_unless_given() {
+        use super::{Command, PeerCommand};
+        let replace_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Command::Peer {
+                command: PeerCommand::Add { replace, .. },
+            } => replace,
+            _ => panic!("not peer add"),
+        };
+        let base = ["kith", "peer", "add", "phone", "--node", "n1", "--level", "family"];
+        assert!(!replace_of(&base));
+        assert!(replace_of(&[&base[..], &["--replace"]].concat()));
     }
 
     #[test]

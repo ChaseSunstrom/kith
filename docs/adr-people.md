@@ -420,7 +420,7 @@ expression tests.
 
 ## Built: slice D
 
-A phone gets in: `POST /v1/peers` with `{name, node, level}` (`people.rs`, `add`; the route is
+A phone gets in: `POST /v1/peers` with `{name, node, level, replace}` (`people.rs`, `add`; the route is
 in `FOR_IDENTITIES`, so the caller's own Roles decide). It makes a WireGuard key, applies a
 RemotePeer holding only the public half as the caller, and answers once, with
 `Cache-Control: no-store`, `{name, node, level, publicKey, addresses, config}`. The config is
@@ -428,16 +428,34 @@ RemotePeer holding only the public half as the caller, and answers once, with
 people public key, the endpoint from `--people-endpoint`, the allowed ranges of the level). The
 refusals: 404 for no such node or level, 409 for a node whose status has no `people` (no
 `--people-endpoint`) or a level or address the plan refuses, 422 for a bad name. Asked again for
-the same name, it makes a new key and the old configuration stops working. A node as the caller
-is not told apart from an Identity.
+a name that already has a key, it answers 409 "RemotePeer NAME has a key: ask with replace to
+give it a new one" and changes nothing; with `replace: true` (`kith peer add --replace`, or the
+page's "A new key for NAME?" confirm) it makes a new key and the old configuration stops working.
+A node as the caller is not told apart from an Identity.
+
+The key is made by kithd itself, from the system's random source, not as a request to a root
+part: there is no root part yet (T-0334). When there is, the key's making moves there and this
+handler asks for it.
+
+Three guards stand before the key is made. Keys are rationed by one token bucket in the
+`Cluster` (5 a minute, a burst of 5), checked after the refusals that cost nothing, so a refused
+request spends no token; an empty bucket answers 429 with `no-store`. The bucket is per kithd
+process, not shared by the cluster: a request a control node takes is limited by that node's own
+bucket, so the cluster's rate is at most 5 a minute for each node asked; a restart starts a full one. A name being added is held in a set until its answer is made: a second add of it
+meanwhile answers 409 "being added", so two concurrent asks cannot both answer 200 with two
+keys. The kernel's answer for the node's public key (`derive`, blocking netlink) runs under
+`spawn_blocking`, so a slow netlink does not hold a runtime thread.
 
 The node's own public key is read by `kith_mesh::public_of`, which asks the kernel for `kwg0`'s
 key through netlink, as the mesh does; no key file is read for it.
 
-The private key is in a `String` in the handler and the answer, and in the CLI's or the page's
-variables while they show it. It is not in the store, the history, the audit line or kithd's log:
-the tests `peers_route*` and `peers_config*` look for it in each of them, and in the applied
-resource. It is not zeroed after use.
+The private key is held in `Zeroizing` buffers in the handler: the 32 bytes, the copy moved into
+`spawn_blocking`, its base64, the configuration text and the answer's body, which the response
+owns and wipes when hyper drops it. They are zeroed before the store is written, where they can
+be (the key is dropped before `applied(...).await`). Copies inside hyper's and the socket's
+buffers are not ours to wipe. The key is in the CLI's or the page's variables while they show it.
+It is not in the store, the history, the audit line or kithd's log: the tests `peers_route*` and
+`peers_config*` look for it in each of them, and in the applied resource.
 
 `kith peer add NAME --node N --level L` prints the configuration and says it is shown once.
 
