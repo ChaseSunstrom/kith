@@ -613,7 +613,8 @@ fn inside(rootfs: &Path, path: &Path) -> Result<PathBuf> {
     for part in path.components() {
         match part {
             Component::Normal(p) => todo.push_back(Component::Normal(p).as_os_str().to_owned()),
-            Component::CurDir => {}
+            // (A name from `/`, as nixpkgs' dockerTools writes them: the rootfs is `/`.)
+            Component::CurDir | Component::RootDir => {}
             _ => return err(format!("layer entry `{}` escapes the image", path.display())),
         }
     }
@@ -1404,6 +1405,18 @@ mod tests {
         ] {
             assert!(matches!(protocol(far), Https), "{far}");
         }
+    }
+
+    /// nixpkgs' dockerTools names entries from `/` (`/nix/store/…`), as tar allows: they land
+    /// under the rootfs, as in Docker; `/..` still does not get out.
+    #[test]
+    fn a_name_from_the_root_lands_in_the_rootfs() {
+        let (dir, rootfs) = sandbox("from-root");
+        unpack_layer(&layer(&dir, "nix.tar", &[E::Raw("/nix/store/hello")]), TAR, &rootfs).unwrap();
+        assert_eq!(fs::read_to_string(rootfs.join("nix/store/hello")).unwrap(), "x");
+        let e = unpack_layer(&layer(&dir, "up.tar", &[E::Raw("/../outside")]), TAR, &rootfs).unwrap_err();
+        assert!(e.to_string().contains("escapes the image"), "{e}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

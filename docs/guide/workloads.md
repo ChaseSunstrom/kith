@@ -53,6 +53,34 @@ no other image has.
 - **After removal** the image is pulled again when a unit needs it (`pullPolicy: never` fails).
   A node off its network (a laptop) wants `--image-grace 0`, which keeps every image.
 
+#### An image from a Nix closure
+
+A node has no Nix, and needs none: build the image elsewhere with one layer for each store
+path (nixpkgs' `dockerTools.buildLayeredImage`, as in
+[examples/nix-images.nix](../../examples/nix-images.nix)), push it to a registry, and name it
+in a template like any other image.
+
+```sh
+nix-build examples/nix-images.nix -A hello -o hello.tar
+docker load -i hello.tar && docker tag hello:1 registry.example/hello:1
+docker push registry.example/hello:1
+```
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: hello }
+spec:
+  template:
+    containers: [{ name: run, image: "registry.example/hello:1" }]
+```
+
+Two such images share the layers of the store paths they share. The example's two, pulled by
+one node: `hello` has 6 layers and `figlet` 7, 4 of them the same (glibc, libgcc, libidn2,
+libunistring), so the node keeps 9 layers; unpacked, `hello` alone is 33 MB, `figlet` 42 MB,
+and both together 42 MB. A layer's entries are named from `/` (`/nix/store/…`) and land in
+the image's root, as Docker takes them.
+
 ### CronJobs
 
 At each minute its `schedule` names (cron's five fields, or `@hourly` and the like; UTC), the node
