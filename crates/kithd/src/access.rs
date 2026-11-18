@@ -203,23 +203,6 @@ pub fn for_identities(path: &str) -> bool {
     FOR_IDENTITIES.iter().any(open)
 }
 
-/// Is `path` a request one node passes on to another for whoever asked it (a unit's output,
-/// a Volume's files, a node's passphrase or new recovery key, a backup's restore: each is done by the node that
-/// has the thing)? On these alone is a node's word for who asked ([`FOR`]) read.
-fn passed_on(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/v1/") else {
-        return false;
-    };
-    let parts: Vec<&str> = rest.split('/').collect();
-    matches!(
-        parts[..],
-        ["logs", _, ..]
-            | ["volumes", _, _, "files"]
-            | ["lock", _, "passphrase" | "recovery"]
-            | ["backups", _, _, "restore"]
-    )
-}
-
 /// Whose the certificate a request came with is: a watch asks again whether it still stands
 /// for them once its wait is over.
 #[derive(Clone)]
@@ -366,7 +349,7 @@ pub fn who(
             let caller = Caller::Node(node.clone());
             let (status, why) = if !crate::cluster::admitted(shared, node, key) {
                 (StatusCode::UNAUTHORIZED, crate::cluster::EVICTED.to_string())
-            } else if !passed_on(path) {
+            } else if !kith_api::passed_on(method, path) {
                 // Where nodes pass nothing on it is the node, with no right, whatever it names.
                 return Ok(caller);
             } else if worker(shared, node) {
@@ -453,6 +436,20 @@ pub fn who(
     Ok(caller)
 }
 
+/// Why a request is refused for coming from another page than the UI's own: a browser says so
+/// in `Sec-Fetch-Site` (`kith` and the nodes say nothing, and a page of the UI says
+/// `same-origin`), and a form elsewhere can send a POST that needs no preflight with a
+/// certificate the browser holds. `same-site` is refused too: a page a workload serves on
+/// another port of the same node is the same site. Only what reads (GET, HEAD) is let through.
+fn cross_site(method: &axum::http::Method, headers: &axum::http::HeaderMap) -> Option<&'static str> {
+    let site = headers.get("sec-fetch-site")?;
+    let reads = matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD);
+    let own = matches!(site.as_bytes(), b"same-origin" | b"none");
+    (!own && !reads).then_some(
+        "a request that changes something is taken only from the UI's own page (Sec-Fetch-Site: same-origin)",
+    )
+}
+
 /// Works out the [`Caller`] of a request on the TLS port, for the handlers.
 pub async fn caller(
     State(shared): State<Arc<Shared>>,
@@ -460,6 +457,9 @@ pub async fn caller(
     mut request: Request,
     next: Next,
 ) -> Response {
+    if let Some(why) = cross_site(request.method(), request.headers()) {
+        return refuse(StatusCode::FORBIDDEN, why).into_response();
+    }
     let caller = who(
         &shared,
         peer.subject.as_ref(),
@@ -624,6 +624,36 @@ mod tests {
         store.apply(node("b", "{trust: worker}")).unwrap();
         assert_eq!(control_stays(&store, &[]), Ok(()));
         assert_eq!(control_stays(&store, &[("a", Some(&control))]), Ok(()));
+    }
+
+    /// A form on another site can POST with the certificate a browser holds, and needs no
+    /// preflight: a change from `Sec-Fetch-Site` other than `same-origin` or `none` is refused
+    /// for every route, and what says nothing (`kith`, the nodes) is not.
+    #[test]
+    fn a_change_from_another_site_is_refused() {
+        use axum::http::{HeaderMap, Method};
+        let said = |site: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(site) = site {
+                headers.insert("sec-fetch-site", site.parse().unwrap());
+            }
+            headers
+        };
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            // (`same-site`: a page a workload serves on another port of the node.)
+            for other in ["cross-site", "same-site", "anything"] {
+                let why = cross_site(&method, &said(Some(other))).expect("refused");
+                assert!(why.contains("same-origin"), "{why}");
+            }
+            for fine in [None, Some("same-origin"), Some("none")] {
+                assert_eq!(cross_site(&method, &said(fine)), None, "{method} {fine:?}");
+            }
+        }
+        // What only reads is let through from anywhere.
+        for method in [Method::GET, Method::HEAD] {
+            assert_eq!(cross_site(&method, &said(Some("cross-site"))), None);
+            assert_eq!(cross_site(&method, &said(Some("same-site"))), None);
+        }
     }
 
     /// A refused certificate is written down, with who showed it and what for: a 401 is no

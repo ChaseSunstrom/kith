@@ -17,6 +17,23 @@ fn one(src: &str) -> Resource {
     load(src).pop().unwrap()
 }
 
+#[test]
+fn passed_on_is_one_list_for_the_nodes_and_the_cli() {
+    // Reads a node passes on to the node that has the thing.
+    assert!(passed_on("GET", "/v1/logs/Workload/default/web?replica=0"));
+    assert!(passed_on("GET", "/v1/volumes/default/data/files"));
+    // Changes a control node that is not the leader passes on as they came.
+    assert!(passed_on("POST", "/v1/apply"));
+    assert!(passed_on("DELETE", "/v1/resources/ConfigMap/default/gone"));
+    assert!(passed_on("POST", "/v1/rollback/ConfigMap/default/gone?to=1"));
+    // Not these: a node's own reads, and the same routes by another method.
+    assert!(!passed_on("GET", "/v1/cluster"));
+    assert!(!passed_on("GET", "/v1/resources?namespace=default"));
+    assert!(!passed_on("GET", "/v1/apply"));
+    assert!(!passed_on("GET", "/v1/resources/ConfigMap/default/gone"));
+    assert!(!passed_on("DELETE", "/v1/rollback/ConfigMap/default/gone?to=1"));
+}
+
 /// The (line, column, message) of the first error in `src`.
 fn err(src: &str) -> (usize, usize, String) {
     let e = match Resource::from_source(src) {
@@ -59,6 +76,90 @@ fn plan_examples_validate_and_normalise() {
     let release = one(WORKSTATION);
     assert_eq!(release.spec["values"]["apps"], json!(["firefox", "code", "steam"]));
     assert_eq!(release.spec["package"]["version"], json!("^1.2"));
+}
+
+/// examples/session/ is the example of docs/guide/hardware.md's Flatpak how-to: the Flatpak client runs
+/// as the session's user, with the settings that let it show its window in the session.
+#[test]
+fn session_example_carries_the_client_settings() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/session/");
+    let read =
+        |file: &str| std::fs::read_to_string(format!("{dir}{file}")).unwrap_or_else(|e| panic!("{dir}{file}: {e}"));
+    let docs = load(&read("session.yaml"));
+    let keys: Vec<String> = docs.iter().map(Resource::key).collect();
+    assert_eq!(
+        keys,
+        [
+            "Namespace/desktop",
+            "Volume/desktop/app-home",
+            "DeviceClaim/desktop/desk-seat",
+            "DeviceClaim/desktop/desk-apps",
+            "Workload/desktop/session",
+            "Workload/desktop/flatpak-app",
+        ]
+    );
+    let find = |key: &str| -> serde_json::Value {
+        docs.iter()
+            .find(|r| r.key() == key)
+            .unwrap_or_else(|| panic!("no {key}"))
+            .spec
+            .clone()
+    };
+    let (session, client) = (find("Workload/desktop/session"), find("Workload/desktop/flatpak-app"));
+    let (session_c, client_c) = (
+        &session["template"]["containers"][0],
+        &client["template"]["containers"][0],
+    );
+    let var = |c: &serde_json::Value, name: &str| -> String {
+        c["env"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|v| v["name"] == json!(name))
+            .and_then(|v| v["value"].as_str())
+            .unwrap_or_else(|| panic!("no {name} in the container's env"))
+            .to_string()
+    };
+    // The client runs as the session's user, whose alone the seat's directory is.
+    let uid = session_c["runAsUser"]
+        .as_u64()
+        .expect("the session runs as a user number");
+    assert_eq!(client_c["runAsUser"], json!(uid));
+    let recipe = read("Containerfile");
+    assert!(
+        recipe.contains(&format!("-u {uid} ")),
+        "the image's user is not uid {uid}"
+    );
+    // The rest of the T-0369 settings: a sandbox inside it, a root file system it may write, its home on a Volume.
+    assert_eq!(client_c["userNamespaces"], json!(true));
+    assert_eq!(client_c["readOnlyRoot"], json!(false));
+    let home = var(client_c, "HOME");
+    assert!(
+        client_c["volumeMounts"].as_array().is_some_and(|m| m
+            .iter()
+            .any(|m| m["volume"] == json!("app-home") && m["path"] == json!(home))),
+        "HOME ({home}) is not a Volume the client mounts"
+    );
+    // Its own XDG_RUNTIME_DIR (the seat's directory is read only to it); the sockets by their whole paths.
+    let seat_dir = var(session_c, "XDG_RUNTIME_DIR");
+    assert_eq!(seat_dir, "/run/seat");
+    assert_ne!(var(client_c, "XDG_RUNTIME_DIR"), seat_dir);
+    assert_eq!(var(client_c, "WAYLAND_DISPLAY"), format!("{seat_dir}/wayland-0"));
+    assert_eq!(var(client_c, "DBUS_SESSION_BUS_ADDRESS"), "unix:path=/run/seat/bus");
+    assert_eq!(
+        var(session_c, "DBUS_SESSION_BUS_ADDRESS"),
+        var(client_c, "DBUS_SESSION_BUS_ADDRESS")
+    );
+    assert!(
+        read("session-start.sh").contains("/run/seat/bus"),
+        "the session starts no bus at the address the client is given"
+    );
+    // The claims: the session holds the seat, the client is a client of it.
+    assert_eq!(session["template"]["deviceClaims"], json!(["desk-seat"]));
+    assert_eq!(client["template"]["deviceClaims"], json!(["desk-apps"]));
+    assert_eq!(find("DeviceClaim/desktop/desk-seat")["seat"], json!("desk-seat0"));
+    assert_eq!(find("DeviceClaim/desktop/desk-apps")["seat"], json!("desk-seat0"));
+    assert_eq!(find("DeviceClaim/desktop/desk-apps")["access"], json!("client"));
 }
 
 #[test]

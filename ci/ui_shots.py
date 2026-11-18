@@ -4,14 +4,16 @@
     python3 ci/ui_shots.py OUT            the board with a Workload open, at 1440 and 390 px, light
                                           and dark, as OUT/ui-WIDTH-SCHEME.png; and its other tabs
                                           the review of a change and a kind with nothing in it,
-                                          as OUT/ui-SCENE-SCHEME.png
+                                          as OUT/ui-SCENE-SCHEME.png; the Install part and a join
+                                          token shown once, as OUT/ui-install-WIDTH-SCHEME.png
+                                          and OUT/ui-token-WIDTH-SCHEME.png
     python3 ci/ui_shots.py OUT --serve    the same cluster left up at the printed address, to look
                                           at by hand; Enter ends it
 
 The page's files are read from crates/kithd/ui as they are on disk, so a change shows without a
 build, and are sent with the policy crates/kithd/src/ui.rs gives them; every other request goes
 to the first node's socket, the way `kith ui` passes it on. What runs is `exec` units (sleep),
-so nothing is pulled. Needs target/debug/kithd and kith (cargo build) and a Chromium
+so nothing is pulled. Builds target/debug/kithd and kith first (cargo build), and needs a Chromium
 (playwright's headless shell in ~/.cache/ms-playwright, or CHROME=path).
 """
 import glob
@@ -31,6 +33,7 @@ import urllib.parse
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 UI = ROOT / "crates/kithd/ui"
+TARGET = pathlib.Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target")  # (a lane builds in a folder of its own)
 HOLD = 5  # seconds the page is given to connect and draw before it is photographed
 KINDS = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".woff2": "font/woff2"}
 POLICY = re.sub(r"\\\n\s*", "", re.search(r'const POLICY: &str = "(.*?)";', (ROOT / "crates/kithd/src/ui.rs").read_text(), re.S).group(1))
@@ -40,7 +43,17 @@ const scene = new URLSearchParams(location.search).get('scene');
 const tab = (name) => [...document.querySelectorAll('#tabs button')].find((button) => button.textContent === name).click();
 // (A step that cannot be taken is told to the script, which then fails: no photograph of the wrong scene.)
 const step = (ms, act) => setTimeout(() => { try { act(); } catch (error) { fetch(`failed?${encodeURIComponent(`${scene}: ${error}`)}`); } }, ms);
+const press = (id) => document.getElementById(id).click();
+if (scene === 'Install' || scene === 'Token') {
+  // The Install part: no sideways scroll, and for Token the dialog that shows a join token once.
+  if (scene === 'Token') step(1500, () => { document.getElementById('token-at').selectedIndex = 1; press('token-make'); step(500, () => press('dialog-yes')); });
+  step(3500, () => {
+    if (document.documentElement.scrollWidth > innerWidth) throw new Error(`sideways overflow: ${document.documentElement.scrollWidth} > ${innerWidth}`);
+    if (document.getElementById('install').hidden) throw new Error('the Install part is not in view');
+  });
+}
 step(1500, () => {
+  if (scene === 'Install' || scene === 'Token') return;
   if (scene !== 'Review') return scene && scene !== 'Empty' && tab(scene);
   const replicas = [...document.querySelectorAll('.field')].find((field) => field.querySelector('label')?.textContent.startsWith('replicas')).querySelector('input');
   replicas.value = '5';
@@ -101,6 +114,8 @@ def until(what, ok, seconds=90):
 def main():
     out = pathlib.Path(sys.argv[1])
     out.mkdir(parents=True, exist_ok=True)
+    # (A lane's own target folder starts empty: what is already built, cargo leaves.)
+    subprocess.run(["cargo", "build", "-q", "-p", "kithd", "-p", "kith-cli"], cwd=ROOT, check=True)
     # (In /tmp whatever TMPDIR says: a socket's path has 108 bytes to fit in.)
     work = pathlib.Path(tempfile.mkdtemp(prefix="kith-ui-", dir="/tmp"))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit("ended"))  # so the nodes are put away then too
@@ -109,13 +124,13 @@ def main():
 
     def kith(*args):
         env = {k: v for k, v in os.environ.items() if k != "KITH_STORE"} | {"KITH_SOCKET": str(work / "alpha/kithd.sock")}
-        return subprocess.run([ROOT / "target/debug/kith", *args], env=env, capture_output=True, text=True)
+        return subprocess.run([TARGET / "debug/kith", *args], env=env, capture_output=True, text=True)
 
     def node(name, *more):
         (work / name).mkdir()
         log = open(work / name / "log", "w")
         args = ["--state", "state", "--socket", "kithd.sock", "--name", name, "--registry-port", "0", "--listen", f"127.0.0.1:{free()}", *more]
-        nodes.append(subprocess.Popen([ROOT / "target/debug/kithd", *args], cwd=work / name, stdin=subprocess.DEVNULL, stdout=log, stderr=log))
+        nodes.append(subprocess.Popen([TARGET / "debug/kithd", *args], cwd=work / name, stdin=subprocess.DEVNULL, stdout=log, stderr=log))
         return args[9]
 
     try:
@@ -188,13 +203,15 @@ def main():
         chrome = os.environ.get("CHROME") or (found[-1] if found else sys.exit("no Chromium: set CHROME"))
         views = [(1440, 900, scheme, "") for scheme in ("light", "dark")] + [(390, 2200, scheme, "") for scheme in ("light", "dark")]
         views += [(1440, 900, scheme, scene) for scene in ("YAML", "Status", "History", "Logs", "Review", "Empty") for scheme in ("light", "dark")]
+        # (The Install part, and a join token shown once, at both widths.)
+        views += [(width, height, scheme, scene) for scene in ("Install", "Token") for width, height in ((1440, 1500), (390, 2400)) for scheme in ("light", "dark")]
         for width, height, scheme, scene in views:
-            shot = out / f"ui-{scene.lower() or width}-{scheme}.png"
+            shot = out / (f"ui-{scene.lower()}-{width}-{scheme}.png" if scene in ("Install", "Token") else f"ui-{scene.lower() or width}-{scheme}.png")
             flags = ["--no-sandbox", "--disable-gpu", "--hide-scrollbars", f"--window-size={width},{height}", f"--screenshot={shot}"]
             if scheme == "dark":
                 flags.append("--blink-settings=preferredColorScheme=0")
             # (Empty: a kind the scene has none of, open with nothing in it.)
-            url = address.replace("scene=", f"scene={scene}").replace("#/Workload/default/web" if scene == "Empty" else "#/none", "#/Secret")
+            url = address.replace("scene=", f"scene={scene}").replace("#/Workload/default/web" if scene in ("Empty", "Install", "Token") else "#/none", "#/Secret" if scene == "Empty" else "#/install")
             subprocess.run([chrome, *flags, url], check=True, capture_output=True, timeout=120)
             print(shot)
         if failed:

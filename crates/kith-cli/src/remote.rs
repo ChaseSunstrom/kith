@@ -51,15 +51,20 @@ impl Drop for Client {
 
 /// Asks kithd for the tunnel: the connection, once kithd has answered `101`.
 fn open(kithd: &Kithd, body: &serde_json::Value) -> Result<Wire, String> {
+    // (Before the connection: a signed request first asks kithd for its cluster's id.)
+    let body = body.to_string();
+    let signed = match super::signed(kithd, "POST", "/v1/run", body.as_bytes())? {
+        Some(header) => format!("{}: {header}\r\n", super::signing::SIGNED),
+        None => String::new(),
+    };
     let mut stream = Wire::connect(&kithd.route, Some(kithd.timeout)).or_else(|e| {
         fail(format!(
             "cannot reach kithd at {}: {e}\nStart kithd.",
             kithd.route.name()
         ))
     })?;
-    let body = body.to_string();
     let head = format!(
-        "POST /v1/run HTTP/1.1\r\nHost: kithd\r\nConnection: Upgrade\r\nUpgrade: kith-run\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "POST /v1/run HTTP/1.1\r\nHost: kithd\r\nConnection: Upgrade\r\nUpgrade: kith-run\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{signed}\r\n",
         body.len()
     );
     let sent = stream
@@ -256,14 +261,27 @@ c.sendall(tag + c.makefile("rb").readline().upper())
             timeout: Duration::from_secs(10),
         };
         let served = std::thread::spawn(move || {
+            let read_head = |conn: &mut UnixStream| {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0u8];
+                    conn.read_exact(&mut byte).unwrap();
+                    head.push(byte[0]);
+                }
+                String::from_utf8(head).unwrap()
+            };
             let (mut conn, _) = listener.accept().unwrap();
-            let mut head = Vec::new();
-            while !head.ends_with(b"\r\n\r\n") {
-                let mut byte = [0u8];
-                conn.read_exact(&mut byte).unwrap();
-                head.push(byte[0]);
+            let mut head = read_head(&mut conn);
+            if head.starts_with("GET /v1/cluster ") {
+                // Asked first, to see whether the request is signed: this cluster is open.
+                conn.write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 18\r\n\r\n{\"signing\":\"open\"}",
+                )
+                .unwrap();
+                drop(conn);
+                conn = listener.accept().unwrap().0;
+                head = read_head(&mut conn);
             }
-            let head = String::from_utf8(head).unwrap();
             let length = head
                 .to_ascii_lowercase()
                 .split("content-length: ")

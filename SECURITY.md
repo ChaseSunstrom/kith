@@ -31,7 +31,11 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **A node's port (`--listen`, TLS).** Four routes take a caller with no certificate, and
   bodies of at most 4 KiB: the CA certificate, joining with a token, claiming an Identity
   with a token, and asking for a disk's key. (The web UI's pages are served to anyone
-  too: they are the same files for everyone, and what they show they ask the API for.)
+  too: they are the same files for everyone, and what they show they ask the API for.
+  A browser's request that changes something is taken only from the UI's own page:
+  `Sec-Fetch-Site` other than `same-origin` or `none` is refused, so a page elsewhere, or
+  one a workload serves on another port of the node, cannot use the certificate the
+  browser holds.)
   A connection holds one of 64 slots until it has shown a certificate, and one that
   shows none for at most 15 seconds; one address (an IPv4 address, an IPv6 /64) holds
   at most 8 of them. The node's own loopback is not counted.

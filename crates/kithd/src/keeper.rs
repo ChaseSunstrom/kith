@@ -34,13 +34,10 @@ pub fn kept() -> Option<(u32, bool)> {
 
 /// Process 1's life. Never returns: when it must end, the machine restarts.
 pub fn keep() -> ! {
+    // Blocked before first_things starts a thread: each thread inherits the mask, and process 1
+    // drops a SIGINT (Ctrl-Alt-Del) that a thread without it takes (no handler), so kithd is never told.
+    let heard = block_heard();
     crate::init::first_things();
-    // Waited for below, not handled: SIGTERM and SIGINT (Ctrl-Alt-Del) are kithd's to act on.
-    let mut heard = SigSet::empty();
-    for signal in [Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT] {
-        heard.add(signal);
-    }
-    let _ = heard.thread_block();
     let _ = std::fs::create_dir_all(kith_runtime::EXITS);
     let (mut starts, mut ends) = (0u32, Vec::<Instant>::new());
     let mut kithd = start(&mut starts, &mut ends);
@@ -82,6 +79,28 @@ pub fn keep() -> ! {
     }
 }
 
+/// Blocks the signals process 1 waits for (waited for below, not handled: SIGTERM and SIGINT
+/// (Ctrl-Alt-Del) are kithd's to act on) in this thread, and so in every thread started after.
+fn block_heard() -> SigSet {
+    let heard = heard_set();
+    let _ = heard.thread_block();
+    heard
+}
+
+/// Unblocked by kithd once its own handlers are set (main.rs `stops`): kithd is started with the
+/// mask process 1 holds, and a signal blocked with no one to take it is never heard.
+pub fn unblock_heard() {
+    let _ = heard_set().thread_unblock();
+}
+
+fn heard_set() -> SigSet {
+    let mut heard = SigSet::empty();
+    for signal in [Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT] {
+        heard.add(signal);
+    }
+    heard
+}
+
 /// Start kithd: this file again (an update of kithd alone, T-0709, is not yet). The start
 /// after ten failures in a minute is told to end (and restart the machine); a failure past
 /// that restarts it here.
@@ -117,4 +136,44 @@ fn restart() -> ! {
     let _ = nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_AUTOBOOT);
     // (Process 1 of a container: ending is how it stops.)
     std::process::exit(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The SigBlk mask of a thread started now (bit N-1 is signal N), read from its own status.
+    fn blocked_in_new_thread() -> u64 {
+        std::thread::spawn(|| {
+            let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+            let line = status.lines().find_map(|line| line.strip_prefix("SigBlk:")).unwrap();
+            u64::from_str_radix(line.trim(), 16).unwrap()
+        })
+        .join()
+        .unwrap()
+    }
+
+    #[test]
+    fn keeper_blocks_what_it_waits_for_before_a_thread_starts() {
+        let before = SigSet::thread_get_mask().unwrap();
+        let _ = block_heard();
+        let blocked = blocked_in_new_thread();
+        // (This test's own thread is put back as it was: the other tests run on it or after it.)
+        before.thread_set_mask().unwrap();
+        for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGCHLD] {
+            assert_eq!(blocked >> (signal as u32 - 1) & 1, 1, "{signal} is not blocked");
+        }
+    }
+
+    #[test]
+    fn keeper_unblocks_what_a_kept_kithd_handles() {
+        let before = SigSet::thread_get_mask().unwrap();
+        let _ = block_heard();
+        unblock_heard();
+        let blocked = blocked_in_new_thread();
+        before.thread_set_mask().unwrap();
+        for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGCHLD] {
+            assert_eq!(blocked >> (signal as u32 - 1) & 1, 0, "{signal} is still blocked");
+        }
+    }
 }

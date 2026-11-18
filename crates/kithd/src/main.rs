@@ -40,6 +40,7 @@ mod modules;
 mod netboot;
 mod os;
 mod own_writes;
+mod people;
 mod pki;
 mod pods;
 mod policy;
@@ -392,7 +393,10 @@ async fn within(
 /// Call inside the runtime.
 fn stops() -> std::io::Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
     use tokio::signal::unix::{SignalKind, signal};
-    Ok((signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?))
+    let heard = (signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?);
+    // (A kept kithd inherits the keeper's blocked mask: unblocked once these handlers are set.)
+    keeper::unblock_heard();
+    Ok(heard)
 }
 
 fn default_state() -> Option<PathBuf> {
@@ -985,9 +989,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let hardware = devices::run(shared.clone(), stopping.clone(), dmem);
             let crons = cron::run(shared.clone(), stopping.clone());
             let exits = exits::run(shared.clone(), stopping.clone());
+            let people = people::run(shared.clone(), stopping.clone());
             let published = pods::publish(shared.clone(), own_ports(&args), stopping.clone());
             tokio::join!(
                 apart(exits),
+                apart(people),
                 apart(published),
                 apart(units),
                 apart(releases),

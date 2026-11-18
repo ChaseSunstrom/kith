@@ -1,7 +1,7 @@
 //! The kernel's side: a WireGuard link made and addressed over route netlink, its key and
 //! peers set and read over generic netlink.
 
-use crate::{Key, MESH_BITS, NODE_BITS, Peer};
+use crate::{Key, MESH_BITS, Peer};
 use netlink_packet_core::{
     NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkDeserializable,
     NetlinkMessage, NetlinkPayload, NetlinkSerializable,
@@ -18,7 +18,7 @@ use netlink_packet_wireguard::{
 use netlink_sys::{Socket, SocketAddr, protocols};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind, Result};
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A peer as the kernel has it.
@@ -68,6 +68,32 @@ pub(crate) fn socket(protocol: isize) -> Result<Socket> {
     socket.connect(&SocketAddr::new(0, 0))?;
     limit(&socket, WAIT)?;
     Ok(socket)
+}
+
+/// Raises `socket`'s send buffer to hold one datagram of `bytes`, so a batch that size goes out
+/// in one send (at the default size the kernel answers EMSGSIZE). As nft does: forced past the
+/// system's limit when it may be (root), else up to it.
+// ponytail: a user's send buffer stops at net.core.wmem_max; a bigger batch needs root or that sysctl raised.
+pub(crate) fn raise_send_buffer(socket: &Socket, bytes: usize) -> Result<()> {
+    use nix::sys::socket::{setsockopt, sockopt::SndBuf, sockopt::SndBufForce};
+    // (The kernel doubles the size it is given, for its own bookkeeping.)
+    let wanted = bytes.saturating_mul(2);
+    setsockopt(socket, SndBufForce, &wanted)
+        .or_else(|_| setsockopt(socket, SndBuf, &wanted))
+        .map_err(Error::from)
+}
+
+/// One allowed address (`net`/`bits`), written in its own family (an IPv4 one is a /32, say).
+fn allowed_ip(&(net, bits): &(IpAddr, u8)) -> WireguardAllowedIp {
+    let family = match net {
+        IpAddr::V4(_) => WireguardAddressFamily::Ipv4,
+        IpAddr::V6(_) => WireguardAddressFamily::Ipv6,
+    };
+    WireguardAllowedIp(vec![
+        WireguardAllowedIpAttr::Family(family),
+        WireguardAllowedIpAttr::IpAddr(net),
+        WireguardAllowedIpAttr::Cidr(bits),
+    ])
 }
 
 /// Send `message` and take the answers, up to the kernel's "done" or its yes or no. Each
@@ -279,18 +305,11 @@ impl Device {
             changes.push(WireguardPeer(gone));
         }
         for peer in wanted.values().filter(|peer| had.get(&peer.key) != Some(*peer)) {
-            let allowed = |net: &Ipv6Addr| {
-                WireguardAllowedIp(vec![
-                    WireguardAllowedIpAttr::Family(WireguardAddressFamily::Ipv6),
-                    WireguardAllowedIpAttr::IpAddr((*net).into()),
-                    WireguardAllowedIpAttr::Cidr(NODE_BITS),
-                ])
-            };
             let mut new = vec![
                 WireguardPeerAttribute::PublicKey(peer.key),
                 flags(WireguardPeerFlags::ReplaceAllowedIps),
                 WireguardPeerAttribute::PersistentKeepalive(peer.keepalive),
-                WireguardPeerAttribute::AllowedIps(peer.allowed.iter().map(allowed).collect()),
+                WireguardPeerAttribute::AllowedIps(peer.allowed.iter().map(allowed_ip).collect()),
             ];
             new.extend(peer.endpoint.map(WireguardPeerAttribute::Endpoint));
             changes.push(WireguardPeer(new));
@@ -493,5 +512,31 @@ mod tests {
         );
         assert_eq!(silent(Error::from(ErrorKind::NotFound)).kind(), ErrorKind::NotFound);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn an_ipv4_allowed_address_is_written_as_ipv4_with_its_length() {
+        let net: (IpAddr, u8) = ("100.89.1.2".parse().unwrap(), 32);
+        assert_eq!(
+            allowed_ip(&net),
+            WireguardAllowedIp(vec![
+                WireguardAllowedIpAttr::Family(WireguardAddressFamily::Ipv4),
+                WireguardAllowedIpAttr::IpAddr(net.0),
+                WireguardAllowedIpAttr::Cidr(32),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_ipv6_allowed_address_is_written_as_ipv6_with_its_length() {
+        let net: (IpAddr, u8) = ("fd8a:2b3c:4d5e:5::".parse().unwrap(), 64);
+        assert_eq!(
+            allowed_ip(&net),
+            WireguardAllowedIp(vec![
+                WireguardAllowedIpAttr::Family(WireguardAddressFamily::Ipv6),
+                WireguardAllowedIpAttr::IpAddr(net.0),
+                WireguardAllowedIpAttr::Cidr(64),
+            ])
+        );
     }
 }

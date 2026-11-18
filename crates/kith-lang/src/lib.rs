@@ -285,6 +285,18 @@ pub fn dir(root: &std::path::Path) -> impl Fn(&str) -> Result<String, String> + 
         if !file {
             return Err("is not a file".into());
         }
-        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+        // (Read no further than one byte past the limit: a longer file is refused by its size,
+        // and the bytes of it are never more than that.)
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&path)
+            .and_then(|handle| handle.take(eval::SIZE as u64 + 1).read_to_end(&mut bytes))
+            .map_err(|e| e.to_string())?;
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(text),
+            // (Cut in the middle of a letter at the limit: still over it, so refused the same.)
+            Err(e) if e.as_bytes().len() > eval::SIZE => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+            Err(_) => Err("stream did not contain valid UTF-8".into()),
+        }
     }
 }
