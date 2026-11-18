@@ -284,13 +284,18 @@ def idle_rss(kithd, tmp):
     the kernel maps the cached pages around each page kithd touches, and pages a linker has
     just written are cached in small folios, so the same binary measured 0.9 to 1.8 MB less
     right after a build than after its cache was dropped and it was read back (read-ahead
-    makes large folios, and the kernel maps a whole one around a fault). So the file's cache is dropped
-    (fsync, POSIX_FADV_DONTNEED) and the file read whole before kithd starts: the number is
-    the same after a build and an hour later. On tmpfs nothing is dropped (there is no
+    makes large folios, and the kernel maps a whole one around a fault). How large is the
+    kernel's to say: a CI runner's mapped 4 MB more of the same binary than this machine's
+    (9.43 MB against 6.23), and as much more for one build as for the next, the code alike.
+    So the file's cache is dropped (fsync, POSIX_FADV_DONTNEED) and the file read whole
+    without read-ahead (POSIX_FADV_RANDOM: a page at a time, so no folio is larger) before
+    kithd starts: the number is the pages it touches and those the kernel maps around each,
+    after a build, an hour later and on any kernel. On tmpfs nothing is dropped (there is no
     disk to read it from): the number is then what that file's pages give."""
     with open(kithd, "rb") as binary:
         os.fsync(binary.fileno())
         os.posix_fadvise(binary.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        os.posix_fadvise(binary.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
         while binary.read(1 << 20):
             pass
     # Run in tmp with a relative socket name: a Unix socket path holds 107 bytes (see Daemon).
