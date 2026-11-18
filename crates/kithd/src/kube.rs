@@ -2593,7 +2593,7 @@ impl Watch {
         match (&self.call.caller, &self.call.certificate) {
             (Caller::Identity(_) | Caller::Node(_), Some(shown)) => shown.stands(&self.call.shared),
             (Caller::Identity(_), None) => false,
-            (Caller::Admin, _) => true,
+            (Caller::Admin | Caller::Console(_), _) => true,
             // (A node shows its certificate, and nothing is passed on to a watch.)
             (Caller::Node(_), None) | (Caller::Via(..) | Caller::Checked(..), _) => false,
         }

@@ -128,7 +128,7 @@ impl Device {
         ])?;
 
         // (The /48 on the interface is the route to every other node too.)
-        device.address(address, MESH_BITS, true)?;
+        put_address(device.index, address, MESH_BITS, true)?;
         up(device.index)?;
         Ok(device)
     }
@@ -182,57 +182,9 @@ impl Device {
         self.index
     }
 
-    /// Put `address` on the interface, or take it off.
-    fn address(&self, address: Ipv6Addr, bits: u8, there: bool) -> Result<()> {
-        let mut message = AddressMessage::default();
-        message.header.family = AddressFamily::Inet6;
-        message.header.prefix_len = bits;
-        message.header.index = self.index;
-        message.attributes.push(AddressAttribute::Address(address.into()));
-        // A further address (every node has it) is never what this node's own traffic
-        // comes from: the others would not take it for this node's. "Deprecated", to
-        // the kernel: good to be reached at, not to be picked for calling out.
-        if bits == 128 {
-            let mut times = CacheInfo::default();
-            (times.ifa_preferred, times.ifa_valid) = (0, u32::MAX);
-            message.attributes.push(AddressAttribute::CacheInfo(times));
-        }
-        let (message, flags) = match there {
-            true => (RouteNetlinkMessage::NewAddress(message), NLM_F_CREATE | NLM_F_REPLACE),
-            false => (RouteNetlinkMessage::DelAddress(message), 0),
-        };
-        ask(protocols::NETLINK_ROUTE, message, NLM_F_ACK | flags).map(drop)
-    }
-
     /// Make the further addresses of the interface (besides its own) `wanted`.
-    //
-    // ponytail: only what this Device added is taken off again: addresses left by a
-    // kithd that was killed stay until the interface goes.
     pub fn set_addresses(&mut self, wanted: &BTreeSet<Ipv6Addr>) -> Result<()> {
-        // All are tried; the first that failed is told. (One that would not go, because it
-        // was gone already, say, is not tried again.)
-        // A kernel that does not answer is not asked the rest: each would wait as long.
-        let silent = |tried: &Result<()>| matches!(tried, Err(e) if e.kind() == ErrorKind::TimedOut);
-        let mut failed = Ok(());
-        for gone in self.held.clone().difference(wanted) {
-            let tried = self.address(*gone, 128, false);
-            if silent(&tried) {
-                return tried;
-            }
-            failed = failed.and(tried);
-            self.held.remove(gone);
-        }
-        for new in wanted.difference(&self.held.clone()) {
-            let tried = self.address(*new, 128, true);
-            if silent(&tried) {
-                return tried;
-            }
-            match tried {
-                Ok(()) => drop(self.held.insert(*new)),
-                Err(e) => failed = failed.and(Err(e)),
-            }
-        }
-        failed
+        hold(self.index, &mut self.held, wanted)
     }
 
     fn message(&self, cmd: WireguardCmd, mut attributes: Vec<WireguardAttribute>) -> GenlMessage<WireguardMessage> {
@@ -377,6 +329,77 @@ pub struct Card {
     pub index: u32,
     pub name: String,
     pub mac: [u8; 6],
+}
+
+/// Put `address` on the interface `index`, or take it off.
+fn put_address(index: u32, address: Ipv6Addr, bits: u8, there: bool) -> Result<()> {
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet6;
+    message.header.prefix_len = bits;
+    message.header.index = index;
+    message.attributes.push(AddressAttribute::Address(address.into()));
+    // A further address (every node has it) is never what this node's own traffic
+    // comes from: the others would not take it for this node's. "Deprecated", to
+    // the kernel: good to be reached at, not to be picked for calling out.
+    if bits == 128 {
+        let mut times = CacheInfo::default();
+        (times.ifa_preferred, times.ifa_valid) = (0, u32::MAX);
+        message.attributes.push(AddressAttribute::CacheInfo(times));
+    }
+    let (message, flags) = match there {
+        true => (RouteNetlinkMessage::NewAddress(message), NLM_F_CREATE | NLM_F_REPLACE),
+        false => (RouteNetlinkMessage::DelAddress(message), 0),
+    };
+    ask(protocols::NETLINK_ROUTE, message, NLM_F_ACK | flags).map(drop)
+}
+
+/// The IPv6 addresses (of 128 bits) the interface `index` has.
+pub fn addresses6(index: u32) -> Result<Vec<Ipv6Addr>> {
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet6;
+    let found = ask_route(RouteNetlinkMessage::GetAddress(message), NLM_F_DUMP)?;
+    Ok(found
+        .into_iter()
+        .filter_map(|found| match found {
+            RouteNetlinkMessage::NewAddress(found) if found.header.index == index && found.header.prefix_len == 128 => {
+                found.attributes.into_iter().find_map(|attribute| match attribute {
+                    AddressAttribute::Address(std::net::IpAddr::V6(address)) => Some(address),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// Make the further addresses of the interface `index` (besides its own) `wanted`; `held` is
+/// what this caller put there before, and the only addresses it takes off again. (The
+/// mesh's WireGuard interface, or the loopback where there is no mesh.)
+pub fn hold(index: u32, held: &mut BTreeSet<Ipv6Addr>, wanted: &BTreeSet<Ipv6Addr>) -> Result<()> {
+    // All are tried; the first that failed is told. (One that would not go, because it
+    // was gone already, say, is not tried again.)
+    // A kernel that does not answer is not asked the rest: each would wait as long.
+    let silent = |tried: &Result<()>| matches!(tried, Err(e) if e.kind() == ErrorKind::TimedOut);
+    let mut failed = Ok(());
+    for gone in held.clone().difference(wanted) {
+        let tried = put_address(index, *gone, 128, false);
+        if silent(&tried) {
+            return tried;
+        }
+        failed = failed.and(tried);
+        held.remove(gone);
+    }
+    for new in wanted.difference(&held.clone()) {
+        let tried = put_address(index, *new, 128, true);
+        if silent(&tried) {
+            return tried;
+        }
+        match tried {
+            Ok(()) => drop(held.insert(*new)),
+            Err(e) => failed = failed.and(Err(e)),
+        }
+    }
+    failed
 }
 
 /// The machine's network cards, in the kernel's order, and the loopback's index.

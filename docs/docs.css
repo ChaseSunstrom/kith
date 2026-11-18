@@ -1,0 +1,141 @@
+/* The guide's pages (ci/site_docs.py makes them), drawn as the front page is: a line down the page with a stop
+   at every part. Colour, type and timing come from site.css's tokens; the bar and the buttons are site.css's too.
+   ci/site_docs.py --check fails on a token used here that site.css does not define. */
+
+.scrolled .bar { border-bottom: 1px solid var(--hair); padding-bottom: 11px; }
+.doc { display: grid; grid-template-columns: 264px minmax(0, 1fr); gap: 56px; max-width: calc(1120px + 2 * var(--gutter)); margin-inline: auto; padding: 24px var(--gutter) 96px; }
+.find label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+/* The side: a search over the headings, and the pages as stops on a line. */
+.side { position: sticky; top: 64px; align-self: start; max-height: calc(100vh - 80px); overflow-y: auto; overscroll-behavior: contain; padding-bottom: 24px; font-size: var(--note); line-height: 1.35; }
+.find input { display: block; width: 100%; padding: 8px 10px; border: 0; border-bottom: 1px solid var(--text); background: var(--sunken); color: var(--text); font: 400 var(--note) / 1.3 var(--sans); border-radius: 0; appearance: none; transition: border-color var(--quick); }
+.find input:focus { outline: 0; border-bottom-color: var(--accent); background-image: linear-gradient(var(--accent), var(--accent)); background-repeat: no-repeat; background-position: 0 100%; background-size: 100% var(--stroke); }
+.find input::placeholder { color: var(--dim); }
+.found { margin-top: 12px; }
+.found li + li { margin-top: 2px; }
+.found a { display: block; padding: 6px 8px 6px 10px; border-left: var(--stroke) solid var(--hair); color: var(--text); text-decoration: none; transition: background var(--quick), border-color var(--quick); }
+.found a:hover, .found a:focus-visible, .found .on a { background: var(--sunken); border-left-color: var(--accent); }
+.found b { display: block; font-weight: 700; }
+.found span, .found .none { color: var(--dim); font-size: var(--small); }
+.found .none { padding: 6px 10px; }
+.side.finding .rail { display: none; }
+
+.rail summary { display: none; cursor: pointer; font-weight: 800; padding: 8px 0; }
+.rail nav { padding-top: 16px; }
+.rail-group { margin: 22px 0 8px; padding-left: 28px; color: var(--dim); font-size: var(--small); font-weight: 700; }
+.stops { position: relative; }
+.stops::before { content: ""; position: absolute; left: 6px; top: 12px; bottom: 12px; width: var(--stroke); background: var(--text); }
+.stops > li { position: relative; padding: 5px 0 5px 28px; }
+.stops > li::before { content: ""; position: absolute; left: 0; top: 8px; width: 15px; height: 15px; border: var(--stroke) solid var(--text); border-radius: 50%; background: var(--bg); transition: border-color var(--quick), background var(--quick); }
+.stops > li:hover::before { border-color: var(--accent); }
+.stops a { color: var(--text); text-decoration: none; }
+.stops > li > a { font-weight: 700; }
+.stops a:hover { color: var(--accent-text); }
+.stops > li.here::before { border-color: var(--accent); background: radial-gradient(var(--accent) 38%, var(--bg) 42%); }
+.stops > li.here > a { color: var(--accent-text); font-weight: 800; }
+.inner { margin: 8px 0 6px; border-left: 1px solid var(--hair); }
+.inner a { display: block; padding: 3px 8px 3px 12px; margin-left: -1px; border-left: var(--stroke) solid transparent; color: var(--dim); font-size: var(--small); line-height: 1.3; transition: color var(--quick), border-color var(--quick); }
+.inner .h3 a { padding-left: 26px; }
+.inner a:hover { color: var(--text); }
+.inner a[aria-current] { color: var(--accent-text); border-left-color: var(--accent); font-weight: 700; }
+
+/* The page: its h1 is where you are (a blue stop); each h2 is a stop on the line; an h3 is a tick on it. */
+.page { position: relative; min-width: 0; padding-left: 44px; max-width: 820px; }
+.page::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: var(--stroke); background: var(--text); }
+.page::after { content: ""; position: absolute; left: -3px; bottom: 0; width: 21px; height: var(--stroke); background: var(--text); }
+.page > * { min-width: 0; }
+.page h1, .page h2, .page h3, .page h4 { position: relative; line-height: 1.2; letter-spacing: -0.015em; }
+.page h1 { font-size: var(--title); font-weight: 800; letter-spacing: -0.03em; padding-top: 12px; margin-bottom: 20px; overflow-wrap: break-word; animation: rise var(--enter) var(--ease) both; }
+.page h1::before, .page h2::before { content: ""; position: absolute; z-index: 1; left: -44px; top: calc(0.6em - var(--stop) / 2 + 12px); width: var(--stop); height: var(--stop); border: var(--stroke) solid var(--text); border-radius: 50%; background: var(--bg); box-sizing: border-box; }
+.page h1::before { background: radial-gradient(var(--accent) 38%, var(--bg) 42%); border-color: var(--accent); left: -41.5px; width: 20px; height: 20px; top: calc(0.6em - 10px + 12px); }
+.page h2 { font-size: var(--head); font-weight: 800; margin: 72px 0 18px; scroll-margin-top: 76px; }
+.page h2::before { left: -43.5px; top: calc(0.6em - 10px); width: 20px; height: 20px; }
+.page h2:target::before { border-color: var(--accent); background: radial-gradient(var(--accent) 38%, var(--bg) 42%); }
+.page h3 { font-size: var(--large); font-weight: 800; margin: 40px 0 12px; }
+.page h3::before { content: ""; position: absolute; left: -44px; top: 0.6em; width: 20px; height: var(--stroke); background: var(--text); }
+.page h4 { font-size: var(--base); font-weight: 800; margin: 28px 0 8px; }
+.anchor { margin-left: 8px; color: var(--dim); font-weight: 400; text-decoration: none; opacity: 0; transition: opacity var(--quick); }
+.page :is(h2, h3, h4):hover .anchor, .anchor:focus-visible { opacity: 1; }
+.anchor:hover { color: var(--accent-text); }
+@media (hover: none) { .anchor { display: none; } }
+
+.page p, .page li { overflow-wrap: break-word; }
+.page p { margin: 0 0 16px; max-width: 70ch; }
+.page h1 + p { font-size: var(--large); line-height: 1.45; max-width: 60ch; }
+.page strong { font-weight: 700; }
+.page hr { margin: 40px 0; border: 0; border-top: 1px solid var(--hair); }
+
+/* Lists: a short ink stroke for each stop of a bullet list, the number in weight for an ordered one. */
+.page ul, .page ol { margin: 0 0 16px; max-width: 70ch; }
+.page li { position: relative; padding-left: 26px; margin-bottom: 6px; }
+.page li > :is(ul, ol) { margin: 6px 0 0; }
+.page li > :is(p, pre, .table, .picture):last-child { margin-bottom: 0; }
+.page li > p { margin-bottom: 10px; }
+.page ul > li::before { content: ""; position: absolute; left: 2px; top: 0.78em; width: 10px; height: var(--stroke); background: var(--text); }
+.page ul ul > li::before { background: var(--dim); width: 8px; }
+.page ol { counter-reset: n; }
+.page ol > li { counter-increment: n; }
+.page ol > li::before { content: counter(n) "."; position: absolute; left: 0; width: 22px; text-align: right; font-weight: 800; font-variant-numeric: tabular-nums; }
+.page li > pre { max-width: none; }
+
+/* Code. A monospace only for what is code; a block hangs from an ink line, as the diffs of the web UI do. */
+.page code { font-family: var(--mono); font-size: 0.86em; background: var(--sunken); padding: 1px 3px; overflow-wrap: anywhere; }
+.page pre { margin: 20px 0; padding: 14px 18px; background: var(--sunken); border-left: var(--stroke) solid var(--text); overflow-x: auto; font-size: 14px; line-height: 1.55; tab-size: 4; -webkit-text-size-adjust: none; }
+.page pre code { padding: 0; background: none; font-size: inherit; overflow-wrap: normal; white-space: pre; }
+.page a code { color: inherit; }
+
+/* Tables: hairlines between rows, an ink line under the head; wider than the page, they scroll. */
+.table { margin: 24px 0; overflow-x: auto; }
+.table table { width: 100%; border-collapse: collapse; font-size: var(--note); line-height: 1.45; }
+.table th { text-align: left; font-weight: 800; border-bottom: var(--stroke) solid var(--text); }
+.table th, .table td { padding: 9px 20px 9px 0; vertical-align: top; border-bottom: 1px solid var(--hair); overflow-wrap: break-word; }
+.table td:first-child { font-weight: 600; min-width: 7ch; }
+.table td code { font-size: 0.88em; }
+.table tr:last-child td { border-bottom: 0; }
+
+/* A drawing in light and dark (the guide's <picture> blocks). */
+.picture { max-width: none; }
+.picture img { max-width: 100%; height: auto; vertical-align: top; border: 1px solid var(--hair); background: var(--bg); }
+
+/* The end of a page: the page before and after, and where its words live. */
+.tail { margin-top: 72px; }
+.tail nav { display: flex; flex-wrap: wrap; gap: 12px 40px; }
+.tail nav a { display: block; flex: 1 1 220px; max-width: 360px; padding: 8px 0 8px 14px; border-left: var(--stroke) solid var(--hair); color: var(--text); font-weight: 800; text-decoration: none; transition: border-color var(--quick), color var(--quick); }
+
+.tail nav a:hover { border-left-color: var(--accent); color: var(--accent-text); }
+.tail nav span { display: block; color: var(--dim); font-size: var(--small); font-weight: 400; }
+.tail .fine { margin-top: 28px; }
+
+/* The index. */
+.pages > li { padding-left: 0; margin: 0; padding-block: 18px; border-bottom: 1px solid var(--hair); }
+.pages > li::before { content: none; }
+.pages { counter-reset: none; max-width: none; margin-top: 20px; border-top: var(--stroke) solid var(--text); }
+.pages > li p { margin: 4px 0 0; max-width: 66ch; color: var(--dim); font-size: var(--note); }
+.pages .name { font-size: var(--large); font-weight: 800; color: var(--text); text-decoration: none; background: linear-gradient(var(--accent), var(--accent)) no-repeat 0 100% / 0 var(--stroke); padding-bottom: 2px; transition: background-size var(--arrive) var(--ease); }
+.pages .name:hover { background-size: 100% var(--stroke); }
+.pages .page-heads { display: flex; flex-wrap: wrap; gap: 2px 18px; margin-top: 10px; font-size: var(--small); }
+.pages .page-heads a { color: var(--accent-text); text-decoration: none; }
+.pages .page-heads a:hover { text-decoration: underline; }
+
+@media (max-width: 960px) {
+  .doc { grid-template-columns: minmax(0, 1fr); gap: 20px; padding-top: 12px; }
+  .side { position: static; max-height: none; overflow: visible; }
+  .rail { border-top: 1px solid var(--hair); border-bottom: 1px solid var(--hair); margin-top: 16px; }
+  .rail summary { display: block; }
+  .rail[open] summary { border-bottom: 1px solid var(--hair); }
+  .rail nav { padding-top: 8px; max-height: 60vh; overflow-y: auto; }
+}
+@media (max-width: 720px) {
+  .doc { padding-bottom: 64px; }
+  .page { padding-left: 32px; }
+  .page h1::before { left: -29.5px; }
+  .page h2::before { left: -31.5px; }
+  .page h3::before { left: -32px; width: 14px; }
+  .page h1 { font-size: var(--title); }
+  .page h2 { margin-top: 56px; }
+  .page h1 + p { font-size: var(--base); }
+  .page pre { margin-inline: -8px 0; padding-inline: 14px; font-size: 13px; }
+  .table table { font-size: var(--small); }
+  .table th, .table td { padding-right: 14px; }
+}
+@media (prefers-reduced-motion: reduce) { .page h1 { animation: none; } }

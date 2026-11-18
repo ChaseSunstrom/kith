@@ -52,6 +52,71 @@ sh ci/vm.sh --test image   # boot a copy of it under UEFI in QEMU and check it
 The build is not yet reproducible end to end: kithd is compiled once per run, and systemd's EFI
 stub and boot loader come from the building machine.
 
+### A node that needs more: a spec
+
+The image has no driver for graphics, sound or Wi-Fi, and no kernel modules to add one to a
+running node. A node that needs one runs an image built for it, from a spec:
+
+```yaml
+# os/examples/gpu-amd.yaml
+features: [gpu-amd-phoenix]
+```
+
+```sh
+KITH_OS_VERSION=1.0.1+gpu-amd sh os/build.sh --spec os/examples/gpu-amd.yaml --out target/os-gpu-amd
+```
+
+| | |
+| --- | --- |
+| A feature | a file of its name in `os/features/` (`gpu-amd-phoenix.config`): lines of kernel config merged over `os/kernel.config`, and `# firmware:` lines, what its driver loads. Naming the feature brings both: no file names, no versions |
+| Versions | None to choose: the kernel and linux-firmware (`firmware_date` in `os/build.sh`) are the ones this kith pins, as a distribution's release does |
+| `firmware:` | Paths or globs in linux-firmware for what no feature knows; built into the kernel too |
+| Firmware | Built in, only the files named: a driver starts before any root is mounted, and all of linux-firmware is 640 MB. So a feature is one GPU family, not every GPU of a vendor |
+| Refused | A feature there is no file for (the ones there are are listed), a key other than these two, a firmware path linux-firmware does not have |
+| The rest | The root, the disk and the update are as without a spec; a spec's kernel is built once and kept, beside the plain one |
+
+The features: `gpu-amd-phoenix`, the GPU of a Ryzen 7040, 8040 or 8000G (Radeon 780M, 760M,
+740M), with `/dev/kfd` for compute and the dmem cgroup, so a [GPU share](hardware.md) is a
+ceiling there. It costs the kernel 4.2 MB (17.9 MB against 13.5, firmware included), so the
+update is 43 MB against 34 and the ESP's two kernels 36 of its 64 MB; the root is the same.
+Built and started under UEFI in QEMU, the kernel brings amdgpu up (`amdgpu: Topology: Add CPU
+node`) and kithd serves; on a 780M itself it has not run yet.
+
+A node can say which features it wants itself. kithd matches its PCI cards (`lspci -n` ids) against
+the `# pci:` lines of `os/features/` and lists the features that match as `wants` in its Node status.
+`kith node features` prints them as a spec, which builds that node's image:
+
+```sh
+kith node features n1 > n1.yaml
+sh os/build.sh --spec n1.yaml --out target/os-n1
+```
+
+A node with no card a feature matches prints `features: []`; a node that runs no kith OS has no
+`wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
+card the catalogue does not list yet) is chosen by hand, as above.
+
+A cluster runs plain and GPU nodes side by side: sign each image's update as its own
+`OSRelease` and roll each with its own `UpdatePlan`, the GPU one with a `selector` on a label
+those nodes carry (`gpu: amd`, put on the Node as [any label is](cluster.md#where-work-runs): kithd does not
+set it from the GPU it finds yet; see [Rolling a release through the
+cluster](#rolling-a-release-through-the-cluster)). A plain release given to a GPU node takes its
+driver away until the next GPU one.
+
+#### A card put in later, or swapped
+
+The plain image has no `/lib/modules`, and kithd then loads nothing. An image that has one
+(a spec's kernel built with loadable modules, `modules.alias` and `modules.dep` from
+`depmod` beside them) gets its drivers from kithd, the way udev does: before it names the node and brings the
+network up (the network card's driver may be one), kithd matches the `modalias` of every
+device under `/sys/devices` to `modules.alias` and loads what matches, what it needs first
+(`finit_module`), and then, on a thread, does the same for each kernel uevent that adds a
+device. A card swapped for another of a kind
+the image has a driver for needs no restart. Modules in `modules.builtin` or already in
+`/proc/modules` are not loaded; each is tried once, and a failure (a bad signature, a
+missing file) is one console line, never an end. Not supported: module parameters,
+`modprobe.d` (blacklists, options), soft dependencies. Compressed modules (`.ko.xz`,
+`.zst`) are loaded by the kernel itself, from 5.17, if it was built to.
+
 ### Updating a node: two slots
 
 ```sh
@@ -271,19 +336,20 @@ with `kith.install`: it serves nothing, and asks on the screen and the serial li
 
 ```
 This machine's disks:
-  nvme0n1 (256.1 GB, Samsung SSD 970)
-  sda (2000.4 GB, WDC WD20EZRZ)
-Install kith OS on which (its name)?
+  nvme0n1 (256.1 GB, Samsung SSD 970, serial S4EWNX0R123456)
+  sda (2000.4 GB, WDC WD20EZRZ, serial WD-WCC4M1234567)
+Install kith OS on which (its name, or serial:X)?
 The node's name (empty: one made from its network card's address)?
 Its address, as 10.0.0.5/24,10.0.0.1 (empty: ask the network)?
 Join a cluster? The address of one of its nodes, as 10.0.0.7:7443 (empty: start a new cluster)
 The join token (`kith node token` there)?
-Everything on nvme0n1 (256.1 GB, Samsung SSD 970) will be erased. Type its name again to go on:
+Everything on nvme0n1 (256.1 GB, Samsung SSD 970, serial S4EWNX0R123456) will be erased. Type its name again to go on:
 ```
 
 The disk it was started from is never listed. A removable disk is installed on when named, but
 `only` never means one. The disk's size is read again just before it is written, and a disk of
-another size writes nothing; nor does a name not typed twice the same. It then copies kith OS to
+another size, or a disk named by serial that now gives another, writes nothing; nor does a
+name not typed twice the same. It then copies kith OS to
 the disk, reads it back to check, and powers off: take the stick out and start it.
 
 Without anyone there, put the answers on the stick as `kith-install.yaml` on its first partition
@@ -296,7 +362,7 @@ prints. The installer refuses plain `http` without that pin, and answers that do
 `https` needs no pin.
 
 ```yaml
-disk: nvme0n1        # or `only`: the one disk of a machine that has one, not removable
+disk: "serial:S4EWNX0R123456"  # or nvme0n1, or `only`: the one disk of a machine that has one, not removable
 hostname: alpha
 ip: 10.0.0.5/24,10.0.0.1      # without it the network is asked (DHCP)
 dns: 10.0.0.1
@@ -311,7 +377,16 @@ nodePolicy: hardened          # what the cluster may not have this node do: see 
 
 Then nothing is asked or confirmed: a stick with answers erases the disk they name in whatever
 machine it starts. A disk that is not there, `only` on a machine with several, or an unknown
-field stops it with the reason on the console and nothing written.
+field stops it with the reason on the console and nothing written. [The installer's
+page](../install.html) is a form that writes this file in your browser, and checks each answer as
+you type.
+
+A kernel's name for a disk (`sda`, `nvme0n1`) can change with the order the disks are found
+in; its serial does not. `serial:` names the disk by what the disk itself reports (NVMe,
+virtio, SCSI and SATA disks), as listed above, here or at the console: no disk with it, or two,
+stops the installer the same way. Two can: a USB case that gives every disk in it one serial, or
+an NVMe drive with several namespaces, which all give their controller's. Name such a disk by
+its name.
 
 What it was told goes into a small `config` partition of the new disk, which the node reads at
 every start as more of its kernel command line: name, address, and kithd's arguments (`--listen
@@ -530,5 +605,5 @@ kept in the TPM, a duress code that opens a decoy.
 ### Not in kith OS yet
 
 A CD image, starting by BIOS, a watchdog for a slot that hangs without stopping, Secure Boot
-(the image is not signed), drivers for Wi-Fi, sound and graphics, a card plugged in later, IPv6
+(the image is not signed), drivers for Wi-Fi and sound, graphics but by a [spec](#a-node-that-needs-more-a-spec), a card plugged in later, IPv6
 addresses from the network, arm64.

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en" data-root="../">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Packages and Sources: kith</title>
+<meta name="description" content="A cluster installs a package itself: push the package, apply a Release.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../site.css">
+<link rel="stylesheet" href="../docs.css">
+<script src="../docs.js" defer></script>
+</head>
+<body>
+<!-- Made by ci/site_docs.py from docs/guide/packages.md: change the markdown, then run it again. -->
+<header class="bar">
+  <a class="brand" href="../index.html" aria-label="kith: the front page">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true"><line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/><circle cx="22" cy="14" r="4"/><circle cx="22" cy="50" r="4"/><circle cx="43" cy="19" r="4.5"/><circle cx="43" cy="50" r="4.5"/><circle class="ring" cx="24" cy="37" r="5.5"/><circle class="hub" cx="24" cy="37" r="5.5"/></svg>
+    <b>kith</b>
+  </a>
+  <nav aria-label="Sections">
+    <a href="../guide/index.html">Guide</a>
+    <a href="../guide/index.html#decisions">Decisions</a>
+    <a href="../index.html#numbers">Numbers</a>
+  </nav>
+  <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+</header>
+<div class="doc">
+<aside class="side">
+  <form class="find" role="search" hidden>
+    <label for="q">Search the headings</label>
+    <input id="q" type="search" placeholder="Search the headings" autocomplete="off" spellcheck="false">
+  </form>
+  <ol class="found" aria-live="polite" hidden></ol>
+  <details class="rail" open>
+    <summary>The guide</summary>
+    <nav aria-label="The guide's pages"><ol class="stops"><li><a href="index.html">All the pages</a></li><li><a href="os.html">kith OS</a></li><li><a href="cluster.html">A cluster</a></li><li><a href="workloads.html">What kithd does today</a></li><li><a href="storage.html">Storage</a></li><li><a href="hardware.html">Hardware</a></li><li class=here><a href="packages.html" aria-current="page">Packages and Sources</a><ol class="inner"><li class="h2"><a href="#packages">Packages</a></li><li class="h3"><a href="#releases">Releases</a></li><li class="h3"><a href="#repositories">Repositories</a></li><li class="h3"><a href="#a-desktop-is-a-package">A desktop is a package</a></li><li class="h2"><a href="#sources-gitops">Sources (GitOps)</a></li></ol></li><li><a href="access.html">Access</a></li><li><a href="api.html">Resources and the language</a></li><li><a href="kubernetes.html">Coming from Kubernetes, Helm, Proxmox or compose</a></li><li><a href="ui.html">Web UI</a></li><li><a href="development.html">Working on kith</a></li><li><a href="numbers.html">How the numbers beside k3s were taken</a></li></ol><p class="rail-group">Decisions and reviews</p><ol class="stops"><li><a href="../adr-keyless.html">image signatures made without a kept key (T-0463)</a></li><li><a href="../adr-people.html">People's devices into the home network: peers, levels and where a level holds</a></li><li><a href="../adr-privilege.html">kithd in two parts: what reads the network holds no root</a></li><li><a href="../adr-taken-node.html">A taken control node is not the cluster taken</a></li><li><a href="../adr-unlock.html">The ways into a node's encrypted state, and what each leaves open</a></li><li><a href="../adr-workers.html">A worker keeps no Secret that nothing placed on it names</a></li><li><a href="../security-review-2.html">Security review 2</a></li></ol></nav>
+  </details>
+</aside>
+<div class="page" role="main">
+<article>
+<h1 id="packages-and-sources">Packages and Sources</h1>
+<h2 id="packages">Packages <a class="anchor" href="#packages" aria-label="Link to this section">#</a></h2>
+<p>A package is a directory of resource templates with default values (<a href="https://github.com/ChaseSunstrom/kith/tree/main/packages/web"><code>packages/web</code></a> is one):</p>
+<pre><code class="language-text">package.yaml          name, version, description, kithVersion, dependencies
+values.yaml           the default values
+values.schema.json    what values may be (optional)
+templates/*.yaml      resources, as templates; files named _something are only included
+NOTES                 what to tell whoever installed it (optional; a template too)
+</code></pre>
+<pre><code class="language-sh">kith package lint packages/web
+kith package render packages/web --name shop -n store --set replicas=3 -f mine.yaml
+kith package render packages/web --name shop | kith apply -f -
+</code></pre>
+<ul><li>Templates are Jinja (<a href="https://docs.rs/minijinja">minijinja</a>). They see <code>values</code> (the defaults, then each <code>-f</code> file, then each <code>--set</code>, merged by key), <code>release.name</code>, <code>release.namespace</code>, <code>package.name</code>, <code>package.version</code>, <code>name</code> (the release's resource name: <code>shop-web</code>) and <code>labels</code>. <code>toYaml</code> and <code>tojson</code> write a value (<code>{{ v | toYaml | indent(4) }}</code>); <code>required(v, "why")</code> stops with <code>why</code> when there is none. A missing value, a template that never ends or writes over 1 MB is an error. A template reads only its package; <code>namespace()</code> is not there.</li><li>Output is checked like any resource (an error shows the rendered line), put in the release's namespace unless it names one, and labelled <code>kith.dev/release</code> and <code>kith.dev/package</code>.</li><li><code>values.schema.json</code> may use <code>type</code>, <code>properties</code>, <code>required</code>, <code>additionalProperties</code>, <code>items</code>, <code>enum</code> and the <code>minimum</code>/<code>maximum</code> family; <code>lint</code> says so about any other keyword.</li></ul>
+<h3 id="releases">Releases <a class="anchor" href="#releases" aria-label="Link to this section">#</a></h3>
+<p>A cluster installs a package itself: push the package, apply a <code>Release</code>.</p>
+<pre><code class="language-sh">kith package push packages/web      # the package, as Package/web-0.1.0 in the store
+kith apply -f release.yaml
+kith get release/shop -n store -o yaml   # status: state, version, resources, notes
+</code></pre>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Release
+metadata: { name: shop, namespace: store }
+spec:
+  package: { name: web, version: 0.1.0 }   # no version: the newest pushed
+  values: { replicas: 3 }
+</code></pre>
+<div class="table"><table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td>Rendering</td><td>The node that leads the store renders and applies again on a change to the Release, the package or shared values, and deletes what is no longer rendered (all of it, with the Release). <code>kith rollback release/shop --to N</code> goes back to an earlier Release.</td></tr><tr><td>Values</td><td>Later over earlier: the package's defaults, the key <code>values</code> (YAML) of the ConfigMap <code>kith-system/kith-values</code>, the same in the Release's namespace, the Release's <code>spec.values</code>.</td></tr><tr><td><code>version</code></td><td>One version (<code>1.2.0</code>) or a range (<code>^1.2</code>, <code>&gt;=1, &lt;3</code>); none is any version that is not a pre-release. A Release stays on the newest package that fits; <code>autoUpgrade: true</code> follows newer ones. Pushing a version again replaces it.</td></tr><tr><td>What it owns</td><td>What a release installed is annotated <code>kith.dev/owned-by</code> with the Release's key and listed in its status; only what is both is deleted when no longer rendered (<code>kith apply</code> refuses a resource annotated as a Release's when there is no such Release).</td></tr><tr><td>What it refuses</td><td>To take over what is there and not its own, to leave its namespace, to make a Node, Package, Release, Source or <code>kith-values</code> ConfigMap. This, or a failing template, is <code>state: error</code> with the reason in <code>message</code>; what was installed stays.</td></tr><tr><td>Whose rights</td><td>A Release acts with the rights of whoever applied it (or rolled it back), which kithd writes down as <code>kith.dev/written-by</code>; what a client says there is not taken. Each render asks for every resource, what it reaches (a Backup's Volume and Secret, a Share's Volume, a CronJob's Jobs) and each deletion as if that writer applied it.</td></tr><tr><td>A refusal</td><td>One refusal and nothing is applied: <code>state: error</code>, <code>Secret/store/db: Release/store/shop was applied by alice, and alice may not apply Secret in namespace store: no Role bound to it allows that</code>. A writer who loses a right or is deleted stops the next render, not what is installed.</td></tr><tr><td>The writer's key</td><td>A Release (and a Source) also needs its writer's key as it was then (<code>kith.dev/written-key</code>): after a new certificate, an Identity made again, or for a Release from before this was written, nothing new is made until it is applied again.</td></tr></tbody></table></div>
+<h3 id="repositories">Repositories <a class="anchor" href="#repositories" aria-label="Link to this section">#</a></h3>
+<p>Packages travel as OCI artifacts in any registry, signed:</p>
+<pre><code class="language-sh">kith package keygen signing.key        # the secret into the file; prints the public key
+kith package push packages/web --to oci://registry.example/packages --key signing.key
+kith package pull oci://registry.example/packages web 0.1.0 --public-key 3f9c…
+</code></pre>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Repository
+metadata: { name: ours }
+spec: { url: oci://registry.example/packages, publicKey: 3f9c… }
+---
+apiVersion: kith.dev/v1
+kind: Release
+metadata: { name: shop }
+spec:
+  package: { repo: ours, name: web, version: ^0.1 }
+  autoUpgrade: true
+</code></pre>
+<div class="table"><table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td>Layout</td><td>The package <code>web</code> is the repository <code>packages/web</code>, each version a tag: one blob (the package's files) and an Ed25519 signature over name, version and the blob's SHA-256, as the annotation <code>dev.kith.signature</code>.</td></tr><tr><td>Fetching</td><td>A Release that names a Repository must be applied by someone who may <code>apply</code> Packages (else nothing is fetched and the status says so). The node that leads the store fetches the newest version that fits, checks it against the <code>publicKey</code> and stores it as a Package (annotated <code>kith.dev/repository</code>). Registries are asked when a Release wants something new and every <code>--repository-poll</code> seconds (300) for Releases with <code>autoUpgrade</code>.</td></tr><tr><td>Checking</td><td>An unsigned or wrongly signed package is refused (the Repository's <code>state: error</code>); a newer version that fails is passed over for the newest that passes. With no <code>publicKey</code>, whoever answers at the <code>url</code> is trusted. Changing either re-fetches and re-checks everything.</td></tr><tr><td>Versions</td><td>A version is fetched once; pushing it again changes nothing here. A signature says a package is the publisher's, not the newest: a registry can hide newer ones. A Package keeps its last 3 revisions (other kinds 100): push a new version rather than rolling far back.</td></tr><tr><td>Pushed by hand</td><td>A Release renders it with its pusher's rights as well as its writer's: what the Package makes and no longer makes is asked of the pusher too. Where the pusher may not, nothing new is made, what was installed stays, and the status says whose right fell short (a Package pushed before kithd wrote the pusher down renders nothing new until pushed again).</td></tr><tr><td>Fetched</td><td>It has no pusher: the Repository's key is its trust, so whoever may apply a Repository gives the rights of every Release that names it. Only kithd's fetcher sets <code>kith.dev/repository</code>: an apply or a Source's file that carries it is refused.</td></tr><tr><td>Reaching a registry</td><td><code>kith</code> goes through kithd. Plain HTTP only to a registry on the same machine.</td></tr></tbody></table></div>
+<p>Not yet: <code>dependencies</code> are read and nothing more; no hooks, no lookup of cluster objects from a template, no registry credentials.</p>
+<h3 id="a-desktop-is-a-package">A desktop is a package <a class="anchor" href="#a-desktop-is-a-package" aria-label="Link to this section">#</a></h3>
+<p>kith has no desktop of its own: a node nobody gives one stays headless. Four example packages show the shape (<a href="https://github.com/ChaseSunstrom/kith/tree/main/packages/hyprland"><code>packages/hyprland</code></a>, <a href="https://github.com/ChaseSunstrom/kith/tree/main/packages/gnome"><code>packages/gnome</code></a>, <a href="https://github.com/ChaseSunstrom/kith/tree/main/packages/kiosk"><code>packages/kiosk</code></a>, <a href="https://github.com/ChaseSunstrom/kith/tree/main/packages/kith-panel"><code>packages/kith-panel</code></a>):</p>
+<pre><code class="language-sh">kith get seat                       # office-pc-seat0
+kith get seat office-pc-seat0 -o yaml &gt; seat.yaml   # add under metadata.labels: kith.dev/namespaces: desktop
+kith apply -f seat.yaml             # the seat is given to the namespace desktop
+kith package render packages/hyprland --name office -n desktop \
+  --set seat=office-pc-seat0 --set image=registry.example/me/hyprland:1 | kith apply -f -
+</code></pre>
+<ul><li>The seat's <code>kith.dev/namespaces</code> label must name the session's namespace (<code>desktop</code> above), or the claim is refused and its <code>status.message</code> says so: an unlabelled seat is <code>kith-system</code>'s alone (<a href="hardware.html#claiming-hardware">Who may claim what</a>).</li><li>A session package renders an exclusive <code>DeviceClaim</code> for the seat and a one-replica <code>Workload</code> that holds it (<a href="hardware.html#hardware">Hardware</a>); <code>reserve</code> is its CPUs and memory. It sets <code>XDG_RUNTIME_DIR=/run/seat</code>, where the apps find the compositor's and PipeWire's sockets.</li><li>kith ships no desktop images: <code>image</code> names one you built or trust. It is told <code>KITH_SEAT</code>, <code>KITH_USER</code> and (Hyprland, GNOME) <code>KITH_APPS</code> and <code>KITH_DOTFILES</code>; the kiosk runs <code>command</code>. It runs as the image's <code>User</code> and is never started as root to become one (<a href="workloads.html#what-a-container-is-kept-from">What a container is kept from</a>): give the image the user the session is to be. The seat's device nodes are that user's (on kith OS).</li><li><code>kith-panel</code> is a <code>Workload</code> for a panel image that is a window of a seat's session: it holds a claim on <code>seat</code> with <code>access: client</code> (<a href="hardware.html#hardware">an app as a workload of its own</a>), runs on the seat's node and finds the Wayland socket at <code>display</code>.</li><li>Delete the release and the node is headless again.</li></ul>
+<p>A desktop with no screen, in a browser: <a href="https://github.com/ChaseSunstrom/kith/tree/main/packages/selkies"><code>packages/selkies</code></a> runs <a href="https://github.com/selkies-project/selkies">Selkies</a>' desktop image (pinned, Ubuntu, software rendering) as a pod behind a Service on port 8080, its login the user <code>ubuntu</code> and the <code>password</code> key of a Secret you make first. The image writes under <code>/</code> as it starts, so it is a pod; and its own password is a published one, so the package names a Secret and renders none:</p>
+<pre><code class="language-sh">kith apply -f - &lt;&lt;&lt; '{"apiVersion": "kith.dev/v1", "kind": "Secret", "metadata": {"name": "selkies-password"}, "spec": {"data": {"password": "YOURS"}}}'
+kith package render packages/selkies --name desk | kith apply -f -
+</code></pre>
+<h2 id="sources-gitops">Sources (GitOps) <a class="anchor" href="#sources-gitops" aria-label="Link to this section">#</a></h2>
+<p>A <code>Source</code> keeps what is in a git repository (or an OCI artifact) applied:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Source
+metadata: { name: cluster, namespace: kith-system }
+spec:
+  git: { url: https://example.org/ops/cluster.git, rev: main }
+  path: clusters/home        # the YAML and JSON files under it
+  intervalSeconds: 60
+  prune: true                # delete what the source no longer has
+  approval: manual           # hold each new revision until approved [auto]
+</code></pre>
+<pre><code class="language-sh">kith get source/cluster -n kith-system -o yaml   # status: state, revision, pending, drift
+kith source approve cluster -n kith-system       # apply the revision that waits
+kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.oci`
+</code></pre>
+<ul><li>A resource that names no namespace goes in the Source's. A Source applies only into its own namespace; one in <code>kith-system</code> applies anywhere and any kind. Either way it applies only what whoever applied it may apply, as a Release does (above): its repository's authors can make whatever that writer can, and no more. A Release or a Source it makes acts with the same writer's rights.</li></ul>
+<div class="table"><table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td>Fetching</td><td>The node that leads the store fetches the source every <code>intervalSeconds</code> (5 at least) and applies its resources, marked <code>kith.dev/owned-by</code> like a Release's. Sources are fetched several at once; one that keeps failing is fetched less often (its interval doubles each time, to an hour).</td></tr><tr><td>Conflicts</td><td>It does not take over what is there and not its own. Of two Sources that name one resource the one that has it keeps it (the first by name, if they come together); the other says <code>error</code>.</td></tr><tr><td><code>status.state</code></td><td><code>synced</code> (at <code>revision</code>), <code>pending</code> (<code>pending.revision</code> waits for <code>kith source approve</code>, with what it would change) or <code>error</code> (with <code>message</code>; what was applied stays). When the source moves on, a manual Source waits again.</td></tr><tr><td>Approval</td><td>It is for a revision: a Source whose <code>path</code> or <code>prune</code> you change applies the revision already approved the new way.</td></tr><tr><td>Drift</td><td>What a Source applied and someone changed since is put back and listed in <code>status.drift</code>: the source is what is true. Deleting a Source deletes what it applied.</td></tr><tr><td>git</td><td>The node's <code>git</code> program, over <code>https://</code> or <code>ssh://</code> only, with no credentials but what ssh has. Nothing is checked out, so links in a repository are skipped (<code>status.skipped</code>); a source is 2000 files and 4 MB at most. git runs under <code>ulimit -f</code> and writes no file over 256 MB.</td></tr><tr><td>Addresses</td><td>Only a Source in <code>kith-system</code> is fetched over <code>ssh://</code> (the node's own keys open the door) or from this node and its own networks (loopback, private, link-local and shared addresses, by whatever name; any address of this machine's cards or a Node's advertised). Any other Source is fetched from the very address that was checked: a name that answers differently a moment later, or a redirect, leads nowhere else (git follows none and needs 2.37 or newer; a registry's redirects and token host are checked the same way).</td></tr></tbody></table></div>
+<p>Not yet: signed-commit verification, credentials for private repositories.</p>
+</article>
+<footer class="tail"><nav aria-label="Next page"><a class="before" href="hardware.html"><span>Before</span>Hardware</a><a class="after" href="access.html"><span>After</span>Access</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/packages.md">docs/guide/packages.md</a>.</p></footer>
+</div>
+</div>
+</body>
+</html>

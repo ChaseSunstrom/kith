@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en" data-root="../">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>A cluster: kith</title>
+<meta name="description" content="A node that holds the CA and listens on every address (--listen 0.0.0.0:7443, or a restart with no --listen) must say where others reach it, --advertise 192.168.1.10:7443, or kithd refuses to start....">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../site.css">
+<link rel="stylesheet" href="../docs.css">
+<script src="../docs.js" defer></script>
+</head>
+<body>
+<!-- Made by ci/site_docs.py from docs/guide/cluster.md: change the markdown, then run it again. -->
+<header class="bar">
+  <a class="brand" href="../index.html" aria-label="kith: the front page">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true"><line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/><circle cx="22" cy="14" r="4"/><circle cx="22" cy="50" r="4"/><circle cx="43" cy="19" r="4.5"/><circle cx="43" cy="50" r="4.5"/><circle class="ring" cx="24" cy="37" r="5.5"/><circle class="hub" cx="24" cy="37" r="5.5"/></svg>
+    <b>kith</b>
+  </a>
+  <nav aria-label="Sections">
+    <a href="../guide/index.html">Guide</a>
+    <a href="../guide/index.html#decisions">Decisions</a>
+    <a href="../index.html#numbers">Numbers</a>
+  </nav>
+  <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+</header>
+<div class="doc">
+<aside class="side">
+  <form class="find" role="search" hidden>
+    <label for="q">Search the headings</label>
+    <input id="q" type="search" placeholder="Search the headings" autocomplete="off" spellcheck="false">
+  </form>
+  <ol class="found" aria-live="polite" hidden></ol>
+  <details class="rail" open>
+    <summary>The guide</summary>
+    <nav aria-label="The guide's pages"><ol class="stops"><li><a href="index.html">All the pages</a></li><li><a href="os.html">kith OS</a></li><li class=here><a href="cluster.html" aria-current="page">A cluster</a><ol class="inner"><li class="h2"><a href="#more-than-one-node">More than one node</a></li><li class="h3"><a href="#the-store-and-who-votes">The store, and who votes</a></li><li class="h3"><a href="#where-work-runs">Where work runs</a></li><li class="h3"><a href="#the-mesh">The mesh</a></li><li class="h3"><a href="#workers">Workers</a></li><li class="h3"><a href="#services-across-nodes">Services across nodes</a></li><li class="h3"><a href="#ingress-a-host-of-its-own-with-a-certificate">Ingress: a host of its own, with a certificate</a></li><li class="h3"><a href="#not-yet">Not yet</a></li><li class="h2"><a href="#restarting-a-node-on-purpose">Restarting a node on purpose</a></li><li class="h3"><a href="#checkpointing-a-long-gpu-job">Checkpointing a long GPU Job</a></li><li class="h2"><a href="#dns">DNS</a></li><li class="h3"><a href="#forwarding-one-zone">Forwarding one zone</a></li></ol></li><li><a href="workloads.html">What kithd does today</a></li><li><a href="storage.html">Storage</a></li><li><a href="hardware.html">Hardware</a></li><li><a href="packages.html">Packages and Sources</a></li><li><a href="access.html">Access</a></li><li><a href="api.html">Resources and the language</a></li><li><a href="kubernetes.html">Coming from Kubernetes, Helm, Proxmox or compose</a></li><li><a href="ui.html">Web UI</a></li><li><a href="development.html">Working on kith</a></li><li><a href="numbers.html">How the numbers beside k3s were taken</a></li></ol><p class="rail-group">Decisions and reviews</p><ol class="stops"><li><a href="../adr-keyless.html">image signatures made without a kept key (T-0463)</a></li><li><a href="../adr-people.html">People's devices into the home network: peers, levels and where a level holds</a></li><li><a href="../adr-privilege.html">kithd in two parts: what reads the network holds no root</a></li><li><a href="../adr-taken-node.html">A taken control node is not the cluster taken</a></li><li><a href="../adr-unlock.html">The ways into a node's encrypted state, and what each leaves open</a></li><li><a href="../adr-workers.html">A worker keeps no Secret that nothing placed on it names</a></li><li><a href="../security-review-2.html">Security review 2</a></li></ol></nav>
+  </details>
+</aside>
+<div class="page" role="main">
+<article>
+<h1 id="a-cluster">A cluster</h1>
+<h2 id="more-than-one-node">More than one node <a class="anchor" href="#more-than-one-node" aria-label="Link to this section">#</a></h2>
+<pre><code class="language-sh">kithd --listen 192.168.1.10:7443 --name alpha      # first start: makes the cluster's CA
+kith node token                                    # on alpha: good once, for an hour
+kithd --join 192.168.1.10:7443 --token TOKEN --name beta    # on the other machine
+kith get node                                      # on either: alpha and beta, `ready at` their addresses
+kith node status                                   # who leads the store, who votes
+</code></pre>
+<p>A node that holds the CA and listens on every address (<code>--listen 0.0.0.0:7443</code>, or a restart with no <code>--listen</code>) must say where others reach it, <code>--advertise 192.168.1.10:7443</code>, or kithd refuses to start. (A joining node says it by joining; on kith OS, one given an address by its network says that one.) Identity is kept in <code>&lt;state&gt;/pki</code>, so after the first start no <code>--join</code> or <code>--token</code> is needed.</p>
+<p>Nodes talk TLS with certificates from the cluster's CA: that proves membership, not which member. Without one, a caller may read the CA certificate and present a join token, nothing else, and is cut off after 15 s. A token carries its secret, the CA's fingerprint, and the name and key print of the node that made it: the joiner talks only to that node and names who answered instead, if anyone else did. (A token from before makers were named still joins, with a warning, through whichever node answers. A kithd from before cannot use a newer token, "not a join token": update the joiner first.)</p>
+<h3 id="the-store-and-who-votes">The store, and who votes <a class="anchor" href="#the-store-and-who-votes" aria-label="Link to this section">#</a></h3>
+<ul><li>Every node keeps its own copy of the store (Raft, log in <code>&lt;state&gt;/raft</code>). A change made anywhere goes to the leader and is answered once more than half the voters have it on disk. Reads come from the node's own copy, which can be a moment behind.</li><li>From three nodes on, three vote: lose one and the other two elect a leader within seconds. With two nodes (or after one of three is deleted) one votes, since two would stop when either did; losing it stops changes until it is back. A node votes only once it has the store.</li><li>Every node tells every other, every two seconds, whom it has heard from. One unheard for ten seconds is <code>unreachable</code> in <code>kith get node</code>, <code>ready</code> again when back. A voter unreachable for a minute hands its vote to a node that is there, if there is a spare.</li><li><code>kith delete node/NAME</code> removes a member. From the next request its certificate is refused (<code>401</code>, on the API and between nodes) and it leaves the mesh; nothing restarts. To have it back, join it again with a new token (the old certificate stays refused). What it already copied it keeps: see SECURITY.md.</li><li>A node that was away while another joined takes the store from the newcomer once a voter it knew vouches for it. Reaching none, it asks every five seconds and catches up; only if every voter it knew was replaced must it be joined again.</li><li>Tested: <code>sh ci/vm.sh --test chaos</code> runs three kith OS VMs with a writer through each, unplugs each node's network in turn, resets each mid-write, then resets all three at once. The other two always keep taking writes, a cut-off node acknowledges none, and every acknowledged write ends up on all three. It does not show lying disks, torn writes, a lossy network or real hardware.</li></ul>
+<h3 id="where-work-runs">Where work runs <a class="anchor" href="#where-work-runs" aria-label="Link to this section">#</a></h3>
+<ul><li>The leader places each Workload replica on a node with room (<code>resources</code>), matching its <code>placement</code>, not cordoned or tainted, spread out. <code>kith get workload/NAME -o yaml</code> shows <code>nodes</code>, or why one is <code>unschedulable</code>; <code>kith logs</code> finds a replica wherever it is. A Job runs on one node. A new node gets nothing until the leader has heard from it.</li><li>A <code>NodeWorkload</code> runs one copy on each node whose labels match <code>selector</code> (empty: all), except cordoned, <code>NoExecute</code>-tainted and lost ones. To label a node: <code>kith get node/NAME -o yaml</code>, add <code>metadata.labels</code>, <code>kith apply</code>; copies follow the match. <code>-o yaml</code> says which copy number runs where, <code>kith get</code> shows ready over nodes, and <code>kith logs nodeworkload/NAME --replica N</code> reads one. With no cluster: one copy if the selector is empty, else none.</li><li>A replica stays put. After its node is unreachable for five minutes (<code>--lost-after SECONDS</code>) it is started elsewhere and stays there; a Job starts over. A restarted node runs nothing until it has caught up with the store, so not while there is no leader.</li></ul>
+<h3 id="the-mesh">The mesh <a class="anchor" href="#the-mesh" aria-label="Link to this section">#</a></h3>
+<p><code>--mesh</code> (or <code>--mesh 51820</code>, the UDP port) joins the cluster's WireGuard mesh. kithd makes <code>kith0</code> (<code>--mesh-interface NAME</code>) itself, with no <code>wg</code> or <code>ip</code>; it needs the kernel's WireGuard and CAP_NET_ADMIN, and runs without a mesh, saying so, if they are missing. An existing WireGuard interface of that name is taken over (any other kind is refused) and removed when kithd stops. The mesh adds 0.08–0.15 ms to a veth round trip of 0.03 ms (<code>sh ci/mesh_rtt.sh</code>; the plan allowed 0.3 ms).</p>
+<ul><li>Without <code>--mesh</code> (kith OS's default) a Service still answers the pods of the node it is on: kithd puts the Service's address on the loopback, and its status says the address and backends as ever. Other nodes' replicas are out of reach, as no mesh carries them.</li><li>Each node gets a stable IPv6 address derived from the CA and its name; <code>kith get node/NAME -o yaml</code> shows it and the public key (<code>mesh</code>), <code>kith node status</code> the peers and their last handshakes. The private key stays in <code>&lt;state&gt;/pki</code>.</li><li>A peer silent for three minutes is reached through a node with the <code>edge</code> role until it answers again. The edge machine must forward (<code>net.ipv6.conf.all.forwarding=1</code>; kithd warns but leaves it alone) and sees what it passes on.</li></ul>
+<p><strong>A laptop</strong> is a node that comes and goes:</p>
+<pre><code class="language-sh">kithd --join HOME:7443 --token "$(…)" --mesh --roaming
+</code></pre>
+<p>The cluster then reaches it at its mesh address, through the tunnel it opens from wherever it is (<code>spec.roaming: true</code> on its Node). A roaming node never votes, and what it runs stays its own however long it is away: nothing moves after <code>--lost-after</code>, and nothing new is placed until it is back. For one gone for good, <code>kith delete node/NAME</code>. It must reach at least one node directly (a public address, or UDP 51820 forwarded at home). Two nodes both behind NAT call each other where an edge node saw them, which opens a direct path through most home routers; behind a NAT that gives a new port for each address it sends to, they meet through an edge node instead. To forbid that:</p>
+<pre><code class="language-yaml">spec:
+  roaming: true
+  mesh: { relay: never }   # straight to the other node, or not at all
+</code></pre>
+<p><code>kith node status</code> says of each peer <code>direct</code>, <code>through an edge node</code> or <code>unreachable</code>. Tunnels are WireGuard between the nodes' own keys, and kithd's traffic inside them is TLS as well.</p>
+<h3 id="workers">Workers <a class="anchor" href="#workers" aria-label="Link to this section">#</a></h3>
+<p>A node is a control node unless made a worker, which is trusted with less. The token's maker decides, not the joining machine:</p>
+<pre><code class="language-sh">kith node token --worker             # on alpha: the node this token lets in is a worker
+kith node token --worker --ingress   # a worker that serves ingress: it is sent the hosts' certificates too
+</code></pre>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: gamma }
+spec: { trust: worker }         # or `control`, which is what a Node without it is
+</code></pre>
+<div class="table"><table><thead><tr><th>A worker</th><th></th></tr></thead><tbody><tr><td>votes</td><td>never, and no Raft message from it is taken. A voter made a worker hands its vote on within seconds; to cut one off at once, delete its Node. Fewer than three control nodes: one votes</td></tr><tr><td>writes</td><td>only what it says of itself: its units' state, its Node's <code>os</code>, <code>mesh</code>, <code>serves</code> and <code>thumbprint</code>, its Devices and Seats, its Volumes' backups and images. Anything else is refused and audited under its name (<code>kith audit</code>)</td></tr><tr><td>answers</td><td>no person: point <code>kith</code>, a kubeconfig, <code>curl</code> and the web UI at a control node (<code>this node is a worker and answers no one by their rights: ask a control node (ADDRESS)</code>). <code>kith logs</code>, <code>kith volume put</code>/<code>get</code>, <code>kith node passphrase</code>, a restore and <code>kith run</code> asked of a worker for another node are refused (<code>node NAME is a worker: its word for who asked is not taken: ask a control node</code>); asked of a control node they reach the worker as usual</td></tr><tr><td>holds</td><td>no copy of the store, only a view (below); no blob it is not using; no encrypted Volume's key. Its replica of a Volume takes over only when no control node has one</td></tr><tr><td>does not yet</td><td>order ACME certificates, or write <code>DNSRecord</code>/<code>DNSBlockList</code> status (it answers DNS; control nodes report)</td></tr></tbody></table></div>
+<p>To keep something off workers:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: signer }
+spec:
+  placement: { require: { kith.dev/trust: control } }   # `worker` is the other value
+  template:
+    containers:
+      - name: signer
+        image: registry.example.org/signer:1
+---
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: signing-key }
+spec:
+  trust: control                # given to units on control nodes only
+  data: { key: the-key-as-text }
+</code></pre>
+<p>Every node has the label <code>kith.dev/trust</code> from its <code>spec.trust</code>, for placement and <code>NodeWorkload</code> selectors. Anything naming a <code>trust: control</code> Secret is placed on control nodes only (<code>missing required labels</code> if none fits), and a worker hands such a Secret to nothing (<code>Secret/NAMESPACE/NAME is for control nodes (trust: control), and this node is a worker</code>). That covers <code>env</code>, <code>envFrom</code> and files, not what kithd reads itself (a Backup's S3 Secret, a <code>tls-</code> Secret, the ACME account). <code>kith apply</code>, <code>delete</code> and <code>rollback</code> refuse to make the CA's node a worker or leave only workers; a Release, a Source, a controller or two changes at once through two nodes are not checked, and making a node control again repairs it.</p>
+<p><strong>A worker's view</strong> is what every node needs (Nodes, Namespaces, templates, Services, NetworkPolicies, Volumes, Devices, DNS) plus only the Secrets and ConfigMaps its own units name, kept in <code>view.json</code> and dropped when they leave (on a worker, <code>kith get secret/other</code> for a unit elsewhere is <code>not found</code>, and <code>kith node status</code> says which change its view is at and who sent it). With no control node in reach a worker keeps running from its view, starts nothing new, and follows another control node when its own is gone (<code>sh ci/vm.sh --test worker</code>). A node made a worker erases its store once its first view is written; to make it control again, delete its Node and rejoin.</p>
+<p><strong>An ingress worker</strong> (the node the internet reaches) also gets every exposed host's <code>tls-</code> Secret and the ACME account's thumbprint (<code>kith-system/acme</code>), never its key. It needs a <code>--ingress</code> token. Control nodes started with <code>--acme</code> order its certificates once its view holds the thumbprint (or after ten minutes, retrying such hosts in fifteen minutes), and it answers the challenges on port 80:</p>
+<pre><code class="language-sh">kithd --acme ...                         # on each control node
+kith node token --worker --ingress       # on a control node
+kithd --join ADDRESS --token TOKEN --ingress --mesh   # on the edge machine
+</code></pre>
+<p>If it is taken, it has every exposed host's key: delete its Node and each <code>tls-</code> Secret, and new keys are ordered (SECURITY.md, "A node that is taken"; design in <code>docs/adr-workers.md</code>). To move it: join the new one, point DNS at it, delete the old Node.</p>
+<p><strong>Mixed versions.</strong> Set <code>trust</code> only once every node knows it: an older kithd cannot read a Node or Secret with it, and an older control node writes whatever a worker sends (update every control node before an ingress worker joins). A worker that meets only pre-view control nodes says <code>this control node is older than workers: update it</code> and takes the whole store; one that served ingress before views keeps getting the store, with a warning, until rejoined or given <code>ingress: true</code>.</p>
+<h3 id="services-across-nodes">Services across nodes <a class="anchor" href="#services-across-nodes" aria-label="Link to this section">#</a></h3>
+<p>A <code>Service</code> has one mesh address on every node (<code>kith get service/NAME -o yaml</code> shows it and its ready replicas) and the name <code>&lt;service&gt;.&lt;namespace&gt;.kith</code>. A TCP connection to it goes to each ready replica in turn, wherever it runs: kithd relays it, over the mesh if needed, to the replica's port on <code>127.0.0.1</code> (or <code>::1</code>). TCP only; a named <code>targetPort</code> is a container port of that name. A kithd restart drops the connections through it.</p>
+<ul><li>Relaying runs on up to four threads of its own and DNS on one more, so a busy Service holds up neither the API nor lookups.</li><li>A node relays 4096 connections at a time (1024 per peer node) and closes one silent for an hour. A node at its limit refuses, and the asker tries the next replica (past 64 refusals from one node it hangs up, closing a client that had spoken).</li><li>Nodes reuse up to 16 idle connections between them for 30 seconds, but each client's connection is still asked for and checked against NetworkPolicy. If the far node gives no answer in three seconds, a client that had already spoken is closed rather than replayed to a second replica.</li><li>On kith OS (kithd as root), a container's connection to a Service with a replica on the same node skips kithd: a cgroup program rewrites the address in the kernel. Only for Services no NetworkPolicy covers and IPv6 replicas; such connections are outside the 4096, never idle-closed, and keep the client's address. If the kernel refuses the program, kithd says so once and relays everything.</li></ul>
+<p>A <code>NetworkPolicy</code> decides who may connect to the Workloads it selects through a Service: the first ingress rule that fits wins, none means refused. Peers are a <code>node</code> or a <code>cidr</code>; peers by <code>namespace</code> or <code>selector</code> cannot be told apart yet (allow lets nobody in, deny keeps everyone out) and egress is not enforced; the status says <code>partial</code> and why, or <code>enforced</code>. A connection to a node's own address bypasses it.</p>
+<h3 id="ingress-a-host-of-its-own-with-a-certificate">Ingress: a host of its own, with a certificate <a class="anchor" href="#ingress-a-host-of-its-own-with-a-certificate" aria-label="Link to this section">#</a></h3>
+<p>With <code>--ingress</code> (and <code>--mesh</code>; for nodes with a public address) a node serves HTTPS on 443 for every Service with <code>expose</code>, by host, passing the connection to the Service's first TCP port; port 80 redirects. The ports need CAP_NET_BIND_SERVICE.</p>
+<ul><li><strong>Certificates</strong> live in the Secret <code>tls-&lt;host&gt;</code> beside the Service (<code>tls.crt</code>, <code>tls.key</code>, PEM): apply your own, or start with <code>--acme</code> (<code>--acme URL</code> for another directory; the flag accepts its terms) to get and renew one from Let's Encrypt. Point the host's DNS at the ingress nodes first, and give <code>--acme</code> to every control node that may lead (the leader orders for ingress workers). <code>kith get service/NAME -o yaml</code> shows <code>tls</code>; a failure is retried an hour later. Keys, and the ACME account's (<code>Secret/kith-system/acme-account</code>), are Secrets in the store.</li><li><strong>Bytes as they are:</strong> TLS ends at the ingress and nothing is added; NetworkPolicy sees the ingress node. <code>expose.proxyProtocol: true</code> sends a PROXY v1 line (<code>PROXY TCP4 &lt;client&gt; &lt;ingress&gt; &lt;client port&gt; &lt;ingress port&gt;</code>) first; clients inside the mesh send none, so the backend must take both.</li><li><strong>Who has a host:</strong> <code>expose.host</code> must be a name a CA issues for (no IP, no <code>_</code>, no label starting or ending in <code>-</code>). Two Services with one host: the one made first has it, and the other says <code>expose: refused</code>. Edits and trimmed history do not change the order; a Service that is deleted gives its host up. (Older clusters keep this once <a href="os.html#what-an-update-keeps-the-format-of-the-store">the store is in format 2</a>.) A Namespace with <code>spec: { hosts: ['*.example.org', example.org] }</code> (YAML wants the <code>*</code> quoted) keeps those hosts for its own Services and exposes no others.</li><li><strong>Limits:</strong> 1024 connections per port, 64 per source (IPv4 address or IPv6 /64). Idle 5 minutes on 443 or 30 seconds on 80, closed.</li></ul>
+<p>A host whose <code>expose</code> has <code>paths</code> or <code>headers</code> is served as HTTP/1.1:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: web }
+spec:
+  selector: { app: web }
+  ports: [{ port: 80 }]
+  expose:
+    host: shop.example.org
+    via: edge
+    paths:
+      - { path: /, service: web, port: 80 }
+      - { path: /api, service: api, port: 8080 }
+      - { path: /healthz, exact: true, service: api, port: 9100 }
+    headers: { X-Env: prod }
+</code></pre>
+<p>The longest fitting path wins (<code>/api</code> fits <code>/api/x</code>, not <code>/apiary</code>; <code>exact</code> only itself), unmatched is 404, and an absent Service or closed port is 502; paths are not decoded or rewritten. kith sets <code>Host</code>, <code>X-Forwarded-For</code>, <code>-Proto</code>, <code>-Host</code> and the Service's <code>headers</code>, and drops what a client claims about its origin (<code>Forwarded</code>, other <code>X-Forwarded-*</code>, <code>X-Real-IP</code>, headers with <code>_</code>). Ambiguous framing gets 400; a head is at most 100 headers, ~64 KiB, 30 seconds. WebSocket is the only upgrade; no HTTP/2, and no <code>proxyProtocol</code>.</p>
+<h3 id="not-yet">Not yet <a class="anchor" href="#not-yet" aria-label="Link to this section">#</a></h3>
+<ul><li>Non-roaming nodes talk at their plain addresses, not over the mesh; workloads have no mesh addresses (Services do); two nodes behind NATs that give a port per address meet only through an edge node.</li><li>A changed Workload's replicas on different nodes are replaced all at once (one at a time on one node; a NodeWorkload always all at once). Replicas on an unreachable node count as ready until <code>--lost-after</code>; a roaming node's, indefinitely.</li><li>A change whose answer was lost with the leader may or may not have happened: <code>kith get</code>.</li><li>Joining needs an empty <code>--state</code>; a node that changes address, or a join that died halfway, needs <code>kith delete node/NAME</code> and a new token. Only the first node admits, and its tokens do not survive its restart (use <code>KITH_TOKEN</code>: <code>--token</code> shows in <code>ps</code>).</li><li>Certificates last ten years and are not renewed (a node's is dropped with its Node, an Identity's with the Identity). <code>kith</code> talks only to the kithd on its own machine.</li></ul>
+<h2 id="restarting-a-node-on-purpose">Restarting a node on purpose <a class="anchor" href="#restarting-a-node-on-purpose" aria-label="Link to this section">#</a></h2>
+<p>Drain a node before restarting or upgrading it. A drain cordons it and adds the <code>kith.dev/drain</code> taint (<code>NoExecute</code>): movable replicas start elsewhere; ones pinned by a Volume, a Device or placement stay, as does a running Job (a drain never stops one), and the plan says why, before anything changes.</p>
+<pre><code class="language-sh">kith node drain n1 --dry-run   # says what moves and what stays, and why; changes nothing
+kith node drain n1             # cordons n1 and starts the movable replicas elsewhere
+# restart n1 here
+kith node undrain n1           # takes the drain off; replicas that moved are not moved back
+</code></pre>
+<ul><li>The plan has one line per Workload, NodeWorkload and Job, saying where it goes or why it stays and what happens if the node is lost (waits, or starts over: a hint; the scheduler decides).</li><li>A drain is an apply of <code>Node/NAME</code>: audited, and allowed to whoever may apply Nodes. The plan (<code>GET /v1/drain/NAME</code>) shows readers of Nodes the lines they may read. A worker plans no drain.</li><li>Undrain removes only what the drain added. A cordon from before (take <code>unschedulable</code> off the Node) stays; one added during the drain goes with it. An OS update's cordon is recorded as the <code>kith.dev/update</code> taint: its end lifts only that cordon, and a drain on the node keeps it cordoned until undrain. A rolling upgrade from an older kithd meets a cordon with no record: a drain that joins it records itself as the owner, so once the update ends, undrain leaves the node cordoned, and <code>kith node uncordon</code> lifts it.</li></ul>
+<h3 id="checkpointing-a-long-gpu-job">Checkpointing a long GPU Job <a class="anchor" href="#checkpointing-a-long-gpu-job" aria-label="Link to this section">#</a></h3>
+<p>A Job runs to its end on one node, and a drain never stops it. Keep its state on a Volume there: the program reads its last checkpoint at start. If the node is lost, the Job waits for it and resumes from that checkpoint.</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: train-state }
+spec: { node: n1, path: train }
+---
+apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: train }
+spec:
+  template:
+    containers:
+      - name: run
+        image: example/train
+        command: [sh, -c, 'exec train --checkpoint-dir /state']
+        volumeMounts: [{ volume: train-state, path: /state }]
+</code></pre>
+<p>The GPU is a <code>DeviceClaim</code> (<a href="hardware.html#hardware">Hardware</a>); the checkpoint format is the program's. <code>sh ci/vm.sh --test pods</code> runs this around a drain: the Job waits while its node is drained, then resumes from the step it left.</p>
+<h2 id="dns">DNS <a class="anchor" href="#dns" aria-label="Link to this section">#</a></h2>
+<pre><code class="language-sh">kithd --dns 192.168.1.10:53          # UDP and TCP; port 53 needs root or CAP_NET_BIND_SERVICE
+kith apply -f examples/dns.yaml      # a DNSZone and two DNSRecords
+dig @192.168.1.10 nas.home.example   # 192.168.1.20
+kith get dnsrecord                   # each one says `served`, or why not
+</code></pre>
+<p>Every node started with <code>--dns</code> answers the same names.</p>
+<ul><li>The cluster's own names, which no zone can take: <code>&lt;node&gt;.node.kith</code> (a node's address), <code>&lt;node&gt;.mesh.kith</code> (its mesh address) and <code>&lt;service&gt;.&lt;namespace&gt;.kith</code> (a Service's mesh address, where the asked node is on the mesh).</li><li>A <code>DNSZone</code> is a domain kithd answers; a <code>DNSRecord</code> is a name in it: A, AAAA, CNAME, TXT, SRV, NS or PTR, <code>*.apps</code> for a wildcard, <code>@</code> for the apex. Values are full names.</li><li><strong>Split horizon:</strong> a zone with <code>clients: [192.168.0.0/16]</code> replaces the everyone-zone of that domain for those clients. A client in two lists gets the longest prefix (ties: the list that sorts first), so give related zones the same list.</li><li><strong>Other names</strong> go to <code>/etc/resolv.conf</code>'s resolvers (re-read every few seconds) or <code>--dns-upstream 1.1.1.1,9.9.9.9</code>, for private-network clients only, so kithd is never an open resolver. Point your router's DHCP at a node and the house uses it. A CNAME out of a zone comes with the target's addresses. Answers are cached by TTL, an hour at most, 4096 answers or 1 MiB, in memory; questions with client options (subnet, cookie) are not cached.</li><li><strong>Exposed hosts</strong> (<code>expose.host</code>, see <a href="#ingress-a-host-of-its-own-with-a-certificate">Ingress</a>) under a zone are answered with one A record per ingress node's LAN address (IPv4 only), at the zone's TTL and clients; the longer zone wins. An A or CNAME DNSRecord of that name overrides them; they beat a <code>*.apps</code> wildcard. Refused hosts, ones the Namespace does not keep, and roaming or unreachable nodes are left out.</li><li><strong>Who serves:</strong> a node's <code>status.serves</code> says its <code>dns</code> port and <code>ingress: true</code>, from its own flags (cleared by a restart without them). Its LAN address is the one it was admitted from (<code>status.address</code>); NAT, a moved node or <code>127.0.0.1</code> do not count. A roaming node has its mesh address. <code>kith get node</code> shows both.</li></ul>
+<p><strong>Block lists</strong> answer names as not there, for <code>clients</code> (none: everyone):</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: DNSBlockList
+metadata: { name: ads }
+spec:
+  url: https://lists.example/hosts.txt
+  clients: [192.168.0.0/16]
+</code></pre>
+<ul><li>Names come from a ConfigMap key in <code>kith-system</code> (<code>configMap: {name, key}</code>) or an <code>https://</code> <code>url</code> each node fetches every <code>interval</code> (24h default, 5m minimum): a hosts file or plain filter rules (<code>||ads.example^</code>); other lines are counted and skipped. A name blocks everything under it; <code>answer: unspecified</code> gives <code>0.0.0.0</code>/<code>::</code> instead of NXDOMAIN. The cluster's own names are answered first.</li><li><code>kith get dnsblocklist</code> says <code>loaded</code> or why not; <code>-o yaml</code> gives names, skipped lines and last read. A failed fetch or a <code>sha256</code> mismatch keeps the last good list.</li><li>Fetches are https only, never to the node's own networks, no redirects, 32 MiB at most; the list's host sees each node ask. At most 1,000,000 names per node (8 bytes each), memory only. A CNAME alias of a listed name is not blocked unless listed too.</li></ul>
+<h3 id="forwarding-one-zone">Forwarding one zone <a class="anchor" href="#forwarding-one-zone" aria-label="Link to this section">#</a></h3>
+<p>To keep the house resolver and send one domain (<code>apps.example.test</code>) to kithd on <code>192.0.2.10</code>: run <code>kithd --dns 192.0.2.10:53 --dns-upstream 1.1.1.1,9.9.9.9</code> (upstreams other than the house resolver, so nothing loops), then point the resolver at it. These come from each resolver's documentation, not a device: check your version.</p>
+<div class="table"><table><thead><tr><th>Resolver</th><th>Setting</th></tr></thead><tbody><tr><td>AdGuard Home</td><td>Settings, DNS settings, Upstream DNS servers: add <code>[/apps.example.test/]192.0.2.10:53</code> above the others</td></tr><tr><td>dnsmasq</td><td><code>server=/apps.example.test/192.0.2.10#53</code>, and <code>rebind-domain-ok=/apps.example.test/</code> if rebind protection is on (kithd answers private addresses)</td></tr><tr><td>Technitium</td><td>Zones, Add Zone, "Conditional Forwarder Zone": <code>apps.example.test</code>, forwarder <code>192.0.2.10</code></td></tr><tr><td>UniFi</td><td>the gateway's Forward Domain setting (where it sits varies by version)</td></tr></tbody></table></div>
+<p>kithd then sees the resolver, not each device, as the client: include it in the zone's <code>clients</code> (<code>[192.0.2.1/32]</code>). <code>dig @&lt;house resolver&gt; www.apps.example.test</code> should give kithd's answer, and other names the same answer as before.</p>
+<p>Not yet: DNSSEC and zone transfers.</p>
+</article>
+<footer class="tail"><nav aria-label="Next page"><a class="before" href="os.html"><span>Before</span>kith OS</a><a class="after" href="workloads.html"><span>After</span>What kithd does today</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/cluster.md">docs/guide/cluster.md</a>.</p></footer>
+</div>
+</div>
+</body>
+</html>

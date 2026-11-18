@@ -36,6 +36,9 @@ pub struct Disk {
     pub name: String,
     pub bytes: u64,
     pub model: String,
+    /// What the disk itself says it is (empty when it says nothing): the same at every
+    /// start, where `name` is the order the kernel found the disks in.
+    pub serial: String,
     /// A stick or a card reader (`removable` in sysfs): never the disk `only` means.
     pub removable: bool,
 }
@@ -43,13 +46,14 @@ pub struct Disk {
 impl std::fmt::Display for Disk {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let size = self.bytes as f64 / 1e9;
-        write!(
-            f,
-            "{} ({size:.1} GB{}{})",
-            self.name,
-            if self.model.is_empty() { "" } else { ", " },
-            self.model
-        )
+        write!(f, "{} ({size:.1} GB", self.name)?;
+        if !self.model.is_empty() {
+            write!(f, ", {}", self.model)?;
+        }
+        if !self.serial.is_empty() {
+            write!(f, ", serial {}", self.serial)?;
+        }
+        write!(f, ")")
     }
 }
 
@@ -74,7 +78,8 @@ pub fn disks(sys: &Path, booted: Option<&str>) -> Vec<Disk> {
             let usable = bytes > 0 && said(&entry.path(), "ro") != "1";
             (usable && Some(&*name) != booted && !other.iter().any(|kind| name.starts_with(kind))).then(|| Disk {
                 model: said(&entry.path(), "device/model"),
-                removable: said(&entry.path(), "removable") == "1",
+                serial: serial(&entry.path()),
+                removable: said(&entry.path(), "removable") != "0",
                 name,
                 bytes,
             })
@@ -84,6 +89,53 @@ pub fn disks(sys: &Path, booted: Option<&str>) -> Vec<Disk> {
     found
 }
 
+/// The serial a disk under `/sys/block` says: an NVMe namespace's controller's, a VirtIO
+/// block disk's own, or a SCSI or SATA disk's page 0x80 (four bytes of header, then the
+/// serial). Only printable ASCII is kept: it is shown, and matched against what was typed.
+fn serial(disk: &Path) -> String {
+    let page = || {
+        let page = std::fs::read(disk.join("device/vpd_pg80")).ok()?;
+        let length = usize::from(*page.get(3)?);
+        Some(String::from_utf8_lossy(page.get(4..4 + length).unwrap_or(&page[4..])).into_owned())
+    };
+    let said = ["device/serial", "serial"]
+        .iter()
+        .find_map(|file| std::fs::read_to_string(disk.join(file)).ok())
+        .or_else(page)
+        .unwrap_or_default();
+    // (Kept bytes first, then trimmed: a page padded "ABC \0" is the serial "ABC".)
+    let kept: String = said.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect();
+    kept.trim().to_string()
+}
+
+/// The one disk that gives `serial` (after `serial:`), or why none is.
+fn by_serial<'a>(serial: &str, disks: &'a [Disk]) -> Result<&'a Disk, String> {
+    let serial = serial.trim();
+    if serial.is_empty() {
+        return Err("`disk: serial:` names no serial".into());
+    }
+    let listed = || disks.iter().map(Disk::to_string).collect::<Vec<_>>().join(", ");
+    let found: Vec<&Disk> = disks.iter().filter(|disk| disk.serial == serial).collect();
+    match found.as_slice() {
+        [one] => Ok(one),
+        [] if disks.is_empty() => Err("this machine has no disk to install on".into()),
+        [] => Err(format!(
+            "no disk with serial {serial} to install on; there is: {}",
+            listed()
+        )),
+        // (Cheap USB bridges, and an NVMe drive's namespaces, give several disks one serial:
+        // then it names none of them.)
+        several => {
+            let names: Vec<&str> = several.iter().map(|disk| disk.name.as_str()).collect();
+            Err(format!(
+                "{} disks give serial {serial}: {}. Name the disk",
+                several.len(),
+                names.join(", ")
+            ))
+        }
+    }
+}
+
 /// Whether `disk` is still the size it was planned at, as `sys` (`/sys/block`) says now. A
 /// disk swapped, or a card pulled, since the plan is not the one that was chosen.
 pub fn size_unchanged(sys: &Path, disk: &Disk) -> Result<(), String> {
@@ -91,6 +143,17 @@ pub fn size_unchanged(sys: &Path, disk: &Disk) -> Result<(), String> {
         .ok()
         .and_then(|sectors| sectors.trim().parse::<u64>().ok())
         .and_then(|sectors| sectors.checked_mul(512));
+    // (A disk named by serial is asked for it again: another disk of its size could have
+    // taken its name since.)
+    if !disk.serial.is_empty() {
+        let serial_now = serial(&sys.join(&disk.name));
+        if serial_now != disk.serial {
+            return Err(format!(
+                "{disk} gives serial {serial_now:?} now, not {}: nothing was written",
+                disk.serial
+            ));
+        }
+    }
     match now {
         Some(bytes) if bytes == disk.bytes => Ok(()),
         Some(bytes) => Err(format!(
@@ -105,7 +168,8 @@ pub fn size_unchanged(sys: &Path, disk: &Disk) -> Result<(), String> {
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Answers {
-    /// The disk's name (`sda`, `nvme0n1`), or `only`: the one disk the machine has that is not removable.
+    /// The disk's name (`sda`, `nvme0n1`); `serial:X`, the disk that says it is X, whatever
+    /// the kernel named it; or `only`: the one disk the machine has that is not removable.
     pub disk: String,
     #[serde(default)]
     pub hostname: Option<String>,
@@ -175,6 +239,7 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
                 _ => return Err(format!("`disk: only` and this machine has several: {}", listed())),
             }
         }
+        serial if serial.starts_with("serial:") => by_serial(&serial["serial:".len()..], disks)?,
         name => disks.iter().find(|disk| disk.name == name).ok_or_else(|| match disks {
             [] => format!("no disk {name}: this machine has no disk to install on"),
             _ => format!("no disk {name} to install on; there is: {}", listed()),
@@ -278,11 +343,16 @@ pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<
     let listed: Vec<String> = disks.iter().map(|disk| format!("  {disk}\n")).collect();
     let some = |answer: String| Some(answer).filter(|answer| !answer.is_empty());
     let disk = ask(&format!(
-        "This machine's disks:\n{}Install kith OS on which (its name)?",
+        "This machine's disks:\n{}Install kith OS on which (its name, or serial:X)?",
         listed.concat()
     ));
-    let chosen = disks.iter().find(|found| found.name == disk);
-    let chosen = chosen.ok_or(format!("there is no disk `{disk}` here"))?;
+    let chosen = match disk.strip_prefix("serial:") {
+        Some(serial) => by_serial(serial, disks)?,
+        None => disks
+            .iter()
+            .find(|found| found.name == disk)
+            .ok_or(format!("there is no disk `{disk}` here"))?,
+    };
     let hostname = some(ask(
         "The node's name (empty: one made from its network card's address)?",
     ));
@@ -298,7 +368,7 @@ pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<
     let again = ask(&format!(
         "Everything on {chosen} will be erased. Type its name again to go on:"
     ));
-    if again != disk {
+    if again != disk && again != chosen.name {
         return Err(format!("`{again}` is not `{disk}`: nothing was written"));
     }
     Ok(Answers {
@@ -515,6 +585,20 @@ fn exclusive(device: &Path) -> Result<File, String> {
         .map_err(|e| format!("{}: {e}", device.display()))
 }
 
+/// The opened disk's own size (its end, as BLKGETSIZE64 gives) against the planned one: sysfs
+/// names a disk, /dev/NAME is what was opened, and they can differ. Left at its start.
+fn opened_size(disk: &mut File, planned: u64) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("the opened disk's size could not be read: {e}; nothing was written");
+    let got = disk.seek(SeekFrom::End(0)).map_err(io)?;
+    disk.seek(SeekFrom::Start(0)).map_err(io)?;
+    if got == planned {
+        return Ok(());
+    }
+    Err(format!(
+        "the disk opened is {got} bytes, not the {planned} planned; nothing was written"
+    ))
+}
+
 /// Clears both partition tables of an open disk, so nothing on it is found to boot from.
 fn clear_table(disk: &mut File) -> Result<(), String> {
     // (The size of a block device is its end, which a file's length is not.)
@@ -626,6 +710,7 @@ pub async fn run(source: String) -> ! {
         // (Its size read again just before the open: a disk swapped since the plan is not the one chosen.)
         size_unchanged(Path::new("/sys/block"), &planned)?;
         let mut disk = exclusive(&device)?;
+        opened_size(&mut disk, planned.bytes)?;
         if let Err(e) = write(&mut image, &mut disk, &config, |tenths| {
             eprintln!("kithd: install: {}%", tenths * 10)
         }) {
@@ -800,6 +885,7 @@ mod tests {
             name: name.into(),
             bytes: gigabytes * 1_000_000_000,
             model: "Test".into(),
+            serial: String::new(),
             removable: false,
         }
     }
@@ -838,6 +924,61 @@ mod tests {
     }
 
     #[test]
+    fn serial_names_a_disk_whatever_the_kernel_calls_it() {
+        let sys = std::env::temp_dir().join(format!("kith-install-serial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sys);
+        for name in ["nvme0n1", "vda", "sda", "sdb"] {
+            std::fs::create_dir_all(sys.join(name).join("device")).unwrap();
+            std::fs::write(sys.join(name).join("size"), "2048").unwrap();
+        }
+        // Where each says it: NVMe its controller, VirtIO's block disk itself, a SCSI or
+        // SATA disk its page 0x80 (four bytes of header, then the serial, padded).
+        std::fs::write(sys.join("nvme0n1/device/serial"), "S4EW0001      \n").unwrap();
+        std::fs::write(sys.join("vda/serial"), "vd-two").unwrap();
+        std::fs::write(sys.join("sda/device/vpd_pg80"), b"\0\x80\0\x0cSCSI-ONE  \0\0").unwrap();
+        let found = disks(&sys, None);
+        std::fs::remove_dir_all(&sys).unwrap();
+        let serials: Vec<_> = found.iter().map(|d| (d.name.as_str(), d.serial.as_str())).collect();
+        assert_eq!(
+            serials,
+            [
+                ("nvme0n1", "S4EW0001"),
+                ("sda", "SCSI-ONE"),
+                ("sdb", ""),
+                ("vda", "vd-two")
+            ]
+        );
+        assert_eq!(found[1].to_string(), "sda (0.0 GB, serial SCSI-ONE)");
+        assert_eq!(found[2].to_string(), "sdb (0.0 GB)");
+
+        let pick = |wanted: &str, found: &[Disk]| {
+            plan(
+                &answers(&format!("disk: \"serial:{wanted}\"\n")).unwrap(),
+                found,
+                0,
+                1 << 20,
+            )
+            .map(|(d, _)| d.name)
+        };
+        assert_eq!(pick("vd-two", &found).unwrap(), "vda");
+        assert_eq!(pick("SCSI-ONE", &found).unwrap(), "sda");
+        let none = pick("nope", &found).unwrap_err();
+        assert!(
+            none.contains("no disk with serial nope") && none.contains("vda (0.0 GB, serial vd-two)"),
+            "{none}"
+        );
+        // A serial two disks give (cheap USB bridges do) names neither.
+        let mut twice = found.clone();
+        twice[2].serial = "SCSI-ONE".into();
+        let both = pick("SCSI-ONE", &twice).unwrap_err();
+        assert!(
+            both.contains("2 disks give serial SCSI-ONE: sda") && both.contains("sdb"),
+            "{both}"
+        );
+        assert!(pick("", &found).unwrap_err().contains("serial:"));
+    }
+
+    #[test]
     fn only_never_picks_a_removable_disk() {
         let sys = std::env::temp_dir().join(format!("kith-install-removable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sys);
@@ -870,6 +1011,23 @@ mod tests {
     }
 
     #[test]
+    fn a_disk_opened_at_another_size_is_not_written() {
+        let path = std::env::temp_dir().join(format!("kith-install-opened-{}", std::process::id()));
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        file.seek(SeekFrom::Start(100)).unwrap();
+        assert!(opened_size(&mut file, 4096).is_ok());
+        // Left at its start, for the write.
+        assert_eq!(file.stream_position().unwrap(), 0);
+        let why = opened_size(&mut file, 8192).unwrap_err();
+        assert!(
+            why.contains("4096") && why.contains("8192") && why.contains("nothing was written"),
+            "{why}"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn a_disk_that_changed_size_is_not_written() {
         let sys = std::env::temp_dir().join(format!("kith-install-resized-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sys);
@@ -886,6 +1044,14 @@ mod tests {
             "{why}"
         );
         assert!(why.contains("nothing was written"), "{why}");
+        // A disk named by serial: another of the same size under its name is refused too.
+        std::fs::write(sys.join("sdb/size"), "4000000000").unwrap();
+        std::fs::write(sys.join("sdb/serial"), "ONE").unwrap();
+        let planned = disks(&sys, None).remove(0);
+        assert!(size_unchanged(&sys, &planned).is_ok());
+        std::fs::write(sys.join("sdb/serial"), "TWO").unwrap();
+        let why = size_unchanged(&sys, &planned).unwrap_err();
+        assert!(why.contains("\"TWO\"") && why.contains("nothing was written"), "{why}");
         // A disk whose size can no longer be read is refused as well.
         std::fs::remove_dir_all(sys.join("sdb")).unwrap();
         assert!(size_unchanged(&sys, &planned).is_err());
@@ -947,6 +1113,17 @@ mod tests {
             joined,
             "-- --listen 0.0.0.0:7443 --join 10.0.0.7:7443 --token kith1.ab.cd.ef.node-1" // pragma: allowlist secret
         );
+
+        // A disk whose sysfs has no removable file is not known to be fixed: never the one `only` means.
+        let sys = std::env::temp_dir().join(format!("kith-install-noremovable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sys);
+        std::fs::create_dir_all(sys.join("sda")).unwrap();
+        std::fs::write(sys.join("sda/size"), "4000000000").unwrap();
+        std::fs::write(sys.join("sda/ro"), "0").unwrap();
+        let unknown = disks(&sys, None);
+        assert!(unknown[0].removable);
+        assert!(config("disk: only\n", &unknown).unwrap_err().contains("removable"));
+        std::fs::remove_dir_all(&sys).unwrap();
 
         // `only` is for a machine with one disk; a name must be one that is there.
         assert_eq!(config("disk: only\n", &two[..1]).unwrap().0.name, "sda");
@@ -1089,6 +1266,19 @@ mod tests {
         assert!(ask(&["sda", "", "", "", "", ""]).0.is_err());
         assert!(ask(&["sdz"]).0.unwrap_err().contains("no disk `sdz`"));
         assert!(interview(&[], |_| String::new()).is_err());
+        // At the console a disk may be named by its serial, as in the answers file; the
+        // second time, by its serial again or its name.
+        let mut two = two;
+        two[1].serial = "S4EW0001".into();
+        for again in ["serial:S4EW0001", "sdb"] {
+            let mut lines = ["serial:S4EW0001", "", "", "", "", again].into_iter();
+            let told = interview(&two, |_| lines.next().unwrap().to_string()).unwrap();
+            assert_eq!(told.disk, "serial:S4EW0001");
+        }
+        let mut lines = ["serial:S4EW0001", "", "", "", "", "sda"].into_iter();
+        assert!(interview(&two, |_| lines.next().unwrap().to_string()).is_err());
+        let refused = interview(&two, |_| "serial:NONE".into()).unwrap_err();
+        assert!(refused.contains("no disk with serial NONE"), "{refused}");
     }
 
     /// A disk image of 64 sectors with a GPT whose third partition is `config`, 4 sectors at sector 40.
@@ -1304,6 +1494,77 @@ mod tests {
         assert!(
             why.contains("the seal failed") && why.contains("failed too") && why.contains("may boot unencrypted"),
             "{why}"
+        );
+    }
+
+    /// docs/install.html makes this file in the browser; its two examples (the form as it
+    /// starts, and the form filled in) are in the page as `<pre data-answers="...">`, and
+    /// ci/site_shots.py checks that the page's script writes them. Here the installer
+    /// reads them: its parser takes every field, and its plan accepts every value.
+    #[test]
+    fn the_install_page_examples_are_answers_the_installer_takes() {
+        const PAGE: &str = include_str!("../../../docs/install.html");
+        let example = |name: &str| {
+            let from = PAGE
+                .find(&format!("<pre data-answers=\"{name}\""))
+                .unwrap_or_else(|| panic!("no {name} example"));
+            let body = &PAGE[from..];
+            let body = &body[body.find('>').unwrap() + 1..body.find("</pre>").unwrap()];
+            let mut text = String::new();
+            let mut in_tag = false;
+            for c in body.chars() {
+                match c {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    c if !in_tag => text.push(c),
+                    _ => {}
+                }
+            }
+            text.replace("&quot;", "\"")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&")
+        };
+        let mut seen = Vec::new();
+        for name in ["default", "example", "custom"] {
+            let yaml = example(name);
+            let told = answers(&yaml).unwrap_or_else(|e| panic!("{name}:\n{yaml}\n{e}"));
+            let mut one = disk("nvme0n1", 256);
+            one.serial = "S4EWNX0R123456".into();
+            let (_, config) =
+                plan(&told, &[one], 300 << 20, 1 << 20).unwrap_or_else(|e| panic!("{name}:\n{yaml}\n{e}"));
+            seen.push((told, config));
+        }
+        // The default is the one disk and nothing else; the example fills in every field.
+        assert_eq!(
+            seen[0].0,
+            Answers {
+                disk: "only".into(),
+                ..Answers::default()
+            }
+        );
+        let full = &seen[1].0;
+        assert!(full.disk.starts_with("serial:") && full.hostname.is_some() && full.ip.is_some() && full.dns.is_some());
+        assert!(full.join.is_some() && full.encrypt && full.release_key.is_some() && full.lan_releases);
+        assert!(full.node_policy.is_some());
+        assert!(
+            seen[1].1.contains("--join ")
+                && seen[1].1.contains("--release-key ")
+                && seen[1].1.contains("--lan-releases")
+        );
+        // The third is what the form writes for a fixed address with its way out, a join and a policy of its
+        // own words (ci/site_shots.py fills the form from the block's data-fields and compares): the installer
+        // takes the address, the join and the policy as the words the form joined.
+        let custom = &seen[2].0;
+        assert_eq!(custom.disk, "nvme0n1");
+        assert_eq!(custom.ip.as_deref(), Some("10.0.0.6/24,10.0.0.1"));
+        assert_eq!(custom.join.as_ref().map(|j| j.address.as_str()), Some("10.0.0.7:7443"));
+        assert_eq!(custom.node_policy.as_deref(), Some("hardened,vms,devices=gpu+input"));
+        assert!(!custom.encrypt && !custom.lan_releases && custom.release_key.is_none() && custom.dns.is_none());
+        assert!(
+            seen[2].1.contains("--advertise 10.0.0.6:")
+                && seen[2].1.contains("--join 10.0.0.7:7443 --token ")
+                && seen[2].1.contains("--node-policy hardened,vms,devices=gpu+input")
         );
     }
 }

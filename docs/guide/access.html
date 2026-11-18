@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en" data-root="../">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Access: who may do what, and what a node refuses: kith</title>
+<meta name="description" content="On a node, whoever can open kithd&#x27;s socket is the admin: kith there may do everything. From anywhere else, a person or a program calls a node&#x27;s TLS port (--listen) as an Identity, with a certificate...">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../site.css">
+<link rel="stylesheet" href="../docs.css">
+<script src="../docs.js" defer></script>
+</head>
+<body>
+<!-- Made by ci/site_docs.py from docs/guide/access.md: change the markdown, then run it again. -->
+<header class="bar">
+  <a class="brand" href="../index.html" aria-label="kith: the front page">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true"><line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/><circle cx="22" cy="14" r="4"/><circle cx="22" cy="50" r="4"/><circle cx="43" cy="19" r="4.5"/><circle cx="43" cy="50" r="4.5"/><circle class="ring" cx="24" cy="37" r="5.5"/><circle class="hub" cx="24" cy="37" r="5.5"/></svg>
+    <b>kith</b>
+  </a>
+  <nav aria-label="Sections">
+    <a href="../guide/index.html">Guide</a>
+    <a href="../guide/index.html#decisions">Decisions</a>
+    <a href="../index.html#numbers">Numbers</a>
+  </nav>
+  <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+</header>
+<div class="doc">
+<aside class="side">
+  <form class="find" role="search" hidden>
+    <label for="q">Search the headings</label>
+    <input id="q" type="search" placeholder="Search the headings" autocomplete="off" spellcheck="false">
+  </form>
+  <ol class="found" aria-live="polite" hidden></ol>
+  <details class="rail" open>
+    <summary>The guide</summary>
+    <nav aria-label="The guide's pages"><ol class="stops"><li><a href="index.html">All the pages</a></li><li><a href="os.html">kith OS</a></li><li><a href="cluster.html">A cluster</a></li><li><a href="workloads.html">What kithd does today</a></li><li><a href="storage.html">Storage</a></li><li><a href="hardware.html">Hardware</a></li><li><a href="packages.html">Packages and Sources</a></li><li class=here><a href="access.html" aria-current="page">Access</a><ol class="inner"><li class="h2"><a href="#who-may-do-what">Who may do what</a></li><li class="h3"><a href="#a-workload-that-calls-the-api">A Workload that calls the API</a></li><li class="h2"><a href="#use-kith-from-a-laptop">Use kith from a laptop</a></li><li class="h2"><a href="#what-a-node-refuses-whatever-the-cluster-says">What a node refuses, whatever the cluster says</a></li></ol></li><li><a href="api.html">Resources and the language</a></li><li><a href="kubernetes.html">Coming from Kubernetes, Helm, Proxmox or compose</a></li><li><a href="ui.html">Web UI</a></li><li><a href="development.html">Working on kith</a></li><li><a href="numbers.html">How the numbers beside k3s were taken</a></li></ol><p class="rail-group">Decisions and reviews</p><ol class="stops"><li><a href="../adr-keyless.html">image signatures made without a kept key (T-0463)</a></li><li><a href="../adr-people.html">People's devices into the home network: peers, levels and where a level holds</a></li><li><a href="../adr-privilege.html">kithd in two parts: what reads the network holds no root</a></li><li><a href="../adr-taken-node.html">A taken control node is not the cluster taken</a></li><li><a href="../adr-unlock.html">The ways into a node's encrypted state, and what each leaves open</a></li><li><a href="../adr-workers.html">A worker keeps no Secret that nothing placed on it names</a></li><li><a href="../security-review-2.html">Security review 2</a></li></ol></nav>
+  </details>
+</aside>
+<div class="page" role="main">
+<article>
+<h1 id="access-who-may-do-what-and-what-a-node-refuses">Access: who may do what, and what a node refuses</h1>
+<h2 id="who-may-do-what">Who may do what <a class="anchor" href="#who-may-do-what" aria-label="Link to this section">#</a></h2>
+<p>On a node, whoever can open kithd's socket is the admin: <code>kith</code> there may do everything. From anywhere else, a person or a program calls a node's TLS port (<code>--listen</code>) as an <strong>Identity</strong>, with a certificate from the cluster's CA, and may do what the <strong>Roles</strong> bound to it allow: nothing, to begin with. Trust, and how to report a hole: <a href="https://github.com/ChaseSunstrom/kith/blob/main/SECURITY.md">SECURITY.md</a>.</p>
+<pre><code class="language-sh">kith identity cert alice --out ~/alice    # on the node the cluster was started on
+</code></pre>
+<p>writes <code>alice.crt</code>, <code>alice.key</code> and <code>ca.crt</code>, and makes <code>Identity/alice</code> if it is not there. Then say what she may do:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Role
+metadata: { name: web-editor }
+spec:
+  rules:
+    - kinds: [Workload, Service, ConfigMap]   # or ['*']
+      verbs: [get, list, watch, apply, delete]
+      namespaces: [web]                        # left out: everywhere
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: { name: alice-web }
+spec:
+  role: web-editor
+  subjects: [alice]        # Identities by name, or `group:ops` for spec.groups
+</code></pre>
+<pre><code class="language-sh">curl --cacert ca.crt --cert alice.crt --key alice.key \
+     --resolve kith:7443:10.0.0.7 https://kith:7443/v1/resources?kind=Workload
+</code></pre>
+<p>Every node's certificate is good for the name <code>kith</code>. A node nobody can log in to (kith OS has no shell) has no socket for that: start its kithd with <code>--claim</code>, and while the cluster has no Identity it prints a token at each start (<code>kith1.&lt;secret&gt;.&lt;the CA's fingerprint&gt;</code>). Whoever sends it first to <code>/v1/claim</code> becomes an Identity bound to <code>cluster-admin</code>:</p>
+<pre><code class="language-sh">curl -k -d "{\"token\":\"$TOKEN\",\"name\":\"root\"}" -H 'Content-Type: application/json' \
+     https://10.0.0.7:7443/v1/claim       # {"ca": …, "cert": …, "key": …}: save as ca.crt, root.crt, root.key
+</code></pre>
+<p>The token is good once, for an hour, for nothing else (it admits no node), and not once the cluster has an Identity. Whoever reads the node's console or logs within the hour can claim the cluster. <code>-k</code> means curl does not know the node yet: to rule out a man in the middle, compare <code>openssl x509 -noout -fingerprint -sha256</code> of <code>https://10.0.0.7:7443/v1/ca</code> with the token's last part, and claim with <code>--cacert</code>. A join token on such a cluster is asked for over TLS (<code>POST /v1/tokens</code> with the cert and key above), only by an Identity that may apply Nodes, Roles and RoleBindings (it could give itself every right anyway).</p>
+<ul><li>Refused: 403 and why. <code>list</code> and <code>watch</code> show only what the caller may see; an apply is all or nothing.</li><li><code>get</code> covers a resource, its history and its output (<code>/v1/logs</code>); <code>apply</code> covers rollback, and push to or pull from a registry through kithd (which calls whatever registry is named).</li><li>Kinds in no namespace (Node, Role, KindDefinition…) need a rule without <code>namespaces</code>.</li><li>The certificate stands while the Identity's <code>publicKey</code> is its key: <code>kith identity cert</code> again ends the old one, <code>kith delete identity/alice</code> all access.</li><li>Grant with care: <code>apply</code> on Role, RoleBinding or Identity grants oneself anything, and whoever may apply a Workload runs programs on your nodes. A Release or a Source acts with the rights of whoever applied it, and makes nothing they may not apply themselves (see Packages and Sources); deleting one removes what it installed, whoever may delete it.</li></ul>
+<p>Every change made through a node, and every refusal (a missing certificate, or one that no longer stands for its Identity, too), is one line in its audit log (<code>audit.log</code> in its state directory, 4 MB, and four older files <code>.1</code> to <code>.4</code>): when, who, what, how it went. <code>kith audit</code> shows the last lines, as does <code>GET /v1/audit</code> for an Identity with <code>get</code> on <code>Audit</code> (no custom kind may take that name). A watch ends when its Identity is deleted or given another certificate. Permission is asked again on the leader as an apply, delete or rollback is put in the log, so a RoleBinding deleted meanwhile stops it; a write already in the log stays.</p>
+<h3 id="a-workload-that-calls-the-api">A Workload that calls the API <a class="anchor" href="#a-workload-that-calls-the-api" aria-label="Link to this section">#</a></h3>
+<p>A Workload that calls the cluster (a controller, a gateway) runs as an Identity: the Identity names the Workloads that may (a namespace, and <code>names</code> in it), the Workload says which it is:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Identity
+metadata: { name: gateway }
+spec:
+  workloads: [{ namespace: web, names: [proxy] }]
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: proxy, namespace: web }
+spec:
+  identity: gateway
+  template:
+    containers: [{ name: proxy, image: registry.example/proxy:1 }]
+</code></pre>
+<p>Each container of its pods finds <code>ca.crt</code>, <code>tls.crt</code>, <code>tls.key</code> and <code>address</code> (a control node's <code>HOST:PORT</code>) in <code>/run/kith/identity</code>, in memory and readable by the container's user alone, and calls <code>https://ADDRESS</code> as <code>gateway</code>: what that Identity's Roles allow, nothing else. The pod's node makes the key; the certificate lasts two hours and is renewed after one, same key, no restart. It stands only while the store says so (the Identity names the Workload, the Workload says <code>identity: gateway</code> and is placed on that node, the node is there); otherwise it leaves the files within a minute and is asked for again every ten minutes. Refused at apply: an Identity that does not name the Workload, one with both <code>publicKey</code> and <code>workloads</code>, a template with exec units or VMs (only containers get the files). A node with no directory in memory starts no such pod. Not yet: an identity provider (OIDC), certificates for people that expire before ten years, one audit log for the cluster.</p>
+<h2 id="use-kith-from-a-laptop">Use kith from a laptop <a class="anchor" href="#use-kith-from-a-laptop" aria-label="Link to this section">#</a></h2>
+<p><code>kith</code> on another machine calls a node's TLS port the same way, with the identity's files (<code>ca.crt</code>, and <code>alice.crt</code> with <code>alice.key</code> beside it, from <code>kith identity cert</code> above). Build it with the <code>remote</code> feature; the default <code>kith</code> does not link TLS at all:</p>
+<pre><code class="language-sh">cargo build --release -p kith-cli --features remote
+kith --server HOST:PORT --identity ~/alice get
+kith --server HOST:PORT --identity ~/alice apply -f web.yaml
+kith --server HOST:PORT --identity ~/alice logs Workload/web -f
+</code></pre>
+<p><code>KITH_SERVER</code> and <code>KITH_IDENTITY</code> say the same. <code>get</code>, <code>apply</code>, <code>watch</code>, <code>logs -f</code>, and the tunnels of <code>run</code> and <code>ui</code> all work over <code>--server</code>; <code>--store</code> and <code>--socket</code> still win over it when they are given. HOST:PORT is the node's <code>--listen</code> address, and its certificate must be signed by the cluster's CA and name <code>kith</code>: a node of another cluster, or one whose name is something else, is refused before anything is sent. The identity directory must hold one <code>NAME.key</code> and its <code>NAME.crt</code>; a key that anyone but its owner can read is refused, and <code>kith</code> says the <code>chmod 600</code> to run. The Roles of the identity decide what it may do, as above.</p>
+<h2 id="what-a-node-refuses-whatever-the-cluster-says">What a node refuses, whatever the cluster says <a class="anchor" href="#what-a-node-refuses-whatever-the-cluster-says" aria-label="Link to this section">#</a></h2>
+<p>Some of what the store tells a node to run is the node's own root (an <code>exec</code> unit, a root container, a VM from a node path), so an admin's credential reaches every node. Its owner can turn each off, there and nowhere else:</p>
+<pre><code class="language-sh">kithd --node-policy hardened              # none of it, and a GPU the only Device handed out
+kithd --node-policy hardened,node-network # the same, but containers that are no pod
+kithd --node-policy no-exec-units,no-run  # everything but exec units and `kith run`
+</code></pre>
+<p>The words: <code>exec-units</code>; <code>root-containers</code> (off: no container is root without an id range of its own, as a pod's on kith OS); <code>unconfined</code> (a <code>seccomp</code> that is unconfined or allows refused calls back); <code>node-network</code> (containers that are no pod); <code>vms</code>; <code>vm-paths</code> (a VM's kernel, firmware or disks as node paths, or a hypervisor other than qemu; <code>vms</code> alone runs none of use); <code>passthrough</code>; <code>host-paths</code> (a Volume in <code>kith-system</code> at any path on the node); <code>run</code> (<code>kith run</code>); <code>wipe</code> (the cluster erasing this node's key or setting duress codes); <code>devices=gpu+input</code> (the Device classes a DeviceClaim hands out: <code>all</code>, or none after the <code>=</code>; with classes named, only Devices the node listed itself). <code>no-</code> before a word turns it off; they are read left to right. On kith OS they go at the end of what the config partition says (<code> -- --node-policy hardened</code>); elsewhere <code>KITH_NODE_POLICY</code> does too.</p>
+<p>What a node refuses is not run there, and the Workload says why. The scheduler reads each Node's <code>status.policy</code> (<code>kith get node/NAME -o yaml</code>): a Workload or Job asking for what a node refuses goes to nodes that allow it, and waits, saying so, when none does. A node with no policy does everything. A word kithd does not know ends its start (kith OS runs <code>hardened</code> instead).</p>
+<p>Where <code>exec-units</code>, <code>vm-paths</code> and <code>run</code> are all off, kithd also cuts its bounding set at start to the fourteen a root pod keeps (<code>KEPT</code> in <code>crates/kithd/src/policy.rs</code>): nothing it starts by an exec can hold <code>SYS_MODULE</code>, <code>SYS_ADMIN</code>, <code>SYS_PTRACE</code> or any other capability outside them. A container's own set is its spec's. Not covered: kithd's own threads, root tracing root's processes or writing <code>/proc/sys</code> (<code>docs/adr-privilege.md</code>). What this is and is not a defence against: <a href="https://github.com/ChaseSunstrom/kith/blob/main/SECURITY.md">SECURITY.md</a>.</p>
+</article>
+<footer class="tail"><nav aria-label="Next page"><a class="before" href="packages.html"><span>Before</span>Packages and Sources</a><a class="after" href="api.html"><span>After</span>Resources and the language</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/access.md">docs/guide/access.md</a>.</p></footer>
+</div>
+</div>
+</body>
+</html>

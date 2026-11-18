@@ -12,6 +12,7 @@
 // Fine for stores of a few MB; a binary body is the upgrade if snapshots get slow.
 
 use crate::access::{self, Caller};
+use crate::access_sign;
 use crate::cluster::Peer;
 use crate::{Shared, pki};
 use axum::body::Body;
@@ -459,6 +460,39 @@ fn sender(store: &kith_api::store::Store, name: &str) -> Option<bool> {
     Some(node.spec["trust"] == "worker")
 }
 
+/// The node a change came from.
+fn sent_by(peer: &Peer) -> String {
+    match &peer.subject {
+        Some(pki::Subject::Node(node, ..)) => node.clone(),
+        _ => "unknown".into(),
+    }
+}
+
+/// Who signed a change a control node passed on (its signature for this node, as it came),
+/// where that holds. Under `spec.signing: required` a node's word for whose write it is
+/// (`who`) stands only with their signature; a change it sends as its own is its own.
+fn signer(
+    shared: &Shared,
+    peer: &Peer,
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    body: &[u8],
+    who: Option<&Caller>,
+) -> Result<Option<access_sign::Signed>, String> {
+    let path = uri.path_and_query().map_or(uri.path(), |path| path.as_str());
+    let asked = access_sign::Asked {
+        method: "POST",
+        path,
+        body,
+    };
+    let header = headers
+        .get(access_sign::SIGNED)
+        .map(|header| header.to_str().unwrap_or_default());
+    // (`who` is the Identity, as the node names it: not the node it came through.)
+    let named = who.and_then(Caller::identity).map(|name| Caller::Identity(name.into()));
+    access_sign::hop(shared, &sent_by(peer), header, &asked, named.as_ref(), true)
+}
+
 /// A change another node passes to the leader: the reply and where in the log it is. A
 /// control node's is given to Raft as it comes; a worker's is held to its size, its rate
 /// and its list first.
@@ -466,6 +500,7 @@ async fn write(
     State(shared): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
     headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
     body: Body,
 ) -> Response {
     let worker = match &peer.subject {
@@ -495,13 +530,7 @@ async fn write(
             .map(|name| name.to_str().ok().and_then(Caller::named))
         {
             None => None,
-            Some(Some(Caller::Identity(name))) => {
-                let node = match &peer.subject {
-                    Some(pki::Subject::Node(node, ..)) => node.clone(),
-                    _ => "unknown".into(),
-                };
-                Some(Caller::Via(node, Box::new(Caller::Identity(name))))
-            }
+            Some(Some(Caller::Identity(name))) => Some(Caller::Via(sent_by(&peer), Box::new(Caller::Identity(name)))),
             Some(_) => {
                 let why = format!("{} names no Identity", access::FOR);
                 return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
@@ -517,10 +546,20 @@ async fn write(
         if !leads {
             return Json(None::<(Reply, u64)>).into_response();
         }
+        let signed = match signer(&shared, &peer, &headers, &uri, &bytes, who.as_ref()) {
+            Ok(signed) => signed,
+            Err(why) => {
+                let caller = who.clone().unwrap_or_else(|| Caller::Node(sent_by(&peer)));
+                shared
+                    .audit
+                    .record(&caller, "write", vec![uri.path().into()], Err(why.clone()));
+                return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
+            }
+        };
         // On a task of its own: a sender that hangs up neither lets go of the turn while the
         // write is on its way nor stops it.
         let shared = shared.clone();
-        let done = tokio::spawn(async move {
+        let done = tokio::spawn(access_sign::within(signed, async move {
             let turn = shared.turn(&command, who.as_ref()).await?;
             let written = tokio::time::timeout(PATIENCE, shared.raft.client_write(command)).await;
             drop(turn);
@@ -528,7 +567,7 @@ async fn write(
                 Ok(Ok(written)) => Some((written.data, written.log_id.index)),
                 _ => None,
             })
-        });
+        }));
         return Json(match done.await {
             Ok(Ok(written)) => written,
             Ok(Err(refused)) => Some((Err::<Done, Error>(refused), 0u64)),
@@ -701,6 +740,11 @@ impl Shared {
             let state = self.store.lock().expect("a handler panicked holding the store");
             crate::api::refused(&state.store, caller, command)
         });
+        // The admin's key and whether callers sign, by the store as it is in this turn.
+        let refused = refused.or_else(|| {
+            let state = self.store.lock().expect("a handler panicked holding the store");
+            access_sign::guard(&state.store, command, access_sign::by_admin()).err()
+        });
         match refused {
             Some(why) => Err(Error::Invalid(why)),
             None => Ok(Some(held)),
@@ -782,7 +826,7 @@ impl Shared {
             Ok(_) => return Forward::Again(None),
             Err(e) => return Forward::Again(Some(e)),
         };
-        let mut call = client.post(format!("https://{at}/v1/raft/write"));
+        let mut call = access_sign::pass_on(client.post(format!("https://{at}/v1/raft/write")));
         // Whose write it is, for the leader to decide again in the log's order (`write`).
         if let Some(name) = who.and_then(Caller::identity) {
             call = call.header(access::FOR, name);
@@ -823,8 +867,9 @@ impl Shared {
 /// Whether `command` can change who may do what: it is put in the log alone ([`Shared::turn`]).
 fn changes_access(command: &Command) -> bool {
     let access = |kind: &str| {
-        // (A KindDefinition says whether a kind is namespaced: which rule matches it.)
-        ["Role", "RoleBinding", "Identity", "KindDefinition"]
+        // (A KindDefinition says whether a kind is namespaced: which rule matches it. A
+        // Cluster holds the admin's key, asked of in the same turn: `access_sign::guard`.)
+        ["Role", "RoleBinding", "Identity", "KindDefinition", "Cluster"]
             .iter()
             .any(|of| of.eq_ignore_ascii_case(kind))
     };

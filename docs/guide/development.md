@@ -47,7 +47,8 @@ a fresh clone, with one test that differs there: `node_policy_refuses_what_the_n
 Time budgets are medians of five runs on one machine, no VM. `python3 ci/budgets.py --times`
 prints them; `python3 ci/budgets.py` holds each to twice the slowest of three medians on main on
 the CI runner, rounded up: a ceiling for a regression, not a claim of speed. A line reads `ok
-one DNS answer from kithd: 2.4 ms (budget 7.0 ms)`, or `FAIL` and exit 1.
+one DNS answer from kithd: 2.4 ms (budget 7.0 ms)`, or `FAIL` and exit 1; a path that cannot
+run here (no cgroup of its own for a container, say) is a `FAIL` too, since it has a budget.
 
 | Time | On the CI runner: the median of five, on three runs on main | Budget |
 |---|---|---|

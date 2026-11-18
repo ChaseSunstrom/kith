@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>kith OS installer answers: write kith-install.yaml</title>
+<meta name="description" content="Answer what the kith OS installer would ask at the console, and this page writes kith-install.yaml for the stick: the disk, the name and address, the cluster to join, the release key.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="site.css">
+<link rel="stylesheet" href="install.css">
+</head>
+<body>
+
+<header class="bar">
+  <a class="brand" href="index.html" aria-label="kith: the front page">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true">
+      <line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/>
+      <circle cx="22" cy="14" r="4"/><circle cx="22" cy="50" r="4"/><circle cx="43" cy="19" r="4.5"/><circle cx="43" cy="50" r="4.5"/>
+      <circle class="ring" cx="24" cy="37" r="5.5"/><circle class="hub" cx="24" cy="37" r="5.5"/>
+    </svg>
+    <b>kith</b>
+  </a>
+  <nav aria-label="On this page">
+    <a href="#stick">Stick</a>
+    <a href="#disk">Disk</a>
+    <a href="#name">Name</a>
+    <a href="#network">Network</a>
+    <a href="#cluster">Cluster</a>
+    <a href="#encryption">Encryption</a>
+    <a href="#policy">Policy</a>
+    <a href="#writing">Writing</a>
+    <a href="#recovery">Key</a>
+  </nav>
+  <button class="button quiet" id="motion" type="button" aria-pressed="false" hidden>Pause</button>
+  <a class="button quiet" href="guide/os.html#installing-on-a-machine">Guide</a>
+  <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+</header>
+
+<main id="top">
+
+<section class="intro">
+  <p class="word"><b>kith OS</b> <i>installer</i></p>
+  <h1>Answer once. <span class="under">It installs without asking.</span></h1>
+  <p class="lead">The installer asks at the machine's console: which disk, what name, what address, which cluster. Answer here instead, and this page writes <code>kith-install.yaml</code> for the stick. The machine then asks nothing.</p>
+  <p class="fine">The file is made in this page, in your browser. Nothing you type is sent anywhere or kept.</p>
+  <noscript><p class="fine need">The form needs JavaScript, which is all this page runs. Without it, the example under "Writing" shows every field, and <a href="guide/os.html#installing-on-a-machine">the guide</a> says what each does.</p></noscript>
+</section>
+
+<section id="stick" class="part" data-see>
+  <div class="head">
+    <p class="no"><b>01</b> The stick</p>
+    <h2>Start with a USB stick.</h2>
+    <p>Write the installer to it: <code>dd if=kith-os-installer.raw of=/dev/sdX</code>. <code>sh os/build.sh</code> makes the file. Everything on that stick is lost. The answers go on it as one more file, at "Writing" below.</p>
+  </div>
+  <div class="net">
+    <h3>Several machines, no stick?</h3>
+    <p>A node can install the machines beside it from the network (PXE), and hand each the installer once. The node's own web UI does that in its Install part (the Install link in the bar, at <code>#/install</code>): netboot on and off, with the cards to answer. From a terminal it is <code>kith node netboot</code>, which <a href="guide/os.html#installing-from-the-network">the guide</a> describes.</p>
+  </div>
+</section>
+
+<div class="install">
+
+<form id="answers" data-needs-js novalidate autocomplete="off">
+
+<section id="disk" class="part" data-step data-see>
+  <div class="head">
+    <p class="no"><b>02</b> The disk</p>
+    <h2>Which disk is erased?</h2>
+    <p>The installer erases the disk the answers name, in whatever machine the stick starts, and asks nobody. Name it so it cannot be another.</p>
+  </div>
+  <p class="warn">Everything on that disk is lost.</p>
+  <fieldset class="field">
+    <legend class="lab">Install on</legend>
+    <div class="choices">
+      <label class="choice"><input type="radio" name="diskKind" value="only" checked><i class="stop"></i><span class="say">The machine's one disk <small><code>only</code>: for a machine with one disk that is not removable. It refuses a machine with several, and never means a USB stick.</small></span></label>
+      <label class="choice"><input type="radio" name="diskKind" value="name"><i class="stop"></i><span class="say">A disk by its name <small><code>sda</code>, <code>nvme0n1</code>. A kernel's name for a disk can change with the order the disks are found in.</small></span></label>
+      <div class="branch" data-when="diskKind=name"><div>
+        <div class="field"><label class="lab" for="diskName">Its name</label><input type="text" id="diskName" name="diskName" placeholder="nvme0n1" maxlength="64" spellcheck="false" autocapitalize="none"></div>
+      </div></div>
+      <label class="choice"><input type="radio" name="diskKind" value="serial"><i class="stop"></i><span class="say">A disk by its serial <small>What the disk itself reports, which does not change: NVMe, virtio, SCSI and SATA disks. The installer lists each disk's serial at the console. It stops when no disk gives it, or two.</small></span></label>
+      <div class="branch" data-when="diskKind=serial"><div>
+        <div class="field"><label class="lab" for="diskSerial">Its serial</label><input type="text" id="diskSerial" name="diskSerial" placeholder="S4EWNX0R123456" maxlength="64" spellcheck="false" autocapitalize="none"></div>
+      </div></div>
+    </div>
+  </fieldset>
+</section>
+
+<section id="name" class="part" data-step data-see>
+  <div class="head">
+    <p class="no"><b>03</b> The name</p>
+    <h2>What is the machine called?</h2>
+    <p>Leave it empty and the machine names itself from its network card's address.</p>
+  </div>
+  <div class="field">
+    <label class="lab" for="hostname">Name <span class="dim">(empty: made from its network card's address)</span></label>
+    <input type="text" id="hostname" name="hostname" placeholder="alpha" maxlength="63" spellcheck="false" autocapitalize="none">
+    <p class="hint">Lower-case letters, digits and <code>-</code>, as a DNS label.</p>
+  </div>
+</section>
+
+<section id="network" class="part" data-step data-see>
+  <div class="head">
+    <p class="no"><b>04</b> The network</p>
+    <h2>Where is it?</h2>
+    <p>Leave a field empty and the machine asks the network (DHCP).</p>
+  </div>
+  <fieldset class="field">
+    <legend class="lab">Address</legend>
+    <div class="choices">
+      <label class="choice"><input type="radio" name="ipKind" value="dhcp" checked><i class="stop"></i><span class="say">Ask the network <small>DHCP.</small></span></label>
+      <label class="choice"><input type="radio" name="ipKind" value="static"><i class="stop"></i><span class="say">A fixed address</span></label>
+      <div class="branch" data-when="ipKind=static"><div>
+        <div class="field"><label class="lab" for="ipAddress">Address and prefix length</label><input type="text" id="ipAddress" name="ipAddress" placeholder="10.0.0.5/24" maxlength="18" inputmode="decimal" spellcheck="false"></div>
+        <div class="field"><label class="lab" for="ipGateway">Way out <span class="dim">(the gateway; empty: none)</span></label><input type="text" id="ipGateway" name="ipGateway" placeholder="10.0.0.1" maxlength="15" inputmode="decimal" spellcheck="false"></div>
+      </div></div>
+    </div>
+  </fieldset>
+  <div class="field">
+    <label class="lab" for="dns">DNS server <span class="dim">(empty: what the network gives)</span></label>
+    <input type="text" id="dns" name="dns" placeholder="10.0.0.1" maxlength="45" spellcheck="false">
+  </div>
+</section>
+
+<section id="cluster" class="part" data-step data-see>
+  <div class="head">
+    <p class="no"><b>05</b> The cluster</p>
+    <h2>Alone, or beside others?</h2>
+    <p>A node that starts a cluster offers a claim on its console. A node that joins needs the address of one of the cluster's nodes and a token that node made.</p>
+  </div>
+  <fieldset class="field">
+    <legend class="lab">This node</legend>
+    <div class="choices">
+      <label class="choice"><input type="radio" name="clusterKind" value="new" checked><i class="stop"></i><span class="say">Starts a new cluster</span></label>
+      <label class="choice"><input type="radio" name="clusterKind" value="join"><i class="stop"></i><span class="say">Joins one</span></label>
+      <div class="branch" data-when="clusterKind=join"><div>
+        <div class="field"><label class="lab" for="joinAddress">Address of one of its nodes</label><input type="text" id="joinAddress" name="joinAddress" placeholder="10.0.0.7:7443" maxlength="80" spellcheck="false" autocapitalize="none"></div>
+        <div class="field"><label class="lab" for="joinToken">Join token</label><input type="text" id="joinToken" name="joinToken" placeholder="kith node token" maxlength="200" spellcheck="false" autocapitalize="none"><p class="hint"><code>kith node token</code> on that cluster makes one. It goes into the file: keep the file as you would keep the token.</p></div>
+      </div></div>
+    </div>
+  </fieldset>
+</section>
+
+<section id="encryption" class="part" data-step data-see>
+  <div class="head">
+    <p class="no"><b>06</b> Encryption</p>
+    <h2>Is its state locked?</h2>
+    <p>Leave it off and the node is as every kith OS node is. The cluster can change most of what follows later.</p>
+  </div>
+  <div class="field">
+    <label class="switch"><input type="checkbox" role="switch" name="encrypt"><i class="line"><i></i></i><span class="say">Encrypt its state <small>Its state is under a key the cluster holds. <a href="guide/os.html#encrypted-state">Encrypted state</a>.</small></span></label>
+    <p class="hint key">With this on, the installer shows a recovery key once, on the machine's console, and then powers off. Be at the console, or watching it, and write the key down: it is the last stop on this page.</p>
+  </div>
+</section>
+
+<section id="policy" class="part" data-step data-see>
+  <div class="head">
+    <p class="no"><b>07</b> What it accepts</p>
+    <h2>And what it refuses.</h2>
+    <p>Leave it as it is and the cluster may have this node do anything.</p>
+  </div>
+  <div class="field">
+    <label class="lab" for="releaseKey">Release key <span class="dim">(empty: the keys the image was built with)</span></label>
+    <input type="text" id="releaseKey" name="releaseKey" placeholder="64 hex digits" maxlength="600" spellcheck="false" autocapitalize="none">
+    <p class="hint">The node takes kith OS releases signed by this key only. One to eight keys of 64 hex digits, with commas between. <a href="guide/os.html#rolling-a-release-through-the-cluster">Rolling a release</a>.</p>
+  </div>
+  <div class="field">
+    <label class="switch"><input type="checkbox" role="switch" name="lanReleases"><i class="line"><i></i></i><span class="say">Fetch updates from the local network <small>A release server on the node's private ranges may serve them.</small></span></label>
+  </div>
+  <fieldset class="field">
+    <legend class="lab">What the cluster may have this node do as its root</legend>
+    <div class="choices">
+      <label class="choice"><input type="radio" name="policyKind" value="all" checked><i class="stop"></i><span class="say">Everything <small>Leave it out, as before.</small></span></label>
+      <label class="choice"><input type="radio" name="policyKind" value="hardened"><i class="stop"></i><span class="say">Hardened <small><code>hardened</code>: none of it, and a GPU the only device handed out.</small></span></label>
+      <label class="choice"><input type="radio" name="policyKind" value="custom"><i class="stop"></i><span class="say">Its own words <small>Words with commas between, read left to right.</small></span></label>
+      <div class="branch" data-when="policyKind=custom"><div>
+        <div class="field"><label class="lab" for="policyWords">The words</label><input type="text" id="policyWords" name="policyWords" placeholder="hardened,vms" maxlength="300" spellcheck="false" autocapitalize="none">
+          <details class="words"><summary>Which words</summary>
+            <p><code>hardened</code> turns every one off. <code>no-KEY</code> turns one off, and <code>KEY</code> turns it on again. <code>devices=gpu+input</code> names the classes of device a claim may hand out (<code>devices=all</code>, or <code>devices=</code> for none).</p>
+            <p>The keys: <code>exec-units</code>, <code>root-containers</code>, <code>unconfined</code>, <code>node-network</code>, <code>vms</code>, <code>vm-paths</code>, <code>passthrough</code>, <code>host-paths</code>, <code>run</code>, <code>wipe</code>. The classes: <code>gpu</code>, <code>display</code>, <code>input</code>, <code>audio</code>, <code>usb</code>, <code>camera</code>, <code>other</code>. <a href="guide/access.html#what-a-node-refuses-whatever-the-cluster-says">What a node refuses</a>.</p>
+          </details>
+        </div>
+      </div></div>
+    </div>
+  </fieldset>
+</section>
+
+</form>
+
+<aside class="part file" data-see aria-label="Your file">
+  <figure class="panel">
+    <figcaption><i class="lamp ok" id="lamp"></i><b>kith-install.yaml</b> <span class="dim" id="sum"></span></figcaption>
+<pre data-answers="default" id="yaml" tabindex="0" aria-label="kith-install.yaml, as written so far">disk: only
+</pre>
+    <p class="status" id="say" role="status">Ready: this is the whole file.</p>
+    <p class="acts" data-needs-js>
+      <button class="button get" id="get" type="button">Download</button>
+      <button class="button quiet" id="copy" type="button">Copy</button>
+      <button class="button quiet" id="example" type="button" data-example='{"diskKind":"serial","diskSerial":"S4EWNX0R123456","hostname":"alpha","ipKind":"static","ipAddress":"10.0.0.5/24","ipGateway":"10.0.0.1","dns":"10.0.0.1","clusterKind":"join","joinAddress":"10.0.0.7:7443","joinToken":"3f9a1c7e5b2d4a60.alpha","encrypt":true,"releaseKey":"0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0","lanReleases":true,"policyKind":"hardened"}'>An example</button>
+      <button class="button quiet" id="reset" type="button">Start over</button>
+    </p>
+  </figure>
+</aside>
+
+</div>
+
+<section id="writing" class="part" data-see>
+  <div class="head">
+    <p class="no"><b>08</b> Writing</p>
+    <h2>Put it where the installer looks.</h2>
+    <p>Nothing is asked or confirmed after this: a stick with answers erases the disk they name in whatever machine it starts. Start only machines you mean to erase.</p>
+  </div>
+  <p class="warn keep">The file names the disk it erases, and holds the join token and the release key. Keep the stick, and the file, private.</p>
+  <div class="pair wide">
+    <figure class="panel">
+      <figcaption>on the stick</figcaption>
+      <ol class="path">
+        <li>Save <code>kith-install.yaml</code> on the stick's first partition, which is FAT.</li>
+        <li>Start the machine from the stick (UEFI). It copies kith OS to the disk and reads it back. With encryption on, it shows the recovery key here: see the next stop.</li>
+        <li>It powers off. Take the stick out and start the machine.</li>
+      </ol>
+    </figure>
+    <figure class="panel">
+      <figcaption>or from a URL</figcaption>
+      <p class="fine">Put <code>kith.install=</code> on the kernel command line, and the installer fetches the answers. Over plain <code>http</code> someone between the machine and the server could change the disk, the token or the key, so the URL carries the file's digest. The installer refuses plain <code>http</code> without it, and a file that does not hash to it. <code>https</code> needs none.</p>
+      <div class="field" data-needs-js>
+        <label class="lab" for="installUrl">Where the file will be</label>
+        <input type="text" id="installUrl" placeholder="http://10.0.2.2/alpha.yaml" maxlength="300" spellcheck="false" autocapitalize="none" autocomplete="off">
+      </div>
+      <pre class="cmd" id="cmdline" data-needs-js>kith.install=http://HOST/FILE#sha256=HEX</pre>
+      <p class="fine" id="cmdsay" data-needs-js>The digest is of the file as it is now. A change to an answer changes it. <code>sha256sum kith-install.yaml</code> prints the same.</p>
+    </figure>
+  </div>
+  <div class="panel example">
+    <figcaption>an example, every field</figcaption>
+<pre data-answers="example">disk: "serial:S4EWNX0R123456"
+hostname: alpha
+ip: 10.0.0.5/24,10.0.0.1
+dns: 10.0.0.1
+join:
+  address: 10.0.0.7:7443
+  token: "3f9a1c7e5b2d4a60.alpha"
+encrypt: true
+releaseKey: "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+lanReleases: true
+nodePolicy: hardened
+</pre>
+  </div>
+  <div class="panel example">
+    <figcaption>an example, a fixed address and a policy of its own words</figcaption>
+<pre data-answers="custom" data-fields='{"diskKind":"name","diskName":"nvme0n1","hostname":"beta","ipKind":"static","ipAddress":"10.0.0.6/24","ipGateway":"10.0.0.1","clusterKind":"join","joinAddress":"10.0.0.7:7443","joinToken":"3f9a1c7e5b2d4a60.beta","policyKind":"custom","policyWords":"hardened,vms,devices=gpu+input"}'>disk: nvme0n1
+hostname: beta
+ip: 10.0.0.6/24,10.0.0.1
+join:
+  address: 10.0.0.7:7443
+  token: "3f9a1c7e5b2d4a60.beta"
+nodePolicy: "hardened,vms,devices=gpu+input"
+</pre>
+  </div>
+</section>
+
+<section id="recovery" class="part" data-see>
+  <div class="head">
+    <p class="no"><b>09</b> The recovery key</p>
+    <h2>Write it down when it appears.</h2>
+    <p>Only if you turned encryption on. Before it powers off, the installer prints the node's recovery key once, on the machine's console: 32 digits in groups of four. Be there, or watch the console, and write it down. It is shown that once, and kept nowhere you can read it later.</p>
+  </div>
+  <p class="fine">Typed at a waiting machine's console, the key opens the node's state where no cluster answers. An install nobody watched has a key nobody saw: <code>kith node recovery NODE</code> makes a new one, shown once.</p>
+  <p class="acts">
+    <a class="button" href="guide/os.html#installing-on-a-machine">The guide has the rest</a>
+    <a class="button quiet" href="index.html">Back to kith</a>
+  </p>
+</section>
+<i class="end" aria-hidden="true"></i>
+
+</main>
+
+<footer>
+  <p><b>kith</b> <span class="dim">is written in Rust, under the Apache-2.0 licence.</span></p>
+  <p class="dim">This page loads nothing from anywhere else, and sends nothing.</p>
+</footer>
+
+<p class="toast" id="toast" role="status" aria-live="polite"></p>
+<script src="install.js"></script>
+</body>
+</html>

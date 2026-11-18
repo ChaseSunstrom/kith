@@ -41,6 +41,8 @@ fn every_guide_is_read() {
     let mut there: Vec<String> = std::fs::read_dir(root().join("docs/guide"))
         .unwrap()
         .map(|entry| format!("docs/guide/{}", entry.unwrap().file_name().to_string_lossy()))
+        // (The .html beside each is ci/site_docs.py's page of it, checked by that.)
+        .filter(|path| path.ends_with(".md"))
         .collect();
     there.sort();
     let mut read: Vec<&str> = DOCS
@@ -88,8 +90,8 @@ fn blocks(tag: &str) -> Vec<(usize, String)> {
 }
 
 /// Blocks that are not a whole resource, and so are not checked: two `spec:` parts shown
-/// inside a list, and the installer's file.
-const PARTS: usize = 4;
+/// inside a list, the installer's file, and an OS spec (`os/build.sh --spec`).
+const PARTS: usize = 5;
 
 #[test]
 fn readme_examples_are_taken_by_this_build() {
@@ -540,5 +542,27 @@ fn readme_shows_the_install_pin_and_the_review_says_m2_is_fixed() {
     assert!(
         m2.contains("fixed: ") && m2.contains("(T-0648)"),
         "docs/security-review-2.md does not say M2 is fixed (T-0648):\n{m2}"
+    );
+}
+
+/// The installer's page (docs/install.html) carries the three answer files kithd's own unit test parses
+/// (`the_install_page_examples`), and the front page and the guide lead to it.
+#[test]
+fn the_installer_page_is_there_and_linked() {
+    let read = |path: &str| std::fs::read_to_string(root().join(path)).unwrap();
+    let page = read("docs/install.html");
+    for name in ["default", "example", "custom"] {
+        assert!(
+            page.contains(&format!("<pre data-answers=\"{name}\"")),
+            "docs/install.html has no <pre data-answers=\"{name}\">"
+        );
+    }
+    assert!(
+        read("docs/index.html").contains("href=\"install.html\""),
+        "docs/index.html does not link docs/install.html"
+    );
+    assert!(
+        read("docs/guide/os.md").contains("](../install.html)"),
+        "docs/guide/os.md does not link docs/install.html"
     );
 }

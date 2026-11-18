@@ -209,7 +209,19 @@ spec! {
         /// longest prefix an image is under is the one it is held to.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub images: Vec<ImageRule>,
+        /// The admin's Ed25519 public key, as 64 hex: a request it signed (`x-kith-signed`) is
+        /// the admin's, on whichever node it lands. Changed only by a write it signed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub admin_key: Option<String>,
+        /// Whether a caller one node passes on to another, and a write at a node's local
+        /// socket, must be signed: `open` (left out: unsigned is taken, as before) or
+        /// `required` (unsigned at the local socket is the node itself, which reads). Changed
+        /// only by a write the admin signed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub signing: Option<Signing>,
     }
+
+    pub enum Signing { Open, Required }
 
     pub struct ImageRule {
         /// A registry (`ghcr.io`) or a registry and a path under it (`ghcr.io/acme`), matched
@@ -1475,6 +1487,13 @@ impl Spec for ClusterSpec {
             if let Some(why) = not_keys(&rule.signed_by) {
                 return Err(format!("{at}: {why}"));
             }
+        }
+        let hex = |key: &String| key.len() == 64 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if self.admin_key.as_ref().is_some_and(|key| !hex(key)) {
+            return Err("spec.adminKey: an Ed25519 public key is 64 lower-case hex".into());
+        }
+        if self.signing == Some(Signing::Required) && self.admin_key.is_none() {
+            return Err("spec.signing: required needs spec.adminKey: nobody could sign".into());
         }
         Ok(())
     }

@@ -3,7 +3,8 @@ target/
 /sdk/**/target
 /sdk/**/Cargo.lock
 __pycache__/
-# (ci/site_shots.py cuts a tall page into pieces to look at; the whole ones are kept.)
-docs/shots/site-*.[0-9].png
+# (ci/site_shots.py makes whole pages and pieces of them to look at: only docs/shots/top/ is kept.)
+docs/shots/site-*.png
+docs/shots/install-*.png
 # (Edit lists a session leaves behind.)
 .fm-scratch/

@@ -1,5 +1,6 @@
-//! Services, on a node of the mesh: every Service has an address every node holds
-//! (`kith_mesh::service_address`), and a TCP connection to one of its ports there is
+//! Services, on a node (of the mesh or not: without `--mesh` the Services' addresses are on the
+//! loopback, and only this node's replicas are reached): every Service has an address every node
+//! holds (`kith_mesh::service_address`), and a TCP connection to one of its ports there is
 //! passed to a ready replica of a Workload its selector matches, one after the other in
 //! turn. A replica on this node is reached on the machine itself (so it may listen on
 //! 127.0.0.1 only); one on another node through that node's kithd, which listens on its
@@ -898,14 +899,15 @@ async fn within<T>(doing: impl Future<Output = std::io::Result<T>>) -> std::io::
         .map_err(|_| std::io::ErrorKind::TimedOut)?
 }
 
-/// Listen for every Service on this node's mesh interface, until stopped. `port` is the
-/// TCP port other nodes pass connections on to (the mesh's own, which is UDP).
+/// Listen for every Service on this node's mesh interface (the loopback with no mesh), until
+/// stopped. `port` is the TCP port other nodes pass connections on to (the mesh's own, which is
+/// UDP); none with no mesh, where there is no relay either.
 ///
 /// With `strays` (a node with the ingress), ports 443 and 80 of the Services' addresses
 /// are not listened on here: the ingress has those ports, and sends what is ours on.
 pub async fn run(
     shared: Arc<Shared>,
-    port: u16,
+    port: Option<u16>,
     mut strays: Option<mpsc::UnboundedReceiver<TcpStream>>,
     mut stopping: watch::Receiver<bool>,
 ) {
@@ -972,6 +974,10 @@ pub async fn run(
         .moved
         .clone();
     let mut probed = BTreeMap::new();
+    // (With no mesh: the Services' addresses on the loopback; and the listeners that could not bind, said once.)
+    let mut on_loopback = Loopback::new(prefix);
+    let mut unbound = BTreeSet::new();
+    let relay = port.map(|port| (me, port));
     loop {
         let (mut wanted, reports, plans) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -1030,6 +1036,7 @@ pub async fn run(
         // The relay, and one listener for each Service port; one whose address is not on
         // the interface yet (the mesh puts it there) is tried again shortly.
         let mut keys: BTreeSet<(Ipv6Addr, u16)> = wanted.keys().copied().collect();
+        let wanted_at: BTreeSet<Ipv6Addr> = keys.iter().map(|(at, _)| *at).collect();
         let elsewhere = elsewhere.load(Ordering::Relaxed);
         keys.retain(|(_, port)| !(elsewhere && [443, 80].contains(port)));
         // (No thread, and no listener, before there is a Service: a node that has none
@@ -1037,8 +1044,13 @@ pub async fn run(
         if threads.is_empty() && !wanted.is_empty() {
             threads = start();
         }
-        if !threads.is_empty() {
-            keys.insert((me, port));
+        if let (false, Some(relay)) = (threads.is_empty(), relay) {
+            keys.insert(relay);
+        }
+        // With no mesh to carry them, the Services' addresses are on the loopback: a pod's
+        // connection to one arrives there, and kithd listens on it (T-0723).
+        if port.is_none() {
+            on_loopback.hold(&wanted_at);
         }
         proxy.turns.keep(&wanted);
         proxy.forget();
@@ -1056,9 +1068,19 @@ pub async fn run(
                 continue;
             }
             // (Until the last thread's handle on the one bound before is dropped, tried again.)
-            let Ok(listeners) = listen(SocketAddr::new(key.0.into(), key.1), threads.len()) else {
-                waiting = true;
-                continue;
+            let listeners = match listen(SocketAddr::new(key.0.into(), key.1), threads.len()) {
+                Ok(listeners) => {
+                    unbound.remove(&key);
+                    listeners
+                }
+                Err(e) => {
+                    // (With a mesh, its address not being there yet is usual; without, it is ours.)
+                    if port.is_none() && unbound.insert(key) {
+                        eprintln!("kithd: services: listening on {}:{}: {e}", key.0, key.1);
+                    }
+                    waiting = true;
+                    continue;
+                }
             };
             let tasks = threads.iter().zip(listeners).map(|(thread, listener)| {
                 let proxy = proxy.clone();
@@ -1067,7 +1089,7 @@ pub async fn run(
                     let Ok(listener) = TcpListener::from_std(listener) else {
                         return;
                     };
-                    if key == (me, port) {
+                    if Some(key) == relay {
                         let take = |proxy: Arc<Proxy>, stream| async move {
                             let _ = proxy.take(stream).await;
                         };
@@ -1093,11 +1115,86 @@ pub async fn run(
     if let Kernel::Has(netns, _) | Kernel::Stuck(netns) = kernel {
         let _ = connect::attach(&[], netns);
     }
+    if port.is_none() {
+        on_loopback.hold(&BTreeSet::new());
+    }
     listening
         .values()
         .flatten()
         .chain(&stray)
         .for_each(tokio::task::JoinHandle::abort);
+}
+
+/// With no mesh, the Services' addresses on the loopback (what the mesh's interface holds
+/// where there is one): the node's own, as a pod's connection to one is sent here, and kithd
+/// listens on it.
+struct Loopback {
+    prefix: Ipv6Addr,
+    /// The loopback's index, asked for once.
+    index: Option<u32>,
+    /// What this kithd put there.
+    held: BTreeSet<Ipv6Addr>,
+    /// Whether the Services' addresses an earlier kithd left (one killed) are taken off.
+    cleaned: bool,
+    /// What was last said of a failure, said again only when it changes.
+    told: Option<String>,
+}
+
+/// The Services' addresses of `prefix` among `present` that are not `wanted`: what a kithd
+/// that was killed left on the loopback.
+fn stale(prefix: Ipv6Addr, present: Vec<Ipv6Addr>, wanted: &BTreeSet<Ipv6Addr>) -> impl Iterator<Item = Ipv6Addr> {
+    let wanted = wanted.clone();
+    present
+        .into_iter()
+        .filter(move |at| kith_mesh::is_service_address(prefix, *at) && !wanted.contains(at))
+}
+
+impl Loopback {
+    fn new(prefix: Ipv6Addr) -> Self {
+        Loopback {
+            prefix,
+            index: None,
+            held: BTreeSet::new(),
+            cleaned: false,
+            told: None,
+        }
+    }
+
+    /// Make the Services' addresses on the loopback `wanted`, saying once what stops it.
+    /// With none wanted and none held (and the stale ones gone) it asks the kernel nothing.
+    fn hold(&mut self, wanted: &BTreeSet<Ipv6Addr>) {
+        if self.cleaned && self.held.is_empty() && wanted.is_empty() {
+            return;
+        }
+        let held = self.try_hold(wanted).map_err(|e| e.to_string());
+        match held {
+            Ok(()) => self.told = None,
+            Err(e) if self.told.as_ref() != Some(&e) => {
+                eprintln!("kithd: services: their addresses on the loopback: {e}");
+                self.told = Some(e);
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn try_hold(&mut self, wanted: &BTreeSet<Ipv6Addr>) -> std::io::Result<()> {
+        let index = match self.index {
+            Some(index) => index,
+            None => {
+                let index = kith_mesh::cards()?
+                    .1
+                    .ok_or_else(|| std::io::Error::other("no loopback"))?;
+                *self.index.insert(index)
+            }
+        };
+        if !self.cleaned {
+            // (Held, they are taken off below, with whatever else is not wanted.)
+            let present = kith_mesh::addresses6(index)?;
+            self.held.extend(stale(self.prefix, present, wanted));
+            self.cleaned = true;
+        }
+        kith_mesh::hold(index, &mut self.held, wanted)
+    }
 }
 
 /// The kernel's program on the containers' cgroup, for the network namespace (`u64`, its
@@ -1364,6 +1461,24 @@ pub fn thread(name: String) -> std::io::Result<tokio::runtime::Handle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a killed kithd left on the loopback goes: the Services' addresses of this cluster that
+    /// are not wanted; the wanted ones, a node's, another cluster's and ::1 stay.
+    #[test]
+    fn a_stale_service_address_on_the_loopback_is_taken_off_and_nothing_else() {
+        let prefix = kith_mesh::prefix(b"a cluster");
+        let service = |name| kith_mesh::service_address(prefix, "default", name);
+        let (kept, left) = (service("kept"), service("left"));
+        let present = vec![
+            Ipv6Addr::LOCALHOST,
+            kept,
+            left,
+            kith_mesh::node_address(prefix, "alpha"),
+            kith_mesh::service_address(kith_mesh::prefix(b"another"), "default", "web"),
+        ];
+        let gone: Vec<_> = stale(prefix, present, &BTreeSet::from([kept])).collect();
+        assert_eq!(gone, [left]);
+    }
 
     #[test]
     fn over_the_limit_is_said_once_a_minute() {

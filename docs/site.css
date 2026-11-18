@@ -2,7 +2,7 @@
    The page's rail is the stem of the k in the bar, carried down; every part is a stop on it. */
 .paused *, .paused ::before, .paused ::after { animation-play-state: paused !important; }
 button.button { font-family: inherit; cursor: pointer; }
-@media (max-width: 720px) { .bar #motion { margin-left: auto; } .bar #motion + .button { margin-left: 0; } }
+[hidden] { display: none !important; }
 
 .shot img { display: block; width: 100%; height: auto; margin-top: 14px; border: 1px solid var(--hair); }
 
@@ -82,18 +82,25 @@ code, pre { font-family: var(--mono); font-size: 0.86em; }
 .scrolled .bar { border-bottom: 1px solid var(--hair); padding-bottom: 11px; }
 .brand { position: relative; display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text); font-size: var(--large); font-weight: 800; letter-spacing: -0.02em; }
 .brand::after { content: ""; position: absolute; left: 6px; top: 33px; width: var(--stroke); height: 15px; background: var(--text); }
-.bar nav { display: flex; gap: 24px; margin-left: auto; font-size: var(--note); font-weight: 600; }
+.bar nav { display: flex; gap: 16px; margin-left: auto; font-size: var(--note); font-weight: 600; }
 .bar nav a { color: var(--text); text-decoration: none; background: linear-gradient(var(--accent), var(--accent)) no-repeat 0 100% / 0 var(--stroke); padding-bottom: 4px; transition: background-size var(--arrive) var(--ease); }
 .bar nav a:hover { background-size: 100% var(--stroke); }
-@media (max-width: 720px) { .bar nav { display: none; } .bar .button { margin-left: auto; } }
+@media (max-width: 1100px) {
+  .bar nav { display: none; }
+  .bar #motion, .bar #motion[hidden] + .button { margin-left: auto; }
+  .bar #motion + .button { margin-left: 0; }
+}
+@media (max-width: 720px) { .bar { gap: 8px; } }
 
 .button { display: inline-block; padding: 11px 20px; border: var(--stroke) solid var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 700; font-size: var(--note); text-decoration: none; transition: background var(--quick), color var(--quick); }
 .button::after { content: "\2192"; display: inline-block; margin-left: 10px; transition: transform var(--quick); }
 .button:hover::after { transform: translateX(4px); }
 .button.quiet { background: none; border-color: var(--text); color: var(--text); transition: background var(--quick), color var(--quick); }
 .button.quiet:hover { background: var(--text); color: var(--bg); }
+.button.quiet[aria-pressed="true"] { background: var(--text); color: var(--bg); }
 .bar .button { padding: 5px 14px; }
 .bar .button::after { content: none; }
+@media (max-width: 720px) { .bar .button { padding: 4px 9px; font-size: var(--small); } }
 
 /* The mark in the bar: it draws itself, and its hub keeps a pulse. */
 .mark { width: 30px; height: 36px; overflow: visible; }
@@ -127,20 +134,37 @@ h1 { font-size: clamp(44px, 7.4vw, 100px); line-height: 0.98; letter-spacing: -0
 .acts { display: flex; flex-wrap: wrap; gap: 12px; margin-block: 32px 20px; }
 
 /* The mark as the map it is: four machines on three lines, and what runs between them. */
-.map { display: block; width: 100%; max-width: 440px; height: auto; overflow: visible; margin-left: auto; }
-.map line { stroke: var(--text); stroke-width: 4; stroke-linecap: round; stroke-dasharray: 40; animation: draw calc(var(--grow) * 1.5) var(--ease) both; }
-.map .stopped { fill: var(--bg); stroke: var(--text); stroke-width: 1.5; }
-.map .hub { fill: var(--accent); stroke: var(--bg); stroke-width: 1.2; }
-.map .stopped, .map .hub, .map .halo { transform-box: fill-box; transform-origin: center; }
+.live { width: 100%; max-width: 460px; justify-self: end; }
+.map { display: block; width: 100%; height: auto; overflow: visible; }
+.map .lines path { fill: none; stroke: var(--text); stroke-width: 6; stroke-linecap: round; stroke-dasharray: 200; animation: drawn calc(var(--grow) * 1.5) var(--ease) both; }
+.map .stopped { fill: var(--bg); stroke: var(--text); stroke-width: 4; }
+.map .hub { fill: var(--accent); stroke: var(--bg); stroke-width: 3; }
+.map .stopped, .map .hub, .map .halo, .map .rep, .map .wave { transform-box: fill-box; transform-origin: center; }
 .map .stopped, .map .hub { animation: pop var(--pop) var(--ease) var(--pop) both; }
-.map .halo { fill: none; stroke: var(--accent); stroke-width: 0.5; animation: halo calc(var(--breath) * 2) ease-out infinite; }
+.map .halo { fill: none; stroke: var(--accent); stroke-width: 1.5; animation: halo calc(var(--breath) * 2) ease-out infinite; }
 .map .halo.late { animation-delay: var(--breath); }
-.map text { font: 700 3.1px var(--sans); fill: var(--text); animation: rise var(--enter) var(--ease) var(--grow) both; }
-.map text.dim { font-weight: 400; fill: var(--dim); }
+.map text { font: 700 14px var(--sans); fill: var(--text); text-anchor: middle; animation: rise var(--enter) var(--ease) var(--grow) both; }
+.map .packets circle { stroke-width: 2; }
 .packets circle { fill: var(--accent); stroke: var(--bg); }
+/* The replicas of one workload: a short line past each machine with a stop for each; a free place is a dashed ring. */
+.map .reps path { fill: none; stroke: var(--text); stroke-width: 3; stroke-linecap: round; animation: rise var(--enter) var(--ease) var(--grow) both; }
+.map .rep { fill: var(--bg); stroke: var(--dim); stroke-width: 2; stroke-dasharray: 3 3; animation: pop var(--pop) var(--ease) calc(var(--grow) + var(--pop)) both; }
+.map .rep.on { fill: var(--accent); stroke: var(--accent); stroke-width: 3; stroke-dasharray: none; animation: pop var(--pop) var(--ease) calc(var(--grow) + var(--pop)) both, beat var(--breath) ease-in-out calc(var(--d, 0s) + var(--k, 0s)) infinite; }
+.map .rep.wait { stroke: var(--warn); stroke-width: 3; stroke-dasharray: none; animation: waitdot var(--blink) ease-in-out infinite; }
+/* Once the map has drawn itself (the script says so), a stop that comes back is not held back by the first draw's delay. */
+.map.go .rep { animation-delay: 0s; }
+.map.go .rep.on { animation-delay: 0s, calc(var(--d, 0s) + var(--k, 0s)); }
+.map .reps[data-node="laptop"] { --d: -0.7s; }
+.map .reps[data-node="server"] { --d: -1.4s; }
+.map .reps[data-node="old"] { --d: -2.0s; }
+.map .rep:nth-of-type(2) { --k: -0.4s; }
+.map .rep:nth-of-type(3) { --k: -1.2s; }
+.map .wave { fill: var(--accent); stroke: var(--bg); stroke-width: 2; opacity: 0; }
+.live figcaption { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; margin: 14px 0 0; padding-top: 10px; border-top: var(--stroke) solid var(--text); font-weight: 400; font-size: var(--note); }
+.live code { font-weight: 700; color: var(--text); }
 @media (max-width: 860px) {
   .hero { grid-template-columns: 1fr; min-height: 0; padding-block: 32px 56px; }
-  .map { max-width: 300px; margin-inline: 0 auto; }
+  .live { max-width: 440px; justify-self: start; }
 }
 
 /* Four numbers, on a band. */
@@ -217,13 +241,22 @@ pre { background: var(--sunken); padding: 20px; line-height: 1.7; font-size: var
 .slot.trying b::after { content: "starting"; color: var(--warn); animation: blink var(--blink) ease-in-out infinite; }
 .slot.failed { border-color: var(--bad); }
 .slot.failed b::after { content: "did not come up"; color: var(--bad); }
-.steps { display: grid; grid-template-columns: repeat(4, 1fr); margin-top: 16px; }
-.steps li { position: relative; margin-top: 28px; border-top: var(--stroke) solid var(--text); padding: 20px 24px 0 0; color: var(--dim); font-size: var(--note); }
-.steps li::before { content: ""; position: absolute; left: 0; top: calc((var(--stop) + var(--stroke)) / -2); width: var(--stop); height: var(--stop); border: var(--stroke) solid var(--text); border-radius: 50%; background: var(--bg); transition: background var(--enter), border-color var(--enter); }
+.steps, .flow ol { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 16px; }
+.steps li, .flow li { position: relative; margin-top: 28px; border-top: var(--stroke) solid var(--text); padding: 20px 24px 0 0; color: var(--dim); font-size: var(--note); }
+.steps li::before, .flow li::before { content: ""; position: absolute; left: 0; top: calc((var(--stop) + var(--stroke)) / -2); width: var(--stop); height: var(--stop); border: var(--stroke) solid var(--text); border-radius: 50%; background: var(--bg); transition: background var(--enter), border-color var(--enter); }
 .steps .now::before { background: var(--accent); border-color: var(--accent); }
-.steps b { color: var(--text); display: block; }
+.steps b, .flow b { color: var(--text); display: block; }
 .after { margin-top: 28px; }
-@media (max-width: 860px) { .parts, .steps { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 860px) { .parts, .steps, .flow ol { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 480px) { .parts, .steps, .flow ol { grid-template-columns: 1fr; } }
+
+/* kith OS from a spec: four stops, lit one after another when the figure is first seen. */
+.flow { margin-top: 64px; }
+.flow code { color: var(--text); overflow-wrap: anywhere; }
+.seen .flow li::before { background: var(--accent); border-color: var(--accent); transition-delay: calc(var(--n, 0) * var(--grow) / 3 + var(--reveal)); }
+.flow li:nth-child(2) { --n: 1; }
+.flow li:nth-child(3) { --n: 2; }
+.flow li:nth-child(4) { --n: 3; }
 
 /* A measure is a line run out to a stop; its budget is where the line would end. */
 .bars { display: grid; gap: 14px; padding-top: 18px; }
@@ -290,6 +323,41 @@ html:not(.js) .track { display: none; } /* a bar is drawn by the script: without
 .calls s { font: var(--small) var(--mono); text-decoration: none; padding: 3px 8px; background: linear-gradient(var(--bad), var(--bad)) no-repeat 8px 52% / 0 1px var(--sunken); transition: background-size var(--enter) var(--ease), color var(--enter); transition-delay: calc(var(--i) * var(--step) / 2 + var(--enter)); }
 .seen .calls s { background-size: calc(100% - 16px) 1px; color: var(--dim); }
 
+/* Hardware: shares of a GPU's memory run out to a ceiling; the one that does not fit stops short of it, in amber. */
+.shares { padding-top: 12px; }
+.shares .row { grid-template-columns: 96px minmax(0, 1fr) 128px; }
+.shares .row > p { font-weight: 700; }
+.shares .row .track::after { content: ""; position: absolute; right: 0; top: 0; bottom: 0; width: var(--stroke); background: var(--text); }
+.shares .wait .track i { color: var(--warn); }
+.shares .wait > b { color: var(--warn); }
+.shares .wait > b small { color: var(--warn); }
+.gpu .fine, .took .fine, .relay .fine, .code .fine { margin-top: 16px; }
+.head.desk { margin-top: 72px; }
+.head.desk h3 { font-size: var(--head); letter-spacing: -0.02em; margin-bottom: 12px; }
+#desk .group { grid-template-columns: 1fr; gap: 4px; }
+#desk { align-self: start; }
+@media (max-width: 720px) { .shares .row { grid-template-columns: 72px minmax(0, 1fr) auto; gap: 6px 12px; } .shares .row .track { grid-column: auto; grid-row: auto; } }
+
+/* Build: your commit goes to a node and what failed comes back; it takes this long. */
+.path { position: relative; margin-top: 20px; padding-left: 4px; }
+.path li { position: relative; padding: 0 0 18px 30px; border-left: var(--stroke) solid var(--text); margin-left: 8px; font-size: var(--note); }
+.path li:last-child { border-left-color: transparent; padding-bottom: 0; }
+.path li::before { content: ""; position: absolute; left: calc(var(--stroke) / -2 - var(--stop) / 2); top: 1px; width: var(--stop); height: var(--stop); border: var(--stroke) solid var(--text); border-radius: 50%; background: var(--bg); transition: background var(--enter), border-color var(--enter); transition-delay: calc(var(--n, 0) * var(--grow) / 3 + var(--reveal)); }
+.seen .path li::before { background: var(--accent); border-color: var(--accent); }
+.path li:nth-child(2) { --n: 1; }
+.path li:nth-child(3) { --n: 2; }
+.path li:nth-child(4) { --n: 3; }
+.took .big b { display: block; font-size: clamp(64px, 11vw, 120px); line-height: 1; letter-spacing: -0.04em; font-weight: 800; }
+.took .big small { font-size: var(--large); font-weight: 600; letter-spacing: 0; margin-left: 6px; }
+.took .bars { padding-top: 14px; }
+.took .row { grid-template-columns: 96px minmax(0, 1fr); }
+.took code { overflow-wrap: anywhere; }
+
+/* Where you are: the nav's link for the part in view is ruled, and its stop on the rail breathes. */
+.bar nav a[aria-current] { background-size: 100% var(--stroke); }
+.part::after { content: ""; position: absolute; left: calc(7.5px - var(--rail) - var(--stop) / 2); top: calc(var(--gap) + 2px); width: var(--stop); height: var(--stop); border: 1.5px solid var(--accent); border-radius: 50%; opacity: 0; pointer-events: none; }
+.part.here::after { animation: ring var(--breath) ease-out infinite; }
+
 footer { max-width: calc(1120px + 2 * var(--gutter)); margin-inline: auto; padding: 20px var(--gutter) 48px calc(var(--gutter) + var(--rail)); font-size: var(--note); display: flex; flex-wrap: wrap; gap: 6px 32px; justify-content: space-between; }
 
 /* What is in a part rises once, when the part is first seen; its stop on the rail is always there. */
@@ -302,6 +370,8 @@ footer { max-width: calc(1120px + 2 * var(--gutter)); margin-inline: auto; paddi
 @keyframes halo { from { transform: scale(0.5); opacity: 0.8; } to { transform: scale(2.6); opacity: 0; } }
 @keyframes beat { 50% { transform: scale(0.72); } }
 @keyframes wait { 50% { background: var(--warn); } }
+@keyframes waitdot { 50% { fill: var(--warn); } }
+@keyframes drawn { from { stroke-dashoffset: 200; } }
 @keyframes blink { 50% { opacity: 0.25; } }
 @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
 @keyframes arrive { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; } }
@@ -313,5 +383,4 @@ footer { max-width: calc(1120px + 2 * var(--gutter)); margin-inline: auto; paddi
   *, ::before, ::after { animation: none !important; transition: none !important; }
   .js [data-see] > *, .js .term .line { opacity: 1; transform: none; }
   .js .group span::before { transform: none; }
-  .packets, .mark .ring, .map .halo { display: none; }
-}
+  .packets, .mark .ring, .map .halo, .map .wave, .part::after { display: none; }}

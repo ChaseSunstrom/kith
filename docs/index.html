@@ -24,11 +24,14 @@
     <a href="#apply">Apply</a>
     <a href="#cluster">Cluster</a>
     <a href="#os">kith OS</a>
+    <a href="#hardware">Hardware</a>
+    <a href="#build">Build</a>
     <a href="#numbers">Numbers</a>
     <a href="#kinds">Kinds</a>
     <a href="#security">Security</a>
   </nav>
-  <button class="button quiet" id="motion" type="button" hidden>Pause</button>
+  <button class="button quiet" id="motion" type="button" aria-pressed="false" hidden>Pause</button>
+  <a class="button quiet" href="guide/index.html">Guide</a>
   <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
 </header>
 
@@ -41,34 +44,46 @@
     <p class="lead">kith is a tiny, immutable operating system and one small daemon. It joins your machines into a cluster and keeps them matching the YAML you apply: containers, virtual machines, storage, DNS, and the network between them.</p>
     <p class="acts">
       <a class="button" href="#start">Run it on one machine</a>
-      <a class="button quiet" href="https://github.com/ChaseSunstrom/kith#readme">Read the README</a>
+      <a class="button quiet" href="guide/index.html">Read the guide</a>
     </p>
     <p class="fine">Version <span data-n="version">1.0.0</span>. No release is tagged yet: it is built from source.</p>
   </div>
-  <svg class="map" viewBox="0 4 70 56" aria-hidden="true">
-    <circle class="halo" cx="24" cy="37" r="9"/>
-    <circle class="halo late" cx="24" cy="37" r="9"/>
-    <line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/>
-    <g class="packets" stroke-width="0.5">
-      <circle r="1.5"><animateMotion dur="2.2s" repeatCount="indefinite" path="M24 37 22 14"/></circle>
-      <circle r="1.5"><animateMotion dur="2.6s" begin="-0.9s" repeatCount="indefinite" path="M22 50 24 37"/></circle>
-      <circle r="1.5"><animateMotion dur="2s" begin="-0.4s" repeatCount="indefinite" path="M24 37 43 19"/></circle>
-      <circle r="1.5"><animateMotion dur="2.4s" begin="-1.3s" repeatCount="indefinite" path="M43 50 24 37"/></circle>
-    </g>
-    <circle class="stopped" cx="22" cy="14" r="3.6"/><circle class="stopped" cx="22" cy="50" r="3.6"/><circle class="stopped" cx="43" cy="19" r="3.9"/><circle class="stopped" cx="43" cy="50" r="3.9"/>
-    <circle class="hub" cx="24" cy="37" r="5.5"/>
-    <text x="15.5" y="15.1" text-anchor="end">desktop</text>
-    <text x="15.5" y="51.1" text-anchor="end">laptop</text>
-    <text x="50" y="20.1">server</text>
-    <text x="50" y="51.1">the old PC</text>
-  </svg>
+  <figure class="live" id="live">
+    <svg class="map" viewBox="0 0 340 350" role="img" aria-label="The kith mark as a live map: a hub, a line to each of four machines, packets running along the lines, and the replicas of one workload as stops beside each machine.">
+      <circle class="halo" cx="96" cy="170" r="16"/>
+      <circle class="halo late" cx="96" cy="170" r="16"/>
+      <g class="lines">
+        <path id="m-desktop" d="M96 170 96 40"/><path id="m-laptop" d="M96 170 96 300"/><path id="m-server" d="M96 170 226 40"/><path id="m-old" d="M96 170 226 300"/>
+      </g>
+      <g class="packets">
+        <circle r="5"><animateMotion dur="2.2s" repeatCount="indefinite"><mpath href="#m-desktop"/></animateMotion></circle>
+        <circle r="5"><animateMotion dur="2.6s" begin="-0.9s" repeatCount="indefinite" keyPoints="1;0" keyTimes="0;1"><mpath href="#m-laptop"/></animateMotion></circle>
+        <circle r="5"><animateMotion dur="2s" begin="-0.4s" repeatCount="indefinite"><mpath href="#m-server"/></animateMotion></circle>
+        <circle r="5"><animateMotion dur="2.4s" begin="-1.3s" repeatCount="indefinite" keyPoints="1;0" keyTimes="0;1"><mpath href="#m-old"/></animateMotion></circle>
+        <circle r="5"><animateMotion dur="3.1s" begin="-2.2s" repeatCount="indefinite" keyPoints="1;0" keyTimes="0;1"><mpath href="#m-desktop"/></animateMotion></circle>
+        <circle r="5"><animateMotion dur="2.9s" begin="-0.2s" repeatCount="indefinite"><mpath href="#m-old"/></animateMotion></circle>
+      </g>
+      <g class="reps" data-node="desktop"><path d="M96 40 22 40"/><circle class="rep on" cx="68" cy="40" r="8"/><circle class="rep on" cx="44" cy="40" r="8"/><circle class="rep" cx="22" cy="40" r="8"/></g>
+      <g class="reps" data-node="laptop"><path d="M96 300 22 300"/><circle class="rep on" cx="68" cy="300" r="8"/><circle class="rep" cx="44" cy="300" r="8"/><circle class="rep" cx="22" cy="300" r="8"/></g>
+      <g class="reps" data-node="server"><path d="M226 40 300 40"/><circle class="rep on" cx="254" cy="40" r="8"/><circle class="rep on" cx="278" cy="40" r="8"/><circle class="rep" cx="300" cy="40" r="8"/></g>
+      <g class="reps" data-node="old"><path d="M226 300 300 300"/><circle class="rep on" cx="254" cy="300" r="8"/><circle class="rep on" cx="278" cy="300" r="8"/><circle class="rep" cx="300" cy="300" r="8"/></g>
+      <circle class="stopped" cx="96" cy="40" r="12"/><circle class="stopped" cx="96" cy="300" r="12"/><circle class="stopped" cx="226" cy="40" r="12"/><circle class="stopped" cx="226" cy="300" r="12"/>
+      <circle class="hub" cx="96" cy="170" r="17"/>
+      <circle class="wave" r="7" cx="-20" cy="-20"/>
+      <text x="96" y="14">desktop</text>
+      <text x="96" y="338">laptop</text>
+      <text x="226" y="14">server</text>
+      <text x="226" y="338">the old PC</text>
+    </svg>
+    <figcaption><code id="live-cmd">$ kith apply -f hello.yaml</code><span class="dim" id="live-said">hello: 7 of 7 replicas ready, on 4 machines</span></figcaption>
+  </figure>
 </section>
 
 <section class="strip" data-see aria-label="kith in four numbers">
-  <div class="stat"><b><span data-n="kithd.size" data-count>11.35</span><small>MB</small></b><p><code>kithd</code>: the store, the scheduler and the runtime in one static binary</p></div>
-  <div class="stat"><b><span data-n="kithd.idle" data-count>4.62</span><small>MB</small></b><p>of memory held by <code>kithd</code> with nothing to do, its binary read from disk</p></div>
+  <div class="stat"><b><span data-n="kithd.size" data-count>12</span><small>MB</small></b><p><code>kithd</code>: the store, the scheduler and the runtime in one static binary</p></div>
+  <div class="stat"><b><span data-n="kithd.idle" data-count>4.71</span><small>MB</small></b><p>of memory held by <code>kithd</code> with nothing to do, its binary read from disk</p></div>
   <div class="stat"><b><span data-n="os.update" data-count>32.1</span><small>MB</small></b><p>a whole kith OS update: kernel, root and its hash tree</p></div>
-  <div class="stat"><b><span data-n="kinds" data-count>35</span></b><p>built-in kinds of resource, all in one strict schema</p></div>
+  <div class="stat"><b><span data-n="kinds" data-count>38</span></b><p>built-in kinds of resource, all in one strict schema</p></div>
 </section>
 
 <section id="apply" class="part" data-see>
@@ -172,19 +187,98 @@
     </ol>
   </figure>
   <p class="fine after">Updates are signed, and a node takes none older than the newest it has run well. A release can hand its keys over to new ones. An <code>UpdatePlan</code> rolls a release through the cluster, one node at a time unless you say more.</p>
+
+  <figure class="panel flow" id="spec">
+    <figcaption>kith OS from a spec <span class="dim">one build for the machines that need it</span></figcaption>
+    <ol>
+      <li><b>A spec.</b> <code>features: [gpu-amd-phoenix]</code>: a feature is named, with no file names and no versions.</li>
+      <li><b>Compiled in.</b> <code>os/build.sh --spec</code> builds its kernel config and the firmware its driver loads into the kernel.</li>
+      <li><b>A selector.</b> Each image is signed as its own <code>OSRelease</code>, and an <code>UpdatePlan</code> with a <code>selector</code> rolls it to the nodes that carry a label.</li>
+      <li><b>Rolled out.</b> Those nodes update into their other slot, as above.</li>
+    </ol>
+  </figure>
+</section>
+
+<section id="hardware" class="part" data-see>
+  <div class="head">
+    <p class="no"><b>04</b> Hardware</p>
+    <h2>A GPU to share. A seat for a desktop.</h2>
+    <p>Hardware is a resource like the rest: a <code>Device</code> a workload claims, and a <code>Seat</code> that holds a screen, a keyboard and a GPU together. What a workload may take is written in its YAML, and a claim that does not fit waits and says why.</p>
+  </div>
+  <div class="pair">
+    <figure class="panel gpu" id="gpu">
+      <figcaption>Shares of a GPU's memory <span class="dim">an example, 8 GiB</span></figcaption>
+      <div class="bars shares">
+        <div class="row cap" style="--v:0.5"><p>render</p><div class="track"><i></i></div><b>4 GiB</b></div>
+        <div class="row cap" style="--v:0.25"><p>encode</p><div class="track"><i></i></div><b>2 GiB</b></div>
+        <div class="row cap" style="--v:0.125"><p>notebook</p><div class="track"><i></i></div><b>1 GiB</b></div>
+        <div class="row cap wait" style="--v:0.25"><p>batch</p><div class="track"><i></i></div><b>2 GiB, <small>1 left</small></b></div>
+      </div>
+      <p class="fine">Each claim says <code>share: { vram: 512Mi }</code> or more. Shares add up, and the one that does not fit waits: its message gives the numbers.</p>
+    </figure>
+    <ul class="points">
+      <li><b>A share is a ceiling</b> where the driver gives the kernel's <code>dmem</code> cgroup a region (amdgpu, xe, NVIDIA's). Each container gets the sum of its shares as <code>dmem.max</code>, and the claim's status says <code>enforced: true</code>.</li>
+      <li><b>Where kithd cannot hand the controller down</b> (it is not root) there is no ceiling, and the status says <code>enforced: false</code>. A share is then a promise between workloads.</li>
+      <li><b>A seat is given to a namespace</b> by a label. A session that claims it takes its screen, keyboard and GPU, and no other workload can.</li>
+    </ul>
+  </div>
+
+  <div class="head desk">
+    <h3>A desktop is a package.</h3>
+    <p>kith has no desktop of its own: a node nobody gives one stays headless. A package renders a session that holds a seat, and deleting the release makes the node headless again. kith ships no desktop images: you name one you built or trust.</p>
+  </div>
+  <div class="pair">
+    <div class="groups" id="desk">
+      <div class="group"><div><h3>On a seat</h3><small>A screen on the machine</small></div><p><span class="pk">gnome</span><span class="pk">hyprland</span><span class="pk">kiosk</span><span class="pk">kith-panel</span></p></div>
+      <div class="group"><div><h3>In a browser</h3><small>No screen needed</small></div><p><span class="pk">selkies</span></p></div>
+    </div>
+    <figure class="panel code">
+      <figcaption>a desktop on a seat</figcaption>
+<pre><span class="c">$</span> kith package render packages/hyprland \
+    --name office -n desktop \
+    --set seat=SEAT --set image=IMAGE \
+  | kith apply -f -</pre>
+      <p class="fine">Selkies is a desktop in a browser: a pod behind a Service on port 8080, and its login is the password of a Secret you make first. On a spare kith OS PC it answered 401 without the password, and 200 with it.</p>
+    </figure>
+  </div>
+</section>
+
+<section id="build" class="part" data-see>
+  <div class="head">
+    <p class="no"><b>05</b> Build</p>
+    <h2>Test on the cluster you are building.</h2>
+    <p>The tests of a pushed commit can run on another kith node, as a Job there, in a pod, as a user that is not root. <code>ci/remote.sh</code> prints what failed and how long it took, and exits as <code>cargo test</code> did.</p>
+  </div>
+  <div class="pair">
+    <figure class="panel code relay" id="relay">
+      <figcaption>from your machine</figcaption>
+<pre><span class="c">$</span> KITH_REMOTE=ADDR \
+  KITH_REMOTE_CREDS=DIR \
+  sh ci/remote.sh</pre>
+      <ol class="path">
+        <li>your commit</li><li>a Job on a node</li><li>cargo test, in a pod</li><li>what failed, and the time</li>
+      </ol>
+    </figure>
+    <figure class="panel took">
+      <figcaption>On a kith OS mini PC with 16 CPUs</figcaption>
+      <p class="big"><b><span data-n="remote.tests" data-count>218</span><small>s</small></b></p>
+      <div class="bars"><div class="row cap" style="--v:1"><p>every test</p><div class="track"><i></i></div></div></div>
+      <p class="fine">The whole workspace, from a fresh clone. One test, <code>node_policy_refuses_what_the_node_turned_off</code>, timed out in the pod: it differs there.</p>
+    </figure>
+  </div>
 </section>
 
 <section id="numbers" class="part" data-see>
   <div class="head">
-    <p class="no"><b>04</b> Numbers</p>
+    <p class="no"><b>06</b> Numbers</p>
     <h2>Small, and held to it.</h2>
     <p>Four budgets are measured by <code>ci/budgets.py</code>, and a build that goes over one fails. Every figure on this page is measured the same way and written here by a script: none is typed in.</p>
   </div>
   <div class="panel bars">
-    <div class="row" data-v="kith.size" data-of="kith.size.budget"><p><code>kith</code>, the command</p><div class="track"><i></i></div><b><span data-n="kith.size">2.93</span> MB <small>of <span data-n="kith.size.budget">3</span></small></b></div>
-    <div class="row" data-v="kithd.size" data-of="kithd.size.budget"><p><code>kithd</code>, everything else</p><div class="track"><i></i></div><b><span data-n="kithd.size">11.35</span> MB <small>of <span data-n="kithd.size.budget">13</span></small></b></div>
-    <div class="row" data-v="kithd.idle" data-of="kithd.idle.budget"><p><code>kithd</code> idle, memory</p><div class="track"><i></i></div><b><span data-n="kithd.idle">4.62</span> MB <small>of <span data-n="kithd.idle.budget">9</span></small></b></div>
-    <div class="row" data-v="apply.peak" data-of="apply.peak.budget"><p><code>kith apply</code>, peak memory</p><div class="track"><i></i></div><b><span data-n="apply.peak">2.93</span> MB <small>of <span data-n="apply.peak.budget">4</span></small></b></div>
+    <div class="row" data-v="kith.size" data-of="kith.size.budget"><p><code>kith</code>, the command</p><div class="track"><i></i></div><b><span data-n="kith.size">2.92</span> MB <small>of <span data-n="kith.size.budget">3</span></small></b></div>
+    <div class="row" data-v="kithd.size" data-of="kithd.size.budget"><p><code>kithd</code>, everything else</p><div class="track"><i></i></div><b><span data-n="kithd.size">12</span> MB <small>of <span data-n="kithd.size.budget">13</span></small></b></div>
+    <div class="row" data-v="kithd.idle" data-of="kithd.idle.budget"><p><code>kithd</code> idle, memory</p><div class="track"><i></i></div><b><span data-n="kithd.idle">4.71</span> MB <small>of <span data-n="kithd.idle.budget">9</span></small></b></div>
+    <div class="row" data-v="apply.peak" data-of="apply.peak.budget"><p><code>kith apply</code>, peak memory</p><div class="track"><i></i></div><b><span data-n="apply.peak">2.71</span> MB <small>of <span data-n="apply.peak.budget">4</span></small></b></div>
     <p class="fine">Static binaries for x86-64. The line at the right of each bar is its budget.</p>
   </div>
 
@@ -201,22 +295,23 @@
   </div>
 
   <div class="counts">
-    <div><b data-n="tests" data-count>791</b><p>tests in the tree</p></div>
-    <div><b data-n="vm_tests" data-count>15</b><p>more that boot whole machines in QEMU</p></div>
-    <div><b data-n="rust_lines" data-count>89603</b><p>lines of Rust, with <code>unsafe</code> forbidden outside one small crate</p></div>
+    <div><b data-n="tests" data-count>1071</b><p>tests in the tree</p></div>
+    <div><b data-n="vm_tests" data-count>23</b><p>more that boot whole machines in QEMU</p></div>
+    <div><b data-n="rust_lines" data-count>114407</b><p>lines of Rust, with <code>unsafe</code> forbidden outside one small crate</p></div>
     <div><b data-n="crates" data-count>14</b><p>crates in one workspace</p></div>
   </div>
 </section>
 
 <section id="kinds" class="part" data-see>
   <div class="head">
-    <p class="no"><b>05</b> Kinds</p>
-    <h2><span data-n="kinds">35</span> kinds, one way to say them.</h2>
+    <p class="no"><b>07</b> Kinds</p>
+    <h2><span data-n="kinds">38</span> kinds, one way to say them.</h2>
     <p>What runs, where its data lives, who may change it, and the machines themselves are all resources. You can define kinds of your own, with controllers and admission in WebAssembly. They are written in YAML, or in kith's own small language: a <code>.kith</code> file has names, functions and imports, gives the same resources, and is checked against the same schemas. Every node serves a web page with a form for each of them, drawn from its schema.</p>
   </div>
   <div class="groups">
     <div class="group"><div><h3>Run</h3><small>Containers, plain processes and virtual machines</small></div><p><span>Workload</span><span>NodeWorkload</span><span>Job</span><span>CronJob</span></p></div>
     <div class="group"><div><h3>Reach</h3><small>Names, load balancing, ingress with ACME, a DNS server</small></div><p><span>Service</span><span>DNSZone</span><span>DNSRecord</span><span>DNSBlockList</span><span>NetworkPolicy</span></p></div>
+    <div class="group"><div><h3>Tunnels</h3><small>A WireGuard way out for pods, and what a person's device reaches</small></div><p><span>Exit</span><span>AccessLevel</span><span>RemotePeer</span></p></div>
     <div class="group"><div><h3>Keep</h3><small>Replicated and encrypted volumes, backups to S3, shares</small></div><p><span>Volume</span><span>VolumeClaim</span><span>Blob</span><span>Backup</span><span>Image</span><span>Share</span></p></div>
     <div class="group"><div><h3>Configure</h3><small>Delivered as files or environment</small></div><p><span>Secret</span><span>ConfigMap</span></p></div>
     <div class="group"><div><h3>Hardware</h3><small>GPUs, displays and input, claimed by a workload</small></div><p><span>Seat</span><span>Device</span><span>DeviceClaim</span></p></div>
@@ -238,7 +333,7 @@
 
 <section id="security" class="part" data-see>
   <div class="head">
-    <p class="no"><b>06</b> Security</p>
+    <p class="no"><b>08</b> Security</p>
     <h2>Kept small, and said plainly.</h2>
   </div>
   <div class="cards">
@@ -254,7 +349,7 @@
 
 <section id="start" class="part" data-see>
   <div class="head">
-    <p class="no"><b>07</b> Start</p>
+    <p class="no"><b>09</b> Start</p>
     <h2>One machine is enough to begin.</h2>
     <p><code>kithd</code> runs as you, with no root, on a Linux you already have. kith OS and more machines can come later.</p>
   </div>
@@ -270,15 +365,17 @@
     </figure>
     <figure class="panel code">
       <figcaption>and then another</figcaption>
-<pre><span class="c">$</span> kithd --listen 192.168.1.10:7443 --name alpha
+<pre><span class="c">$</span> kithd --listen 192.0.2.10:7443 --name alpha
 <span class="c">$</span> kith node token
 <span class="c"># on the other machine</span>
-<span class="c">$</span> kithd --join 192.168.1.10:7443 --token TOKEN --name beta
+<span class="c">$</span> kithd --join 192.0.2.10:7443 --token TOKEN --name beta
 <span class="c">$</span> kith get node</pre>
     </figure>
   </div>
   <p class="acts">
     <a class="button" href="https://github.com/ChaseSunstrom/kith#readme">The README has the rest</a>
+    <a class="button quiet" href="install.html">Install kith OS</a>
+    <a class="button quiet" href="guide/index.html">The guide</a>
     <a class="button quiet" href="https://github.com/ChaseSunstrom/kith/blob/main/PLAN.md">The design</a>
   </p>
 </section>
@@ -288,10 +385,10 @@
 
 <footer>
   <p><b>kith</b> <span class="dim">is written in Rust, under the Apache-2.0 licence.</span></p>
-  <p class="dim">Numbers measured on <span data-n="measured">2026-11-15</span> by <code>ci/site_numbers.py</code>. This page loads nothing from anywhere else.</p>
+  <p class="dim">Numbers measured on <span data-n="measured">2026-11-17</span> by <code>ci/site_numbers.py</code>. This page loads nothing from anywhere else.</p>
 </footer>
 
-<script id="measured" type="application/json">{"apply.peak": 2.93, "apply.peak.budget": 4, "by_crate": {"kithd": [57334, 504], "kith-cli": [4389, 43], "kith-api": [5329, 39], "kith-lsp": [898, 1], "kith-yaml": [942, 9], "kith-packages": [969, 10], "kith-sched": [974, 21], "kith-runtime": [6089, 54], "kith-dns": [3340, 55], "kith-lang": [2628, 15], "kith-kube": [3726, 14], "kith-mesh": [1210, 4], "kith-store": [1237, 9], "kith-dm-sys": [538, 13]}, "cmp.k3s.apply": 0.5, "cmp.k3s.before": 233, "cmp.k3s.burst": 4.29, "cmp.k3s.control": 1030, "cmp.k3s.cpu": 11.2, "cmp.k3s.cpu2": 5.1, "cmp.k3s.crash": 0.69, "cmp.k3s.disk": 1261, "cmp.k3s.each": 11.9, "cmp.k3s.job": 2.92, "cmp.k3s.kept": 24081, "cmp.k3s.login": 24.7, "cmp.k3s.lost": 350, "cmp.k3s.lost60": 57, "cmp.k3s.p50": 3, "cmp.k3s.p99": 9, "cmp.k3s.ready": 30.8, "cmp.k3s.roll": 1.33, "cmp.k3s.rps": 6988, "cmp.k3s.scale": 2.72, "cmp.k3s.version": "v1.37.2", "cmp.k3s.worker": 474, "cmp.kith.apply": 0.03, "cmp.kith.boot": 2.5, "cmp.kith.burst": 0.16, "cmp.kith.control": 66, "cmp.kith.cpu": 0.8, "cmp.kith.cpu2": 0.8, "cmp.kith.crash": 0.01, "cmp.kith.disk": 248, "cmp.kith.each": 0.4, "cmp.kith.job": 0.07, "cmp.kith.kept": 26004, "cmp.kith.lost": 300, "cmp.kith.lost60": 60, "cmp.kith.p50": 2, "cmp.kith.p99": 8, "cmp.kith.ready": 2.6, "cmp.kith.roll": 0.14, "cmp.kith.rps": 7367, "cmp.kith.scale": 0.17, "cmp.kith.worker": 65, "cmp.runs": 3, "crates": 14, "kinds": 35, "kith.size": 2.93, "kith.size.budget": 3, "kithd.idle": 4.62, "kithd.idle.budget": 9, "kithd.size": 11.35, "kithd.size.budget": 13, "measured": "2026-11-15", "os.image": 282, "os.root": 6.2, "os.update": 32.1, "refused": 40, "refused.names": ["mount", "umount2", "pivot_root", "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount", "fspick", "mount_setattr", "open_by_handle_at", "unshare", "setns", "clone", "clone3", "init_module", "finit_module", "delete_module", "kexec_load", "kexec_file_load", "reboot", "swapon", "swapoff", "acct", "settimeofday", "clock_settime", "bpf", "perf_event_open", "userfaultfd", "io_uring_setup", "io_uring_enter", "io_uring_register", "add_key", "request_key", "keyctl", "ptrace", "process_vm_readv", "process_vm_writev", "kcmp", "pidfd_getfd"], "rust_lines": 89603, "tests": 791, "version": "1.0.0", "vm_tests": 15}</script>
+<script id="measured" type="application/json">{"apply.peak": 2.71, "apply.peak.budget": 4, "by_crate": {"kithd": [74366, 709], "kith-cli": [4833, 50], "kith-api": [6253, 47], "kith-lsp": [898, 1], "kith-yaml": [1163, 11], "kith-packages": [1025, 12], "kith-sched": [975, 21], "kith-runtime": [9349, 80], "kith-dns": [3394, 56], "kith-lang": [2674, 17], "kith-kube": [3781, 15], "kith-mesh": [2519, 15], "kith-store": [2118, 19], "kith-dm-sys": [1059, 18]}, "cmp.k3s.apply": 0.5, "cmp.k3s.before": 233, "cmp.k3s.burst": 4.29, "cmp.k3s.control": 1030, "cmp.k3s.cpu": 11.2, "cmp.k3s.cpu2": 5.1, "cmp.k3s.crash": 0.69, "cmp.k3s.disk": 1261, "cmp.k3s.each": 11.9, "cmp.k3s.job": 2.92, "cmp.k3s.kept": 24081, "cmp.k3s.login": 24.7, "cmp.k3s.lost": 350, "cmp.k3s.lost60": 57, "cmp.k3s.p50": 3, "cmp.k3s.p99": 9, "cmp.k3s.ready": 30.8, "cmp.k3s.roll": 1.33, "cmp.k3s.rps": 6988, "cmp.k3s.scale": 2.72, "cmp.k3s.version": "v1.37.2", "cmp.k3s.worker": 474, "cmp.kith.apply": 0.03, "cmp.kith.boot": 2.5, "cmp.kith.burst": 0.16, "cmp.kith.control": 66, "cmp.kith.cpu": 0.8, "cmp.kith.cpu2": 0.8, "cmp.kith.crash": 0.01, "cmp.kith.disk": 248, "cmp.kith.each": 0.4, "cmp.kith.job": 0.07, "cmp.kith.kept": 26004, "cmp.kith.lost": 300, "cmp.kith.lost60": 60, "cmp.kith.p50": 2, "cmp.kith.p99": 8, "cmp.kith.ready": 2.6, "cmp.kith.roll": 0.14, "cmp.kith.rps": 7367, "cmp.kith.scale": 0.17, "cmp.kith.worker": 65, "cmp.runs": 3, "crates": 14, "kinds": 38, "kith.size": 2.92, "kith.size.budget": 3, "kithd.idle": 4.71, "kithd.idle.budget": 9, "kithd.size": 12, "kithd.size.budget": 13, "measured": "2026-11-17", "os.image": 282, "os.root": 6.2, "os.update": 32.1, "refused": 40, "refused.names": ["mount", "umount2", "pivot_root", "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount", "fspick", "mount_setattr", "open_by_handle_at", "unshare", "setns", "clone", "clone3", "init_module", "finit_module", "delete_module", "kexec_load", "kexec_file_load", "reboot", "swapon", "swapoff", "acct", "settimeofday", "clock_settime", "bpf", "perf_event_open", "userfaultfd", "io_uring_setup", "io_uring_enter", "io_uring_register", "add_key", "request_key", "keyctl", "ptrace", "process_vm_readv", "process_vm_writev", "kcmp", "pidfd_getfd"], "remote.tests": 218, "rust_lines": 114407, "tests": 1071, "version": "1.0.0", "vm_tests": 23}</script>
 <script src="site.js"></script>
 </body>
 </html>

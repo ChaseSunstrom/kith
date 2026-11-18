@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en" data-root="../">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Storage: kith</title>
+<meta name="description" content="NFS is served by the volume&#x27;s node (NFS 4.2, port 2049 of its IPv4 addresses) to the addresses in nfs.clients only, never the cluster&#x27;s nodes. kith get share films -o yaml says the node and path; on...">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../site.css">
+<link rel="stylesheet" href="../docs.css">
+<script src="../docs.js" defer></script>
+</head>
+<body>
+<!-- Made by ci/site_docs.py from docs/guide/storage.md: change the markdown, then run it again. -->
+<header class="bar">
+  <a class="brand" href="../index.html" aria-label="kith: the front page">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true"><line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/><circle cx="22" cy="14" r="4"/><circle cx="22" cy="50" r="4"/><circle cx="43" cy="19" r="4.5"/><circle cx="43" cy="50" r="4.5"/><circle class="ring" cx="24" cy="37" r="5.5"/><circle class="hub" cx="24" cy="37" r="5.5"/></svg>
+    <b>kith</b>
+  </a>
+  <nav aria-label="Sections">
+    <a href="../guide/index.html">Guide</a>
+    <a href="../guide/index.html#decisions">Decisions</a>
+    <a href="../index.html#numbers">Numbers</a>
+  </nav>
+  <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+</header>
+<div class="doc">
+<aside class="side">
+  <form class="find" role="search" hidden>
+    <label for="q">Search the headings</label>
+    <input id="q" type="search" placeholder="Search the headings" autocomplete="off" spellcheck="false">
+  </form>
+  <ol class="found" aria-live="polite" hidden></ol>
+  <details class="rail" open>
+    <summary>The guide</summary>
+    <nav aria-label="The guide's pages"><ol class="stops"><li><a href="index.html">All the pages</a></li><li><a href="os.html">kith OS</a></li><li><a href="cluster.html">A cluster</a></li><li><a href="workloads.html">What kithd does today</a></li><li class=here><a href="storage.html" aria-current="page">Storage</a><ol class="inner"><li class="h2"><a href="#shared-volumes">Shared volumes</a></li><li class="h2"><a href="#shares-a-volume-for-machines-that-are-not-nodes">Shares: a volume for machines that are not nodes</a></li><li class="h2"><a href="#replicas">Replicas</a></li><li class="h2"><a href="#encrypted-volumes">Encrypted volumes</a></li><li class="h2"><a href="#blobs">Blobs</a></li><li class="h2"><a href="#files-in-and-out-of-a-volume">Files in and out of a volume</a></li><li class="h2"><a href="#backups">Backups</a></li><li class="h2"><a href="#images-made-in-the-cluster">Images made in the cluster</a></li><li class="h2"><a href="#remote-apps">Remote apps</a></li></ol></li><li><a href="hardware.html">Hardware</a></li><li><a href="packages.html">Packages and Sources</a></li><li><a href="access.html">Access</a></li><li><a href="api.html">Resources and the language</a></li><li><a href="kubernetes.html">Coming from Kubernetes, Helm, Proxmox or compose</a></li><li><a href="ui.html">Web UI</a></li><li><a href="development.html">Working on kith</a></li><li><a href="numbers.html">How the numbers beside k3s were taken</a></li></ol><p class="rail-group">Decisions and reviews</p><ol class="stops"><li><a href="../adr-keyless.html">image signatures made without a kept key (T-0463)</a></li><li><a href="../adr-people.html">People's devices into the home network: peers, levels and where a level holds</a></li><li><a href="../adr-privilege.html">kithd in two parts: what reads the network holds no root</a></li><li><a href="../adr-taken-node.html">A taken control node is not the cluster taken</a></li><li><a href="../adr-unlock.html">The ways into a node's encrypted state, and what each leaves open</a></li><li><a href="../adr-workers.html">A worker keeps no Secret that nothing placed on it names</a></li><li><a href="../security-review-2.html">Security review 2</a></li></ol></nav>
+  </details>
+</aside>
+<div class="page" role="main">
+<article>
+<h1 id="storage">Storage</h1>
+<p>A <code>Volume</code> is a directory on one node. A container mounts one by naming it, or a <code>VolumeClaim</code> bound to one, in its <code>volumeMounts</code>:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: db-disk }
+spec: { node: n1, path: db, size: 20Gi }
+---
+apiVersion: kith.dev/v1
+kind: VolumeClaim
+metadata: { name: db-data }
+spec: { size: 10Gi }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db }
+spec:
+  template:
+    containers:
+      - name: run
+        image: example/db
+        volumeMounts: [{ volume: db-data, path: /var/lib/db }]
+</code></pre>
+<ul><li>The workload runs on the volume's node only, unless the volume is <code>shared</code> (below). Volumes on two nodes, or a <code>DeviceClaim</code> on another node, leave it unplaced (<code>unschedulable</code> says why).</li><li>A claim takes the first Volume (by name) of its namespace that is free, big enough, on a node matching its <code>selector</code>, and <code>shared</code> if the claim asks (<code>status.volume</code> and <code>status.message</code> show the pairing). If its Volume is deleted it takes no other: make the Volume again, or delete the claim and apply it again.</li><li><code>provision: true</code> on a claim with no Volume makes one of its name and size on the ready node with the fewest Volumes; it goes with the claim, its directory stays. Whoever applies such a claim must be allowed to apply a Volume.</li><li>The container sees a bind mount (<code>readOnly: true</code> for read-only) of <code>&lt;state&gt;/volumes/&lt;namespace&gt;/&lt;name&gt;/&lt;path&gt;</code>. <code>path</code> must be relative, with no <code>..</code> or symbolic link in it (in <code>kith-system</code>, an absolute host path). A container path that is relative, has <code>..</code>, or is <code>/</code>, <code>/proc</code>, <code>/sys</code> or <code>/dev</code> (or under them) stops the unit.</li><li>Not yet: <code>subvolume: true</code> makes a plain directory; <code>size</code> is no quota; an <code>exec</code> unit and a NodeWorkload mount nothing.</li></ul>
+<h3 id="shared-volumes">Shared volumes <a class="anchor" href="#shared-volumes" aria-label="Link to this section">#</a></h3>
+<p><code>shared: true</code> on a Volume lets a workload that mounts it run on any node:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: media }
+spec: { node: n1, path: media, shared: true }
+</code></pre>
+<ul><li>The data stays on <code>n1</code>; a replica elsewhere mounts it over the mesh (NFS 4.2 over WireGuard) under <code>&lt;state&gt;/remote/n1/&lt;namespace&gt;/&lt;name&gt;</code>. A workload that also mounts an unshared volume goes to that volume's node. Only the cluster's nodes can reach it; a container gets nothing, and every node is trusted with it as root.</li><li>It takes the mesh (<code>--mesh</code>) and a kernel with the NFS server and NFS 4.2 client (kith OS has them); kithd drives the kernel itself and leaves a machine's own NFS server alone. While the volume's node is away, a container using it from another node waits (a <code>hard</code> mount).</li><li>Not yet: <code>kith-system</code>, VMs and non-node machines cannot use one; the data is not copied.</li></ul>
+<h3 id="shares-a-volume-for-machines-that-are-not-nodes">Shares: a volume for machines that are not nodes <a class="anchor" href="#shares-a-volume-for-machines-that-are-not-nodes" aria-label="Link to this section">#</a></h3>
+<p>A <code>Share</code> gives a Volume to the laptops, televisions and phones on your network:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Share
+metadata: { name: films }
+spec:
+  volume: media          # in this namespace
+  readOnly: false        # [false]
+  uid: 1000              # whoever uses the share is this user on the files [65534, nobody]
+  gid: 1000
+  nfs:
+    clients: [192.168.1.0/24, 192.168.2.7]   # who may mount it over NFS
+  users: [ada, grace]    # the Identities that may use it over SMB
+</code></pre>
+<ul><li><p><strong>NFS</strong> is served by the volume's node (NFS 4.2, port 2049 of its IPv4 addresses) to the addresses in <code>nfs.clients</code> only, never the cluster's nodes. <code>kith get share films -o yaml</code> says the <code>node</code> and <code>path</code>; on a client, <code>mount -t nfs4 NODE:PATH /mnt</code>. Every client is the Share's <code>uid</code> and <code>gid</code> on the files (nobody, 65534, unless you say: name the user a container on the volume runs as). One Share gives a volume over NFS (the first by name).</p></li><li><p><strong>SMB</strong> is a Samba container the <code>nas</code> package runs on the volume's node (port 445):</p><pre><code class="language-sh">kith apply -f passwords.yaml    # a Secret with a password under each user's name
+kith package render packages/nas --name films \
+    --set volume=media --set 'users=[ada,grace]' --set passwords=nas-passwords \
+    --set image=registry.example/nas/samba:1 | kith apply -f -
+</code></pre><p>The package makes the Share too (<code>--set 'nfs.clients=[192.168.1.0/24]'</code> for NFS beside it). kith ships no Samba image: name one you trust, with Samba 4.15 or later and <code>nss_wrapper</code>.</p></li><li><p>A Share's <code>status</code> says why it is given to nobody. Applying one takes leave to apply its Volume.</p></li><li><p>Not yet: NFS trusts an address (no Kerberos), so name single addresses or a network you trust (wider than a /8 is refused); IPv6 clients are not served; SMB users all write as one user, on port 445 of every address (one <code>nas</code> release a node); a <code>kith-system</code> Volume cannot be given; <strong>the Samba half has been rendered and its start script run against stand-ins, not run with a real Samba here</strong>.</p></li></ul>
+<h3 id="replicas">Replicas <a class="anchor" href="#replicas" aria-label="Link to this section">#</a></h3>
+<p>A Volume can be kept on more than one node, and move when its node is lost:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: data }
+spec:
+  node: alpha     # where it is to begin with
+  path: d
+  replicas: 2     # copies in all: this one, and one on another node
+  sync: 5m        # how often the others are brought up to date (5m unless said)
+</code></pre>
+<ul><li>The cluster picks the other nodes (<code>status.replicas</code>). Every <code>sync</code> (at least <code>10s</code>), each fetches the directory from the node that has the volume (<code>status.primary</code>) over the cluster's mutual TLS and replaces its own copy; <code>status.synced</code> says when.</li><li>When the primary is not heard from for <code>--lost-after</code>, the replica that synced last becomes primary and workloads that mount the volume are placed there. A node that comes back is not given the volume back; what it had is kept as <code>PATH.was-TIME</code> (yours to delete).</li><li><strong>A failover loses what was written after the last sync</strong>, and a copy is the directory as read while in use: a database caught mid-write may need its own recovery.</li><li>A restore, a replica's first copy and each sync unpack no more than the Volume's <code>size</code> and stop with an error when more arrives (no <code>size</code>, no cap: a Volume that outgrows it cannot be restored from its own Backup).</li><li>Not yet: each sync sends the whole volume, so this is for modest data; it cannot be <code>shared</code> or in <code>kith-system</code>; moving a volume back is by hand.</li></ul>
+<h3 id="encrypted-volumes">Encrypted volumes <a class="anchor" href="#encrypted-volumes" aria-label="Link to this section">#</a></h3>
+<p>A Volume can be kept encrypted on its node's disk, with its key held by the other nodes:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: vault }
+spec:
+  node: alpha
+  path: data
+  size: 20Gi        # needed: the volume has all of it from the start (8Mi at least)
+  encrypted: true   # said when the Volume is made
+</code></pre>
+<ul><li>On its node the volume is one file of that size, opened through dm-crypt (aes-xts, a 512-bit key) and mounted where the volume's directory would be.</li><li><strong>The key is never on the volume's node's disk.</strong> Every other node keeps a copy and hands it to the volume's node alone, over the cluster's mutual TLS, each time that node opens the volume. A disk taken from the node has the file and no key. <strong>When a node's disk is lost, delete its Node</strong> (<code>kith delete node/NAME</code>), or <code>kith node lock NAME</code> if its state is encrypted: the others then hand its keys to nobody.</li><li>Until it is open, a workload that mounts it does not start and says so. <strong>A cluster of one node cannot have an encrypted volume</strong>; if every node that keeps the key is gone, so is the volume.</li><li>Not yet: someone with the volume's node's disk <em>and</em> another node's disk can open it, unless that node's state is <a href="os.html#encrypted-state">encrypted too</a>. A Backup or an Image of it is not encrypted. It cannot be <code>shared</code>, have <code>replicas</code>, or be in <code>kith-system</code>; it is not resized; it needs kith OS. Tested in VMs (<code>sh ci/vm.sh --test share</code>).</li></ul>
+<h3 id="blobs">Blobs <a class="anchor" href="#blobs" aria-label="Link to this section">#</a></h3>
+<p>Bytes the cluster keeps by what they are, on more than one node:</p>
+<pre><code class="language-sh">kith blob put backup.tar          # prints the name the bytes are kept under
+kith blob get NAME -o backup.tar  # from any node, whichever nodes hold them
+</code></pre>
+<ul><li>A blob's name is the first 62 hex digits of the BLAKE3 hash of its bytes, so the same bytes put twice are one file. <code>put</code> makes a <code>Blob</code> resource (<code>spec.copies</code>: 2 unless <code>--copies</code> says) and answers once the bytes are on the node asked; the other holders fetch them within seconds over the cluster's mutual TLS and write themselves into <code>status.nodes</code>. A copy that does not hash to its name is thrown away; a holder not heard from for a minute is replaced.</li><li>Reading needs <code>get</code> on <code>Blob</code> in its namespace, putting needs <code>apply</code>; a Blob cannot be made with <code>kith apply</code>, so knowing a name lets no other namespace read it.</li><li>Not yet: a blob passes through the CLI's memory whole; no size limit but the disk.</li></ul>
+<h3 id="files-in-and-out-of-a-volume">Files in and out of a volume <a class="anchor" href="#files-in-and-out-of-a-volume" aria-label="Link to this section">#</a></h3>
+<pre><code class="language-sh">kith volume put data ./nextcloud-data    # what is in the directory, into the Volume `data`
+kith volume put data ./config.php        # or one file, under its name
+kith volume get data ./copy              # what is in the Volume, into a directory
+tar -cf - -C /srv/app . | kith volume put data -   # a tar you make yourself (`get … -` writes one)
+</code></pre>
+<ul><li>The node that has the Volume does it, whichever node is asked, as one tar stream (<code>kith</code> runs the machine's own <code>tar</code>). A put adds to what is there: a file replaces one of its name, nothing else is touched. It arrives first in <code>.kith-put</code> and is moved in when the whole stream was good, so a refused or cut-short put leaves the Volume as it was. A running container that changes the Volume's directories meanwhile can leave a put half moved in: stop it first.</li><li>Files, directories, links and hard links go in, with modes (less setuid and setgid) and times. The owner is not carried: they are the user's that the Volume's directory is, the user of the container that mounts it (see <a href="workloads.html#what-a-container-is-kept-from">What a container is kept from</a>).</li><li>Refused, with the entry's name: a path that leaves the Volume or goes through a link, a device, a pipe, a sparse file, a file where the Volume has a directory or the other way round, more bytes than the Volume's <code>size</code>, and whatever would leave the node's disk under 64 MiB free. A link that points out of the Volume is left out, and the reply names each.</li><li>Both need <code>apply</code> on <code>Volume</code> and on <code>Workload</code> in the namespace: whoever may run a workload that mounts the Volume reads and writes the same files. Each is in the audit log. A <code>kith-system</code> Volume is neither read nor written this way. Unpack a get as an ordinary user, not root, which would keep the owners and setuid bits of whatever ran there.</li><li>Not yet: no path inside the Volume to put into or get from.</li></ul>
+<h3 id="backups">Backups <a class="anchor" href="#backups" aria-label="Link to this section">#</a></h3>
+<p>A <code>Backup</code> archives a Volume every so often and keeps the last few:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Backup
+metadata: { name: nightly }
+spec:
+  volume: data      # a Volume in this namespace
+  every: 24h        # a number and s, m, h or d
+  keep: 7           # how many are kept (7 unless said)
+</code></pre>
+<ul><li><p>The node the volume is on makes a tar of its directory when one is due and keeps it as a blob (<code>copies</code>, 2 unless said). <code>status.backups</code> lists them, oldest first (<code>at</code>, <code>size</code>, <code>blob</code>). One that fails says why in <code>status.message</code> and is tried again in ten minutes.</p></li><li><p>To an S3-compatible bucket instead:</p><pre><code class="language-yaml">spec:
+  volume: data
+  every: 24h
+  s3:
+    endpoint: https://s3.example.org   # objects are endpoint/bucket/prefix…
+    bucket: backups
+    prefix: kith/                      # optional
+    region: us-east-1                  # optional
+    secret: s3-keys                    # a Secret here with accessKey and secretKey
+</code></pre><p>Requests are signed (AWS Signature Version 4) and go over <code>https://</code> only, to the internet or the LAN, not to the node itself, a link-local address or the mesh; redirects are not followed. Whoever may apply a Backup chooses where the volumes go, so it needs <code>get</code> on <code>Volume</code> and <code>Secret</code> as well as <code>apply</code> on <code>Backup</code>.</p></li><li><p><code>kith backup restore NAME [--at SECONDS]</code> unpacks one (the last unless said) into the volume, on its node, whichever node is asked. The volume must be empty. It needs <code>apply</code> on <code>Backup</code> and <code>Volume</code>. Files keep their owner, mode and times, less setuid and setgid.</p></li><li><p>An archive holds files, directories and links (never followed); pipes, sockets and devices are left out. A volume more than 128 directories deep, or with a file kithd cannot read, is not archived: the Backup's status says which.</p></li><li><p>Not yet: the archive is of the directory as it is while read, not a snapshot: stop what writes to it for an exact backup, and the workloads that use a volume before restoring it. Each backup is whole, and not encrypted beyond TLS. Deleting a Backup leaves what it made.</p></li></ul>
+<h3 id="images-made-in-the-cluster">Images made in the cluster <a class="anchor" href="#images-made-in-the-cluster" aria-label="Link to this section">#</a></h3>
+<p>The cluster can build a container image and run it with no registry outside it. A build is a Job that leaves the image's files in a Volume; an <code>Image</code> is that volume, packed:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Image
+metadata: { name: hello }
+spec:
+  volume: hello-root          # its directory is the image's root
+  job: hello-build            # made when this Job has succeeded (leave out: made at once)
+  tag: "1"                    # latest, unless said
+  entrypoint: [/bin/hello]    # and cmd, env (NAME=value), workingDir
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: hello }
+spec:
+  template:
+    containers: [{ name: run, image: "localhost:5000/default/hello:1" }]
+</code></pre>
+<ul><li><p>The volume's node packs the directory as the image's one layer and keeps it as Blobs. <code>kith get image hello -o yaml</code> has the <code>digest</code> when it is made, or a <code>message</code> saying why not.</p></li><li><p><strong>The registry</strong> is on <code>127.0.0.1:5000</code> of every node (<code>--registry-port</code>; 0 turns it off), a read-only OCI registry: <code>localhost:5000/NAMESPACE/NAME:TAG</code> is the Image <code>NAME</code> of <code>NAMESPACE</code>. It answers kithd's own pull and nothing else on the node: it speaks TLS under a certificate and a password that kithd makes for each start, so <code>docker pull</code> on a node gets nothing.</p></li><li><p><strong>The <code>kith-build</code> package</strong> renders a Volume on the node you name, a Job that runs your script in a builder image with the volume at <code>/out</code> (as root), and the Image. Nothing privileged builds: no daemon, no nested containers.</p><pre><code class="language-sh">kith package render packages/kith-build --name hello --set node=n1 \
+    --set builder=registry.example/tools:1 --set tag=2 --set 'entrypoint=[/hello]' \
+    --set 'script=cc -static -o /out/hello /src/hello.c' | kith apply -f -
+</code></pre></li><li><p>An Image is made once per spec and Job run; a node keeps a tag it has pulled, so give what should roll out a new tag.</p></li><li><p>What runs in a namespace runs that namespace's Images only: a template in <code>web</code> naming <code>localhost:5000/default/hello:1</code> is not started, and says why. Writing an Image takes leave to read its Volume.</p></li><li><p>Not yet: a base image under the layer (<code>FROM</code>); Dockerfiles; <code>docker push</code>; a registry other machines can reach; deleting an Image leaves its Blobs. Not tested: a pull on another node.</p></li></ul>
+<h3 id="remote-apps">Remote apps <a class="anchor" href="#remote-apps" aria-label="Link to this section">#</a></h3>
+<p><code>kith run --on NODE|SELECTOR [--via PROGRAM] -- APP [ARGS…]</code> runs a graphical app on another node and opens its window on this machine, through <a href="https://gitlab.freedesktop.org/mstoeckl/waypipe">waypipe</a> over the mesh. <code>--on</code> is a node's name, or labels (<code>role=display,zone=lab</code>) for the first ready Node, by name, that has them; <code>--via</code> names the program that carries the window (default <code>waypipe</code>). The command line is passed as written, never through a shell.</p>
+<ul><li><strong>waypipe must be installed on both ends</strong> (kith does not ship it). The windows are tagged for your compositor as a sandboxed program's (<code>waypipe --secctx dev.kith.run</code>, Wayland's security-context-v1), so that it keeps them from reading the screen or typing as you. A waypipe before 0.9, a compositor without that protocol or another <code>--via</code> program does not take the tag: the app then starts without it, and <code>kith run</code> says so.</li><li><strong>Who may:</strong> only who may run the node itself: a Role rule with <code>verbs: [exec]</code> on <code>kinds: [Node]</code> and no <code>namespaces</code> (<code>admin</code> has it). The app runs as kithd's user on the node, outside any container, so a right in one namespace is never enough. It is checked on the node you ask; the other node accepts the hop only from a cluster node, asks its own store whether the caller may, and writes its own audit entry with both names (it takes the first node's word for who asked: see SECURITY.md).</li><li><strong>How:</strong> <code>kith</code> asks its kithd for a tunnel (<code>POST /v1/run</code>); kithd runs the app under <code>waypipe server</code>, <code>kith</code> runs <code>waypipe client</code>, and the two are joined. Either end closing kills the app and what it started. The command line is in the audit log: pass no secret.</li><li>Not yet: a node that vanishes without a word leaves an idle app running on the other; one <code>kith run</code> carries one connection; the app's exit status is not returned.</li></ul>
+</article>
+<footer class="tail"><nav aria-label="Next page"><a class="before" href="workloads.html"><span>Before</span>What kithd does today</a><a class="after" href="hardware.html"><span>After</span>Hardware</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/storage.md">docs/guide/storage.md</a>.</p></footer>
+</div>
+</div>
+</body>
+</html>

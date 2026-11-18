@@ -148,7 +148,7 @@ macro_rules! kinds {
 }
 
 kinds! {
-    Cluster: ClusterSpec, cluster, "Cluster-wide settings: the keys that sign images (the other fields are kept and not acted on)";
+    Cluster: ClusterSpec, cluster, "Cluster-wide settings: the keys that sign images, the admin's key and whether callers must sign (the other fields are kept and not acted on)";
     Node: NodeSpec, cluster, "One machine: roles, taints, OS version, system extensions, resource reservations";
     Namespace: NamespaceSpec, cluster, "Grouping, quotas, default policies";
     Workload: WorkloadSpec, namespaced, "Long-running replicas";
