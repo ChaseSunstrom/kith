@@ -217,6 +217,8 @@ fn passed_on(path: &str) -> bool {
             | ["volumes", _, _, "files"]
             | ["lock", _, "passphrase" | "recovery"]
             | ["backups", _, _, "restore"]
+            // (A control node that is not the leader passes a change to it as it came.)
+            | ["apply"]
     )
 }
 

@@ -826,6 +826,18 @@ impl Shared {
             Ok(_) => return Forward::Again(None),
             Err(e) => return Forward::Again(Some(e)),
         };
+        // A signed apply goes to the leader as it came (its path, body and header), and the leader
+        // runs it as `/v1/apply` would: a Command re-serialized would not be what was signed.
+        if let Some(relay) = access_sign::current().and_then(|signed| signed.relay) {
+            if matches!(command, Command::Apply { .. }) {
+                let call = client
+                    .post(format!("https://{at}{}", relay.path))
+                    .header(access::FOR, relay.who.to_string())
+                    .header("content-type", "application/json")
+                    .body(relay.body);
+                return self.relayed(access_sign::pass_on(call), at).await;
+            }
+        }
         let mut call = access_sign::pass_on(client.post(format!("https://{at}/v1/raft/write")));
         // Whose write it is, for the leader to decide again in the log's order (`write`).
         if let Some(name) = who.and_then(Caller::identity) {
@@ -849,6 +861,41 @@ impl Shared {
             }
             // Never reached it (or refused it, which is the same to the change): nothing
             // happened, and asking again is safe.
+            Err(e) if e.is_connect() => Forward::Again(Some(format!(
+                "the leader at {at} was not reached: {}",
+                crate::cluster::why(&e)
+            ))),
+            Err(e) => {
+                let why = format!(
+                    "the leader at {at} did not answer ({}); look before trying again",
+                    crate::cluster::why(&e)
+                );
+                Forward::Failed(unavailable(why))
+            }
+        }
+    }
+
+    /// What the leader did with a signed apply passed on as it came (`call`), as this node's
+    /// reply. The leader's write is in the log before it answers: a `Mark` after it has the
+    /// index this node waits for, so the changes it returns are read back here too.
+    async fn relayed(&self, call: reqwest::RequestBuilder, at: &str) -> Forward {
+        match call.timeout(PATIENCE).send().await {
+            Ok(reply) if reply.status().is_success() => {
+                let Ok(changes) = reply.json::<Vec<kith_api::store::Change>>().await else {
+                    let why = format!("the leader at {at} did not answer with the changes it made");
+                    return Forward::Failed(unavailable(why));
+                };
+                let index = match Box::pin(self.write_as(Command::Mark, None)).await {
+                    Ok((_, index)) => index,
+                    Err(e) => return Forward::Failed(e),
+                };
+                let caught_up = self.raft.wait(Some(PATIENCE));
+                let _ = caught_up.applied_index_at_least(Some(index), "own write").await;
+                Forward::Done(Ok(Done::Changes(changes)), index)
+            }
+            // (The leader refused it: what it says is the reply, as for a write.)
+            Ok(reply) => Forward::Failed(Error::Invalid(reply.text().await.unwrap_or_default())),
+            // Never reached it: nothing happened, and asking again is safe.
             Err(e) if e.is_connect() => Forward::Again(Some(format!(
                 "the leader at {at} was not reached: {}",
                 crate::cluster::why(&e)

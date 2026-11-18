@@ -737,6 +737,76 @@ fn secret(prompt: &str, twice: bool) -> Result<String, String> {
     Ok(first)
 }
 
+/// Where the admin's passphrase comes from: the terminal, else one line of stdin, which no
+/// line can give when stdin carries the input (`apply -f -`): then the manifest goes as a file.
+#[derive(Debug, PartialEq)]
+enum Source {
+    Tty,
+    Stdin,
+    Refuse,
+}
+
+fn passphrase_source(tty_opens: bool, stdin_is_input: bool) -> Source {
+    match (tty_opens, stdin_is_input) {
+        (true, _) => Source::Tty,
+        (false, false) => Source::Stdin,
+        (false, true) => Source::Refuse,
+    }
+}
+
+/// Set once a command reads its input from stdin (`apply -f -`, `volume put -`).
+static STDIN_WAS_INPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The admin's passphrase: typed at /dev/tty with echo off (twice, when `twice`), else one line
+/// of stdin.
+fn admin_passphrase(prompt: &str, twice: bool) -> Result<String, String> {
+    use std::sync::atomic::Ordering;
+    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty");
+    let source = passphrase_source(tty.is_ok(), STDIN_WAS_INPUT.load(Ordering::SeqCst));
+    match source {
+        Source::Tty => typed_on(&tty.expect("chosen only when /dev/tty opened"), prompt, twice),
+        Source::Stdin => one_line(&mut std::io::stdin().lock()),
+        Source::Refuse => fail(
+            "the admin's passphrase is typed at a terminal, and stdin holds the manifest: give the manifest as a file (kith apply -f FILE)",
+        ),
+    }
+}
+
+/// What is typed on `tty` after `prompt`, unseen (and, when `twice`, again to be the same).
+fn typed_on(tty: &std::fs::File, prompt: &str, twice: bool) -> Result<String, String> {
+    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+    use std::io::{BufReader, Write};
+    let shown = tcgetattr(tty).or_else(|e| fail(format!("/dev/tty: {e}")))?;
+    let mut unseen = shown.clone();
+    unseen.local_flags.remove(LocalFlags::ECHO);
+    let mut out = tty;
+    let mut input = BufReader::new(tty);
+    let mut typed = |prompt: &str| {
+        let _ = out.write_all(prompt.as_bytes()).and_then(|()| out.flush());
+        let _ = tcsetattr(tty, SetArg::TCSANOW, &unseen);
+        let typed = one_line(&mut input);
+        let _ = tcsetattr(tty, SetArg::TCSANOW, &shown);
+        let _ = out.write_all(b"\n");
+        typed
+    };
+    let first = typed(prompt)?;
+    if !twice {
+        return Ok(first);
+    }
+    let again = typed("Once more: ")?;
+    if first != again {
+        return fail("the two are not the same: nothing was done");
+    }
+    Ok(first)
+}
+
+/// The next line of `input`, without its line end.
+fn one_line(input: &mut impl std::io::BufRead) -> Result<String, String> {
+    let mut line = String::new();
+    input.read_line(&mut line).or_else(|e| fail(format!("reading the passphrase: {e}")))?;
+    Ok(line.trim().to_string())
+}
+
 /// kithd, open: its socket, or a node over TLS.
 fn connect(kithd: &Kithd) -> Result<Wire, String> {
     // A kithd that accepts and then says nothing must not hang a script forever.
@@ -783,13 +853,19 @@ fn carry(
     to: Option<&mut dyn std::io::Write>,
 ) -> Result<Vec<u8>, String> {
     use std::io::{BufRead, Write};
+    // (A body sent in chunks is not signed: its digest is not known before it is sent.)
+    let asked = if from.is_none() { signed(kithd, method, path, b"")? } else { None };
+    let signed = match asked {
+        Some(header) => format!("{}: {header}\r\n", signing::SIGNED),
+        None => String::new(),
+    };
     let mut stream = connect(kithd)?;
     let framing = if from.is_some() {
         "Transfer-Encoding: chunked\r\n"
     } else {
         ""
     };
-    let head = format!("{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\n{framing}\r\n");
+    let head = format!("{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\n{framing}{signed}\r\n");
     let mut sent = stream.write_all(head.as_bytes());
     if let Some(from) = from {
         let mut chunk = vec![0; 64 << 10];
@@ -905,11 +981,21 @@ fn request<T: serde::de::DeserializeOwned>(kithd: &Kithd, method: &str, path: &s
 /// The passphrase typed for this run's signed writes: asked for once, when the first is signed.
 static PASSPHRASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// The signature a write to kithd's socket carries where the cluster says `signing: required`
-/// (none for a read, a node over TLS, or an open cluster). Its key is the passphrase's, salted
-/// with the cluster id kithd gives.
+/// The admin's key from it, for the cluster kithd named: one cluster per run.
+static KEY: std::sync::OnceLock<ring::signature::Ed25519KeyPair> = std::sync::OnceLock::new();
+
+/// Whether a read of `path` is one another node may pass on (kithd's `passed_on`): such a read
+/// is signed, as a change is, and any other read is the node's own.
+fn read_passed_on(path: &str) -> bool {
+    path.starts_with("/v1/logs/") || path.starts_with("/v1/volumes/")
+}
+
+/// The signature a request to kithd's socket carries where the cluster says `signing: required`
+/// (none for a node over TLS, an open cluster, or a read of the node's own: kithd reads those as
+/// its own). A read another node may pass on is signed: the logs and a volume's files (kithd's
+/// `passed_on`, access.rs). Its key is the passphrase's, salted with the cluster id kithd gives.
 fn signed(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Option<String>, String> {
-    if matches!(method, "GET" | "HEAD") || !matches!(kithd.route, Route::Socket(_)) {
+    if (matches!(method, "GET" | "HEAD") && !read_passed_on(path)) || !matches!(kithd.route, Route::Socket(_)) {
         return Ok(None);
     }
     let status: serde_json::Value = request(kithd, "GET", "/v1/cluster", b"")?;
@@ -919,14 +1005,20 @@ fn signed(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Option
     let Some(cluster) = status["clusterId"].as_str() else {
         return fail("kithd gave no cluster id to sign with: update kithd");
     };
-    if PASSPHRASE.get().is_none() {
-        let typed = secret("The admin's passphrase, which signs this change: ", false)?;
-        let _ = PASSPHRASE.set(typed);
-    }
-    let key = signing::key(PASSPHRASE.get().map_or("", String::as_str), cluster);
+    // (The key is derived once per run: PBKDF2 at 600000 rounds is the slow part, and a follow polls.)
+    let key = match KEY.get() {
+        Some(key) => key,
+        None => {
+            if PASSPHRASE.get().is_none() {
+                let typed = admin_passphrase("The admin's passphrase, which signs this change: ", false)?;
+                let _ = PASSPHRASE.set(typed);
+            }
+            KEY.get_or_init(|| signing::key(PASSPHRASE.get().map_or("", String::as_str), cluster))
+        }
+    };
     let asked = signing::Request { method, path, body };
     // "*": this node is the one it is sent to, and a node passes it on only to where it belongs.
-    let header = signing::header(&key, cluster, "*", &asked, kith_api::store::now() + 300, &signing::nonce()?);
+    let header = signing::header(key, cluster, "*", &asked, kith_api::store::now() + 300, &signing::nonce()?);
     Ok(Some(header))
 }
 
@@ -1314,6 +1406,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 VolumeCommand::Put { name, path, namespace } => {
                     let route = route(&namespace, &name);
                     let done = if path.as_os_str() == "-" {
+                        STDIN_WAS_INPUT.store(true, std::sync::atomic::Ordering::SeqCst);
                         carry(&kithd, "PUT", &route, Some(&mut std::io::stdin().lock()), None)?
                     } else {
                         // A directory's content, or the one file, under the name it has.
@@ -1591,7 +1684,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let Some(cluster_id) = status["clusterId"].as_str() else {
                 return fail("kithd gave no cluster id to derive the key with: update kithd");
             };
-            let passphrase = secret("A passphrase for the admin's key: ", true)?;
+            let passphrase = admin_passphrase("A passphrase for the admin's key: ", true)?;
             let public = signing::public(&signing::key(&passphrase, cluster_id));
             // (The write below is signed with this same passphrase: the key it sets, if it is the one there.)
             let _ = PASSPHRASE.set(passphrase);
@@ -2221,6 +2314,7 @@ fn load(files: &Files) -> Result<Vec<Resource>, String> {
             continue;
         }
         let (name, src) = if path.as_os_str() == "-" {
+            STDIN_WAS_INPUT.store(true, std::sync::atomic::Ordering::SeqCst);
             let mut src = String::new();
             std::io::stdin()
                 .read_to_string(&mut src)
@@ -2308,6 +2402,28 @@ fn features_spec(node: &Resource) -> Result<String, String> {
     };
     text.push_str(&format!("features: [{}]\n", names.join(", ")));
     Ok(text)
+}
+
+#[cfg(test)]
+mod passphrase_tests {
+    use super::{Source, passphrase_source};
+
+    #[test]
+    fn the_admin_passphrase_comes_from_the_terminal_or_one_stdin_line_never_a_manifest() {
+        assert_eq!(passphrase_source(true, false), Source::Tty);
+        assert_eq!(passphrase_source(true, true), Source::Tty);
+        assert_eq!(passphrase_source(false, false), Source::Stdin);
+        assert_eq!(passphrase_source(false, true), Source::Refuse);
+    }
+
+    #[test]
+    fn a_read_another_node_may_pass_on_is_signed_and_the_rest_are_not() {
+        use super::read_passed_on;
+        assert!(read_passed_on("/v1/logs/Workload/default/web?replica=0"));
+        assert!(read_passed_on("/v1/volumes/default/data/files"));
+        assert!(!read_passed_on("/v1/cluster"));
+        assert!(!read_passed_on("/v1/resources?namespace=default"));
+    }
 }
 
 #[cfg(test)]

@@ -257,11 +257,35 @@ pub fn requires(shared: &Shared) -> bool {
     required(&shared.store.lock().expect("a handler panicked holding the store").store)
 }
 
-/// A request's signer, and the header to pass on with it.
+/// A request's signer, the header to pass on with it, and the request itself where a change to
+/// the log may be passed on as it came ([`Relay`]).
 #[derive(Clone, Debug)]
 pub struct Signed {
     pub header: String,
     pub who: Caller,
+    pub relay: Option<Relay>,
+}
+
+/// A signed request to `/v1/apply` as it came: a control node that is not the leader sends
+/// the leader this path and body, with the same header, and the leader checks them as signed.
+#[derive(Clone, Debug)]
+pub struct Relay {
+    pub path: String,
+    pub body: axum::body::Bytes,
+    /// Who signed it, as the FOR header names them.
+    pub who: Caller,
+}
+
+impl Signed {
+    /// This request as it came (`path`, `body`), to be passed on as it is.
+    fn relayed(mut self, path: &str, body: &axum::body::Bytes) -> Signed {
+        self.relay = Some(Relay {
+            path: path.into(),
+            body: body.clone(),
+            who: self.who.clone(),
+        });
+        self
+    }
 }
 
 /// [`verify`] on this node: its cluster, store, clock and nonces.
@@ -275,6 +299,7 @@ pub fn check(shared: &Shared, header: &str, targets: &[&str], asked: &Asked) -> 
     Ok(Signed {
         header: header.into(),
         who,
+        relay: None,
     })
 }
 
@@ -380,13 +405,15 @@ pub async fn passed(
     request: Request,
 ) -> (Request, Result<Option<Signed>, String>) {
     let (method, path) = (request.method().to_string(), path(&request));
+    // (A write to the log may be signed for `*`: a control node passes it on to the leader.)
+    let log = method != "GET";
     let Some(header) = header(&request) else {
         let asked = Asked {
             method: &method,
             path: &path,
             body: &[],
         };
-        return (request, hop(shared, node, None, &asked, Some(named), false));
+        return (request, hop(shared, node, None, &asked, Some(named), log));
     };
     let (request, bytes, _room) = match read(request).await {
         Ok(read) => read,
@@ -398,7 +425,8 @@ pub async fn passed(
         path: &path,
         body: &bytes,
     };
-    (request, hop(shared, node, Some(&header), &asked, Some(named), false))
+    let signed = hop(shared, node, Some(&header), &asked, Some(named), log);
+    (request, signed.map(|signed| signed.map(|signed| signed.relayed(&path, &bytes))))
 }
 
 /// Is an unsigned call at the local socket taken under `required`, as the node, which reads?
@@ -458,7 +486,7 @@ pub async fn local(State(shared): State<Arc<Shared>>, request: Request, next: Ne
         )),
     });
     let signed = match checked {
-        Ok(signed) => Some(signed),
+        Ok(signed) => Some(signed.relayed(&path, &bytes)),
         Err(why) if required => return refused(StatusCode::UNAUTHORIZED, format!("refused: {why}")),
         Err(_) => None,
     };

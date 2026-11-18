@@ -1378,6 +1378,131 @@ fn signed_hops_alone_stand_once_signing_is_required() {
     assert!(code != 0 && err.contains("not local socket's over this request"), "{err}");
 }
 
+/// A signed write made at a follower reaches the leader as the admin signed it: the follower
+/// passes the request on as it came (its path, its body, its signature), and the leader checks
+/// that signature over it. The follower refuses the same signature again; the leader refuses a
+/// write a node passes on without one.
+#[test]
+fn a_signed_write_through_a_follower_is_taken_as_signed() {
+    use ring::signature::KeyPair;
+    let (test, signed, by) = ("signed_relay", "x-kith-signed", "x-kith-for");
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let id = token.trim().split('.').nth(2).unwrap().to_string();
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("beta to have the store", || beta.nodes().len() == 2);
+    let key = admin_key()
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    // The admin's key is written unsigned once (trust on first use), at alpha.
+    let cluster = format!(
+        "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec: {{ adminKey: {key} }}\n"
+    );
+    std::fs::write(alpha.dir.join("cluster.yaml"), cluster).unwrap();
+    alpha.ok(&["apply", "-f", "cluster.yaml"]);
+    // Beta verifies the signature against the key it holds, so wait until its store has the key.
+    wait_for("beta to hold the admin's key", || {
+        beta.kith(&["get", "cluster/home", "-o", "json"]).1.contains(&key)
+    });
+
+    // Signed at beta's local socket for the cluster, the change is taken by the leader alpha.
+    let at_beta = |header: &str, body: &str| {
+        let mut curl = Command::new("curl");
+        curl.current_dir(&beta.dir).args(["--unix-socket", "kithd.sock"]);
+        ask(curl, "POST", "http://kithd/v1/apply", &[(signed, header)], Some(body))
+    };
+    let body = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "Cluster", "metadata": { "name": "home" },
+        "spec": { "adminKey": key, "signing": "required" } }])
+    .to_string();
+    let header = signed_by_admin(&id, "*", "POST", "/v1/apply", body.as_bytes(), 1);
+    let (code, said) = at_beta(&header, &body);
+    assert_eq!(code, "200", "{said}");
+    let held = alpha.ok(&["get", "cluster/home", "-o", "json"]);
+    assert!(held.contains("\"signing\": \"required\""), "{held}");
+
+    // Replayed at beta: refused there, as the signature was used already.
+    let (code, said) = at_beta(&header, &body);
+    assert!(code == "401" && said.contains("used already"), "{code} {said}");
+
+    // A write beta passes on with no signature, for the local socket: refused where the leader is.
+    let betas = beta.dir.join("state/pki");
+    let (code, said) = ask_as_node_with(
+        &alpha.address(),
+        &betas,
+        "POST",
+        "/v1/apply",
+        &[(by, "local socket")],
+        Some(&body),
+    );
+    assert!(
+        code == "403" && said.contains("an unsigned caller passed on by node beta"),
+        "{code} {said}"
+    );
+
+    // Another signed write, through beta, is taken too.
+    let config = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "ConfigMap", "metadata": { "name": "relayed" },
+        "spec": { "data": { "a": "b" } } }])
+    .to_string();
+    let header = signed_by_admin(&id, "*", "POST", "/v1/apply", config.as_bytes(), 2);
+    let (code, said) = at_beta(&header, &config);
+    assert_eq!(code, "200", "{said}");
+    assert!(alpha.ok(&["get", "configmap/relayed"]).contains("relayed"));
+}
+
+/// The status names the cluster (the id a signer salts its key with, the print of the CA the
+/// join token carries) and says `open` until the Cluster says `signing: required`.
+#[test]
+fn the_status_names_the_cluster_and_whether_writes_must_be_signed() {
+    use ring::signature::KeyPair;
+    let alpha = Node::start("signed_status", "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let id = token.trim().split('.').nth(2).unwrap().to_string();
+    let status = || {
+        let mut curl = Command::new("curl");
+        curl.current_dir(&alpha.dir).args(["--unix-socket", "kithd.sock"]);
+        let (code, said) = ask(curl, "GET", "http://kithd/v1/cluster", &[], None);
+        assert_eq!(code, "200", "{said}");
+        serde_json::from_str::<serde_json::Value>(&said).unwrap()
+    };
+    let before = status();
+    assert_eq!(before["clusterId"], id.as_str(), "{before}");
+    assert_eq!(before["signing"], "open", "{before}");
+
+    let key = admin_key()
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let cluster = format!(
+        "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec: {{ adminKey: {key} }}\n"
+    );
+    std::fs::write(alpha.dir.join("cluster.yaml"), cluster).unwrap();
+    alpha.ok(&["apply", "-f", "cluster.yaml"]);
+    assert_eq!(status()["signing"], "open");
+
+    let body = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "Cluster", "metadata": { "name": "home" },
+        "spec": { "adminKey": key, "signing": "required" } }])
+    .to_string();
+    let header = signed_by_admin(&id, "*", "POST", "/v1/apply", body.as_bytes(), 1);
+    let mut curl = Command::new("curl");
+    curl.current_dir(&alpha.dir).args(["--unix-socket", "kithd.sock"]);
+    let (code, said) = ask(curl, "POST", "http://kithd/v1/apply", &[("x-kith-signed", header.as_str())], Some(&body));
+    assert_eq!(code, "200", "{said}");
+    let after = status();
+    assert_eq!(after["signing"], "required", "{after}");
+    assert_eq!(after["clusterId"], id.as_str(), "{after}");
+}
+
 /// A Workload that runs as an Identity: the CA holder signs, for the worker it is placed on
 /// alone, a certificate for a key it never saw; the API takes that for what the Identity's
 /// Role allows, and refuses it the moment the store says otherwise. The test plays the
