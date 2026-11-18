@@ -229,6 +229,8 @@ struct Controller {
     count: Option<Job<Counted>>,
     /// When the last count ended.
     counted: Option<Instant>,
+    /// The removal of scratch set aside and left (`storage::sweep`), beside the count, on its way.
+    leftovers: Option<Job<()>>,
     /// The state disk is under its reserve with no pod to replace for it, and it was said.
     low: bool,
     /// The pods replaced for what they wrote, when, and the removal of what they wrote once no run
@@ -378,6 +380,7 @@ pub async fn run(
         reserve,
         count: None,
         counted: None,
+        leftovers: None,
         low: false,
         replacing: BTreeMap::new(),
         missed: BTreeSet::new(),
@@ -1795,6 +1798,14 @@ impl Controller {
                 removal.done(hung).is_none()
             })
         });
+        if let Some(job) = self.leftovers.as_mut() {
+            let hung = || {
+                "removing the scratch left by an earlier run has not ended in 60 s: it goes on, and holds no pod's count".to_string()
+            };
+            if job.done(hung).is_some() {
+                self.leftovers = None;
+            }
+        }
         let hung = || "the storage count has not ended in 60 s: no pod's storage is limited until it does".to_string();
         let done = self.count.as_mut().and_then(|job| Some((job.began, job.done(hung)?)));
         if let Some((began, counted)) = done {
@@ -1890,42 +1901,24 @@ impl Controller {
         if pods.is_empty() {
             return;
         }
+        // (A scratch set aside and not removed, by a kithd that stopped first, goes in a job of
+        // its own, one at a time: a huge one holds no pod's count, or its clock.)
+        if self.leftovers.is_none() {
+            let (dirs, stop) = (
+                pods.iter().map(|(pod, ..)| replicas.join(&pod.id)).collect::<Vec<_>>(),
+                self.stop.clone(),
+            );
+            self.leftovers = Job::start("storage", &shared.changed, move || {
+                dirs.iter().for_each(|replica| storage::sweep(replica, &stop));
+            });
+        }
         let state = state.to_path_buf();
         let stop = self.stop.clone();
         self.count = Job::start("storage", &shared.changed, move || {
             let pods: Vec<storage::Pod> = pods
                 .into_iter()
-                .map(|(mut pod, roots, cgroups)| {
-                    // (A scratch set aside and not removed, by a kithd that stopped first, goes now.)
-                    storage::sweep(&replicas.join(&pod.id), &stop);
-                    // Held, what it holds is read, not counted; a project that cannot be read
-                    // is counted.
-                    let usage = pod.held.then(|| storage::Projects::usage(&state, &pod.id)).flatten();
-                    pod.held = usage.is_some();
-                    if let Some((bytes, files, most)) = usage {
-                        (pod.bytes, pod.files, pod.most) = (bytes, files, most);
-                        return pod;
-                    }
-                    let until = storage::Until {
-                        at: Instant::now() + storage::SPELL,
-                        stop: &stop,
-                    };
-                    let limit = pod.limit.unwrap_or(u64::MAX);
-                    (pod.bytes, pod.finished) = storage::count(&roots, limit, until);
-                    if pod.finished && pod.bytes <= limit {
-                        let mut pids = Vec::new();
-                        for cgroup in &cgroups {
-                            let (more, all) = storage::pids(cgroup, until);
-                            pids.extend(more);
-                            pod.finished &= all;
-                        }
-                        let (held, finished) = storage::unlinked(&pids, &roots, until);
-                        (pod.bytes, pod.finished) = (pod.bytes.saturating_add(held), pod.finished && finished);
-                    }
-                    pod
-                })
+                .map(|(pod, roots, cgroups)| storage::measure(pod, &roots, &cgroups, &state, &stop))
                 .collect();
-            // Free once what was set aside is gone.
             let disk = nix::sys::statvfs::statvfs(&state).ok();
             let free = disk.map_or(free, |d| d.blocks_available() * d.fragment_size());
             (free, reserve, pods)
