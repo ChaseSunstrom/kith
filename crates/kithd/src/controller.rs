@@ -214,6 +214,8 @@ struct Controller {
     /// Units a kithd before this one started that still run, with their marks: each is taken
     /// by its slot when that slot would start, or stopped if it is not wanted or not the same.
     adopted: BTreeMap<String, (Handle, String)>,
+    /// When the stop of an adopted unit last failed (it stays in `adopted`, tried again after STOP_RETRY).
+    stuck: BTreeMap<String, Instant>,
     runtime: Runtime,
     logs: PathBuf,
     log_cap: u64,
@@ -404,6 +406,7 @@ pub async fn run(
         projects,
         scanned: None,
         adopted,
+        stuck: BTreeMap::new(),
         gens: BTreeMap::new(),
         surging: BTreeMap::new(),
         stopped_first: BTreeMap::new(),
@@ -838,6 +841,30 @@ fn after_restart(
         .collect();
     let surge = !as_wanted && !other.is_empty() && other.iter().all(|s| s.rolling) && no_surge(&other, root).is_none();
     (found != surge, surge)
+}
+
+/// What a slot about to start does with the unit adopted under its id, whose mark it was started as.
+#[derive(Debug, PartialEq)]
+enum Taken {
+    /// None adopted: start it.
+    Free,
+    /// As it ran: taken back.
+    Take,
+    /// Another mark, and not stopped yet (a stop that failed): the slot waits, as for a leaving one.
+    Stuck,
+}
+
+fn taken_back(was: Option<&str>, now: &str) -> Taken {
+    match was {
+        None => Taken::Free,
+        Some(was) if was == now => Taken::Take,
+        Some(_) => Taken::Stuck,
+    }
+}
+
+/// A stop of an adopted unit that failed is tried again at most every `STOP_RETRY` (`tried`: the last).
+fn retry_due(tried: Option<Instant>) -> bool {
+    tried.is_none_or(|at| at.elapsed() >= STOP_RETRY)
 }
 
 /// The pods of the adopted units `ids` that are [`held`]: they answer without a slot, so they are
@@ -1487,18 +1514,31 @@ impl Controller {
                         .is_ok(),
                     false => true,
                 };
-            if !kept {
+            if !kept && retry_due(self.stuck.get(id).copied()) {
                 unwanted.push(id.clone());
             }
         }
         for id in unwanted {
             if let Some((handle, was)) = self.adopted.remove(&id) {
-                eprintln!("kithd: {id}: run by an earlier kithd and not wanted as it is: stopped");
-                // One that is not gone is asked again next pass, not forgotten running.
-                if let Err(e) = delete(handle).await {
-                    eprintln!("kithd: {id}: {}", e.error);
-                    if let Some(handle) = e.handle {
-                        self.adopted.insert(id, (*handle, was));
+                // (Said once: a retry that fails again is quiet.)
+                if !self.stuck.contains_key(&id) {
+                    eprintln!("kithd: {id}: run by an earlier kithd and not wanted as it is: stopped");
+                }
+                // One that is not gone is asked again after STOP_RETRY, not forgotten running; its
+                // slot, if wanted, waits for it (see `taken_back`).
+                match delete(handle).await {
+                    Ok(()) => drop(self.stuck.remove(&id)),
+                    Err(e) => {
+                        if !self.stuck.contains_key(&id) {
+                            eprintln!("kithd: {id}: {}", e.error);
+                        }
+                        match e.handle {
+                            Some(handle) => {
+                                self.stuck.insert(id.clone(), Instant::now());
+                                self.adopted.insert(id, (*handle, was));
+                            }
+                            None => drop(self.stuck.remove(&id)),
+                        }
                     }
                 }
             }
@@ -1743,7 +1783,8 @@ impl Controller {
         let replicas = self
             .slots
             .values()
-            .flat_map(|slot| [pod_of(&slot.owner, slot.replica), storage_pod(slot)]);
+            .flat_map(|slot| [pod_of(&slot.owner, slot.replica), storage_pod(slot)])
+            .chain(held_pods.iter().cloned());
         let memory = crate::files::memory_dir();
         let bases: Vec<&Path> = [Some(state.as_path()), memory.as_deref()]
             .into_iter()
@@ -1893,7 +1934,20 @@ impl Controller {
                     _ => None,
                 };
                 let mut stop_now = stopping.clone();
-                let taken = self.adopted.remove(id).filter(|(_, was)| *was == mark(slot));
+                let ran_as = mark(slot);
+                let taken = match taken_back(self.adopted.get(id).map(|(_, was)| was.as_str()), &ran_as) {
+                    Taken::Take => {
+                        self.stuck.remove(id);
+                        self.adopted.remove(id)
+                    }
+                    Taken::Free => None,
+                    // A unit of this id that could not be stopped yet: its cgroup is still there.
+                    Taken::Stuck => {
+                        slot.held = true;
+                        slot.message = Some("stopping: the unit an earlier kithd ran is not gone yet".into());
+                        continue;
+                    }
+                };
                 let started = tokio::select! {
                     started = async {
                         if let Some((handle, _)) = taken {
@@ -3657,6 +3711,19 @@ mod tests {
             held_pods(ids, &BTreeMap::new(), &wanted).is_empty(),
             "none held with no update"
         );
+    }
+
+    /// An adopted unit is taken by its slot only as it ran; one with another mark that could not be
+    /// stopped (it is still in `adopted`) holds its slot, so the same unit id is not started over its
+    /// cgroup; and a stop that failed is tried again only after STOP_RETRY.
+    #[test]
+    fn a_stuck_adopted_unit_holds_its_slot_and_is_retried_in_time() {
+        assert_eq!(taken_back(None, "m"), Taken::Free);
+        assert_eq!(taken_back(Some("m"), "m"), Taken::Take);
+        assert_eq!(taken_back(Some("old"), "m"), Taken::Stuck);
+        assert!(!retry_due(Some(Instant::now())));
+        assert!(retry_due(Some(Instant::now() - STOP_RETRY)));
+        assert!(retry_due(None));
     }
 
     /// A kithd started again that finds one generation of a replica running as it is no longer
