@@ -160,7 +160,8 @@ pub fn run(store: &mut Store, command: Command) -> Reply {
         Command::Import { store: imported } => {
             // (What comes in is from before replication, and so from before the mark.)
             let marked = store.marked();
-            *store = imported;
+            let before = std::mem::replace(store, imported);
+            store.continue_changes(&before);
             store.cut_node_key_histories();
             if marked {
                 store.mark();

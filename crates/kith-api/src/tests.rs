@@ -2146,3 +2146,54 @@ fn an_identity_names_the_workloads_that_run_as_it() {
     );
     assert!(exec.unwrap_err().contains("only containers"));
 }
+
+const ALPHA: &str = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: alpha }\nspec: {}\n";
+const HOME_ZONE: &str =
+    "apiVersion: kith.dev/v1\nkind: DNSZone\nmetadata: { name: home }\nspec: { domain: home.example }\n";
+
+#[test]
+fn changes_count_an_apply_a_status_and_a_delete_of_their_kind_only() {
+    let mut store = Store::default();
+    assert_eq!(store.changes("Node"), 0);
+    store.apply(one(ALPHA)).unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (1, 0));
+    store.apply(one(HOME_ZONE)).unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (1, 1));
+    store.set_status("Node/alpha", Some(json!({"state": "ready"}))).unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (2, 1));
+    store.delete("DNSZone/home").unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (2, 2));
+    assert_eq!(store.changes("Service"), 0);
+}
+
+#[test]
+fn changes_of_a_write_that_changes_nothing_move_nothing() {
+    let mut store = Store::default();
+    store.apply(one(ALPHA)).unwrap();
+    store.set_status("Node/alpha", Some(json!({"state": "ready"}))).unwrap();
+    let before = store.changes("Node");
+    // The same spec again, and the same status again: no change.
+    assert_eq!(store.apply(one(ALPHA)).unwrap().action, Action::Unchanged);
+    store.set_status("Node/alpha", Some(json!({"state": "ready"}))).unwrap();
+    // A delete that finds nothing, and a status for a key there is not.
+    assert!(store.delete("Node/ghost").is_err());
+    assert!(store.set_status("Node/ghost", None).is_err());
+    assert_eq!(store.changes("Node"), before);
+    assert_eq!(store.changes("DNSZone"), 0);
+}
+
+#[test]
+fn changes_go_on_when_a_store_is_replaced_whole() {
+    let mut before = Store::default();
+    before.apply(one(ALPHA)).unwrap();
+    // A store brought in (an import, a snapshot) keeps no counts, and has a zone this one lacks.
+    let mut brought = Store::default();
+    brought.apply(one(HOME_ZONE)).unwrap();
+    brought.apply(one(ALPHA)).unwrap();
+    let mut brought: Store = serde_json::from_str(&serde_json::to_string(&brought).unwrap()).unwrap();
+    assert_eq!(brought.changes("Node"), 0);
+    brought.continue_changes(&before);
+    assert!(brought.changes("Node") > before.changes("Node"));
+    assert!(brought.changes("DNSZone") > before.changes("DNSZone"));
+    assert!(brought.get("Node/alpha").is_some());
+}

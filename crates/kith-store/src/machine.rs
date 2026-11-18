@@ -297,7 +297,9 @@ impl RaftStateMachine<TypeConfig> for Machine {
         };
         self.save(&saved)?;
         let mut state = self.state();
-        *state = saved.state;
+        let mut next = saved.state;
+        next.store.continue_changes(&state.store);
+        *state = next;
         state.forget();
         (self.changed)();
         Ok(())

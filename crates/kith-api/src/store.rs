@@ -89,10 +89,14 @@ impl Change {
 /// What a key's history was before a batch changed it; none: it was not there.
 type Undo = BTreeMap<String, Option<Vec<Revision>>>;
 
-#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Store {
     /// Revisions per resource key, oldest first. The last one is live.
     resources: BTreeMap<String, Vec<Revision>>,
+    /// How many times each kind has changed here ([`Store::changes`]). Not in a snapshot:
+    /// [`Store::continue_changes`] carries them over a store that replaces this one whole.
+    #[serde(skip)]
+    changes: BTreeMap<String, u64>,
     /// When the next changes happen, if not now: replicas replaying a change must agree on it.
     #[serde(skip)]
     clock: Option<u64>,
@@ -106,7 +110,51 @@ pub struct Store {
     entry: u64,
 }
 
+/// The same store when it holds the same resources, histories and clock: the change counts are
+/// not compared (a store from a snapshot counts none, and is the same store).
+impl PartialEq for Store {
+    fn eq(&self, other: &Self) -> bool {
+        self.resources == other.resources
+            && self.clock == other.clock
+            && self.born == other.born
+            && self.entry == other.entry
+    }
+}
+
+/// The kind a resource key names: `Kind` of `Kind/ns/name` or `Kind/name`.
+fn kind_of(key: &str) -> &str {
+    key.split('/').next().unwrap_or(key)
+}
+
 impl Store {
+    /// How many times `kind` has changed here: an apply that changes a resource of it, a delete,
+    /// a status write that changes one, a put or a removal. A write that changes nothing moves none.
+    /// (Whole-store replacements carry the counts on: see [`Store::continue_changes`].)
+    pub fn changes(&self, kind: &str) -> u64 {
+        self.changes.get(kind).copied().unwrap_or(0)
+    }
+
+    fn bump(&mut self, kind: &str) {
+        *self.changes.entry(kind.to_string()).or_default() += 1;
+    }
+
+    /// Carry on from `before`, the store this one replaces whole: every kind either holds moves
+    /// past what it was in `before`, so a reader that saw `before`'s counts sees a change.
+    pub fn continue_changes(&mut self, before: &Store) {
+        let kinds: std::collections::BTreeSet<&str> = [self.resources.keys(), before.resources.keys()]
+            .into_iter()
+            .flatten()
+            .map(|key| kind_of(key))
+            .chain(self.changes.keys().map(String::as_str))
+            .chain(before.changes.keys().map(String::as_str))
+            .collect();
+        let counts: Vec<(String, u64)> = kinds
+            .into_iter()
+            .map(|kind| (kind.to_string(), before.changes(kind).max(self.changes(kind)) + 1))
+            .collect();
+        self.changes.extend(counts);
+    }
+
     /// Validate `desired` and work out what applying it would change.
     /// `apply` owns labels, annotations and spec; status stays with the controllers,
     /// so a `status` in `desired` is ignored.
@@ -180,6 +228,7 @@ impl Store {
     fn apply_logged(&mut self, desired: Resource, undo: &mut Undo) -> Result<Change, Error> {
         let change = self.plan(desired)?;
         if change.action != Action::Unchanged {
+            self.bump(&change.after.kind);
             let key = change.after.key();
             undo.entry(key.clone())
                 .or_insert_with(|| self.resources.get(&key).cloned());
@@ -229,7 +278,11 @@ impl Store {
         if let Some(born) = &mut self.born {
             born.retain(|key, _| resources.contains_key(key));
         }
-        self.resources.len() != before
+        let gone = self.resources.len() != before;
+        if gone {
+            self.bump("NodeKey");
+        }
+        gone
     }
 
     /// Apply several resources, all or nothing: if one is refused the store is left as it was.
@@ -247,6 +300,7 @@ impl Store {
     /// not the store: at 10 000 resources a copy of it cost 18 ms (T-0080).
     fn staged(&mut self, desired: Vec<Resource>, back: bool) -> Result<Vec<Change>, Error> {
         let mut undo = Undo::new();
+        let counts = self.changes.clone();
         let changes: Result<Vec<Change>, Error> =
             desired.into_iter().map(|r| self.apply_logged(r, &mut undo)).collect();
         if back || changes.is_err() {
@@ -256,6 +310,8 @@ impl Store {
                     None => self.forget(&key),
                 };
             }
+            // (The histories are back as they were, so the counts are too.)
+            self.changes = counts;
         }
         changes
     }
@@ -377,6 +433,9 @@ impl Store {
     /// Keep `resource` as it is given, as its only revision: how a view of another node's
     /// store is kept. It was checked where it was applied, and its history is not sent.
     pub fn put(&mut self, resource: Resource) {
+        if self.get(&resource.key()) != Some(&resource) {
+            self.bump(&resource.kind);
+        }
         let at = self.clock.unwrap_or_else(now);
         self.resources.insert(resource.key(), vec![Revision { at, resource }]);
     }
@@ -391,7 +450,11 @@ impl Store {
         if let Some(born) = &mut self.born {
             born.remove(key);
         }
-        self.resources.remove(key)
+        let gone = self.resources.remove(key);
+        if gone.is_some() {
+            self.bump(kind_of(key));
+        }
+        gone
     }
 
     pub fn history(&self, key: &str) -> Result<&[Revision], Error> {
@@ -420,7 +483,12 @@ impl Store {
             .get_mut(key)
             .and_then(|h| h.last_mut())
             .ok_or_else(|| Error::NotFound(key.into()))?;
+        if live.resource.status == status {
+            return Ok(());
+        }
+        let kind = live.resource.kind.clone();
         live.resource.status = status;
+        self.bump(&kind);
         Ok(())
     }
 }
