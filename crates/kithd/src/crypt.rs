@@ -1587,7 +1587,7 @@ pub async fn recovery(
 ) -> Response {
     let kind = |_: &_| vec![("NodeKey".to_string(), None)];
     if let Err(refused) = crate::api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, kind) {
-        return refused.into_response();
+        return crate::cluster::no_store(refused.into_response());
     }
     let done = async {
         let cluster = shared.cluster.as_ref();
@@ -1605,10 +1605,11 @@ pub async fn recovery(
     shared
         .audit
         .record(&caller, "recovery", vec![format!("NodeKey/{name}")], said);
-    match done {
+    // (The key is this answer's alone: no cache keeps it, and the web UI shows it once.)
+    crate::cluster::no_store(match done {
         Ok(recovery) => Json(json!({ "node": name, "recovery": recovery })).into_response(),
         Err(why) => refuse(StatusCode::CONFLICT, why).into_response(),
-    }
+    })
 }
 
 /// The nodes of these NodeKeys whose recovery key nobody was shown. Forgotten, a node
@@ -1953,6 +1954,31 @@ mod tests {
     use super::*;
     use crate::cluster::pinned_peer::{answering_as, at, node, shared_with};
     use std::sync::atomic::Ordering;
+
+    /// What the web UI shows once, a new recovery key, is kept by no cache: the answer, and a
+    /// refusal of it, say `no-store`; an Identity with no right to apply NodeKeys gets a 403.
+    #[tokio::test]
+    async fn no_store_on_the_recovery_key_and_403_for_who_may_not() {
+        let ca = crate::pki::Ca::create().unwrap();
+        let (a, b, x) = (node(&ca, "a"), node(&ca, "b"), node(&ca, "x"));
+        let (taken, _) = answering_as(&x).await;
+        let there = at("b", &taken, Some(crate::pki::print_of(&b.cert).unwrap()));
+        let shared = shared_with("recovery-no-store", a, &[there]).await;
+        let ask = |caller: Caller| recovery(State(shared.clone()), Extension(caller), Named("b".into()));
+        let kept = |answer: &Response| {
+            answer.headers()[axum::http::header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        let refused = ask(Caller::Identity("carol".into())).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(kept(&refused), "no-store");
+        // (A node that cannot be asked: an answer of the same kind, with the same header.)
+        let failed = ask(Caller::Admin).await;
+        assert_eq!(failed.status(), StatusCode::CONFLICT);
+        assert_eq!(kept(&failed), "no-store");
+    }
 
     #[tokio::test]
     async fn pinned_peer_is_sent_no_passphrase() {

@@ -4,7 +4,9 @@
     python3 ci/ui_shots.py OUT            the board with a Workload open, at 1440 and 390 px, light
                                           and dark, as OUT/ui-WIDTH-SCHEME.png; and its other tabs
                                           the review of a change and a kind with nothing in it,
-                                          as OUT/ui-SCENE-SCHEME.png
+                                          as OUT/ui-SCENE-SCHEME.png; the Install part and a join
+                                          token shown once, as OUT/ui-install-WIDTH-SCHEME.png
+                                          and OUT/ui-token-WIDTH-SCHEME.png
     python3 ci/ui_shots.py OUT --serve    the same cluster left up at the printed address, to look
                                           at by hand; Enter ends it
 
@@ -40,7 +42,17 @@ const scene = new URLSearchParams(location.search).get('scene');
 const tab = (name) => [...document.querySelectorAll('#tabs button')].find((button) => button.textContent === name).click();
 // (A step that cannot be taken is told to the script, which then fails: no photograph of the wrong scene.)
 const step = (ms, act) => setTimeout(() => { try { act(); } catch (error) { fetch(`failed?${encodeURIComponent(`${scene}: ${error}`)}`); } }, ms);
+const press = (id) => document.getElementById(id).click();
+if (scene === 'Install' || scene === 'Token') {
+  // The Install part: no sideways scroll, and for Token the dialog that shows a join token once.
+  if (scene === 'Token') step(1500, () => { press('token-make'); step(500, () => press('dialog-yes')); });
+  step(3500, () => {
+    if (document.documentElement.scrollWidth > innerWidth) throw new Error(`sideways overflow: ${document.documentElement.scrollWidth} > ${innerWidth}`);
+    if (document.getElementById('install').hidden) throw new Error('the Install part is not in view');
+  });
+}
 step(1500, () => {
+  if (scene === 'Install' || scene === 'Token') return;
   if (scene !== 'Review') return scene && scene !== 'Empty' && tab(scene);
   const replicas = [...document.querySelectorAll('.field')].find((field) => field.querySelector('label')?.textContent.startsWith('replicas')).querySelector('input');
   replicas.value = '5';
@@ -188,13 +200,15 @@ def main():
         chrome = os.environ.get("CHROME") or (found[-1] if found else sys.exit("no Chromium: set CHROME"))
         views = [(1440, 900, scheme, "") for scheme in ("light", "dark")] + [(390, 2200, scheme, "") for scheme in ("light", "dark")]
         views += [(1440, 900, scheme, scene) for scene in ("YAML", "Status", "History", "Logs", "Review", "Empty") for scheme in ("light", "dark")]
+        # (The Install part, and a join token shown once, at both widths.)
+        views += [(width, height, scheme, scene) for scene in ("Install", "Token") for width, height in ((1440, 1500), (390, 2400)) for scheme in ("light", "dark")]
         for width, height, scheme, scene in views:
-            shot = out / f"ui-{scene.lower() or width}-{scheme}.png"
+            shot = out / (f"ui-{scene.lower()}-{width}-{scheme}.png" if scene in ("Install", "Token") else f"ui-{scene.lower() or width}-{scheme}.png")
             flags = ["--no-sandbox", "--disable-gpu", "--hide-scrollbars", f"--window-size={width},{height}", f"--screenshot={shot}"]
             if scheme == "dark":
                 flags.append("--blink-settings=preferredColorScheme=0")
             # (Empty: a kind the scene has none of, open with nothing in it.)
-            url = address.replace("scene=", f"scene={scene}").replace("#/Workload/default/web" if scene == "Empty" else "#/none", "#/Secret")
+            url = address.replace("scene=", f"scene={scene}").replace("#/Workload/default/web" if scene in ("Empty", "Install", "Token") else "#/none", "#/Secret" if scene == "Empty" else "#/install")
             subprocess.run([chrome, *flags, url], check=True, capture_output=True, timeout=120)
             print(shot)
         if failed:

@@ -355,6 +355,48 @@ dialog::backdrop { background: color-mix(in srgb, var(--bg) 84%, transparent); }
 .toast { background: var(--text); color: var(--bg); border-left: 6px solid var(--accent); padding: calc(var(--unit) * 2.5) calc(var(--unit) * 4); overflow-wrap: anywhere; animation: slide var(--arrive) var(--ease); }
 .toast.bad { border-left-color: var(--bad); }
 
+/* Install: the steps of bringing a machine in, as stops on the rail the board's kinds hang
+   from. The stop is filled where something is on (netboot answering), a ring where it is not.
+   Another part of the same page as the board (the address #/install), not another page. */
+.navlink { font-size: var(--small); font-weight: 700; text-decoration: none; border-bottom: var(--stroke) solid transparent; transition: color var(--quick), border-color var(--quick); }
+.navlink:hover { color: var(--accent-text); }
+.navlink[aria-current] { border-bottom-color: var(--accent); }
+.install { flex: 1; min-height: 0; overflow: auto; padding: 0 calc(var(--unit) * 5) calc(var(--unit) * 8); scrollbar-width: thin; scrollbar-color: var(--hair) transparent; }
+.install > * { max-width: 88ch; }
+.install .intro { display: flex; flex-direction: column; gap: calc(var(--unit) * 2); padding-top: calc(var(--unit) * 3); border-top: var(--stroke) solid var(--text); animation: rise var(--enter) var(--ease) both; }
+.install .intro h2 { font-size: var(--large); font-weight: 800; letter-spacing: -0.02em; }
+.install .intro code, .install .hint code { font-family: var(--mono); font-size: var(--small); }
+.install .intro a { color: var(--accent-text); font-weight: 700; }
+.rail { position: relative; display: flex; flex-direction: column; gap: calc(var(--unit) * 9); margin-top: calc(var(--unit) * 7); padding-left: var(--rail); }
+.rail::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: var(--stroke); background: var(--text); }
+.rail .stop { position: relative; display: flex; flex-direction: column; gap: calc(var(--unit) * 3); min-width: 0; animation: rise var(--enter) var(--ease) both; }
+.rail .stop:nth-child(2) { animation-delay: var(--step); }
+.rail .stop:nth-child(3) { animation-delay: calc(var(--step) * 2); }
+.rail h3 { position: relative; display: flex; align-items: baseline; gap: calc(var(--unit) * 2); flex-wrap: wrap; font-size: var(--base); font-weight: 800; }
+.rail h3 b { font-weight: 400; font-size: var(--small); color: var(--dim); }
+.rail h3 .dim { font-size: var(--small); }
+.rail h3::before { content: ""; position: absolute; left: calc(0.5px - var(--rail)); top: 4px; width: 14px; height: 14px; border: var(--stroke) solid var(--text); border-radius: 50%; background: var(--bg); transition: background var(--arrive), border-color var(--quick); }
+.rail .stop.on h3::before { border-color: var(--accent); background: var(--accent); animation: beat var(--breath) ease-in-out infinite; }
+.rail .stop > p { max-width: 62ch; font-size: var(--small); }
+.install .field > input[type="checkbox"] { width: 22px; min-height: 22px; height: 22px; accent-color: var(--accent); }
+.install .field > input[type="file"] { padding: calc(var(--unit) * 1.5) calc(var(--unit) * 2.5); font-size: var(--small); }
+.machines { display: flex; flex-direction: column; }
+.machines li { display: flex; align-items: center; gap: calc(var(--unit) * 3); flex-wrap: wrap; min-height: var(--row); border-bottom: 1px solid var(--hair); font-size: var(--small); }
+.machines li:first-child { border-top: 1px solid var(--text); }
+.machines code { font-family: var(--mono); }
+.machines:empty { display: none; }
+/* What is shown once: big enough to read aloud and copy by eye, and selectable whole. */
+.secret { display: flex; flex-direction: column; gap: calc(var(--unit) * 3); }
+.secret .warning { margin: 0; padding-left: calc(var(--unit) * 3); border-left: var(--stroke) solid var(--warn); font-weight: 700; }
+.secret pre { background: var(--sunken); padding: calc(var(--unit) * 3); border-left: var(--stroke) solid var(--accent); white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }
+.secret .key { font-size: var(--large); letter-spacing: 0.04em; }
+.secret label { color: var(--dim); font-size: var(--small); }
+@media (max-width: 900px) {
+  .install { padding-left: calc(var(--unit) * 3); padding-right: calc(var(--unit) * 3); overflow: visible; }
+  .install .field { grid-template-columns: minmax(0, 1fr); }
+  .install .hint { grid-column: 1; }
+}
+
 /* A finger gets 44 px of everything it can press. */
 @media (pointer: coarse) {
   :root { --row: 44px; }

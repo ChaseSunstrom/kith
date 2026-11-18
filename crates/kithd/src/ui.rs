@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// The page: name under `/ui/`, content type, content.
-const FILES: [(&str, &str, &[u8]); 5] = [
+const FILES: [(&str, &str, &[u8]); 6] = [
     ("", "text/html; charset=utf-8", include_bytes!("../ui/index.html")),
     ("app.css", "text/css; charset=utf-8", include_bytes!("../ui/app.css")),
     (
@@ -36,6 +36,11 @@ const FILES: [(&str, &str, &[u8]); 5] = [
         "forms.js",
         "text/javascript; charset=utf-8",
         include_bytes!("../ui/forms.js"),
+    ),
+    (
+        "install.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../ui/install.js"),
     ),
     // The page's face (Overpass, SIL OFL: its copyright and licence are in the file's own
     // name table and in docs/fonts/OFL.txt). The website's copy: there is one in the tree.
@@ -275,7 +280,7 @@ mod tests {
         );
         assert!(run.status.success(), "{said}");
         // Every script the page loads is one node could read.
-        for script in ["app.js", "forms.js"] {
+        for script in ["app.js", "forms.js", "install.js"] {
             let check = std::process::Command::new("node")
                 .arg("--check")
                 .arg(dir.join(script))
@@ -377,6 +382,78 @@ mod tests {
             .output();
         let Ok(run) = run else {
             eprintln!("skipped: no node to run forms.js with");
+            return;
+        };
+        let said = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success() && run.stdout.starts_with(b"ok"), "{said}");
+    }
+
+    /// The Install part (a join token, netboot, a recovery key): every place the script draws
+    /// into is in the page, the page links to it, what it says once it keeps nowhere, and what
+    /// it writes (the `join:` block of kith-install.yaml, a card list) is what the call takes.
+    #[test]
+    fn ui_install_part_is_in_the_page_and_keeps_no_secret() {
+        let text = |name: &str| {
+            let (.., content) = FILES.iter().find(|(file, ..)| *file == name).unwrap();
+            std::str::from_utf8(content).unwrap()
+        };
+        let (page, script, app) = (text(""), text("install.js"), text("app.js"));
+        assert!(
+            page.contains("href=\"#/install\""),
+            "the bar has no way into the Install part"
+        );
+        let mut drawn = 0;
+        for call in script.split("$('").skip(1) {
+            let id = call.split('\'').next().unwrap();
+            drawn += 1;
+            assert!(
+                page.contains(&format!("id=\"{id}\"")),
+                "install.js draws into #{id}, which the page lacks"
+            );
+        }
+        assert!(drawn >= 20, "the script draws into {drawn} places: it is not the part");
+        // A token or a key is in a dialog and in a variable of the call that shows it: no storage, no address, no cookie.
+        for kept in [
+            "localStorage",
+            "sessionStorage",
+            "document.cookie",
+            "history.",
+            "location",
+            "indexedDB",
+        ] {
+            assert!(!script.contains(kept), "install.js has {kept}");
+        }
+        assert!(
+            app.contains("$('dialog-body').replaceChildren();"),
+            "a closed dialog still holds what it showed"
+        );
+        // The three calls are the ones `kith` makes, and a file goes as its bytes.
+        for call in [
+            "`tokens?trust=${trust}`",
+            "`netboot?${query}`",
+            "'netboot'",
+            "/recovery`",
+        ] {
+            assert!(script.contains(call), "install.js does not make {call}");
+        }
+        assert!(app.contains("'application/octet-stream'"), "a boot file goes as JSON");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+        let check = "const { pathToFileURL } = await import('node:url');\n\
+            const { joinBlock, minutesLeft, cards } = await import(pathToFileURL(process.argv[1]).href);\n\
+            const same = (a, b) => { if (a !== b) throw new Error(`${JSON.stringify(a)} is not ${JSON.stringify(b)}`); };\n\
+            same(joinBlock('10.0.0.7:7443', 'kith1.ab'), 'join:\\n  address: 10.0.0.7:7443\\n  token: \"kith1.ab\"\\n');\n\
+            same(joinBlock('a:1', 'x\"\\ny'), 'join:\\n  address: a:1\\n  token: \"x\\\\\"\\\\ny\"\\n');\n\
+            same(cards(' 52:54:00:12:34:56,\\n  aa:bb:cc:dd:ee:ff ,, '), '52:54:00:12:34:56,aa:bb:cc:dd:ee:ff');\n\
+            same(cards(' , '), '');\n\
+            same(minutesLeft(40), '40 seconds');\n\
+            same(minutesLeft(3600), '60 minutes');\n\
+            console.log('ok');";
+        let run = std::process::Command::new("node")
+            .args(["--input-type=module", "-e", check])
+            .arg(dir.join("install.js"))
+            .output();
+        let Ok(run) = run else {
+            eprintln!("skipped: no node to run install.js with");
             return;
         };
         let said = String::from_utf8_lossy(&run.stderr);
