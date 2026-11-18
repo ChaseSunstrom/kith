@@ -1,0 +1,7 @@
+apiVersion: kith.dev/v1
+kind: Service
+metadata:
+  name: {{ name }}
+spec:
+  selector: { app: {{ name }} }
+  ports: [{ port: 8080, targetPort: https }]

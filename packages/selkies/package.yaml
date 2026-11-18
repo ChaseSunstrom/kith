@@ -1,0 +1,6 @@
+# A desktop in a browser: Selkies streams a full Linux desktop over one HTTPS port (8080),
+# behind a user name and password. See docs/guide/packages.md.
+name: selkies
+version: 0.1.0
+description: A Linux desktop in a browser, streamed by Selkies
+kithVersion: ">=0.0.1"

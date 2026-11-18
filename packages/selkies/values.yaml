@@ -1,0 +1,11 @@
+# The Secret, in the release's namespace, whose `password` key is the desktop's password: for
+# the browser's login and the desktop user's own. Until it is there the desktop does not start
+# (the image's own is a published one: make yours first, as the NOTES show).
+passwordSecret: selkies-password  # pragma: allowlist secret (a Secret's name)
+# The name to log in with in the browser.
+user: ubuntu
+image: ghcr.io/selkies-project/selkies/desktop:2.2.1-ubuntu26.04
+# What the desktop is promised on its node. Idle it holds about 200 MB; a browser in it more.
+reserve:
+  cpu: "1"
+  memory: 1Gi

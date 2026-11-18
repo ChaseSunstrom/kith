@@ -1,0 +1,3 @@
+{{ name }} streams a desktop from {{ values.image }} to a browser, for {{ values.user }} with the password in the Secret {{ values.passwordSecret }} (key `password`). It starts once that Secret is there:
+  kith apply -f - <<< '{"apiVersion": "kith.dev/v1", "kind": "Secret", "metadata": {"name": "{{ values.passwordSecret }}", "namespace": "{{ release.namespace }}"}, "spec": {"data": {"password": "YOURS"}}}'
+From a node on the mesh: https://{{ name }}.{{ release.namespace }}.kith:8080/

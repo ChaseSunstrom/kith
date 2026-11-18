@@ -1,0 +1,25 @@
+# The desktop: one replica. Its image's services write under / as they start, so it is a
+# pod (a root of its own to write).
+apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: {{ name }}
+  labels:
+    app: {{ name }}
+spec:
+  replicas: 1
+  template:
+    pod: true
+    containers:
+      - name: desktop
+        image: {{ values.image | tojson }}
+        ports: [{ name: https, port: 8080 }]
+        readiness: { tcp: { port: 8080 } }
+        resources: {{ values.reserve | tojson }}
+        env:
+          - { name: SELKIES_BASIC_AUTH_USER, value: {{ values.user | tojson }} }
+          - name: SELKIES_BASIC_AUTH_PASSWORD
+            secret: { name: {{ values.passwordSecret | tojson }}, key: password }
+          # (The desktop user's own password: its sudo cannot set one under no_new_privs.)
+          - name: PASSWD
+            secret: { name: {{ values.passwordSecret | tojson }}, key: password }

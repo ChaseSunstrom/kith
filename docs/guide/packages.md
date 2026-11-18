@@ -128,6 +128,17 @@ kith package render packages/hyprland --name office -n desktop \
   own](hardware.md#hardware)), runs on the seat's node and finds the Wayland socket at `display`.
 - Delete the release and the node is headless again.
 
+A desktop with no screen, in a browser: [`packages/selkies`](../../packages/selkies) runs
+[Selkies](https://github.com/selkies-project/selkies)' desktop image (pinned, Ubuntu, software
+rendering) as a pod behind a Service on port 8080, its login the user `ubuntu` and the `password`
+key of a Secret you make first. The image writes under `/` as it starts, so it is a pod; and its
+own password is a published one, so the package names a Secret and renders none:
+
+```sh
+kith apply -f - <<< '{"apiVersion": "kith.dev/v1", "kind": "Secret", "metadata": {"name": "selkies-password"}, "spec": {"data": {"password": "YOURS"}}}'
+kith package render packages/selkies --name desk | kith apply -f -
+```
+
 ## Sources (GitOps)
 
 A `Source` keeps what is in a git repository (or an OCI artifact) applied:

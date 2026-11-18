@@ -437,6 +437,36 @@ fn the_nas_package_renders_a_share_and_its_smb_server() {
     assert!(read("served").contains("--foreground"));
 }
 
+/// A browser desktop: a pod (its image writes under /), port 8080 behind a Service, and the
+/// password of both the browser's login and the desktop's user from one Secret, never a value.
+#[test]
+fn the_selkies_package_is_a_pod_behind_a_password_from_a_secret() {
+    let sandbox = Sandbox::new("selkies");
+    let selkies = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/selkies");
+    let (code, out, err) = sandbox.kith(&["package", "lint", selkies]);
+    assert_eq!((code, out.as_str()), (0, "selkies 0.1.0 ok\n"), "{err}");
+    let (code, out, notes) = sandbox.kith(&["package", "render", selkies, "--name", "desk", "-n", "home"]);
+    assert_eq!(code, 0, "{notes}");
+    assert!(out.contains("    pod: true\n") && out.contains("port: 8080"), "{out}");
+    for name in ["SELKIES_BASIC_AUTH_PASSWORD", "PASSWD"] {
+        let from = format!("name: {name}\n            secret:\n              name: selkies-password\n              key: password");
+        assert!(out.contains(&from), "{name}: {out}");
+    }
+    assert!(!out.contains("kind: Secret"), "the password is the owner's to make: {out}");
+    // With no Secret named, nothing renders.
+    let (code, _, err) = sandbox.kith(&["package", "render", selkies, "--name", "desk", "--set", "passwordSecret="]);
+    assert_ne!(code, 0, "{err}");
+    // What it renders, and the Secret as its notes make it, are what `kith apply` takes.
+    sandbox.write("rendered.yaml", &out);
+    let (code, _, err) = sandbox.kith(&["apply", "-f", "rendered.yaml"]);
+    assert_eq!(code, 0, "{err}");
+    let secret = notes.split("<<< '").nth(1).and_then(|rest| rest.split('\'').next()).unwrap();
+    sandbox.write("secret.json", secret);
+    let (code, out, err) = sandbox.kith(&["apply", "-f", "secret.json"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Secret/home/selkies-password created"), "{out}");
+}
+
 #[test]
 fn package_render_and_lint() {
     let sandbox = Sandbox::new("package");
