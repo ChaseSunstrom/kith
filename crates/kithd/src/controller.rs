@@ -881,11 +881,19 @@ fn held_pods<'a>(
 /// An adopted unit nothing wants that is the old generation of a replica whose new one has not
 /// answered (and drained) yet: it goes on answering till then.
 fn held(surging: &Surging, wanted: &BTreeMap<String, Slot>, id: &str) -> bool {
-    !wanted.contains_key(id)
-        && surging.iter().any(|((owner, replica), (_, ready_since))| {
-            let rest = id.strip_prefix(&pod_of(owner, *replica));
-            !drained(*ready_since) && rest.is_some_and(|rest| rest.starts_with('_') || rest.starts_with("b_"))
-        })
+    held_by(surging, wanted, id).is_some()
+}
+
+/// The owner whose update holds the unit `id`, if one does (see [`held`]).
+fn held_by<'a>(surging: &'a Surging, wanted: &BTreeMap<String, Slot>, id: &str) -> Option<&'a str> {
+    if wanted.contains_key(id) {
+        return None;
+    }
+    surging.iter().find_map(|((owner, replica), (_, ready_since))| {
+        let rest = id.strip_prefix(&pod_of(owner, *replica));
+        let of = rest.is_some_and(|rest| rest.starts_with('_') || rest.starts_with("b_"));
+        (!drained(*ready_since) && of).then_some(owner.as_str())
+    })
 }
 
 /// What the status says of the replicas of `owner` being updated, `(replica, words)`: why one was
@@ -1502,14 +1510,26 @@ impl Controller {
             if !wanted.get(id).is_none_or(|new| &mark(new) != was) {
                 continue;
             }
-            let adopt = |pod: &str| {
+            // Its pod is taken back with its owner's egress rules, as a slot's is.
+            let adopt = |pod: &str, owner: &str| {
+                let egress = {
+                    let held = shared.store.lock().expect("a handler panicked holding the store");
+                    crate::services::egress_of(&held.store, owner, crate::services::mesh_prefix(shared))
+                };
                 let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
-                pods.adopt(self.logs.parent().unwrap_or(&self.logs), pod, handle.pid())
+                pods.adopt(
+                    self.logs.parent().unwrap_or(&self.logs),
+                    pod,
+                    handle.pid(),
+                    owner,
+                    egress,
+                )
             };
             // (One whose pod cannot be taken back answers nobody: stopped, as if not held.)
-            let kept = held(&self.surging, &wanted, id)
+            let holder = held_by(&self.surging, &wanted, id);
+            let kept = holder.is_some()
                 && match nix::unistd::getuid().is_root() {
-                    true => adopt(pod_of_unit(id))
+                    true => adopt(pod_of_unit(id), holder.unwrap_or_default())
                         .inspect_err(|e| eprintln!("kithd: {id}: {e}"))
                         .is_ok(),
                     false => true,
