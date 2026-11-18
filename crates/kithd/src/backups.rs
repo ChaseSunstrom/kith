@@ -947,15 +947,33 @@ pub async fn restore(
         let (Some(cluster), Some(there)) = (&shared.cluster, address) else {
             return Err(io(format!("node {} that has the volume has no address yet", dir.node)));
         };
-        let url = format!(
-            "https://{}/v1/backups/{namespace}/{name}/restore?at={}",
-            there.address, entry["at"]
-        );
+        // (A signed restore goes on as it came: its signature covers the path and body it was made
+        // for, so nothing is added to them. Unsigned, the node that has the volume is told the backup
+        // this node chose.)
+        let carried = match crate::access_sign::current() {
+            None => None,
+            Some(signed) => match signed.relay {
+                Some(relay) => Some(relay),
+                None => return Err(invalid("a signed restore cannot be passed on as it came".into())),
+            },
+        };
+        let url = match &carried {
+            Some(relay) => format!("https://{}{}", there.address, relay.path),
+            None => format!(
+                "https://{}/v1/backups/{namespace}/{name}/restore?at={}",
+                there.address, entry["at"]
+            ),
+        };
         // (The node that has the volume, and no other at its address.)
         let client = cluster.to(&there).map_err(io)?;
         // (As long as a volume takes to unpack, and no longer than an hour.)
         let asked = client.post(url).timeout(Duration::from_secs(3600));
-        let asked = asked.header(crate::access::FOR, caller.to_string()).send().await;
+        let asked = match carried {
+            Some(relay) => asked.body(relay.body),
+            None => asked,
+        };
+        let asked = crate::access_sign::pass_on(asked.header(crate::access::FOR, caller.to_string()));
+        let asked = asked.send().await;
         let failed = |e: reqwest::Error| {
             io(format!(
                 "asking node {} to restore: {}",

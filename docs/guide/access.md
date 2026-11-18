@@ -103,8 +103,29 @@ says `identity: gateway` and is placed on that node, the node is there); otherwi
 files within a minute and is asked for again every ten minutes. Refused at apply: an Identity
 that does not name the Workload, one with both `publicKey` and `workloads`, a template with exec
 units or VMs (only containers get the files). A node with no directory in memory starts no such
-pod. Not yet: `kith` over TLS, an identity provider (OIDC), certificates for people that expire
-before ten years, one audit log for the cluster.
+pod. Not yet: an identity provider (OIDC), certificates for people that expire before ten years,
+one audit log for the cluster.
+
+## Use kith from a laptop
+
+`kith` on another machine calls a node's TLS port the same way, with the identity's files
+(`ca.crt`, and `alice.crt` with `alice.key` beside it, from `kith identity cert` above). Build it
+with the `remote` feature; the default `kith` does not link TLS at all:
+
+```sh
+cargo build --release -p kith-cli --features remote
+kith --server HOST:PORT --identity ~/alice get
+kith --server HOST:PORT --identity ~/alice apply -f web.yaml
+kith --server HOST:PORT --identity ~/alice logs Workload/web -f
+```
+
+`KITH_SERVER` and `KITH_IDENTITY` say the same. `get`, `apply`, `watch`, `logs -f`, and the
+tunnels of `run` and `ui` all work over `--server`; `--store` and `--socket` still win over it
+when they are given. HOST:PORT is the node's `--listen` address, and its certificate must be
+signed by the cluster's CA and name `kith`: a node of another cluster, or one whose name is
+something else, is refused before anything is sent. The identity directory must hold one
+`NAME.key` and its `NAME.crt`; a key that anyone but its owner can read is refused, and `kith`
+says the `chmod 600` to run. The Roles of the identity decide what it may do, as above.
 
 ## What a node refuses, whatever the cluster says
 

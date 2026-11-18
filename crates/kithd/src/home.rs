@@ -61,7 +61,10 @@ pub enum State {
 pub enum Action {
     Nothing,
     /// Put it on the card for `seconds`, or renew it so; and announce it if `announce`.
-    Hold { announce: bool, seconds: u32 },
+    Hold {
+        announce: bool,
+        seconds: u32,
+    },
     /// Take it off, at once.
     Delete,
 }
@@ -69,7 +72,9 @@ pub enum Action {
 /// The whole seconds of the lifetime left for a confirmation that began at `started`, at `now`:
 /// none when it began three seconds ago or more (the node was paused, or the answer was late).
 fn left(started: Instant, now: Instant) -> u32 {
-    LIFETIME.saturating_sub(now.saturating_duration_since(started)).as_secs() as u32
+    LIFETIME
+        .saturating_sub(now.saturating_duration_since(started))
+        .as_secs() as u32
 }
 
 /// The next state and what to do at `now`. `confirmed` is when the confirmation began, if one has
@@ -84,13 +89,37 @@ pub fn step(state: State, confirmed: Option<Instant>, now: Instant) -> (State, A
         // (Not confirmed while it waited: no address was added, and the wait is of no use.)
         (State::Waiting(_), false) => (State::Idle, Action::Nothing),
         (State::Waiting(until), true) if now < until => (state, Action::Nothing),
-        (State::Waiting(_), true) => (State::Held { announced: 1, last: now }, Action::Hold { announce: true, seconds }),
+        (State::Waiting(_), true) => (
+            State::Held {
+                announced: 1,
+                last: now,
+            },
+            Action::Hold {
+                announce: true,
+                seconds,
+            },
+        ),
         (State::Held { .. }, false) => (State::Idle, Action::Delete),
         (State::Held { announced, last }, true) => {
             if announced < ANNOUNCEMENTS && now.duration_since(last) >= GAP {
-                (State::Held { announced: announced + 1, last: now }, Action::Hold { announce: true, seconds })
+                (
+                    State::Held {
+                        announced: announced + 1,
+                        last: now,
+                    },
+                    Action::Hold {
+                        announce: true,
+                        seconds,
+                    },
+                )
             } else {
-                (state, Action::Hold { announce: false, seconds })
+                (
+                    state,
+                    Action::Hold {
+                        announce: false,
+                        seconds,
+                    },
+                )
             }
         }
     }
@@ -213,14 +242,24 @@ fn mask(bits: u8) -> u32 {
 /// `addresses` (card name, its address, its prefix length) with `home`'s address in its network,
 /// if it is not the network or broadcast address of that. Or why there is none. `held_on` is the
 /// card the address is held on by this node: its address there is ours, not another's.
-pub fn choose<'a>(home: Home, addresses: &'a [(String, Ipv4Addr, u8)], held_on: Option<&str>) -> Result<(&'a str, u8), String> {
+pub fn choose<'a>(
+    home: Home,
+    addresses: &'a [(String, Ipv4Addr, u8)],
+    held_on: Option<&str>,
+) -> Result<(&'a str, u8), String> {
     let address = home.address;
     // An address of the node's own (a static one, a lease) would be given a lifetime, and taken
     // off when the leader is lost.
-    if let Some((name, ..)) = addresses.iter().find(|(name, a, _)| *a == address && held_on != Some(name.as_str())) {
-        return Err(format!("the house address {address} is not held: it is already an address of {name} on this node"));
+    if let Some((name, ..)) = addresses
+        .iter()
+        .find(|(name, a, _)| *a == address && held_on != Some(name.as_str()))
+    {
+        return Err(format!(
+            "the house address {address} is not held: it is already an address of {name} on this node"
+        ));
     }
-    let in_network = |(_, a, bits): &&(String, Ipv4Addr, u8)| u32::from(*a) & mask(*bits) == u32::from(address) & mask(*bits);
+    let in_network =
+        |(_, a, bits): &&(String, Ipv4Addr, u8)| u32::from(*a) & mask(*bits) == u32::from(address) & mask(*bits);
     let (name, _, bits) = addresses
         .iter()
         .filter(|(_, a, bits)| (1..=30).contains(bits) && !a.is_loopback())
@@ -228,7 +267,9 @@ pub fn choose<'a>(home: Home, addresses: &'a [(String, Ipv4Addr, u8)], held_on: 
         .ok_or_else(|| format!("the house address {address} is not held: no card of this node is in its network"))?;
     let (n, m) = (u32::from(address), mask(*bits));
     if n & !m == 0 || n | m == u32::MAX {
-        return Err(format!("the house address {address} is not held: it is the network or broadcast address of {name}'s /{bits}"));
+        return Err(format!(
+            "the house address {address} is not held: it is the network or broadcast address of {name}'s /{bits}"
+        ));
     }
     Ok((name, *bits))
 }
@@ -274,12 +315,21 @@ fn wanted(shared: &crate::Shared, held: Option<&Put>) -> Result<Put, String> {
         let state = shared.store.lock().expect("nothing panics holding the store");
         configured(&state.store).ok_or(NO_CLUSTER)?
     };
-    let none = || format!("the house address {} is not held: no card of this node is in its network", home.address);
-    let (cards, _) = kith_mesh::cards().map_err(|e| format!("the house address {} is not held: reading the cards: {e}", home.address))?;
+    let none = || {
+        format!(
+            "the house address {} is not held: no card of this node is in its network",
+            home.address
+        )
+    };
+    let (cards, _) = kith_mesh::cards()
+        .map_err(|e| format!("the house address {} is not held: reading the cards: {e}", home.address))?;
     let all = addresses();
     let (name, bits) = choose(home, &all, held.map(|put| put.card.name.as_str()))?;
     let card = cards.into_iter().find(|card| card.name == name).ok_or_else(none)?;
-    Ok(Put { home: Home { bits, ..home }, card })
+    Ok(Put {
+        home: Home { bits, ..home },
+        card,
+    })
 }
 
 /// When a confirmation that Raft says this node leads, a quorum having just said so, began: now,
@@ -303,7 +353,10 @@ fn let_go(held: &mut Option<Put>, stuck: &mut Option<(Put, Instant)>) {
     if let Some(put) = held.take()
         && let Err(e) = kith_mesh::drop_address4(put.card.index, put.home.address, put.home.bits)
     {
-        eprintln!("kithd: taking the house address {} off {}: {e}", put.home.address, put.card.name);
+        eprintln!(
+            "kithd: taking the house address {} off {}: {e}",
+            put.home.address, put.card.name
+        );
         *stuck = Some((put, Instant::now()));
     }
 }
@@ -386,8 +439,14 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
                             home.address,
                             mac_text(other)
                         )),
-                        Ok(Err(e)) => Some(format!("the house address {} is not taken: asking the LAN: {e}", home.address)),
-                        Err(e) => Some(format!("the house address {} is not taken: asking the LAN: {e}", home.address)),
+                        Ok(Err(e)) => Some(format!(
+                            "the house address {} is not taken: asking the LAN: {e}",
+                            home.address
+                        )),
+                        Err(e) => Some(format!(
+                            "the house address {} is not taken: asking the LAN: {e}",
+                            home.address
+                        )),
                     };
                     blocked = why;
                     if blocked.is_none() {
@@ -426,7 +485,10 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
                     continue;
                 }
                 if let Err(e) = kith_mesh::address4_for(card.index, home.address, home.bits, seconds) {
-                    eprintln!("kithd: holding the house address {} on {}: {e}", home.address, card.name);
+                    eprintln!(
+                        "kithd: holding the house address {} on {}: {e}",
+                        home.address, card.name
+                    );
                     // (Not held: nothing is said, and the wait is begun again.)
                     let_go(&mut held, &mut stuck);
                     state = State::Idle;
@@ -437,7 +499,10 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
                 if announce {
                     let frame = announcement(card.mac, home.address);
                     if let Err(e) = crate::dhcp::send_frame(card, &frame) {
-                        eprintln!("kithd: announcing the house address {} on {}: {e}", home.address, card.name);
+                        eprintln!(
+                            "kithd: announcing the house address {} on {}: {e}",
+                            home.address, card.name
+                        );
                     }
                 }
             }
@@ -450,7 +515,13 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
             if ear.is_none() {
                 match crate::dhcp::packet_socket(card, true) {
                     Ok(fd) => ear = Some(fd),
-                    Err(e) => say(&mut ear_said, format!("not listening on {} for another card answering for the house address {}: {e}", card.name, home.address)),
+                    Err(e) => say(
+                        &mut ear_said,
+                        format!(
+                            "not listening on {} for another card answering for the house address {}: {e}",
+                            card.name, home.address
+                        ),
+                    ),
                 }
             }
             // Another card answers for it: tell the LAN again whose it is.
@@ -459,12 +530,19 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
                 if due(defended, now, DEFEND_EVERY) {
                     defended = Some(now);
                     if let Err(e) = crate::dhcp::send_frame(card, &announcement(card.mac, home.address)) {
-                        eprintln!("kithd: announcing the house address {} on {}: {e}", home.address, card.name);
+                        eprintln!(
+                            "kithd: announcing the house address {} on {}: {e}",
+                            home.address, card.name
+                        );
                     }
                 }
                 if due(warned, now, WARN_EVERY) {
                     warned = Some(now);
-                    eprintln!("kithd: WARN: MAC {} answers for the house address {} too: announced it again", mac_text(other), home.address);
+                    eprintln!(
+                        "kithd: WARN: MAC {} answers for the house address {} too: announced it again",
+                        mac_text(other),
+                        home.address
+                    );
                 }
             }
         }
@@ -475,9 +553,12 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
                 card.name,
                 LIFETIME.as_secs()
             ),
-            (None, State::Waiting(_)) => blocked
-                .clone()
-                .unwrap_or_else(|| format!("the house address {} is not held: this node leads, and waits for the old holder's to be gone", home.address)),
+            (None, State::Waiting(_)) => blocked.clone().unwrap_or_else(|| {
+                format!(
+                    "the house address {} is not held: this node leads, and waits for the old holder's to be gone",
+                    home.address
+                )
+            }),
             (None, _) => not_leader(home, &denied),
         };
         if state == State::Idle {
@@ -489,7 +570,10 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
 }
 
 fn not_leader(home: &Home, why: &str) -> String {
-    format!("the house address {} is not held: this node is not the confirmed leader ({why})", home.address)
+    format!(
+        "the house address {} is not held: this node is not the confirmed leader ({why})",
+        home.address
+    )
 }
 
 #[cfg(test)]
@@ -544,9 +628,18 @@ mod tests {
         // another, a reply for another address, and what is not ARP, or too short: nothing.
         assert_eq!(conflict(&probe_frame(MAC, HOME), MAC, HOME), None);
         assert_eq!(conflict(&announcement(MAC, HOME), MAC, HOME), None);
-        assert_eq!(conflict(&request(OTHER, Ipv4Addr::new(10, 9, 0, 7), HOME), MAC, HOME), None);
-        assert_eq!(conflict(&probe_frame(OTHER, Ipv4Addr::new(10, 9, 0, 101)), MAC, HOME), None);
-        assert_eq!(conflict(&announcement(OTHER, Ipv4Addr::new(10, 9, 0, 101)), MAC, HOME), None);
+        assert_eq!(
+            conflict(&request(OTHER, Ipv4Addr::new(10, 9, 0, 7), HOME), MAC, HOME),
+            None
+        );
+        assert_eq!(
+            conflict(&probe_frame(OTHER, Ipv4Addr::new(10, 9, 0, 101)), MAC, HOME),
+            None
+        );
+        assert_eq!(
+            conflict(&announcement(OTHER, Ipv4Addr::new(10, 9, 0, 101)), MAC, HOME),
+            None
+        );
         let mut ip = announcement(OTHER, HOME);
         ip[12..14].copy_from_slice(&[0x08, 0x00]);
         assert_eq!(conflict(&ip, MAC, HOME), None);
@@ -578,8 +671,21 @@ mod tests {
             if now < t0 + WAIT {
                 assert_eq!((next, action), (state, Action::Nothing), "at {half} halves of a second");
             } else {
-                assert_eq!(action, Action::Hold { announce: true, seconds: 3 }, "at {half} halves of a second");
-                assert_eq!(next, State::Held { announced: 1, last: now });
+                assert_eq!(
+                    action,
+                    Action::Hold {
+                        announce: true,
+                        seconds: 3
+                    },
+                    "at {half} halves of a second"
+                );
+                assert_eq!(
+                    next,
+                    State::Held {
+                        announced: 1,
+                        last: now
+                    }
+                );
                 return;
             }
             state = next;
@@ -613,7 +719,14 @@ mod tests {
         let held = State::Held { announced: 3, last: t0 };
         for (took, seconds) in [(0.0, 3), (0.1, 2), (0.5, 2), (1.0, 2), (1.9, 1), (2.5, 0)] {
             let (_, action) = step(held, Some(t0), at(took, t0));
-            let expected = if seconds == 0 { Action::Delete } else { Action::Hold { announce: false, seconds } };
+            let expected = if seconds == 0 {
+                Action::Delete
+            } else {
+                Action::Hold {
+                    announce: false,
+                    seconds,
+                }
+            };
             assert_eq!(action, expected, "a confirmation that took {took} s");
         }
     }
@@ -626,14 +739,26 @@ mod tests {
         let (state, action) = step(held, Some(t0), at(10.0, t0));
         assert_eq!((state, action), (State::Idle, Action::Delete));
         // A node that was not holding yet, paused the same way, starts no wait either.
-        assert_eq!(step(State::Idle, Some(t0), at(10.0, t0)), (State::Idle, Action::Nothing));
-        assert_eq!(step(State::Waiting(t0), Some(t0), at(10.0, t0)), (State::Idle, Action::Nothing));
+        assert_eq!(
+            step(State::Idle, Some(t0), at(10.0, t0)),
+            (State::Idle, Action::Nothing)
+        );
+        assert_eq!(
+            step(State::Waiting(t0), Some(t0), at(10.0, t0)),
+            (State::Idle, Action::Nothing)
+        );
         // A new confirmation, begun after the pause, starts the wait: the address is not added
         // before it is over, and then for the lifetime of the confirmation that allowed it.
         let (state, action) = step(state, Some(at(10.0, t0)), at(10.2, t0));
         assert_eq!((state, action), (State::Waiting(at(10.2, t0) + WAIT), Action::Nothing));
         let (state, action) = step(state, Some(at(15.5, t0)), at(15.6, t0));
-        assert_eq!(action, Action::Hold { announce: true, seconds: 2 });
+        assert_eq!(
+            action,
+            Action::Hold {
+                announce: true,
+                seconds: 2
+            }
+        );
         assert!(matches!(state, State::Held { .. }));
     }
 
@@ -686,7 +811,11 @@ mod tests {
             ("eth0".to_string(), Ipv4Addr::new(10, 9, 0, 2), 24),
         ];
         assert_eq!(choose(home, &cards, None), Ok(("eth0", 24)));
-        assert!(choose(home, &cards[..2], None).unwrap_err().contains("no card of this node is in its network"));
+        assert!(
+            choose(home, &cards[..2], None)
+                .unwrap_err()
+                .contains("no card of this node is in its network")
+        );
         assert!(choose(home, &[], None).is_err());
     }
 
@@ -704,21 +833,35 @@ mod tests {
         // Fine in the Cluster's /23, the broadcast address of the card's /24 ...
         let home = Home::parse("10.9.0.255/23").unwrap();
         let card = [("eth0".to_string(), Ipv4Addr::new(10, 9, 0, 2), 24)];
-        assert!(choose(home, &card, None).unwrap_err().contains("network or broadcast address of eth0's /24"));
+        assert!(
+            choose(home, &card, None)
+                .unwrap_err()
+                .contains("network or broadcast address of eth0's /24")
+        );
         // ... and the network address of the card's /24.
         let home = Home::parse("10.9.1.0/23").unwrap();
         let card = [("eth0".to_string(), Ipv4Addr::new(10, 9, 1, 7), 24)];
-        assert!(choose(home, &card, None).unwrap_err().contains("network or broadcast address of eth0's /24"));
+        assert!(
+            choose(home, &card, None)
+                .unwrap_err()
+                .contains("network or broadcast address of eth0's /24")
+        );
     }
 
     #[test]
     fn an_address_the_node_has_already_is_not_held() {
         let home = Home::parse("10.9.0.100/24").unwrap();
-        let cards = [("eth0".to_string(), Ipv4Addr::new(10, 9, 0, 2), 24), ("eth0".to_string(), HOME, 24)];
+        let cards = [
+            ("eth0".to_string(), Ipv4Addr::new(10, 9, 0, 2), 24),
+            ("eth0".to_string(), HOME, 24),
+        ];
         let why = choose(home, &cards, None).unwrap_err();
         assert!(why.contains("already an address of eth0"), "{why}");
         // On another card, too.
-        let other = [("eth1".to_string(), HOME, 24), ("eth0".to_string(), Ipv4Addr::new(10, 9, 0, 2), 24)];
+        let other = [
+            ("eth1".to_string(), HOME, 24),
+            ("eth0".to_string(), Ipv4Addr::new(10, 9, 0, 2), 24),
+        ];
         assert!(choose(home, &other, Some("eth0")).is_err());
         // But on the card it is held on by this node, it is the node's own doing.
         assert_eq!(choose(home, &cards, Some("eth0")), Ok(("eth0", 24)));
@@ -731,7 +874,11 @@ mod tests {
         let (ear, wire) = socketpair(AddressFamily::Unix, SockType::Datagram, None, SockFlag::empty()).unwrap();
         // Nothing waiting: none, at once.
         assert_eq!(heard(&ear, MAC, HOME), None);
-        for frame in [probe_frame(MAC, HOME), announcement(OTHER, Ipv4Addr::new(10, 9, 0, 7)), announcement(OTHER, HOME)] {
+        for frame in [
+            probe_frame(MAC, HOME),
+            announcement(OTHER, Ipv4Addr::new(10, 9, 0, 7)),
+            announcement(OTHER, HOME),
+        ] {
             send(wire.as_raw_fd(), &frame, MsgFlags::empty()).unwrap();
         }
         assert_eq!(heard(&ear, MAC, HOME), Some(OTHER));
@@ -741,8 +888,18 @@ mod tests {
 
     #[test]
     fn an_address_that_could_not_be_taken_off_is_ours_until_its_lifetime_is_over() {
-        let card = kith_mesh::Card { name: "eth0".into(), index: 2, mac: MAC };
-        let put = Put { home: Home { address: HOME, bits: 24 }, card };
+        let card = kith_mesh::Card {
+            name: "eth0".into(),
+            index: 2,
+            mac: MAC,
+        };
+        let put = Put {
+            home: Home {
+                address: HOME,
+                bits: 24,
+            },
+            card,
+        };
         assert_eq!(ours(&None, &None), None);
         assert_eq!(ours(&Some(put.clone()), &None), Some(&put));
         let now = Instant::now();

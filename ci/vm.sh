@@ -155,7 +155,7 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    unit and a Job; the machine stays up, kithd serves again within
                    2 s and takes each back as it ran; killed ten times in a minute,
                    the machine restarts
-  --test services  instead: one node on the mesh with ci/pod.rs as a container image
+  --test services  instead: one node with no --mesh (as kith OS starts) with ci/pod.rs as a container image
                    already there: a pod that sends back every byte it is sent, its
                    Service, and a Job on the same node sending through that Service
                    over 680 connections (one after another and side by side, from
@@ -165,14 +165,14 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    kithd passes its bytes; on the node's own network, the kernel
                    sends its connections straight to the pod. Needs rustc for
                    x86_64-unknown-linux-musl
-  --test compose   instead: one node as for services, and on this machine `kith import
+  --test compose   instead: one node on the mesh, and on this machine `kith import
                    compose` of ci/compose/stack.yml (four services of the test pod,
                    nothing in it left out) applied to it. Expected: each Workload ready,
                    each Service given its backend, and a Job in a pod asking each service
                    by its compose name (and the alias a container_name gives) is answered
                    by that service's pod; the seconds from the apply to all four ready are
                    printed (kith's side of T-0320's comparison with docker compose)
-  --test quota     instead: one node as for services, its state disk made with project
+  --test quota     instead: one node on the mesh, its state disk made with project
                    quotas (as os/build.sh makes it). Expected: kithd says it holds
                    pods' storage limits at the write; a pod of 64Ki removed and the
                    node started again, the pod given its id after it is held to its

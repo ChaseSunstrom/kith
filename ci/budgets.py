@@ -45,7 +45,11 @@ KITHD_SIZE = 13
 KITHD_IDLE_RSS = 9 * MB
 # binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
 # 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.
-SIZE_BUDGETS = {"kith": 3 * MB, "kithd": KITHD_SIZE * MB}
+# kith-remote is kith built with --server's TLS (cargo feature remote, T-0404): rustls, ring and
+# webpki are most of its extra size. Its own line, so the default kith links no TLS and keeps 3 MB.
+# Measured 3.55 MB: ring's provider links every suite whichever are asked for; a provider of the
+# one P-256 suite (a direct webpki dependency) is the way under 3.5 if the line is to come down.
+SIZE_BUDGETS = {"kith": 3 * MB, "kith-remote": int(3.60 * MB), "kithd": KITHD_SIZE * MB}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
@@ -398,7 +402,8 @@ def main():
     # The binaries the image ships, built by the one command line that builds them for it: a
     # package built alone gets other features of the crates both share, so it is another binary
     # (and each order would build those crates again).
-    built = subprocess.run(["sh", "ci/musl.sh"], check=True, stdout=subprocess.PIPE, text=True)
+    built = subprocess.run(["sh", "ci/musl.sh"], check=True, stdout=subprocess.PIPE, text=True,
+                           env={**os.environ, "KITH_MUSL_REMOTE": "1"})
     bin_dir = built.stdout.strip()
     with tempfile.TemporaryDirectory() as tmp:
         if args.times:

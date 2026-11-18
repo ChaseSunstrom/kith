@@ -35,6 +35,9 @@ pub enum Caller {
     /// The same, on a worker that runs from a view: it has no Identity and no Role to ask
     /// again by, and takes the control node's word for what they may do as well.
     Checked(String, Box<Caller>),
+    /// The local socket, unsigned, where the cluster says `spec.signing: required`: the node
+    /// named, which reads and nothing more (`access_sign.rs`).
+    Console(String),
 }
 
 /// The header by which a node that passes a request on says who asked it.
@@ -85,6 +88,7 @@ impl std::fmt::Display for Caller {
             Caller::Node(node) => write!(f, "node {node}"),
             Caller::Identity(name) => f.write_str(name),
             Caller::Via(node, who) | Caller::Checked(node, who) => write!(f, "{who} via node {node}"),
+            Caller::Console(node) => write!(f, "console of node {node}"),
         }
     }
 }
@@ -105,6 +109,15 @@ impl Grants {
             // A node has no right of its own here: what it does for the cluster goes by the
             // node routes, and what it passes on is asked as whoever asked it.
             Caller::Node(_) => return Grants(Some(Vec::new())),
+            Caller::Console(_) => {
+                let reads = vec![Verb::Get, Verb::List, Verb::Watch];
+                let rule = AccessRule {
+                    kinds: vec!["*".into()],
+                    verbs: reads,
+                    namespaces: Vec::new(),
+                };
+                return Grants(Some(vec![rule]));
+            }
             Caller::Via(_, who) => return Grants::of(who, store),
             Caller::Identity(name) => name,
         };
@@ -188,23 +201,6 @@ pub fn for_identities(path: &str) -> bool {
         rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     };
     FOR_IDENTITIES.iter().any(open)
-}
-
-/// Is `path` a request one node passes on to another for whoever asked it (a unit's output,
-/// a Volume's files, a node's passphrase or new recovery key, a backup's restore: each is done by the node that
-/// has the thing)? On these alone is a node's word for who asked ([`FOR`]) read.
-fn passed_on(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/v1/") else {
-        return false;
-    };
-    let parts: Vec<&str> = rest.split('/').collect();
-    matches!(
-        parts[..],
-        ["logs", _, ..]
-            | ["volumes", _, _, "files"]
-            | ["lock", _, "passphrase" | "recovery"]
-            | ["backups", _, _, "restore"]
-    )
 }
 
 /// Whose the certificate a request came with is: a watch asks again whether it still stands
@@ -353,7 +349,7 @@ pub fn who(
             let caller = Caller::Node(node.clone());
             let (status, why) = if !crate::cluster::admitted(shared, node, key) {
                 (StatusCode::UNAUTHORIZED, crate::cluster::EVICTED.to_string())
-            } else if !passed_on(path) {
+            } else if !kith_api::passed_on(method, path) {
                 // Where nodes pass nothing on it is the node, with no right, whatever it names.
                 return Ok(caller);
             } else if worker(shared, node) {
@@ -440,6 +436,20 @@ pub fn who(
     Ok(caller)
 }
 
+/// Why a request is refused for coming from another page than the UI's own: a browser says so
+/// in `Sec-Fetch-Site` (`kith` and the nodes say nothing, and a page of the UI says
+/// `same-origin`), and a form elsewhere can send a POST that needs no preflight with a
+/// certificate the browser holds. `same-site` is refused too: a page a workload serves on
+/// another port of the same node is the same site. Only what reads (GET, HEAD) is let through.
+fn cross_site(method: &axum::http::Method, headers: &axum::http::HeaderMap) -> Option<&'static str> {
+    let site = headers.get("sec-fetch-site")?;
+    let reads = matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD);
+    let own = matches!(site.as_bytes(), b"same-origin" | b"none");
+    (!own && !reads).then_some(
+        "a request that changes something is taken only from the UI's own page (Sec-Fetch-Site: same-origin)",
+    )
+}
+
 /// Works out the [`Caller`] of a request on the TLS port, for the handlers.
 pub async fn caller(
     State(shared): State<Arc<Shared>>,
@@ -447,6 +457,9 @@ pub async fn caller(
     mut request: Request,
     next: Next,
 ) -> Response {
+    if let Some(why) = cross_site(request.method(), request.headers()) {
+        return refuse(StatusCode::FORBIDDEN, why).into_response();
+    }
     let caller = who(
         &shared,
         peer.subject.as_ref(),
@@ -462,11 +475,25 @@ pub async fn caller(
         Ok(caller) => caller,
         Err((status, why)) => return refuse(status, why).into_response(),
     };
+    // A node's word for who asked: under `spec.signing: required`, with their signature.
+    let mut signed = None;
+    if let Caller::Via(node, who) | Caller::Checked(node, who) = &caller {
+        let (method, path) = (request.method().to_string(), request.uri().path().to_string());
+        let (passed, checked) = crate::access_sign::passed(&shared, node, who, request).await;
+        request = passed;
+        match checked {
+            Ok(scope) => signed = scope,
+            Err(why) => {
+                shared.audit.record(&caller, &method, vec![path], Err(why.clone()));
+                return refuse(StatusCode::FORBIDDEN, why).into_response();
+            }
+        }
+    }
     if let Some(subject) = &peer.subject {
         request.extensions_mut().insert(Certificate(subject.clone()));
     }
     request.extensions_mut().insert(caller);
-    next.run(request).await
+    crate::access_sign::within(signed, next.run(request)).await
 }
 
 /// Refuse a Workload of `resources` that says it runs as an Identity which does not say it
@@ -597,6 +624,36 @@ mod tests {
         store.apply(node("b", "{trust: worker}")).unwrap();
         assert_eq!(control_stays(&store, &[]), Ok(()));
         assert_eq!(control_stays(&store, &[("a", Some(&control))]), Ok(()));
+    }
+
+    /// A form on another site can POST with the certificate a browser holds, and needs no
+    /// preflight: a change from `Sec-Fetch-Site` other than `same-origin` or `none` is refused
+    /// for every route, and what says nothing (`kith`, the nodes) is not.
+    #[test]
+    fn a_change_from_another_site_is_refused() {
+        use axum::http::{HeaderMap, Method};
+        let said = |site: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(site) = site {
+                headers.insert("sec-fetch-site", site.parse().unwrap());
+            }
+            headers
+        };
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            // (`same-site`: a page a workload serves on another port of the node.)
+            for other in ["cross-site", "same-site", "anything"] {
+                let why = cross_site(&method, &said(Some(other))).expect("refused");
+                assert!(why.contains("same-origin"), "{why}");
+            }
+            for fine in [None, Some("same-origin"), Some("none")] {
+                assert_eq!(cross_site(&method, &said(fine)), None, "{method} {fine:?}");
+            }
+        }
+        // What only reads is let through from anywhere.
+        for method in [Method::GET, Method::HEAD] {
+            assert_eq!(cross_site(&method, &said(Some("cross-site"))), None);
+            assert_eq!(cross_site(&method, &said(Some("same-site"))), None);
+        }
     }
 
     /// A refused certificate is written down, with who showed it and what for: a 401 is no

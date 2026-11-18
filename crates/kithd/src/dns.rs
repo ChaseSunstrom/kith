@@ -383,7 +383,11 @@ fn others(all: &[SocketAddr], listen: SocketAddr, house: Option<Ipv4Addr>) -> Ar
 /// address not yet on any card can be bound: the house address comes and goes with the leader.
 fn udp_socket(address: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, SockaddrStorage, bind, setsockopt, socket, sockopt};
-    let family = if address.is_ipv4() { AddressFamily::Inet } else { AddressFamily::Inet6 };
+    let family = if address.is_ipv4() {
+        AddressFamily::Inet
+    } else {
+        AddressFamily::Inet6
+    };
     let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
     let fd = socket(family, SockType::Datagram, flags, None)?;
     setsockopt(&fd, sockopt::ReuseAddr, &true)?;
@@ -419,11 +423,15 @@ async fn house(
                 Ok(udp) => {
                     eprintln!("kithd: serving DNS on the house address {at}");
                     said.clear();
-                    kith_dns::serve_udp_on(udp, zones.clone(), upstreams.clone(), forwarders.clone(), cache.clone()).await;
+                    kith_dns::serve_udp_on(udp, zones.clone(), upstreams.clone(), forwarders.clone(), cache.clone())
+                        .await;
                 }
                 Err(e) => {
                     if said != e.to_string() {
-                        eprintln!("kithd: serving DNS on the house address {at}: {e} (tried again every {} s)", HOUSE_RETRY.as_secs());
+                        eprintln!(
+                            "kithd: serving DNS on the house address {at}: {e} (tried again every {} s)",
+                            HOUSE_RETRY.as_secs()
+                        );
                         said = e.to_string();
                     }
                 }

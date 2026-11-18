@@ -246,10 +246,7 @@ impl Crowd {
     /// own are not counted: only what runs on it can use them.
     fn place(self: &Arc<Crowd>, from: std::net::IpAddr) -> Option<Place> {
         use std::net::IpAddr;
-        let from = match from {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(from, IpAddr::V4),
-            v4 => v4,
-        };
+        let from = from.to_canonical();
         if from.is_loopback() {
             return Some(Place(self.clone(), None));
         }
@@ -886,6 +883,16 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
         None if id == metrics.id => me.to_string(),
         None => id.to_string(),
     };
+    // What a signer needs (kith's passphrase key is salted with the cluster id): the id is the
+    // print of the CA, and `signing` says whether writes must be signed.
+    let id = shared
+        .cluster
+        .as_ref()
+        .and_then(|cluster| crate::pki::fingerprint(&cluster.me.ca).ok());
+    let signing = match crate::access_sign::requires(&shared) {
+        true => "required",
+        false => "open",
+    };
     let membership = metrics.membership_config.membership();
     let voters: Vec<u64> = membership.voter_ids().collect();
     let by_name = |ids: Vec<u64>| {
@@ -899,12 +906,16 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
         let upstream = shared.upstream.lock().expect("nothing panics holding the upstream");
         return Json(serde_json::json!({
             "node": me,
+            "clusterId": id,
+            "signing": signing,
             "view": { "applied": at, "from": upstream.as_ref().map(|(address, _)| address) },
             "mesh": shared.mesh.lock().expect("nothing panics holding the mesh").clone(),
         }));
     }
     Json(serde_json::json!({
         "node": name(metrics.id),
+        "clusterId": id,
+        "signing": signing,
         "leader": metrics.current_leader.map(name),
         "learners": by_name(learners.collect()),
         "voters": by_name(voters),
@@ -926,6 +937,23 @@ pub async fn token(
     axum::Extension(caller): axum::Extension<crate::access::Caller>,
     axum::extract::Query(asked): axum::extract::Query<std::collections::BTreeMap<String, String>>,
 ) -> axum::response::Response {
+    no_store(made(shared, caller, asked).await)
+}
+
+/// An answer that holds a secret (a join token, a recovery key): no browser or proxy keeps it.
+pub(crate) fn no_store(mut answer: Response) -> Response {
+    answer.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    answer
+}
+
+async fn made(
+    shared: Arc<Shared>,
+    caller: crate::access::Caller,
+    asked: std::collections::BTreeMap<String, String>,
+) -> Response {
     use axum::response::IntoResponse;
     if caller.node().is_some() {
         return refuse(StatusCode::FORBIDDEN, "a node may not make join tokens").into_response();
@@ -1378,7 +1406,8 @@ async fn join(
     // nodes take it as a peer by this key, and it calls them.)
     let mut more = serde_json::Map::new();
     let address = match &request.mesh {
-        None => SocketAddr::new(peer.addr.ip(), request.port),
+        // (An IPv4 machine on a socket that takes both is `::ffff:a.b.c.d`: kept as a.b.c.d.)
+        None => SocketAddr::new(peer.addr.ip().to_canonical(), request.port),
         Some(said) => {
             let mesh = serde_json::json!({ "key": said.key, "address": mesh_address.to_string(), "port": said.port });
             more.insert("mesh".into(), mesh);
@@ -1774,6 +1803,35 @@ pub(crate) mod pinned_peer {
         );
         let store = shared.store.lock().unwrap();
         assert!(store.store.get("Node/w-gpu").is_none() && store.store.get("Device/w-gpu-card0").is_some());
+    }
+
+    /// A machine that joins over IPv4 to a socket that takes both is seen as `::ffff:a.b.c.d`:
+    /// its Node is reached at `a.b.c.d`, the form every reader of `status.address` expects.
+    #[tokio::test]
+    async fn joined_from_a_mapped_address_is_stored_at_its_ipv4() {
+        let ca = pki::Ca::create().unwrap();
+        let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
+        let token = cluster
+            .tokens
+            .mint(&cluster.me.ca, Some(&cluster.me), pki::Lets::Worker)
+            .unwrap();
+        let shared = shared_of("join-mapped", cluster, &[]).await;
+        let peer = Peer {
+            addr: "[::ffff:192.0.2.7]:40000".parse().unwrap(),
+            subject: None,
+        };
+        let request = JoinRequest {
+            token,
+            name: "w".into(),
+            port: 7000,
+            mesh: None,
+            view: true,
+            ingress: false,
+        };
+        let joined = join(State(shared.clone()), ConnectInfo(peer), Json(request)).await;
+        let _joined = joined.map_err(|(_, Json(said))| said).unwrap();
+        let node = shared.store.lock().unwrap().store.get("Node/w").cloned().unwrap();
+        assert_eq!(node.status.unwrap()["address"], "192.0.2.7:7000");
     }
 
     /// A token for an ingress worker lets in a worker that runs from a view, and the node that
@@ -2417,6 +2475,43 @@ mod tests {
         assert!(String::from_utf8_lossy(&why).contains("carol may not apply Node"));
         assert!(!read.load(Ordering::SeqCst), "the body was read before the refusal");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What the web UI shows once: the token's answer, and a refusal of it, are kept by no cache;
+    /// and an Identity with no right to apply Nodes, Roles and RoleBindings gets a 403 from the
+    /// token and from netboot's PUT and DELETE (the page says the server's sentence as it is).
+    #[tokio::test]
+    async fn no_store_on_the_token_and_403_for_who_may_not() {
+        use super::pinned_peer::{node, shared_of};
+        let ca = pki::Ca::create().unwrap();
+        let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
+        let shared = shared_of("no-store", cluster, &[]).await;
+        let kept = |answer: &Response| {
+            answer.headers()[axum::http::header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        let ask = |caller: Caller| token(State(shared.clone()), axum::Extension(caller), Query(BTreeMap::new()));
+        let made = ask(Caller::Admin).await;
+        assert_eq!(made.status(), StatusCode::OK);
+        assert_eq!(kept(&made), "no-store");
+        let body = axum::body::to_bytes(made.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("\"token\":\"kith1."));
+        let refused = ask(Caller::Identity("carol".into())).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(kept(&refused), "no-store");
+        for method in [axum::http::Method::PUT, axum::http::Method::DELETE] {
+            let refused = netboot(
+                State(shared.clone()),
+                axum::Extension(Caller::Identity("carol".into())),
+                method,
+                Query(BTreeMap::new()),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        }
     }
 
     #[test]
