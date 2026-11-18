@@ -21,7 +21,12 @@ if [ "${1:-}" = --tests ]; then
     printf '%s\n' "$built" | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1
     exit 0
 fi
+# kith with TLS to a node (cargo feature remote) is built first and kept as kith-remote, beside
+# the default kith, which the size budget weighs; the default build after it leaves kith as it was.
+cargo build --release --quiet --target "$target" -p kith-cli --features remote >&2
+out="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/$target/release"
+cp "$out/kith" "$out/kith-remote"
 cargo build --release --quiet --target "$target" -p kithd -p kith-cli >&2
 # cargo reads a relative CARGO_TARGET_DIR from here; the line printed is absolute (order.py
 # matches it against /proc's maps).
-echo "$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/$target/release"
+echo "$out"

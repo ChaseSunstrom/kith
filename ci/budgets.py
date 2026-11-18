@@ -45,7 +45,9 @@ KITHD_SIZE = 13
 KITHD_IDLE_RSS = 9 * MB
 # binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
 # 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.
-SIZE_BUDGETS = {"kith": 3 * MB, "kithd": KITHD_SIZE * MB}
+# kith-remote is kith built with --server's TLS (cargo feature remote, T-0404): rustls, ring and
+# webpki are most of its extra size. Its own line, so the default kith links no TLS and keeps 3 MB.
+SIZE_BUDGETS = {"kith": 3 * MB, "kith-remote": int(3.50 * MB), "kithd": KITHD_SIZE * MB}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
