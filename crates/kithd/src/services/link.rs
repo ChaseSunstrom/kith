@@ -44,6 +44,9 @@ const ACCEPTING: usize = 64;
 const HEADER: usize = 7;
 /// The most frames the writer takes into one write.
 const BATCH: usize = 256;
+/// The most `Reset` frames that may wait for the writer: past it the link is taken down (every
+/// stream open at once may be reset, and each of those that were refused).
+const MAX_RESETS: usize = 2 * MAX_STREAMS;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -114,6 +117,8 @@ struct Shared {
     frames: mpsc::UnboundedSender<Frame>,
     /// Frames and writes made, to see how many share one.
     counts: (AtomicU64, AtomicU64),
+    /// `Reset` frames queued and not yet taken by the writer.
+    resets: AtomicUsize,
     tasks: Mutex<Vec<AbortHandle>>,
 }
 
@@ -127,6 +132,11 @@ impl Shared {
     }
 
     fn send(&self, stream: u32, kind: Kind, bytes: Vec<u8>) {
+        // A peer that opens what is refused and reads nothing is answered with a reset each, which
+        // the writer cannot send: the link goes down when it holds more than a link may.
+        if kind == Kind::Reset && self.resets.fetch_add(1, Ordering::Relaxed) >= MAX_RESETS {
+            return self.down();
+        }
         // (Failing, the link is down: its streams have been told.)
         let _ = self.frames.send(Frame { stream, kind, bytes });
     }
@@ -306,6 +316,7 @@ pub fn link<T: AsyncRead + AsyncWrite + Send + 'static>(io: T, odd: bool) -> (Li
         }),
         frames,
         counts: Default::default(),
+        resets: AtomicUsize::new(0),
         tasks: Mutex::new(Vec::new()),
     });
     let writer = tokio::spawn(write_frames(shared.clone(), write, waits));
@@ -324,6 +335,9 @@ async fn write_frames<W: AsyncWrite + Unpin>(
     while waits.recv_many(&mut frames, BATCH).await > 0 {
         out.clear();
         for frame in frames.drain(..) {
+            if frame.kind == Kind::Reset {
+                shared.resets.fetch_sub(1, Ordering::Relaxed);
+            }
             encode(&mut out, frame.stream, frame.kind, &frame.bytes);
             shared.counts.0.fetch_add(1, Ordering::Relaxed);
         }
