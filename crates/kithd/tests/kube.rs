@@ -1163,9 +1163,6 @@ fn access_is_kiths_own_and_the_kubernetes_api_is_no_way_past_it() {
     bob.refused(&["get", "deployments", "-n", "team"], &[]);
 }
 
-/// Server-side apply by two managers: each keeps its own fields, a field one has is not
-/// taken by the other without `--force-conflicts`, and what a manager leaves out of its
-/// next apply is taken out when no other manager has it.
 /// A StatefulSet of several replicas has a claim and a Volume of each replica's own, named
 /// TEMPLATE-NAME-ORDINAL, as Kubernetes names them; scaling down keeps them.
 #[test]
@@ -1201,6 +1198,9 @@ fn statefulset_of_three_has_a_claim_and_a_volume_for_each_replica() {
     assert_eq!(after.lines().count(), 3, "{after}");
 }
 
+/// Server-side apply by two managers: each keeps its own fields, a field one has is not
+/// taken by the other without `--force-conflicts`, and what a manager leaves out of its
+/// next apply is taken out when no other manager has it.
 #[test]
 fn two_field_managers_keep_their_own_fields_and_conflict_on_each_others() {
     let Some(cluster) = Cluster::start("kube-managers") else {

@@ -58,19 +58,25 @@ pub struct Own {
 impl Held {
     /// What replica `n` mounts and where: its own Volumes with the rest, and the node that goes
     /// with them, or why it has none.
-    pub fn of_replica(mut self, n: u32) -> Result<Held, String> {
-        match self.each.remove(&n) {
-            None => Ok(self),
-            Some(Err(why)) => Err(why),
+    pub fn of_replica(&self, n: u32) -> Result<Held, String> {
+        // (Only replica `n`'s entry is copied, not every replica's.)
+        let mut held = Held {
+            node: self.node.clone(),
+            volumes: self.volumes.clone(),
+            each: BTreeMap::new(),
+        };
+        match self.each.get(&n) {
+            None => Ok(held),
+            Some(Err(why)) => Err(why.clone()),
             Some(Ok(own)) => {
-                if let (Some(one), Some(other)) = (&self.node, &own.node) {
+                if let (Some(one), Some(other)) = (&held.node, &own.node) {
                     if one != other {
                         return Err(format!("its volumes are on different nodes: {one}, {other}"));
                     }
                 }
-                self.node = self.node.or(own.node);
-                self.volumes.extend(own.dirs);
-                Ok(self)
+                held.node = held.node.or_else(|| own.node.clone());
+                held.volumes.extend(own.dirs.clone());
+                Ok(held)
             }
         }
     }

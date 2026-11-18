@@ -293,9 +293,11 @@ fn decide(store: &Store, seen: Seen, grace: Duration, drain: Option<&str>) -> (V
         // (And where its exit is.) A replica that has Volumes of its own (a StatefulSet's claims)
         // goes where they are, and one whose are not anywhere waits alone.
         let pin = |replica: u32| {
-            let held = mounts
-                .get(&key)
-                .map(|held| held.clone().and_then(|held| held.of_replica(replica)));
+            let held = mounts.get(&key).map(|held| {
+                held.as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|held| held.of_replica(replica))
+            });
             let node = crate::volumes::together(claims.get(&key), held.as_ref());
             node.and_then(|node| crate::exits::pinned(store, resource, node))
         };
@@ -707,6 +709,61 @@ spec:
         assert_eq!(db["nodes"], json!({ "0": "a", "1": "b" }));
         let wait = db["unschedulable"]["2"].as_str().unwrap();
         assert!(wait.contains("data-db-2"), "{wait}");
+    }
+
+    #[test]
+    fn a_replica_whose_volume_is_on_a_node_that_is_not_ready_or_not_there_waits() {
+        // Replica 0's Volume is on a (ready), 1's on b (not ready), 2's on `gone` (no Node).
+        // None of them is started on an empty Volume on a.
+        let cluster = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: data-db-0 }
+spec: { node: a, path: d0 }
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: data-db-1 }
+spec: { node: b, path: d1 }
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: data-db-2 }
+spec: { node: gone, path: d2 }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db }
+spec:
+  replicas: 3
+  template:
+    containers: [{ name: run, image: img, volumeMounts: [{ volume: data-db, perReplica: true, path: /d }] }]
+";
+        let mut store = Store::default();
+        for resource in Resource::from_source(cluster).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        // (`b` has been lost for longer than the grace.)
+        let there = |node: &str| match node {
+            "b" => (None, Some(Duration::from_secs(600))),
+            _ => (Some((4.0, 8e9)), None),
+        };
+        let (fields, _) = plan(&store, &there, Duration::from_secs(300));
+        let (_, db) = fields.iter().find(|(key, _)| key == "Workload/default/db").unwrap();
+        assert_eq!(db["nodes"], json!({ "0": "a" }), "{db:?}");
+        for replica in ["1", "2"] {
+            assert!(db["unschedulable"][replica].is_string(), "{replica}: {db:?}");
+        }
     }
 
     #[test]

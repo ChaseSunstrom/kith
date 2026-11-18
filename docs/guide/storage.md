@@ -61,7 +61,8 @@ volumeMounts: [{ volume: data-db, perReplica: true, path: /var/lib/db }]
 - A replica whose claim has no Volume, or whose Volume's node is gone, waits (`unschedulable`
   says why) and is never started on an empty directory elsewhere. The others go on.
 - Scaling down removes no claim and no data; scaling up again finds them. Deleting a claim is
-  what removes its Volume, as above. Moving a Volume's data to another node is not done.
+  what removes its Volume, as above. A claim deleted while its replica is still there is not
+  made again until the StatefulSet is applied again, so that replica waits until then. Moving a Volume's data to another node is not done.
 
 ### Shared volumes
 
