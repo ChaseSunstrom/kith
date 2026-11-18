@@ -459,7 +459,8 @@ sys.exit(1)' "$work/beta.disk" "$1"
                 wait "$vm" 2>/dev/null || true
                 kill "$alpha"
                 wait "$alpha" 2>/dev/null || true
-                kill "$dhcp"
+                # The server usually ends once alpha's connection does; killed if it has not, so the next one can take its port.
+                kill "$dhcp" 2>/dev/null || true
                 wait "$dhcp" 2>/dev/null || true
                 KITH_OS_VERSION=0.0.0-test sh "$root/os/build.sh" --out "$work/next" >&2
                 cp "$work/next/kith-os.update" "$work/good.update"
