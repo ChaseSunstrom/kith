@@ -293,14 +293,22 @@ leader holds the address, for no more than three seconds at a time, renewed twic
 leader that hangs or is cut off loses it by itself, and one that wakes from a pause adds nothing
 before a new confirmation. A new leader waits four seconds, asks the LAN with ARP probes whether
 something else has the address, and does not take it if so (the log says "the house address ... is
-in use by MAC ...: not taken"). In all, the address moves within about ten seconds of the leader
-going away, and two cards do not answer for it for longer than the three seconds (a machine
-frozen by its hypervisor keeps the address until it runs again and takes it off). A node says why it does not hold it in its log
-("not the confirmed leader", "no card of this node is in its network"), when that changes.
+in use by MAC ...: not taken", again as a warning each minute it stays so). In all, the address
+moves within about ten seconds of the leader going away (at most 12), and two cards do not answer
+for it for longer than the three seconds (a machine frozen by its hypervisor keeps the address
+until it runs again and takes it off). A node says why it does not hold it in its log ("not the
+confirmed leader", "no card of this node is in its network", "already an address of ... on this
+node"), when that changes. The address is checked when the `Cluster` is applied: an IPv4 address
+with its prefix length that is not a network or broadcast address, loopback, multicast,
+link-local, nor in the default pod and people ranges (100.88.0.0/16, 100.89.0.0/16); and it must
+not be one the node already has (a static address or a lease).
 
 Three voters are needed for it to move: with two, the one that is left cannot confirm that it
-leads. Choose an address outside the router's DHCP range. Only DNS answers on it so far; UDP 51820
-and TCP 443 are for the nodes' own addresses still.
+leads. Choose an address outside the router's DHCP range. ARP cannot stop a hostile host on the
+LAN from claiming the address: the holder announces it again when it hears another card answer
+for it (at most once a second) and logs the other MAC, but a host that keeps claiming it can
+still take traffic. Only DNS answers on it so far; UDP 51820 and TCP 443 are for the nodes' own
+addresses still.
 
 ### Not yet
 

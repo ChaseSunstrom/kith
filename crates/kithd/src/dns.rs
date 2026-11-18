@@ -384,6 +384,9 @@ fn udp_socket(address: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     Ok(fd.into())
 }
 
+/// How long the house address's socket waits to be bound again after it could not be.
+const HOUSE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Answers on the house address, on `port`, while the store names one (`serve_udp_on`).
 async fn house(
     port: u16,
@@ -393,6 +396,8 @@ async fn house(
     forwarders: Vec<Cidr>,
     cache: Arc<kith_dns::Cache>,
 ) {
+    // The last error said, so that one that stays is said once.
+    let mut said = String::new();
     loop {
         let now = *wanted.borrow_and_update();
         let serving = async {
@@ -403,11 +408,18 @@ async fn house(
             match udp_socket(at).and_then(UdpSocket::from_std) {
                 Ok(udp) => {
                     eprintln!("kithd: serving DNS on the house address {at}");
+                    said.clear();
                     kith_dns::serve_udp_on(udp, zones.clone(), upstreams.clone(), forwarders.clone(), cache.clone()).await;
                 }
-                Err(e) => eprintln!("kithd: serving DNS on the house address {at}: {e}"),
+                Err(e) => {
+                    if said != e.to_string() {
+                        eprintln!("kithd: serving DNS on the house address {at}: {e} (tried again every {} s)", HOUSE_RETRY.as_secs());
+                        said = e.to_string();
+                    }
+                }
             }
-            std::future::pending::<()>().await;
+            // (Not bound, or no longer served: the next try is after this, or when the store changes.)
+            tokio::time::sleep(HOUSE_RETRY).await;
         };
         tokio::select! {
             () = serving => {}

@@ -7,9 +7,11 @@
 //! hangs, or is cut off, keeps the address for no more than that lifetime past its last
 //! confirmation: the kernel takes it off; and one that wakes from a pause adds or renews
 //! nothing before a new confirmation has succeeded. A node that has just become leader waits
-//! that lifetime and two seconds more, then asks the LAN (ARP probes, RFC 5227) whether
+//! that lifetime and a second more, then asks the LAN (ARP probes, RFC 5227) whether
 //! something else has the address and takes it only if not, and tells the LAN with three
-//! announcements. Two MACs never answer for the address.
+//! announcements. Two MACs never answer for the address of this cluster's nodes; ARP cannot
+//! stop a hostile host on the LAN from claiming it (the holder announces it again when it hears
+//! one, and says so).
 
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -19,7 +21,9 @@ use std::time::{Duration, Instant};
 const LIFETIME: Duration = Duration::from_secs(3);
 /// How long a new leader waits before it adds the address: the old holder's has gone (Raft
 /// elects no one until the old leader's last heartbeat is a lease old), and a second for the
-/// kernel to be late taking it off.
+/// kernel to be late taking it off. The old holder's last renewal is at most one LIFETIME
+/// before it lost its quorum, and the election takes at least its timeout (1 s) after that: the
+/// +1 s here plus that timeout is the margin over the old holder's lifetime.
 const WAIT: Duration = Duration::from_secs(4);
 /// How often leadership is confirmed, and how long a confirmation is waited for.
 const CONFIRM_EVERY: Duration = Duration::from_millis(500);
@@ -28,8 +32,18 @@ const ANNOUNCEMENTS: u8 = 3;
 const GAP: Duration = Duration::from_secs(1);
 /// How many probes before the address is taken, how far apart, and how long the LAN is listened to.
 const PROBES: u32 = 3;
-const PROBE_GAP: Duration = Duration::from_millis(300);
-const PROBE_FOR: Duration = Duration::from_secs(1);
+const PROBE_GAP: Duration = Duration::from_millis(200);
+const PROBE_FOR: Duration = Duration::from_millis(600);
+/// A holder that hears another answer for the address announces it again, at most this often,
+/// and says so, at most this often; and one that is kept from taking it says whose it is.
+const DEFEND_EVERY: Duration = Duration::from_secs(1);
+const WARN_EVERY: Duration = Duration::from_secs(10);
+const BLOCKED_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Whether something rate-limited that was last done at `last` is due again at `now`.
+fn due(last: Option<Instant>, now: Instant, every: Duration) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= every)
+}
 
 /// Where this node is with the address.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -127,8 +141,8 @@ pub fn conflict(frame: &[u8], mac: [u8; 6], address: Ipv4Addr) -> Option<[u8; 6]
     (named && sender != mac).then_some(sender)
 }
 
-/// Ask the LAN through `card` whether any other has `address`: three probes in 0.9 s, and the
-/// LAN listened to for a second. The MAC of one that does.
+/// Ask the LAN through `card` whether any other has `address`: three probes in 0.4 s, and the
+/// LAN listened to for 0.6 s. The MAC of one that does.
 fn probe(card: &kith_mesh::Card, address: Ipv4Addr) -> std::io::Result<Option<[u8; 6]>> {
     use nix::errno::Errno;
     use nix::sys::socket::{MsgFlags, recv, send, setsockopt, sockopt::ReceiveTimeout};
@@ -157,6 +171,21 @@ fn probe(card: &kith_mesh::Card, address: Ipv4Addr) -> std::io::Result<Option<[u
     Ok(None)
 }
 
+/// The MAC of whoever `ear` (a socket that hears the card) has heard answer for `address` besides
+/// `mac`, in what was waiting: no more than 256 frames, and the last such.
+fn heard(ear: &std::os::fd::OwnedFd, mac: [u8; 6], address: Ipv4Addr) -> Option<[u8; 6]> {
+    use nix::sys::socket::{MsgFlags, recv};
+    use std::os::fd::AsRawFd;
+    let (mut buffer, mut other) = ([0u8; 2048], None);
+    for _ in 0..256 {
+        match recv(ear.as_raw_fd(), &mut buffer, MsgFlags::MSG_DONTWAIT) {
+            Ok(n) => other = conflict(&buffer[..n], mac, address).or(other),
+            Err(_) => break,
+        }
+    }
+    other
+}
+
 fn mac_text(mac: [u8; 6]) -> String {
     mac.map(|byte| format!("{byte:02x}")).join(":")
 }
@@ -169,16 +198,10 @@ pub struct Home {
 }
 
 impl Home {
-    /// `192.168.1.250/24`; nothing else (no name, no address without a prefix, no network or
-    /// broadcast address of the network, nothing a LAN cannot have).
+    /// `192.168.1.250/24`; nothing else: what applying the Cluster allows (one parser, in kith-api).
     pub fn parse(text: &str) -> Option<Home> {
-        let (address, bits) = text.split_once('/')?;
-        let address: Ipv4Addr = address.parse().ok()?;
-        let bits: u8 = bits.parse().ok().filter(|bits| (1..=30).contains(bits))?;
-        let mask = mask(bits);
-        let taken = address.is_loopback() || address.is_unspecified() || address.is_multicast();
-        let (network, broadcast) = (u32::from(address) & !mask == 0, u32::from(address) | mask == u32::MAX);
-        (!(taken || network || broadcast)).then_some(Home { address, bits })
+        let (address, bits) = kith_api::kinds::home_address(text).ok()?;
+        Some(Home { address, bits })
     }
 }
 
@@ -186,14 +209,28 @@ fn mask(bits: u8) -> u32 {
     u32::MAX.checked_shl(32 - u32::from(bits)).unwrap_or(0)
 }
 
-/// The card to hold `home` on: the first of `addresses` (card name, its address, its prefix
-/// length) with `home`'s address in its network.
-pub fn lan_card(home: Home, addresses: &[(String, Ipv4Addr, u8)]) -> Option<&str> {
-    addresses
+/// The card to hold `home` on and the prefix length to add it with (the card's own): the first of
+/// `addresses` (card name, its address, its prefix length) with `home`'s address in its network,
+/// if it is not the network or broadcast address of that. Or why there is none. `held_on` is the
+/// card the address is held on by this node: its address there is ours, not another's.
+pub fn choose<'a>(home: Home, addresses: &'a [(String, Ipv4Addr, u8)], held_on: Option<&str>) -> Result<(&'a str, u8), String> {
+    let address = home.address;
+    // An address of the node's own (a static one, a lease) would be given a lifetime, and taken
+    // off when the leader is lost.
+    if let Some((name, ..)) = addresses.iter().find(|(name, a, _)| *a == address && held_on != Some(name.as_str())) {
+        return Err(format!("the house address {address} is not held: it is already an address of {name} on this node"));
+    }
+    let in_network = |(_, a, bits): &&(String, Ipv4Addr, u8)| u32::from(*a) & mask(*bits) == u32::from(address) & mask(*bits);
+    let (name, _, bits) = addresses
         .iter()
-        .filter(|(_, address, bits)| *bits > 0 && !address.is_loopback())
-        .find(|(_, address, bits)| u32::from(*address) & mask(*bits) == u32::from(home.address) & mask(*bits))
-        .map(|(name, ..)| name.as_str())
+        .filter(|(_, a, bits)| (1..=30).contains(bits) && !a.is_loopback())
+        .find(in_network)
+        .ok_or_else(|| format!("the house address {address} is not held: no card of this node is in its network"))?;
+    let (n, m) = (u32::from(address), mask(*bits));
+    if n & !m == 0 || n | m == u32::MAX {
+        return Err(format!("the house address {address} is not held: it is the network or broadcast address of {name}'s /{bits}"));
+    }
+    Ok((name, *bits))
 }
 
 /// The house address the Clusters say (the lowest of them, so that every node takes the same
@@ -230,17 +267,19 @@ struct Put {
 const NO_CLUSTER: &str = "the house address is in no Cluster";
 
 /// What this node should hold, and on which card: the house address, if a card of this node is in
-/// its network; or why it holds nothing.
-fn wanted(shared: &crate::Shared) -> Result<Put, String> {
+/// its network and does not have it already; or why it holds nothing. (No Cluster with a house
+/// address: the cards are not read.)
+fn wanted(shared: &crate::Shared, held: Option<&Put>) -> Result<Put, String> {
     let home = {
         let state = shared.store.lock().expect("nothing panics holding the store");
         configured(&state.store).ok_or(NO_CLUSTER)?
     };
     let none = || format!("the house address {} is not held: no card of this node is in its network", home.address);
     let (cards, _) = kith_mesh::cards().map_err(|e| format!("the house address {} is not held: reading the cards: {e}", home.address))?;
-    let name = lan_card(home, &addresses()).ok_or_else(none)?.to_owned();
+    let all = addresses();
+    let (name, bits) = choose(home, &all, held.map(|put| put.card.name.as_str()))?;
     let card = cards.into_iter().find(|card| card.name == name).ok_or_else(none)?;
-    Ok(Put { home, card })
+    Ok(Put { home: Home { bits, ..home }, card })
 }
 
 /// When a confirmation that Raft says this node leads, a quorum having just said so, began: now,
@@ -284,16 +323,24 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
     let (mut reason, mut blocked) = (NO_CLUSTER.to_string(), None::<String>);
     // What Raft last said when it did not confirm this node as leader.
     let mut denied = String::new();
+    // A socket that hears the card while the address is held (to hear another answer for it), and
+    // when it was last defended, last said so, and when a block was last said.
+    // ponytail: the socket hears every frame of the card, read twice a second and the ARP ones
+    // picked out here (nix has no ARP-only packet socket); a kernel filter when a LAN is busy
+    // enough to overflow its buffer.
+    let (mut ear, mut ear_said) = (None::<std::os::fd::OwnedFd>, String::new());
+    let (mut defended, mut warned, mut block_warned) = (None::<Instant>, None::<Instant>, None::<Instant>);
     loop {
         tokio::select! {
             _ = tick.tick() => {}
             _ = stopping.changed() => break,
         }
-        let want = wanted(&shared);
+        let want = wanted(&shared, held.as_ref());
         // The address or its card changed (the Cluster was edited, a card came or went): what
         // was held is let go, and the new one is waited for as any.
         if want.as_ref().ok() != before.as_ref() {
             let_go(&mut held);
+            ear = None;
             (state, blocked, before) = (State::Idle, None, want.as_ref().ok().cloned());
         }
         let want = match want {
@@ -308,10 +355,12 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
         if let Err(why) = &confirm {
             denied.clone_from(why);
         }
-        let (next, action) = step(state, confirm.ok(), Instant::now());
+        // When the confirmation began; what is held is for the time left of it at the last moment.
+        let mut began = confirm.ok();
+        let (next, action) = step(state, began, Instant::now());
         state = next;
         match action {
-            Action::Hold { announce, mut seconds } => {
+            Action::Hold { announce, .. } => {
                 if held.is_none() {
                     // The first time, and every time after it was let go: is it anyone's?
                     let (asked, address) = (card.clone(), home.address);
@@ -328,19 +377,34 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
                     };
                     blocked = why;
                     if blocked.is_none() {
-                        // (A second the probe took: the confirmation is old, and a new one gives the lifetime.)
-                        let again = confirmed(&shared).await;
-                        seconds = again.map_or(0, |started| left(started, Instant::now()));
-                        if seconds == 0 {
+                        // (A moment the probe took: the confirmation is old, and a new one gives the lifetime.)
+                        began = confirmed(&shared).await.ok();
+                        if began.is_none() {
                             state = State::Idle;
                         }
                     } else {
                         state = State::Waiting(Instant::now() + WAIT);
                     }
-                    if blocked.is_some() || seconds == 0 {
-                        say(&mut reason, blocked.clone().unwrap_or_else(|| not_leader(home, &denied)));
+                    if blocked.is_some() || began.is_none() {
+                        let why = blocked.clone().unwrap_or_else(|| not_leader(home, &denied));
+                        let again = reason == why;
+                        say(&mut reason, why.clone());
+                        // Said as it began (above); and again, as a warning, every minute it stays.
+                        if blocked.is_some() && (!again || due(block_warned, Instant::now(), BLOCKED_WARN_EVERY)) {
+                            if again {
+                                eprintln!("kithd: WARN: {why}");
+                            }
+                            block_warned = Some(Instant::now());
+                        }
                         continue;
                     }
+                }
+                // The time left of the confirmation, now, at the moment before the kernel is told.
+                let seconds = began.map_or(0, |started| left(started, Instant::now()));
+                if seconds == 0 {
+                    let_go(&mut held);
+                    state = State::Idle;
+                    continue;
                 }
                 if let Err(e) = kith_mesh::address4_for(card.index, home.address, home.bits, seconds) {
                     eprintln!("kithd: holding the house address {} on {}: {e}", home.address, card.name);
@@ -360,6 +424,30 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
             }
             Action::Delete => let_go(&mut held),
             Action::Nothing => {}
+        }
+        if held.is_none() {
+            ear = None;
+        } else {
+            if ear.is_none() {
+                match crate::dhcp::packet_socket(card, true) {
+                    Ok(fd) => ear = Some(fd),
+                    Err(e) => say(&mut ear_said, format!("not listening on {} for another card answering for the house address {}: {e}", card.name, home.address)),
+                }
+            }
+            // Another card answers for it: tell the LAN again whose it is.
+            if let Some(other) = ear.as_ref().and_then(|ear| heard(ear, card.mac, home.address)) {
+                let now = Instant::now();
+                if due(defended, now, DEFEND_EVERY) {
+                    defended = Some(now);
+                    if let Err(e) = crate::dhcp::send_frame(card, &announcement(card.mac, home.address)) {
+                        eprintln!("kithd: announcing the house address {} on {}: {e}", home.address, card.name);
+                    }
+                }
+                if due(warned, now, WARN_EVERY) {
+                    warned = Some(now);
+                    eprintln!("kithd: WARN: MAC {} answers for the house address {} too: announced it again", mac_text(other), home.address);
+                }
+            }
         }
         let why = match (&held, state) {
             (Some(_), _) => format!(
@@ -578,11 +666,69 @@ mod tests {
             ("eth1".to_string(), Ipv4Addr::new(10, 0, 2, 15), 24),
             ("eth0".to_string(), Ipv4Addr::new(10, 9, 0, 2), 24),
         ];
-        assert_eq!(lan_card(home, &cards), Some("eth0"));
-        assert_eq!(lan_card(home, &cards[..2]), None);
-        assert_eq!(lan_card(home, &[]), None);
-        // A card's own prefix decides (a /16 card holds a /24 house address, which is in it).
+        assert_eq!(choose(home, &cards, None), Ok(("eth0", 24)));
+        assert!(choose(home, &cards[..2], None).unwrap_err().contains("no card of this node is in its network"));
+        assert!(choose(home, &[], None).is_err());
+    }
+
+    #[test]
+    fn the_address_is_added_with_the_prefix_of_the_card_not_of_the_cluster() {
+        // A /24 house address on a /16 card: it is in the card's network, and added with the
+        // card's /16, so that no route of its own comes with it.
+        let home = Home::parse("10.9.0.100/24").unwrap();
         let wide = [("eth0".to_string(), Ipv4Addr::new(10, 9, 3, 2), 16)];
-        assert_eq!(lan_card(home, &wide), Some("eth0"));
+        assert_eq!(choose(home, &wide, None), Ok(("eth0", 16)));
+    }
+
+    #[test]
+    fn the_network_and_broadcast_address_are_judged_by_the_card() {
+        // Fine in the Cluster's /23, the broadcast address of the card's /24 ...
+        let home = Home::parse("10.9.0.255/23").unwrap();
+        let card = [("eth0".to_string(), Ipv4Addr::new(10, 9, 0, 2), 24)];
+        assert!(choose(home, &card, None).unwrap_err().contains("network or broadcast address of eth0's /24"));
+        // ... and the network address of the card's /24.
+        let home = Home::parse("10.9.1.0/23").unwrap();
+        let card = [("eth0".to_string(), Ipv4Addr::new(10, 9, 1, 7), 24)];
+        assert!(choose(home, &card, None).unwrap_err().contains("network or broadcast address of eth0's /24"));
+    }
+
+    #[test]
+    fn an_address_the_node_has_already_is_not_held() {
+        let home = Home::parse("10.9.0.100/24").unwrap();
+        let cards = [("eth0".to_string(), Ipv4Addr::new(10, 9, 0, 2), 24), ("eth0".to_string(), HOME, 24)];
+        let why = choose(home, &cards, None).unwrap_err();
+        assert!(why.contains("already an address of eth0"), "{why}");
+        // On another card, too.
+        let other = [("eth1".to_string(), HOME, 24), ("eth0".to_string(), Ipv4Addr::new(10, 9, 0, 2), 24)];
+        assert!(choose(home, &other, Some("eth0")).is_err());
+        // But on the card it is held on by this node, it is the node's own doing.
+        assert_eq!(choose(home, &cards, Some("eth0")), Ok(("eth0", 24)));
+    }
+
+    #[test]
+    fn what_is_waiting_on_the_ear_is_read_without_waiting_for_more() {
+        use nix::sys::socket::{AddressFamily, MsgFlags, SockFlag, SockType, send, socketpair};
+        use std::os::fd::AsRawFd;
+        let (ear, wire) = socketpair(AddressFamily::Unix, SockType::Datagram, None, SockFlag::empty()).unwrap();
+        // Nothing waiting: none, at once.
+        assert_eq!(heard(&ear, MAC, HOME), None);
+        for frame in [probe_frame(MAC, HOME), announcement(OTHER, Ipv4Addr::new(10, 9, 0, 7)), announcement(OTHER, HOME)] {
+            send(wire.as_raw_fd(), &frame, MsgFlags::empty()).unwrap();
+        }
+        assert_eq!(heard(&ear, MAC, HOME), Some(OTHER));
+        // Read: not heard twice.
+        assert_eq!(heard(&ear, MAC, HOME), None);
+    }
+
+    #[test]
+    fn a_rate_limited_thing_is_due_the_first_time_and_after_its_interval() {
+        let t0 = Instant::now();
+        let every = Duration::from_secs(1);
+        assert!(due(None, t0, every));
+        assert!(!due(Some(t0), t0, every));
+        assert!(!due(Some(t0), at(0.9, t0), every));
+        assert!(due(Some(t0), at(1.0, t0), every));
+        // (A clock that went back: not due, and no panic.)
+        assert!(!due(Some(at(5.0, t0)), t0, every));
     }
 }

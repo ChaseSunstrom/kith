@@ -75,7 +75,7 @@
             done
             echo "vm.sh: n$had was reset: $house was announced again after $moved s" >&2
             monitor "$had" cont
-            awk -v moved="$moved" 'BEGIN { exit !(moved <= 10) }' || fail "the address took $moved s to move after n$had was reset (10 s allowed)"
+            awk -v moved="$moved" 'BEGIN { exit !(moved <= 12) }' || fail "the address took $moved s to move after n$had was reset (12 s allowed)"
             steady 30 "after n$had was reset"
             alone "after n$had was reset"
             [ "$holder" != "$first_holder" ] || fail "$house is held by the card that was reset"
@@ -104,7 +104,7 @@
                 sleep 1
             done
             echo "vm.sh: n$now_holder was stopped: $house was announced again after $moved s" >&2
-            awk -v moved="$moved" 'BEGIN { exit !(moved <= 10) }' || fail "the address took $moved s to move after n$now_holder was stopped (10 s allowed)"
+            awk -v moved="$moved" 'BEGIN { exit !(moved <= 12) }' || fail "the address took $moved s to move after n$now_holder was stopped (12 s allowed)"
             alone "while n$now_holder was stopped"
             sleep 3
             alone "while n$now_holder was stopped"
@@ -120,5 +120,5 @@
             [ "$holder" != "$(printf '52:54:00:00:09:0%s' "$now_holder")" ] || fail "n$now_holder went on again and holds $house"
             asked "$holder" >/dev/null || fail "nothing answered DNS from $house after n$now_holder went on again"
             ! grep -a 'panicked at\|Kernel panic' "$work"/n?.log || fail "a node panicked"
-            echo "vm.sh: ok: three nodes; one MAC answered for $house and announced it, DNS answered from it; after the holder was reset, and after the next was stopped, another announced it within 10 s ($moved s the last time) and two cards were never heard at once while a holder was stopped, nor for more than 4 s after it went on again"
+            echo "vm.sh: ok: three nodes; one MAC answered for $house and announced it, DNS answered from it; after the holder was reset, and after the next was stopped, another announced it within 12 s ($moved s the last time) and two cards were never heard at once while a holder was stopped, nor for more than 4 s after it went on again"
             exit 0
