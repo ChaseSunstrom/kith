@@ -349,7 +349,9 @@ nodePolicy: hardened          # what the cluster may not have this node do: see 
 
 Then nothing is asked or confirmed: a stick with answers erases the disk they name in whatever
 machine it starts. A disk that is not there, `only` on a machine with several, or an unknown
-field stops it with the reason on the console and nothing written.
+field stops it with the reason on the console and nothing written. [The installer's
+page](../install.html) is a form that writes this file in your browser, and checks each answer as
+you type.
 
 A kernel's name for a disk (`sda`, `nvme0n1`) can change with the order the disks are found
 in; its serial does not. `serial:` names the disk by what the disk itself reports (NVMe,
