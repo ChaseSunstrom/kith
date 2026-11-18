@@ -61,7 +61,8 @@ spec:
 - **On kith OS** a device filter on each container's cgroup checks every open and `mknod`: it
   lets through the usual few, the terminals of the container's own `/dev/pts` and each device it
   was given, and refuses the rest, even to a root pod. A pod that made its own node
-  (`/dev/net/tun`) needs a `Device` with `class: other` and its `path`, claimed. Where kithd is
+  (`/dev/net/tun`), or a FUSE program (`/dev/fuse`; kith OS's kernel has FUSE), needs a `Device` with `class: other` and its `path`,
+  claimed. Where kithd is
   your own service there is no filter: no one in a user namespace can make a node.
 - The right to apply a `DeviceClaim` and a workload that names it is the grant: a Role rule with
   `kinds: ["*"]` covers both, so give it only to someone you trust with any hardware.

@@ -208,6 +208,18 @@ EOF
             tun withtun '"deviceClaims":["tun"],'
             grep -q 'ids: /dev/net/tun /dev/net/tun owner [0-9]* opens Ok' "$work/withtun.out" || fail "a pod whose claim names the tun Device did not open /dev/net/tun: $(cat "$work/withtun.out" "$work/withtun.err")"
             echo "vm.sh: ok: /dev/net/tun opens only in a pod that claims a Device of it" >&2
+            # FUSE (the kernel has it, T-0438): /dev/fuse the same way.
+            fuse() { job "$1" "\"pod\":true,$2" "\"image\":\"kith.test/pod:1\",\"command\":[\"/bin/pod\",\"ids\",\"/dev/fuse\"]" '^[0-9]+ succeeded'; }
+            fuse nofuse ''
+            ! grep -q 'opens Ok' "$work/nofuse.out" || fail "a pod with no claim opened /dev/fuse: $(cat "$work/nofuse.out")"
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Device","metadata":{"name":"n2-fuse","labels":{"kith.dev/namespaces":"default"}},"spec":{"node":"n2","class":"other","path":"/dev/fuse"}},
+ {"apiVersion":"kith.dev/v1","kind":"DeviceClaim","metadata":{"name":"fuse"},"spec":{"device":"n2-fuse"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Device n2-fuse and its claim were not applied"
+            fuse withfuse '"deviceClaims":["fuse"],'
+            grep -q 'ids: /dev/fuse /dev/fuse owner [0-9]* opens Ok' "$work/withfuse.out" || fail "a pod whose claim names the fuse Device did not open /dev/fuse: $(cat "$work/withfuse.out" "$work/withfuse.err")"
+            echo "vm.sh: ok: /dev/fuse is there, and opens only in a pod that claims a Device of it" >&2
 
             # The seat is kith-system's until its label names the namespace that claims it: the
             # node's discovered Seat is given to default here, as an admin would label it.
