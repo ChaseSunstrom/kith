@@ -176,10 +176,10 @@ pub fn ready_addresses(workload: &Resource) -> BTreeMap<u32, Ipv6Addr> {
         let address = unit["address"]
             .as_str()
             .and_then(|address| address.parse::<Ipv6Addr>().ok());
-        if let (Some(replica), Some(address)) = (replica, address) {
-            if ready.contains(&replica) {
-                addresses.entry(replica).or_insert(address);
-            }
+        if let (Some(replica), Some(address)) = (replica, address)
+            && ready.contains(&replica)
+        {
+            addresses.entry(replica).or_insert(address);
         }
     }
     addresses
