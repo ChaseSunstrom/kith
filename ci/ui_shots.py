@@ -13,7 +13,7 @@
 The page's files are read from crates/kithd/ui as they are on disk, so a change shows without a
 build, and are sent with the policy crates/kithd/src/ui.rs gives them; every other request goes
 to the first node's socket, the way `kith ui` passes it on. What runs is `exec` units (sleep),
-so nothing is pulled. Needs target/debug/kithd and kith (cargo build) and a Chromium
+so nothing is pulled. Builds target/debug/kithd and kith first (cargo build), and needs a Chromium
 (playwright's headless shell in ~/.cache/ms-playwright, or CHROME=path).
 """
 import glob
@@ -114,6 +114,8 @@ def until(what, ok, seconds=90):
 def main():
     out = pathlib.Path(sys.argv[1])
     out.mkdir(parents=True, exist_ok=True)
+    # (A lane's own target folder starts empty: what is already built, cargo leaves.)
+    subprocess.run(["cargo", "build", "-q", "-p", "kithd", "-p", "kith-cli"], cwd=ROOT, check=True)
     # (In /tmp whatever TMPDIR says: a socket's path has 108 bytes to fit in.)
     work = pathlib.Path(tempfile.mkdtemp(prefix="kith-ui-", dir="/tmp"))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit("ended"))  # so the nodes are put away then too
