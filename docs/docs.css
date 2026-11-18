@@ -2,7 +2,11 @@
    at every part. Colour, type and timing come from site.css's tokens; the bar and the buttons are site.css's too.
    ci/site_docs.py --check fails on a token used here that site.css does not define. */
 
-.scrolled .bar { border-bottom: 1px solid var(--hair); padding-bottom: 11px; }
+/* The bar: the mark is drawn whole from the first paint (a page you turn to does not draw it again), and its links stay at every width. */
+.bar .mark line { animation: none; stroke-dasharray: none; }
+.bar .mark circle:not(.ring) { animation: none; }
+@media (max-width: 1100px) { .bar nav { display: flex; } }
+@media (max-width: 720px) { .bar nav { gap: 12px; } .bar nav .more { display: none; } }
 .doc { display: grid; grid-template-columns: 264px minmax(0, 1fr); gap: 56px; max-width: calc(1120px + 2 * var(--gutter)); margin-inline: auto; padding: 24px var(--gutter) 96px; }
 .find label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
@@ -41,7 +45,10 @@
 
 /* The page: its h1 is where you are (a blue stop); each h2 is a stop on the line; an h3 is a tick on it. */
 .page { position: relative; min-width: 0; padding-left: 44px; max-width: 820px; }
-.page::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: var(--stroke); background: var(--text); }
+/* The line fills with blue as far as the page has been read (docs.js sets --run, 0 to 1; each stop passed turns blue too). */
+.page::before, .reading { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: var(--stroke); background: var(--text); }
+.reading { --run: 0; background: var(--accent); transform: scaleY(var(--run)); transform-origin: top; pointer-events: none; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .page::after { content: ""; position: absolute; left: -3px; bottom: 0; width: 21px; height: var(--stroke); background: var(--text); }
 .page > * { min-width: 0; }
 .page h1, .page h2, .page h3, .page h4 { position: relative; line-height: 1.2; letter-spacing: -0.015em; }
@@ -50,6 +57,7 @@
 .page h1::before { background: radial-gradient(var(--accent) 38%, var(--bg) 42%); border-color: var(--accent); left: -41.5px; width: 20px; height: 20px; top: calc(0.6em - 10px + 12px); }
 .page h2 { font-size: var(--head); font-weight: 800; margin: 72px 0 18px; scroll-margin-top: 76px; }
 .page h2::before { left: -43.5px; top: calc(0.6em - 10px); width: 20px; height: 20px; }
+.page h2.read::before { border-color: var(--accent); }
 .page h2:target::before { border-color: var(--accent); background: radial-gradient(var(--accent) 38%, var(--bg) 42%); }
 .page h3 { font-size: var(--large); font-weight: 800; margin: 40px 0 12px; }
 .page h3::before { content: ""; position: absolute; left: -44px; top: 0.6em; width: 20px; height: var(--stroke); background: var(--text); }
@@ -69,20 +77,28 @@
 .page ul, .page ol { margin: 0 0 16px; max-width: 70ch; }
 .page li { position: relative; padding-left: 26px; margin-bottom: 6px; }
 .page li > :is(ul, ol) { margin: 6px 0 0; }
-.page li > :is(p, pre, .table, .picture):last-child { margin-bottom: 0; }
+.page li > :is(p, pre, .code, .table, .picture):last-child { margin-bottom: 0; }
 .page li > p { margin-bottom: 10px; }
 .page ul > li::before { content: ""; position: absolute; left: 2px; top: 0.78em; width: 10px; height: var(--stroke); background: var(--text); }
 .page ul ul > li::before { background: var(--dim); width: 8px; }
 .page ol { counter-reset: n; }
 .page ol > li { counter-increment: n; }
 .page ol > li::before { content: counter(n) "."; position: absolute; left: 0; width: 22px; text-align: right; font-weight: 800; font-variant-numeric: tabular-nums; }
-.page li > pre { max-width: none; }
+.page li > :is(pre, .code) { max-width: none; }
 
 /* Code. A monospace only for what is code; a block hangs from an ink line, as the diffs of the web UI do. */
 .page code { font-family: var(--mono); font-size: 0.86em; background: var(--sunken); padding: 1px 3px; overflow-wrap: anywhere; }
 .page pre { margin: 20px 0; padding: 14px 18px; background: var(--sunken); border-left: var(--stroke) solid var(--text); overflow-x: auto; font-size: 14px; line-height: 1.55; tab-size: 4; -webkit-text-size-adjust: none; }
 .page pre code { padding: 0; background: none; font-size: inherit; overflow-wrap: normal; white-space: pre; }
 .page a code { color: inherit; }
+/* A block's Copy button (docs.js wraps the pre): a row above the code, on the same ground and ink line. */
+.code { margin: 20px 0; background: var(--sunken); border-left: var(--stroke) solid var(--text); min-width: 0; }
+.code pre { margin: 0; border-left: 0; padding-top: 4px; }
+.page pre:focus-visible { outline: var(--stroke) solid var(--accent); outline-offset: -3px; }
+.copy { display: block; margin: 0 0 0 auto; min-height: 40px; min-width: 72px; padding: 6px 16px; border: var(--stroke) solid var(--text); background: var(--bg); color: var(--text); font: 700 var(--small) / 1.4 var(--sans); cursor: pointer; }
+.copy:hover, .copy:focus-visible { background: var(--text); color: var(--bg); }
+.copy[data-state] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+@media (prefers-reduced-motion: no-preference) { .copy { transition: background var(--quick), color var(--quick); } }
 
 /* Tables: hairlines between rows, an ink line under the head; wider than the page, they scroll. */
 .table { margin: 24px 0; overflow-x: auto; }
@@ -98,11 +114,13 @@
 .picture img { max-width: 100%; height: auto; vertical-align: top; border: 1px solid var(--hair); background: var(--bg); }
 
 /* The end of a page: the page before and after, and where its words live. */
-.tail { margin-top: 72px; }
+.page .tail { display: block; max-width: none; margin: 72px 0 0; padding: 0; } /* not site.css's footer: it sits in the page's own column */
 .tail nav { display: flex; flex-wrap: wrap; gap: 12px 40px; }
 .tail nav a { display: block; flex: 1 1 220px; max-width: 360px; padding: 8px 0 8px 14px; border-left: var(--stroke) solid var(--hair); color: var(--text); font-weight: 800; text-decoration: none; transition: border-color var(--quick), color var(--quick); }
 
 .tail nav a:hover { border-left-color: var(--accent); color: var(--accent-text); }
+.tail nav .next { text-align: right; border-left: 0; border-right: var(--stroke) solid var(--hair); padding: 8px 14px 8px 0; margin-left: auto; }
+.tail nav .next:hover { border-right-color: var(--accent); }
 .tail nav span { display: block; color: var(--dim); font-size: var(--small); font-weight: 400; }
 .tail .fine { margin-top: 28px; }
 
@@ -134,7 +152,8 @@
   .page h1 { font-size: var(--title); }
   .page h2 { margin-top: 56px; }
   .page h1 + p { font-size: var(--base); }
-  .page pre { margin-inline: -8px 0; padding-inline: 14px; font-size: 13px; }
+  .code { margin-inline: -8px 0; }
+  .page pre { padding-inline: 14px; font-size: 13px; }
   .table table { font-size: var(--small); }
   .table th, .table td { padding-right: 14px; }
 }

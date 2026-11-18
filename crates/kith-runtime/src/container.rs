@@ -2134,6 +2134,31 @@ mod tests {
     /// asks which is the lowest free must not meet another's.
     static RANGE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The skip line for a create that failed with `said`, if the host's cgroup (a CI runner's may
+    /// take no pids limit) is why; None for any other failure, which the test must assert on.
+    fn cgroup_skip(said: &str) -> Option<String> {
+        said.contains("cgroup error")
+            .then(|| format!("::warning title=SKIP::SKIP (not a pass): this host's cgroup takes no container ({said})"))
+    }
+
+    /// Writes the skip line straight to stderr: `eprintln!` is captured by the harness and a
+    /// passing test's output is dropped, which is how a skip went unseen.
+    fn report_skip(line: &str) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+
+    /// A create a runner's cgroup refuses (no pids limit) is a skip the CI log shows, not a silent
+    /// pass: the line is a GitHub `::warning` annotation, written past the test harness's capture.
+    #[test]
+    fn pids_limit_skip_is_reported_only_for_a_cgroup_refusal() {
+        let line = cgroup_skip("failed to create: cgroup error: no pids").expect("a cgroup refusal skips");
+        assert!(line.starts_with("::warning ") && line.contains("SKIP"), "{line}");
+        assert!(line.contains("no pids"), "the cause is in the line: {line}");
+        assert!(cgroup_skip("failed to prepare rootfs").is_none());
+        assert!(cgroup_skip("").is_none());
+    }
+
     #[test]
     fn device_nodes_refuse_mem_kmem_port_and_tpm() {
         for path in ["/dev/mem", "/dev/kmem", "/dev/port", "/dev/tpm0", "/dev/tpmrm0"] {
@@ -3035,9 +3060,9 @@ mod tests {
             .expect("a rootfs that is a file makes no container")
             .to_string();
         // (A CI runner's cgroup may take no pids limit: the create fails before the rootfs.)
-        if said.contains("cgroup error") {
+        if let Some(line) = cgroup_skip(&said) {
             let _ = fs::remove_dir_all(&root);
-            return eprintln!("skipped: this host's cgroup takes no container ({said})");
+            return report_skip(&line);
         }
         assert!(said.contains("failed to prepare rootfs"), "{said}");
         assert!(
@@ -3114,9 +3139,9 @@ mod tests {
         };
         let (out, err) = files();
         let first = match runtime.create("a", &image, &unit, out, err) {
-            Err(e) if e.to_string().contains("cgroup error") => {
+            Err(e) if cgroup_skip(&e.to_string()).is_some() => {
                 let _ = fs::remove_dir_all(&root);
-                return eprintln!("skipped: this host's cgroup takes no container ({e})");
+                return report_skip(&cgroup_skip(&e.to_string()).unwrap());
             }
             made => made.unwrap(),
         };
