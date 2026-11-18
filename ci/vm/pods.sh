@@ -191,7 +191,7 @@ EOF
             api 1 DELETE /v1/resources/Job/default/escape >/dev/null || fail "the Job escape was not deleted"
             part writer '"ids","+/v/note"' ',"subPath":"shared/deep"' '^[0-9]+ succeeded'
             part reader '"ids","=/v/note"' ',"subPath":"shared/deep"' '^[0-9]+ succeeded'
-            grep -q 'ids: =/v/note holds Ok("made")' "$work/reader.out" || fail "a pod did not see in its part what another wrote there: $(cat "$work/writer.out" "$work/reader.out" "$work/reader.err")"
+            grep -q 'ids: =/v/note holds Ok(\\*"made\\*")' "$work/reader.out" || fail "a pod did not see in its part what another wrote there: $(cat "$work/writer.out" "$work/reader.out" "$work/reader.err")"
             echo "vm.sh: ok: a subPath through a link to / was refused at its start; a plain one, made, was shared" >&2
 
             # A tun device (a VPN's): the one way a pod has it is a Device of class other with its
