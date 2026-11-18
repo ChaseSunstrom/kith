@@ -97,12 +97,78 @@ intel-iommu,intremap=on`), the plain kernel reads the IOMMU's table and leaves i
 IRQ remapping in x2apic mode` and `VFIO - User Level meta-driver version: 0.3`. Passing a real
 card through has not been tried: that is on hardware.
 
+A node can say which features it wants itself. kithd matches its PCI cards (`lspci -n` ids) against
+the `# pci:` lines of `os/features/` and lists the features that match as `wants` in its Node status.
+`kith node features` prints them as a spec, which builds that node's image:
+
+```sh
+kith node features n1 > n1.yaml
+sh os/build.sh --spec n1.yaml --out target/os-n1
+```
+
+A node with no card a feature matches prints `features: []`; a node that runs no kith OS has no
+`wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
+card the catalogue does not list yet) is chosen by hand, as above.
+
+#### The `all` feature: drivers as signed modules
+
+```sh
+KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
+KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
+```
+
+For a node whose hardware is not known when the image is built, `features: [all]` turns on
+kernel modules (`os/features/all.config`): GPUs (amdgpu, i915, xe, nouveau), sound (HDA and its
+codecs, USB audio, Sound Open Firmware), Wi-Fi (iwlwifi, ath9k to ath12k, mt76, rtw88, rtw89)
+and the network cards the plain kernel lacks. `firmware: [all]` is all of linux-firmware; a list
+of paths there (`amdgpu/*`) is those files, and in both cases the files each module names
+(`modinfo -F firmware`) are there too.
+
+- **Signed, per kernel build.** The kernel makes a key of its own at the start of each kernel build (a tree cut short and gone on from has its old key removed first), signs
+  every module with it as `modules_install` writes them, and builds the public half in;
+  `CONFIG_MODULE_SIG_FORCE` refuses any other module. `build.sh` then deletes the key: the build
+  fails if a `signing_key` or a `.pem` is left in the kernel's tree or in the root, and a
+  failed build deletes it too. It checks one module's signature against the kernel's own key.
+  So the modules of one build load only into that build's kernel, and the kernel of an `all`
+  image is not the same bytes from one kernel build to the next (the plain one is). The
+  kernel and its modules are cached by the hash of their config, so the key is made when
+  they are built, not at each image build.
+- **In the root, not the ESP.** `/lib/modules/VER` (with `modules.dep`, `modules.alias`,
+  `modules.builtin` and `modules.builtin.modinfo`, so a loader knows what is built in) and
+  `/lib/firmware` (with the links linux-firmware lists in `WHENCE`: a driver asks for
+  `iwlwifi-cc-a0-77.ucode`, the file is `intel/iwlwifi/`) are in the squashfs under dm-verity,
+  block by block like the rest. The ESP stays 64 MB; the root slots grow with the root, so a
+  node installed from a plain image has slots too small to be updated to this one.
+- **Sizes** (the plain image is 295,715,328 bytes, as before, and its kernel the same bytes):
+  kernel 13 MB; modules 77 MB (170 of them) and firmware 1,992 MB, both before compression; the
+  root 931 MB squashfs; the raw disk image 2,576 MB (953 MB as qcow2), the update file 965 MB. The check for it is 4 GB,
+  not the plain 300 MB. The installer's memory disk carries the payload and not the modules.
+- **Not yet.** kithd does not load modules (`finit_module`): this installs them, so a node of
+  this image has its drivers on disk and loads none yet. The NVIDIA open modules are a later
+  slice: built out of tree against this kernel and signed with the same throwaway key in the
+  same build. A spec naming both `all` and `gpu-amd-phoenix` is refused (the same driver, built in there).
+
 A cluster runs plain and GPU nodes side by side: sign each image's update as its own
 `OSRelease` and roll each with its own `UpdatePlan`, the GPU one with a `selector` on a label
 those nodes carry (`gpu: amd`, put on the Node as [any label is](cluster.md#where-work-runs): kithd does not
 set it from the GPU it finds yet; see [Rolling a release through the
 cluster](#rolling-a-release-through-the-cluster)). A plain release given to a GPU node takes its
 driver away until the next GPU one.
+
+#### A card put in later, or swapped
+
+The plain image has no `/lib/modules`, and kithd then loads nothing. An image that has one
+(a spec's kernel built with loadable modules, `modules.alias` and `modules.dep` from
+`depmod` beside them) gets its drivers from kithd, the way udev does: before it names the node and brings the
+network up (the network card's driver may be one), kithd matches the `modalias` of every
+device under `/sys/devices` to `modules.alias` and loads what matches, what it needs first
+(`finit_module`), and then, on a thread, does the same for each kernel uevent that adds a
+device. A card swapped for another of a kind
+the image has a driver for needs no restart. Modules in `modules.builtin` or already in
+`/proc/modules` are not loaded; each is tried once, and a failure (a bad signature, a
+missing file) is one console line, never an end. Not supported: module parameters,
+`modprobe.d` (blacklists, options), soft dependencies. Compressed modules (`.ko.xz`,
+`.zst`) are loaded by the kernel itself, from 5.17, if it was built to.
 
 ### Updating a node: two slots
 
@@ -323,20 +389,30 @@ with `kith.install`: it serves nothing, and asks on the screen and the serial li
 
 ```
 This machine's disks:
-  nvme0n1 (256.1 GB, Samsung SSD 970)
-  sda (2000.4 GB, WDC WD20EZRZ)
-Install kith OS on which (its name)?
+  nvme0n1 (256.1 GB, Samsung SSD 970, serial S4EWNX0R123456)
+  sda (2000.4 GB, WDC WD20EZRZ, serial WD-WCC4M1234567)
+Install kith OS on which (its name, or serial:X)?
 The node's name (empty: one made from its network card's address)?
 Its address, as 10.0.0.5/24,10.0.0.1 (empty: ask the network)?
 Join a cluster? The address of one of its nodes, as 10.0.0.7:7443 (empty: start a new cluster)
 The join token (`kith node token` there)?
-Everything on nvme0n1 (256.1 GB, Samsung SSD 970) will be erased. Type its name again to go on:
+Everything on nvme0n1 (256.1 GB, Samsung SSD 970, serial S4EWNX0R123456) will be erased. Type its name again to go on:
 ```
 
 The disk it was started from is never listed. A removable disk is installed on when named, but
 `only` never means one. The disk's size is read again just before it is written, and a disk of
-another size writes nothing; nor does a name not typed twice the same. It then copies kith OS to
+another size, or a disk named by serial that now gives another, writes nothing; nor does a
+name not typed twice the same. It then copies kith OS to
 the disk, reads it back to check, and powers off: take the stick out and start it.
+
+On a screen with 32 bits a pixel (the console's framebuffer), each question is also drawn in the
+look of the [installer's page](../install.html): the install's steps as stops on a rail, the one
+being asked in blue, on paper. The answers are still typed, one line each, as above, and the text
+stays on the serial line. An encrypted install's recovery key is shown on the screen too. When the
+answers were typed, that screen holds until a key is pressed, or for five minutes, then clears; an
+install that was given its answers (from a file, a URL, or the network) does not stop for it. The
+picture is cleared from the text console when the installer hands the screen back. The key is
+written to the serial line as before, and to no log or kernel ring.
 
 Without anyone there, put the answers on the stick as `kith-install.yaml` on its first partition
 (FAT), or at a URL on the kernel command line (`kith.install=https://10.0.0.2/alpha.yaml`; a
@@ -348,7 +424,7 @@ prints. The installer refuses plain `http` without that pin, and answers that do
 `https` needs no pin.
 
 ```yaml
-disk: nvme0n1        # or `only`: the one disk of a machine that has one, not removable
+disk: "serial:S4EWNX0R123456"  # or nvme0n1, or `only`: the one disk of a machine that has one, not removable
 hostname: alpha
 ip: 10.0.0.5/24,10.0.0.1      # without it the network is asked (DHCP)
 dns: 10.0.0.1
@@ -363,7 +439,16 @@ nodePolicy: hardened          # what the cluster may not have this node do: see 
 
 Then nothing is asked or confirmed: a stick with answers erases the disk they name in whatever
 machine it starts. A disk that is not there, `only` on a machine with several, or an unknown
-field stops it with the reason on the console and nothing written.
+field stops it with the reason on the console and nothing written. [The installer's
+page](../install.html) is a form that writes this file in your browser, and checks each answer as
+you type.
+
+A kernel's name for a disk (`sda`, `nvme0n1`) can change with the order the disks are found
+in; its serial does not. `serial:` names the disk by what the disk itself reports (NVMe,
+virtio, SCSI and SATA disks), as listed above, here or at the console: no disk with it, or two,
+stops the installer the same way. Two can: a USB case that gives every disk in it one serial, or
+an NVMe drive with several namespaces, which all give their controller's. Name such a disk by
+its name.
 
 What it was told goes into a small `config` partition of the new disk, which the node reads at
 every start as more of its kernel command line: name, address, and kithd's arguments (`--listen
@@ -466,6 +551,7 @@ kith node duress beta                  # a duress code for beta, shown once: typ
 kith node duress --all                 # one code for the whole cluster (--off takes either away)
 sh ci/vm.sh --test crypt               # all of it, in QEMU, on a disk that is a file
 sh ci/vm.sh --test tpm                 # the seal, with a software TPM (swtpm)
+sh ci/vm.sh --test blackout            # every node killed at once and started together: nothing typed
 sh ci/vm.sh --test duress              # the new recovery key and the duress code, the same way
 ```
 
@@ -478,7 +564,9 @@ stays).
 **The recovery key.** The installer shows it once, at the console, when it is done (32 digits in
 groups of four): write it down. Typed at a waiting machine's console, it opens the state where
 no cluster answers: a laptop away from home, or a cluster whose nodes were all off at once. It
-opens a locked node too; only `wipe` of a running node, or a duress code, ends that.
+opens a locked node too; only `wipe` of a running node, or a duress code, ends that. A cluster
+that must come back from a power cut with nobody there seals its control nodes instead: [When
+every node was off](cluster.md#when-every-node-was-off).
 
 An install nobody watched (from a URL, or the network) has a recovery key nobody saw. `kith node
 recovery beta` has beta, while it runs, make a new one and show it this once (kept nowhere); the

@@ -209,7 +209,33 @@ spec! {
         /// longest prefix an image is under is the one it is held to.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub images: Vec<ImageRule>,
+        /// The admin's Ed25519 public key, as 64 hex: a request it signed (`x-kith-signed`) is
+        /// the admin's, on whichever node it lands. Changed only by a write it signed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub admin_key: Option<String>,
+        /// Whether a caller one node passes on to another, and a write at a node's local
+        /// socket, must be signed: `open` (left out: unsigned is taken, as before) or
+        /// `required` (unsigned at the local socket is the node itself, which reads). Changed
+        /// only by a write the admin signed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub signing: Option<Signing>,
+        /// The house's one address on its LAN: whichever control node leads holds it, and
+        /// answers DNS at it, so a router can name it once (DHCP option 6) and forward to it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub home: Option<HomeSpec>,
     }
+
+    pub struct HomeSpec {
+        /// The address with its prefix length, as the LAN has it (`192.168.1.250/24`): an IPv4
+        /// address no other machine there has, in the network of a card of the node that holds it.
+        pub address: String,
+        /// How the outside reaches the house: a name, or an address, with a port
+        /// (`house.example.org:51820`). Kept and not acted on: the router forwards to `address`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub endpoint: Option<String>,
+    }
+
+    pub enum Signing { Open, Required }
 
     pub struct ImageRule {
         /// A registry (`ghcr.io`) or a registry and a path under it (`ghcr.io/acme`), matched
@@ -693,6 +719,11 @@ spec! {
         pub ports: Vec<ServicePort>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub expose: Option<Expose>,
+        /// No address of its own: its name (`<service>.<namespace>.kith`, and under
+        /// `svc.cluster.local`) answers the addresses of its ready replicas, as a headless
+        /// Kubernetes Service does. Off unless true.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub headless: Option<bool>,
     }
 
     pub struct ServicePort {
@@ -1428,8 +1459,87 @@ fn not_keys(signers: &[Signer]) -> Option<String> {
     })
 }
 
+/// The house address `192.168.1.250/24` as (address, prefix length), or why it is not one a LAN
+/// can have: IPv4 with a prefix of 1 to 30, not the network's or broadcast address of that prefix,
+/// not loopback, multicast, link-local, in 0.0.0.0/8, 255.255.255.255, or in the default pod range
+/// (100.88.0.0/16) or the people range (100.89.0.0/16) that kith's own mesh uses.
+pub fn home_address(text: &str) -> Result<(std::net::Ipv4Addr, u8), String> {
+    let wrong = || format!("`{text}` is not an IPv4 address with its prefix length, like `192.168.1.250/24`");
+    let (address, bits) = text.split_once('/').ok_or_else(wrong)?;
+    let address: std::net::Ipv4Addr = address.parse().map_err(|_| wrong())?;
+    let bits: u8 = bits
+        .parse()
+        .ok()
+        .filter(|bits| (1..=30).contains(bits))
+        .ok_or_else(|| format!("`{text}`: the prefix length is 1 to 30 (a LAN of at least two machines)"))?;
+    let as_number = u32::from(address);
+    let mask = u32::MAX << (32 - u32::from(bits));
+    let in_range = |network: [u8; 4]| as_number & 0xffff_0000 == u32::from(std::net::Ipv4Addr::from(network));
+    let why = if address.is_loopback() {
+        "loopback"
+    } else if address.is_multicast() {
+        "a multicast address"
+    } else if address.is_link_local() {
+        "a link-local address (169.254.0.0/16)"
+    } else if address.octets()[0] == 0 {
+        "in 0.0.0.0/8"
+    } else if address.is_broadcast() {
+        "the broadcast address 255.255.255.255"
+    } else if in_range([100, 88, 0, 0]) {
+        "in the default pod range 100.88.0.0/16"
+    } else if in_range([100, 89, 0, 0]) {
+        "in the people range 100.89.0.0/16"
+    } else if as_number & !mask == 0 {
+        "the network address of its prefix"
+    } else if as_number | mask == u32::MAX {
+        "the broadcast address of its prefix"
+    } else {
+        return Ok((address, bits));
+    };
+    Err(format!(
+        "`{text}` is {why}: the house address is one machine's own address on the LAN"
+    ))
+}
+
+/// Why `text` is not how the outside reaches the house: a name or an IPv4 address (or an IPv6 one
+/// in brackets), a colon and a port.
+pub fn home_endpoint_refused(text: &str) -> Option<String> {
+    let wrong = || {
+        Some(format!(
+            "`{text}` is not a name or an address with a port, like `house.example.org:51820`"
+        ))
+    };
+    let Some((host, port)) = text.rsplit_once(':') else {
+        return wrong();
+    };
+    if port.parse::<u16>().ok().filter(|port| *port > 0).is_none() {
+        return wrong();
+    }
+    let name = |host: &str| {
+        host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+    };
+    let host_ok = match host.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => name(host),
+    };
+    if host_ok { None } else { wrong() }
+}
+
 impl Spec for ClusterSpec {
     fn check(&self) -> Result<(), String> {
+        if let Some(home) = &self.home {
+            home_address(&home.address).map_err(|why| format!("spec.home.address: {why}"))?;
+            if let Some(why) = home.endpoint.as_deref().and_then(home_endpoint_refused) {
+                return Err(format!("spec.home.endpoint: {why}"));
+            }
+        }
         if self.images.len() > 32 {
             return Err("spec.images: at most 32 rules".into());
         }
@@ -1470,6 +1580,13 @@ impl Spec for ClusterSpec {
             if let Some(why) = not_keys(&rule.signed_by) {
                 return Err(format!("{at}: {why}"));
             }
+        }
+        let hex = |key: &String| key.len() == 64 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if self.admin_key.as_ref().is_some_and(|key| !hex(key)) {
+            return Err("spec.adminKey: an Ed25519 public key is 64 lower-case hex".into());
+        }
+        if self.signing == Some(Signing::Required) && self.admin_key.is_none() {
+            return Err("spec.signing: required needs spec.adminKey: nobody could sign".into());
         }
         Ok(())
     }
@@ -2259,10 +2376,33 @@ fn public_key_checked(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The IPv4 ranges a network may not lie over: the people's, and the pods' default (`--pod-range`
+/// moves the pods', and kithd checks that at start). Their IPv6 ranges are the cluster's own, and
+/// kithd refuses those in the AccessLevel's status.
+const TAKEN: [(&str, std::net::Ipv4Addr, u8); 2] = [
+    ("people", std::net::Ipv4Addr::new(100, 89, 0, 0), 16),
+    ("pods", std::net::Ipv4Addr::new(100, 88, 0, 0), 16),
+];
+
+/// Does the IPv4 range `net` lie over one of [`TAKEN`]: the first `min` bits of the two agree?
+fn taken_range(net: &str) -> Option<String> {
+    let (address, length) = net.split_once('/')?;
+    let address: std::net::Ipv4Addr = address.parse().ok()?;
+    let length: u8 = length.parse().ok()?;
+    TAKEN.iter().find_map(|&(name, range, bits)| {
+        let mask = u32::MAX.checked_shl(32 - u32::from(length.min(bits))).unwrap_or(0);
+        let overlaps = (u32::from(address) & mask) == (u32::from(range) & mask);
+        overlaps.then(|| format!("networks: `{net}` overlaps the {name} range {range}/{bits}"))
+    })
+}
+
 impl Spec for AccessLevelSpec {
     fn check(&self) -> Result<(), String> {
         for net in &self.networks {
             passed_range(net)?;
+            if let Some(why) = taken_range(net) {
+                return Err(why);
+            }
         }
         for service in &self.services {
             // (A Service is named as a Workload's Service is: `namespace/name`, or every one.)
@@ -2340,6 +2480,12 @@ impl Spec for ServiceSpec {
     fn check(&self) -> Result<(), String> {
         if self.ports.is_empty() {
             return Err("ports: needs at least one port".into());
+        }
+        // (A headless one has no address for a host to go to: refused, not left unserved.)
+        if self.headless == Some(true) && self.expose.is_some() {
+            return Err(
+                "expose: a headless Service has no address to send a host to: its name answers its replicas".into(),
+            );
         }
         // (The host is asked for in TLS, named in a Secret and in DNS: a name, not a URL.)
         let Some(expose) = &self.expose else { return Ok(()) };
@@ -2708,5 +2854,67 @@ impl Spec for OsReleaseSpec {
 impl Spec for SourceSpec {
     fn check(&self) -> Result<(), String> {
         exactly_one("spec", &[("git", self.git.is_some()), ("oci", self.oci.is_some())])
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use crate::Resource;
+
+    fn read(kind: &str, spec: &str) -> Result<(), String> {
+        let text = format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{ name: family }}\nspec: {spec}\n");
+        Resource::from_source(&text)
+            .and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>())
+            .map(drop)
+            .map_err(|e| e.msg)
+    }
+
+    #[test]
+    fn access_level_refuses_a_range_over_the_people_or_pods_range() {
+        // (The people's `100.89.0.0/16` and the pods' default `100.88.0.0/16`, docs/adr-people.md.)
+        for (net, range) in [
+            ("100.89.0.0/16", "people range 100.89.0.0/16"),
+            ("100.89.4.0/24", "people range 100.89.0.0/16"),
+            ("100.89.255.255/32", "people range 100.89.0.0/16"),
+            ("100.0.0.0/8", "people range 100.89.0.0/16"),
+            ("100.64.0.0/10", "people range 100.89.0.0/16"),
+            ("100.88.0.0/16", "pods range 100.88.0.0/16"),
+            ("100.88.128.0/17", "pods range 100.88.0.0/16"),
+        ] {
+            let refused = read("AccessLevel", &format!("{{ networks: [{net}] }}")).unwrap_err();
+            assert!(
+                refused.contains(&format!("`{net}` overlaps the {range}")),
+                "{net}: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_level_accepts_a_range_beside_the_people_range() {
+        for net in ["100.90.0.0/16", "100.64.0.0/16", "100.128.0.0/9", "100.87.255.255/32"] {
+            read("AccessLevel", &format!("{{ networks: [{net}] }}")).unwrap_or_else(|e| panic!("{net}: {e}"));
+        }
+    }
+
+    #[test]
+    fn access_remote_peer_needs_its_node_level_and_key() {
+        let key = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
+        read(
+            "RemotePeer",
+            &format!("{{ node: n1, level: family, publicKey: '{key}' }}"),
+        )
+        .unwrap();
+        for (spec, why) in [
+            (format!("{{ level: family, publicKey: '{key}' }}"), "node"),
+            (format!("{{ node: n1, publicKey: '{key}' }}"), "level"),
+            ("{ node: n1, level: family }".to_string(), "publicKey"),
+            (
+                format!("{{ node: n1, level: family, publicKey: '{}' }}", &key[..43]),
+                "32 bytes",
+            ),
+        ] {
+            let refused = read("RemotePeer", &spec).unwrap_err();
+            assert!(refused.contains(why), "{spec}: {refused}");
+        }
     }
 }

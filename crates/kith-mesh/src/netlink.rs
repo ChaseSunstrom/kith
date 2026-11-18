@@ -1,7 +1,7 @@
 //! The kernel's side: a WireGuard link made and addressed over route netlink, its key and
 //! peers set and read over generic netlink.
 
-use crate::{Key, MESH_BITS, NODE_BITS, Peer};
+use crate::{Key, MESH_BITS, Peer};
 use netlink_packet_core::{
     NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkDeserializable,
     NetlinkMessage, NetlinkPayload, NetlinkSerializable,
@@ -18,7 +18,7 @@ use netlink_packet_wireguard::{
 use netlink_sys::{Socket, SocketAddr, protocols};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind, Result};
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A peer as the kernel has it.
@@ -68,6 +68,32 @@ pub(crate) fn socket(protocol: isize) -> Result<Socket> {
     socket.connect(&SocketAddr::new(0, 0))?;
     limit(&socket, WAIT)?;
     Ok(socket)
+}
+
+/// Raises `socket`'s send buffer to hold one datagram of `bytes`, so a batch that size goes out
+/// in one send (at the default size the kernel answers EMSGSIZE). As nft does: forced past the
+/// system's limit when it may be (root), else up to it.
+// ponytail: a user's send buffer stops at net.core.wmem_max; a bigger batch needs root or that sysctl raised.
+pub(crate) fn raise_send_buffer(socket: &Socket, bytes: usize) -> Result<()> {
+    use nix::sys::socket::{setsockopt, sockopt::SndBuf, sockopt::SndBufForce};
+    // (The kernel doubles the size it is given, for its own bookkeeping.)
+    let wanted = bytes.saturating_mul(2);
+    setsockopt(socket, SndBufForce, &wanted)
+        .or_else(|_| setsockopt(socket, SndBuf, &wanted))
+        .map_err(Error::from)
+}
+
+/// One allowed address (`net`/`bits`), written in its own family (an IPv4 one is a /32, say).
+fn allowed_ip(&(net, bits): &(IpAddr, u8)) -> WireguardAllowedIp {
+    let family = match net {
+        IpAddr::V4(_) => WireguardAddressFamily::Ipv4,
+        IpAddr::V6(_) => WireguardAddressFamily::Ipv6,
+    };
+    WireguardAllowedIp(vec![
+        WireguardAllowedIpAttr::Family(family),
+        WireguardAllowedIpAttr::IpAddr(net),
+        WireguardAllowedIpAttr::Cidr(bits),
+    ])
 }
 
 /// Send `message` and take the answers, up to the kernel's "done" or its yes or no. Each
@@ -128,23 +154,62 @@ impl Device {
         ])?;
 
         // (The /48 on the interface is the route to every other node too.)
-        device.address(address, MESH_BITS, true)?;
+        put_address(device.index, address, MESH_BITS, true)?;
+        up(device.index)?;
+        Ok(device)
+    }
+
+    /// The WireGuard interface `name` for the people (docs/adr-people.md): made or found, with no
+    /// peers, this private key and UDP port, the two addresses, and up.
+    pub fn ensure_people(
+        name: &str,
+        key: &Key,
+        port: u16,
+        four: (Ipv4Addr, u8),
+        six: (Ipv6Addr, u8),
+    ) -> Result<Device> {
+        let mut device = Device::make(name)?;
+        // (Peers left by an earlier run are not the people's: none is the right set.)
+        device.set_peers(&[])?;
+        device.set(vec![
+            WireguardAttribute::PrivateKey(*key),
+            WireguardAttribute::ListenPort(port),
+        ])?;
+        address4(device.index, four.0, four.1, None)?;
+        put_address(device.index, six.0, six.1, true)?;
         up(device.index)?;
         Ok(device)
     }
 
     /// The WireGuard interface `name`, made if it is not there, as it is.
     pub(crate) fn make(name: &str) -> Result<Device> {
-        let ask_route = |message, flags| ask(protocols::NETLINK_ROUTE, message, flags);
-        let mut new = link(0, Some(name));
-        let kind = LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Wireguard)]);
-        new.attributes.push(kind.clone());
-        let made = ask_route(RouteNetlinkMessage::NewLink(new), NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
-        match made {
-            Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(e),
-            _ => {}
+        let made = Device::lookup(name, true)?;
+        made.ok_or_else(|| Error::other(format!("no word from the kernel about {name}")))
+    }
+
+    /// The WireGuard interface `name` as it is, if it is there; nothing is made.
+    pub fn open(name: &str) -> Result<Option<Device>> {
+        Device::lookup(name, false)
+    }
+
+    /// The WireGuard interface `name`: made first if `make` is set and it is not there. `None`
+    /// when it is not there and was not made.
+    fn lookup(name: &str, make: bool) -> Result<Option<Device>> {
+        if make {
+            let mut new = link(0, Some(name));
+            let kind = LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Wireguard)]);
+            new.attributes.push(kind);
+            let made = ask_route(RouteNetlinkMessage::NewLink(new), NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+            match made {
+                Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(e),
+                _ => {}
+            }
         }
-        let found = ask_route(RouteNetlinkMessage::GetLink(link(0, Some(name))), NLM_F_ACK)?;
+        let found = match ask_route(RouteNetlinkMessage::GetLink(link(0, Some(name))), NLM_F_ACK) {
+            // (Not there, and not made: the kernel says there is no such device.)
+            Err(e) if !make && e.raw_os_error() == Some(nix::errno::Errno::ENODEV as i32) => return Ok(None),
+            found => found?,
+        };
         let Some(RouteNetlinkMessage::NewLink(found)) = found.into_iter().next() else {
             return Err(Error::other(format!("no word from the kernel about {name}")));
         };
@@ -170,69 +235,21 @@ impl Device {
             _ => None,
         });
         let family = id.next().ok_or_else(|| Error::other("the kernel has no WireGuard"))?;
-        Ok(Device {
+        Ok(Some(Device {
             index,
             family,
             had: None,
             held: BTreeSet::new(),
-        })
+        }))
     }
 
     pub(crate) fn index(&self) -> u32 {
         self.index
     }
 
-    /// Put `address` on the interface, or take it off.
-    fn address(&self, address: Ipv6Addr, bits: u8, there: bool) -> Result<()> {
-        let mut message = AddressMessage::default();
-        message.header.family = AddressFamily::Inet6;
-        message.header.prefix_len = bits;
-        message.header.index = self.index;
-        message.attributes.push(AddressAttribute::Address(address.into()));
-        // A further address (every node has it) is never what this node's own traffic
-        // comes from: the others would not take it for this node's. "Deprecated", to
-        // the kernel: good to be reached at, not to be picked for calling out.
-        if bits == 128 {
-            let mut times = CacheInfo::default();
-            (times.ifa_preferred, times.ifa_valid) = (0, u32::MAX);
-            message.attributes.push(AddressAttribute::CacheInfo(times));
-        }
-        let (message, flags) = match there {
-            true => (RouteNetlinkMessage::NewAddress(message), NLM_F_CREATE | NLM_F_REPLACE),
-            false => (RouteNetlinkMessage::DelAddress(message), 0),
-        };
-        ask(protocols::NETLINK_ROUTE, message, NLM_F_ACK | flags).map(drop)
-    }
-
     /// Make the further addresses of the interface (besides its own) `wanted`.
-    //
-    // ponytail: only what this Device added is taken off again: addresses left by a
-    // kithd that was killed stay until the interface goes.
     pub fn set_addresses(&mut self, wanted: &BTreeSet<Ipv6Addr>) -> Result<()> {
-        // All are tried; the first that failed is told. (One that would not go, because it
-        // was gone already, say, is not tried again.)
-        // A kernel that does not answer is not asked the rest: each would wait as long.
-        let silent = |tried: &Result<()>| matches!(tried, Err(e) if e.kind() == ErrorKind::TimedOut);
-        let mut failed = Ok(());
-        for gone in self.held.clone().difference(wanted) {
-            let tried = self.address(*gone, 128, false);
-            if silent(&tried) {
-                return tried;
-            }
-            failed = failed.and(tried);
-            self.held.remove(gone);
-        }
-        for new in wanted.difference(&self.held.clone()) {
-            let tried = self.address(*new, 128, true);
-            if silent(&tried) {
-                return tried;
-            }
-            match tried {
-                Ok(()) => drop(self.held.insert(*new)),
-                Err(e) => failed = failed.and(Err(e)),
-            }
-        }
-        failed
+        hold(self.index, &mut self.held, wanted)
     }
 
     fn message(&self, cmd: WireguardCmd, mut attributes: Vec<WireguardAttribute>) -> GenlMessage<WireguardMessage> {
@@ -263,6 +280,33 @@ impl Device {
             _ => None,
         });
         key.ok_or_else(|| Error::other("the interface has no key"))
+    }
+
+    /// The UDP port the interface listens on.
+    pub fn listen_port(&mut self) -> Result<u16> {
+        let port = self.get()?.into_iter().find_map(|attribute| match attribute {
+            WireguardAttribute::ListenPort(port) => Some(port),
+            _ => None,
+        });
+        port.ok_or_else(|| Error::other("the interface has no port"))
+    }
+
+    /// The addresses the interface has, of every family, each with its prefix length.
+    pub fn addresses(&self) -> Result<Vec<(IpAddr, u8)>> {
+        let found = ask_route(RouteNetlinkMessage::GetAddress(AddressMessage::default()), NLM_F_DUMP)?;
+        Ok(found
+            .into_iter()
+            .filter_map(|found| match found {
+                RouteNetlinkMessage::NewAddress(found) if found.header.index == self.index => {
+                    let bits = found.header.prefix_len;
+                    found.attributes.into_iter().find_map(|attribute| match attribute {
+                        AddressAttribute::Address(address) => Some((address, bits)),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect())
     }
 
     /// The peers the interface has now.
@@ -327,18 +371,11 @@ impl Device {
             changes.push(WireguardPeer(gone));
         }
         for peer in wanted.values().filter(|peer| had.get(&peer.key) != Some(*peer)) {
-            let allowed = |net: &Ipv6Addr| {
-                WireguardAllowedIp(vec![
-                    WireguardAllowedIpAttr::Family(WireguardAddressFamily::Ipv6),
-                    WireguardAllowedIpAttr::IpAddr((*net).into()),
-                    WireguardAllowedIpAttr::Cidr(NODE_BITS),
-                ])
-            };
             let mut new = vec![
                 WireguardPeerAttribute::PublicKey(peer.key),
                 flags(WireguardPeerFlags::ReplaceAllowedIps),
                 WireguardPeerAttribute::PersistentKeepalive(peer.keepalive),
-                WireguardPeerAttribute::AllowedIps(peer.allowed.iter().map(allowed).collect()),
+                WireguardPeerAttribute::AllowedIps(peer.allowed.iter().map(allowed_ip).collect()),
             ];
             new.extend(peer.endpoint.map(WireguardPeerAttribute::Endpoint));
             changes.push(WireguardPeer(new));
@@ -377,6 +414,77 @@ pub struct Card {
     pub index: u32,
     pub name: String,
     pub mac: [u8; 6],
+}
+
+/// Put `address` on the interface `index`, or take it off.
+fn put_address(index: u32, address: Ipv6Addr, bits: u8, there: bool) -> Result<()> {
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet6;
+    message.header.prefix_len = bits;
+    message.header.index = index;
+    message.attributes.push(AddressAttribute::Address(address.into()));
+    // A further address (every node has it) is never what this node's own traffic
+    // comes from: the others would not take it for this node's. "Deprecated", to
+    // the kernel: good to be reached at, not to be picked for calling out.
+    if bits == 128 {
+        let mut times = CacheInfo::default();
+        (times.ifa_preferred, times.ifa_valid) = (0, u32::MAX);
+        message.attributes.push(AddressAttribute::CacheInfo(times));
+    }
+    let (message, flags) = match there {
+        true => (RouteNetlinkMessage::NewAddress(message), NLM_F_CREATE | NLM_F_REPLACE),
+        false => (RouteNetlinkMessage::DelAddress(message), 0),
+    };
+    ask(protocols::NETLINK_ROUTE, message, NLM_F_ACK | flags).map(drop)
+}
+
+/// The IPv6 addresses (of 128 bits) the interface `index` has.
+pub fn addresses6(index: u32) -> Result<Vec<Ipv6Addr>> {
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet6;
+    let found = ask_route(RouteNetlinkMessage::GetAddress(message), NLM_F_DUMP)?;
+    Ok(found
+        .into_iter()
+        .filter_map(|found| match found {
+            RouteNetlinkMessage::NewAddress(found) if found.header.index == index && found.header.prefix_len == 128 => {
+                found.attributes.into_iter().find_map(|attribute| match attribute {
+                    AddressAttribute::Address(std::net::IpAddr::V6(address)) => Some(address),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// Make the further addresses of the interface `index` (besides its own) `wanted`; `held` is
+/// what this caller put there before, and the only addresses it takes off again. (The
+/// mesh's WireGuard interface, or the loopback where there is no mesh.)
+pub fn hold(index: u32, held: &mut BTreeSet<Ipv6Addr>, wanted: &BTreeSet<Ipv6Addr>) -> Result<()> {
+    // All are tried; the first that failed is told. (One that would not go, because it
+    // was gone already, say, is not tried again.)
+    // A kernel that does not answer is not asked the rest: each would wait as long.
+    let silent = |tried: &Result<()>| matches!(tried, Err(e) if e.kind() == ErrorKind::TimedOut);
+    let mut failed = Ok(());
+    for gone in held.clone().difference(wanted) {
+        let tried = put_address(index, *gone, 128, false);
+        if silent(&tried) {
+            return tried;
+        }
+        failed = failed.and(tried);
+        held.remove(gone);
+    }
+    for new in wanted.difference(&held.clone()) {
+        let tried = put_address(index, *new, 128, true);
+        if silent(&tried) {
+            return tried;
+        }
+        match tried {
+            Ok(()) => drop(held.insert(*new)),
+            Err(e) => failed = failed.and(Err(e)),
+        }
+    }
+    failed
 }
 
 /// The machine's network cards, in the kernel's order, and the loopback's index.
@@ -423,17 +531,7 @@ pub fn address4(index: u32, address: std::net::Ipv4Addr, bits: u8, gateway: Opti
     use netlink_packet_route::route::{
         RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType,
     };
-    let mut message = AddressMessage::default();
-    message.header.family = AddressFamily::Inet;
-    message.header.prefix_len = bits;
-    message.header.index = index;
-    let mask = u32::MAX.checked_shl(32 - u32::from(bits.min(32))).unwrap_or(0);
-    let broadcast = std::net::Ipv4Addr::from(u32::from(address) | !mask);
-    message.attributes.extend([
-        AddressAttribute::Local(address.into()),
-        AddressAttribute::Address(address.into()),
-        AddressAttribute::Broadcast(broadcast),
-    ]);
+    let message = address_message(index, address, bits);
     let flags = NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
     ask_route(RouteNetlinkMessage::NewAddress(message), flags)?;
     let Some(gateway) = gateway else { return Ok(()) };
@@ -448,6 +546,44 @@ pub fn address4(index: u32, address: std::net::Ipv4Addr, bits: u8, gateway: Opti
         RouteAttribute::Oif(index),
     ]);
     ask_route(RouteNetlinkMessage::NewRoute(route), flags).map(drop)
+}
+
+/// The kernel's message for `address`/`bits` on link `index`.
+fn address_message(index: u32, address: std::net::Ipv4Addr, bits: u8) -> AddressMessage {
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet;
+    message.header.prefix_len = bits;
+    message.header.index = index;
+    let mask = u32::MAX.checked_shl(32 - u32::from(bits.min(32))).unwrap_or(0);
+    let broadcast = std::net::Ipv4Addr::from(u32::from(address) | !mask);
+    message.attributes.extend([
+        AddressAttribute::Local(address.into()),
+        AddressAttribute::Address(address.into()),
+        AddressAttribute::Broadcast(broadcast),
+    ]);
+    message
+}
+
+/// Give a link an IPv4 address that the kernel takes off by itself `seconds` from now (again
+/// does no harm, and starts the time again): an address held for as long as someone says so.
+/// It is no route, and no gateway: a card in that network has them already.
+pub fn address4_for(index: u32, address: std::net::Ipv4Addr, bits: u8, seconds: u32) -> Result<()> {
+    let mut message = address_message(index, address, bits);
+    let mut times = CacheInfo::default();
+    (times.ifa_preferred, times.ifa_valid) = (seconds, seconds);
+    message.attributes.push(AddressAttribute::CacheInfo(times));
+    let flags = NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
+    ask_route(RouteNetlinkMessage::NewAddress(message), flags).map(drop)
+}
+
+/// Take an IPv4 address off a link; one that is not there (its time ran out) is no error.
+pub fn drop_address4(index: u32, address: std::net::Ipv4Addr, bits: u8) -> Result<()> {
+    let message = address_message(index, address, bits);
+    match ask_route(RouteNetlinkMessage::DelAddress(message), NLM_F_ACK) {
+        // (EADDRNOTAVAIL: the kernel's word for an address it does not have.)
+        Err(e) if e.raw_os_error() == Some(99) || e.kind() == ErrorKind::NotFound => Ok(()),
+        other => other.map(drop),
+    }
 }
 
 #[cfg(test)]
@@ -470,5 +606,31 @@ mod tests {
         );
         assert_eq!(silent(Error::from(ErrorKind::NotFound)).kind(), ErrorKind::NotFound);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn an_ipv4_allowed_address_is_written_as_ipv4_with_its_length() {
+        let net: (IpAddr, u8) = ("100.89.1.2".parse().unwrap(), 32);
+        assert_eq!(
+            allowed_ip(&net),
+            WireguardAllowedIp(vec![
+                WireguardAllowedIpAttr::Family(WireguardAddressFamily::Ipv4),
+                WireguardAllowedIpAttr::IpAddr(net.0),
+                WireguardAllowedIpAttr::Cidr(32),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_ipv6_allowed_address_is_written_as_ipv6_with_its_length() {
+        let net: (IpAddr, u8) = ("fd8a:2b3c:4d5e:5::".parse().unwrap(), 64);
+        assert_eq!(
+            allowed_ip(&net),
+            WireguardAllowedIp(vec![
+                WireguardAllowedIpAttr::Family(WireguardAddressFamily::Ipv6),
+                WireguardAllowedIpAttr::IpAddr(net.0),
+                WireguardAllowedIpAttr::Cidr(64),
+            ])
+        );
     }
 }

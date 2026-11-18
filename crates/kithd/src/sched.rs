@@ -112,16 +112,29 @@ fn owners(store: &Store) -> impl Iterator<Item = &Resource> {
         .flat_map(|kind| store.list(Some(kind)))
 }
 
-/// Puts the drain on a Node's spec: cordoned, and the `kith.dev/drain` NoExecute taint. A node
-/// an owner cordoned already keeps its cordon: its taint says so (`owner`), and undrain
-/// leaves it.
-pub(crate) fn drain_on(spec: &mut Value) {
-    let mut taints = spec["taints"].as_array().cloned().unwrap_or_default();
-    if taints.iter().any(|taint| taint["key"] == kith_sched::DRAIN) {
+/// The OS update's cordon record: its taint, `noSchedule` (update.rs).
+pub(crate) const UPDATE_CORDON: &str = "kith.dev/update";
+
+/// The taints that record a cordon: the drain's and the OS update's.
+const CORDON_RECORDS: [&str; 2] = [kith_sched::DRAIN, UPDATE_CORDON];
+
+/// Does a Node's spec carry the cordon record under `key`?
+pub(crate) fn has_record(spec: &Value, key: &str) -> bool {
+    spec["taints"]
+        .as_array()
+        .is_some_and(|taints| taints.iter().any(|taint| taint["key"] == key))
+}
+
+/// Puts a cordon record under `key`, with `effect`, on a Node's spec: the cordon itself
+/// (`unschedulable`), unless one is there already, which the record then says an owner set
+/// (`owner`). A node with a record under `key` already keeps it.
+pub(crate) fn cordon_on(spec: &mut Value, key: &str, effect: &str) {
+    if has_record(spec, key) {
         return;
     }
+    let mut taints = spec["taints"].as_array().cloned().unwrap_or_default();
     let owned = spec["unschedulable"] == true;
-    let mut taint = json!({ "key": kith_sched::DRAIN, "effect": "noExecute" });
+    let mut taint = json!({ "key": key, "effect": effect });
     if owned {
         taint["value"] = "owner".into();
     } else {
@@ -131,21 +144,41 @@ pub(crate) fn drain_on(spec: &mut Value) {
     spec["taints"] = Value::Array(taints);
 }
 
-/// Takes the drain off a Node's spec: its taint, and the cordon too unless an owner set it.
-pub(crate) fn drain_off(spec: &mut Value) {
+/// Takes the cordon record under `key` off a Node's spec, and the cordon with it unless an
+/// owner set it. When the record set the cordon and another record still holds it, that other
+/// record now says it set it, so its own end takes the cordon off.
+pub(crate) fn cordon_off(spec: &mut Value, key: &str) {
     let Some(mut taints) = spec["taints"].as_array().cloned() else {
         return;
     };
-    let Some(at) = taints.iter().position(|taint| taint["key"] == kith_sched::DRAIN) else {
+    let Some(at) = taints.iter().position(|taint| taint["key"] == key) else {
         return;
     };
     let taint = taints.remove(at);
+    let mut lift = taint["value"] != "owner";
+    let held = taints
+        .iter_mut()
+        .find(|taint| CORDON_RECORDS.contains(&taint["key"].as_str().unwrap_or_default()));
+    if let Some(other) = held {
+        if lift && let Some(other) = other.as_object_mut() {
+            other.remove("value");
+        }
+        lift = false;
+    }
     spec["taints"] = Value::Array(taints);
-    if taint["value"] != "owner"
-        && let Some(spec) = spec.as_object_mut()
-    {
+    if lift && let Some(spec) = spec.as_object_mut() {
         spec.remove("unschedulable");
     }
+}
+
+/// Puts the drain on a Node's spec: cordoned, and the `kith.dev/drain` NoExecute taint.
+pub(crate) fn drain_on(spec: &mut Value) {
+    cordon_on(spec, kith_sched::DRAIN, "noExecute");
+}
+
+/// Takes the drain off a Node's spec: its taint, and the cordon too unless an owner set it.
+pub(crate) fn drain_off(spec: &mut Value) {
+    cordon_off(spec, kith_sched::DRAIN);
 }
 
 /// What the scheduler is told of each node at `now`: its capacity, and for how long it has
@@ -1116,6 +1149,55 @@ spec: { template: { exec: [{ name: run, command: [sleep, inf] }] } }
             .find(|(of, _)| of == "Job/default/batch")
             .map(|(_, f)| f["nodes"].clone());
         assert_eq!(nodes, Some(json!({ "0": "b" })));
+    }
+
+    /// A cordon record takes off only the cordon it set: an owner's cordon stays, and so does
+    /// one a drain or an OS update holds on a node with the other's record on it.
+    #[test]
+    fn cordon_lifts_only_the_cordon_its_record_set() {
+        let drain = kith_sched::DRAIN;
+        let cordoned = |spec: &Value| spec["unschedulable"] == true;
+        let mut owned = json!({ "unschedulable": true });
+        cordon_on(&mut owned, UPDATE_CORDON, "noSchedule");
+        cordon_off(&mut owned, UPDATE_CORDON);
+        assert!(cordoned(&owned), "an owner's cordon: {owned}");
+        // The update holds the cordon, a drain joins it, the update ends: still cordoned.
+        let mut drained = json!({});
+        cordon_on(&mut drained, UPDATE_CORDON, "noSchedule");
+        cordon_on(&mut drained, drain, "noExecute");
+        cordon_off(&mut drained, UPDATE_CORDON);
+        assert!(cordoned(&drained), "a drained node after the update: {drained}");
+        cordon_off(&mut drained, drain);
+        assert!(!cordoned(&drained), "{drained}");
+        // A drain holds it, the update joins, the drain ends: still cordoned.
+        let mut updated = json!({});
+        cordon_on(&mut updated, drain, "noExecute");
+        cordon_on(&mut updated, UPDATE_CORDON, "noSchedule");
+        cordon_off(&mut updated, drain);
+        assert!(cordoned(&updated), "an update's cordon after the drain: {updated}");
+        cordon_off(&mut updated, UPDATE_CORDON);
+        assert!(!cordoned(&updated), "{updated}");
+        // An owner, then the drain and the update on top: the owner's cordon outlasts both.
+        let mut kept = json!({ "unschedulable": true });
+        cordon_on(&mut kept, drain, "noExecute");
+        cordon_on(&mut kept, UPDATE_CORDON, "noSchedule");
+        cordon_off(&mut kept, UPDATE_CORDON);
+        cordon_off(&mut kept, drain);
+        assert!(cordoned(&kept), "an owner's cordon with a drain and an update: {kept}");
+    }
+
+    /// Undrain leaves a cordon an owner set before the drain, and one an OS update holds.
+    #[test]
+    fn drain_off_leaves_an_owners_cordon_and_an_updates() {
+        let mut owned = json!({ "unschedulable": true });
+        drain_on(&mut owned);
+        drain_off(&mut owned);
+        assert_eq!(owned["unschedulable"], true, "{owned}");
+        let mut updated = json!({});
+        cordon_on(&mut updated, UPDATE_CORDON, "noSchedule");
+        drain_on(&mut updated);
+        drain_off(&mut updated);
+        assert_eq!(updated["unschedulable"], true, "{updated}");
     }
 
     /// What a node says its own policy refuses is not placed on it, whatever label of the

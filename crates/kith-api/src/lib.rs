@@ -16,6 +16,29 @@ use std::collections::BTreeMap;
 pub const API_VERSION: &str = "kith.dev/v1";
 pub const DEFAULT_NAMESPACE: &str = "default";
 
+/// Is `method` `path` a request one node passes on to another for whoever asked it: a unit's logs,
+/// a Volume's files, a node's passphrase or new recovery key, a backup's restore, and a change to
+/// the store a control node that is not the leader passes on as it came (an apply, a delete, a
+/// rollback). kithd reads the signer of such a request from the node that passed it on (`FOR`);
+/// the CLI signs a read of one, and any other request it signs anyway. The one list for both.
+pub fn passed_on(method: &str, path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or("");
+    let Some(rest) = path.strip_prefix("/v1/") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    match parts[..] {
+        ["logs", _, ..]
+        | ["volumes", _, _, "files"]
+        | ["lock", _, "passphrase" | "recovery"]
+        | ["backups", _, _, "restore"] => true,
+        ["apply"] => method == "POST",
+        ["resources", ..] => method == "DELETE",
+        ["rollback", ..] => method == "POST",
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -148,7 +171,7 @@ macro_rules! kinds {
 }
 
 kinds! {
-    Cluster: ClusterSpec, cluster, "Cluster-wide settings: the keys that sign images (the other fields are kept and not acted on)";
+    Cluster: ClusterSpec, cluster, "Cluster-wide settings: the keys that sign images, the admin's key and whether callers must sign, and the house address (the other fields are kept and not acted on)";
     Node: NodeSpec, cluster, "One machine: roles, taints, OS version, system extensions, resource reservations";
     Namespace: NamespaceSpec, cluster, "Grouping, quotas, default policies";
     Workload: WorkloadSpec, namespaced, "Long-running replicas";
@@ -339,6 +362,24 @@ impl Resource {
         }
     }
 
+    /// What a new resource must meet beyond `validated`: a Service's and a Namespace's name, and a
+    /// namespace, are one DNS label (a dot makes another Service's or replica's name). Asked where
+    /// a resource is submitted (kithd's apply and plan, the CLI's apply), not in `validated`: replay
+    /// validates every logged resource too, and a log written before this rule holds dotted ones.
+    pub fn submitted(&self) -> Result<(), String> {
+        let one_label = |what: &str, name: &str| match name.contains('.') {
+            true => Err(format!("{what} names are one DNS label: no `.` in `{name}`")),
+            false => Ok(()),
+        };
+        if matches!(self.kind.as_str(), "Service" | "Namespace") {
+            one_label(&self.kind, &self.metadata.name)?;
+        }
+        self.metadata
+            .namespace
+            .as_deref()
+            .map_or(Ok(()), |ns| one_label("namespace", ns))
+    }
+
     /// What can be checked of a resource whose kind is not kith's own without the
     /// `KindDefinition` (the store has that, and checks the rest: see `Store::plan`).
     fn custom(self) -> Result<Resource, String> {
@@ -357,7 +398,7 @@ impl Resource {
 
     /// The fields of its spec that are set and that nothing acts on: kept, and no rule in
     /// force for them. Whoever reads a file says them, so that nobody takes one for a rule.
-    /// (Today a Cluster's, of which kithd reads `images` alone.)
+    /// (Today a Cluster's, of which kithd reads `images` and `home`.)
     pub fn not_acted_on(&self) -> Vec<&'static str> {
         let cluster = ["domain", "voters", "updatePolicy", "mesh", "values"];
         match self.kind.as_str() {

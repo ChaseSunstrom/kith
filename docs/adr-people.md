@@ -379,6 +379,45 @@ kith-mesh people` (the batch taken, rules read back, a peer on the device only a
 rules); `cargo test -q -p kith-cli --test readme`; `crates/kithd/ui/test.mjs` (`qr.js`
 against a reference matrix); `python3 ci/budgets.py`.
 
+## Built: slice A
+
+`AccessLevel` and `RemotePeer` are kinds kith-api applies and checks (`kinds!`, `Spec::check`),
+and `crates/kithd/src/people.rs` gives each peer its two addresses on the leader and keeps them
+in its status, with the refusals of review condition 5. Not built, as the plan says: the device,
+the nftables table, `--people`, the configuration shown once, DNS and exits (slices B to D).
+
+Where the build differs from the text above:
+
+- An IPv6 overlap is not refused at apply: the mesh /48 and the people /64 come from the CA,
+  which kith-api does not hold. kithd refuses an AccessLevel over either in its `refused` status
+  instead. An IPv4 overlap with the people ranges or `100.88.0.0/16` is refused at apply.
+- The pods range checked is the default `100.88.0.0/16`. The start-time check of the people
+  ranges against `--pod-range` and the connected networks (condition 4) is not done yet.
+- An IPv4 address is 16 bits of the name's SHA-256 inside `100.89.0.0/16`; the IPv6 address is
+  the people /64 with the name's SHA-256 bytes 8 to 16 as its interface id. Of the peers that
+  share a public key, one is given its addresses: the one already holding an address of ours,
+  else the smallest name. The others are refused, naming it, and keep any address they held, so
+  a refusal never frees one. A refusal names no address.
+- A refused peer keeps its addresses reserved in its status. Slice B, which routes or writes
+  WireGuard config, uses a peer's addresses only when its `refused` is empty.
+
+## Built: slice C
+
+`kithd --people [PORT]` (env `KITH_PEOPLE`, default 51821; needs `--mesh`; root only) and
+`--people-endpoint NAME:PORT` (env `KITH_PEOPLE_ENDPOINT`) bring the people's device up: the key
+`pki/people.key` (0600, made once, kept across starts); the WireGuard device `kwg0` with no peers,
+that key and the port, `100.89.0.1/16` and the people /64's `::1`, up; the `inet kith-people`
+table written first, with its base chains and a masquerade for the people's IPv4 range. The node's
+status says `people: {publicKey, port, endpoint}` (publicKey base64, as a peer's). Without the
+flag, a start takes away `kwg0`, the table and the `people` status an earlier start left.
+
+Not built (slice D): the level chains, the node's networks, routing rules 9010/9012, and any peer
+on the device. The table is empty of those. The table is strict in production: a kernel with no
+masquerade (kith OS has CONFIG_NFT_MASQ=y) says so by name, and `--people` does not start. A test
+namespace on a host kernel with no masquerade (`unshare -Urn` here) makes the table without its masq
+rules, as kith-mesh's `build_here` does, and says so; the masq rule is covered by kith-mesh's
+expression tests.
+
 ## Open
 
 - **Should the filter tell people apart?** Then the router routes `100.89.0.0/16` to the node
@@ -410,7 +449,7 @@ section holds.
 | Medium: the internet rule named no family and the private list only IPv4, so a guest with the internet reached the IPv6 LAN | The internet is IPv4 only; IPv6 is reached by named ranges alone, with `fc00::/7`, `fe80::/10` and `ff00::/8` dropped by name, and `0/8`, `224/4`, `240/4`, `198.18/15`, `192.0.0.0/24` added to the IPv4 list (condition 2) |
 | Medium: a named range was accepted on any way out, so on a level with an Exit a LAN range behind the default gateway left through the tunnel | A named range is accepted only on a way out that is no Exit's link, no mesh link and no people link (condition 3) |
 | Medium: a named range was refused only if it held the mesh, the people ranges or `100.88/16` whole, and the pods' range is a flag now | Any overlap is refused, against the mesh's /48, the people ranges and the node's own `--pod-range`; the people ranges are checked the same way against the pods' range and the node's connected networks at start (condition 4) |
-| Medium: an address from 16 bits of a name's hash collides (about 7% at 100 peers), no order said, the gateway's and the ends of the range not kept out, a key on two peers not refused; the kernel gives an address to the last peer set with it, and the rules are by address | The address is kept in the RemotePeer's status once given and never drawn again; the first to hold it keeps it and a later one is refused, named; the range's first two and last addresses are never given; a public key on two RemotePeers is both refused; kithd checks that no two peers share an address before it sets any (condition 5) |
+| Medium: an address from 16 bits of a name's hash collides (about 7% at 100 peers), no order said, the gateway's and the ends of the range not kept out, a key on two peers not refused; the kernel gives an address to the last peer set with it, and the rules are by address | The address is kept in the RemotePeer's status once given and never drawn again; the first to hold it keeps it and a later one is refused, named; the range's first two and last addresses are never given; a public key on two RemotePeers gives its address to one (the holder, else the smallest name) and refuses the rest, naming it; kithd checks that no two peers share an address before it sets any (condition 5) |
 | Medium: the mark that revocation flushes by was set only on forwarded packets, so connections to the node itself (its API, a Service) ran on | Marked on delivery to the node as well, and flushed with the rest; a request already authenticated and being answered ends with its connection, said in the docs (condition 6) |
 | Medium: `--people` is the owner's flag, but which networks its peers reach was then the store's to say on that node, with no word of the node's own, and no requests of the root part for the link, the table and the rules | The networks a level may name on a node are those given with `--people` where its kithd is started (none given: Services only); the store narrows within them and never widens. `--node-policy hardened` leaves `--people` as it was given. The link, the table and the rules are a family of typed requests in docs/adr-privilege.md's terms, written into that record with this task's first code (condition 7) |
 | Medium: a level without the internet left its resolver out of the peer's AllowedIPs, and the node's resolver forwards for any `fc00::/7` source (the cited `may_forward` branch is not the one kithd uses) | The level's resolver address is in AllowedIPs; the people prefixes are refused forwarding by name, both families, with a test over IPv6 (condition 8) |

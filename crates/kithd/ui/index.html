@@ -25,6 +25,7 @@
     <h1>kith</h1>
   </a>
   <span id="who" class="who dim"></span>
+  <a id="install-link" class="navlink" href="#/install">Install</a>
   <span class="grow"></span>
   <span id="generation" class="dim" title="How many times the cluster's state has changed"></span>
   <span id="link" class="link wait" role="status">connecting</span>
@@ -64,6 +65,60 @@
       <button id="review" type="button" class="primary" hidden>Review changes</button>
     </div>
   </section>
+</main>
+
+<main id="install" class="install" aria-labelledby="install-title" hidden>
+  <header class="intro">
+    <h2 id="install-title">Install</h2>
+    <p class="dim">Bring another machine in. The steps, as stops on a line: a token to join with, the network boot that installs several machines at once, and a new recovery key for a node that keeps its state encrypted. Each asks first, and what it shows once is shown once.</p>
+    <p class="dim">To write the answers file for a stick, use <a href="//chasesunstrom.github.io/kith/install.html" rel="noreferrer">the installer page on the website</a>: it makes <code>kith-install.yaml</code>, and the token below is its <code>join:</code> block.</p>
+  </header>
+  <div class="rail">
+    <section class="stop" aria-labelledby="token-title">
+      <h3 id="token-title"><b>01</b> A join token</h3>
+      <p class="dim">Lets one machine in, for an hour. A control node votes and may do everything; a worker only runs what it is given.</p>
+      <div class="fields">
+        <div class="field"><label for="token-trust">lets in</label>
+          <select id="token-trust"><option value="control">a control node</option><option value="worker">a worker</option></select></div>
+        <div class="field"><label for="token-at">reached at</label>
+          <select id="token-at"></select>
+          <span class="hint">An address of one of this cluster's nodes, as the new machine sees it.</span></div>
+      </div>
+      <div class="tools"><button id="token-make" type="button" class="primary">Make a token</button><span id="token-check" class="check dim" role="status"></span></div>
+    </section>
+
+    <section class="stop" aria-labelledby="netboot-title">
+      <h3 id="netboot-title"><b>02</b> Netboot <span id="netboot-said" class="dim" role="status"></span></h3>
+      <p class="dim">This node answers machines that start from the network, hands each the installer once, and erases the disk it is told to. For an hour at most.</p>
+      <ul id="netboot-machines" class="machines"></ul>
+      <div class="fields">
+        <div class="field"><label for="netboot-file">boot file</label>
+          <input id="netboot-file" type="file" accept=".efi">
+          <span class="hint">kith-netboot.efi, made by os/build.sh.</span></div>
+        <div class="field"><label for="netboot-macs">cards</label>
+          <input id="netboot-macs" type="text" autocomplete="off" spellcheck="false" placeholder="52:54:00:12:34:56, …">
+          <span class="hint">The network cards' addresses of the machines to install, with commas. No other machine is answered.</span></div>
+        <div class="field"><label for="netboot-minutes">minutes</label>
+          <input id="netboot-minutes" type="number" min="1" max="60" value="30"></div>
+        <div class="field"><label for="netboot-disk">disk</label>
+          <input id="netboot-disk" type="text" value="only" autocomplete="off" spellcheck="false">
+          <span class="hint">A disk's name (nvme0n1), or <code>only</code>: the one disk, and none if there are two.</span></div>
+        <div class="field"><label for="netboot-encrypt">encrypt</label>
+          <input id="netboot-encrypt" type="checkbox">
+          <span class="hint">The machines keep their state encrypted.</span></div>
+      </div>
+      <div class="tools"><button id="netboot-on" type="button" class="primary">Turn on</button><button id="netboot-off" type="button" class="danger" hidden>Turn off</button><span id="netboot-check" class="check dim" role="status"></span></div>
+    </section>
+
+    <section class="stop" aria-labelledby="recovery-title">
+      <h3 id="recovery-title"><b>03</b> A new recovery key</h3>
+      <p class="dim">For a node that keeps its state encrypted. The one it had stops working at once. The new one is shown once, and kept nowhere.</p>
+      <div class="fields">
+        <div class="field"><label for="recovery-node">node</label><select id="recovery-node"></select></div>
+      </div>
+      <div class="tools"><button id="recovery-make" type="button" class="primary">Make a new key</button><span id="recovery-check" class="check dim" role="status"></span></div>
+    </section>
+  </div>
 </main>
 
 <dialog id="dialog" aria-labelledby="dialog-title">

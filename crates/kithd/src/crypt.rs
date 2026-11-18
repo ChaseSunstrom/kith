@@ -1440,7 +1440,7 @@ pub async fn set(
             // recovery key, gives the cluster its key to hold as a new node does.)
             "unlock" if held.spec["forgotten"] == true => {
                 let key = held.key();
-                let deleted = shared.submit(Command::Delete { key }).await;
+                let deleted = shared.submit_as(Command::Delete { key }, Some(&caller)).await;
                 let said = json!({ "node": name, "locked": false, "wiped": false, "seal": false });
                 return deleted.map(|_| said).map_err(|e| e.to_string());
             }
@@ -1474,8 +1474,8 @@ pub async fn set(
             said["code"] = code.into();
         }
         let (resources, at) = (vec![held], kith_api::store::now());
-        let applied = shared.submit(Command::Apply { resources, at }).await;
-        stays_forgotten(&shared, &applied.map_err(|e| e.to_string())?).await?;
+        let applied = shared.submit_as(Command::Apply { resources, at }, Some(&caller)).await;
+        stays_forgotten(&shared, &caller, &applied.map_err(|e| e.to_string())?).await?;
         Ok(said)
     }
     .await;
@@ -1505,14 +1505,14 @@ fn put_back(done: &kith_store::Done) -> Vec<kith_api::Resource> {
 
 /// Forgotten stays forgotten: what [`put_back`] names of a write that was `done` is
 /// written as it was, and the write is said to have failed.
-async fn stays_forgotten(shared: &Shared, done: &kith_store::Done) -> Result<(), String> {
+async fn stays_forgotten(shared: &Shared, caller: &Caller, done: &kith_store::Done) -> Result<(), String> {
     let back = put_back(done);
     if back.is_empty() {
         return Ok(());
     }
     let names: Vec<String> = back.iter().map(|key| key.metadata.name.clone()).collect();
     let (resources, at) = (back, kith_api::store::now());
-    let again = shared.submit(Command::Apply { resources, at }).await;
+    let again = shared.submit_as(Command::Apply { resources, at }, Some(caller)).await;
     let names = names.join(", ");
     Err(match again {
         Ok(_) => format!("a duress code was typed meanwhile: the cluster has forgotten the key of {names}"),
@@ -1546,7 +1546,7 @@ async fn at_node(shared: &Shared, caller: &Caller, name: &str, what: &str, body:
     let ask = ask.post(format!("https://{}/v1/lock/{name}/{what}", there.address));
     let ask = ask.timeout(Duration::from_secs(60)).json(&body);
     // (For whoever asked this node: the node the record is of asks what they may.)
-    let ask = ask.header(crate::access::FOR, caller.to_string());
+    let ask = crate::access_sign::pass_on(ask.header(crate::access::FOR, caller.to_string()));
     let unreached = |e: reqwest::Error| {
         let e = crate::cluster::why(&e);
         format!("{name} cannot be reached, and its lock record is its own to write ({e})")
@@ -1587,7 +1587,7 @@ pub async fn recovery(
 ) -> Response {
     let kind = |_: &_| vec![("NodeKey".to_string(), None)];
     if let Err(refused) = crate::api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, kind) {
-        return refused.into_response();
+        return crate::cluster::no_store(refused.into_response());
     }
     let done = async {
         let cluster = shared.cluster.as_ref();
@@ -1605,10 +1605,11 @@ pub async fn recovery(
     shared
         .audit
         .record(&caller, "recovery", vec![format!("NodeKey/{name}")], said);
-    match done {
+    // (The key is this answer's alone: no cache keeps it, and the web UI shows it once.)
+    crate::cluster::no_store(match done {
         Ok(recovery) => Json(json!({ "node": name, "recovery": recovery })).into_response(),
         Err(why) => refuse(StatusCode::CONFLICT, why).into_response(),
-    }
+    })
 }
 
 /// The nodes of these NodeKeys whose recovery key nobody was shown. Forgotten, a node
@@ -1671,12 +1672,15 @@ pub async fn duress_all(
             return Err("the cluster holds no node's key: no node's state is encrypted".to_string());
         }
         let applied = shared
-            .submit(Command::Apply {
-                resources: keys,
-                at: kith_api::store::now(),
-            })
+            .submit_as(
+                Command::Apply {
+                    resources: keys,
+                    at: kith_api::store::now(),
+                },
+                Some(&caller),
+            )
             .await;
-        stays_forgotten(&shared, &applied.map_err(|e| e.to_string())?).await
+        stays_forgotten(&shared, &caller, &applied.map_err(|e| e.to_string())?).await
     }
     .await;
     let about = names.iter().map(|name| format!("NodeKey/{name}")).collect();
@@ -1835,7 +1839,10 @@ pub async fn forget(State(shared): State<Arc<Shared>>, Json(asked): Json<Forget>
     }
     let about: Vec<String> = wiped.iter().map(kith_api::Resource::key).collect();
     let (resources, at) = (wiped, kith_api::store::now());
-    let applied = shared.submit(Command::Apply { resources, at }).await;
+    // (The duress code typed at this node's console is the authority here, as the console token is
+    // for `claim`: the admin's. A node that is not the leader passes it on as the admin's write.)
+    let admin = crate::access::Caller::Admin;
+    let applied = shared.submit_as(Command::Apply { resources, at }, Some(&admin)).await;
     let applied = applied.map(drop).map_err(|e| e.to_string());
     eprintln!("kithd: a duress code was typed: forgetting {}", about.join(", "));
     shared.audit.record(&"a duress code", "forget", about, applied.clone());
@@ -1953,6 +1960,31 @@ mod tests {
     use super::*;
     use crate::cluster::pinned_peer::{answering_as, at, node, shared_with};
     use std::sync::atomic::Ordering;
+
+    /// What the web UI shows once, a new recovery key, is kept by no cache: the answer, and a
+    /// refusal of it, say `no-store`; an Identity with no right to apply NodeKeys gets a 403.
+    #[tokio::test]
+    async fn no_store_on_the_recovery_key_and_403_for_who_may_not() {
+        let ca = crate::pki::Ca::create().unwrap();
+        let (a, b, x) = (node(&ca, "a"), node(&ca, "b"), node(&ca, "x"));
+        let (taken, _) = answering_as(&x).await;
+        let there = at("b", &taken, Some(crate::pki::print_of(&b.cert).unwrap()));
+        let shared = shared_with("recovery-no-store", a, &[there]).await;
+        let ask = |caller: Caller| recovery(State(shared.clone()), Extension(caller), Named("b".into()));
+        let kept = |answer: &Response| {
+            answer.headers()[axum::http::header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        let refused = ask(Caller::Identity("carol".into())).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(kept(&refused), "no-store");
+        // (A node that cannot be asked: an answer of the same kind, with the same header.)
+        let failed = ask(Caller::Admin).await;
+        assert_eq!(failed.status(), StatusCode::CONFLICT);
+        assert_eq!(kept(&failed), "no-store");
+    }
 
     #[tokio::test]
     async fn pinned_peer_is_sent_no_passphrase() {

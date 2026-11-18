@@ -10,6 +10,7 @@
         helms=$(printf '%s' "${KITH_HELM:-$(command -v helm || true)}" | tr ':' ' ')
         [ "$test" != kube ] || [ -x "$kubectl" ] || skip "no kubectl (KITH_KUBECTL names one; sh ci/kube.sh --vm fetches one)"
         [ "$test" != quota ] || command -v socat >/dev/null 2>&1 || skip "no socat to restart a node with"
+        [ "$test" != home ] || command -v socat >/dev/null 2>&1 || skip "no socat to reset and stop a node with"
         if [ "$test" = pods ]; then
             command -v socat >/dev/null 2>&1 || skip "no socat to plug a keyboard in with"
         fi
@@ -29,7 +30,7 @@
         fail() { tail -n 30 "$work"/n?.log || true; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
         # (rollout, chaos and access: three nodes and nothing more said to kithd; share, pods, kube and
-        # worker: two, on the mesh; services and quota: one, on the mesh.)
+        # worker: two, on the mesh; quota: one, on the mesh; services: one, with no mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os out='' dumps='' gateway='' https=''
         seed() { :; }
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
@@ -54,6 +55,8 @@
         [ "$test" != pods ] || more='--mesh --storage-reserve 8388608 --image-grace 120'
         # (worker: this machine asks what listens on port 80 of a node's own network.)
         [ "$test" != worker ] || inside=80
+        # (services: no --mesh, as kith OS starts a node: its Services answer there too, T-0723.)
+        [ "$test" != services ] || more=''
         # (policy: no way left to be root with all of the kernel's capabilities, so kithd gives up the rest.
         # QEMU reads a comma in -smbios as the end of a value, so each one here is doubled.)
         [ "$test" != policy ] || more='--mesh --node-policy no-exec-units,,no-vm-paths,,no-run'
@@ -237,6 +240,8 @@ EOF
             joined="--dns 0.0.0.0:5353 --dns-upstream 10.0.2.2:$((port + 9))"
             [ "${KITH_POD_NOUPSTREAM:-}" != 1 ] || { first='--dns-upstream 10.9.0.9:5353'; joined='--dns 0.0.0.0:5353 --dns-upstream 10.9.0.9:5353'; }
         fi
+        # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
+        [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353'; }
         node 1 "--claim ${first:-}"
         tries=0
         until token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/n1.log" 2>/dev/null) && [ -n "$token" ] \
@@ -355,6 +360,9 @@ EOF
 
         if [ "$test" = chaos ]; then
             . "$root/ci/vm/chaos.sh"
+        fi
+        if [ "$test" = home ]; then
+            . "$root/ci/vm/home.sh"
         fi
 
         # Before any release, each node says it takes releases from its image's keys (each

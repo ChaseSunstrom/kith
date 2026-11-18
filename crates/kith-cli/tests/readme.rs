@@ -544,3 +544,25 @@ fn readme_shows_the_install_pin_and_the_review_says_m2_is_fixed() {
         "docs/security-review-2.md does not say M2 is fixed (T-0648):\n{m2}"
     );
 }
+
+/// The installer's page (docs/install.html) carries the three answer files kithd's own unit test parses
+/// (`the_install_page_examples`), and the front page and the guide lead to it.
+#[test]
+fn the_installer_page_is_there_and_linked() {
+    let read = |path: &str| std::fs::read_to_string(root().join(path)).unwrap();
+    let page = read("docs/install.html");
+    for name in ["default", "example", "custom"] {
+        assert!(
+            page.contains(&format!("<pre data-answers=\"{name}\"")),
+            "docs/install.html has no <pre data-answers=\"{name}\">"
+        );
+    }
+    assert!(
+        read("docs/index.html").contains("href=\"install.html\""),
+        "docs/index.html does not link docs/install.html"
+    );
+    assert!(
+        read("docs/guide/os.md").contains("](../install.html)"),
+        "docs/guide/os.md does not link docs/install.html"
+    );
+}

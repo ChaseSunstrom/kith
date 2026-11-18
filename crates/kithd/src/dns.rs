@@ -16,7 +16,7 @@
 
 use crate::{Shared, ingress};
 use kith_api::Resource;
-use kith_api::kinds::{DnsRecordSpec, DnsRecordType, DnsZoneSpec};
+use kith_api::kinds::{DnsRecordSpec, DnsRecordType, DnsZoneSpec, ServiceSpec};
 use kith_api::store::Store;
 use kith_dns::{Cidr, Rdata, Record, Records, View, Zones};
 use serde_json::{Value, json};
@@ -93,15 +93,22 @@ fn records_of(record: &DnsRecordSpec, domain: &str, ttl: u32) -> Result<Vec<Reco
 
 /// What the zones are made of, as `run` compares it with the last build: each resource's key and
 /// spec, and a Node's address, what it serves and its state (the ingress addresses come from
-/// those). Not the revision: deleted and made again, it starts over.
+/// those); a Workload's labels (which Services pick it) and each replica's node, readiness and
+/// address (the names come from those). Not the revision: deleted and made again, it starts over.
 fn zones_made_of(store: &Store) -> Vec<(String, Value, Option<Value>)> {
-    let kinds = ["Node", "Service", "DNSZone", "DNSRecord", "Namespace"].into_iter();
+    let kinds = ["Node", "Service", "Workload", "DNSZone", "DNSRecord", "Namespace"].into_iter();
     kinds
         .flat_map(|kind| store.list(Some(kind)))
         .map(|r| {
             let status = r.status.as_ref().map(|s| {
                 if r.kind == "Node" {
                     json!([s["address"], s["serves"], s["state"]])
+                } else if r.kind == "Workload" {
+                    let units = s["containers"].as_array().into_iter().flatten();
+                    let units: Vec<Value> = units
+                        .map(|unit| json!([unit["replica"], unit["node"], unit["ready"], unit["address"]]))
+                        .collect();
+                    json!([r.metadata.labels, units])
                 } else {
                     s["address"].clone()
                 }
@@ -112,6 +119,12 @@ fn zones_made_of(store: &Store) -> Vec<(String, Value, Option<Value>)> {
 }
 
 /// What the server answers from, and what to report on each DNSZone and DNSRecord.
+/// Whether a Service's or Workload's name and namespace are each one DNS label. A dotted one (a
+/// store written before the rule at submission holds one) would name another's: not served.
+fn one_label(resource: &Resource) -> bool {
+    !resource.metadata.name.contains('.') && !crate::services::namespace(resource).contains('.')
+}
+
 pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTreeMap<String, Value>) {
     let mut status = BTreeMap::new();
     let served = || json!({ "state": "served" });
@@ -148,23 +161,56 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
             own.push(Record { name, ttl, data });
         }
     }
-    // `<service>.<namespace>.kith`: the Service's address on the mesh.
-    for (key, address) in mesh
-        .into_iter()
-        .flat_map(|mesh| crate::services::addresses(store, mesh))
-    {
-        let mut parts = key.split('/').skip(1);
-        if let (Some(namespace), Some(service)) = (parts.next(), parts.next()) {
-            let (name, ttl) = (format!("{service}.{namespace}.kith"), NODE_TTL);
-            let data = Rdata::Aaaa(address);
-            own.push(Record {
-                name,
-                ttl,
-                data: data.clone(),
-            });
-            // (As what is written for Kubernetes names it: a pod is told to look there.)
-            let name = format!("{service}.{namespace}.svc.cluster.local");
-            own.push(Record { name, ttl, data });
+    // Each Service, by its name (`<service>.<namespace>.kith`, and as Kubernetes writes it,
+    // under `svc.cluster.local`, where a pod is told to look): the Service's address on the
+    // mesh, or for a headless one, the addresses of its ready replicas. Each ready replica is
+    // also named under every Service that selects its Workload: `<workload>-<replica>.<service>.
+    // <namespace>.svc.cluster.local` (a StatefulSet's pod names).
+    for service in store.list(Some("Service")) {
+        let Ok(spec) = serde_json::from_value::<ServiceSpec>(service.spec.clone()) else {
+            continue;
+        };
+        if !one_label(service) {
+            continue;
+        }
+        let namespace = crate::services::namespace(service);
+        let name = &service.metadata.name;
+        let mut replicas = Vec::new();
+        for workload in crate::services::behind(store, service, &spec) {
+            if !one_label(workload) {
+                continue;
+            }
+            for (replica, address) in crate::services::ready_addresses(workload) {
+                let named = format!(
+                    "{}-{replica}.{name}.{namespace}.svc.cluster.local",
+                    workload.metadata.name
+                );
+                own.push(Record {
+                    name: named,
+                    ttl: NODE_TTL,
+                    data: Rdata::Aaaa(address),
+                });
+                replicas.push(address);
+            }
+        }
+        let addresses = if spec.headless == Some(true) {
+            replicas
+        } else {
+            mesh.map(|mesh| kith_mesh::service_address(mesh, &namespace, name))
+                .into_iter()
+                .collect()
+        };
+        for address in addresses {
+            for named in [
+                format!("{name}.{namespace}.kith"),
+                format!("{name}.{namespace}.svc.cluster.local"),
+            ] {
+                own.push(Record {
+                    name: named,
+                    ttl: NODE_TTL,
+                    data: Rdata::Aaaa(address),
+                });
+            }
         }
     }
 
@@ -255,6 +301,7 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
         let mut records = Records::default();
         let domains: BTreeSet<&str> = shown.iter().map(|zone| zone.domain.as_str()).collect();
         let apexes = domains.into_iter().map(soa);
+        let mut refused = None;
         for record in own
             .iter()
             .cloned()
@@ -262,8 +309,14 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
             .chain(shown.iter().flat_map(|zone| zone.records.clone()))
         {
             // Each record was added once already, beside the rest of its domain's, so this
-            // only fails where one zone's domain lies inside another's and they collide.
-            let _ = records.add(record);
+            // only fails where one zone's domain lies inside another's and they collide, or
+            // past the RRset limit. Said once: the first, with a line on stderr.
+            if let Err(error) = records.add(record) {
+                refused.get_or_insert(error);
+            }
+        }
+        if let Some(error) = refused {
+            eprintln!("kithd: dns: records refused, not answered: {error}");
         }
         // An exposed host is answered where its zone is shown, at each ingress address, for the
         // zone's TTL. A DNSRecord of that name answers instead when it is an A or a CNAME; a TXT
@@ -368,13 +421,97 @@ fn is_self(upstream: SocketAddr, listen: SocketAddr) -> bool {
     upstream.port() == listen.port() && same_host
 }
 
+/// The resolvers of `all` that are not this server, listening on `listen`, nor the house address
+/// `house` (whichever node holds it, it is asked of this one: a resolver named so loops).
+fn others(all: &[SocketAddr], listen: SocketAddr, house: Option<Ipv4Addr>) -> Arc<[SocketAddr]> {
+    let at_house = house.map(|address| SocketAddr::new(address.into(), listen.port()));
+    all.iter()
+        .copied()
+        .filter(|upstream| !is_self(*upstream, listen) && !at_house.is_some_and(|house| is_self(*upstream, house)))
+        .collect()
+}
+
+/// A UDP socket on `address`, non-blocking. It may share its port with another of ours bound to
+/// a different address (the one on every address and the one on the house address), and an
+/// address not yet on any card can be bound: the house address comes and goes with the leader.
+/// SO_REUSEPORT, not SO_REUSEADDR: the kernel lets only a socket of the same user share the port,
+/// so another program on the node cannot bind beside ours and take its queries.
+fn udp_socket(address: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, SockaddrStorage, bind, setsockopt, socket, sockopt};
+    let family = if address.is_ipv4() {
+        AddressFamily::Inet
+    } else {
+        AddressFamily::Inet6
+    };
+    let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
+    let fd = socket(family, SockType::Datagram, flags, None)?;
+    setsockopt(&fd, sockopt::ReusePort, &true)?;
+    if address.is_ipv4() {
+        setsockopt(&fd, sockopt::IpFreebind, &true)?;
+    }
+    bind(std::os::fd::AsRawFd::as_raw_fd(&fd), &SockaddrStorage::from(address))?;
+    Ok(fd.into())
+}
+
+/// How long the house address's socket waits to be bound again after it could not be.
+const HOUSE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Answers on the house address, on `port`, while the store names one (`serve_udp_on`).
+async fn house(
+    port: u16,
+    mut wanted: watch::Receiver<Option<Ipv4Addr>>,
+    zones: watch::Receiver<Arc<Zones>>,
+    upstreams: watch::Receiver<Arc<[SocketAddr]>>,
+    forwarders: Vec<Cidr>,
+    cache: Arc<kith_dns::Cache>,
+) {
+    // The last error said, so that one that stays is said once.
+    let mut said = String::new();
+    loop {
+        let now = *wanted.borrow_and_update();
+        let serving = async {
+            let Some(address) = now else {
+                return std::future::pending::<()>().await;
+            };
+            let at = SocketAddr::from((address, port));
+            match udp_socket(at).and_then(UdpSocket::from_std) {
+                Ok(udp) => {
+                    eprintln!("kithd: serving DNS on the house address {at}");
+                    said.clear();
+                    kith_dns::serve_udp_on(udp, zones.clone(), upstreams.clone(), forwarders.clone(), cache.clone())
+                        .await;
+                }
+                Err(e) => {
+                    if said != e.to_string() {
+                        eprintln!(
+                            "kithd: serving DNS on the house address {at}: {e} (tried again every {} s)",
+                            HOUSE_RETRY.as_secs()
+                        );
+                        said = e.to_string();
+                    }
+                }
+            }
+            // (Not bound, or no longer served: the next try is after this, or when the store changes.)
+            tokio::time::sleep(HOUSE_RETRY).await;
+        };
+        tokio::select! {
+            () = serving => {}
+            changed = wanted.changed() => {
+                if changed.is_err() {
+                    return std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+}
+
 /// UDP and TCP on the same address; with port 0, on the same free port.
 pub async fn bind(listen: SocketAddr) -> Result<(UdpSocket, TcpListener), String> {
     let failed = |e: std::io::Error| format!("serving DNS on {listen}: {e}");
     for _ in 0..20 {
         let tcp = TcpListener::bind(listen).await.map_err(failed)?;
         let address = tcp.local_addr().map_err(failed)?;
-        match UdpSocket::bind(address).await {
+        match udp_socket(address).and_then(UdpSocket::from_std) {
             Ok(udp) => return Ok((udp, tcp)),
             // Someone else has that port on UDP: with port 0, take another.
             Err(_) if listen.port() == 0 => {}
@@ -382,6 +519,14 @@ pub async fn bind(listen: SocketAddr) -> Result<(UdpSocket, TcpListener), String
         }
     }
     Err(format!("serving DNS on {listen}: no port is free on both UDP and TCP"))
+}
+
+/// Whether this node leads the log: the one control node that says the DNS statuses (and the
+/// block lists') for all of them.
+pub fn leads(shared: &Shared) -> bool {
+    let metrics = shared.raft.metrics();
+    let metrics = metrics.borrow();
+    metrics.current_leader == Some(metrics.id)
 }
 
 /// Serve DNS until kithd stops.
@@ -398,28 +543,42 @@ pub async fn run(
     let forwarders = kith_dns::LOCAL_NETWORKS.into_iter().chain([pods.as_str()]);
     let forwarders: Vec<Cidr> = forwarders.filter_map(|net| net.parse().ok()).collect();
     let listen = tcp.local_addr().expect("a bound socket has an address");
-    let ours = move |all: &[SocketAddr]| -> Arc<[SocketAddr]> {
-        all.iter()
-            .copied()
-            .filter(|upstream| !is_self(*upstream, listen))
-            .collect()
+    // The house address the Clusters name (held by this node or not): a resolver list that names
+    // it (a router's DHCP) must not be asked by the node that holds it, nor dropped for good by
+    // the one that held it when the list was read.
+    let (house_wants, house_wanted) = watch::channel(None::<Ipv4Addr>);
+    let configured = || {
+        let state = shared.store.lock().expect("nothing panics holding the store");
+        crate::home::configured(&state.store).map(|home| home.address)
     };
+    house_wants.send_replace(configured());
+    let ours = move |all: &[SocketAddr], house: Option<Ipv4Addr>| others(all, listen, house);
     let said = move |now: &[SocketAddr]| {
         eprintln!("kithd: serving DNS on {listen}; other names go to {now:?}");
         if now.is_empty() {
             eprintln!("kithd: no other resolver to ask (--dns-upstream): only names in the store resolve");
         }
     };
-    let (ask, asked) = watch::channel(ours(&upstreams.borrow_and_update()));
+    let (ask, asked) = watch::channel(ours(&upstreams.borrow_and_update(), *house_wanted.borrow()));
     said(&asked.borrow());
+    let mut house_seen = house_wanted.clone();
+    house_seen.mark_unchanged();
     let told = async {
-        while upstreams.changed().await.is_ok() {
-            let now = ours(&upstreams.borrow_and_update());
+        // (Resolvers named on the command line: the list never changes, the house address may.)
+        let mut listed = true;
+        loop {
+            tokio::select! {
+                got = upstreams.changed(), if listed => listed = got.is_ok(),
+                got = house_seen.changed() => {
+                    if got.is_err() {
+                        return std::future::pending::<()>().await;
+                    }
+                }
+            }
+            let now = ours(&upstreams.borrow_and_update(), *house_seen.borrow_and_update());
             said(&now);
             ask.send_replace(now);
         }
-        // (Resolvers named on the command line: nothing more is told.)
-        std::future::pending::<()>().await;
     };
     let (zones, served) = watch::channel(Arc::new(Zones::default()));
     // The lists of names to answer as not there, and the answers kept from the upstreams.
@@ -443,6 +602,8 @@ pub async fn run(
         loop {
             let reports = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
+                let home = crate::home::configured(&state.store).map(|home| home.address);
+                house_wants.send_if_modified(|was| std::mem::replace(was, home) != home);
                 let from = zones_made_of(&state.store);
                 (built_from.as_ref() != Some(&from)).then(|| {
                     built_from = Some(from);
@@ -467,12 +628,17 @@ pub async fn run(
             // (Every node that answers says the same of the records: a worker leaves the
             // saying to the control nodes, whose it is to write.)
             let worker = crate::access::worker(&shared, shared.members.me());
-            if let Some(statuses) = reports.filter(|statuses| !statuses.is_empty() && !worker)
-                && let Err(e) = shared.submit(kith_store::Command::Status { statuses }).await
-            {
-                eprintln!("kithd: reporting on DNS records: {e}");
-                // Tried again at the next change to the store.
-                built_from = None;
+            if let Some(statuses) = reports.filter(|statuses| !statuses.is_empty() && !worker) {
+                // (Every control node builds the same statuses: the leader alone says them. A
+                // follower's would be passed on as its own write, and refused.)
+                if !leads(&shared) {
+                    // Said again at the next change to the store, which may find this node leading.
+                    built_from = None;
+                } else if let Err(e) = shared.submit(kith_store::Command::Status { statuses }).await {
+                    eprintln!("kithd: reporting on DNS records: {e}");
+                    // Tried again at the next change to the store.
+                    built_from = None;
+                }
             }
             if generation.changed().await.is_err() {
                 return;
@@ -486,6 +652,14 @@ pub async fn run(
         tokio::runtime::Handle::current()
     });
     let sockets = udp.into_std().and_then(|udp| Ok((udp, tcp.into_std()?)));
+    let at_home = thread.spawn(house(
+        listen.port(),
+        house_wanted,
+        served.clone(),
+        asked.clone(),
+        forwarders.clone(),
+        cache.clone(),
+    ));
     let answering = thread.spawn(async move {
         let (udp, tcp) = sockets?;
         let (udp, tcp) = (UdpSocket::from_std(udp)?, TcpListener::from_std(tcp)?);
@@ -506,11 +680,22 @@ pub async fn run(
         _ = stopping.changed() => {}
     }
     stop.abort();
+    at_home.abort();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The socket on every address and the one on the house address share a port, and the
+    /// second binds an address no card has yet.
+    #[test]
+    fn house_socket_shares_the_port() {
+        let all = udp_socket("0.0.0.0:0".parse().unwrap()).unwrap();
+        let port = all.local_addr().unwrap().port();
+        let house = udp_socket(SocketAddr::from(([10, 9, 0, 100], port))).unwrap();
+        assert_eq!(house.local_addr().unwrap().port(), port);
+    }
 
     /// A node's resolvers can be written after kithd started (its lease comes while it serves).
     #[tokio::test]
@@ -1165,5 +1350,155 @@ spec: {}
         assert!(!is_self(at("1.1.1.1:53"), at("0.0.0.0:53")));
         // Any address of this machine, when listening on all of them.
         assert!(is_self(at("127.0.0.2:53"), at("0.0.0.0:53")));
+    }
+
+    /// Every control node builds the same DNS statuses, and only the leader says them: a
+    /// follower's would be passed on as its own write, and refused for the kinds it does not hold.
+    #[tokio::test]
+    async fn dns_statuses_are_said_by_the_leader_alone() {
+        let ca = crate::pki::Ca::create().unwrap();
+        let me = crate::cluster::pinned_peer::node(&ca, "dns-c");
+        let shared = crate::cluster::pinned_peer::shared_with("dns-leader", me, &[]).await;
+        assert!(!leads(&shared));
+        let id = shared.raft.metrics().borrow().id;
+        let one = std::collections::BTreeMap::from([(id, kith_store::openraft::BasicNode::new(""))]);
+        shared.raft.initialize(one).await.unwrap();
+        let leads_now = shared.raft.wait(Some(std::time::Duration::from_secs(30)));
+        leads_now.current_leader(id, "leads").await.unwrap();
+        assert!(leads(&shared));
+    }
+
+    /// A router that names the house address as a resolver: it is dropped from the upstreams
+    /// when a Cluster names it, held by this node or not (and kept when none does).
+    #[test]
+    fn the_house_address_named_as_an_upstream_is_not_asked() {
+        let at = |address: &str| address.parse::<SocketAddr>().unwrap();
+        let (listen, house) = (at("0.0.0.0:5353"), Some(Ipv4Addr::new(10, 9, 0, 100)));
+        let all = [at("10.9.0.100:5353"), at("1.1.1.1:5353"), at("10.9.0.100:53")];
+        assert_eq!(*others(&all, listen, house), [at("1.1.1.1:5353"), at("10.9.0.100:53")]);
+        assert_eq!(*others(&all, listen, None), all);
+    }
+
+    /// The addresses `client` is told `name` is (type AAAA), sorted.
+    fn answers6(zones: &Zones, client: &str, name: &str) -> Vec<std::net::Ipv6Addr> {
+        let found = zones.lookup(client.parse().unwrap(), name, 28).unwrap();
+        let mut ips: Vec<std::net::Ipv6Addr> = found
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                Rdata::Aaaa(ip) => Some(*ip),
+                _ => None,
+            })
+            .collect();
+        ips.sort();
+        ips
+    }
+
+    #[test]
+    fn a_statefulsets_replicas_are_named_under_each_service_and_a_headless_service_answers_them() {
+        let mut store = store(
+            "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: web, labels: { app: web } }
+spec:
+  replicas: 3
+  template:
+    containers: [{ name: main, image: example.org/web }]
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: web }
+spec: { headless: true, selector: { app: web }, ports: [{ port: 80 }] }
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: api }
+spec: { selector: { app: web }, ports: [{ port: 80 }] }
+",
+        );
+        let unit = |replica: u32, ready: bool, address: &str| json!({ "name": "main", "replica": replica, "node": "a", "ready": ready, "address": address });
+        let status = |second: &str| json!({ "containers": [unit(0, true, "fd00:1::10"), unit(1, true, second), unit(2, false, "fd00:1::12")] });
+        store
+            .set_status("Workload/default/web", Some(status("fd00:1::11")))
+            .unwrap();
+        let before = zones_made_of(&store);
+
+        let ip = |text: &str| text.parse::<std::net::Ipv6Addr>().unwrap();
+        let prefix = kith_mesh::prefix(b"test");
+        let (zones, _) = zones_of(&store, Some(prefix));
+        let client = "10.0.0.1";
+        // Each ready replica is named under each Service that selects its Workload, and it
+        // answers its own address; one not ready answers nothing.
+        assert_eq!(
+            answers6(&zones, client, "web-0.web.default.svc.cluster.local"),
+            [ip("fd00:1::10")]
+        );
+        assert_eq!(
+            answers6(&zones, client, "web-1.api.default.svc.cluster.local"),
+            [ip("fd00:1::11")]
+        );
+        assert!(answers6(&zones, client, "web-2.api.default.svc.cluster.local").is_empty());
+        // A headless Service answers its ready replicas, and not an address of its own.
+        assert_eq!(
+            answers6(&zones, client, "web.default.svc.cluster.local"),
+            [ip("fd00:1::10"), ip("fd00:1::11")]
+        );
+        assert_eq!(
+            answers6(&zones, client, "web.default.kith"),
+            [ip("fd00:1::10"), ip("fd00:1::11")]
+        );
+        // The other Service answers its own address, as it did.
+        let api = kith_mesh::service_address(prefix, "default", "api");
+        assert_eq!(answers6(&zones, client, "api.default.svc.cluster.local"), [api]);
+
+        // A replica that moves to another address is told apart, so the zones are built again.
+        store
+            .set_status("Workload/default/web", Some(status("fd00:1::99")))
+            .unwrap();
+        assert_ne!(zones_made_of(&store), before);
+        let (zones, _) = zones_of(&store, Some(prefix));
+        assert_eq!(
+            answers6(&zones, client, "web-1.api.default.svc.cluster.local"),
+            [ip("fd00:1::99")]
+        );
+    }
+
+    #[test]
+    fn a_service_or_namespace_with_a_dot_in_its_name_is_not_served() {
+        // A Service `db-0` in namespace `db.prod` would name `db-0.db.prod.svc.cluster.local`, which
+        // is replica 0 of Workload `db` under Service `db` in `prod`: a dotted one is not served.
+        let mut store = store(
+            "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db, namespace: prod, labels: { app: db } }
+spec:
+  replicas: 1
+  template:
+    containers: [{ name: main, image: example.org/db }]
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: db, namespace: prod }
+spec: { headless: true, selector: { app: db }, ports: [{ port: 80 }] }
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: db-0, namespace: 'db.prod' }
+spec: { selector: { app: other }, ports: [{ port: 80 }] }
+",
+        );
+        let status = json!({ "containers": [{ "name": "main", "replica": 0, "node": "a", "ready": true, "address": "fd00:1::10" }] });
+        store.set_status("Workload/prod/db", Some(status)).unwrap();
+        let prefix = kith_mesh::prefix(b"test");
+        let (zones, _) = zones_of(&store, Some(prefix));
+        let client = "10.0.0.1";
+        let ip = |text: &str| text.parse::<std::net::Ipv6Addr>().unwrap();
+        assert_eq!(
+            answers6(&zones, client, "db-0.db.prod.svc.cluster.local"),
+            [ip("fd00:1::10")]
+        );
+        assert!(answers6(&zones, client, "db-0.db.prod.kith").is_empty());
     }
 }

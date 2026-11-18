@@ -7,6 +7,7 @@
 //! a Raft replica either way (`raft.rs`): alone, this node is all of its voters.
 
 mod access;
+mod access_sign;
 mod acme;
 mod api;
 mod audit;
@@ -26,6 +27,7 @@ mod encrypted;
 mod exits;
 mod files;
 mod gpt;
+mod home;
 mod images;
 mod ingress;
 mod init;
@@ -35,8 +37,11 @@ mod kube;
 mod kubeproto;
 mod members;
 mod mesh;
+mod modules;
 mod netboot;
 mod os;
+mod own_writes;
+mod people;
 mod pki;
 mod pods;
 mod policy;
@@ -155,6 +160,13 @@ struct Args {
     /// The name of the mesh's network interface
     #[arg(long, env = "KITH_MESH_INTERFACE", value_name = "NAME", default_value = "kith0")]
     mesh_interface: String,
+    /// Run the people's WireGuard device on this UDP port (docs/adr-people.md): kwg0, beside the
+    /// mesh's interface. Needs --mesh, and root
+    #[arg(long, env = "KITH_PEOPLE", value_name = "PORT", num_args = 0..=1, default_missing_value = "51821", requires = "mesh", value_parser = clap::value_parser!(u16).range(1..))]
+    people: Option<u16>,
+    /// Where other nodes reach this node's people's device, as NAME:PORT or ADDRESS:PORT (with --people)
+    #[arg(long, env = "KITH_PEOPLE_ENDPOINT", value_name = "NAME:PORT", requires = "people", value_parser = people_endpoint)]
+    people_endpoint: Option<String>,
     /// With --join: this node comes and goes (a laptop). It is reached on the mesh wherever it is,
     /// never votes, and what it runs is not started elsewhere while it is away
     #[arg(long, env = "KITH_ROAMING", requires_all = ["join", "mesh"])]
@@ -187,10 +199,42 @@ fn own_ports(args: &Args) -> Vec<(u16, &'static str)> {
     own.extend(args.dns.map(|at| (at.port(), "DNS")));
     own.extend((args.registry_port != 0).then_some((args.registry_port, "registry")));
     own.extend(args.mesh.map(|port| (port, "mesh")));
+    own.extend(args.people.map(|port| (port, "people")));
     if args.ingress {
         own.extend([(80, "ingress"), (443, "ingress")]);
     }
     own
+}
+
+/// A `--people-endpoint`: a name or an address, then `:PORT` (the port not 0). An IPv6 address is
+/// in brackets. A name is labels of letters, digits and '-' (not at either end of a label); the
+/// unspecified address (0.0.0.0, ::) is not one a peer can reach.
+fn people_endpoint(at: &str) -> Result<String, String> {
+    let bad = || format!("{at}: wants NAME:PORT or ADDRESS:PORT, the port from 1 to 65535, a real address");
+    let (host, port) = at.rsplit_once(':').ok_or_else(bad)?;
+    if !matches!(port.parse::<u16>(), Ok(port) if port != 0) {
+        return Err(bad());
+    }
+    let fine = match host.strip_prefix('[').and_then(|host| host.strip_suffix(']')) {
+        Some(six) => six.parse::<std::net::Ipv6Addr>().is_ok_and(|six| !six.is_unspecified()),
+        None => match host.parse::<std::net::Ipv4Addr>() {
+            Ok(four) => !four.is_unspecified(),
+            Err(_) => host.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            }),
+        },
+    };
+    if fine { Ok(at.to_string()) } else { Err(bad()) }
+}
+
+/// Why this start is refused, if it is: `--people` sets the people's device and table up as root.
+fn people_refusal(args: &Args, root: bool) -> Option<String> {
+    (args.people.is_some() && !root).then(|| {
+        "--people sets up the people's WireGuard device and table: run kithd as root (or drop --people)".to_string()
+    })
 }
 
 fn mesh_options(args: &Args, state: &std::path::Path, port: u16) -> mesh::Options {
@@ -236,6 +280,8 @@ pub struct Shared {
     /// The order access is decided in, where a change is put in the log: a change to access
     /// holds it alone until applied, an Identity's write shared once decided again (`raft.rs`).
     pub order: tokio::sync::RwLock<()>,
+    /// The nonces of the signed requests this node has taken (`access_sign.rs`).
+    pub nonces: access_sign::Nonces,
     /// On a worker that runs from a view (`view`): the index of the store its view is at.
     /// `None` on every other node, which keeps the store.
     pub view: watch::Sender<Option<u64>>,
@@ -387,7 +433,10 @@ async fn within(
 /// Call inside the runtime.
 fn stops() -> std::io::Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
     use tokio::signal::unix::{SignalKind, signal};
-    Ok((signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?))
+    let heard = (signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?);
+    // (A kept kithd inherits the keeper's blocked mask: unblocked once these handlers are set.)
+    keeper::unblock_heard();
+    Ok(heard)
 }
 
 fn default_state() -> Option<PathBuf> {
@@ -579,6 +628,7 @@ async fn replica(
         exits: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
         order: tokio::sync::RwLock::default(),
+        nonces: access_sign::Nonces::default(),
         view: watch::channel(None).0,
         upstream: Mutex::default(),
         lost_after,
@@ -663,6 +713,9 @@ fn strip_node_keys(kept: &std::path::Path) -> Result<(), String> {
 
 fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     let first_process = boot.is_some();
+    if let Some(why) = people_refusal(&args, nix::unistd::getuid().is_root()) {
+        return Err(why);
+    }
     // Before anything is run or served: what this node's owner has it refuse.
     let node_policy = policy::read(args.node_policy.as_deref(), first_process)?;
     // And, where it refuses every way to be root with all the kernel's capabilities, before
@@ -868,11 +921,12 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             }
         });
         let mut server_stop = stopping.clone();
-        // Whoever can open the socket is the machine's admin.
+        // Whoever can open the socket is the machine's admin: under `spec.signing: required`,
+        // with the admin's signature (`access_sign::local`).
         let local = api::router(shared.clone())
-            .layer(axum::Extension(access::Caller::Admin))
             .merge(cluster::admin_router(shared.clone()))
-            .merge(ui::pages());
+            .merge(ui::pages())
+            .layer(axum::middleware::from_fn_with_state(shared.clone(), access_sign::local));
         let server =
             axum::serve(listener, local).with_graceful_shutdown(async move { drop(server_stop.changed().await) });
         let server = within(server, stopping.clone());
@@ -978,9 +1032,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let hardware = devices::run(shared.clone(), stopping.clone(), dmem);
             let crons = cron::run(shared.clone(), stopping.clone());
             let exits = exits::run(shared.clone(), stopping.clone());
+            let people = people::run(shared.clone(), stopping.clone());
             let published = pods::publish(shared.clone(), own_ports(&args), stopping.clone());
             tokio::join!(
                 apart(exits),
+                apart(people),
                 apart(published),
                 apart(units),
                 apart(releases),
@@ -1008,16 +1064,22 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             if let Some(port) = args.mesh {
                 mesh::run(shared.clone(), mesh_options(&args, &state, port), stopping.clone()).await;
             } else {
-                mesh::left(shared.clone(), stopping.clone()).await;
+                mesh::left(shared.clone(), "mesh", stopping.clone()).await;
             }
         };
+        // (Its own leftovers too, with no --people: see `people::device`.)
+        let device = people::device(
+            shared.clone(),
+            state.clone(),
+            args.people,
+            args.people_endpoint.clone(),
+            args.mesh_interface.clone(),
+            stopping.clone(),
+        );
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();
         let taken = args.ingress.then_some(taken);
-        let proxy = async {
-            if let Some(port) = args.mesh {
-                services::run(shared.clone(), port, taken, stopping.clone()).await;
-            }
-        };
+        // (Without a mesh too: a node's Services answer its pods there as well, T-0723.)
+        let proxy = services::run(shared.clone(), args.mesh, taken, stopping.clone());
         let ingress = async {
             // (A control node with --acme alone orders for the workers that serve ingress.)
             if args.ingress || args.acme.is_some() {
@@ -1053,15 +1115,18 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let format = raft::tend_format(shared.clone(), stopping.clone());
             tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format);
         };
-        let (served, nodes, (), (), (), (), (), (), _) = tokio::join!(
+        let house = home::run(shared.clone(), stopping.clone());
+        let (served, nodes, (), (), (), (), (), (), (), (), _) = tokio::join!(
             server,
             apart(nodes),
             apart(work),
             apart(names),
             apart(mesh),
+            apart(device),
             apart(proxy),
             apart(ingress),
             apart(saying),
+            apart(house),
             apart(storage)
         );
         let _ = shared.raft.shutdown().await;
@@ -1169,10 +1234,59 @@ mod tests {
             "--dns=0.0.0.0:5353",
             "--registry-port=0",
             "--mesh=51999",
+            "--people=51998",
             "--ingress",
         ]);
         let ports: Vec<u16> = said.iter().map(|(port, _)| *port).collect();
-        assert_eq!(ports, [8443, 5353, 51999, 80, 443]);
+        assert_eq!(ports, [8443, 5353, 51999, 51998, 80, 443]);
+    }
+
+    /// `--people` needs `--mesh`; its endpoint is a name or an address, with a port; and a kithd
+    /// not run as root refuses it by name.
+    #[test]
+    fn people_flag() {
+        use clap::Parser;
+        let parse = |args: &[&str]| super::Args::try_parse_from(["kithd"].into_iter().chain(args.iter().copied()));
+        let without_mesh = parse(&["--people"]).err().expect("--people needs --mesh").to_string();
+        assert!(without_mesh.contains("--mesh"), "{without_mesh}");
+        assert_eq!(parse(&["--mesh", "--people"]).unwrap().people, Some(51821));
+        assert_eq!(parse(&["--mesh", "--people=40000"]).unwrap().people, Some(40000));
+        assert_eq!(parse(&["--mesh"]).unwrap().people, None);
+        assert!(parse(&["--mesh", "--people=0"]).is_err(), "the port is from 1 to 65535");
+        assert!(parse(&["--mesh", "--people=65535"]).is_ok());
+        for bad in [
+            "node-a.:51821",
+            ".node-a:51821",
+            "node..a:51821",
+            "-node-a:51821",
+            "node-a-:51821",
+            "0.0.0.0:51821",
+            "[::]:51821",
+        ] {
+            let endpoint = format!("--people-endpoint={bad}");
+            assert!(parse(&["--mesh", "--people", endpoint.as_str()]).is_err(), "{bad}");
+        }
+        for ok in [
+            "node-a.example.org:51821",
+            "10.0.0.5:51821",
+            "[fd00::1]:51821",
+            "a-b.c1:51821",
+        ] {
+            let endpoint = format!("--people-endpoint={ok}");
+            assert!(parse(&["--mesh", "--people", endpoint.as_str()]).is_ok(), "{ok}");
+        }
+        for bad in ["node-a", ":51821", "node-a:0", "node-a:http"] {
+            let endpoint = format!("--people-endpoint={bad}");
+            assert!(parse(&["--mesh", "--people", endpoint.as_str()]).is_err(), "{bad}");
+        }
+        assert!(
+            parse(&["--mesh", "--people-endpoint=node-a:51821"]).is_err(),
+            "needs --people"
+        );
+        let refused = super::people_refusal(&parse(&["--mesh", "--people"]).unwrap(), false);
+        assert!(refused.is_some_and(|why| why.contains("--people")));
+        assert!(super::people_refusal(&parse(&["--mesh", "--people"]).unwrap(), true).is_none());
+        assert!(super::people_refusal(&parse(&["--mesh"]).unwrap(), false).is_none());
     }
 
     #[test]

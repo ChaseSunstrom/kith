@@ -129,6 +129,34 @@ spec:
   one away, the unit restarts. Not yet: an app on another node shown in this session; a
   NodeWorkload claim. A client of a session is in it: see [SECURITY.md](../../SECURITY.md).
 
+### Running a Flatpak app in a session
+
+`examples/session/` is a session and one Flatpak app in its window, both in the `desktop`
+namespace on the seat `desk-seat0`. After the seat exists, `kith apply -f examples/session/session.yaml`
+applies it; put your own image names and app ID in place of the placeholders.
+
+What makes it work:
+
+- **One user.** The session and the app both run as uid 1000 (`runAsUser`), a user the example's
+  Containerfile makes. The seat's directory is that user's alone, so an app as another user cannot
+  open the sockets in it.
+- **The session holds the seat.** `desk-seat` is exclusive, so the session takes the seat's
+  devices. `session-start.sh` starts the session bus at `/run/seat/bus` and the compositor on
+  `/run/seat/wayland-0`, with `XDG_RUNTIME_DIR=/run/seat`.
+- **The app is a client.** `desk-apps` has `access: client`: it takes no seat device, only the
+  seat's directory and the render nodes. Its `WAYLAND_DISPLAY` and `DBUS_SESSION_BUS_ADDRESS` point
+  at those sockets. Its `XDG_RUNTIME_DIR` is its own, `/run/user/1000`, because the seat's
+  directory is read-only to it.
+- **A home that lasts.** `HOME` is `/home/app`, a Volume (`app-home`) on the seat's node, so the
+  app's data outlives its container. `userNamespaces: true` lets Flatpak's sandbox start, and
+  `readOnlyRoot: false` lets it install into the image's root.
+
+Untried: nothing here has run on a seat. Not checked: that Flatpak accepts an absolute
+`WAYLAND_DISPLAY`, that weston reaches the DRM device as uid 1000 without the video and render
+groups, and that `flatpak run` finds an app installed in the image. The repository does not build
+or pull the example image. An app that shares the session's user, bus and seat directory is in the
+session's trust: see [SECURITY.md](../../SECURITY.md).
+
 ### What a seat keeps for itself
 
 ```yaml
@@ -264,5 +292,7 @@ firmware, claimed with `--claim`, and a desktop Linux PC beside it on the same L
   node/NAME` then took it out. **A `pod: true` template does not start on a kithd that is not
   root** ("failed to prepare rootfs").
 - **Not working yet:** the GPU has only the firmware's framebuffer (no `amdgpu` in the plain image;
-  the `gpu-amd-phoenix` [spec](os.md#a-node-that-needs-more-a-spec) builds it in, not yet run here); a Service has no status and its name reaches
-  nothing on a node started without `--mesh`, which kith OS's default is.
+  the `gpu-amd-phoenix` [spec](os.md#a-node-that-needs-more-a-spec) builds it in, not yet run here).
+  (A Service used to have no status and its name reached nothing on a node started without
+  `--mesh`, which kith OS's default is: now its address is on the node's loopback there, and a pod
+  on that node reaches it, T-0723.)

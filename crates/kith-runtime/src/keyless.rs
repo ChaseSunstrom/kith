@@ -53,11 +53,11 @@ pub struct Identity {
     log_id: String,
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn sha256(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn sha256(bytes: &[u8]) -> Vec<u8> {
     ring::digest::digest(&ring::digest::SHA256, bytes).as_ref().to_vec()
 }
 

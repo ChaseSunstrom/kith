@@ -5,5 +5,8 @@ target/
 __pycache__/
 # (ci/site_shots.py makes whole pages and pieces of them to look at: only docs/shots/top/ is kept.)
 docs/shots/site-*.png
+docs/shots/install-*.png
 # (Edit lists a session leaves behind.)
 .fm-scratch/
+# (Sampo points a lane's cargo at its own build folder through this file.)
+.cargo/config.toml

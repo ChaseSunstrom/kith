@@ -210,6 +210,15 @@ fn exposed_in(store: &Store, prefix: Ipv6Addr, view: bool) -> (BTreeMap<String, 
             continue;
         };
         let key = service.key();
+        // (A headless Service has no address to send a host to: its name answers its replicas.
+        // Refused at apply; one a store kept from before that check is refused here too.)
+        if crate::services::headless(service) {
+            refused.insert(
+                key,
+                "a headless Service has no address to expose: its name answers its replicas".to_string(),
+            );
+            continue;
+        }
         let namespace = key.split('/').nth(1).unwrap_or_default();
         let address = kith_mesh::service_address(prefix, namespace, &service.metadata.name);
         let host = expose.host.to_ascii_lowercase();
