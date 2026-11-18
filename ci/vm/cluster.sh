@@ -55,7 +55,8 @@
         [ "$test" != pods ] || more='--mesh --storage-reserve 8388608 --image-grace 120'
         # (worker: this machine asks what listens on port 80 of a node's own network.)
         [ "$test" != worker ] || inside=80
-        # (services: no --mesh, as kith OS starts a node: its Services answer there too, T-0723.)
+        # (services: no --mesh, as kith OS starts a node: its Services answer there too, T-0723;
+        # then services.sh starts it again with --mesh beside a second node with $nolink, T-0326.)
         [ "$test" != services ] || more=''
         # (policy: no way left to be root with all of the kernel's capabilities, so kithd gives up the rest.
         # QEMU reads a comma in -smbios as the end of a value, so each one here is doubled.)
@@ -177,7 +178,7 @@
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
                 -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside${https:+,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:443}$out" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $dumps \
-                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
+                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway${nolink:+ KITH_NO_LINK=1} -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 &
             vms="$vms $!"
         }

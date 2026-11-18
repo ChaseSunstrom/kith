@@ -28,8 +28,9 @@
 #                               the cluster through its node's upstream, a second kithd with its own
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
 #                               back in order, however its connection ends, passed by kithd from a pod
-#                               and by the kernel from the node's own network
-#   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) imported with
+#                               and by the kernel from the node's own network; then on the mesh with
+#                               a second node that opens no links (of before), each sends to the other's
+#   sh ci/vm.sh --test compose one node: ci/compose/stack.yml (four services of the test pod) imported with
 #                               kith import compose, applied, ready, each asked for by its compose name
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
@@ -180,9 +181,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    sent, reset by either end on the way) and one of 5000 small turns:
                    every byte comes back in order. The Job runs twice: in a pod,
                    kithd passes its bytes; on the node's own network, the kernel
-                   sends its connections straight to the pod. Needs rustc for
+                   sends its connections straight to the pod. Then the node starts again
+                   with --mesh and a second joins it with KITH_NO_LINK set (kithd says
+                   no `link` and opens none, as a node of before): a pod on each sends
+                   through the Service of a pod on the other, both ways. Needs rustc for
                    x86_64-unknown-linux-musl
-  --test compose   instead: one node on the mesh, and on this machine `kith import
+  --test compose  instead: one node on the mesh, and on this machine `kith import
                    compose` of ci/compose/stack.yml (four services of the test pod,
                    nothing in it left out) applied to it. Expected: each Workload ready,
                    each Service given its backend, and a Job in a pod asking each service
