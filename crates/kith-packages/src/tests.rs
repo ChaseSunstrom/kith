@@ -452,3 +452,55 @@ fn kith_templates_are_held_and_see_only_the_package() {
         "{wrong}"
     );
 }
+
+/// `lookup(kind, namespace, name)` is the live resource's spec, or an empty map; the keys it
+/// was asked for come back, found or not.
+#[test]
+fn lookup_finds_a_live_resource_and_is_empty_when_absent() {
+    let mut files = BTreeMap::new();
+    files.insert("package.yaml".to_string(), "name: peek\nversion: 0.1.0\n".to_string());
+    files.insert(
+        "templates/a.yaml".to_string(),
+        "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: copy }\nspec:\n  data:\n    \
+         port: \"{{ lookup('Service', release.namespace, 'db').port | default('none') }}\"\n    \
+         empty: \"{{ 'empty' if not lookup('Service', release.namespace, 'nope') else 'full' }}\"\n"
+            .to_string(),
+    );
+    let package = Package::from_files(files).unwrap();
+    let mut live = Live::default();
+    live.specs.insert("Service/store/db".into(), json!({ "port": 5432 }));
+    let rendered = package.render_live(SHOP, &[], &live).unwrap();
+    let data = &rendered.resources[0].spec["data"];
+    assert_eq!(
+        (data["port"].as_str(), data["empty"].as_str()),
+        (Some("5432"), Some("empty"))
+    );
+    let looked: Vec<&str> = rendered.looked.iter().map(String::as_str).collect();
+    assert_eq!(looked, ["Service/store/db", "Service/store/nope"]);
+
+    // With nothing live (`render`, lint): everything is absent.
+    let rendered = package.render(SHOP, &[]).unwrap();
+    assert_eq!(rendered.resources[0].spec["data"]["port"], "none");
+    assert_eq!(package.lint(), Vec::<String>::new());
+
+    // Another namespace is not seen (said, not an empty map taken for absence); and a
+    // snapshot that was refused says why when it is asked.
+    let mut files = package.files.clone();
+    files.insert(
+        "templates/a.yaml".into(),
+        "x: {{ lookup('Secret', 'other', 's') }}\n".into(),
+    );
+    let elsewhere = Package::from_files(files.clone()).unwrap();
+    let said = elsewhere.render_live(SHOP, &[], &live).unwrap_err();
+    assert!(said.contains("only its own namespace (store)"), "{said}");
+    let refused = Live {
+        refused: Some("too big".into()),
+        ..Live::default()
+    };
+    files.insert(
+        "templates/a.yaml".into(),
+        "x: {{ lookup('Secret', 'store', 's') }}\n".into(),
+    );
+    let said = Package::from_files(files).unwrap().render_live(SHOP, &[], &refused);
+    assert!(said.unwrap_err().contains("too big"));
+}
