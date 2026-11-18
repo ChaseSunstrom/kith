@@ -96,6 +96,9 @@ function ask({ title, body, yes, danger = false, act = async () => true }) {
   go.textContent = yes ?? '';
   go.className = danger ? 'danger' : 'primary';
   no.textContent = yes ? 'Cancel' : 'Close';
+  // (One question at a time: a second, asked while the first is open, would be closed by the
+  // first's late answer, and the first's would never come.)
+  if (dialog.open) return Promise.reject(new Error('another question is still open: answer it first'));
   return new Promise((done) => {
     const finish = (result) => {
       go.onclick = no.onclick = dialog.oncancel = null;
@@ -107,6 +110,9 @@ function ask({ title, body, yes, danger = false, act = async () => true }) {
     no.onclick = () => finish(undefined);
     dialog.oncancel = (event) => {
       event.preventDefault();
+      // (While `act` runs the dialog stays: Esc would close it over a call that goes on, and
+      // what it brings, a new key, would be shown to no one.)
+      if (go.disabled) return;
       finish(undefined);
     };
     go.onclick = async () => {
@@ -735,7 +741,7 @@ async function route() {
   // (The Install part is a view of its own, not a kind: the board is out of sight while it is in.)
   if (name === 'install') return install.show(true);
   install.show(false);
-  const kind =kindNamed(name) ?? kindNamed(state.kind) ?? kindNamed('Workload') ?? state.kinds[0];
+  const kind = kindNamed(name) ?? kindNamed(state.kind) ?? kindNamed('Workload') ?? state.kinds[0];
   const key = rest.length === 0 ? null : rest[0] === '+' ? '+' : [kind?.kind, ...rest].join('/');
   if (state.draft?.dirty && (key !== state.key || kind?.kind !== state.kind)) {
     const leave = await ask({ title: 'Leave what you changed?', body: h('p', {}, `Your edits to ${state.key === '+' ? `the new ${state.kind}` : state.key} were not applied.`), yes: 'Leave', danger: true });
@@ -805,7 +811,7 @@ async function watch() {
   }
 }
 
-const install = installPart({ $, h, api, ask, toast, say, state });
+const install = installPart({ $, h, api, ask, toast, say, state, may: (verb, kind) => may(verb, kindNamed(kind)) });
 $('filter').addEventListener('input', (event) => {
   state.filter = event.target.value;
   drawTable();

@@ -358,7 +358,7 @@ dialog::backdrop { background: color-mix(in srgb, var(--bg) 84%, transparent); }
 /* Install: the steps of bringing a machine in, as stops on the rail the board's kinds hang
    from. The stop is filled where something is on (netboot answering), a ring where it is not.
    Another part of the same page as the board (the address #/install), not another page. */
-.navlink { font-size: var(--small); font-weight: 700; text-decoration: none; border-bottom: var(--stroke) solid transparent; transition: color var(--quick), border-color var(--quick); }
+.navlink { display: inline-block; min-height: 24px; padding-block: 4px; font-size: var(--small); font-weight: 700; text-decoration: none; border-bottom: var(--stroke) solid transparent; transition: color var(--quick), border-color var(--quick); }
 .navlink:hover { color: var(--accent-text); }
 .navlink[aria-current] { border-bottom-color: var(--accent); }
 .install { flex: 1; min-height: 0; overflow: auto; padding: 0 calc(var(--unit) * 5) calc(var(--unit) * 8); scrollbar-width: thin; scrollbar-color: var(--hair) transparent; }
@@ -378,7 +378,7 @@ dialog::backdrop { background: color-mix(in srgb, var(--bg) 84%, transparent); }
 .rail h3::before { content: ""; position: absolute; left: calc(0.5px - var(--rail)); top: 4px; width: 14px; height: 14px; border: var(--stroke) solid var(--text); border-radius: 50%; background: var(--bg); transition: background var(--arrive), border-color var(--quick); }
 .rail .stop.on h3::before { border-color: var(--accent); background: var(--accent); animation: beat var(--breath) ease-in-out infinite; }
 .rail .stop > p { max-width: 62ch; font-size: var(--small); }
-.install .field > input[type="checkbox"] { width: 22px; min-height: 22px; height: 22px; accent-color: var(--accent); }
+.install .field > input[type="checkbox"] { width: 24px; min-height: 24px; height: 24px; accent-color: var(--accent); }
 .install .field > input[type="file"] { padding: calc(var(--unit) * 1.5) calc(var(--unit) * 2.5); font-size: var(--small); }
 .machines { display: flex; flex-direction: column; }
 .machines li { display: flex; align-items: center; gap: calc(var(--unit) * 3); flex-wrap: wrap; min-height: var(--row); border-bottom: 1px solid var(--hair); font-size: var(--small); }
@@ -390,7 +390,7 @@ dialog::backdrop { background: color-mix(in srgb, var(--bg) 84%, transparent); }
 .secret .warning { margin: 0; padding-left: calc(var(--unit) * 3); border-left: var(--stroke) solid var(--warn); font-weight: 700; }
 .secret pre { background: var(--sunken); padding: calc(var(--unit) * 3); border-left: var(--stroke) solid var(--accent); white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }
 .secret .key { font-size: var(--large); letter-spacing: 0.04em; }
-.secret label { color: var(--dim); font-size: var(--small); }
+.secret .what { margin: 0; color: var(--dim); font-size: var(--small); }
 @media (max-width: 900px) {
   .install { padding-left: calc(var(--unit) * 3); padding-right: calc(var(--unit) * 3); overflow: visible; }
   .install .field { grid-template-columns: minmax(0, 1fr); }

@@ -33,6 +33,7 @@ import urllib.parse
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 UI = ROOT / "crates/kithd/ui"
+TARGET = pathlib.Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target")  # (a lane builds in a folder of its own)
 HOLD = 5  # seconds the page is given to connect and draw before it is photographed
 KINDS = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".woff2": "font/woff2"}
 POLICY = re.sub(r"\\\n\s*", "", re.search(r'const POLICY: &str = "(.*?)";', (ROOT / "crates/kithd/src/ui.rs").read_text(), re.S).group(1))
@@ -45,7 +46,7 @@ const step = (ms, act) => setTimeout(() => { try { act(); } catch (error) { fetc
 const press = (id) => document.getElementById(id).click();
 if (scene === 'Install' || scene === 'Token') {
   // The Install part: no sideways scroll, and for Token the dialog that shows a join token once.
-  if (scene === 'Token') step(1500, () => { press('token-make'); step(500, () => press('dialog-yes')); });
+  if (scene === 'Token') step(1500, () => { document.getElementById('token-at').selectedIndex = 1; press('token-make'); step(500, () => press('dialog-yes')); });
   step(3500, () => {
     if (document.documentElement.scrollWidth > innerWidth) throw new Error(`sideways overflow: ${document.documentElement.scrollWidth} > ${innerWidth}`);
     if (document.getElementById('install').hidden) throw new Error('the Install part is not in view');
@@ -121,13 +122,13 @@ def main():
 
     def kith(*args):
         env = {k: v for k, v in os.environ.items() if k != "KITH_STORE"} | {"KITH_SOCKET": str(work / "alpha/kithd.sock")}
-        return subprocess.run([ROOT / "target/debug/kith", *args], env=env, capture_output=True, text=True)
+        return subprocess.run([TARGET / "debug/kith", *args], env=env, capture_output=True, text=True)
 
     def node(name, *more):
         (work / name).mkdir()
         log = open(work / name / "log", "w")
         args = ["--state", "state", "--socket", "kithd.sock", "--name", name, "--registry-port", "0", "--listen", f"127.0.0.1:{free()}", *more]
-        nodes.append(subprocess.Popen([ROOT / "target/debug/kithd", *args], cwd=work / name, stdin=subprocess.DEVNULL, stdout=log, stderr=log))
+        nodes.append(subprocess.Popen([TARGET / "debug/kithd", *args], cwd=work / name, stdin=subprocess.DEVNULL, stdout=log, stderr=log))
         return args[9]
 
     try:

@@ -427,6 +427,15 @@ mod tests {
             app.contains("$('dialog-body').replaceChildren();"),
             "a closed dialog still holds what it showed"
         );
+        // Esc does not close a dialog over a call that goes on (the new key it brings would be
+        // shown to no one), and a second question does not take the first's dialog.
+        assert!(
+            app.contains("if (go.disabled) return;") && app.contains("if (dialog.open) return Promise.reject"),
+            "ask() can be closed while its act runs"
+        );
+        // Who may not is told so up front, and the secret's label is the text's name.
+        assert!(script.contains("may('apply', 'NodeKey')") && script.contains("You may not"));
+        assert!(script.contains("'aria-labelledby': 'secret-what'") && script.contains("id: 'secret-what'"));
         // The three calls are the ones `kith` makes, and a file goes as its bytes.
         for call in [
             "`tokens?trust=${trust}`",
@@ -439,10 +448,18 @@ mod tests {
         assert!(app.contains("'application/octet-stream'"), "a boot file goes as JSON");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
         let check = "const { pathToFileURL } = await import('node:url');\n\
-            const { joinBlock, minutesLeft, cards } = await import(pathToFileURL(process.argv[1]).href);\n\
+            const { joinBlock, minutesLeft, cards, reachable } = await import(pathToFileURL(process.argv[1]).href);\n\
             const same = (a, b) => { if (a !== b) throw new Error(`${JSON.stringify(a)} is not ${JSON.stringify(b)}`); };\n\
-            same(joinBlock('10.0.0.7:7443', 'kith1.ab'), 'join:\\n  address: 10.0.0.7:7443\\n  token: \"kith1.ab\"\\n');\n\
-            same(joinBlock('a:1', 'x\"\\ny'), 'join:\\n  address: a:1\\n  token: \"x\\\\\"\\\\ny\"\\n');\n\
+            same(joinBlock('10.0.0.7:7443', 'kith1.ab'), 'join:\\n  address: \"10.0.0.7:7443\"\\n  token: \"kith1.ab\"\\n');\n\
+            same(joinBlock('a:1', 'x\"\\ny'), 'join:\\n  address: \"a:1\"\\n  token: \"x\\\\\"\\\\ny\"\\n');\n\
+            for (const good of ['[fd00::7]:7443', 'node-1.example.org:443', '127.0.0.1:65535']) same(reachable(good), true);\n\
+            // A node says its own address: what is no host:port, or is a host:port with more, is no address of the block.\n\
+            const hostile = ['evil.example:1\\n  token: \"x\"', 'evil.example:1\\n', 'a b:1', 'a:1 # x', 'a:0', 'a:65536', ':80', 'host', '::1:7443',\n\
+              '[::1]:80\\nx', 'a:1\"', '{a}:1', 'a/b:1', '-a:1', 'a-:1', '', undefined, null, 7];\n\
+            for (const bad of hostile) {\n\
+              same(reachable(bad), false);\n\
+              same(joinBlock(bad, 't'), 'join:\\n  address: \"ADDRESS:PORT\"\\n  token: \"t\"\\n');\n\
+            }\n\
             same(cards(' 52:54:00:12:34:56,\\n  aa:bb:cc:dd:ee:ff ,, '), '52:54:00:12:34:56,aa:bb:cc:dd:ee:ff');\n\
             same(cards(' , '), '');\n\
             same(minutesLeft(40), '40 seconds');\n\

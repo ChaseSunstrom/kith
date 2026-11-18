@@ -6,9 +6,22 @@
 //
 // What is drawn is kithd's text and the operator's own: text nodes only, as the board does.
 
-/** The `join:` block of kith-install.yaml for a token: what the website's installer page writes. */
+/**
+ * Is this a `host:port` a machine can be sent to: an IPv4 or a bracketed IPv6 address, or a
+ * DNS name (letters, digits, `-` and `.`), and a port of 1 to 65535? An address is a node's own
+ * word for itself, and the token goes where it says: nothing else is let into the block.
+ */
+export function reachable(address) {
+  const match = /^(?:(\[[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\])|([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)):([0-9]{1,5})$/.exec(String(address));
+  return Boolean(match) && Number(match[3]) >= 1 && Number(match[3]) <= 65535;
+}
+
+/**
+ * The `join:` block of kith-install.yaml for a token: what the website's installer page writes.
+ * An address that is not `host:port` is written as the placeholder ADDRESS:PORT, to be filled in.
+ */
 export function joinBlock(address, token) {
-  return `join:\n  address: ${address}\n  token: ${JSON.stringify(token)}\n`;
+  return `join:\n  address: ${JSON.stringify(reachable(address) ? address : 'ADDRESS:PORT')}\n  token: ${JSON.stringify(token)}\n`;
 }
 
 /** How long is left of netboot, said: "28 minutes", "40 seconds". */
@@ -23,7 +36,7 @@ export function cards(text) {
   return text.split(/[\s,]+/).filter(Boolean).join(',');
 }
 
-export function installPart({ $, h, api, ask, toast, say, state }) {
+export function installPart({ $, h, api, ask, toast, say, state, may }) {
   let timer = null;
   let shown = false;
 
@@ -40,13 +53,28 @@ export function installPart({ $, h, api, ask, toast, say, state }) {
   /** The nodes' addresses, and the nodes that keep a key: from what the board already holds. */
   function draw() {
     const addresses = nodes()
-      .filter((node) => node.status?.address)
+      .filter((node) => reachable(node.status?.address))
       .sort((a, b) => a.metadata.name.localeCompare(b.metadata.name))
       .map((node) => [node.status.address, `${node.status.address}  (${node.metadata.name})`]);
-    fill($('token-at'), addresses.length ? addresses : [['', 'no node says its address']]);
+    // (None is chosen for the person: a node's address is its own word, and the token goes to it.)
+    fill($('token-at'), [['', 'choose the node the new machine will reach'], ...addresses]);
     const keyed = names('NodeKey');
     fill($('recovery-node'), keyed.length ? keyed.map((name) => [name, name]) : [['', 'no node keeps its state encrypted']]);
-    $('recovery-make').disabled = keyed.length === 0;
+    // What the server asks of the caller (a token and netboot: the right to apply Nodes, Roles and
+    // RoleBindings; a key: NodeKeys), said up front, with the actions that would be refused off.
+    const lets = ['Node', 'Role', 'RoleBinding'].every((kind) => may('apply', kind));
+    const keys = may('apply', 'NodeKey');
+    const needs = (id, ok, kinds) => {
+      const line = $(id);
+      if (!ok) say(line, `You may not: it needs the right to apply ${kinds}.`, 'bad');
+      else if (line.textContent.startsWith('You may not')) say(line, '');
+    };
+    needs('token-check', lets, 'Nodes, Roles and RoleBindings');
+    needs('netboot-check', lets, 'Nodes, Roles and RoleBindings');
+    needs('recovery-check', keys, 'NodeKeys');
+    $('token-make').disabled = !lets;
+    $('netboot-on').disabled = $('netboot-off').disabled = !lets;
+    $('recovery-make').disabled = !keys || keyed.length === 0;
   }
 
   // ── A secret, shown once ──────────────────────────────────────────────────────────
@@ -62,16 +90,18 @@ export function installPart({ $, h, api, ask, toast, say, state }) {
 
   const secret = (warning, label, text, big = false) => h('div', { class: 'secret' },
     h('p', { class: 'warning', role: 'alert' }, warning),
-    h('label', {}, label),
-    h('pre', { class: big ? 'key' : '', tabindex: 0 }, text),
-    h('div', { class: 'tools' }, h('button', { type: 'button', class: 'small', onclick: () => copy(text) }, 'Copy')),
+    h('p', { class: 'what', id: 'secret-what' }, label),
+    h('pre', { class: big ? 'key' : '', tabindex: 0, 'aria-labelledby': 'secret-what' }, text),
+    h('div', { class: 'tools' },
+      h('button', { type: 'button', class: 'small', onclick: () => copy(text) }, 'Copy'),
+      h('span', { class: 'dim' }, 'A copy stays on the clipboard until something else is copied: clear it when you have used it.')),
   );
 
   // ── 01: a join token ──────────────────────────────────────────────────────────────
 
   async function token() {
     const trust = $('token-trust').value;
-    const address = $('token-at').value || 'ADDRESS:PORT';
+    const address = $('token-at').value;
     say($('token-check'), '');
     const made = await ask({
       title: 'Make a join token?',
@@ -108,6 +138,7 @@ export function installPart({ $, h, api, ask, toast, say, state }) {
   }
 
   async function refresh() {
+    if ($('netboot-on').disabled) return; // (not allowed: draw said so, and the call would only be refused)
     try {
       drawNetboot(await api('GET', 'netboot'));
       say($('netboot-check'), '');
