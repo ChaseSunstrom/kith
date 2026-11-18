@@ -20,8 +20,9 @@
   </a>
   <nav aria-label="Sections">
     <a href="../guide/index.html">Guide</a>
-    <a href="../guide/index.html#decisions">Decisions</a>
-    <a href="../index.html#numbers">Numbers</a>
+    <a href="../install.html">Install</a>
+    <a class="more" href="../guide/index.html#decisions">Decisions</a>
+    <a class="more" href="../index.html#numbers">Numbers</a>
   </nav>
   <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
 </header>
@@ -86,7 +87,7 @@ helm install site ./chart --wait
 <ol><li>Stop the app in the guest, so its files are whole.</li><li>Apply the Volume its Workload will mount (<code>kith apply -f app.yaml</code>; the Workload may wait with <code>replicas: 0</code>).</li><li>From a machine that reaches both, send the directory: <code>ssh GUEST tar -cf - -C /var/lib/app . | kith volume put app-data -</code> (or <code>kith volume put app-data ./a-copy</code>). It says how many files went in and names any link it left out; see <a href="storage.html#files-in-and-out-of-a-volume">Files in and out of a volume</a> for what it refuses.</li><li>Start the Workload and look at the app. The files are its user's whatever they were in the guest. Keep the old guest stopped, not deleted, until the new one has run a week.</li></ol>
 <p>kith does not need the hypervisor gone first: a kith OS image boots as a guest (UEFI, virtio disk and network), the way to try it beside what runs today. It is tested in QEMU, not on Proxmox itself.</p>
 </article>
-<footer class="tail"><nav aria-label="Next page"><a class="before" href="api.html"><span>Before</span>Resources and the language</a><a class="after" href="ui.html"><span>After</span>Web UI</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/kubernetes.md">docs/guide/kubernetes.md</a>.</p></footer>
+<footer class="tail"><nav aria-label="Previous and next pages"><a class="prev" rel="prev" href="api.html"><span>Previous</span>Resources and the language</a><a class="next" rel="next" href="ui.html"><span>Next</span>Web UI</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/kubernetes.md">docs/guide/kubernetes.md</a>.</p></footer>
 </div>
 </div>
 </body>
