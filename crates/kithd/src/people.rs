@@ -182,7 +182,7 @@ pub fn plan(asked: &[Asked], people: Ipv6Addr) -> BTreeMap<String, Said> {
 
 /// Why an AccessLevel's network lies over the cluster's mesh /48 or its people /64: the first
 /// `min` bits of the two agree. IPv4 networks are not these; the people's IPv4 ranges are kith-api's.
-fn over(net: &str, mesh: Ipv6Addr, people: Ipv6Addr) -> Option<String> {
+pub(crate) fn over(net: &str, mesh: Ipv6Addr, people: Ipv6Addr) -> Option<String> {
     let (address, length) = net.split_once('/')?;
     let IpAddr::V6(address) = address.parse::<IpAddr>().ok()? else {
         return None;
@@ -201,7 +201,7 @@ fn over(net: &str, mesh: Ipv6Addr, people: Ipv6Addr) -> Option<String> {
     }
 }
 
-fn held(resource: &Resource) -> Option<(Ipv4Addr, Ipv6Addr)> {
+pub(crate) fn held(resource: &Resource) -> Option<(Ipv4Addr, Ipv6Addr)> {
     let addresses = resource.status.as_ref()?.get("addresses")?;
     let four = addresses.get("ipv4")?.as_str()?.parse().ok()?;
     let six = addresses.get("ipv6")?.as_str()?.parse().ok()?;
@@ -320,15 +320,20 @@ pub fn up(state: &Path, port: u16, interface: &str, people64: Ipv6Addr) -> std::
 }
 
 /// `up`, with the table made by `table` (the tests make theirs without masquerade: see `table_here`).
-fn up_with(
+pub(crate) fn up_with(
     state: &Path,
     port: u16,
     people64: Ipv6Addr,
     table: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<kith_mesh::Key> {
     let key = crate::mesh::private_key(&state.join("pki").join("people.key"))?;
+    // (The order of docs/adr-people.md: the table with its drops, the rules that send nowhere, the
+    // device with no peers. `levels` adds the levels' chains and the peers, after.)
     table()?;
-    Ok(kith_mesh::people::device(&key, port, people64)?.public_key)
+    kith_mesh::exit::people_hold()?;
+    let found = kith_mesh::people::device(&key, port, people64)?;
+    crate::levels::DEVICE_UP.store(true, std::sync::atomic::Ordering::Release);
+    Ok(found.public_key)
 }
 
 /// A kernel with no nftables masquerade (CONFIG_NFT_MASQ) refuses the table's post chain: that

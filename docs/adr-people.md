@@ -418,6 +418,38 @@ namespace on a host kernel with no masquerade (`unshare -Urn` here) makes the ta
 rules, as kith-mesh's `build_here` does, and says so; the masq rule is covered by kith-mesh's
 expression tests.
 
+## Built: slice E1
+
+Levels hold on the `--people` node (kithd's `levels.rs`). A pass reads the store (the node's
+RemotePeers, their AccessLevels and Services) and makes what the kernel holds match it:
+
+- The `kith-people` table is written whole, in one batch, from the people and their levels.
+  There is no `ct state established` accept, so a narrowed level is cut by the rewrite alone; a
+  peer taken away also has its connections' marks (`0x6b79_0000 | offset`) deleted from conntrack.
+- Rules 9010 (main table, `suppress_prefixlen 0`), 9012 (unreachable) for both families, and 9011
+  (the peer's /32, the full main table) for each peer of a level with `internet: true`, all `iif
+  kwg0`. exit.rs's 9000-9005 are untouched; its `Rule` gained `suppress`.
+- Order of a pass: the peers leaving come off kwg0 first; then the table, then the rules; only
+  then do the peers go on. Any failed step empties kwg0's peers (fail closed) and says why.
+- The kernel is read again each pass (table present, rules), so a rule or table removed by hand
+  is put back within 10 s; an unchanged pass writes nothing. `Tend` starts only after `up` has
+  finished its own order (the device, the table, the 9010/9012 base).
+- A peer's AllowedIPs on kwg0 are its own /32 and /128 and nothing else (condition 8 on this
+  side; what the client's shown configuration holds is slice D).
+- `--people-networks A,B` (env `KITH_PEOPLE_NETWORKS`; needs `--people`) names what a level's
+  `networks` may hold: a level's network outside them, or overlapping the mesh /48 or the people
+  /64, is left out with a note (condition 7: narrows, never widens). A Service reached only on UDP
+  is left out (an empty port list means all ports). A level that names an `exit` has no internet
+  until slice E2 ("exit X is not held yet").
+- Two peers with one address or key are both left out (condition 5). A level the store does not
+  have leaves its people out. What was left out, and why, is the Node's `peopleNotes` (up to 16
+  lines of 200 characters; a worker may say only its own).
+
+Not built: a conntrack flush for a peer deleted while kithd was down; the node's own IPv6 links
+in the table's link list (IPv4 only); the kithd resolver's own `may_forward` check that a people
+prefix may be forwarded to (condition 8's other half); a start failure's reason beyond stderr;
+exit levels, the Service listener and per-peer limits (slice E2).
+
 ## Open
 
 - **Should the filter tell people apart?** Then the router routes `100.89.0.0/16` to the node

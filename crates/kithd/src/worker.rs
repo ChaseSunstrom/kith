@@ -197,6 +197,26 @@ fn people_shape(key: &str, people: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// What a node says of what its levels could not give (`status.peopleNotes`): null, or a few short
+/// lines of text.
+fn notes_shape(key: &str, notes: &Value) -> Result<(), String> {
+    let few = match notes {
+        Value::Null => true,
+        Value::Array(lines) => {
+            lines.len() <= 16
+                && lines
+                    .iter()
+                    .all(|line| line.as_str().is_some_and(|line| line.chars().count() <= 200))
+        }
+        _ => false,
+    };
+    if few {
+        Ok(())
+    } else {
+        Err(refused(key, "`peopleNotes` is null or up to 16 lines of text"))
+    }
+}
+
 fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), String> {
     let node = who.name;
     let Some(live) = store.get(key) else {
@@ -205,9 +225,16 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
     };
     match live.kind.as_str() {
         "Node" if live.metadata.name == node => {
-            only(key, fields, &["os", "mesh", "serves", "policy", "thumbprint", "people"])?;
+            only(
+                key,
+                fields,
+                &["os", "mesh", "serves", "policy", "thumbprint", "people", "peopleNotes"],
+            )?;
             if let Some(people) = fields.get("people") {
                 people_shape(key, people)?;
+            }
+            if let Some(notes) = fields.get("peopleNotes") {
+                notes_shape(key, notes)?;
             }
             // (Its own policy, as it says it: null, or a small object of yes and no and the classes of Device.)
             let small = |policy: &Value| match policy {
@@ -749,6 +776,32 @@ spec: { volume: there, every: 1d }
             json!({ "people": device(json!(key), json!(51821), Value::Null) }),
         );
         assert!(try_as(&store, "w-b", theirs).is_err());
+    }
+
+    #[test]
+    fn a_worker_says_what_its_levels_left_out_in_a_few_lines() {
+        let store = store();
+        let notes = |said: Value| patch_of("Node/w", json!({ "peopleNotes": said }));
+        let long = "x".repeat(201);
+        let many: Vec<String> = (0..17).map(|n| n.to_string()).collect();
+        for said in [
+            json!(["peer a: refused"]),
+            json!([]),
+            Value::Null,
+            json!(["é".repeat(200)]),
+        ] {
+            assert!(try_as(&store, "w", notes(said.clone())).is_ok(), "{said}");
+        }
+        for said in [
+            json!([long]),
+            json!(many),
+            json!("text"),
+            json!([1]),
+            json!({ "a": "b" }),
+        ] {
+            assert!(try_as(&store, "w", notes(said.clone())).is_err(), "{said}");
+        }
+        assert!(try_as(&store, "w-b", notes(json!(["x"]))).is_err(), "another node's");
     }
 
     #[test]

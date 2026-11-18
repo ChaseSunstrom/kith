@@ -1,6 +1,7 @@
 //! The people table: `inet kith-people`, where a level is enforced on the node that ends the
-//! people's tunnels (`docs/adr-people.md`, "Where a level is enforced"). Not wired into
-//! kithd yet; this module only builds the table and its chains, and reads them back.
+//! people's tunnels (`docs/adr-people.md`, "Where a level is enforced"). This module builds the
+//! table and its chains, makes kwg0 and sets its peers, and takes them all away; which levels and
+//! which peers is kithd's `levels.rs`.
 
 use crate::pod::{
     Batch, INET, NESTED, answering, at, attribute, expression, has_table, is, l4proto, link_name, nfproto, number,
@@ -11,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A level's reach: the networks it may reach, its Services' addresses and ports, its API's
 /// port, its resolver, and its internet (see `docs/adr-people.md`).
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Level {
     pub networks: Vec<(IpAddr, u8)>,
     /// (address, TCP ports; none is all of them).
@@ -21,7 +22,7 @@ pub struct Level {
     pub internet: Internet,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Internet {
     None,
     Home,
@@ -29,7 +30,7 @@ pub enum Internet {
 }
 
 /// A peer of the people's device: its level, its 16 bits in `100.89.0.0/16`, its addresses.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Person {
     pub level: String,
     pub offset: u16,
@@ -271,24 +272,30 @@ pub fn table_present() -> std::io::Result<bool> {
     has_table(INET, TABLE)
 }
 
-/// Sets the people's device's peers, as the device has them now: kithd's tests seed one (a start
-/// never does). Fails if there is no device to seed.
-#[doc(hidden)]
-pub fn set_peers_for_tests(peers: &[Peer]) -> std::io::Result<()> {
+/// Makes `peers` the people's device's peers: the others go, a changed one is set again, and one
+/// the device has with an endpoint it learnt keeps it (none is given). Fails if there is no device.
+pub fn set_peers(peers: &[Peer]) -> std::io::Result<()> {
     match crate::netlink::Device::open(DEVICE)? {
         Some(mut device) => device.set_peers(peers),
         None => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "no people device to seed",
+            "no people device to set peers on",
         )),
     }
 }
 
-/// Takes the people's device and table away, if they are there (the take-away with no flag).
+/// [`set_peers`], for kithd's tests that seed a peer (a start never does).
+#[doc(hidden)]
+pub fn set_peers_for_tests(peers: &[Peer]) -> std::io::Result<()> {
+    set_peers(peers)
+}
+
+/// Takes the people's device, its rules and its table away, if they are there (the take-away with no flag).
 pub fn remove() -> std::io::Result<()> {
     if let Some(device) = crate::netlink::Device::open(DEVICE)? {
         device.remove()?;
     }
+    crate::exit::people_release()?;
     if has_table(INET, TABLE)? {
         let mut batch = Batch::new(TABLE);
         batch.drop_table(INET);

@@ -69,6 +69,9 @@ struct Rule<'a> {
     /// Of a rule with no table (unreachable), a table all the same: the kernel tells two
     /// rules apart by it, so each exit has its own (two may have one address).
     owner: Option<u32>,
+    /// Of the main table, the routes of this prefix length or shorter are left out: 31 for a
+    /// pod (only its /32 routes and the mesh's), 0 for a person (no default route).
+    suppress: Option<u32>,
 }
 
 impl Rule<'_> {
@@ -96,12 +99,10 @@ impl Rule<'_> {
         }
         if let Some(table) = self.table {
             rule.attributes.push(RuleAttribute::Table(table));
-            // Of the main table, only the routes to one pod (a /32) or to the mesh: not its
-            // way to everywhere, nor a wider network's that holds the pods' range.
-            if table == 254 {
-                rule.attributes
-                    .push(RuleAttribute::SuppressPrefixLen(if self.v6 { 0 } else { 31 }));
-            }
+            // (Of the main table, a pod's rule leaves out all but the routes to one pod (a /32) or
+            // to the mesh: not its way to everywhere, nor a wider network's that holds the pods' range.)
+            rule.attributes
+                .extend(self.suppress.map(RuleAttribute::SuppressPrefixLen));
         }
         rule.attributes.extend(self.owner.map(RuleAttribute::Table));
         rule
@@ -141,6 +142,7 @@ fn rules(link: &str, number: u16, range: crate::pod::Range, mesh: Option<(Ipv6Ad
         from: None,
         table,
         owner: None,
+        suppress: (table == Some(254)).then_some(if v6 { 0 } else { 31 }),
     };
     let mut rules = vec![
         rule(false, NOWHERE, None, None),
@@ -193,6 +195,97 @@ pub fn release(link: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// The people's rules (docs/adr-people.md, "Where a level is enforced"), by what comes in on kwg0:
+// the main table with no default route, a person's IPv4 by the whole of it, and nowhere.
+const PEOPLE_MAIN: u32 = 9010;
+const PEOPLE_INTERNET: u32 = 9011;
+const PEOPLE_NOWHERE: u32 = 9012;
+
+fn people_rule(v6: bool, priority: u32, from: Option<Ipv4Addr>, table: Option<u32>) -> Rule<'static> {
+    Rule {
+        v6,
+        priority,
+        iif: Some(crate::people::DEVICE),
+        to: None,
+        from,
+        table,
+        owner: None,
+        suppress: (priority == PEOPLE_MAIN).then_some(0),
+    }
+}
+
+/// The rules of the people's device are all of those by `kwg0` at 9010 to 9012, of both families.
+fn people_dump() -> Result<Vec<RuleMessage>> {
+    let dump = ask_route(RouteNetlinkMessage::GetRule(RuleMessage::default()), NLM_F_DUMP)?;
+    let ours = |rule: &RuleMessage| {
+        rule.attributes
+            .contains(&RuleAttribute::Iifname(crate::people::DEVICE.into()))
+            && (PEOPLE_MAIN..=PEOPLE_NOWHERE)
+                .any(|priority| rule.attributes.contains(&RuleAttribute::Priority(priority)))
+    };
+    Ok(dump
+        .into_iter()
+        .filter_map(|rule| match rule {
+            RouteNetlinkMessage::NewRule(rule) if ours(&rule) => Some(rule),
+            _ => None,
+        })
+        .collect())
+}
+
+/// What kwg0 has of the people's rules, as (priority, IPv6, source): for the tests and the check.
+pub fn people_rules() -> Result<Vec<(u32, bool, Option<Ipv4Addr>)>> {
+    let mut seen = Vec::new();
+    for rule in people_dump()? {
+        let priority = rule.attributes.iter().find_map(|a| match a {
+            RuleAttribute::Priority(priority) => Some(*priority),
+            _ => None,
+        });
+        let source = rule.attributes.iter().find_map(|a| match a {
+            RuleAttribute::Source(IpAddr::V4(from)) => Some(*from),
+            _ => None,
+        });
+        seen.extend(priority.map(|priority| (priority, rule.header.family == AddressFamily::Inet6, source)));
+    }
+    seen.sort();
+    Ok(seen)
+}
+
+/// Hold the people's device (before it is made: the last rule, which lets nothing out, goes first):
+/// what an earlier start had of the others is taken away, then both families' main table with no
+/// default route. A person's whole internet is [`people_internet`]'s, after.
+pub fn people_hold() -> Result<()> {
+    for v6 in [false, true] {
+        people_rule(v6, PEOPLE_NOWHERE, None, None).set(true)?;
+    }
+    for rule in people_dump()? {
+        if !rule.attributes.contains(&RuleAttribute::Priority(PEOPLE_NOWHERE)) {
+            delete(rule)?;
+        }
+    }
+    for v6 in [false, true] {
+        people_rule(v6, PEOPLE_MAIN, None, Some(254)).set(true)?;
+    }
+    Ok(())
+}
+
+/// A person's IPv4 `from` by the whole main table (its default route too): made, or with `!there`
+/// taken away.
+pub fn people_internet(from: Ipv4Addr, there: bool) -> Result<()> {
+    people_rule(false, PEOPLE_INTERNET, Some(from), Some(254)).set(there)
+}
+
+/// Take all of the people's rules away.
+pub fn people_release() -> Result<()> {
+    people_dump()?.into_iter().try_for_each(delete)
+}
+
+fn delete(rule: RuleMessage) -> Result<()> {
+    match ask_route(RouteNetlinkMessage::DelRule(rule), NLM_F_ACK) {
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        gone => gone.map(drop),
+    }
 }
 
 /// Whether the kernel has the rules that send nowhere what `link` sends, for both families.
@@ -302,6 +395,7 @@ fn from_tunnel(number: u16, address: Ipv4Addr) -> [Rule<'static>; 2] {
         from: Some(address),
         table,
         owner,
+        suppress: None,
     };
     [
         rule(FROM_TUNNEL, Some(table(number)), None),
@@ -360,9 +454,14 @@ pub fn remove(number: u16, address: Option<Ipv4Addr>) -> Result<()> {
 /// Forget every connection a pod of an exit started (they are tracked with [`MARK`]): one
 /// that went by a tunnel since changed or gone does not go on by what is there now.
 pub fn forget() -> Result<()> {
+    forget_marked(MARK)
+}
+
+/// Forget every connection tracked with exactly this `mark` (a person's: `0x6b79_0000` and its offset).
+pub fn forget_marked(mark: u32) -> Result<()> {
     // (Of nfnetlink's conntrack (1), delete (2), with no tuple: all of those whose mark is it.)
     let mut message = Vec::new();
-    let attributes = [crate::pod::number(8, MARK), crate::pod::number(21, u32::MAX)].concat();
+    let attributes = [crate::pod::number(8, mark), crate::pod::number(21, u32::MAX)].concat();
     message.extend((attributes.len() as u32 + 20).to_ne_bytes());
     message.extend(0x102u16.to_ne_bytes());
     message.extend(5u16.to_ne_bytes()); // a request, acknowledged
