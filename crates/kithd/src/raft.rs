@@ -971,13 +971,15 @@ impl Shared {
                 Forward::Wait(wait, format!("the leader at {at} asked to wait {} s", wait.as_secs()))
             }
             Ok(reply) => {
-                if let Ok(Some((reply, index))) = reply.json::<Option<(Reply, u64)>>().await {
+                let status = reply.status();
+                let said = reply.text().await.unwrap_or_default();
+                let answer = answered(status, &said, at);
+                if let Forward::Done(_, index) = &answer {
                     // What a client writes through this node, it can read from this node.
                     let caught_up = self.raft.wait(Some(PATIENCE));
-                    let _ = caught_up.applied_index_at_least(Some(index), "own write").await;
-                    return Forward::Done(reply, index);
+                    let _ = caught_up.applied_index_at_least(Some(*index), "own write").await;
                 }
-                Forward::Again(None)
+                answer
             }
             // Never reached it (or refused it, which is the same to the change): nothing
             // happened, and asking again is safe.
@@ -1080,6 +1082,20 @@ enum Forward {
     Again(Option<String>),
     /// Refused for now (a worker that wrote too much): ask again after this long.
     Wait(Duration, String),
+}
+
+/// What a leader's answer (not a 429) to a forwarded write is: its reply and index; a refusal
+/// of this node itself (401, 403: asking again gets the same, and the leader's words say why) at
+/// once; and for anything else (`null`: not the leader any more; a 5xx) ask again.
+fn answered(status: reqwest::StatusCode, said: &str, at: &str) -> Forward {
+    if matches!(status.as_u16(), 401 | 403) {
+        let said: String = said.chars().take(300).collect();
+        return Forward::Failed(Error::Invalid(format!("the leader at {at} refused ({status}): {said}")));
+    }
+    match serde_json::from_str::<Option<(Reply, u64)>>(said) {
+        Ok(Some((reply, index))) => Forward::Done(reply, index),
+        _ => Forward::Again(None),
+    }
 }
 
 /// The change was not taken in time; `refused` is why the last leader called was not reached.
@@ -1432,6 +1448,26 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leader's refusal of this node (401, 403) ends a forwarded write at once with the leader's
+    /// words; a 5xx or a `null` is asked again; a reply and an index are the answer.
+    #[test]
+    fn a_leaders_refusal_is_not_asked_again() {
+        use reqwest::StatusCode as S;
+        for status in [S::UNAUTHORIZED, S::FORBIDDEN] {
+            match answered(status, "evicted: join again", "10.0.0.1:1") {
+                Forward::Failed(Error::Invalid(why)) => {
+                    assert!(why.contains("evicted: join again") && why.contains(status.as_str()), "{why}")
+                }
+                _ => panic!("{status} is not refused at once"),
+            }
+        }
+        for (status, said) in [(S::SERVICE_UNAVAILABLE, "overloaded"), (S::OK, "null"), (S::BAD_GATEWAY, "")] {
+            assert!(matches!(answered(status, said, "a"), Forward::Again(None)), "{status} {said}");
+        }
+        let said = serde_json::to_string(&Some((Reply::Err(Error::NotFound("x".into())), 7u64))).unwrap();
+        assert!(matches!(answered(S::OK, &said, "a"), Forward::Done(Err(Error::NotFound(_)), 7)));
+    }
 
     /// A worker is held to one barrier a second, and the map keeps no name whose second is over
     /// (a deleted worker's, or one of many names that came and went).

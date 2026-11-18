@@ -1136,9 +1136,9 @@ fn applied_what_it_holds(
 }
 
 /// A write that changes nothing, put in the log through the leader (a follower sends it on), and
-/// waited for here: the leader's log up to it is this node's store, so a delete committed there
-/// is in it. The leader's own read index is not asked of a follower; this is what stands for it.
-/// The index it is at.
+/// waited for here, giving the index it is at: the leader's log up to it is this node's store, so a
+/// delete committed there is in it. The leader's own read index is not asked of a follower; this
+/// is what stands for it. A leader that refuses this node says so at once, in the error.
 async fn leader_barrier(shared: &Shared) -> Result<u64, kith_api::store::Error> {
     let unsaid = |e: &dyn std::fmt::Display| kith_api::store::Error::Io(format!("the leader did not confirm: {e}"));
     let barrier = shared.write_at(Command::Patch { statuses: vec![] });
