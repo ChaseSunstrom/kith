@@ -20,6 +20,8 @@ pub struct Held {
     /// The seat it has the directory of (a workload's: that of the first claim on one), and
     /// whether as a client: to read, and with none of the seat's devices.
     pub seat: Option<(String, bool)>,
+    /// A workload's: the vram bytes its shares ask of each Device it counts them on.
+    pub shares: BTreeMap<String, u64>,
 }
 
 /// What a workload is given on its node: device nodes, and a seat's directory.
@@ -31,6 +33,8 @@ pub struct Granted {
     /// Each Device it draws on here, and its class: the node's own policy may hand out none
     /// of a class, and what holds one is then not run (`policy::Policy::device`).
     pub classes: Vec<(String, DeviceClass)>,
+    /// The dmem cgroup's regions its shares are a ceiling on, and the bytes of each.
+    pub dmem: Vec<(String, u64)>,
 }
 
 /// The answer for every workload that names claims (its key), and every `DeviceClaim` (its key).
@@ -79,6 +83,13 @@ fn vram_of(store: &Store, device: &str) -> Option<u64> {
         .get("vram")?
         .parse()
         .ok()
+}
+
+/// The region of the dmem cgroup a `Device` is, where its driver gives one: its `dmem` label.
+/// (One name, as the kernel writes them: a label written by hand is no more lines of `dmem.max`.)
+fn dmem_of(store: &Store, device: &str) -> Option<String> {
+    let region = store.get(&format!("Device/{device}"))?.metadata.labels.get("dmem")?;
+    (!region.is_empty() && !region.contains(char::is_whitespace)).then(|| region.clone())
 }
 
 /// The label on a Device or Seat that names the namespaces it is given to, comma-separated.
@@ -172,6 +183,7 @@ fn resolve_one(store: &Store, namespace: &str, claim: &DeviceClaimSpec) -> Resul
         node: list(&nodes),
         devices,
         seat: claim.seat.clone().map(|seat| (seat, client)),
+        shares: BTreeMap::new(),
     })
 }
 
@@ -400,6 +412,7 @@ pub fn resolve(store: &Store) -> Claims {
                     node,
                     devices: devices.into_iter().collect(),
                     seat,
+                    shares: own.clone(),
                 })
             })();
             // A granted workload that cannot be admitted gives its grant back, and the round is run again.
@@ -443,7 +456,8 @@ pub fn resolve(store: &Store) -> Claims {
                     let counts = held.devices.iter().map(|device| {
                         let counted = match vram_of(store, device) {
                             Some(of) => {
-                                json!({ "counted": true, "asked": asked.get(device).copied().unwrap_or(0), "of": of })
+                                let asked = asked.get(device).copied().unwrap_or(0);
+                                json!({ "counted": true, "asked": asked, "of": of, "enforced": dmem_of(store, device).is_some() })
                             }
                             None => json!({ "counted": false }),
                         };
@@ -552,8 +566,22 @@ pub fn granted(store: &Store, me: &str, sys: &Path) -> BTreeMap<String, Granted>
                 paths.insert(PathBuf::from(path));
             }
         }
+        // (A share is a ceiling where the kernel keeps one: on the Device's dmem region.)
+        let dmem = held
+            .shares
+            .iter()
+            .filter_map(|(name, bytes)| Some((dmem_of(store, name)?, *bytes)));
+        let dmem = dmem.collect();
         let (devices, seat) = (paths.into_iter().collect(), held.seat);
-        granted.insert(key, Granted { devices, seat, classes });
+        granted.insert(
+            key,
+            Granted {
+                devices,
+                seat,
+                classes,
+                dmem,
+            },
+        );
     }
     granted
 }
@@ -1284,7 +1312,7 @@ spec: { node: b, devices: [b-usb0] }
         assert_eq!(status["holders"], json!(["Workload/default/a1", "Workload/default/a2"]));
         assert_eq!(
             status["share"],
-            json!({ "a-vram": { "counted": true, "asked": 1073741824, "of": 1073741824 } })
+            json!({ "a-vram": { "counted": true, "asked": 1073741824, "of": 1073741824, "enforced": false } })
         );
         // A holder that goes frees its share, and the one that waited has its turn.
         store.delete("Workload/default/a1").unwrap();
@@ -1379,6 +1407,51 @@ spec: { node: b, devices: [b-usb0] }
             status("odd")["holders"],
             json!(["Workload/default/b3", "Workload/default/b4"])
         );
+    }
+
+    /// A share of a Device whose driver gives the dmem cgroup a region is that region's ceiling in
+    /// the holder's cgroup (the sum of its shares there), and the status says it is enforced.
+    #[test]
+    fn a_share_is_the_dmem_ceiling_of_a_device_with_a_region() {
+        let source = [
+            card("a-held", ", vram: '1073741824', dmem: 'drm/0000:04:00.0/vram'"),
+            card("a-bare", ", vram: '1073741824'"),
+            claim("held", "{ device: a-held, access: shared, share: { vram: 256Mi } }"),
+            claim("more", "{ device: a-held, access: shared, share: { vram: 256Mi } }"),
+            claim("bare", "{ device: a-bare, access: shared, share: { vram: 256Mi } }"),
+            workload("w", "[held, more, bare]"),
+        ]
+        .concat();
+        let mut store = store(&source);
+        settle(&mut store);
+        let none = std::env::temp_dir().join("kith-claims-dmem-none");
+        let dmem = &granted(&store, "a", &none)["Workload/default/w"].dmem;
+        assert_eq!(*dmem, [("drm/0000:04:00.0/vram".to_string(), 536870912)]);
+        let status = |name: &str| {
+            store
+                .get(&format!("DeviceClaim/default/{name}"))
+                .unwrap()
+                .status
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(status("held")["share"]["a-held"]["enforced"], json!(true));
+        assert_eq!(status("bare")["share"]["a-bare"]["enforced"], json!(false));
+        // A region named by hand with a second line in it is none.
+        let odd = card(
+            "a-held",
+            ", vram: '1073741824', dmem: \"drm/x/vram 1\\nnvidia/y/vidmem\"",
+        );
+        let mut store = self::store(
+            &[
+                odd,
+                claim("held", "{ device: a-held, access: shared, share: { vram: 256Mi } }"),
+                workload("w", "[held]"),
+            ]
+            .concat(),
+        );
+        settle(&mut store);
+        assert!(granted(&store, "a", &none)["Workload/default/w"].dmem.is_empty());
     }
 
     #[test]

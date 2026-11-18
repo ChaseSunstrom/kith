@@ -1092,7 +1092,8 @@ spec! {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub access: Option<Access>,
         /// With `access: shared`: the vram the claim asks for on each Device it holds, which the
-        /// scheduler counts against the Device's `vram` label. Nothing enforces it (see the README).
+        /// scheduler counts against the Device's `vram` label, and a ceiling in each container's
+        /// cgroup where the Device has a `dmem` region (docs/guide/hardware.md).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub share: Option<DeviceShare>,
         /// With an exclusive claim: the workload (`Workload/NAME` or `Job/NAME`, of this claim's

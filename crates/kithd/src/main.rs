@@ -762,6 +762,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let _ = std::fs::remove_file(&socket);
     }
     let mut runtime = kith_runtime::Runtime::new(state.join("runtime"));
+    let dmem = runtime.as_ref().is_ok_and(|runtime| runtime.gives_dmem());
     if let Some(said) = runtime.as_ref().ok().and_then(|runtime| runtime.cgroup_problem()) {
         eprintln!("kithd: {said}");
     }
@@ -974,7 +975,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                     crypt::keep(shared.clone(), config, record, opened, stopping.clone()).await;
                 }
             };
-            let hardware = devices::run(shared.clone(), stopping.clone());
+            let hardware = devices::run(shared.clone(), stopping.clone(), dmem);
             let crons = cron::run(shared.clone(), stopping.clone());
             let exits = exits::run(shared.clone(), stopping.clone());
             let published = pods::publish(shared.clone(), own_ports(&args), stopping.clone());

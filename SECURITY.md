@@ -164,6 +164,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   a device does once open, and nothing of an `exec` unit, which is a process of the host.
   Where kithd is not root there is none: the user namespace a container is in there
   makes no device nodes.
+  A GPU share (`share: { vram }`) is a ceiling only where the Device has a `dmem` region
+  and kithd can hand the dmem controller down: the kernel then keeps the container's use
+  of that GPU's memory under the share (`dmem.max`). Elsewhere it is a count the scheduler
+  keeps, and a container that takes more is not stopped.
   A device node a unit was given (an exclusive Device's, most of all) is not given to another
   unit while the unit that had it still runs: a unit whose stop failed with processes left
   keeps its devices and its name, its stop is retried at a later pass and no more often than

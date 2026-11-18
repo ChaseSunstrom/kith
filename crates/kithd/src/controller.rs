@@ -96,6 +96,8 @@ struct Slot {
     notes: BTreeMap<String, String>,
     /// The device nodes its DeviceClaims give it (a changed set replaces the unit, like a changed value).
     devices: Vec<PathBuf>,
+    /// The dmem regions its GPU shares are a ceiling on, and the bytes of each (`claims::Granted`).
+    dmem: Vec<(String, u64)>,
     /// The seat whose directory it has at `/run/seat`, and whether to read only.
     seat: Option<(String, bool)>,
     /// What its containers mount: the Volume's directory, where in the container, and read-only
@@ -194,6 +196,11 @@ fn mark(slot: &Slot) -> String {
             slot.env.as_ref().ok()
         )
     );
+    // (A unit with no GPU share has the mark it had before shares were ceilings.)
+    let what = match slot.dmem.is_empty() {
+        true => what,
+        false => format!("{what}{:?}", slot.dmem),
+    };
     sha2::Sha256::digest(what.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -816,7 +823,12 @@ impl Controller {
             // ponytail: a NodeWorkload cannot claim (a copy on every node, a device on one), and
             // alone, a node has no name for the Devices to name: both run nothing, and say so.
             let claimed = !template.device_claims.is_empty();
-            let crate::claims::Granted { devices, seat, classes } = granted.get(&key).cloned().unwrap_or_default();
+            let crate::claims::Granted {
+                devices,
+                seat,
+                classes,
+                dmem,
+            } = granted.get(&key).cloned().unwrap_or_default();
             let allowed = !claimed || (resource.kind != "NodeWorkload" && granted.contains_key(&key));
             // What this node's own policy refuses of it is not run here, whoever wrote it and
             // whatever the store says (docs/adr-privilege.md): said where a replica is this
@@ -1015,6 +1027,7 @@ impl Controller {
                             exit: template.exit.clone().filter(|_| template.pod == Some(true)),
                             notes: template.annotations.clone(),
                             devices: devices.clone(),
+                            dmem: dmem.clone(),
                             seat: seat.clone(),
                             volumes: mounts_of(unit, &volumes),
                             files: files.clone(),
@@ -1112,6 +1125,7 @@ impl Controller {
                 || new.notes != slot.notes
                 || new.policy != slot.policy
                 || devices
+                || new.dmem != slot.dmem
                 || new.seat != slot.seat
                 || new.volumes != slot.volumes
                 || new_values
@@ -2306,6 +2320,7 @@ async fn start(
             .filter(|path| !path.starts_with(crate::vm::PCI))
             .cloned()
             .collect(),
+        dmem: slot.dmem.clone(),
         // A NodeWorkload is the node's own: it keeps the node's users.
         host_users: slot.owner.starts_with("NodeWorkload/"),
         project,
@@ -2914,6 +2929,7 @@ mod tests {
             exit: None,
             notes: BTreeMap::new(),
             devices: devices.iter().map(PathBuf::from).collect(),
+            dmem: Vec::new(),
             seat: None,
             volumes: Vec::new(),
             files: Ok(Vec::new()),
@@ -2952,6 +2968,10 @@ mod tests {
             slot_of("w", &["/dev/b"], "c"),
             Slot {
                 env: Ok(vec![("A".into(), "1".into())]),
+                ..slot_of("w", &["/dev/a"], "c")
+            },
+            Slot {
+                dmem: vec![("drm/0000:04:00.0/vram".into(), 1 << 28)],
                 ..slot_of("w", &["/dev/a"], "c")
             },
             Slot {

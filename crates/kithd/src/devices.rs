@@ -23,7 +23,7 @@ pub(crate) const ABSENT: &str = "kith.dev/absent";
 
 /// Every label discovery writes. A worker's Device may carry these and no other
 /// (`crate::worker`): one added here is one a control node takes from a worker.
-pub(crate) const LABELS: [&str; 13] = [
+pub(crate) const LABELS: [&str; 14] = [
     DISCOVERED,
     ABSENT,
     "kith.dev/node",
@@ -33,6 +33,7 @@ pub(crate) const LABELS: [&str; 13] = [
     "pci",
     "driver",
     "vram",
+    "dmem",
     "function",
     "identity",
     "serial",
@@ -71,6 +72,23 @@ fn names(dir: &Path) -> Vec<String> {
 fn read(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     Some(text.trim().to_string()).filter(|text| !text.is_empty())
+}
+
+/// The region of the dmem cgroup controller that is the memory of the PCI device at `bus`, and
+/// its bytes, as `dmem.capacity` lists it (`drm/0000:03:00.0/vram 2147483648`; NVIDIA's driver
+/// writes the domain with 8 digits). The first, where a driver gives more.
+fn dmem(sys: &Path, bus: &str) -> Option<(String, String)> {
+    let at = |address: &str| {
+        let (domain, rest) = address.split_once(':')?;
+        Some((u32::from_str_radix(domain, 16).ok()?, rest.to_string()))
+    };
+    let want = at(bus)?;
+    let capacity = std::fs::read_to_string(sys.join("fs/cgroup/dmem.capacity")).ok()?;
+    capacity.lines().find_map(|line| {
+        let (region, bytes) = line.split_once(' ')?;
+        let address = region.split('/').nth(1)?;
+        (at(address)? == want && bytes.trim().parse::<u64>().is_ok()).then(|| (region.into(), bytes.trim().into()))
+    })
 }
 
 /// A PCI or USB id as the kernel writes it (`0x1002`) without the `0x`, lower case.
@@ -153,6 +171,7 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
             let place = std::fs::canonicalize(&device).ok();
             let place = place.and_then(|real| Some(real.file_name()?.to_str()?.to_string()));
             labels.extend(place.clone().filter(|bus| is_pci_address(bus)).map(|bus| ("pci", bus)));
+            let region = place.as_deref().and_then(|bus| dmem(sys, bus));
             if let Some(place) = place.filter(|_| driver.as_deref() == Some("nvidia")) {
                 let (own, mut nodes) = nvidia(proc, dev, &place);
                 nodes.extend(own);
@@ -161,7 +180,9 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
             }
             labels.extend(driver.map(|driver| ("driver", driver)));
             let vram = read(&device.join("mem_info_vram_total")).filter(|bytes| bytes.parse::<u64>().is_ok());
+            let vram = vram.or(region.as_ref().map(|(_, bytes)| bytes.clone()));
             labels.extend(vram.map(|bytes| ("vram", bytes)));
+            labels.extend(region.map(|(region, _)| ("dmem", region)));
             found.push(("gpu", name.clone(), Some(format!("/dev/dri/{name}")), labels));
         } else if card.split_once('-').is_some_and(|(n, _)| number(n, "").is_some())
             && read(&dir.join("status")).as_deref() == Some("connected")
@@ -501,7 +522,9 @@ fn held_lines(said: &mut Vec<Held>, held: Vec<Held>) -> Vec<String> {
 }
 
 /// Keep the store's `Device`s and `Seat` of this node as `/sys` says, until stopped.
-pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
+/// `dmem`: whether this node's containers' cgroups have the dmem controller. Where they have not,
+/// no Device of its says it has a region: a share on it is no ceiling here.
+pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>, dmem: bool) {
     use kith_store::Command;
     // (Alone, in agent mode, a node has no name to put on them.)
     let Some(cluster) = &shared.cluster else { return };
@@ -518,7 +541,12 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
             _ = stopping.changed() => break,
         }
         wait = EVERY;
-        let found = scan(sys, me);
+        let mut found = scan(sys, me);
+        if !dmem {
+            found
+                .iter_mut()
+                .for_each(|device| drop(device.metadata.labels.remove("dmem")));
+        }
         let (resources, gone, held) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             changes(&state.store, me, &found)
@@ -809,6 +837,48 @@ mod tests {
         assert_eq!(
             get(&found, "n1-pci-0000-02-00.0").metadata.labels["pci"],
             "0000:02:00.0"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A card whose driver gives the dmem cgroup a region of its memory carries the region as
+    /// the `dmem` label (by its PCI address: NVIDIA's writes the domain with 8 digits), and the
+    /// region's size as its `vram` where the driver says no other.
+    #[test]
+    fn a_card_with_a_dmem_region_names_it() {
+        let root = tree("dmem");
+        for (card, address) in [
+            ("card0", "0000:04:00.0"),
+            ("card1", "0000:01:00.0"),
+            ("card2", "0000:05:00.0"),
+        ] {
+            put(&root, &format!("bus/pci/devices/{address}/vendor"), "0x10de\n");
+            std::fs::create_dir_all(root.join("class/drm").join(card)).unwrap();
+            let link = root.join("class/drm").join(card).join("device");
+            std::os::unix::fs::symlink(format!("../../../bus/pci/devices/{address}"), link).unwrap();
+        }
+        put(
+            &root,
+            "bus/pci/devices/0000:04:00.0/mem_info_vram_total",
+            "4294967296\n",
+        );
+        put(
+            &root,
+            "fs/cgroup/dmem.capacity",
+            "drm/0000:04:00.0/vram 2147483648\nnvidia/00000000:01:00.0/vidmem 17094934528\n",
+        );
+        let found = scan_in(&root, &root.join("proc"), &root.join("dev"), "n1");
+        let label = |name: &str, label: &str| get(&found, name).metadata.labels.get(label).cloned();
+        assert_eq!(label("n1-gpu-card0", "dmem").as_deref(), Some("drm/0000:04:00.0/vram"));
+        assert_eq!(label("n1-gpu-card0", "vram").as_deref(), Some("4294967296"));
+        assert_eq!(
+            label("n1-gpu-card1", "dmem").as_deref(),
+            Some("nvidia/00000000:01:00.0/vidmem")
+        );
+        assert_eq!(label("n1-gpu-card1", "vram").as_deref(), Some("17094934528"));
+        assert_eq!(
+            (label("n1-gpu-card2", "dmem"), label("n1-gpu-card2", "vram")),
+            (None, None)
         );
         let _ = std::fs::remove_dir_all(&root);
     }

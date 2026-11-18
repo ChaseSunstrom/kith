@@ -80,6 +80,10 @@ pub struct Unit {
     /// Host device nodes the container is given (and allowed in its cgroup), e.g. `/dev/dri/card0`.
     /// An exec unit ignores them: it sees all of `/dev` already.
     pub devices: Vec<PathBuf>,
+    /// Ceilings on GPU memory: a region of the dmem cgroup controller (`drm/0000:03:00.0/vram`)
+    /// and the bytes the container may have of it. Where this kithd's cgroups have no dmem
+    /// controller to give, there is none, and a line says so.
+    pub dmem: Vec<(String, u64)>,
     /// Host directories bound into the container. An exec unit gets none: it has no mount namespace.
     pub mounts: Vec<Mount>,
     /// The user (and group) the container's process is: `None` is the image's own, or 65534
@@ -434,6 +438,12 @@ impl Runtime {
         })
     }
 
+    /// Whether the cgroups of its containers have the dmem controller (it is handed down to
+    /// them here, as far as this process may): where they have not, a GPU share is no ceiling.
+    pub fn gives_dmem(&self) -> bool {
+        hand_down_dmem(Path::new("/sys/fs/cgroup"), &self.cgroup_parent)
+    }
+
     /// Why no container can start here, said once at start; `None` where one can (root's
     /// kithd, on kith OS, makes `/kith` itself and is not asked).
     pub fn cgroup_problem(&self) -> Option<String> {
@@ -650,6 +660,15 @@ impl Runtime {
                 volume.container
             ));
         }
+        let mut limited = std::borrow::Cow::Borrowed(unit);
+        if !unit.dmem.is_empty() && !hand_down_dmem(Path::new("/sys/fs/cgroup"), &self.cgroup_parent) {
+            eprintln!(
+                "kith: container `{id}`: its GPU share is not a ceiling here: {}'s cgroup has no dmem controller to give",
+                self.cgroup_parent
+            );
+            limited.to_mut().dmem.clear();
+        }
+        let unit = &*limited;
         let spec = spec_shifted(id, image, unit, &cgroup, &bundle, (uid, gid), shift).ctx(&what)?;
         // (The spec names a user only where kithd is root: see `spec_shifted`.)
         let user = spec.process().as_ref().map(|process| process.user());
@@ -1907,7 +1926,36 @@ fn resources(unit: &Unit) -> std::result::Result<LinuxResources, Box<dyn std::er
         let quota = i64::try_from(millis.saturating_mul(100))?;
         resources = resources.cpu(LinuxCpuBuilder::default().quota(quota).period(100_000u64).build()?);
     }
+    if !unit.dmem.is_empty() {
+        let lines: Vec<String> = unit
+            .dmem
+            .iter()
+            .map(|(region, bytes)| format!("{region} {bytes}"))
+            .collect();
+        resources = resources.unified(std::collections::HashMap::from([(
+            "dmem.max".to_string(),
+            lines.join("\n"),
+        )]));
+    }
     Ok(resources.build()?)
+}
+
+/// Gives the dmem controller down from `root` (the cgroup mount) to the cgroups made in `parent`,
+/// as far as this process may: whether `parent`'s children have it.
+fn hand_down_dmem(root: &Path, parent: &str) -> bool {
+    // (Root's `/kith` may not be made yet: it is what its first container would make.)
+    let _ = fs::create_dir_all(root.join(parent.trim_start_matches('/')));
+    let mut dir = root.to_path_buf();
+    let parts = Path::new(parent)
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)));
+    for part in std::iter::once(None).chain(parts.map(Some)) {
+        dir.extend(part);
+        // (Refused where it is not ours to give, or a cgroup above has it not: then it is not there.)
+        let _ = fs::write(dir.join("cgroup.subtree_control"), "+dmem");
+    }
+    let given = fs::read_to_string(dir.join("cgroup.subtree_control")).unwrap_or_default();
+    given.split_whitespace().any(|controller| controller == "dmem")
 }
 
 #[cfg(test)]
@@ -1927,6 +1975,37 @@ mod tests {
         // (One that is not: refused only for want of the node, if this machine has none.)
         let err = device_nodes(&[PathBuf::from("/dev/memory")], None).map(|_| ());
         assert!(err.is_err_and(|e| !e.to_string().contains("is given to no pod")));
+    }
+
+    /// A GPU share is a line of the cgroup's `dmem.max` per region, where the parent's cgroup
+    /// gives its children the dmem controller.
+    #[test]
+    fn a_gpu_share_is_a_dmem_max_line() {
+        let unit = Unit {
+            dmem: vec![
+                ("drm/0000:04:00.0/vram".into(), 1 << 28),
+                ("nvidia/00000000:01:00.0/vidmem".into(), 1 << 30),
+            ],
+            ..Unit::default()
+        };
+        let unified = resources(&unit).unwrap().unified().clone().unwrap();
+        assert_eq!(
+            unified["dmem.max"],
+            "drm/0000:04:00.0/vram 268435456\nnvidia/00000000:01:00.0/vidmem 1073741824"
+        );
+        assert!(resources(&Unit::default()).unwrap().unified().is_none());
+        // (Files that cannot be written: as a cgroup's are when it is not ours to change.)
+        let root = std::env::temp_dir().join(format!("kith-dmem-{}", std::process::id()));
+        for (dir, has) in [("", "cpu memory dmem"), ("kith", "cpu dmem"), ("bare", "cpu memory")] {
+            let file = root.join(dir).join("cgroup.subtree_control");
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, has).unwrap();
+            fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o444)).unwrap();
+        }
+        assert!(hand_down_dmem(&root, "/kith"));
+        assert!(!hand_down_dmem(&root, "/bare"));
+        assert!(!hand_down_dmem(&root, "/none"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

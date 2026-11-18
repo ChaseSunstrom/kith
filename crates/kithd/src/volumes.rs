@@ -769,6 +769,7 @@ spec: { node: a, path: tiny, size: 1Gi }
             node: "b".into(),
             devices: vec!["b-gpu".into()],
             seat: None,
+            shares: Default::default(),
         });
         let on_a = found.owners.get("Workload/default/db");
         assert_eq!(

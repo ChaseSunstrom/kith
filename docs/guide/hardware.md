@@ -10,7 +10,8 @@ its `spec` has `node`, `class` and the device node as `path`. The class is `gpu`
 
 - **Labels** (a selector can name them). All: `kith.dev/node`, `class`, `kith.dev/discovered:
   "true"`. GPUs and USB devices also `vendor`, `model`; a GPU `driver` and, where known, `vram`
-  in bytes; inputs and sound cards `model`. An input also `identity`, a hash of its name, port,
+  in bytes, and `dmem`, the region of its memory where its driver gives the kernel's dmem cgroup
+  one and kithd can give its containers the controller (`drm/0000:03:00.0/vram`); inputs and sound cards `model`. An input also `identity`, a hash of its name, port,
   serial and ids: another device behind the same event index is taken from its holder. A USB
   device also `bus`, its port (`1-2`), and `serial`, a hash of its serial where it says one:
   its ids are the stick's own to say, so name one stick by `serial` or `bus` with
@@ -81,8 +82,13 @@ absent") and a selector passes over it.
 
 **A share of a GPU's vram.** A `shared` claim may say `share: { vram: 512Mi }`: what it asks of
 each Device it holds, counted against the Device's `vram` label. A workload's shares add up; one
-that does not fit waits, and its message gives the numbers (`status.share`). **Nothing enforces
-a share: it is cooperative.** Untried: `dmem` cgroups, MPS, MIG partitions.
+that does not fit waits, and its message gives the numbers (`status.share`). On a Device with a
+`dmem` label the share is also a ceiling: each of the workload's containers gets the sum of its
+shares there as `dmem.max` in its cgroup, and the kernel refuses it more of the GPU's memory
+(`status.share.DEVICE.enforced: true`). That is where the driver gives the region (amdgpu, xe,
+NVIDIA's) and kithd may hand the controller down to its containers (root, or a delegation with
+`dmem`; a kithd that cannot gives its Devices no `dmem` label). Elsewhere a share is
+cooperative. Untried: MPS, MIG partitions.
 
 ### An app as a workload of its own, in a session's window
 

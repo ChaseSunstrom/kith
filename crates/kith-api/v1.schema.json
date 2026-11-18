@@ -1911,7 +1911,7 @@
               "type": "null"
             }
           ],
-          "description": "With `access: shared`: the vram the claim asks for on each Device it holds, which the\nscheduler counts against the Device's `vram` label. Nothing enforces it (see the README)."
+          "description": "With `access: shared`: the vram the claim asks for on each Device it holds, which the\nscheduler counts against the Device's `vram` label, and a ceiling in each container's\ncgroup where the Device has a `dmem` region (docs/guide/hardware.md)."
         },
         "holder": {
           "type": [
