@@ -79,7 +79,10 @@ fn check(container: &Container, probe: &Probe) -> Result<Check, String> {
         every: secs(probe.interval_seconds, 10),
         timeout: secs(probe.timeout_seconds, 1),
         threshold: probe.failure_threshold.unwrap_or(3).max(1),
-        start: probe.start_seconds.filter(|s| *s > 0).map(|s| Duration::from_secs(s.into())),
+        start: probe
+            .start_seconds
+            .filter(|s| *s > 0)
+            .map(|s| Duration::from_secs(s.into())),
     })
 }
 
@@ -296,7 +299,10 @@ mod tests {
             "liveness": { "tcp": { "port": 80 }, "startSeconds": 7 },
             "readiness": { "tcp": { "port": 80 } },
         }));
-        assert_eq!(check(&c, c.liveness.as_ref().unwrap()).unwrap().start, Some(Duration::from_secs(7)));
+        assert_eq!(
+            check(&c, c.liveness.as_ref().unwrap()).unwrap().start,
+            Some(Duration::from_secs(7))
+        );
         assert_eq!(check(&c, c.readiness.as_ref().unwrap()).unwrap().start, None);
     }
 
@@ -321,7 +327,9 @@ mod tests {
                 ready: true,
             });
             let changed = Notify::new();
-            let watching = watch_one(None, Some(check(start)), &tx, &changed, true, |health, ok| health.live = ok);
+            let watching = watch_one(None, Some(check(start)), &tx, &changed, true, |health, ok| {
+                health.live = ok
+            });
             let down = tokio::time::timeout(within, health.wait_for(|health| !health.live));
             tokio::select! {
                 _ = watching => unreachable!(),

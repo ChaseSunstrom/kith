@@ -42,7 +42,8 @@ directory is refused.
   only after the new one is ready (and its Service address has moved, 3 seconds), so a
   `replicas: 1` Workload behind a Service is never without a ready replica. A replica that holds
   one of something (a volume, a claimed device, the node's network, or a second copy's worth of
-  CPU or memory the node does not have) stops first instead, and the status says why.
+  CPU or memory the node does not have) stops first instead, and the status says why
+  ([Rolling updates](cluster.md#rolling-updates): a replacement that does not come up, a kithd restarted in the middle).
 - **Shutdown.** On SIGTERM kithd stops what it started, answering requests for 3 seconds at most.
   A second signal ends it at once and its next start stops what was left.
 

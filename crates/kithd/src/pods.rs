@@ -596,7 +596,9 @@ fn published(shared: &Shared) -> (Asking, BTreeMap<(bool, u16), Vec<Asker>>) {
     let pods = shared.pods.lock().expect("nothing panics holding the pods");
     let mut wanted: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for (id, namespace, ports) in asked {
-        let Some(pod) = pods.made.get(pods.live_id(&id)) else { continue };
+        let Some(pod) = pods.made.get(pods.live_id(&id)) else {
+            continue;
+        };
         for port in ports {
             wanted
                 .entry(port)

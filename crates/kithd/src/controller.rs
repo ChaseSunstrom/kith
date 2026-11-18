@@ -264,12 +264,14 @@ struct Controller {
     /// Per (Workload, replica) that has been replaced by surge: which generation is the current
     /// one (false: the ids a replica has always had; true: those with a `b`).
     gens: BTreeMap<(String, u32), bool>,
-    /// Per replica being replaced by surge: `None` while the new generation is not ready, then
-    /// when it became ready (the old one goes `DRAIN` after).
-    surging: BTreeMap<(String, u32), Option<Instant>>,
-    /// Per Workload (alone on a node): why its replicas are stopped before they are replaced.
-    stopped_first: BTreeMap<String, String>,
+    /// Per replica being replaced by surge: when it began, and `None` while the new generation is
+    /// not ready, then when it became ready (the old one goes `DRAIN` after).
+    surging: Surging,
+    /// Per Workload: the replica stopped before it is replaced, and why.
+    stopped_first: BTreeMap<String, (u32, String)>,
 }
+
+type Surging = BTreeMap<(String, u32), (Instant, Option<Instant>)>;
 
 /// How long a look at the node's own hardware is gone by (a walk of `/sys` measured 3.3 ms in
 /// a debug build on a machine with 45 devices). Under `TICK`, so an idle node looks at each
@@ -666,13 +668,21 @@ pub fn pod_of(owner: &str, replica: u32) -> String {
     format!("{prefix}{replica}")
 }
 
+/// The pod whose storage a unit is counted, limited and replaced with: its own, so that the two
+/// generations of a replica being replaced beside the old have each a limit and a project, and what
+/// one writes past its own does not replace the other. (Files and scratch stay the replica's: `pod_of`.)
+fn storage_pod(slot: &Slot) -> String {
+    let own = slot.pod.as_ref().map(|(pod, _)| pod.clone());
+    own.unwrap_or_else(|| pod_of(&slot.owner, slot.replica))
+}
+
 /// Per pod with a container: its storage limit, the sum of what its containers state in
 /// `resources.storage` (`None` where none does).
 fn pod_limits(slots: &BTreeMap<String, Slot>) -> BTreeMap<String, Option<u64>> {
     let mut limits: BTreeMap<String, Option<u64>> = BTreeMap::new();
     for slot in slots.values() {
         let Run::Container(c) = &slot.run else { continue };
-        let limit = limits.entry(pod_of(&slot.owner, slot.replica)).or_default();
+        let limit = limits.entry(storage_pod(slot)).or_default();
         if let Some(bytes) = c.resources.as_ref().and_then(|r| r.storage.as_ref()?.bytes()) {
             *limit = Some(limit.unwrap_or(0).saturating_add(bytes));
         }
@@ -711,7 +721,7 @@ fn is_second(slot: &Slot) -> bool {
 /// once that is ready, or the only one.
 fn live_gen(
     gens: &BTreeMap<(String, u32), bool>,
-    surging: &BTreeMap<(String, u32), Option<Instant>>,
+    surging: &Surging,
     slots: &BTreeMap<String, Slot>,
     owner: &str,
     replica: u32,
@@ -741,6 +751,75 @@ fn drained(ready_since: Option<Instant>) -> bool {
     ready_since.is_some_and(|at| at.elapsed() >= DRAIN)
 }
 
+/// How long a replacement is given to answer, beside the start deadlines of its liveness probes,
+/// before the status says what it lacks.
+const SLOW: Duration = Duration::from_secs(30);
+
+/// Which generation a replica is wanted as when a kithd started again finds both of its generations
+/// running (the old and the one its update began) and does not know which is which: the one that is
+/// wanted as it runs is the new, and the other the old; the second where neither is.
+/// ponytail: a third update begun in the same stretch is not told apart; the old is held either way.
+fn adopted_gen(marks: &BTreeMap<String, String>, wanted: &BTreeMap<String, Slot>, owner: &str, replica: u32) -> bool {
+    let runs = |second: bool| {
+        wanted
+            .iter()
+            .filter(|(_, s)| s.owner == owner && s.replica == replica && is_second(s) == second)
+            .any(|(id, s)| marks.get(id).is_some_and(|was| *was == mark(s)))
+    };
+    !(runs(false) && !runs(true))
+}
+
+/// An adopted unit nothing wants that is the old generation of a replica whose new one has not
+/// answered (and drained) yet: it goes on answering till then.
+fn held(surging: &Surging, wanted: &BTreeMap<String, Slot>, id: &str) -> bool {
+    !wanted.contains_key(id)
+        && surging.iter().any(|((owner, replica), (_, ready_since))| {
+            let rest = id.strip_prefix(&pod_of(owner, *replica));
+            !drained(*ready_since) && rest.is_some_and(|rest| rest.starts_with('_') || rest.starts_with("b_"))
+        })
+}
+
+/// What the status says of the replicas of `owner` being updated, `(replica, words)`: why one was
+/// stopped first, and for one whose replacement does not answer after `SLOW` what that lacks.
+fn update_says(
+    gens: &BTreeMap<(String, u32), bool>,
+    surging: &Surging,
+    slots: &BTreeMap<String, Slot>,
+    owner: &str,
+    stopped: Option<&(u32, String)>,
+) -> Vec<(u32, String)> {
+    let mut says: Vec<(u32, String)> = stopped.cloned().into_iter().collect();
+    for ((_, replica), (began, ready_since)) in surging.iter().filter(|((o, _), _)| o == owner) {
+        let new = gens.get(&(owner.to_string(), *replica)).copied().unwrap_or(false);
+        let units: Vec<&Slot> = slots
+            .values()
+            .filter(|s| s.owner == owner && s.replica == *replica && is_second(s) == new)
+            .collect();
+        let start = units.iter().filter_map(|s| match &s.run {
+            Run::Container(c) => c.liveness.as_ref()?.start_seconds,
+            Run::Exec(_) => None,
+        });
+        let given = SLOW + Duration::from_secs(start.max().unwrap_or(0).into());
+        if ready_since.is_some() || units.is_empty() || began.elapsed() < given {
+            continue;
+        }
+        let lacks: Vec<String> = units
+            .iter()
+            .filter(|s| !s.ready())
+            .map(|s| format!("{}: {}", s.run.name(), s.message.as_deref().unwrap_or(s.state)))
+            .collect();
+        says.push((
+            *replica,
+            format!(
+                "rolling update: replica {replica}'s replacement is not ready after {} s ({}); the old one still answers",
+                began.elapsed().as_secs(),
+                lacks.join(", ")
+            ),
+        ));
+    }
+    says
+}
+
 /// Why a replica of these units (as the update wants them) cannot run twice at once, if it
 /// cannot: what is held once on a node (its network, a device, a volume) or not a container.
 fn no_surge(units: &[&Slot], root: bool) -> Option<String> {
@@ -753,6 +832,12 @@ fn no_surge(units: &[&Slot], root: bool) -> Option<String> {
         "it holds a device or a seat, which a second replica could not have as well"
     } else if units.iter().any(|slot| !slot.volumes.is_empty()) {
         "it mounts a volume, which a second replica could not have as well"
+    } else if units.iter().any(|slot| match &slot.run {
+        Run::Container(c) => c.volume_mounts.iter().any(|m| m.scratch.is_some()),
+        Run::Exec(_) => false,
+    }) {
+        // (A ConfigMap's files are the replica's too, but what is written is what is wanted: ponytail.)
+        "it mounts a scratch, which both its replicas would share"
     } else if units.iter().any(|slot| !matches!(slot.run, Run::Container(_))) {
         "it has a unit that is not a container"
     } else {
@@ -777,13 +862,15 @@ fn asks(slot: &Slot) -> (f64, f64) {
 /// beside what its slots ask for, if it has none. What asks for nothing needs no room, and a
 /// capacity not known (0) is no ground to refuse.
 fn no_room(capacity: (f64, f64), slots: &BTreeMap<String, Slot>, new: &[&Slot]) -> Option<String> {
-    let sum = |units: &mut dyn Iterator<Item = &Slot>| {
-        units.map(asks).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1))
-    };
+    let sum = |units: &mut dyn Iterator<Item = &Slot>| units.map(asks).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
     let extra = sum(&mut new.iter().copied());
     let used = sum(&mut slots.values());
     if capacity.0 > 0.0 && extra.0 > 0.0 && used.0 + extra.0 > capacity.0 {
-        return Some(format!("this node has no CPU to spare for a second replica ({} of {})", used.0 + extra.0, capacity.0));
+        return Some(format!(
+            "this node has no CPU to spare for a second replica ({} of {})",
+            used.0 + extra.0,
+            capacity.0
+        ));
     }
     if capacity.1 > 0.0 && extra.1 > 0.0 && used.1 + extra.1 > capacity.1 {
         return Some(format!(
@@ -914,6 +1001,8 @@ impl Controller {
             )
         };
         let mut wanted: BTreeMap<String, Slot> = BTreeMap::new();
+        // Replicas found running as both generations, which one is wanted is not known yet.
+        let mut undecided: Vec<(String, u32)> = Vec::new();
         // Per Workload, NodeWorkload or Job key: things to say in its status that belong to no unit.
         let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut owners = BTreeSet::new();
@@ -1044,7 +1133,10 @@ impl Controller {
                     // The units a run really has: a name counts once, and only if it can be an id.
                     let first = template.init_containers.iter().map(|c| &c.name);
                     let names: BTreeSet<_> = template.units().chain(first).collect();
-                    let units = names.iter().filter(|name| unit_id(&prefix, 0, false, name).is_ok()).count();
+                    let units = names
+                        .iter()
+                        .filter(|name| unit_id(&prefix, 0, false, name).is_ok())
+                        .count();
                     let (runs, not_before) = self.job_runs(&key, resource, replicas, units).await;
                     // A Job retries whole runs, so a unit that exits stays exited.
                     (runs, not_before, RestartPolicy::Never)
@@ -1111,14 +1203,31 @@ impl Controller {
                 // Which generation of the replica is wanted: the second where a rolling update has
                 // started it beside the old (see `gens`); one found running as it, by a kithd that
                 // was started again, is the one it was.
-                let second = resource.kind == "Workload" && template.pod == Some(true) && {
-                    let ran = format!("{prefix}{replica}b_");
-                    *self
-                        .gens
-                        .entry((key.clone(), replica))
-                        .or_insert_with(|| self.adopted.keys().any(|id| id.starts_with(&ran)))
+                let surges = resource.kind == "Workload" && template.pod == Some(true);
+                let seen = |ran: String| self.adopted.keys().any(|id| id.starts_with(&ran));
+                let second = match self.gens.get(&(key.clone(), replica)) {
+                    Some(second) => Some(*second),
+                    // Found running as both (an update was begun): both are wanted below, and
+                    // `adopted_gen` says which, once the marks are known.
+                    None if surges && seen(format!("{prefix}{replica}b_")) && seen(format!("{prefix}{replica}_")) => {
+                        undecided.push((key.clone(), replica));
+                        None
+                    }
+                    None => Some(surges && seen(format!("{prefix}{replica}b_"))),
                 };
-                for (at, ((unit, env), files)) in units.iter().zip(&envs).zip(&files).enumerate() {
+                if let Some(second) = second.filter(|_| surges) {
+                    self.gens.insert((key.clone(), replica), second);
+                }
+                let tries = second.map_or(vec![false, true], |second| vec![second]);
+                let each = tries.iter().flat_map(|second| {
+                    units
+                        .iter()
+                        .zip(&envs)
+                        .zip(&files)
+                        .enumerate()
+                        .map(move |x| (*second, x))
+                });
+                for (second, (at, ((unit, env), files))) in each {
                     // What a variable says of the replica itself (its address is known when
                     // it starts: `start`).
                     let mut env = env.clone();
@@ -1224,20 +1333,18 @@ impl Controller {
             // Dropped when nothing is wanted under its id: once gone it is not adopted as an exit.
             stop_unit(&mut self.slots, id, !wanted.contains_key(id)).await;
         }
-        // Taken back units nothing wants any more, or wants otherwise, are stopped.
-        let unwanted: Vec<String> = self
+        // A replica found running as both generations by a kithd started again: one is wanted (the
+        // new one) and the other held below, so that a restart mid-update stops neither at once.
+        let marks: BTreeMap<String, String> = self
             .adopted
             .iter()
-            .filter(|(id, (_, was))| wanted.get(*id).is_none_or(|new| &mark(new) != was))
-            .map(|(id, _)| id.clone())
+            .map(|(id, (_, was))| (id.clone(), was.clone()))
             .collect();
-        for id in unwanted {
-            if let Some((handle, _)) = self.adopted.remove(&id) {
-                eprintln!("kithd: {id}: run by an earlier kithd and not wanted as it is: stopped");
-                if let Err(e) = delete(handle).await {
-                    eprintln!("kithd: {id}: {}", e.error);
-                }
-            }
+        for (owner, replica) in undecided {
+            let second = adopted_gen(&marks, &wanted, &owner, replica);
+            wanted.retain(|_, s| !(s.owner == owner && s.replica == replica && is_second(s) != second));
+            self.gens.insert((owner.clone(), replica), second);
+            self.surging.entry((owner, replica)).or_insert((Instant::now(), None));
         }
         let mut stale: Vec<String> = Vec::new();
         let mut again_now = false;
@@ -1249,12 +1356,30 @@ impl Controller {
         let wants = |owner: &str, replica: u32| wanted.values().any(|new| new.owner == owner && new.replica == replica);
         self.surging.retain(|(owner, replica), _| wants(owner, *replica));
         self.gens.retain(|(owner, replica), _| wants(owner, *replica));
-        for ((owner, replica), since) in self.surging.iter_mut() {
+        for ((owner, replica), (_, since)) in self.surging.iter_mut() {
             let new = self.gens.get(&(owner.clone(), *replica)).copied().unwrap_or(false);
             *since = match (second_is_live(&self.slots, owner, *replica, new), *since) {
                 (true, was) => was.or(Some(Instant::now())),
                 (false, _) => None,
             };
+        }
+        // Taken back units nothing wants any more, or wants otherwise, are stopped: but the old
+        // generation of a replica whose update is not over (see `held`) stays till the new one answers.
+        let unwanted: Vec<String> = self
+            .adopted
+            .iter()
+            .filter(|(id, (_, was))| {
+                wanted.get(*id).is_none_or(|new| &mark(new) != was) && !held(&self.surging, &wanted, id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in unwanted {
+            if let Some((handle, _)) = self.adopted.remove(&id) {
+                eprintln!("kithd: {id}: run by an earlier kithd and not wanted as it is: stopped");
+                if let Err(e) = delete(handle).await {
+                    eprintln!("kithd: {id}: {}", e.error);
+                }
+            }
         }
         // Per owner, the replicas with something to replace.
         let mut changed: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
@@ -1282,7 +1407,7 @@ impl Controller {
                 // What a replica's replacement began beside stays until that answers (and its
                 // drain is over): only then is it not wanted.
                 let held = self.surging.get(&(slot.owner.clone(), slot.replica));
-                if !held.is_some_and(|ready_since| !drained(*ready_since)) {
+                if !held.is_some_and(|(_, ready_since)| !drained(*ready_since)) {
                     stale.push(id.clone());
                 }
                 continue;
@@ -1291,7 +1416,7 @@ impl Controller {
                 changed.entry(&slot.owner).or_default().insert(slot.replica);
             }
         }
-        self.surging.retain(|_, ready_since| !drained(*ready_since));
+        self.surging.retain(|_, (_, ready_since)| !drained(*ready_since));
         // What a note on a replica stopped first says is kept while its update goes on.
         self.stopped_first.retain(|owner, _| {
             changed.contains_key(owner.as_str()) || self.slots.values().any(|s| s.owner == *owner && !s.ready())
@@ -1302,7 +1427,11 @@ impl Controller {
             let live = |slot: &Slot| {
                 is_second(slot) == live_gen(&self.gens, &self.surging, &self.slots, &slot.owner, slot.replica)
             };
-            let ready = |replica: u32| mine().filter(|slot| slot.replica == replica && live(slot)).all(Slot::ready);
+            let ready = |replica: u32| {
+                mine()
+                    .filter(|slot| slot.replica == replica && live(slot))
+                    .all(Slot::ready)
+            };
             let rolling = wanted.values().any(|new| new.owner == owner && new.rolling);
             let go: Vec<u32> = if rolling {
                 // One replica at a time: one that is down anyway first; a ready one only
@@ -1313,10 +1442,12 @@ impl Controller {
                     .find(|r| !ready(*r))
                     .or(replicas.first().copied());
                 let pick = pick.expect("a changed owner has a changed replica");
-                let others_ready =
-                    mine().all(|slot| slot.replica == pick || (ready(slot.replica) && !self.surging.contains_key(&(owner.to_string(), slot.replica))));
+                let others_ready = mine().all(|slot| {
+                    slot.replica == pick
+                        || (ready(slot.replica) && !self.surging.contains_key(&(owner.to_string(), slot.replica)))
+                });
                 let (ready_pick, at) = (ready(pick), (owner.to_string(), pick));
-                match (self.surging.get(&at).copied(), ready_pick) {
+                match (self.surging.get(&at).map(|s| s.1), ready_pick) {
                     // Its new replica is not ready, and what it was started as is not what is
                     // wanted now: it is replaced (the old one answers meanwhile).
                     (Some(None), _) | (None, false) => vec![pick],
@@ -1347,17 +1478,15 @@ impl Controller {
                             None => {
                                 let was = self.gens.get(&at).copied().unwrap_or(false);
                                 self.gens.insert(at.clone(), !was);
-                                self.surging.insert(at, None);
+                                self.surging.insert(at, (Instant::now(), None));
                                 // (The new one is wanted from the next pass.)
                                 again_now = true;
                                 Vec::new()
                             }
                             Some(why) => {
                                 let said = format!("rolling update: replica {pick} is stopped first: {why}");
-                                match me {
-                                    None => drop(self.stopped_first.insert(owner.into(), said)),
-                                    Some(_) => eprintln!("kithd: {owner}: {said}"),
-                                }
+                                // (Said in the status on both paths: see the report below.)
+                                self.stopped_first.insert(owner.into(), (pick, said));
                                 vec![pick]
                             }
                         }
@@ -1488,7 +1617,10 @@ impl Controller {
             }
         }
         // What a replica mounted of its own goes with it.
-        let replicas = self.slots.values().map(|slot| pod_of(&slot.owner, slot.replica));
+        let replicas = self
+            .slots
+            .values()
+            .flat_map(|slot| [pod_of(&slot.owner, slot.replica), storage_pod(slot)]);
         let memory = crate::files::memory_dir();
         let bases: Vec<&Path> = [Some(state.as_path()), memory.as_deref()]
             .into_iter()
@@ -1534,7 +1666,9 @@ impl Controller {
         // (Of each generation of a replica: the new one runs its init containers itself.)
         let mut first: BTreeMap<(String, u32, bool), u32> = BTreeMap::new();
         for slot in self.slots.values().filter(|slot| slot.done()) {
-            *first.entry((slot.owner.clone(), slot.replica, is_second(slot))).or_default() += 1;
+            *first
+                .entry((slot.owner.clone(), slot.replica, is_second(slot)))
+                .or_default() += 1;
         }
         // Where a Service looks for a replica: the generation that answers for it.
         let answering: BTreeMap<String, String> = self
@@ -1543,7 +1677,11 @@ impl Controller {
             .filter(|(owner, replica)| live_gen(&self.gens, &self.surging, &self.slots, owner, *replica))
             .map(|(owner, replica)| (pod_of(owner, *replica), pod_id(owner, *replica, true)))
             .collect();
-        shared.pods.lock().expect("nothing panics holding the pods").set_live(answering);
+        shared
+            .pods
+            .lock()
+            .expect("nothing panics holding the pods")
+            .set_live(answering);
         // The units still stopping, with their devices: what is due waits for them (see
         // held_by_leaving). One that starts stopping in this pass is added as it does.
         let mut leaving: Vec<(String, String, Vec<PathBuf>)> = self
@@ -1620,7 +1758,7 @@ impl Controller {
                     continue;
                 }
                 // Its pod's project, its limit set, before anything of it starts.
-                let pod = pod_of(&slot.owner, slot.replica);
+                let pod = storage_pod(slot);
                 let given = match (&slot.run, self.projects.as_mut()) {
                     (Run::Container(_), Some(projects)) => Some(
                         projects
@@ -1738,12 +1876,28 @@ impl Controller {
         let mut statuses = Vec::new();
         let node = shared.members.me();
         for (key, mut notes) in notes {
-            notes.extend(self.stopped_first.get(&key).cloned());
+            // What a rolling update says: in `notes` where one node reports; in a cluster, where a
+            // field only this node says is rewritten by the others, on the units of its replica.
+            let says = update_says(
+                &self.gens,
+                &self.surging,
+                &self.slots,
+                &key,
+                self.stopped_first.get(&key),
+            );
+            if me.is_none() {
+                notes.extend(says.iter().map(|(_, said)| said.clone()));
+            }
             // Of a replica being replaced beside the old, the one that answers.
             let answers = |slot: &&Slot| {
                 is_second(slot) == live_gen(&self.gens, &self.surging, &self.slots, &slot.owner, slot.replica)
             };
-            let mine: Vec<&Slot> = self.slots.values().filter(|slot| slot.owner == key).filter(answers).collect();
+            let mine: Vec<&Slot> = self
+                .slots
+                .values()
+                .filter(|slot| slot.owner == key)
+                .filter(answers)
+                .collect();
             let units: Vec<Value> = mine
                 .iter()
                 .map(|slot| {
@@ -1751,8 +1905,10 @@ impl Controller {
                     if let Some(code) = slot.exit_code {
                         c["exitCode"] = json!(code);
                     }
-                    if let Some(message) = &slot.message {
-                        c["message"] = json!(message);
+                    let said = says.iter().filter(|(r, _)| *r == slot.replica && me.is_some()).map(|(_, said)| said.as_str());
+                    let message: Vec<&str> = slot.message.as_deref().into_iter().chain(said).collect();
+                    if !message.is_empty() {
+                        c["message"] = json!(message.join("; "));
                     }
                     // (The logs of a replica replaced beside the old are those of the new: `log_of`.)
                     if is_second(slot) {
@@ -1995,7 +2151,7 @@ impl Controller {
         self.replacing.retain(|pod, (at, removal)| {
             let runs: Vec<(bool, Instant)> = slots
                 .values()
-                .filter(|slot| slot.handle.is_some() && pod_of(&slot.owner, slot.replica) == *pod)
+                .filter(|slot| slot.handle.is_some() && storage_pod(slot) == *pod)
                 .map(|slot| (slot.leaving, slot.started))
                 .collect();
             if storage::replacing(&runs, *at) {
@@ -2043,9 +2199,8 @@ impl Controller {
                 // A held pod's running units say while it holds all its limit lets it.
                 for pod in &pods {
                     let reached = storage::reached(pod);
-                    let theirs = |slot: &&mut Slot| {
-                        pod_of(&slot.owner, slot.replica) == pod.id && slot.handle.is_some() && !slot.leaving
-                    };
+                    let theirs =
+                        |slot: &&mut Slot| storage_pod(slot) == pod.id && slot.handle.is_some() && !slot.leaving;
                     for slot in self.slots.values_mut().filter(theirs) {
                         let said = slot.message.as_deref();
                         if said.is_none_or(|m| m.starts_with(storage::REACHED)) {
@@ -2074,7 +2229,7 @@ impl Controller {
         let mut pods: BTreeMap<String, (Option<u64>, Paths, Paths, bool)> = BTreeMap::new();
         for slot in self.slots.values() {
             let Run::Container(c) = &slot.run else { continue };
-            let pod = pod_of(&slot.owner, slot.replica);
+            let pod = storage_pod(slot);
             let limit = limits.get(&pod).copied().flatten();
             let (_, roots, cgroups, unconfined) = pods.entry(pod).or_insert((limit, Vec::new(), Vec::new(), false));
             *unconfined |= c.seccomp.as_ref().is_some_and(|s| s.unconfined == Some(true));
@@ -2273,8 +2428,7 @@ impl Controller {
     /// empty root. A pod one of whose units started after the count `began` is left to the next
     /// count; one a unit of which could not be killed is tried again then, its scratch where it is.
     fn replace(&mut self, pod: &str, began: Instant, why: &str, state: &Path) {
-        let mine =
-            |slot: &&mut Slot| pod_of(&slot.owner, slot.replica) == pod && slot.handle.is_some() && !slot.leaving;
+        let mine = |slot: &&mut Slot| storage_pod(slot) == pod && slot.handle.is_some() && !slot.leaving;
         let mut units: Vec<(&String, &mut Slot)> = self.slots.iter_mut().filter(|(_, slot)| mine(slot)).collect();
         let started: Vec<Instant> = units.iter().map(|(_, slot)| slot.started).collect();
         if !storage::replaceable(&started, began) {
@@ -3236,9 +3390,8 @@ mod tests {
         slots.insert(old_id, old);
         let (new_id, new) = surge_unit(true, "pending");
         slots.insert(new_id.clone(), new);
-        let ready = |slots: &BTreeMap<String, Slot>, b: bool| {
-            slots.values().filter(|s| is_second(s) == b).all(Slot::ready)
-        };
+        let ready =
+            |slots: &BTreeMap<String, Slot>, b: bool| slots.values().filter(|s| is_second(s) == b).all(Slot::ready);
         // Starting: the old answers.
         assert!(!second_is_live(&slots, "Workload/x/a", 0, true));
         assert!(ready(&slots, false) && !ready(&slots, true));
@@ -3280,6 +3433,13 @@ mod tests {
         };
         volume.volumes = vec![(dir, "/data".into(), false)];
         assert!(no_surge(&[&volume], true).unwrap().contains("volume"));
+        // A scratch is the replica's, shared by the generations of it.
+        let mut scratch = surge_unit(true, "pending").1;
+        let Run::Container(c) = &mut scratch.run else {
+            unreachable!()
+        };
+        c.volume_mounts = serde_json::from_value(json!([{ "scratch": "work", "path": "/work" }])).unwrap();
+        assert!(no_surge(&[&scratch], true).unwrap().contains("scratch"));
         let mut exec = surge_unit(true, "pending").1;
         exec.run = Run::Exec(serde_json::from_value(json!({ "name": "x", "command": ["true"] })).unwrap());
         assert!(no_surge(&[&exec], true).unwrap().contains("container"));
@@ -3290,7 +3450,9 @@ mod tests {
     fn surge_needs_room_on_the_node() {
         let asking = |cpu: f64, memory: f64| {
             let mut slot = surge_unit(false, "running").1;
-            let Run::Container(c) = &mut slot.run else { unreachable!() };
+            let Run::Container(c) = &mut slot.run else {
+                unreachable!()
+            };
             c.resources = serde_json::from_value(json!({ "cpu": cpu.to_string(), "memory": memory.to_string() })).ok();
             assert!(c.resources.is_some());
             slot
@@ -3304,6 +3466,105 @@ mod tests {
         assert!(no_room((1.0, 8e9), &slots, &[&new]).unwrap().contains("CPU"));
         // A replica that asks for nothing is never held back for room.
         assert_eq!(no_room((0.5, 1e6), &slots, &[&surge_unit(true, "pending").1]), None);
+    }
+
+    /// A kithd started again in the middle of an update finds both generations of a replica running
+    /// and does not know which began the update: the one that is wanted as it runs is the new one
+    /// (or the second, where neither is), and the other is held until that answers: it is the
+    /// replica's only answer meanwhile. (The reconcile pass takes these two as given.)
+    #[test]
+    fn surge_after_a_restart_holds_the_old_generation() {
+        let owner = "Workload/x/a";
+        let mut wanted = BTreeMap::new();
+        let (id_a, a) = surge_unit(false, "pending");
+        let (id_b, b) = surge_unit(true, "pending");
+        let (mark_a, mark_b) = (mark(&a), mark(&b));
+        wanted.insert(id_a.clone(), a);
+        wanted.insert(id_b.clone(), b);
+        let adopted = |a: &str, b: &str| BTreeMap::from([(id_a.clone(), a.to_string()), (id_b.clone(), b.to_string())]);
+        // The first update: the original is the old one, the second generation what is wanted.
+        assert!(adopted_gen(&adopted("v1", &mark_b), &wanted, owner, 0));
+        // The second: the second generation is the old one, the first what is wanted.
+        assert!(!adopted_gen(&adopted(&mark_a, "v2"), &wanted, owner, 0));
+        // Neither is what is wanted: the second.
+        assert!(adopted_gen(&adopted("v3", "v2"), &wanted, owner, 0));
+        // (Another replica is none of these: neither is wanted.)
+        assert!(adopted_gen(&adopted(&mark_a, "v2"), &wanted, owner, 1));
+        // What is held: the units nothing wants, of a replica whose update is not over.
+        let began = Instant::now();
+        let surging = BTreeMap::from([((owner.to_string(), 0), (began, None))]);
+        wanted.remove(&id_a);
+        assert!(held(&surging, &wanted, &id_a));
+        assert!(!held(&surging, &wanted, &id_b), "what is wanted is not held");
+        assert!(!held(&surging, &wanted, "w_x_a_1_app") && !held(&surging, &wanted, "w_x_a_10_app"));
+        assert!(!held(&BTreeMap::new(), &wanted, &id_a));
+        let drained_since = BTreeMap::from([((owner.to_string(), 0), (began, Some(Instant::now() - DRAIN)))]);
+        assert!(
+            !held(&drained_since, &wanted, &id_a),
+            "once the new one has answered a while"
+        );
+        let ready_now = BTreeMap::from([((owner.to_string(), 0), (began, Some(Instant::now())))]);
+        assert!(held(&ready_now, &wanted, &id_a), "and while the drain goes on");
+    }
+
+    /// What the status says of a replica mid-update: why it was stopped first, and, once its
+    /// replacement has not answered for a while, the replacement's own words (the old keeps answering).
+    #[test]
+    fn surge_says_why_it_stopped_first_and_what_the_new_one_lacks() {
+        let owner = "Workload/x/a";
+        let (id_old, old) = surge_unit(false, "running");
+        let (id_new, mut new) = surge_unit(true, "pending");
+        new.message = Some("pulling img: no route to host".into());
+        let slots = BTreeMap::from([(id_old, old), (id_new, new)]);
+        let (gens, long_ago) = (
+            BTreeMap::from([((owner.to_string(), 0), true)]),
+            Instant::now() - SLOW * 2,
+        );
+        let says = |surging: &BTreeMap<(String, u32), (Instant, Option<Instant>)>, stopped: Option<&(u32, String)>| {
+            update_says(&gens, surging, &slots, owner, stopped)
+        };
+        // Just begun: nothing to say yet.
+        let fresh = BTreeMap::from([((owner.to_string(), 0), (Instant::now(), None))]);
+        assert!(says(&fresh, None).is_empty());
+        // Not ready after a while: what it is, in its own words.
+        let slow = BTreeMap::from([((owner.to_string(), 0), (long_ago, None))]);
+        let said = says(&slow, None);
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0].0, 0);
+        assert!(
+            said[0].1.contains("no route to host") && said[0].1.contains("still answers"),
+            "{said:?}"
+        );
+        // Ready (and draining): all is well.
+        let ready = BTreeMap::from([((owner.to_string(), 0), (long_ago, Some(Instant::now())))]);
+        assert!(says(&ready, None).is_empty());
+        // A replica stopped first says why.
+        let first = (
+            0,
+            "rolling update: replica 0 is stopped first: it mounts a volume".to_string(),
+        );
+        assert_eq!(says(&BTreeMap::new(), Some(&first)), vec![first.clone()]);
+    }
+
+    /// Each generation of a pod has its own storage: its limit is its own, as it is its project, and
+    /// what one writes past it does not replace the other.
+    #[test]
+    fn surge_counts_the_storage_of_each_generation_apart() {
+        let stored = |b: bool, bytes: &str| {
+            let (id, mut slot) = surge_unit(b, "running");
+            let Run::Container(c) = &mut slot.run else {
+                unreachable!()
+            };
+            c.resources = serde_json::from_value(json!({ "storage": bytes })).ok();
+            assert!(c.resources.is_some());
+            (id, slot)
+        };
+        let slots = BTreeMap::from([stored(false, "1000"), stored(true, "1000")]);
+        let limits = pod_limits(&slots);
+        assert_eq!(limits.len(), 2, "{limits:?}");
+        assert!(limits.values().all(|limit| *limit == Some(1000)), "{limits:?}");
+        assert_eq!(storage_pod(&slots["w_x_a_0_app"]), pod_of("Workload/x/a", 0));
+        assert_ne!(storage_pod(&slots["w_x_a_0b_app"]), pod_of("Workload/x/a", 0));
     }
 
     /// A unit is taken back by the slot that would start it only when its mark is the slot's:

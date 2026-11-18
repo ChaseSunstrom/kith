@@ -162,6 +162,36 @@ fn session_example_carries_the_client_settings() {
     assert_eq!(find("DeviceClaim/desktop/desk-apps")["access"], json!("client"));
 }
 
+/// A liveness probe's `startSeconds` is on the wire as that name, a whole number, and is kept
+/// through the typed read: it is not `start_seconds` or Kubernetes' `initialDelaySeconds`.
+#[test]
+fn a_probe_has_start_seconds_on_the_wire() {
+    let probe = |field: &str| {
+        workload(&format!(
+            "        liveness:\n          tcp: {{ port: 80 }}\n          {field}\n"
+        ))
+    };
+    let r = one(&probe("startSeconds: 45"));
+    assert_eq!(
+        r.spec["template"]["containers"][0]["liveness"]["startSeconds"],
+        json!(45)
+    );
+    for bad in [
+        "startSeconds: '45'",
+        "startSeconds: -1",
+        "start_seconds: 45",
+        "initialDelaySeconds: 45",
+    ] {
+        let (_, _, msg) = err(&probe(bad));
+        assert!(!msg.is_empty(), "{bad}");
+    }
+    let workload = KINDS.iter().find(|info| info.kind == "Workload").unwrap();
+    assert!(
+        workload.schema().to_string().contains("\"startSeconds\""),
+        "the schema names it"
+    );
+}
+
 #[test]
 fn strings_are_never_coerced() {
     let r = one(&workload(
