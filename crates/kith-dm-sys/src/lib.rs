@@ -101,12 +101,18 @@ fn ioctl_value(file: &File, number: u32, value: u64) -> Result<i32> {
 /// `file` (a /dev/fbN), as FBIOGET_VSCREENINFO reports them.
 pub fn fb_channels(file: &File) -> Result<[u32; 3]> {
     const GET_SCREEN_INFO: u32 = 0x4600; // FBIOGET_VSCREENINFO
-    // (struct fb_var_screeninfo is 160 bytes; the `offset` of each channel's fb_bitfield,
-    // red, green and blue, is the u32 at 32, 44 and 56.)
-    let mut screen = vec![0u8; 160];
+    let mut screen = vec![0u8; FB_VAR_SCREENINFO];
     ioctl(file, GET_SCREEN_INFO, &mut screen)?;
-    let at = |byte: usize| u32::from_ne_bytes([screen[byte], screen[byte + 1], screen[byte + 2], screen[byte + 3]]);
-    Ok([at(32), at(44), at(56)])
+    Ok(fb_channels_of(&screen))
+}
+
+/// `struct fb_var_screeninfo`, in bytes.
+const FB_VAR_SCREENINFO: usize = 160;
+/// Where the `offset` (a u32) of the red, green and blue `fb_bitfield` sit in it.
+const FB_CHANNEL_OFFSETS: [usize; 3] = [32, 44, 56];
+
+fn fb_channels_of(screen: &[u8]) -> [u32; 3] {
+    FB_CHANNEL_OFFSETS.map(|at| u32::from_ne_bytes([screen[at], screen[at + 1], screen[at + 2], screen[at + 3]]))
 }
 
 /// Put the console `tty` (/dev/tty0) in graphics mode, where the kernel draws no text over
@@ -783,6 +789,18 @@ pub fn relro_ranges(headers: impl Iterator<Item = (u32, usize, usize)> + Clone, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fb_var_screeninfo_is_160_bytes_with_the_channels_offsets_at_32_44_56() {
+        assert_eq!(FB_VAR_SCREENINFO, 160, "struct fb_var_screeninfo");
+        assert_eq!(FB_CHANNEL_OFFSETS, [32, 44, 56], "red, green and blue fb_bitfield.offset");
+        // A pixel of BGR: blue in the low byte, red at 16.
+        let mut screen = vec![0u8; FB_VAR_SCREENINFO];
+        for (at, offset) in FB_CHANNEL_OFFSETS.into_iter().zip([16u32, 8, 0]) {
+            screen[at..at + 4].copy_from_slice(&offset.to_ne_bytes());
+        }
+        assert_eq!(fb_channels_of(&screen), [16, 8, 0]);
+    }
 
     const PAGE: usize = 0x1000;
     fn relro(at: usize, size: usize) -> (u32, usize, usize) {

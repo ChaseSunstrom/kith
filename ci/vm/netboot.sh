@@ -60,12 +60,6 @@
             }
             blank beta
             beta install-beta
-            if [ "$test" = crypt ]; then
-                # An encrypted install shows its recovery key and holds it on the console's picture
-                # until a key is typed: the test has read the key, and types one to go on.
-                hears install-beta 'shown this once: '
-                printf '\n' | socat - "unix-connect:$work/install-beta.tty" >/dev/null
-            fi
             wait "$vm" || fail "the machine started from the network did not install and start again"
             grep -aqF 'kithd: install: kith OS is on vda' "$work/install-beta.log" || fail "the machine started from the network did not install"
             hears alpha "kithd: netboot: $mac has the installer"

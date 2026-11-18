@@ -6,7 +6,7 @@
 //! framebuffer (or none at all) nothing is drawn.
 
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -177,16 +177,33 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// The lines of `question` as drawn on a `width`-pixel picture, each with its scale: the
+/// question's own lines are kept, and each is wrapped at the question's size; a line with a
+/// word too long for that (a recovery key) is drawn smaller, whole.
+fn layout(question: &str, width: usize) -> Vec<(String, usize)> {
+    let room = width.saturating_sub(2 * MARGIN);
+    let mut lines = Vec::new();
+    for source in question.split('\n') {
+        let longest = source.split_whitespace().map(|word| word.chars().count()).max().unwrap_or(0);
+        let scale = if longest <= room / (6 * QUESTION_SCALE) { QUESTION_SCALE } else { LABEL_SCALE };
+        let pieces = wrap(source, room / (6 * scale));
+        if pieces.is_empty() {
+            lines.push((String::new(), scale));
+        }
+        lines.extend(pieces.into_iter().map(|line| (line, scale)));
+    }
+    lines
+}
+
 /// Draw the install question `question` with the rail of `stops`, `current` being the stop
 /// it belongs to: the stops before it in ink, it in the accent, the ones after it outlined,
 /// and `footer` at the foot. Only the colours of the site's tokens are used.
 pub fn draw_question(frame: &mut Frame, stops: &[&str], current: usize, question: &str, footer: &str) {
     frame.rect(0, 0, frame.width, frame.height, SITE_BG);
-    let per_line = frame.width.saturating_sub(2 * MARGIN) / (6 * QUESTION_SCALE);
     let mut y = MARGIN;
-    for line in wrap(question, per_line) {
-        frame.text(MARGIN, y, QUESTION_SCALE, &line, SITE_TEXT);
-        y += 10 * QUESTION_SCALE;
+    for (line, scale) in layout(question, frame.width) {
+        frame.text(MARGIN, y, scale, &line, SITE_TEXT);
+        y += 10 * scale;
     }
     let last = FIRST_STOP_Y + STOP_GAP * stops.len().saturating_sub(1);
     frame.rect(RAIL_X + (STOP - STROKE) / 2, FIRST_STOP_Y, STROKE, last - FIRST_STOP_Y, SITE_HAIR);
@@ -211,18 +228,19 @@ pub fn draw_question(frame: &mut Frame, stops: &[&str], current: usize, question
 }
 
 /// Show the picture `shown`, wait for a key (`wait_for_key`), then show it cleared, whatever
-/// the wait gave. Nothing is written anywhere but to the panel.
+/// happened before: a show that failed part-way leaves part of the picture, so it is cleared
+/// too, and no key is waited for on a picture that is not there. Nothing is written anywhere
+/// but to the panel.
 pub fn hold_until_key(
     panel: &mut dyn Panel,
     shown: &Frame,
     wait_for_key: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
-    panel.show(shown)?;
-    let waited = wait_for_key();
+    let waited = panel.show(shown).and_then(|()| wait_for_key());
     let mut cleared = shown.clone();
     cleared.bytes.fill(0);
-    panel.show(&cleared)?;
-    waited
+    let cleared = panel.show(&cleared);
+    waited.and(cleared)
 }
 
 /// The geometry the kernel gives the framebuffer at `sysfs` (the `fb0` directory of
@@ -276,7 +294,11 @@ impl Panel for Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if let Some(tty) = &self.tty {
+        if let Some(tty) = &mut self.tty {
+            // (The console keeps its text while it draws none, and the questions and the key were
+            // printed to it: cleared first (home, erase screen, erase scrollback), they do not
+            // come back with the text.)
+            let _ = tty.write_all(b"\x1b[H\x1b[2J\x1b[3J");
             let _ = kith_dm_sys::set_graphics(tty, false);
         }
     }
@@ -411,6 +433,52 @@ mod tests {
         })
         .expect("held");
         assert_eq!(*log.borrow(), ["show", "key", "clear"]);
+    }
+
+    #[test]
+    fn fb_key_screen_clears_even_when_the_first_show_fails() {
+        struct Torn<'a> {
+            log: &'a RefCell<Vec<&'static str>>,
+        }
+        impl Panel for Torn<'_> {
+            fn show(&mut self, frame: &Frame) -> io::Result<()> {
+                let blank = frame.bytes.iter().all(|&b| b == 0);
+                self.log.borrow_mut().push(if blank { "clear" } else { "show" });
+                if blank {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("part of the picture written"))
+                }
+            }
+        }
+        let log = RefCell::new(Vec::new());
+        let mut shown = screen(3200, RGB);
+        draw_question(&mut shown, &STOPS, STOPS.len() - 1, "kith1.0123456789abcdef", KEY);
+        let mut panel = Torn { log: &log };
+        let held = hold_until_key(&mut panel, &shown, || {
+            log.borrow_mut().push("key");
+            Ok(())
+        });
+        assert!(held.is_err(), "the failed show is reported");
+        assert_eq!(*log.borrow(), ["show", "clear"], "a picture half-written is cleared, and no key is waited for");
+    }
+
+    #[test]
+    fn fb_the_recovery_key_is_on_a_line_of_its_own_at_800_px() {
+        let key = "kith1.0123456789abcdef0123456789abcdef0";
+        assert_eq!(key.len(), 39);
+        assert_eq!(
+            layout(&format!("Recovery key:\n{key}"), 800),
+            [("Recovery key:".to_string(), QUESTION_SCALE), (key.to_string(), LABEL_SCALE)],
+            "the key is drawn whole, at the smaller size that fits it"
+        );
+    }
+
+    #[test]
+    fn fb_newlines_in_a_question_are_kept() {
+        let question = "Install kith OS on which disk?\nvda 2 GB\n\nvdb 4 GB";
+        let lines: Vec<String> = layout(question, 800).into_iter().map(|(line, _)| line).collect();
+        assert_eq!(lines, ["Install kith OS on which disk?", "vda 2 GB", "", "vdb 4 GB"]);
     }
 
     #[test]

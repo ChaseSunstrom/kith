@@ -550,6 +550,21 @@ pub fn keyboard() -> std::sync::mpsc::Receiver<String> {
     typed
 }
 
+/// How long a recovery key's screen waits for a line with nobody at the console: then it is
+/// cleared and the install goes on.
+const KEY_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A line typed (any), or `wait` with none: `Ok` either way; `Err` when no console can be
+/// typed at, so no key can be released.
+fn wait_for_key_line(typed: &std::sync::mpsc::Receiver<String>, wait: std::time::Duration) -> std::io::Result<()> {
+    match typed.recv_timeout(wait) {
+        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(()),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::io::Error::other("no console can be typed at"))
+        }
+    }
+}
+
 /// Each line read from `console` to `lines`, until it ends or nobody listens. A line is read
 /// 4 KiB at most at a time: one longer (a serial line's noise, no newline) comes in pieces.
 fn lines_of(mut console: impl std::io::BufRead, lines: &std::sync::mpsc::Sender<String>) {
@@ -756,29 +771,34 @@ pub async fn run(source: String) -> ! {
     match wrote {
         Ok(recovery) => {
             if let Some(recovery) = recovery {
+                // Answers given (a file, a URL) are for an install nobody watches: no screen waits
+                // for the key then. Asked, the Enters typed before now are dropped first, so that
+                // none of them clears the key's screen at once.
+                let asked = given.is_none();
+                if asked {
+                    typed.lock().expect("nothing panics holding the keyboard").try_iter().for_each(drop);
+                }
                 eprintln!(
                     "kithd: install: the node's state is encrypted. Its recovery key opens it where no cluster answers, and is shown this once: {recovery}"
                 );
-                // On the screen too, where there is one: held until a key is pressed, then cleared.
-                let held = tokio::task::spawn_blocking(move || {
-                    let Some(mut device) = fb::open() else {
-                        return Ok(());
-                    };
-                    let mut frame = device.frame();
-                    let key = format!("Recovery key: {recovery}");
-                    fb::draw_question(&mut frame, &fb::STOPS, fb::STOPS.len() - 1, &key, fb::KEY);
-                    let typed = typed.lock().expect("nothing panics holding the keyboard");
-                    fb::hold_until_key(&mut device, &frame, || {
-                        typed
-                            .recv()
-                            .map(drop)
-                            .map_err(|_| std::io::Error::other("no console can be typed at"))
-                    })
-                });
-                match held.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => eprintln!("kithd: install: the recovery key's screen: {e}"),
-                    Err(e) => eprintln!("kithd: install: the recovery key's screen: {e}"),
+                if asked {
+                    // On the screen too, where there is one: held until a key is pressed (or KEY_WAIT
+                    // goes by), then cleared.
+                    let held = tokio::task::spawn_blocking(move || {
+                        let Some(mut device) = fb::open() else {
+                            return Ok(());
+                        };
+                        let mut frame = device.frame();
+                        let key = format!("Recovery key:\n{recovery}");
+                        fb::draw_question(&mut frame, &fb::STOPS, fb::STOPS.len() - 1, &key, fb::KEY);
+                        let typed = typed.lock().expect("nothing panics holding the keyboard");
+                        fb::hold_until_key(&mut device, &frame, || wait_for_key_line(&typed, KEY_WAIT))
+                    });
+                    match held.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => eprintln!("kithd: install: the recovery key's screen: {e}"),
+                        Err(e) => eprintln!("kithd: install: the recovery key's screen: {e}"),
+                    }
                 }
             }
             // (Nothing to take out of a machine installed from its own memory: it starts at once.)
@@ -901,6 +921,18 @@ async fn fetched(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recovery key's screen waits for a line typed, or for its wait with none (then the
+    /// install goes on); it is refused only when no console can be typed at at all.
+    #[test]
+    fn install_key_screen_waits_for_a_line_or_gives_up_after_its_wait() {
+        let (lines, typed) = std::sync::mpsc::channel::<String>();
+        assert!(wait_for_key_line(&typed, std::time::Duration::from_millis(10)).is_ok(), "nobody typed: it gives up");
+        lines.send(String::new()).expect("a listener");
+        assert!(wait_for_key_line(&typed, std::time::Duration::from_secs(60)).is_ok(), "a line released it");
+        drop(lines);
+        assert!(wait_for_key_line(&typed, std::time::Duration::from_millis(10)).is_err(), "no console at all is said");
+    }
 
     /// A console that sends no newline (a serial line's noise) comes in pieces of at most
     /// 4 KiB: what one line holds is bounded. A short line comes whole.
