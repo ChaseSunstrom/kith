@@ -633,6 +633,30 @@ mod tests {
         assert_eq!(check(&by_admin(&good())), Ok(Caller::Admin));
     }
 
+    /// kith-cli's pinned header (its `signed_cross_vector_is_kithds`): from its passphrase, the
+    /// key kith derives here as kith does, and kithd's own `verify` takes the header as it is.
+    #[test]
+    fn signed_header_from_the_cli_verifies() {
+        let mut seed = [0u8; 32];
+        let rounds = std::num::NonZeroU32::new(600_000).unwrap();
+        let passphrase = b"correct horse battery staple";
+        ring::pbkdf2::derive(ring::pbkdf2::PBKDF2_HMAC_SHA256, rounds, CLUSTER.as_bytes(), passphrase, &mut seed);
+        let key = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        assert_eq!(
+            crate::pki::hex(key.public_key().as_ref()),
+            "45adefd230fccdc0edc77acb13998359d12eeb0ab7a4fdd1c49a2203fb8eb183"
+        );
+        let header = "v1; who=local socket; target=*; expires=1800000300; nonce=00112233445566778899aabbccddeeff; sig=a70zVltHfKC0JVo4PtNzEiwAsqr/KLbBg1ITbXFjm/5TA4bG8PX3zj/35f76yW68aScPFOH4Ks62okBH8wDvBQ==";
+        let store = store_with(key.public_key().as_ref(), "");
+        let asked = Asked {
+            method: "POST",
+            path: "/v1/apply",
+            body: b"[]",
+        };
+        let checked = verify(header, CLUSTER, &["*"], &asked, &store, NOW, &Nonces::default());
+        assert_eq!(checked, Ok(Caller::Admin));
+    }
+
     fn refused(header: &str, why: &str) {
         let said = check(header).unwrap_err();
         assert!(said.contains(why), "{said}");

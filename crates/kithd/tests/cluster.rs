@@ -1371,10 +1371,11 @@ fn signed_hops_alone_stand_once_signing_is_required() {
         "{code} {said}"
     );
 
-    // Unsigned, the local socket reads and writes nothing.
+    // The local socket reads, and a write it makes with a passphrase that is not the admin's is
+    // refused: kith signs with the passphrase it is given (none here).
     assert!(alpha.ok(&["get", "cluster/home"]).contains("home"));
     let (code, _, err) = alpha.kith(&["apply", "-f", "cluster.yaml"]);
-    assert!(code != 0 && err.contains("requires the admin's signature"), "{err}");
+    assert!(code != 0 && err.contains("not local socket's over this request"), "{err}");
 }
 
 /// A Workload that runs as an Identity: the CA holder signs, for the worker it is placed on

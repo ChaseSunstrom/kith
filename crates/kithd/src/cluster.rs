@@ -883,6 +883,13 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
         None if id == metrics.id => me.to_string(),
         None => id.to_string(),
     };
+    // What a signer needs (kith's passphrase key is salted with the cluster id): the id is the
+    // print of the CA, and `signing` says whether writes must be signed.
+    let id = shared.cluster.as_ref().and_then(|cluster| crate::pki::fingerprint(&cluster.me.ca).ok());
+    let signing = match crate::access_sign::requires(&shared) {
+        true => "required",
+        false => "open",
+    };
     let membership = metrics.membership_config.membership();
     let voters: Vec<u64> = membership.voter_ids().collect();
     let by_name = |ids: Vec<u64>| {
@@ -896,12 +903,16 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
         let upstream = shared.upstream.lock().expect("nothing panics holding the upstream");
         return Json(serde_json::json!({
             "node": me,
+            "clusterId": id,
+            "signing": signing,
             "view": { "applied": at, "from": upstream.as_ref().map(|(address, _)| address) },
             "mesh": shared.mesh.lock().expect("nothing panics holding the mesh").clone(),
         }));
     }
     Json(serde_json::json!({
         "node": name(metrics.id),
+        "clusterId": id,
+        "signing": signing,
         "leader": metrics.current_leader.map(name),
         "learners": by_name(learners.collect()),
         "voters": by_name(voters),

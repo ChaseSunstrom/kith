@@ -13,6 +13,7 @@ use std::process::ExitCode;
 
 mod import;
 mod remote;
+mod signing;
 mod ui;
 mod wire;
 
@@ -163,6 +164,11 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    /// The admin's key: what signs the cluster's writes under `spec.signing: required`
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
     /// Show who changed what through this node, and who was refused
     Audit {
         /// How many of the last entries to show (1000 at most)
@@ -239,6 +245,13 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     text
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Set the Cluster's spec.adminKey from a passphrase typed now (kept nowhere): the key
+    /// that signs writes under `spec.signing: required`, the same one each time it is typed
+    Key,
 }
 
 #[derive(Subcommand)]
@@ -686,9 +699,9 @@ fn escape(key: &str) -> String {
         .collect()
 }
 
-/// What is typed at the terminal after `prompt`, unseen and twice the same; from a pipe,
-/// its first line.
-fn secret(prompt: &str) -> Result<String, String> {
+/// What is typed at the terminal after `prompt`, unseen (and, when `twice`, again to be the
+/// same); from a pipe, its first line.
+fn secret(prompt: &str, twice: bool) -> Result<String, String> {
     use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
     use std::io::IsTerminal;
     let stdin = std::io::stdin();
@@ -713,7 +726,11 @@ fn secret(prompt: &str) -> Result<String, String> {
         eprintln!();
         typed
     };
-    let (first, again) = (typed(prompt)?, typed("Once more: ")?);
+    let first = typed(prompt)?;
+    if !twice {
+        return Ok(first);
+    }
+    let again = typed("Once more: ")?;
     if first != again {
         return fail("the two are not the same: nothing was done");
     }
@@ -885,12 +902,45 @@ fn request<T: serde::de::DeserializeOwned>(kithd: &Kithd, method: &str, path: &s
     serde_json::from_slice(&reply).or_else(|e| fail(format!("reading kithd's reply: {e}")))
 }
 
+/// The passphrase typed for this run's signed writes: asked for once, when the first is signed.
+static PASSPHRASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The signature a write to kithd's socket carries where the cluster says `signing: required`
+/// (none for a read, a node over TLS, or an open cluster). Its key is the passphrase's, salted
+/// with the cluster id kithd gives.
+fn signed(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Option<String>, String> {
+    if matches!(method, "GET" | "HEAD") || !matches!(kithd.route, Route::Socket(_)) {
+        return Ok(None);
+    }
+    let status: serde_json::Value = request(kithd, "GET", "/v1/cluster", b"")?;
+    if status["signing"] != "required" {
+        return Ok(None);
+    }
+    let Some(cluster) = status["clusterId"].as_str() else {
+        return fail("kithd gave no cluster id to sign with: update kithd");
+    };
+    if PASSPHRASE.get().is_none() {
+        let typed = secret("The admin's passphrase, which signs this change: ", false)?;
+        let _ = PASSPHRASE.set(typed);
+    }
+    let key = signing::key(PASSPHRASE.get().map_or("", String::as_str), cluster);
+    let asked = signing::Request { method, path, body };
+    // "*": this node is the one it is sent to, and a node passes it on only to where it belongs.
+    let header = signing::header(&key, cluster, "*", &asked, kith_api::store::now() + 300, &signing::nonce()?);
+    Ok(Some(header))
+}
+
 /// The same, the reply's body as it came.
 fn raw(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, String> {
     use std::io::Write;
+    // (Before the connection: a signed write first asks kithd for its cluster's id.)
+    let signed = match signed(kithd, method, path, body)? {
+        Some(header) => format!("{}: {header}\r\n", signing::SIGNED),
+        None => String::new(),
+    };
     let mut stream = connect(kithd)?;
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{signed}\r\n",
         body.len()
     );
     let mut reply = Vec::new();
@@ -1489,7 +1539,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             let passphrase = match off {
                 true => None,
-                false => Some(secret(&format!("A passphrase for {name}'s state: "))?),
+                false => Some(secret(&format!("A passphrase for {name}'s state: "), true)?),
             };
             let body = serde_json::json!({ "passphrase": passphrase }).to_string();
             let _: serde_json::Value =
@@ -1519,7 +1569,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             // it for itself alone and passes it on to no node.)
             let pin = match off {
                 true => None,
-                false => Some(secret(&format!("A PIN for {name}'s state, 6 to 32 digits: "))?),
+                false => Some(secret(&format!("A PIN for {name}'s state, 6 to 32 digits: "), true)?),
             };
             let body = serde_json::json!({ "pin": pin, "untried": untried_tpm }).to_string();
             let said: serde_json::Value = request(&kithd, "POST", &format!("/v1/lock/{name}/pin"), body.as_bytes())?;
@@ -1529,6 +1579,28 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 ),
                 None => println!("{name} has no PIN: it asks the cluster for the key of its state"),
             }
+        }
+        Command::Admin {
+            command: AdminCommand::Key,
+        } => {
+            let backend = backend()?;
+            let Backend::Daemon(kithd) = &backend else {
+                return fail("the admin's key is set through kithd: leave out --store");
+            };
+            let status: serde_json::Value = request(kithd, "GET", "/v1/cluster", b"")?;
+            let Some(cluster_id) = status["clusterId"].as_str() else {
+                return fail("kithd gave no cluster id to derive the key with: update kithd");
+            };
+            let passphrase = secret("A passphrase for the admin's key: ", true)?;
+            let public = signing::public(&signing::key(&passphrase, cluster_id));
+            // (The write below is signed with this same passphrase: the key it sets, if it is the one there.)
+            let _ = PASSPHRASE.set(passphrase);
+            let clusters = backend.list(Some("Cluster"))?;
+            let [mut cluster] = <[Resource; 1]>::try_from(clusters)
+                .map_err(|all| format!("error: {} Clusters: exactly one is needed to set its key", all.len()))?;
+            cluster.spec["adminKey"] = serde_json::json!(public);
+            backend.apply(vec![cluster], false)?;
+            println!("The Cluster's spec.adminKey is set: writes signed with this passphrase are its admin's");
         }
         Command::Identity {
             command: IdentityCommand::Cert { name, out },
