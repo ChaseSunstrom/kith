@@ -399,11 +399,34 @@ pub fn new_identity(name: &str) -> Resource {
 /// in format 4 not one that changes access ([`crate::raft::changes_access`]: a Role,
 /// RoleBinding, Identity, KindDefinition or Cluster, and any import): only a signed entry
 /// does, so a taken leader cannot write what the admin did not sign. Every other bare write
-/// stays bare here (a node's own, a Release, a Source: later slices).
+/// stays bare here (a node's own, a spec a Release or Source writes: later slices).
+///
+/// A cost, until slice 6 (T-0850: `writer_may` for a Release and a Source): a Release or Source
+/// whose render holds a Role, RoleBinding, Identity or KindDefinition (or prunes one) is bare, so
+/// it is refused here too. Their controllers do not propose it under `required`
+/// ([`refuses_render`]) and say so in the status.
 fn bare(store: &Store, command: &Command) -> Result<(), String> {
-    match store.checking() && required(store) && crate::raft::changes_access(command) {
+    // (The command first: the scan of the store for `required` only runs for an access write.)
+    match crate::raft::changes_access(command) && store.checking() && required(store) {
         true => Err("a bare write that changes access is refused under spec.signing: required".into()),
         false => Ok(()),
+    }
+}
+
+/// Would the cluster refuse `command` bare, a controller's own write (a Release's or a Source's
+/// render), under `spec.signing: required`? Then the controller proposes nothing and says so,
+/// rather than write an entry every node refuses and audits, again each round.
+pub fn refuses_render(store: &Store, command: &Command) -> Option<String> {
+    bare(store, command).err()
+}
+
+/// What a command touches, for the audit log: its resources' keys (an import: the whole store).
+fn targets(command: &Command) -> Vec<String> {
+    match command {
+        Command::Apply { resources, .. } => resources.iter().map(|resource| resource.key()).collect(),
+        Command::Delete { key } | Command::Rollback { key, .. } => vec![key.clone()],
+        Command::Import { .. } => vec!["(the whole store)".into()],
+        _ => Vec::new(),
     }
 }
 
@@ -462,7 +485,7 @@ pub fn hook(cluster: Option<String>, audit: Arc<crate::audit::Audit>) -> kith_st
     Arc::new(move |store, command, leader| {
         let Command::Signed { header, path, .. } = command else {
             return bare(store, command).map_err(|why| {
-                audit.record(&"unsigned", "signed", Vec::new(), Err(why.clone()));
+                audit.record(&"unsigned", "signed", targets(command), Err(why.clone()));
                 kith_api::store::Error::Invalid(format!("refused: {why}"))
             });
         };
@@ -1505,6 +1528,19 @@ mod tests {
 
     /// Under `required` at format 4 every node refuses a bare write that changes access, and
     /// any import, as the hook; what does not change access, and what is signed, is taken.
+    /// A bare refusal is audited with what it touched, not with nothing.
+    #[test]
+    fn signed_bare_refusals_name_their_targets_for_the_audit() {
+        let writes = bare_access();
+        assert_eq!(targets(&writes[0]).len(), 2, "an apply: each resource's key");
+        assert_eq!(targets(&Command::Delete { key: "Role/x".into() }), ["Role/x"]);
+        assert_eq!(targets(writes.last().unwrap()), ["(the whole store)"]);
+        assert!(writes.iter().all(|write| !targets(write).is_empty()));
+        // The scan of the store for `required` is for an access write only: a plain one is not asked.
+        assert_eq!(refuses_render(&required_store(), &applies(vec![map("a")])), None);
+        assert!(refuses_render(&required_store(), &writes[0]).is_some());
+    }
+
     #[test]
     fn signed_required_refuses_bare_access_writes_and_imports() {
         let leader = kith_store::node_id(LEADER);
@@ -1779,7 +1815,7 @@ mod tests {
         };
         // Required, by the admin's signature.
         let required = cluster(", signing: required");
-        let body = serde_json::to_vec(&[required.clone()]).unwrap();
+        let body = serde_json::to_vec(std::slice::from_ref(&required)).unwrap();
         let flip = shared.submit_as(applies(vec![required]), Some(&Caller::Admin));
         within(Some(signed(2, "/v1/apply", &body)), flip).await.unwrap();
         assert!(requires(&shared));

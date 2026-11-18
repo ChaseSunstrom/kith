@@ -425,9 +425,11 @@ predicate the leader's edge uses, so a taken leader's bare write is refused by t
 nodes too, and a replay decides alike.
 
 - **What is refused bare:** an `Apply`, `Delete` or `Rollback` of a Role, RoleBinding,
-  Identity, KindDefinition or Cluster (`raft::changes_access`, which looks into a `Patch`
-  or a batch and a Signed entry's command), and any `Import`. A refusal applies nothing and
-  is audited as `signed`, as in slice 2. An open cluster, and a store below format 4, take
+  Identity, KindDefinition or Cluster (`raft::changes_access`, which looks into a Signed
+  entry's command), and any `Import`. A `Patch`, `Status` or `Report` is not one: each sets
+  a status, never a spec, and access reads spec (what it reads of a Node's status, its
+  address, `ca` and `view`, is the node's own, held by layer 2). A refusal applies nothing
+  and is audited as `signed`, with the keys it touched as its targets. An open cluster, and a store below format 4, take
   them as before: the hook decides nothing until `Store::checking()`.
 - **The certificate route writes its Identity Signed.** The admin signs an empty
   `POST /v1/identities/NAME/certificate` at the CA node's local socket; the node makes the
@@ -435,7 +437,9 @@ nodes too, and a replay decides alike.
   around it. Every node takes it through `certified`: one `Apply` of the Identity as the
   store has it, with only a valid P-256 `publicKey` changed. A forged or changed entry is
   refused. The route is signed but never relayed (`Relay::signs` is the wrap predicate,
-  `Relay::carries` the relay one): the CA node must be the leader.
+  `Relay::carries` the relay one): the route answers only on the CA node while it leads. A
+  CA node that does not lead says so (and the leader, not holding the CA key, answers
+  `CA_ELSEWHERE`); passing the request on is a follow-up, not built here.
 - **A signed write sent to a follower over TLS** is relayed as it came (method, path, body
   and header unchanged), and the leader writes it Signed; both nodes apply it alike. Bare,
   the follower and the local socket refuse it, as in layer 1.
@@ -446,6 +450,11 @@ nodes too, and a replay decides alike.
   restore (`Import`) are refused under `required`; sign them as a change, or set `open`
   first. A rolling upgrade from slice 2 can part: a slice 2 node takes a bare access write
   at format 4 that a slice 3 node refuses, so update every node before `required`.
+  A Release or Source that renders (or prunes) a Role, RoleBinding, Identity or
+  KindDefinition is a bare write too, so it is refused at apply: its controller proposes
+  nothing under `required` (`releases::refuse_access`) and says so in the Release's or
+  Source's status, once, not in an entry every node audits again each round. Slice 6
+  (T-0850, `writer_may` for a Release and a Source) lifts it.
 - **What a taken leader can still do:** put its own `publicKey` on an Identity the admin
   signed the route for: `certified` checks the key is a valid P-256 point and that nothing
   else changed, but not whose it is, as the key is made after the signature (see "What
