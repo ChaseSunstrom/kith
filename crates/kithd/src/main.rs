@@ -35,6 +35,7 @@ mod kube;
 mod kubeproto;
 mod members;
 mod mesh;
+mod modules;
 mod netboot;
 mod os;
 mod pki;
