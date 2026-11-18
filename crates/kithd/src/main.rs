@@ -39,6 +39,7 @@ mod mesh;
 mod modules;
 mod netboot;
 mod os;
+mod people;
 mod pki;
 mod pods;
 mod policy;
@@ -987,9 +988,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let hardware = devices::run(shared.clone(), stopping.clone(), dmem);
             let crons = cron::run(shared.clone(), stopping.clone());
             let exits = exits::run(shared.clone(), stopping.clone());
+            let people = people::run(shared.clone(), stopping.clone());
             let published = pods::publish(shared.clone(), own_ports(&args), stopping.clone());
             tokio::join!(
                 apart(exits),
+                apart(people),
                 apart(published),
                 apart(units),
                 apart(releases),
