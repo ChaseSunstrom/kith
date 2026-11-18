@@ -14,11 +14,12 @@
 
 pub mod exit;
 mod netlink;
+pub mod people;
 pub mod pod;
 
 pub use netlink::{Card, Device, Seen, address4, addresses6, cards, hold, up};
 use sha2::{Digest, Sha256};
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 /// A WireGuard key, private or public.
 pub type Key = [u8; 32];
@@ -108,8 +109,9 @@ pub struct Member {
 pub struct Peer {
     pub key: Key,
     pub endpoint: Option<SocketAddr>,
-    /// The nodes (their /80s) whose traffic goes to and comes from this peer.
-    pub allowed: Vec<Ipv6Addr>,
+    /// The addresses (address and length: a node's /80, IPv4 or IPv6) whose traffic goes to
+    /// and comes from this peer.
+    pub allowed: Vec<(IpAddr, u8)>,
     pub keepalive: u16,
 }
 
@@ -151,12 +153,13 @@ pub fn wanted(prefix: Ipv6Addr, me: &str, members: &[Member]) -> Vec<Peer> {
         edges.iter().copied().find(|edge| says(edge)).or(edges.first().copied())
     };
     let peer = |member: &Member| {
+        let node = |name: &str| (IpAddr::V6(node_net(prefix, name)), NODE_BITS);
         let mut allowed = Vec::new();
         if through(member).is_none() {
-            allowed.push(node_net(prefix, &member.name));
+            allowed.push(node(&member.name));
         }
         let relayed = others().filter(|other| through(other).is_some_and(|relay| relay.key == member.key));
-        allowed.extend(relayed.map(|other| node_net(prefix, &other.name)));
+        allowed.extend(relayed.map(|other| node(&other.name)));
         Peer {
             key: member.key,
             endpoint: endpoint(member),
@@ -265,8 +268,19 @@ mod tests {
             reaches: Vec::new(),
             seen: None,
         };
+        // (Each allowed address is a node's /80: the nets compared are the /80s' addresses.)
         let nets = |peers: &[Peer]| -> Vec<(u8, Vec<Ipv6Addr>)> {
-            let of = |peer: &Peer| (peer.key[0], peer.allowed.clone());
+            let of = |peer: &Peer| {
+                let nets = peer
+                    .allowed
+                    .iter()
+                    .map(|&(net, bits)| match net {
+                        IpAddr::V6(net) if bits == NODE_BITS => net,
+                        other => panic!("not a node's /80: {other}/{bits}"),
+                    })
+                    .collect();
+                (peer.key[0], nets)
+            };
             peers.iter().map(of).collect()
         };
         // Everyone reached: every other node is a peer with its own /80, and not oneself.

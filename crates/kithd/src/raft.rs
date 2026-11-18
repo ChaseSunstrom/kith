@@ -829,18 +829,18 @@ impl Shared {
         // A signed apply, delete or rollback goes to the leader as it came (its method, path, body and
         // header), and the leader runs it as its own route would (its audit names that route): a
         // Command re-serialized would not be what was signed. `carries` checks the route matches.
-        if let Some(relay) = access_sign::current().and_then(|signed| signed.relay) {
-            if relay.carries(command) {
-                let url = format!("https://{at}{}", relay.path);
-                let call = match command {
-                    Command::Delete { .. } => client.delete(url),
-                    _ => client.post(url),
-                }
-                .header(access::FOR, relay.who.to_string())
-                .header("content-type", "application/json")
-                .body(relay.body.clone());
-                return self.relayed(access_sign::pass_on(call), at, &relay).await;
+        if let Some(relay) = access_sign::current().and_then(|signed| signed.relay)
+            && relay.carries(command)
+        {
+            let url = format!("https://{at}{}", relay.path);
+            let call = match command {
+                Command::Delete { .. } => client.delete(url),
+                _ => client.post(url),
             }
+            .header(access::FOR, relay.who.to_string())
+            .header("content-type", "application/json")
+            .body(relay.body.clone());
+            return self.relayed(access_sign::pass_on(call), at, &relay).await;
         }
         // A signed request's change that is not carried is not sent on as this node's own write: the
         // leader would take it as none, with no signature checked there. (A Mark is this node's own.)

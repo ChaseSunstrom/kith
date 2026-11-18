@@ -10,13 +10,12 @@
 //! referrers; older cosigns keep it under the same tag, with its certificate and the log's
 //! promise in the layer's annotations.
 
+use crate::outside::{Lookup, Remote};
 use crate::{Result, err};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use oci_client::errors::OciDistributionError;
+use oci_client::Reference;
 use oci_client::manifest::OciManifest;
-use oci_client::secrets::RegistryAuth;
-use oci_client::{Client, Reference};
 use ring::signature::{ECDSA_P256_SHA256_ASN1, ED25519, UnparsedPublicKey, VerificationAlgorithm};
 
 const SIGNATURE: &str = "dev.cosignproject.cosign/signature";
@@ -24,8 +23,6 @@ const CERTIFICATE: &str = "dev.sigstore.cosign/certificate";
 const PROMISE: &str = "dev.sigstore.cosign/bundle";
 /// The most of a bundle that is read: cosign's are some 5 kB.
 const BUNDLE: usize = 64 << 10;
-/// The longest the signatures of one image are looked for.
-const LOOKING: std::time::Duration = std::time::Duration::from_secs(60);
 /// The most of a signed text that is read: cosign's are some 250 bytes.
 const TEXT: usize = 16 << 10;
 /// The most signatures of one image that are looked at.
@@ -86,34 +83,25 @@ pub fn key(said: &str) -> Result<Key> {
     })
 }
 
-/// Whether a registry said it has no such manifest (and not: that it could not say).
-fn absent(e: &OciDistributionError) -> bool {
-    use oci_client::errors::OciErrorCode::{ManifestUnknown, NameUnknown, NotFound};
-    match e {
-        OciDistributionError::ImageManifestNotFoundError(_) | OciDistributionError::ServerError { code: 404, .. } => {
-            true
-        }
-        OciDistributionError::RegistryError { envelope, .. } => {
-            let codes = &mut envelope.errors.iter().map(|error| &error.code);
-            codes.any(|code| matches!(code, ManifestUnknown | NameUnknown | NotFound))
-        }
-        _ => false,
-    }
-}
-
 /// The key (its `id`) that signed one of `digests`: the image's manifest, or the list of
-/// manifests it was picked from. An error says what was found instead.
-pub async fn signer(client: &Client, reference: &Reference, digests: &[&str], keys: &[Key]) -> Result<String> {
+/// manifests it was picked from. An error says what was found instead. The signatures are
+/// looked for for at most `wait` (the metadata deadline): a registry that answers slowly, or
+/// never, is not waited on for ever.
+pub(crate) async fn signer(
+    remote: &Remote,
+    reference: &Reference,
+    digests: &[&str],
+    keys: &[Key],
+    wait: std::time::Duration,
+) -> Result<String> {
     let mut found = Vec::new();
-    // (A registry that answers slowly, or never, is not waited on for ever.)
-    let looked = tokio::time::timeout(LOOKING, look(client, reference, digests, keys, &mut found)).await;
+    let looked = tokio::time::timeout(wait, look(remote, reference, digests, keys, &mut found)).await;
     match looked {
         Ok(Ok(Some(by))) => return Ok(by),
         Ok(Err(e)) => return Err(e),
         Ok(Ok(None)) => {}
         Err(_) => found.push(format!(
-            "its signatures were looked for for {} s, and that is the most",
-            LOOKING.as_secs()
+            "its signatures were looked for for {wait:?}, and that is the most"
         )),
     }
     found.dedup();
@@ -143,7 +131,7 @@ fn by_identity(
 
 /// cosign 3's bundles among `digest`'s referrers: the identity one is by.
 async fn referred(
-    client: &Client,
+    remote: &Remote,
     reference: &Reference,
     digest: &str,
     identities: &[(&Key, &crate::keyless::Identity)],
@@ -151,11 +139,16 @@ async fn referred(
 ) -> Option<String> {
     let (registry, repository) = (reference.registry().to_string(), reference.repository().to_string());
     let subject = Reference::with_digest(registry.clone(), repository.clone(), digest.to_string());
-    // (A registry with no referrers of it, or that cannot say, has none: the tag is looked at next.)
-    let index = client
-        .pull_referrers(&subject, Some(crate::keyless::BUNDLE))
-        .await
-        .ok()?;
+    // (A registry with no referrers of it has none: the tag is looked at next. One whose index is
+    // too big, or that cannot be asked, is said so, and the tag is looked at next too.)
+    let index = match remote.referrers(&subject, digest, crate::keyless::BUNDLE).await {
+        Ok(Lookup::Found(index)) => index,
+        Ok(Lookup::Missing(_)) => return None,
+        Err(e) => {
+            found.push(format!("the referrers of {digest} could not be read: {e}"));
+            return None;
+        }
+    };
     // Bundles only, whatever else the registry answered with, and of a bundle's size.
     let bundles = index.manifests.iter().filter(|described| {
         described.artifact_type.as_deref() == Some(crate::keyless::BUNDLE)
@@ -164,7 +157,7 @@ async fn referred(
     });
     for described in bundles.take(SIGNATURES) {
         let at = Reference::with_digest(registry.clone(), repository.clone(), described.digest.clone());
-        let Ok((OciManifest::Image(manifest), _)) = client.pull_manifest(&at, &RegistryAuth::Anonymous).await else {
+        let Ok(Lookup::Found((OciManifest::Image(manifest), _))) = remote.manifest(&at).await else {
             continue;
         };
         if manifest.subject.as_ref().map(|subject| subject.digest.as_str()) != Some(digest) {
@@ -180,7 +173,7 @@ async fn referred(
         };
         let mut room = vec![0u8; BUNDLE];
         let mut into = std::io::Cursor::new(&mut room[..]);
-        if client.pull_blob(&at, layer, &mut into).await.is_err() {
+        if remote.oci.pull_blob(&at, layer, &mut into).await.is_err() {
             continue;
         }
         let bytes = &into.get_ref()[..into.position() as usize];
@@ -197,7 +190,7 @@ async fn referred(
 }
 
 async fn look(
-    client: &Client,
+    remote: &Remote,
     reference: &Reference,
     digests: &[&str],
     keys: &[Key],
@@ -213,15 +206,15 @@ async fn look(
     for digest in digests {
         let hex = crate::image::sha256_hex(digest)?;
         if !identities.is_empty()
-            && let Some(by) = referred(client, reference, digest, &identities, found).await
+            && let Some(by) = referred(remote, reference, digest, &identities, found).await
         {
             return Ok(Some(by));
         }
         let (registry, repository) = (reference.registry().to_string(), reference.repository().to_string());
         let at = Reference::with_tag(registry, repository, format!("sha256-{hex}.sig"));
-        let manifest = match client.pull_manifest(&at, &RegistryAuth::Anonymous).await {
-            Ok((OciManifest::Image(manifest), _)) => manifest,
-            Err(e) if !absent(&e) => {
+        let manifest = match remote.manifest(&at).await {
+            Ok(Lookup::Found((OciManifest::Image(manifest), _))) => manifest,
+            Err(e) => {
                 found.push(format!(
                     "its signatures (the tag sha256-{hex}.sig) could not be asked for: {e}"
                 ));
@@ -242,7 +235,7 @@ async fn look(
             // (As much as fits: more is not a text cosign wrote, and its digest is checked as it comes.)
             let mut room = vec![0u8; TEXT];
             let mut into = std::io::Cursor::new(&mut room[..]);
-            if client.pull_blob(&at, layer, &mut into).await.is_err() {
+            if remote.oci.pull_blob(&at, layer, &mut into).await.is_err() {
                 continue;
             }
             let text = &into.get_ref()[..into.position() as usize];
@@ -307,6 +300,7 @@ mod tests {
         at: String,
         files: Files,
         asked: Arc<Mutex<Vec<String>>>,
+        sent: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     fn digest(bytes: &[u8]) -> String {
@@ -325,9 +319,12 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let at = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
             let (files, asked) = (Files::default(), Arc::new(Mutex::new(Vec::new())));
-            let (served, noted) = (files.clone(), asked.clone());
+            let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (served, noted, counted) = (files.clone(), asked.clone(), sent.clone());
             std::thread::spawn(move || {
                 for mut stream in listener.incoming().flatten() {
+                    // (A client that stops reading is given up on, not waited for.)
+                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
                     let (mut request, mut byte) = (Vec::new(), [0u8]);
                     while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
                         request.push(byte[0]);
@@ -353,10 +350,22 @@ mod tests {
                         body.len(),
                         digest(&body)
                     );
-                    let _ = stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(&body));
+                    let _ = stream.write_all(head.as_bytes());
+                    // Counted as it goes: a client that closes early stops the count there.
+                    for chunk in body.chunks(64 << 10) {
+                        if stream.write_all(chunk).is_err() {
+                            break;
+                        }
+                        counted.fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
             });
-            Registry { at, files, asked }
+            Registry { at, files, asked, sent }
+        }
+
+        /// The bytes of response bodies handed to a client so far.
+        fn sent(&self) -> usize {
+            self.sent.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn put(&self, path: String, kind: &'static str, body: &[u8]) -> String {
@@ -710,6 +719,50 @@ mod tests {
         );
         assert!(said.contains("no signature in its repository"), "{said}");
         assert_eq!(registry.asked(&layer), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A referrers index of 64 MiB from an outside registry is refused naming the limit, and not
+    /// more than the limit (and a buffer or two) of it is taken from the registry.
+    #[tokio::test]
+    async fn outside_capped_referrers_index_is_refused_naming_the_limit() {
+        let dir = std::env::temp_dir().join(format!("kith-outside-referrers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, registry) = (ImageStore::new(&dir).unwrap(), Registry::start());
+        let name = format!("{}/huge:1", registry.at);
+        let (made, _) = registry.image("huge", "signed");
+        let mut index =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#.to_vec();
+        index.resize(64 << 20, b' ');
+        registry.put(
+            format!("/v2/huge/referrers/{made}"),
+            "application/vnd.oci.image.index.v1+json",
+            &index,
+        );
+        // (Only an identity has its referrers looked at: a key is checked by its signatures alone.)
+        let (authority, log) = (
+            crate::keyless::tests::Authority::new(),
+            crate::keyless::tests::Log::new(),
+        );
+        let who = crate::keyless::tests::named(
+            crate::keyless::tests::WHO,
+            crate::keyless::tests::ISSUED,
+            &authority,
+            &log,
+        );
+        let pulled = store.pull_signed(&name, PullPolicy::Always, std::slice::from_ref(&who));
+        let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(20), pulled).await else {
+            panic!("the pull was still reading the referrers after 20 s");
+        };
+        let Err(reason) = result else {
+            panic!("pulled an image whose referrers were 64 MiB");
+        };
+        assert!(reason.to_string().contains("4 MiB"), "{reason}");
+        let sent = registry.sent();
+        assert!(
+            sent <= 16 << 20,
+            "{sent} bytes of the referrers index were sent before it was refused"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
