@@ -31,7 +31,7 @@
         drive() { echo "-drive file=$work/$1,format=raw,if=virtio"; }
         lan() { # N: a card on the network the nodes share, and one out to this machine
             echo "-netdev socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1 -device virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
-                "-netdev user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443 -device virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1"
+                "-netdev user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443${net_restrict-,restrict=on} -device virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1"
         }
         vm() { # NAME [QEMU's arguments]: a machine whose serial console is logged and can be typed at
             name=$1
@@ -126,14 +126,14 @@
         vm install-beta $(drive beta.stick) -device virtio-scsi-pci,id=scsi \
             -drive "file=$work/spare.disk,format=raw,if=none,id=spare" -device scsi-hd,drive=spare,serial=kith-spare \
             -drive "file=$work/beta.disk,format=raw,if=none,id=beta" -device scsi-hd,drive=beta,serial=kith-beta \
-            -netdev user,id=out -device virtio-net-pci,netdev=out \
-            -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.install=http://10.0.2.2:$((port + 9))/beta.yaml#sha256=$pin"
+            -netdev "user,id=out,guestfwd=tcp:10.0.2.100:80-tcp:127.0.0.1:$((port + 9))${net_restrict-,restrict=on}" -device virtio-net-pci,netdev=out \
+            -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.install=http://10.0.2.100/beta.yaml#sha256=$pin"
         installed install-beta sd
         grep -aq 'kith OS is on sd[a-z] (.*serial kith-beta)' "$work/install-beta.log" || fail "install-beta did not install on the disk with serial kith-beta"
         cmp -s -n $((64 << 20)) "$work/spare.disk" /dev/zero || fail "the disk that was not chosen was written to"
         beta() { # LOG: the installed disk, started
             # shellcheck disable=SC2046
-            vm "$1" $(drive beta.disk) -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + 5))-:7443" -device virtio-net-pci,netdev=out
+            vm "$1" $(drive beta.disk) -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + 5))-:7443${net_restrict-,restrict=on}" -device virtio-net-pci,netdev=out
             hears "$1" 'kithd: init: beta is up'
             hears "$1" 'kithd: node beta serving other nodes on 0.0.0.0:7443'
             print $((port + 5))
