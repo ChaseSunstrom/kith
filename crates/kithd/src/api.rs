@@ -395,7 +395,7 @@ fn writer(caller: &Caller) -> &Caller {
 /// Package (a Release renders it with no more than its pusher's rights) written down as
 /// `caller`'s, and, for an Identity, the print of the key it has in `store`: what the client
 /// said of either is not taken. (None, as the local socket's: it acts for no key.)
-fn stamped(store: &Store, caller: &Caller, mut resources: Vec<Resource>) -> Vec<Resource> {
+pub(crate) fn stamped(store: &Store, caller: &Caller, mut resources: Vec<Resource>) -> Vec<Resource> {
     let who = writer(caller);
     let print = match who {
         Caller::Identity(name) => crate::releases::print_of(store, name),

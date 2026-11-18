@@ -319,6 +319,30 @@ fn fixture_3_entries() -> Vec<openraft::Entry<TypeConfig>> {
     entries
 }
 
+/// A state as format 4's builds wrote it: format 3's log, then the entry from which every
+/// node checks signed entries, a signed write and a blank. Its snapshot ends after the signed
+/// write, so both files hold what format 3 has not.
+const FIXTURE_4: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/format-4");
+const SNAPSHOT_4: usize = 20;
+
+fn fixture_4_entries() -> Vec<openraft::Entry<TypeConfig>> {
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let mut entries = fixture_3_entries();
+    let made = Command::Apply {
+        resources: vec![config("f", "1")],
+        at: 700,
+    };
+    for payload in [
+        EntryPayload::Normal(Command::MarkChecked),
+        EntryPayload::Normal(signed("local socket", 1200, 3, made)),
+        EntryPayload::Blank,
+    ] {
+        let log_id = LogId::new(CommittedLeaderId::new(3, 7), entries.len() as u64 + 1);
+        entries.push(Entry { log_id, payload });
+    }
+    entries
+}
+
 /// Every command of `entries` run in turn, each as its place in the log.
 fn whole(entries: Vec<openraft::Entry<TypeConfig>>) -> Store {
     let mut whole = Store::default();
@@ -351,19 +375,19 @@ fn formats(dir: &std::path::Path) -> (u32, u32) {
 fn format_fixture_is_written() {
     use openraft::RaftSnapshotBuilder;
     use openraft::storage::{RaftLogStorage, RaftStateMachine};
-    let dir = std::path::Path::new(FIXTURE_3);
+    let dir = std::path::Path::new(FIXTURE_4);
     std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
     std::fs::create_dir(dir).expect("this format's fixture is there already, and stays as it was written");
     let mut log = Log::open(&dir.join("log.redb")).unwrap();
     let mut machine = Machine::open(dir, Arc::new(|| {}), any()).unwrap();
-    let entries = fixture_3_entries();
+    let entries = fixture_4_entries();
     log.put(entries.clone()).unwrap();
     block(async {
         log.save_vote(&fixture_vote()).await.unwrap();
         log.save_committed(entries.last().map(|entry| entry.log_id))
             .await
             .unwrap();
-        machine.apply(entries[..SNAPSHOT_3].to_vec()).await.unwrap();
+        machine.apply(entries[..SNAPSHOT_4].to_vec()).await.unwrap();
         machine.build_snapshot().await.unwrap();
         log.purge(entries[PURGED - 1].log_id).await.unwrap();
     });
@@ -416,6 +440,17 @@ fn format_3_state_is_read_whole_by_this_build() {
     );
     assert!(read.signing());
     assert_eq!(formats(&dir.0), (3, 3));
+}
+
+#[test]
+fn format_4_state_is_read_whole_by_this_build() {
+    let (read, dir) = read_whole(FIXTURE_4, fixture_4_entries(), SNAPSHOT_4);
+    assert_eq!(read.born("ConfigMap/default/f"), Some((20, 700)));
+    assert_eq!(read.born("ConfigMap/default/d"), Some((16, 500)));
+    let book = serde_json::to_value(&read).unwrap()["signers"]["local socket"].clone();
+    assert_eq!(book[0], 1200);
+    assert!(read.checking() && read.signing());
+    assert_eq!(formats(&dir.0), (4, 4));
 }
 
 /// A copy of the state in `fixture`, opened by this build: the log reads as `entries`,
@@ -613,6 +648,51 @@ fn format_of_the_log_stays_3_after_a_mark_barrier() {
     run(&mut store, Command::MarkSigned).unwrap();
     run(&mut store, Command::Mark).unwrap();
     assert_eq!(crate::format_of(&store), 3);
+}
+
+/// Format 4 (every node checks signed entries) is the MarkChecked's, in the log and the store,
+/// and the marks before it, sent again as barriers, leave both in 4 (T-0783).
+#[test]
+fn format_of_the_log_is_4_with_mark_checked_and_stays() {
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let scratch = Scratch::new();
+    let path = scratch.0.join("log.redb");
+    std::fs::write(scratch.0.join("snapshot.json"), r#"{"format":1}"#).unwrap();
+    let entry = |index, command| Entry {
+        log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+        payload: EntryPayload::Normal(command),
+    };
+    let log = Log::open(&path).unwrap();
+    log.put([entry(1, Command::Mark), entry(2, Command::MarkSigned)])
+        .unwrap();
+    drop(log);
+    assert_eq!(formats(&scratch.0).0, 3);
+    let log = Log::open(&path).unwrap();
+    log.put([
+        entry(3, Command::MarkChecked),
+        entry(4, Command::Mark),
+        entry(5, Command::MarkSigned),
+    ])
+    .unwrap();
+    drop(log);
+    assert_eq!(formats(&scratch.0).0, 4);
+    let mut store = Store::default();
+    run(&mut store, Command::MarkSigned).unwrap();
+    assert_eq!(crate::format_of(&store), 3);
+    run(&mut store, Command::MarkChecked).unwrap();
+    run(&mut store, Command::Mark).unwrap();
+    run(&mut store, Command::MarkSigned).unwrap();
+    assert!(store.checking() && store.signing() && store.marked());
+    assert_eq!(crate::format_of(&store), 4);
+    // An import keeps it: what comes in is a store, not the cluster's format.
+    run(
+        &mut store,
+        Command::Import {
+            store: Store::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!(crate::format_of(&store), 4);
 }
 
 /// Two nodes fed one log, a signed entry in it the check at apply refuses: both stores end
@@ -1386,6 +1466,63 @@ fn forgotten_key_kept_from_before_is_cut_at_open() {
         replica.raft.shutdown().await.unwrap();
         drop(replica);
         assert!(!holds(&dir.0, WRAPPED).await);
+    });
+}
+
+/// A store that has Node/a at `address`, and one change of its kind.
+fn node_at(address: &str) -> Store {
+    let mut store = Store::default();
+    store.put(
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kith.dev/v1", "kind": "Node",
+            "metadata": { "name": "a" }, "spec": {}, "status": { "address": address },
+        }))
+        .unwrap(),
+    );
+    store
+}
+
+/// A snapshot another node sends, at `index`, with `store` as its state.
+async fn install(machine: &mut Machine, store: &Store, index: u64) {
+    use openraft::storage::RaftStateMachine;
+    let meta = openraft::SnapshotMeta {
+        last_log_id: Some(openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index)),
+        last_membership: Default::default(),
+        snapshot_id: format!("sent-{index}"),
+    };
+    let mut state = serde_json::to_value(crate::State::default()).unwrap();
+    state["store"] = serde_json::to_value(store).unwrap();
+    let sent = std::io::Cursor::new(serde_json::to_vec(&state).unwrap());
+    machine.install_snapshot(&meta, Box::new(sent)).await.unwrap();
+}
+
+/// A store brought in whole (Import, or a snapshot) counts the kinds it changes on from the store
+/// it replaces: a reader that kept the counts sees a changed Node come in.
+#[test]
+fn a_brought_in_store_moves_the_counts_of_the_kinds_it_changes() {
+    let mut store = node_at("10.1.2.3:7443");
+    let before = store.changes("Node");
+    run(
+        &mut store,
+        Command::Import {
+            store: node_at("10.9.9.9:7443"),
+        },
+    )
+    .unwrap();
+    assert!(
+        store.changes("Node") > before,
+        "Import: {before} then {}",
+        store.changes("Node")
+    );
+
+    let dir = Scratch::new();
+    block(async {
+        let mut machine = Machine::open(&dir.0, Arc::new(|| {}), any()).unwrap();
+        install(&mut machine, &node_at("10.1.2.3:7443"), 3).await;
+        let before = machine.state.lock().unwrap().store.changes("Node");
+        install(&mut machine, &node_at("10.9.9.9:7443"), 4).await;
+        let after = machine.state.lock().unwrap().store.changes("Node");
+        assert!(after > before, "a snapshot: {before} then {after}");
     });
 }
 

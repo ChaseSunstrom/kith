@@ -461,9 +461,9 @@ fn running_log_entries(node: &Node) -> Option<String> {
     log_entries(&copy).ok()
 }
 
-/// Every member's kithd reads store format 3, and says so with each answer to Raft's calls:
-/// the leader marks the store (format 2, then 3), every control node's log holds both marks
-/// (and so says format 3), and a node started again on that state serves. (Not behind KITH_E2E: it pulls nothing.)
+/// Every member's kithd reads store format 4, and says so with each answer to Raft's calls:
+/// the leader marks the store (format 2, then 3, then 4), every control node's log holds the three
+/// marks (and so says format 4), and a node started again on that state serves. (Not behind KITH_E2E: it pulls nothing.)
 #[test]
 fn the_store_is_marked_once_every_member_reads_its_format() {
     let test = "mark";
@@ -475,8 +475,10 @@ fn the_store_is_marked_once_every_member_reads_its_format() {
     let mut beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
     let mark = r#""payload":{"Normal":"Mark"}"#;
     let signing = r#""payload":{"Normal":"MarkSigned"}"#;
-    let marked = |node: &Node| running_log_entries(node).is_some_and(|log| log.contains(mark) && log.contains(signing));
-    wait_for("both logs to hold the mark", || marked(&alpha) && marked(&beta));
+    let checked = r#""payload":{"Normal":"MarkChecked"}"#;
+    let marks = [mark, signing, checked];
+    let marked = |node: &Node| running_log_entries(node).is_some_and(|log| marks.iter().all(|m| log.contains(m)));
+    wait_for("both logs to hold the marks", || marked(&alpha) && marked(&beta));
     // Each answers Raft's calls with the format its kithd reads: what a leader waits to hear
     // from every member before it marks. (Asked as beta, of alpha, and the other way.)
     let says = |of: &Node, by: &Node| {
@@ -490,7 +492,7 @@ fn the_store_is_marked_once_every_member_reads_its_format() {
     };
     for (of, by) in [(&alpha, &beta), (&beta, &alpha)] {
         let said = says(of, by);
-        assert!(said.contains("x-kith-store: 3"), "{said}");
+        assert!(said.contains("x-kith-store: 4"), "{said}");
     }
     // What is made now is of its entry in the log: both nodes answer, and agree.
     let config = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: after }\nspec: { data: { a: '1' } }\n";
@@ -500,14 +502,10 @@ fn the_store_is_marked_once_every_member_reads_its_format() {
     alpha.stop();
     beta.stop();
     for node in [&alpha, &beta] {
-        assert!(
-            store_holds(node, mark) && store_holds(node, signing),
-            "{}",
-            node.dir.display()
-        );
+        assert!(marks.iter().all(|m| store_holds(node, m)), "{}", node.dir.display());
         let snapshot = std::fs::read_to_string(node.dir.join("state/raft/snapshot.json")).unwrap_or_default();
         assert!(
-            snapshot.is_empty() || snapshot.starts_with(r#"{"format":3,"#),
+            snapshot.is_empty() || snapshot.starts_with(r#"{"format":4,"#),
             "{snapshot:.80}"
         );
     }

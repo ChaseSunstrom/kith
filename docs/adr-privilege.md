@@ -1,9 +1,30 @@
 # kithd in two parts: what reads the network holds no root
 
-Status: design, before any code (T-0334). Nothing here is built. A security review reads
-this record before the first line of the split is written; what it finds is decided at
-the end ("Review"). The first cut ("Step A") ships by itself and is worth having even if
-the rest is never built.
+Status: design, partly built (T-0334). Built: Step A, the node's own policy
+(`crates/kithd/src/policy.rs`, read and applied in `main.rs:729-734`), and the seam of the
+split in `crates/kithd/src/root_part.rs`, with listeners as its first family. Not built:
+the socket, the second process, every other family, the serving part's confinement. A
+security review read this record before the split was written; what it found is decided
+at the end ("Review"). Step A ships by itself and is worth having even if the rest is
+never built.
+
+What is built, where the code is the word where this record differs:
+
+- **Step A** (`policy.rs`): `read` takes `KITH_NODE_POLICY` or the flag, `cut` applies it,
+  `set`/`get` hold it for the process; its status is in the node's status (`main.rs:1121`).
+- **`root_part.rs`**: the `Request` enum (only `Bind` so far, `deny_unknown_fields`), its
+  wire (`decode`: JSON, at most `MAX_REQUEST` = 256 KiB, unknown fields and variants
+  refused; nothing reads a wire yet, the tests do), `check` (a request is refused for what
+  it is, never for who asks; `Bind` refuses kithd's own ports 7443, 5000, 51820 and
+  multicast addresses), and the `Root` trait with its in-process `Direct`.
+- **`Bind`** is used by `share.rs`'s NFS listener (`share.rs:397`).
+- There is no socket and no second process yet.
+
+The carve of the rest, one task each: T-0808 pods and Services behind `Root`, with a
+counter of crossings; T-0809 mesh, images, units, volumes and node; T-0810 the socket
+pair transport, `--split` off by default; T-0811 confinement of the serving part, tied
+lifetimes of the two parts, and the VM test of privilege; T-0812 the before and after
+runs, the budgets, and `--split` on by default.
 
 ## The problem
 
@@ -408,7 +429,8 @@ used by `share.rs`'s NFS listener). No socket and no second process yet.
 Taken in step 4 on the commit before Step A and again after the split, three runs each
 on the same VMs: apply to ready, and requests a second through a Service
 (`ci/compare.sh`'s rows by those names), and idle memory of both parts together (each
-part's proportional share, summed). The before runs are written here when taken. Two
+part's proportional share, summed). The before and after runs are taken and written here
+by T-0812, not before. Two
 processes of one binary share its text; the root part's own memory is what is added.
 The 9.00 MB idle budget is not moved by this task: if the sum passes what the single
 process holds today, the owner is asked.

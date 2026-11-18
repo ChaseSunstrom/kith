@@ -44,7 +44,7 @@ sh ci/vm.sh --test image   # boot a copy of it under UEFI in QEMU and check it
 
 | Part | What it is |
 | --- | --- |
-| kernel | 6.18, 13 MB, from kernel.org's source at a pinned version and checksum (`os/kernel.config`): no modules, no initramfs; NVMe, SATA, USB and SD storage, the common wired cards, virtio, WireGuard, dm-verity, dm-crypt, KVM. The first build takes ten minutes or so |
+| kernel | 6.18, 13 MB, from kernel.org's source at a pinned version and checksum (`os/kernel.config`): no modules, no initramfs; NVMe, SATA, USB and SD storage, the common wired cards, virtio, WireGuard, dm-verity, dm-crypt, KVM, the IOMMU drivers (Intel and AMD). The first build takes ten minutes or so |
 | root | a read-only squashfs of about 6 MB: kithd as `/sbin/init`, `kith`, curl's CA bundle. No shell, no libc, no package manager |
 | verity | the root's dm-verity hash is on the command line inside the one EFI file the firmware starts (systemd's stub, the kernel, the command line), so a changed root is refused block by block |
 | disk | GPT: `esp` (systemd-boot, `kith-1-a.efi`), `root-a` and `verity-a`, `root-b` and `verity-b` (empty: an update goes there), `state` (ext4), the only partition a running node writes |
@@ -82,6 +82,21 @@ update is 43 MB against 34 and the ESP's two kernels 36 of its 64 MB; the root i
 Built and started under UEFI in QEMU, the kernel brings amdgpu up (`amdgpu: Topology: Add CPU
 node`) and kithd serves; on a 780M itself it has not run yet.
 
+`vfio`, to prepare the kernel for handing a PCI card (a GPU, a USB controller) to a virtual
+machine: the IOMMU switched on (Intel's, with interrupt remapping) and `vfio-pci` built in
+(`os/examples/vfio.yaml`). That is all it does: binding a card to `vfio-pci`, and `vms` on kith
+OS (there is no qemu in the image), come later. Every kith OS kernel, spec or not, has the
+IOMMU drivers pinned in `os/kernel.config` (x86's default config already had them), Intel's
+off by default as before: nothing on an installed node's command line can turn it on, so the
+spec does. Measured: the plain kernel is byte for byte the one it was, 13,489,152 bytes, the
+update 34,288,640 and the raw image the same 282 MiB, under its 300 MB budget; the `vfio`
+spec's kernel is 13,558,784 bytes (+68 KiB, 69,632 bytes), its update 34,427,904. Booted in
+QEMU with a virtual Intel IOMMU (`-machine q35,kernel-irqchip=split -device
+intel-iommu,intremap=on`), the plain kernel reads the IOMMU's table and leaves it off, and the
+`vfio` one says `DMAR: Intel(R) Virtualization Technology for Directed I/O`, `DMAR-IR: Enabled
+IRQ remapping in x2apic mode` and `VFIO - User Level meta-driver version: 0.3`. Passing a real
+card through has not been tried: that is on hardware.
+
 A node can say which features it wants itself. kithd matches its PCI cards (`lspci -n` ids) against
 the `# pci:` lines of `os/features/` and lists the features that match as `wants` in its Node status.
 `kith node features` prints them as a spec, which builds that node's image:
@@ -100,6 +115,7 @@ card the catalogue does not list yet) is chosen by hand, as above.
 ```sh
 KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
 KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
+sh ci/vm.sh --test modules   # the same image: drivers load at start, on a device added, and a bad signature is refused
 ```
 
 For a node whose hardware is not known when the image is built, `features: [all]` turns on
@@ -126,12 +142,12 @@ of paths there (`amdgpu/*`) is those files, and in both cases the files each mod
   node installed from a plain image has slots too small to be updated to this one.
 - **Sizes** (the plain image is 295,715,328 bytes, as before, and its kernel the same bytes):
   kernel 13 MB; modules 77 MB (170 of them) and firmware 1,992 MB, both before compression; the
-  root 931 MB squashfs; the raw disk image 2,576 MB (953 MB as qcow2), the update file 965 MB. The check for it is 4 GB,
-  not the plain 300 MB. The installer's memory disk carries the payload and not the modules.
-- **Not yet.** kithd does not load modules (`finit_module`): this installs them, so a node of
-  this image has its drivers on disk and loads none yet. The NVIDIA open modules are a later
-  slice: built out of tree against this kernel and signed with the same throwaway key in the
-  same build. A spec naming both `all` and `gpu-amd-phoenix` is refused (the same driver, built in there).
+  root 931 MB squashfs; the raw disk image 2,576 MB (954 MB as qcow2); the update file 966 MB.
+  `build.sh --check` allows the `all` image 4 GB, not the plain 300 MB. The installer's memory
+  disk carries the payload and not the modules.
+- **Not in it yet.** The NVIDIA open modules: a later slice, built out of tree against this
+  kernel and signed with the same throwaway key in the same build. A spec naming both `all` and
+  `gpu-amd-phoenix` is refused (the same driver, built in there).
 
 A cluster runs plain and GPU nodes side by side: sign each image's update as its own
 `OSRelease` and roll each with its own `UpdatePlan`, the GPU one with a `selector` on a label

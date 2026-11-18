@@ -36,17 +36,20 @@ use std::sync::{Arc, Mutex};
 /// This is the newest a build reads. What it writes is [`format_of`] its store: 1 until the
 /// cluster's one [`Command::Mark`], so a kithd started on a format 1 state leaves it one an
 /// older kithd reads, and going back is possible until every member has the newer. Format 3
-/// is the same after [`Command::MarkSigned`].
-pub const FORMAT: u32 = 3;
+/// is the same after [`Command::MarkSigned`], and 4 after [`Command::MarkChecked`].
+pub const FORMAT: u32 = 4;
 
-/// The format `store` is written in: 3 once it keeps the nonces of signed entries (an older
-/// build would drop them, and could not run one), 2 once it keeps when each resource was
-/// first made (an older build would drop that, and order by what is left), 1 before.
+/// The format `store` is written in: 4 once every node checks signed entries (a format 3
+/// build refuses every one, and would part from the others on the first: T-0783), 3 once it
+/// keeps the nonces of signed entries (an older build would drop them, and could not run one),
+/// 2 once it keeps when each resource was first made (an older build would drop that, and
+/// order by what is left), 1 before.
 pub fn format_of(store: &Store) -> u32 {
-    match (store.signing(), store.marked()) {
-        (true, _) => 3,
-        (false, true) => 2,
-        (false, false) => 1,
+    match (store.checking(), store.signing(), store.marked()) {
+        (true, ..) => 4,
+        (false, true, _) => 3,
+        (false, false, true) => 2,
+        (false, false, false) => 1,
     }
 }
 
@@ -170,6 +173,10 @@ pub enum Command {
     /// From here on the store keeps the nonces of signed entries ([`Store::sign`]), marked
     /// first if it was not, and is in format 3: once, as [`Command::Mark`] is.
     MarkSigned,
+    /// From here on every node checks a signed entry before it runs it ([`Store::check`]),
+    /// the store keeping nonces first if it did not, and is in format 4: once, as
+    /// [`Command::Mark`] is. Only then does the leader write signed entries.
+    MarkChecked,
 }
 
 /// What a command that worked gives back.
@@ -235,6 +242,7 @@ pub fn run(store: &mut Store, command: Command) -> Reply {
         Command::Import { store: imported } => {
             // (What comes in is from before replication, and so from before the mark.)
             let before = std::mem::replace(store, imported);
+            store.continue_changes(&before);
             store.cut_node_key_histories();
             if before.marked() {
                 store.mark();
@@ -249,6 +257,12 @@ pub fn run(store: &mut Store, command: Command) -> Reply {
         Command::MarkSigned => {
             store.mark();
             store.sign();
+            Ok(Done::Nothing)
+        }
+        Command::MarkChecked => {
+            store.mark();
+            store.sign();
+            store.check();
             Ok(Done::Nothing)
         }
         Command::Signed { header, command, .. } => {
@@ -290,7 +304,8 @@ pub fn keys(command: &Command) -> Option<Vec<String>> {
         | Command::Delete { .. }
         | Command::Rollback { .. }
         | Command::Mark
-        | Command::MarkSigned => Vec::new(),
+        | Command::MarkSigned
+        | Command::MarkChecked => Vec::new(),
     })
 }
 
