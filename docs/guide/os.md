@@ -44,7 +44,7 @@ sh ci/vm.sh --test image   # boot a copy of it under UEFI in QEMU and check it
 
 | Part | What it is |
 | --- | --- |
-| kernel | 6.18, 13 MB, from kernel.org's source at a pinned version and checksum (`os/kernel.config`): no modules, no initramfs; NVMe, SATA, USB and SD storage, the common wired cards, virtio, WireGuard, dm-verity, dm-crypt, KVM. The first build takes ten minutes or so |
+| kernel | 6.18, 13 MB, from kernel.org's source at a pinned version and checksum (`os/kernel.config`): no modules, no initramfs; NVMe, SATA, USB and SD storage, the common wired cards, virtio, WireGuard, dm-verity, dm-crypt, KVM, the IOMMU drivers (Intel and AMD). The first build takes ten minutes or so |
 | root | a read-only squashfs of about 6 MB: kithd as `/sbin/init`, `kith`, curl's CA bundle. No shell, no libc, no package manager |
 | verity | the root's dm-verity hash is on the command line inside the one EFI file the firmware starts (systemd's stub, the kernel, the command line), so a changed root is refused block by block |
 | disk | GPT: `esp` (systemd-boot, `kith-1-a.efi`), `root-a` and `verity-a`, `root-b` and `verity-b` (empty: an update goes there), `state` (ext4), the only partition a running node writes |
@@ -81,6 +81,21 @@ ceiling there. It costs the kernel 4.2 MB (17.9 MB against 13.5, firmware includ
 update is 43 MB against 34 and the ESP's two kernels 36 of its 64 MB; the root is the same.
 Built and started under UEFI in QEMU, the kernel brings amdgpu up (`amdgpu: Topology: Add CPU
 node`) and kithd serves; on a 780M itself it has not run yet.
+
+`vfio`, to prepare the kernel for handing a PCI card (a GPU, a USB controller) to a virtual
+machine: the IOMMU switched on (Intel's, with interrupt remapping) and `vfio-pci` built in
+(`os/examples/vfio.yaml`). That is all it does: binding a card to `vfio-pci`, and `vms` on kith
+OS (there is no qemu in the image), come later. Every kith OS kernel, spec or not, has the
+IOMMU drivers pinned in `os/kernel.config` (x86's default config already had them), Intel's
+off by default as before: nothing on an installed node's command line can turn it on, so the
+spec does. Measured: the plain kernel is byte for byte the one it was, 13,489,152 bytes, the
+update 34,288,640 and the raw image the same 282 MiB, under its 300 MB budget; the `vfio`
+spec's kernel is 13,558,784 bytes (+68 KiB, 69,632 bytes), its update 34,427,904. Booted in
+QEMU with a virtual Intel IOMMU (`-machine q35,kernel-irqchip=split -device
+intel-iommu,intremap=on`), the plain kernel reads the IOMMU's table and leaves it off, and the
+`vfio` one says `DMAR: Intel(R) Virtualization Technology for Directed I/O`, `DMAR-IR: Enabled
+IRQ remapping in x2apic mode` and `VFIO - User Level meta-driver version: 0.3`. Passing a real
+card through has not been tried: that is on hardware.
 
 A node can say which features it wants itself. kithd matches its PCI cards (`lspci -n` ids) against
 the `# pci:` lines of `os/features/` and lists the features that match as `wants` in its Node status.
