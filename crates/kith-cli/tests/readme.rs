@@ -552,8 +552,17 @@ fn the_installer_page_is_there_and_linked() {
     let read = |path: &str| std::fs::read_to_string(root().join(path)).unwrap();
     let page = read("docs/install.html");
     for name in ["default", "example", "custom"] {
-        assert!(page.contains(&format!("<pre data-answers=\"{name}\"")), "docs/install.html has no <pre data-answers=\"{name}\">");
+        assert!(
+            page.contains(&format!("<pre data-answers=\"{name}\"")),
+            "docs/install.html has no <pre data-answers=\"{name}\">"
+        );
     }
-    assert!(read("docs/index.html").contains("href=\"install.html\""), "docs/index.html does not link docs/install.html");
-    assert!(read("docs/guide/os.md").contains("](../install.html)"), "docs/guide/os.md does not link docs/install.html");
+    assert!(
+        read("docs/index.html").contains("href=\"install.html\""),
+        "docs/index.html does not link docs/install.html"
+    );
+    assert!(
+        read("docs/guide/os.md").contains("](../install.html)"),
+        "docs/guide/os.md does not link docs/install.html"
+    );
 }

@@ -1462,7 +1462,9 @@ mod tests {
     fn the_install_page_examples_are_answers_the_installer_takes() {
         const PAGE: &str = include_str!("../../../docs/install.html");
         let example = |name: &str| {
-            let from = PAGE.find(&format!("<pre data-answers=\"{name}\"")).unwrap_or_else(|| panic!("no {name} example"));
+            let from = PAGE
+                .find(&format!("<pre data-answers=\"{name}\""))
+                .unwrap_or_else(|| panic!("no {name} example"));
             let body = &PAGE[from..];
             let body = &body[body.find('>').unwrap() + 1..body.find("</pre>").unwrap()];
             let mut text = String::new();
@@ -1475,7 +1477,10 @@ mod tests {
                     _ => {}
                 }
             }
-            text.replace("&quot;", "\"").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+            text.replace("&quot;", "\"")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&")
         };
         let mut seen = Vec::new();
         for name in ["default", "example", "custom"] {
@@ -1483,16 +1488,27 @@ mod tests {
             let told = answers(&yaml).unwrap_or_else(|e| panic!("{name}:\n{yaml}\n{e}"));
             let mut one = disk("nvme0n1", 256);
             one.serial = "S4EWNX0R123456".into();
-            let (_, config) = plan(&told, &[one], 300 << 20, 1 << 20).unwrap_or_else(|e| panic!("{name}:\n{yaml}\n{e}"));
+            let (_, config) =
+                plan(&told, &[one], 300 << 20, 1 << 20).unwrap_or_else(|e| panic!("{name}:\n{yaml}\n{e}"));
             seen.push((told, config));
         }
         // The default is the one disk and nothing else; the example fills in every field.
-        assert_eq!(seen[0].0, Answers { disk: "only".into(), ..Answers::default() });
+        assert_eq!(
+            seen[0].0,
+            Answers {
+                disk: "only".into(),
+                ..Answers::default()
+            }
+        );
         let full = &seen[1].0;
         assert!(full.disk.starts_with("serial:") && full.hostname.is_some() && full.ip.is_some() && full.dns.is_some());
         assert!(full.join.is_some() && full.encrypt && full.release_key.is_some() && full.lan_releases);
         assert!(full.node_policy.is_some());
-        assert!(seen[1].1.contains("--join ") && seen[1].1.contains("--release-key ") && seen[1].1.contains("--lan-releases"));
+        assert!(
+            seen[1].1.contains("--join ")
+                && seen[1].1.contains("--release-key ")
+                && seen[1].1.contains("--lan-releases")
+        );
         // The third is what the form writes for a fixed address with its way out, a join and a policy of its
         // own words (ci/site_shots.py fills the form from the block's data-fields and compares): the installer
         // takes the address, the join and the policy as the words the form joined.
@@ -1502,6 +1518,10 @@ mod tests {
         assert_eq!(custom.join.as_ref().map(|j| j.address.as_str()), Some("10.0.0.7:7443"));
         assert_eq!(custom.node_policy.as_deref(), Some("hardened,vms,devices=gpu+input"));
         assert!(!custom.encrypt && !custom.lan_releases && custom.release_key.is_none() && custom.dns.is_none());
-        assert!(seen[2].1.contains("--advertise 10.0.0.6:") && seen[2].1.contains("--join 10.0.0.7:7443 --token ") && seen[2].1.contains("--node-policy hardened,vms,devices=gpu+input"));
+        assert!(
+            seen[2].1.contains("--advertise 10.0.0.6:")
+                && seen[2].1.contains("--join 10.0.0.7:7443 --token ")
+                && seen[2].1.contains("--node-policy hardened,vms,devices=gpu+input")
+        );
     }
 }
