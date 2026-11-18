@@ -30,17 +30,57 @@ struct Pod {
 }
 
 /// What a container of a pod is given.
+#[derive(Clone, Debug)]
 pub struct Given {
     /// The pod's network namespace, by a path any process of this machine can open.
     pub netns: PathBuf,
     pub hostname: String,
     /// The pod's `resolv.conf` and `hosts`, for the container's `/etc`.
     pub files: [PathBuf; 2],
+    /// The pod's address, for a variable that asks.
+    pub address: IpAddr,
 }
+
+/// What the serving part was told when it asked for a pod, so that a pod's second container
+/// asks the root part nothing (`root_part::pod`).
+struct Told {
+    exit: Option<u16>,
+    hostname: String,
+    given: Given,
+}
+
+/// Sockets made ahead inside one pod's namespace, for the connections of its Services and
+/// probes: a connection takes one instead of a thread and a `setns` of its own.
+#[derive(Default)]
+struct Spare {
+    v4: Vec<OwnedFd>,
+    v6: Vec<OwnedFd>,
+    /// Which family last reached something: the one tried first.
+    v6_first: bool,
+    used: Option<std::time::Instant>,
+}
+
+impl Spare {
+    fn pool(&mut self, v6: bool) -> &mut Vec<OwnedFd> {
+        if v6 { &mut self.v6 } else { &mut self.v4 }
+    }
+}
+
+/// A connection takes a spare socket while more than this many are left; at this many it asks
+/// for [`BATCH`] more first. So N connections cost at most N/8 + 1 requests.
+const LOW: usize = 8;
+/// What one request for sockets asks for (the root part takes at most this many at once).
+pub const BATCH: usize = 16;
+/// The most spare sockets of one family a pod keeps.
+const MOST: usize = 32;
+/// Spare sockets of a pod nothing connected to for this long are closed.
+const SPARE_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Default)]
 pub struct Pods {
     made: BTreeMap<String, Pod>,
+    told: BTreeMap<String, Told>,
+    spares: BTreeMap<String, Spare>,
     /// Told once the node is ready for pods: its DNS for them starts then.
     up: Arc<Notify>,
     /// Told when a pod is made or let go (its address may be given to the next): the
@@ -142,12 +182,64 @@ impl Pods {
             netns: netns.into(),
             hostname: hostname.into(),
             files: [pod.dir.join("resolv.conf"), pod.dir.join("hosts")],
+            address: pod.address,
         })
+    }
+
+    /// What was told of pod `id` when its first container asked, if the exit and hostname are
+    /// the ones asked for now: a pod asked for another way goes to the root part, which says no.
+    pub fn told(&self, id: &str, hostname: &str, exit: Option<u16>) -> Option<Given> {
+        let told = self.told.get(id)?;
+        let alive = self.made.contains_key(id);
+        (alive && told.exit == exit && told.hostname == hostname).then(|| told.given.clone())
+    }
+
+    pub fn remember(&mut self, id: &str, exit: Option<u16>, given: &Given) {
+        let hostname = given.hostname.clone();
+        let given = given.clone();
+        self.told.insert(id.into(), Told { exit, hostname, given });
+    }
+
+    /// A pod `id` that is made, for a test that has no network to make one with.
+    #[cfg(test)]
+    pub fn pretend(&mut self, id: &str, state: &Path) {
+        let namespace = std::fs::File::open("/dev/null").expect("/dev/null opens").into();
+        let (address, dir) = (Ipv4Addr::LOCALHOST.into(), state.join("pods").join(id));
+        let pod = Pod {
+            number: 1,
+            exit: None,
+            namespace,
+            address,
+            dir,
+        };
+        self.made.insert(id.into(), pod);
+    }
+
+    /// Whether `path` is the way to the namespace of a pod this node made (`Given::netns`):
+    /// the only network namespace a container is started in, other than the node's.
+    pub fn owns_netns(&self, path: &Path) -> bool {
+        let pid = std::process::id();
+        let ours = |pod: &Pod| Path::new(&format!("/proc/{pid}/fd/{}", pod.namespace.as_raw_fd())) == path;
+        self.made.values().any(ours)
+    }
+
+    /// `count` stream sockets made inside pod `id`'s namespace, on one thread: a pod gone is
+    /// an error, and never the node's.
+    pub fn sockets(&self, id: &str, v6: bool, count: usize) -> Result<Vec<OwnedFd>, String> {
+        let pod = self.made.get(id).ok_or("the pod is not on this node")?;
+        let make = || (0..count).map(|_| crate::root_part::stream_socket(v6)).collect();
+        let made: std::io::Result<Vec<OwnedFd>> = kith_mesh::pod::within(&pod.namespace, make).and_then(|made| made);
+        made.map_err(|e| format!("sockets in the pod {id}: {e}"))
     }
 
     /// Let go of every pod `wanted` does not name: its namespace goes with its last process.
     pub fn keep(&mut self, wanted: impl Fn(&str) -> bool) {
         let before = self.made.len();
+        // (What was told of a pod gone, and the sockets made ahead in it, go with it; spares
+        // nothing connected to for a while are closed.)
+        self.told.retain(|id, _| wanted(id));
+        let idle = |spare: &Spare| spare.used.is_some_and(|at| at.elapsed() > SPARE_IDLE);
+        self.spares.retain(|id, spare| wanted(id) && !idle(spare));
         self.made.retain(|id, pod| {
             let kept = wanted(id);
             if !kept {
@@ -248,23 +340,100 @@ impl Pods {
 /// A connection to `port` of a pod, or (`None`, or a pod with no network of its own) of
 /// this machine: on the loopback either way, so what listens only there is reached.
 //
-// ponytail: a thread is started and ended for every connection into a pod (the socket has
-// to be made inside its namespace). Sockets made ahead, or the kernel passing the
-// connection on (services.rs's own note), when a node's Services are that busy.
+// A socket made inside a pod's namespace takes a thread and a `setns`: so they are made
+// ahead, [`BATCH`] to a request of the root part (`root_part::Request::Sockets`), and a
+// connection takes one. (The kernel passing the connection on, services.rs's own note, when
+// a node's Services are busier than that.)
 pub async fn connect(pod: Option<(&Shared, &str)>, port: u16) -> std::io::Result<TcpStream> {
-    let socket = |v4: bool| -> std::io::Result<TcpSocket> {
-        let make = || if v4 { TcpSocket::new_v4() } else { TcpSocket::new_v6() };
-        let Some((shared, id)) = pod else { return make() };
+    let made = |shared: &Shared, id: &str| {
         let pods = shared.pods.lock().expect("nothing panics holding the pods");
-        match pods.made.get(id) {
-            Some(pod) => kith_mesh::pod::within(&pod.namespace, make)?,
-            None => make(),
-        }
+        pods.made.contains_key(id)
     };
-    match socket(true)?.connect((Ipv4Addr::LOCALHOST, port).into()).await {
-        Ok(stream) => Ok(stream),
-        Err(_) => socket(false)?.connect((Ipv6Addr::LOCALHOST, port).into()).await,
+    match pod {
+        Some((shared, id)) if made(shared, id) => {
+            let root = crate::root_part::Direct::today(&shared.pods, None);
+            through(&root, &shared.pods, id, port).await
+        }
+        _ => match TcpSocket::new_v4()?.connect((Ipv4Addr::LOCALHOST, port).into()).await {
+            Ok(stream) => Ok(stream),
+            Err(_) => TcpSocket::new_v6()?.connect((Ipv6Addr::LOCALHOST, port).into()).await,
+        },
     }
+}
+
+/// A connection to `port` on the loopback of pod `id`, from a socket made ahead there. The
+/// family that last reached something goes first.
+pub async fn through<R: crate::root_part::Root>(
+    root: &R,
+    pods: &std::sync::Mutex<Pods>,
+    id: &str,
+    port: u16,
+) -> std::io::Result<TcpStream> {
+    let first = pods
+        .lock()
+        .expect("nothing panics holding the pods")
+        .spares
+        .entry(id.into())
+        .or_default()
+        .v6_first;
+    let mut last = None;
+    for v6 in [first, !first] {
+        let fd = take(root, pods, id, v6).map_err(std::io::Error::other)?;
+        let socket = TcpSocket::from_std_stream(std::net::TcpStream::from(fd));
+        let to: std::net::SocketAddr = match v6 {
+            true => (Ipv6Addr::LOCALHOST, port).into(),
+            false => (Ipv4Addr::LOCALHOST, port).into(),
+        };
+        match socket.connect(to).await {
+            Ok(stream) => {
+                pods.lock()
+                    .expect("nothing panics holding the pods")
+                    .spares
+                    .entry(id.into())
+                    .or_default()
+                    .v6_first = v6;
+                return Ok(stream);
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.expect("both families were tried"))
+}
+
+/// A spare socket of pod `id`: one of those made ahead while more than [`LOW`] are left,
+/// else [`BATCH`] more are asked for first (with no lock held: the root part takes the pods').
+fn take<R: crate::root_part::Root>(
+    root: &R,
+    pods: &std::sync::Mutex<Pods>,
+    id: &str,
+    v6: bool,
+) -> Result<OwnedFd, String> {
+    let held = || pods.lock().expect("nothing panics holding the pods");
+    {
+        let mut pods = held();
+        let spare = pods.spares.entry(id.into()).or_default();
+        spare.used = Some(std::time::Instant::now());
+        if spare.pool(v6).len() > LOW {
+            return Ok(spare.pool(v6).pop().expect("more than LOW are spare"));
+        }
+    }
+    let count = u8::try_from(BATCH).expect("a batch is under 256");
+    let asked = root.request(crate::root_part::Request::Sockets {
+        pod: id.into(),
+        v6,
+        count,
+    });
+    let mut pods = held();
+    let pool = pods.spares.entry(id.into()).or_default().pool(v6);
+    match asked {
+        Ok(crate::root_part::Reply::Sockets(more)) => pool.extend(more),
+        Ok(_) => return Err("the root part answered a request for sockets with something else".into()),
+        // (A refused refill is no loss while sockets are still spare.)
+        Err(e) if pool.is_empty() => return Err(e),
+        Err(_) => {}
+    }
+    pool.truncate(MOST);
+    pool.pop().ok_or_else(|| "no socket was made".into())
 }
 
 /// Make the node's tables for its pods again where they are gone while pods run (`nft flush

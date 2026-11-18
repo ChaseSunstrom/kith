@@ -229,6 +229,17 @@ Sockets made ahead cost kernel memory while idle: 16 unconnected TCP sockets a p
 Measured in step 4; if it shows in the idle budget the count becomes 4 until a pod has
 taken its first connection.
 
+As built in one process (T-0808, `kithd/src/root_part.rs`): `Direct` does `Pod`, `Sockets`
+(16 a request, asked for when 8 are left, and only for a pod's address family that
+connections use), and `Create` and `Start`, each after `check` or `check_create` has
+looked at what is asked and never at who asks: a mount outside the state directory, a device no
+claim granted, a network namespace that is no pod's of this node, and what the node's
+policy has none of are refused. A `Book` counts what crosses, and the `crossings` tests
+assert this table against it. `Create` and `Start` take an image and a handle that have no
+wire form yet, so they are methods of `Root` and not variants of `Request` until the root part is
+a process (T-0810). The bound of 32 unused sockets a pod and their time is kept by the serving
+part, since a root part in this process cannot tell which are unused.
+
 **The sixth criterion is corrected by this record**: it said "none for a Service
 connection". With sockets made ahead it is "at most N/8 + 1 for N connections into a
 pod, and none for any other". The rival that reaches zero, a rule in each pod's

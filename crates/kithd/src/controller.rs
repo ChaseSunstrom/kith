@@ -14,6 +14,7 @@ mod prune;
 pub mod storage;
 
 use crate::Shared;
+use crate::root_part::Root;
 use futures_util::FutureExt;
 use kith_api::Resource;
 use kith_api::kinds::{
@@ -792,6 +793,8 @@ impl Controller {
                 found,
             )
         };
+        // What the root part will give a container: these device nodes and no others.
+        crate::root_part::claim(granted.values().flat_map(|granted| granted.devices.iter().cloned()));
         let mut wanted: BTreeMap<String, Slot> = BTreeMap::new();
         // Per Workload, NodeWorkload or Job key: things to say in its status that belong to no unit.
         let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -2322,6 +2325,8 @@ async fn start(
         Run::Container(c) => &c.resources,
         Run::Exec(e) => &e.resources,
     };
+    // What this node's root part does for the units it starts (docs/adr-privilege.md).
+    let root = crate::root_part::Direct::today(&shared.pods, Some(runtime));
     let mut unit = Unit {
         env: slot.env.clone()?,
         // (An exec unit is given none: it sees all of `/dev`. A PCI device held for a VM is
@@ -2447,12 +2452,17 @@ async fn start(
         // (Only root can make a network: elsewhere the pod shares the node's.)
         if nix::unistd::getuid().is_root() {
             let net = mesh.map(|(prefix, me)| kith_mesh::node_net(prefix, me));
-            let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
-            let exit = exit.as_ref().map(|(tunnel, dns)| (*tunnel, dns.as_slice()));
-            let given = pods.given(state, pod, namespace, hostname, net, exit)?;
+            let ask = crate::root_part::Request::Pod {
+                id: pod.clone(),
+                namespace: namespace.into(),
+                hostname: hostname.clone(),
+                net,
+                exit,
+            };
+            let given = crate::root_part::pod(&root, &shared.pods, ask)?;
             unit.netns = Some(given.netns);
             unit.hostname = Some(given.hostname);
-            address = pods.address(pod).or(address);
+            address = Some(given.address).or(address);
             for (file, at) in given.files.into_iter().zip(["/etc/resolv.conf", "/etc/hosts"]) {
                 unit.mounts.push(kith_runtime::Mount {
                     host: file,
@@ -2519,13 +2529,20 @@ async fn start(
                 .pull_signed(&c.image, policy, &signed_by)
                 .await
                 .map_err(|e| e.to_string())?;
-            let created = runtime.create(id, &image, &unit, log("out")?, log("err")?);
+            let (out, err) = (log("out")?, log("err")?);
+            let created = root.create(crate::root_part::Create {
+                id,
+                image: &image,
+                unit: &unit,
+                out,
+                err,
+            });
             // The runtime says what the container would be; here whose word refused it.
-            let whose = |e: kith_runtime::Error| match e.to_string().contains(kith_runtime::NODE_ROOT) {
+            let whose = |e: String| match e.contains(kith_runtime::NODE_ROOT) {
                 true => format!(
                     "this node's policy refuses containers that are the node's root (rootContainers is off: `--node-policy root-containers` where the node's kithd is started allows them): {e}"
                 ),
-                false => e.to_string(),
+                false => e,
             };
             created.map_err(whose)
         }
@@ -2536,21 +2553,20 @@ async fn start(
                 .map_err(|e| e.to_string())
         }
     };
-    let mut handle = created?;
-    // Written down before it runs: a unit may end kithd at once (as ci/vm/outlive.sh's does),
-    // and one that ran with no record would be run again by the next.
+    let handle = created?;
+    // Written down before it runs (`Hands::start`): a unit may end kithd at once (as
+    // ci/vm/outlive.sh's does), and one that ran with no record would be run again by the next.
     // ponytail: an exec unit whose kithd ends between this and `start` gets no go, ends, and is
     // taken back as ended: a Job fails once in that window of microseconds.
-    runtime.record(id, &handle, &mark(slot));
-    match handle.start() {
-        Ok(()) => Ok(handle),
-        Err(e) => {
+    match root.start(handle, id, &mark(slot)) {
+        Ok(handle) => Ok(handle),
+        Err((handle, e)) => {
             // It never ran; what processes it left are the slot's to hold until they are gone.
             // (Deleted here, not on a thread: this start is given up when kithd ends, and a
             // delete nobody waits for any more would be cut short by the exit.)
             slot.tried = Some(Instant::now());
             stopped(id, slot, handle.delete());
-            Err(e.to_string())
+            Err(e)
         }
     }
 }
