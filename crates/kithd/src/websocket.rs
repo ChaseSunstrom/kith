@@ -2,6 +2,9 @@
 //! with no new dependency: the accept key, a frame decoder that refuses what is malformed and bounds
 //! every length before any of its body is read, and the encoder. No extension (RSV bits stay 0),
 //! no fragmentation, no continuation frames.
+//!
+//! ponytail: the slice that carries stdin must accept continuation frames (opcode 0), capping the
+//! reassembled message at FRAME_MAX: kubectl's gorilla client splits its writes over a 4 KiB buffer.
 
 use base64::Engine;
 
@@ -26,7 +29,10 @@ pub(crate) struct Frame {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FrameError {
     /// The header declares more payload than the caller allows. Refused before any body is read.
-    TooLong { len: u64, max: usize },
+    TooLong {
+        len: u64,
+        max: usize,
+    },
     Malformed(&'static str),
 }
 
@@ -37,7 +43,10 @@ pub(crate) fn accept_key(client_key: &str) -> Option<String> {
     if raw.len() != 16 {
         return None;
     }
-    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, format!("{client_key}{GUID}").as_bytes());
+    let digest = ring::digest::digest(
+        &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+        format!("{client_key}{GUID}").as_bytes(),
+    );
     Some(base64::engine::general_purpose::STANDARD.encode(digest))
 }
 
@@ -68,7 +77,11 @@ pub(crate) fn decode(buf: &[u8], from_client: bool, max: usize) -> Result<Option
     }
     let masked = b1 & 0x80 != 0;
     if masked != from_client {
-        return Err(FrameError::Malformed(if from_client { "a client frame is not masked" } else { "a server frame is masked" }));
+        return Err(FrameError::Malformed(if from_client {
+            "a client frame is not masked"
+        } else {
+            "a server frame is masked"
+        }));
     }
     let (len, head) = match b1 & 0x7f {
         short @ 0..=125 => (u64::from(short), 2),
@@ -132,7 +145,9 @@ fn check_close(body: &[u8]) -> Result<(), FrameError> {
             if !matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999) {
                 return Err(FrameError::Malformed("a close code that is not allowed"));
             }
-            std::str::from_utf8(reason).map(|_| ()).map_err(|_| FrameError::Malformed("a close reason that is not UTF-8"))
+            std::str::from_utf8(reason)
+                .map(|_| ())
+                .map_err(|_| FrameError::Malformed("a close reason that is not UTF-8"))
         }
     }
 }
@@ -193,7 +208,10 @@ mod tests {
 
     #[test]
     fn websocket_accept_key_is_the_rfc_6455_example() {
-        assert_eq!(accept_key("dGhlIHNhbXBsZSBub25jZQ=="), Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".to_string()));
+        assert_eq!(
+            accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".to_string())
+        );
     }
 
     #[test]
@@ -208,7 +226,10 @@ mod tests {
         for len in [0usize, 1, 125, 126, 65535, 65536] {
             let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
             let wire = encode(Op::Binary, &payload, Some(KEY));
-            let want = Frame { op: Op::Binary, payload };
+            let want = Frame {
+                op: Op::Binary,
+                payload,
+            };
             assert_eq!(decode(&wire, true, MAX), Ok(Some((want, wire.len()))), "length {len}");
         }
     }
@@ -217,7 +238,10 @@ mod tests {
     fn websocket_server_frames_round_trip_unmasked() {
         for op in [Op::Text, Op::Binary, Op::Ping, Op::Pong] {
             let wire = encode(op, b"hello", None);
-            let want = Frame { op, payload: b"hello".to_vec() };
+            let want = Frame {
+                op,
+                payload: b"hello".to_vec(),
+            };
             assert_eq!(decode(&wire, false, MAX), Ok(Some((want, wire.len()))), "{op:?}");
         }
     }
@@ -225,7 +249,11 @@ mod tests {
     #[test]
     fn websocket_masking_is_applied_on_the_wire() {
         let wire = encode(Op::Binary, b"abc", Some([1, 2, 3, 4]));
-        assert_eq!(&wire[..6], &[0x82, 0x83, 1, 2, 3, 4], "FIN binary, mask bit, length 3, key");
+        assert_eq!(
+            &wire[..6],
+            &[0x82, 0x83, 1, 2, 3, 4],
+            "FIN binary, mask bit, length 3, key"
+        );
         assert_eq!(&wire[6..], &[b'a' ^ 1, b'b' ^ 2, b'c' ^ 3]);
     }
 
@@ -233,7 +261,10 @@ mod tests {
     fn websocket_lengths_use_the_shortest_form() {
         assert_eq!(encode(Op::Binary, &[0; 125], None)[1], 125);
         assert_eq!(&encode(Op::Binary, &[0; 126], None)[..4], &[0x82, 126, 0, 126]);
-        assert_eq!(&encode(Op::Binary, &vec![0; 65536], None)[..10], &[0x82, 127, 0, 0, 0, 0, 0, 1, 0, 0]);
+        assert_eq!(
+            &encode(Op::Binary, &vec![0; 65536], None)[..10],
+            &[0x82, 127, 0, 0, 0, 0, 0, 1, 0, 0]
+        );
     }
 
     #[test]
@@ -241,10 +272,16 @@ mod tests {
         // A 64-bit length of 2^40 with only the 10-byte header in hand.
         let mut head = vec![0x82, 0x80 | 127];
         head.extend((1u64 << 40).to_be_bytes());
-        assert_eq!(decode(&head, true, MAX), Err(FrameError::TooLong { len: 1 << 40, max: MAX }));
+        assert_eq!(
+            decode(&head, true, MAX),
+            Err(FrameError::TooLong { len: 1 << 40, max: MAX })
+        );
         // A 16-bit length over a small limit, header only.
         let head = [0x82, 0x80 | 126, 0xFF, 0xFF];
-        assert_eq!(decode(&head, true, 1024), Err(FrameError::TooLong { len: 65535, max: 1024 }));
+        assert_eq!(
+            decode(&head, true, 1024),
+            Err(FrameError::TooLong { len: 65535, max: 1024 })
+        );
     }
 
     #[test]
@@ -259,7 +296,10 @@ mod tests {
 
     #[test]
     fn websocket_a_length_that_is_not_the_shortest_is_refused() {
-        assert!(refused(&[0x82, 0x80 | 126, 0, 100, 1, 2, 3, 4], true), "100 fits in 7 bits");
+        assert!(
+            refused(&[0x82, 0x80 | 126, 0, 100, 1, 2, 3, 4], true),
+            "100 fits in 7 bits"
+        );
         let mut long = vec![0x82, 0x80 | 127];
         long.extend(1000u64.to_be_bytes());
         long.extend(KEY);
@@ -278,13 +318,22 @@ mod tests {
         assert!(refused(&[0xC2, 0x80, 1, 2, 3, 4], true), "RSV1 set");
         assert!(refused(&[0x83, 0x80, 1, 2, 3, 4], true), "opcode 3 is reserved");
         assert!(refused(&[0x8B, 0x80, 1, 2, 3, 4], true), "opcode 11 is reserved");
-        assert!(refused(&[0x80, 0x80, 1, 2, 3, 4], true), "a continuation with nothing to continue");
-        assert!(refused(&[0x02, 0x80, 1, 2, 3, 4], true), "a binary frame without FIN is fragmented");
+        assert!(
+            refused(&[0x80, 0x80, 1, 2, 3, 4], true),
+            "a continuation with nothing to continue"
+        );
+        assert!(
+            refused(&[0x02, 0x80, 1, 2, 3, 4], true),
+            "a binary frame without FIN is fragmented"
+        );
     }
 
     #[test]
     fn websocket_the_masking_direction_is_enforced() {
-        assert!(refused(&[0x82, 0x03, b'a', b'b', b'c'], true), "a client frame must be masked");
+        assert!(
+            refused(&[0x82, 0x03, b'a', b'b', b'c'], true),
+            "a client frame must be masked"
+        );
         let masked = encode(Op::Binary, b"abc", Some(KEY));
         assert!(refused(&masked, false), "a server frame must not be masked");
     }
@@ -292,8 +341,14 @@ mod tests {
     #[test]
     fn websocket_control_frames_are_short_and_unfragmented() {
         let ping = encode(Op::Ping, &[7; 125], Some(KEY));
-        assert!(matches!(decode(&ping, true, MAX), Ok(Some((Frame { op: Op::Ping, .. }, _)))));
-        assert!(refused(&[0x89, 0x80 | 126, 0, 126, 1, 2, 3, 4], true), "a ping of 126 bytes");
+        assert!(matches!(
+            decode(&ping, true, MAX),
+            Ok(Some((Frame { op: Op::Ping, .. }, _)))
+        ));
+        assert!(
+            refused(&[0x89, 0x80 | 126, 0, 126, 1, 2, 3, 4], true),
+            "a ping of 126 bytes"
+        );
         assert!(refused(&[0x09, 0x80, 1, 2, 3, 4], true), "a ping without FIN");
     }
 
@@ -301,18 +356,45 @@ mod tests {
     fn websocket_close_frames_round_trip_with_a_valid_code_and_reason() {
         let body = close_body(1011, "replica gone");
         let wire = encode(Op::Close, &body, Some(KEY));
-        assert_eq!(decode(&wire, true, MAX), Ok(Some((Frame { op: Op::Close, payload: body }, wire.len()))));
+        assert_eq!(
+            decode(&wire, true, MAX),
+            Ok(Some((
+                Frame {
+                    op: Op::Close,
+                    payload: body
+                },
+                wire.len()
+            )))
+        );
         let empty = encode(Op::Close, &[], None);
-        assert_eq!(decode(&empty, false, MAX), Ok(Some((Frame { op: Op::Close, payload: vec![] }, 2))));
+        assert_eq!(
+            decode(&empty, false, MAX),
+            Ok(Some((
+                Frame {
+                    op: Op::Close,
+                    payload: vec![]
+                },
+                2
+            )))
+        );
     }
 
     #[test]
     fn websocket_close_frames_refuse_a_bad_code_or_reason() {
-        assert!(refused(&encode(Op::Close, &[0x03], None), false), "a one-byte close body");
+        assert!(
+            refused(&encode(Op::Close, &[0x03], None), false),
+            "a one-byte close body"
+        );
         for code in [999u16, 1004, 1005, 1006, 1015, 2999, 5000] {
-            assert!(refused(&encode(Op::Close, &close_body(code, ""), None), false), "code {code}");
+            assert!(
+                refused(&encode(Op::Close, &close_body(code, ""), None), false),
+                "code {code}"
+            );
         }
-        assert!(refused(&encode(Op::Close, &[0x03, 0xE8, 0xFF], None), false), "a reason that is not UTF-8");
+        assert!(
+            refused(&encode(Op::Close, &[0x03, 0xE8, 0xFF], None), false),
+            "a reason that is not UTF-8"
+        );
     }
 
     #[test]
