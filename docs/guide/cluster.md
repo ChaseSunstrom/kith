@@ -491,6 +491,9 @@ waits, by default, for one: it starts nothing until a write comes back from the 
 `alone: run` on its Node and it does not wait forever:
 
 ```yaml
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: laptop }
 spec:
   alone: run   # no leader for 30 s: run what this node's own copy of the store places here
 ```

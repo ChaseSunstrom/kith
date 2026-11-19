@@ -187,7 +187,10 @@ sh ci/vm.sh --test blackout            # three control nodes (two sealed) and a 
 <p>Writes the cluster acknowledged before the cut are there after it: the test checks every one, on each of the three control nodes. It starts the two sealed ones first and has them elect a leader with the third still off, then starts the third and a worker, which are handed their keys. Plan for the quorum, not for one machine: with three control nodes, two sealed and started are enough.</p>
 <h2 id="a-node-away-from-its-cluster">A node away from its cluster <a class="anchor" href="#a-node-away-from-its-cluster" aria-label="Link to this section">#</a></h2>
 <p>A node that starts with no leader in reach (a laptop at a café, an edge worker on a bad link) waits, by default, for one: it starts nothing until a write comes back from the cluster. Set <code>alone: run</code> on its Node and it does not wait forever:</p>
-<pre><code class="language-yaml">spec:
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: laptop }
+spec:
   alone: run   # no leader for 30 s: run what this node's own copy of the store places here
 </code></pre>
 <p>After 30 seconds with no leader answering, the node starts the Workloads and NodeWorkloads its copy places on it. <strong>Jobs are not started alone</strong>: their runs are the cluster's to start, and a Job waits for a leader. The console says what the node runs alone and its risks, and the Node's status records <code>alone: {since, until, risks}</code>, the time it began and the time a leader answered. The status is written once a write comes back, because none can before then.</p>
