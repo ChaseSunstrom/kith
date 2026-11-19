@@ -1458,6 +1458,47 @@ fn job_spec(cx: &mut Cx, mut spec: Map, at: &str) -> (Value, Strings) {
     (value, pod.labels)
 }
 
+/// The kith kind a bare Pod is held as, by its `spec.restartPolicy` (Kubernetes's default, and
+/// so a missing one, is Always): a Pod that is not to start again is a Job, else a Workload.
+pub fn pod_holder(restart: Option<&str>) -> &'static str {
+    match restart {
+        Some("Never" | "OnFailure") => "Job",
+        _ => "Workload",
+    }
+}
+
+/// A Pod sent alone: a Job or a one-replica Workload, with its spec taken as a template's is
+/// (one table), marked `kith.dev/pod`. What it refuses is said by the Pod's own paths.
+fn bare_pod(cx: &mut Cx, root: &mut Map, mut meta: Metadata, out: Out) {
+    let mut spec = cx.map(root, "spec", "");
+    // (kith places a pod: one pinned to a node is not placed as written.)
+    if spec.remove("nodeName").is_some_and(|node| !is_empty(&node)) {
+        cx.note("spec.nodeName", "pins the pod to a node: not translated");
+    }
+    let restart = spec.get("restartPolicy").and_then(Value::as_str).map(String::from);
+    let holder = pod_holder(restart.as_deref());
+    let template = json!({ "metadata": { "annotations": meta.annotations }, "spec": spec });
+    meta.annotations.insert("kith.dev/pod".into(), "true".into());
+    if holder == "Workload" {
+        let mut sent = json!({ "spec": { "replicas": 1, "template": template } });
+        let Value::Object(sent) = &mut sent else { return };
+        workload(cx, sent, meta, "Deployment", out);
+    } else {
+        // (A Pod that is never run again has no retries; one that is has a Job's.)
+        let retries = (restart.as_deref() == Some("Never")).then_some(json!(0));
+        let Value::Object(job) = obj([("template", Some(template)), ("backoffLimit", retries)]) else {
+            return;
+        };
+        let (spec, labels) = job_spec(cx, job, "spec");
+        meta.labels.extend(labels);
+        out.push(make("Job", meta, spec));
+    }
+    // (Said as the Pod's, not as the template's of what it is held as.)
+    for line in cx.hints.iter_mut().chain(&mut cx.refused) {
+        *line = line.replace(": spec.template.spec.", ": spec.");
+    }
+}
+
 fn cron_job(cx: &mut Cx, root: &mut Map, mut meta: Metadata, out: Out) {
     // (Kubernetes's own limit: a Job's name is the CronJob's and the minute.)
     if meta.name.len() > 52 {
@@ -1889,6 +1930,7 @@ pub fn take(objects: Vec<Value>, import: bool) -> Taken {
             "Job",
             "CronJob",
             "Ingress",
+            "Pod",
         ];
         if !known.contains(&kind.as_str()) {
             let why = if kind.is_empty() {
@@ -1914,6 +1956,7 @@ pub fn take(objects: Vec<Value>, import: bool) -> Taken {
         let mut made = Vec::new();
         match kind.as_str() {
             "Deployment" | "StatefulSet" | "DaemonSet" => workload(&mut cx, &mut root, meta, &kind, &mut made),
+            "Pod" => bare_pod(&mut cx, &mut root, meta, &mut made),
             "Service" => service(&mut cx, &mut root, meta, &mut made),
             "ConfigMap" => config_map(&mut cx, &mut root, meta, &mut made),
             "Secret" => secret(&mut cx, &mut root, meta, &mut made),
@@ -2782,7 +2825,7 @@ spec:
             privileged: true
 ---
 apiVersion: v1
-kind: Pod
+kind: Role
 metadata:
   name: lone
 ---
@@ -2811,7 +2854,7 @@ data:
             "{report:#?}"
         );
         assert!(
-            has("Pod/lone: is a kind kith has nothing for: not translated"),
+            has("Role/lone: is a kind kith has nothing for: not translated"),
             "{report:#?}"
         );
         assert!(
@@ -2850,6 +2893,53 @@ items:
         assert_eq!(report, Vec::<String>::new());
         assert_eq!(all.len(), 1);
         assert!(all[0].metadata.annotations.is_empty());
+    }
+
+    /// A bare Pod is a Job (it is not run again) or a one-replica Workload (a missing
+    /// restartPolicy is Always), marked, its spec taken as a template's and refused by the Pod's paths.
+    #[test]
+    fn bare_pod_is_a_job_or_a_workload_marked_and_refused_by_its_own_paths() {
+        let pod = |policy: &str, extra: &str| {
+            let policy = if policy.is_empty() {
+                String::new()
+            } else {
+                format!("  restartPolicy: {policy}\n")
+            };
+            run(&format!(
+                "kind: Pod\nmetadata:\n  name: p\n  labels: {{app: p}}\nspec:\n{policy}{extra}  containers:\n    - {{name: c, image: i}}\n"
+            ))
+        };
+        for (policy, held) in [
+            ("Never", "Job"),
+            ("OnFailure", "Job"),
+            ("Always", "Workload"),
+            ("", "Workload"),
+        ] {
+            let (all, report) = pod(policy, "");
+            assert_eq!(report, Vec::<String>::new(), "{policy}");
+            let [one] = &all[..] else { panic!("{policy}: {all:?}") };
+            assert_eq!((one.kind.as_str(), one.metadata.name.as_str()), (held, "p"), "{policy}");
+            assert_eq!(
+                one.metadata.annotations.get("kith.dev/pod").map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(one.metadata.labels.get("app").map(String::as_str), Some("p"));
+            assert_eq!(one.spec["template"]["containers"][0]["image"], "i", "{policy}");
+        }
+        assert_eq!(pod("Never", "").0[0].spec["retries"], 0);
+        assert_eq!(pod("Always", "").0[0].spec["replicas"], 1);
+        // What a template's table refuses, and what only a Pod has, are refused by name.
+        for field in [
+            "hostNetwork: true",
+            "nodeName: n1",
+            "activeDeadlineSeconds: 5",
+            "hostPID: true",
+        ] {
+            let (_, report) = pod("Never", &format!("  {field}\n"));
+            let name = field.split(':').next().unwrap();
+            let said = format!("Pod/p: spec.{name}");
+            assert!(report.iter().any(|line| line.starts_with(&said)), "{field}: {report:?}");
+        }
     }
 
     #[test]
