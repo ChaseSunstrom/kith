@@ -836,13 +836,28 @@ fn workflows_json_patch_sees_what_kubectl_sees() {
     cluster.ok(&["apply", "-f", "api.yaml"]);
     // The base of the patch is what kubectl reads: the replicas the server defaulted, and the
     // resourceVersion it reads, so a test of that and a replace of the replicas both find their paths.
-    let version = cluster.got(&["deployment", "api"])["metadata"]["resourceVersion"].clone();
-    let ops = serde_json::json!([
-        { "op": "test", "path": "/metadata/resourceVersion", "value": version },
-        { "op": "replace", "path": "/spec/replicas", "value": 3 },
-    ])
-    .to_string();
-    cluster.ok(&["patch", "deployment", "api", "--type", "json", "-p", ops.as_str()]);
+    // The Deployment may be written (its status) between the read and the patch, as a client
+    // under optimistic concurrency sees: then the test op fails and the read is done again.
+    let mut said = String::new();
+    for _ in 0..10 {
+        let version = cluster.got(&["deployment", "api"])["metadata"]["resourceVersion"].clone();
+        let ops = serde_json::json!([
+            { "op": "test", "path": "/metadata/resourceVersion", "value": version },
+            { "op": "replace", "path": "/spec/replicas", "value": 3 },
+        ])
+        .to_string();
+        let (ok, out, err) = cluster.kubectl(&["patch", "deployment", "api", "--type", "json", "-p", ops.as_str()]);
+        if ok {
+            said.clear();
+            break;
+        }
+        said = format!("{out}{err}");
+        assert!(
+            said.contains("test /metadata/resourceVersion: the value is not the one given"),
+            "kubectl patch: {said}"
+        );
+    }
+    assert!(said.is_empty(), "the test op failed 10 times: {said}");
     assert_eq!(cluster.got(&["deployment", "api"])["spec"]["replicas"], 3);
 }
 
