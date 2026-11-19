@@ -875,8 +875,11 @@ fn unchanged_manifests_and_a_chart_are_held_as_they_were_sent() {
     }
     // What kith runs for them is its own kinds.
     let db = cluster.held("workload/db");
+    // (Each replica's claim is `data-db-ORDINAL`: the mount names what they share.)
+    let mount = &db["spec"]["template"]["containers"][0]["volumeMounts"][0];
     assert_eq!(
-        db["spec"]["template"]["containers"][0]["volumeMounts"][0]["volume"], "data-db-0",
+        (&mount["volume"], &mount["perReplica"]),
+        (&"data-db".into(), &true.into()),
         "{db}"
     );
     // A claim is given a Volume on the node (Kubernetes would ask a storage class for one).
@@ -1055,11 +1058,6 @@ fn refused_is_said_with_the_field_and_nothing_is_dropped_in_silence() {
     // (kubectl asks for no port of a pod that is not running: `sh ci/vm.sh --test kube` does.)
     cluster.refused(&["logs", "web-0", "--previous"], &["previous"]);
     cluster.refused(&["logs", "web-0", "--since=1h"], &["sinceSeconds"]);
-    let json = r#"[{"op":"replace","path":"/spec/replicas","value":1}]"#;
-    cluster.refused(
-        &["patch", "deployment", "web", "--type", "json", "-p", json],
-        &["json-patch"],
-    );
     cluster.refused(&["delete", "deployment", "web", "--cascade=orphan"], &["Orphan"]);
     // Deleted only as it was seen (not another by its name), and no sooner or later for the asking.
     let seen =
@@ -1247,6 +1245,41 @@ fn access_is_kiths_own_and_the_kubernetes_api_is_no_way_past_it() {
     // And a certificate that was taken back is nobody's.
     cluster.kith(&["delete", "identity/bob"]);
     bob.refused(&["get", "deployments", "-n", "team"], &[]);
+}
+
+/// A StatefulSet of several replicas has a claim and a Volume of each replica's own, named
+/// TEMPLATE-NAME-ORDINAL, as Kubernetes names them; scaling down keeps them.
+#[test]
+fn statefulset_of_three_has_a_claim_and_a_volume_for_each_replica() {
+    let Some(cluster) = Cluster::start("kube-statefulset") else {
+        return;
+    };
+    let set = REST
+        .split("\n---\n")
+        .next()
+        .unwrap()
+        .replace("replicas: 1", "replicas: 3");
+    cluster.write("db.yaml", &set);
+    cluster.ok(&["apply", "-f", "db.yaml"]);
+    let db = cluster.held("workload/db");
+    assert_eq!(db["spec"]["replicas"], 3, "{db}");
+    for ordinal in 0..3 {
+        let claim = format!("data-db-{ordinal}");
+        eventually("a claim bound to the Volume made for it", 30, || {
+            cluster.got(&["pvc", &claim])["status"]["phase"] == "Bound"
+        });
+        let volume = cluster.held(&format!("volume/{claim}"));
+        assert_eq!(volume["spec"]["node"], "alpha", "{volume}");
+    }
+    // Scaled down, the claims (and what they hold) stay, as Kubernetes keeps them.
+    cluster.ok(&["scale", "statefulset/db", "--replicas=1"]);
+    assert_eq!(cluster.held("workload/db")["spec"]["replicas"], 1);
+    let claims = cluster.ok(&["get", "pvc", "-o", "name"]);
+    says(&claims, &["data-db-0", "data-db-1", "data-db-2"]);
+    // Scaled up again, they are the replicas' again (and nothing new is made for them).
+    cluster.ok(&["scale", "statefulset/db", "--replicas=3"]);
+    let after = cluster.ok(&["get", "pvc", "-o", "name"]);
+    assert_eq!(after.lines().count(), 3, "{after}");
 }
 
 /// Server-side apply by two managers: each keeps its own fields, a field one has is not

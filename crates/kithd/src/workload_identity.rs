@@ -1,5 +1,5 @@
 //! A Workload that runs as an Identity (`spec.identity`): the node that runs it makes a key
-//! for the pod's life, and the node that holds the cluster CA key signs a certificate for
+//! for the pod's life, and a node that holds the cluster CA key signs a certificate for
 //! its public half, good for calling the API for two hours ([`crate::pki::WORKLOAD_LIFE`]).
 //!
 //! The CA holder checks, in its own store, each time it signs (the first time and at every
@@ -18,11 +18,13 @@
 
 use crate::Shared;
 use crate::cluster::Peer;
+use crate::view::Upstream;
 use axum::extract::{ConnectInfo, Path as Named, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use kith_api::store::Store;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,6 +36,10 @@ const AT_MOST_EVERY: u64 = 60;
 /// When each (node, Workload, replica) was last given one, for a minute.
 // ponytail: in the CA holder's memory: a restart lets each ask once more.
 static GIVEN: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
+
+/// The CA holder (its Node's name) that last answered a pod's renewal: asked first next time.
+// ponytail: in memory: a restart asks the holders in the store's order once.
+static ANSWERED: Mutex<Option<String>> = Mutex::new(None);
 
 /// Where a pod's files are in each of its containers.
 pub const MOUNTED_AT: &str = "/run/kith/identity";
@@ -188,8 +194,49 @@ fn fresh(pod: &Path, identity: &str) -> bool {
     young && matches!(named, Some(crate::pki::Subject::Workload { identity: was, .. }) if was == identity)
 }
 
-/// Ask the CA holder to sign for `public` as `replica` of the Workload `namespace`/`name`
-/// on this node: the certificate, and the address it was asked at (the API's, for the pod).
+/// The CA holders to ask: every Node that says it holds the CA key and has an address to ask.
+fn holders(store: &Store) -> Vec<Upstream> {
+    let holds = |node: &&kith_api::Resource| node.status.as_ref().is_some_and(|status| status["ca"] == true);
+    store
+        .list(Some("Node"))
+        .filter(holds)
+        .filter_map(Upstream::of)
+        .collect()
+}
+
+/// Asks the CA holders in turn, the one that last answered (`answered`) first, until one
+/// answers: its text, and the address it was asked at. A refusal is an answer too, and stops
+/// the walk. When none answers, the first failure (or that none is known).
+async fn walk<F, Fut>(
+    mut holders: Vec<Upstream>,
+    answered: &Mutex<Option<String>>,
+    ask: F,
+) -> Result<(String, String), Unmade>
+where
+    F: Fn(Upstream) -> Fut,
+    Fut: Future<Output = Result<String, Unmade>>,
+{
+    let last = answered.lock().expect("nothing panics holding this").clone();
+    holders.sort_by_key(|holder| Some(&holder.name) != last.as_ref());
+    let mut first = None;
+    for holder in holders {
+        let (name, address) = (holder.name.clone(), holder.address.clone());
+        match ask(holder).await {
+            Err(failed @ Unmade::Failed(_)) => {
+                first.get_or_insert(failed);
+            }
+            answer => {
+                *answered.lock().expect("nothing panics holding this") = Some(name);
+                return answer.map(|text| (text, address));
+            }
+        }
+    }
+    Err(first.unwrap_or(Unmade::Failed("no node that holds the CA key is known".into())))
+}
+
+/// Ask a CA holder (the first that answers, see [`walk`]) to sign for `public` as `replica` of
+/// the Workload `namespace`/`name` on this node: the certificate, and the address it was asked
+/// at (the API's, for the pod).
 async fn signed(
     shared: &Shared,
     (namespace, name, replica): (&str, &str, &str),
@@ -198,32 +245,32 @@ async fn signed(
     let failed = |why: String| Unmade::Failed(why);
     let cluster = shared.cluster.as_ref();
     let cluster = cluster.ok_or(failed("this kithd is not part of a cluster".into()))?;
-    let holder = {
+    let holders = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
-        let holds = |node: &&kith_api::Resource| node.status.as_ref().is_some_and(|status| status["ca"] == true);
-        let mut nodes = state.store.list(Some("Node"));
-        nodes.find(holds).and_then(crate::view::Upstream::of)
+        holders(&state.store)
     };
-    let holder = holder.ok_or(failed("no node that holds the CA key is known".into()))?;
-    let client = cluster.to(&holder).map_err(failed)?;
-    let url = format!(
-        "https://{}/v1/workload-certificate/{namespace}/{name}/{replica}",
-        holder.address
-    );
-    let sent = client
-        .post(url)
-        .body(public.to_vec())
-        .timeout(Duration::from_secs(10))
-        .send();
-    let answer = sent.await.map_err(|e| failed(format!("asking {}: {e}", holder.name)))?;
-    let status = answer.status();
-    let text = answer.text().await;
-    let text = text.map_err(|e| failed(format!("reading {}: {e}", holder.name)))?;
-    match status {
-        StatusCode::OK => Ok((text, holder.address)),
-        StatusCode::FORBIDDEN => Err(Unmade::Refused(text)),
-        _ => Err(failed(format!("{} said {status}: {text}", holder.name))),
-    }
+    walk(holders, &ANSWERED, |holder: Upstream| async move {
+        let client = cluster.to(&holder).map_err(failed)?;
+        let url = format!(
+            "https://{}/v1/workload-certificate/{namespace}/{name}/{replica}",
+            holder.address
+        );
+        let sent = client
+            .post(url)
+            .body(public.to_vec())
+            .timeout(Duration::from_secs(10))
+            .send();
+        let answer = sent.await.map_err(|e| failed(format!("asking {}: {e}", holder.name)))?;
+        let status = answer.status();
+        let text = answer.text().await;
+        let text = text.map_err(|e| failed(format!("reading {}: {e}", holder.name)))?;
+        match status {
+            StatusCode::OK => Ok(text),
+            StatusCode::FORBIDDEN => Err(Unmade::Refused(text)),
+            _ => Err(failed(format!("{} said {status}: {text}", holder.name))),
+        }
+    })
+    .await
 }
 
 /// The pod's key: the one it has, else one made now and kept (one key for the pod's life,
@@ -531,5 +578,111 @@ spec: {identity: gateway, template: {containers: [{name: c, image: i}]}}
         // Another replica, another node: each its own.
         assert!(due("n1", "Workload/a/b#1", 1059) && due("n2", "Workload/a/b#0", 1059));
         assert!(due("n1", "Workload/a/b#0", 1060));
+    }
+
+    const HOLDERS: &str = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: {name: alpha}
+spec: {trust: worker}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: {name: beta}
+spec: {trust: worker}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: {name: gamma}
+spec: {trust: worker}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: {name: delta}
+spec: {trust: worker}
+";
+
+    fn holder(name: &str, port: u16) -> Upstream {
+        Upstream {
+            name: name.into(),
+            address: format!("127.0.0.1:{port}"),
+            certificate: None,
+        }
+    }
+
+    #[test]
+    fn workload_identity_holders_are_the_nodes_that_hold_the_ca() {
+        let mut nodes = store(HOLDERS);
+        for (name, status) in [
+            ("alpha", serde_json::json!({ "ca": true, "address": "127.0.0.1:1" })),
+            ("beta", serde_json::json!({ "ca": true, "address": "127.0.0.1:2" })),
+            ("gamma", serde_json::json!({ "ca": false, "address": "127.0.0.1:3" })),
+            // Named as a holder, but with no address to ask: not asked.
+            ("delta", serde_json::json!({ "ca": true })),
+        ] {
+            nodes.set_status(&format!("Node/{name}"), Some(status)).unwrap();
+        }
+        let named: Vec<_> = holders(&nodes).into_iter().map(|h| (h.name, h.address)).collect();
+        let want = [("alpha", "127.0.0.1:1"), ("beta", "127.0.0.1:2")];
+        assert_eq!(named, want.map(|(n, a)| (n.to_string(), a.to_string())));
+    }
+
+    #[tokio::test]
+    async fn workload_identity_walks_to_the_holder_that_answers() {
+        let answered = Mutex::new(None);
+        let asked = Mutex::new(Vec::new());
+        let ask = |holder: Upstream| {
+            asked.lock().unwrap().push(holder.name.clone());
+            let said = match holder.name.as_str() {
+                "alpha" => Err(Unmade::Failed("alpha is down".into())),
+                _ => Ok("cert".to_string()),
+            };
+            std::future::ready(said)
+        };
+        let got = walk(vec![holder("alpha", 1), holder("beta", 2)], &answered, ask).await;
+        assert_eq!(got.unwrap(), ("cert".to_string(), "127.0.0.1:2".to_string()));
+        assert_eq!(*asked.lock().unwrap(), ["alpha", "beta"]);
+        assert_eq!(*answered.lock().unwrap(), Some("beta".to_string()));
+    }
+
+    #[tokio::test]
+    async fn workload_identity_stops_at_a_refusal() {
+        let answered = Mutex::new(None);
+        let asked = Mutex::new(Vec::new());
+        let ask = |holder: Upstream| {
+            asked.lock().unwrap().push(holder.name.clone());
+            let said = match holder.name.as_str() {
+                "alpha" => Err(Unmade::Refused("the pod may not have one".into())),
+                _ => Ok("cert".to_string()),
+            };
+            std::future::ready(said)
+        };
+        let got = walk(vec![holder("alpha", 1), holder("beta", 2)], &answered, ask).await;
+        assert!(matches!(got, Err(Unmade::Refused(why)) if why == "the pod may not have one"));
+        assert_eq!(*asked.lock().unwrap(), ["alpha"]);
+    }
+
+    #[tokio::test]
+    async fn workload_identity_says_why_when_no_holder_answers() {
+        let answered = Mutex::new(None);
+        let down = |holder: Upstream| std::future::ready(Err(Unmade::Failed(format!("{} is down", holder.name))));
+        let got = walk(vec![holder("alpha", 1), holder("beta", 2)], &answered, down).await;
+        assert!(matches!(got, Err(Unmade::Failed(why)) if why == "alpha is down"));
+        assert!(answered.lock().unwrap().is_none());
+        let none = walk(Vec::new(), &answered, down).await;
+        assert!(matches!(none, Err(Unmade::Failed(why)) if why.contains("no node that holds the CA key")));
+    }
+
+    #[tokio::test]
+    async fn workload_identity_asks_the_holder_that_last_answered_first() {
+        let answered = Mutex::new(Some("beta".to_string()));
+        let asked = Mutex::new(Vec::new());
+        let ask = |holder: Upstream| {
+            asked.lock().unwrap().push(holder.name.clone());
+            std::future::ready(Ok::<_, Unmade>("cert".to_string()))
+        };
+        let got = walk(vec![holder("alpha", 1), holder("beta", 2)], &answered, ask).await;
+        assert_eq!(got.unwrap().1, "127.0.0.1:2");
+        assert_eq!(*asked.lock().unwrap(), ["beta"]);
     }
 }

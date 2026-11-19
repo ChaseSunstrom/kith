@@ -1317,6 +1317,19 @@ impl Controller {
                 .collect();
             let files: Vec<_> = units.iter().map(|unit| files_of(shared, &namespace, unit)).collect();
             for replica in replicas {
+                // A replica's own claim whose Volume is not here is not started, whatever else
+                // is: it would be on an empty directory, with its data on another node or lost.
+                let lacking = template.containers().flat_map(|c| &c.volume_mounts).find_map(|mount| {
+                    let name = format!("{}-{replica}", mount.volume.as_ref()?);
+                    (mount.per_replica == Some(true) && !volumes.contains_key(&name)).then_some(name)
+                });
+                if let Some(name) = lacking {
+                    let why = format!("replica {replica} waits: its Volume {name} is not ready on this node");
+                    if !note.contains(&why) {
+                        note.push(why);
+                    }
+                    continue;
+                }
                 // Which generation of the replica is wanted: the second where a rolling update has
                 // started it beside the old (see `gens`); one found running as it, by a kithd that
                 // was started again, is the one it was.
@@ -1391,7 +1404,7 @@ impl Controller {
                             devices: devices.clone(),
                             dmem: dmem.clone(),
                             seat: seat.clone(),
-                            volumes: mounts_of(unit, &volumes),
+                            volumes: mounts_of(unit, &volumes, replica),
                             files: files.clone(),
                             init: at < inits,
                             after: at.min(inits) as u32,
@@ -2857,16 +2870,23 @@ fn write_files(state: &Path, id: &str, slot: &Slot, files: &[Files]) -> Result<(
     Ok(())
 }
 
-/// What a unit mounts, from the Volumes its workload's mounts come to: only a container mounts.
-fn mounts_of(unit: &Run, volumes: &BTreeMap<String, crate::volumes::Dir>) -> Vec<(crate::volumes::Dir, String, bool)> {
+/// What a unit of replica `replica` mounts, from the Volumes its workload's mounts come to: only a
+/// container mounts. (A mount that is `perReplica` is of the replica's own claim, `NAME-REPLICA`.)
+fn mounts_of(
+    unit: &Run,
+    volumes: &BTreeMap<String, crate::volumes::Dir>,
+    replica: u32,
+) -> Vec<(crate::volumes::Dir, String, bool)> {
     let Run::Container(c) = unit else { return Vec::new() };
     let mounts = c.volume_mounts.iter();
     let found = mounts.filter_map(|m| {
-        Some((
-            volumes.get(m.volume.as_ref()?)?.clone(),
-            m.path.clone(),
-            m.read_only == Some(true),
-        ))
+        let name = m.volume.as_ref()?;
+        let name = if m.per_replica == Some(true) {
+            format!("{name}-{replica}")
+        } else {
+            name.clone()
+        };
+        Some((volumes.get(&name)?.clone(), m.path.clone(), m.read_only == Some(true)))
     });
     found.collect()
 }
@@ -2885,6 +2905,17 @@ fn running_said(note: Option<&str>, replaced: Option<String>) -> Option<String> 
         .into_iter()
         .chain(replaced)
         .reduce(|said, more| format!("{said}; {more}"))
+}
+
+/// A refusal of a node's root container, said with the policy that allows it: the runtime says what
+/// the container would be; here whose word refused it.
+fn node_root_refusal(said: String) -> String {
+    match said.contains(kith_runtime::NODE_ROOT) {
+        true => format!(
+            "this node's policy refuses containers that are the node's root (rootContainers is off: `--node-policy root-containers` where the node's kithd is started allows them): {said}"
+        ),
+        false => said,
+    }
 }
 
 /// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
@@ -3105,14 +3136,7 @@ async fn start(
                 .await
                 .map_err(|e| e.to_string())?;
             let created = runtime.create(id, &image, &unit, log("out")?, log("err")?);
-            // The runtime says what the container would be; here whose word refused it.
-            let whose = |e: kith_runtime::Error| match e.to_string().contains(kith_runtime::NODE_ROOT) {
-                true => format!(
-                    "this node's policy refuses containers that are the node's root (rootContainers is off: `--node-policy root-containers` where the node's kithd is started allows them): {e}"
-                ),
-                false => e.to_string(),
-            };
-            created.map_err(whose)
+            created.map_err(|e| node_root_refusal(e.to_string()))
         }
         Run::Exec(e) => {
             unit.command = e.command.clone();
@@ -3260,6 +3284,21 @@ mod tests {
         assert_eq!(running_said(Some(note), None), Some(note.to_string()));
         assert_eq!(running_said(None, Some(replaced.clone())), Some(replaced));
         assert_eq!(running_said(None, None), None);
+    }
+
+    /// A refusal the runtime made of a node's root container is said with the policy that allows
+    /// it, around the runtime's own text; any other refusal comes back as it was.
+    #[test]
+    fn node_root_refusal_names_the_policy() {
+        let root = format!("this container {}: its user is root's", kith_runtime::NODE_ROOT);
+        let said = node_root_refusal(root.clone());
+        assert!(said.contains("rootContainers is off"), "{said}");
+        assert!(said.contains("--node-policy root-containers"), "{said}");
+        assert!(said.ends_with(&root), "{said}");
+        assert_eq!(
+            node_root_refusal("an unrelated failure".to_string()),
+            "an unrelated failure"
+        );
     }
 
     /// A public key's text, as `signedBy` takes it: Ed25519, each `n` another.
@@ -4121,5 +4160,37 @@ spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volum
         }
         assert!(store.get("Volume/default/db").is_none());
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn per_replica_mount_is_the_replicas_own_claim_and_no_other() {
+        let source = "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db }
+spec: { replicas: 2, template: { containers: [{ name: run, image: img, volumeMounts: [{ volume: data, perReplica: true, path: /d }, { volume: log, path: /l }] }] } }
+";
+        let resource = Resource::from_source(source).unwrap().remove(0).unwrap();
+        let (template, _) = template_of(&resource).unwrap();
+        let unit = Run::Container(template.containers().next().unwrap().clone());
+        let dir = |name: &str| crate::volumes::Dir {
+            namespace: "default".into(),
+            name: name.into(),
+            path: name.into(),
+            node: "a".into(),
+            encrypted: false,
+        };
+        let dirs: BTreeMap<String, _> = ["data-0", "data-1", "log"]
+            .map(|name| (name.to_string(), dir(name)))
+            .into();
+        let names = |replica| -> Vec<(String, String)> {
+            mounts_of(&unit, &dirs, replica)
+                .into_iter()
+                .map(|(dir, at, _)| (dir.name, at))
+                .collect()
+        };
+        assert_eq!(names(1), [("data-1".into(), "/d".into()), ("log".into(), "/l".into())]);
+        // One that has no Volume here is left out (and `lacking` keeps the replica from starting).
+        assert_eq!(names(2), [("log".into(), "/l".into())]);
     }
 }

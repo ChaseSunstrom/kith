@@ -112,8 +112,9 @@ must be allowed to apply a Job.
   rolling. A readiness probe's `initialDelaySeconds` is not kept: kith asks at once.
 - Pulls are anonymous; layers must be gzip or plain tar.
 - [`dist/kithd.service`](../../dist/kithd.service) is a systemd user unit; `sh ci/systemd.sh` runs
-  it under your user's systemd and checks its cgroups and its stop. A root service on a distro is
-  untested.
+  it under your user's systemd and checks its cgroups and its stop. In a Debian guest (systemd
+  254 or newer, cgroup v2) install it as that user unit and run `loginctl enable-linger "$USER"`
+  so it outlives a login. A root service on a distro is untested.
 
 ### What a container is kept from
 
