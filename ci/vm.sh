@@ -296,6 +296,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    of a namespace the Exit does not list is refused; and in what
                    the node's two cards carried, no packet of the pod's but the
                    tunnel's own. Needs what --test pods needs, and ip and wg
+  --selftest-said  instead: said() matches a line that a kernel stack-depth record landed in the
+                   middle of, and does not match the line when it is absent; reads fixture logs only
   --selftest-kill  instead: start this script with a stand-in for QEMU, kill its shell from
                    outside (SIGKILL, then SIGTERM) and expect no QEMU left and the VM lock
                    free; needs no QEMU, KVM or kernel
@@ -311,7 +313,8 @@ append="console=ttyS0 panic=-1"
 while [ $# -gt 0 ]; do
     case $1 in
     --help | -h) usage; exit 0 ;;
-    --selftest-kill) selftest=1; shift ;;
+    --selftest-kill) selftest=kill; shift ;;
+    --selftest-said) selftest=said; shift ;;
     --kernel | --initrd | --disk | --append | --time | --test)
         [ $# -ge 2 ] || { echo "vm.sh: $1 needs a value" >&2; exit 2; }
         case $1 in
@@ -338,10 +341,44 @@ fi
 
 skip() { echo "skipped: $1"; exit 0; }
 
+# said_in FILE TEXT: the console FILE says TEXT (a grep pattern). A kernel stack-depth record (what a
+# task prints when it exits: "[ts] comm (pid) used greatest stack depth: N bytes left") can land in the
+# middle of a line the guest is writing, which then reads as two lines. TEXT is looked for as written;
+# failing that, with that one record taken out (and its newline) and nothing else.
+said_in() {
+    grep -aq "$2" "$1" 2>/dev/null && return 0
+    sed -z -E 's/\[ *[0-9]+\.[0-9]+\] [^ ()]+ \([0-9]+\) used greatest stack depth: [0-9]+ bytes left\n//g' "$1" 2>/dev/null | grep -aq "$2"
+}
+
+# --selftest-said: said_in on fixture logs. A kernel stack-depth record can land in the middle of a
+# line the guest writes; the line then reads as two. The match must hold for that, and must fail when
+# the line is absent. Needs nothing but sh and grep.
+if [ "$selftest" = said ]; then
+    st=$(mktemp -d)
+    rec='[    3.141592] cryptomgr_probe (83) used greatest stack depth: 15568 bytes left'
+    printf 'reboot: Restarting %s\nsystem\n' "$rec" >"$st/split"
+    printf 'reboot: Restarting system\n' >"$st/whole"
+    printf '%s\nreboot: Restarting system\n' "$rec" >"$st/beside"
+    printf 'reboot: Restarting %s\nkithd: serving\n' "$rec" >"$st/absent"
+    printf 'kithd: init: restarting\n' >"$st/other"
+    printf 'kithd: init: the state'"'"'s file system grown to 40[    2.926586] kithd (90) used greatest stack depth: 13224 bytes left\n709 MB\n' >"$st/grown"
+    bad=0
+    said_in "$st/grown" 'grown to 40709 MB' || { echo "vm.sh: selftest: FAIL: a line split by a record does not match" >&2; bad=1; }
+    said_in "$st/split" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: an interleaved line does not match" >&2; bad=1; }
+    said_in "$st/whole" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: a whole line does not match" >&2; bad=1; }
+    said_in "$st/beside" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: a line beside a record does not match" >&2; bad=1; }
+    ! said_in "$st/absent" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: a split line matches with its second half absent" >&2; bad=1; }
+    ! said_in "$st/other" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: an absent line matches" >&2; bad=1; }
+    rm -rf "$st"
+    [ "$bad" = 0 ] || exit 1
+    echo "vm.sh: selftest ok: said matches a line a kernel record was interleaved into, and not an absent one"
+    exit 0
+fi
+
 # --selftest-kill: this script, with a stand-in for QEMU (a sleep that writes its pid), killed from
 # outside by SIGKILL (no trap runs) and by SIGTERM: nothing of it may be left, and its lock must be
 # free. Needs no QEMU, no KVM and no kernel. Stops only the pid the stand-in wrote, if it survives.
-if [ -n "$selftest" ]; then
+if [ "$selftest" = kill ]; then
     st=$(mktemp -d)
     mkdir "$st/bin"
     printf '#!/bin/sh\necho $$ >"%s/pid"\nexec sleep 300\n' "$st" >"$st/bin/qemu-system-x86_64"
@@ -413,7 +450,7 @@ setsid=''; ! command -v setsid >/dev/null 2>&1 || setsid=setsid
 env -u KITH_VM_RUN $setsid sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 1; done; exec sh -c "$2" sh "$3"' sh $$ "$reap" "$KITH_VM_RUN" </dev/null >/dev/null 2>&1 8>&- &
 trap 'kill $vms $web 2>/dev/null || true; env -u KITH_VM_RUN sh -c "$reap" sh "$KITH_VM_RUN"; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
 trap 'exit 1' INT TERM
-said() { grep -aq "$1" "$work/log" 2>/dev/null; }
+said() { said_in "$work/log" "$1"; }
 fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
 
 if [ -n "$test" ] && [ "$test" != init ]; then
