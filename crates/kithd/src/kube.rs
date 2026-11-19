@@ -2440,6 +2440,13 @@ async fn write(
         call.allowed(kind, namespace, Verb::Get)?;
     }
     let primary = key(kind, namespace, &name);
+    let exists = || {
+        status(
+            StatusCode::CONFLICT,
+            "AlreadyExists",
+            format!("{} \"{name}\" already exists", kind.plural),
+        )
+    };
     // An apply says who applies, as Kubernetes asks; and one to what is there is answered with
     // all of it (merged, and a conflict names whose field it is): for who may read it. Whether
     // it is there is told to who may write (a create says), so asking after that is no leak.
@@ -2470,18 +2477,22 @@ async fn write(
         if there {
             call.allowed(kind, namespace, Verb::Get)?;
         }
+        // (Only a marked bare Pod is a Pod that is there: a Deployment or Job of the name is a name taken.)
         if there && kind.kind == "Pod" && how == How::Apply {
-            let why = format!("Pod/{name}: a Pod that is there is not changed: delete it and send it again");
-            return Err(invalid(why));
+            let state = call.shared.store.lock().expect("a handler panicked holding the store");
+            if held_bare(
+                &state.store,
+                Some(namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE)),
+                &name,
+            )
+            .is_some()
+            {
+                let why = format!("Pod/{name}: a Pod that is there is not changed: delete it and send it again");
+                return Err(invalid(why));
+            }
+            return Err(exists());
         }
     }
-    let exists = || {
-        status(
-            StatusCode::CONFLICT,
-            "AlreadyExists",
-            format!("{} \"{name}\" already exists", kind.plural),
-        )
-    };
     let read = {
         let state = call.shared.store.lock().expect("a handler panicked holding the store");
         let live = state.store.get(&primary);
@@ -2632,6 +2643,14 @@ async fn delete(
     // other Pod name is a replica's, and a delete restarts it.
     let mut kind = kind;
     if kind.kind == "Pod" {
+        // (Before the store is looked at, for a bare Pod's name or any other: who holds no right to
+        // delete a Job or a Workload, or to restart a replica, is told that and nothing of which names exist.)
+        let place = Some(namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE));
+        if let Err(refused) = call.allowed(&BARE[1], place, Verb::Apply) {
+            if !BARE.iter().any(|row| call.allowed(row, place, Verb::Delete).is_ok()) {
+                return Err(refused);
+            }
+        }
         let held = {
             let state = call.shared.store.lock().expect("a handler panicked holding the store");
             held_bare(&state.store, namespace, name)
@@ -4467,6 +4486,34 @@ spec: {role: writer, subjects: [carol]}
                     .is_none()
             );
         }
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A caller with no right on Jobs or Workloads is told 403, the same, of a name that is a pod
+    /// (a bare one, a replica) and of one that is nothing: a delete is no way to find what exists.
+    #[tokio::test]
+    async fn bare_pod_delete_of_a_caller_with_no_rights_is_403_for_every_name() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-delete-oracle-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let who = "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: nobody}\nspec: {}\n";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(who).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        two_replicas_of_x(&shared).await;
+        let (code, said) = send_pod(&shared, Caller::Admin, a_pod("once", Some("Never"))).await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let mut answers = Vec::new();
+        for name in ["once", "x-0", "x-j0", "ghost"] {
+            let (code, said) = delete_pod_named(&shared, Caller::Identity("nobody".into()), name).await;
+            assert_eq!(code, StatusCode::FORBIDDEN, "{name}: {said}");
+            answers.push(said);
+        }
+        assert!(answers.windows(2).all(|two| two[0] == two[1]), "{answers:?}");
+        assert!(shared.store.lock().unwrap().store.get("Job/default/once").is_some());
         drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
     }

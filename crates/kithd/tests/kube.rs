@@ -754,7 +754,13 @@ fn workflows_kubectl_delete_pod_restarts_that_replica() {
     assert_eq!(pods(), "pod/web-0\npod/web-1\n", "the same names");
     assert_eq!(cluster.held("workload/web")["spec"]["replicas"], 2);
     // A pod that is not there is not found, and says its name.
-    cluster.refused(&["delete", "pod", "bare"], &["bare"]);
+    cluster.refused(&["delete", "pod", "bare"], &["NotFound", "bare"]);
+    // A Pod applied over a Deployment of its name is a name taken (AlreadyExists), not a Pod to delete first.
+    cluster.write(
+        "webpod.yaml",
+        "apiVersion: v1\nkind: Pod\nmetadata: { name: web }\nspec:\n  restartPolicy: Never\n  containers: [{ name: a, image: busybox:1.36 }]\n",
+    );
+    cluster.refused(&["apply", "--server-side", "-f", "webpod.yaml"], &["already exists"]);
 }
 
 /// A Pod sent alone is read back as the Pod that was sent, and `kubectl delete pod` deletes it (and
