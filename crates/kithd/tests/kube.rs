@@ -119,7 +119,8 @@ impl Cluster {
     }
 
     /// The status kithd answers one request of `who` (an Identity of this cluster) with, as
-    /// curl asks it. An upgrade to a WebSocket answers 101 and curl gives up waiting after 3 s.
+    /// curl asks it. An upgrade to a WebSocket answers 101, and the session then waits for kithd's
+    /// 5 s cap, so the 101 comes back at about 5 s; curl's 10 s limit covers that under load.
     fn reply(&self, who: &str, method: &str, path: &str, headers: &[&str], body: Option<&str>) -> String {
         let mut args: Vec<String> = vec![
             "-s".into(),
@@ -128,7 +129,7 @@ impl Cluster {
             "-w".into(),
             "%{http_code}".into(),
             "-m".into(),
-            "3".into(),
+            "10".into(),
             "-X".into(),
             method.into(),
             "--cacert".into(),
