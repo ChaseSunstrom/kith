@@ -197,8 +197,14 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
             at,
         });
         let last = (!step.last.is_empty()).then_some(Command::Patch { statuses: step.last });
+        // (The Jobs are this node's own writes, signed by its key: `own_writes`.)
+        // ponytail: a Job Apply signs per entry; the nonce book holds 4096 per node in 5 minutes.
         for command in deletes.chain(makes).chain(last) {
-            if let Err(e) = shared.submit(command).await {
+            let said = match command {
+                Command::Apply { .. } => shared.submit_node(command).await,
+                _ => shared.submit(command).await,
+            };
+            if let Err(e) = said {
                 eprintln!("kithd: a CronJob's Jobs: {e}");
             }
         }

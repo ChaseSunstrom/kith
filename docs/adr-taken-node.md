@@ -370,7 +370,8 @@ text above, the safe way was taken, and each is said here:
   `kith run` spec, a lock's body, a volume file put), the leader refuses the mismatch
   under `required`, so it fails closed. Sign at the node that has the thing, and the
   admin's Cluster changes at the node that leads, until those hops carry as well.
-- **"node:<name>" is not taken as a signer**: no node signs yet. Refused.
+- **"node:<name>" as a signer** (slice 5): taken only through `own_writes::admit`, with the
+  node's own certificate key; see "A node signs its own writes".
 - **`required` is not refused while older nodes report**: kithd does not yet say its
   version on its Node. Set it once every node is updated.
 - **An unsigned POST that only reads** (`/v1/diff`) is refused at the local socket under
@@ -459,9 +460,21 @@ nodes too, and a replay decides alike.
 - **A signed write sent to a follower over TLS** is relayed as it came (method, path, body
   and header unchanged), and the leader writes it Signed; both nodes apply it alike. Bare,
   the follower and the local socket refuse it, as in layer 1.
-- **What stays bare, for later slices:** the node's own writes, ACME, the scheduler and
-  cron (slice 5); a Release, Source, registry, update or wasm write, and refusing every
-  bare spec write (slice 6). The forge VM test is slice 4.
+- **A node signs its own writes (slice 5, `own_writes`):** under `required`, a node's ACME
+  secret, the scheduler's Volume and a cron Job are `Signed` by the node's own key, header
+  `who=node:<name>`, path `/v1/own`, carrying `key=<P-256 point>`. The point is accepted only
+  when its fingerprint is the one in that Node's `status.certificate`, so another node's key
+  is refused. The body must equal the command; the command must be one the node may make
+  (`made`: a Volume for a provisioned claim on that node, a Job of an existing CronJob, the
+  ACME account or an exposed host's TLS secret); the nonce is taken once. `own_writes::checked`
+  is a pure function of the store and the entry. A follower forwards its signed entry to the
+  leader, which accepts it only from the control node named in `who`. Callers use
+  `raft::submit_node`. A bare Patch of a Node's `certificate` or `raftId` is refused at apply
+  (`access_sign::bare`), so a taken node cannot take another's identity. Without `required`
+  the writes stay bare, as before.
+- **What stays bare, for later slices:** a Release, Source, registry, update or wasm write,
+  and refusing every bare spec write (slice 6). The forge VM test is slice 4; slice 5 adds
+  a bare Node-certificate Patch and a signed scheduler Volume to it.
 - **What it costs:** `kith node claim` (a bare Identity, Role and RoleBinding) and a
   restore (`Import`) are refused under `required`; sign them as a change, or set `open`
   first. A rolling upgrade from slice 2 can part: a slice 2 node takes a bare access write

@@ -208,7 +208,12 @@ for r in sorted(found, key=lambda r: r["metadata"]["name"]):
             entry swapped 5 4 harmless harmless changed
             forge swapped
             grep -q '"applied":false' "$work/forged.json" || fail "a signed entry with another command than its body makes was applied: $(cat "$work/forged.json")"
-            # Each node refused all four at apply, and wrote it in its audit log.
+            # (5) a bare Patch of a Node's certificate (a taken leader would make a key its own): what a node
+            # says of itself is signed by its key (`own_writes`), so a bare one is refused at apply.
+            printf '{"Patch":{"statuses":[["Node/n2",{"certificate":"00"}]]}}' >"$work/node.entry"
+            forge node
+            grep -q '"applied":false' "$work/forged.json" || fail "a bare Patch of a Node's certificate was applied: $(cat "$work/forged.json")"
+            # Each node refused all five at apply, and wrote it in its audit log.
             audited() { # N WHO WHAT WHY
                 api "$1" GET '/v1/audit?tail=200' 2>/dev/null | python3 -c '
 import json, sys
@@ -223,9 +228,10 @@ sys.exit(0 if any(e["verb"] == "signed" and not e["ok"] and e["who"] == who and 
                 until audited "$n" unsigned forged-bare 'a bare write that changes access is refused' \
                     && audited "$n" 'local socket' /v1/apply 'over this request' \
                     && audited "$n" 'local socket' /v1/apply "$(printf '%032x' 2) of local socket was seen already" \
-                    && audited "$n" 'local socket' /v1/apply 'is not what its method, path and body make'; do
+                    && audited "$n" 'local socket' /v1/apply 'is not what its method, path and body make' \
+                    && api "$n" GET '/v1/audit?tail=200' 2>/dev/null | grep -q "sets a Node's certificate or raft id"; do
                     tries=$((tries + 1))
-                    [ "$tries" -lt 60 ] || fail "n$n did not write all four refusals in its audit log: $(api "$n" GET '/v1/audit?tail=6' 2>&1 | head -c 1500)"
+                    [ "$tries" -lt 60 ] || fail "n$n did not write all five refusals in its audit log: $(api "$n" GET '/v1/audit?tail=6' 2>&1 | head -c 1500)"
                     sleep 1
                 done
             done
@@ -234,7 +240,14 @@ sys.exit(0 if any(e["verb"] == "signed" and not e["ok"] and e["who"] == who and 
             ! grep -q 'forged\|harmless' "$work/held" || fail "a forged resource is held: $(cat "$work/held")"
             agreed RoleBinding
             ! grep -q 'forged\|mallory' "$work/held" || fail "a forged RoleBinding is held: $(cat "$work/held")"
-            echo "vm.sh: four entries the leader was not asked for, a bare RoleBinding, a signed one with its body changed, one with a replayed nonce and one with a command its signed body does not make, each refused by all three nodes at apply" >&2
+            # A node's own write, signed by its key (`own_writes`): the scheduler's Volume for a claim the
+            # admin signed, applied on all three nodes while signing is required (a bare one is refused).
+            printf '[{"apiVersion":"kith.dev/v1","kind":"VolumeClaim","metadata":{"name":"own"},"spec":{"size":"1Gi","provision":true}}]' >"$work/claim.json"
+            entry claim 6 5 claim
+            applied claim
+            agreed Volume '"path": "data"'
+            echo "vm.sh: a Volume the scheduler made for a claim, signed by its node's key, held by all three nodes under required" >&2
+            echo "vm.sh: five entries the leader was not asked for, a bare RoleBinding, a signed one with its body changed, one with a replayed nonce, one with a command its signed body does not make and a bare Patch of a Node's certificate, each refused by all three nodes at apply" >&2
             ! grep -al 'Kernel panic\|panicked at' "$work"/n?.log || fail "a node panicked"
-            echo "vm.sh: ok: three nodes; the admin writing through n2 and n3 by a RoleBinding deleted through n1 while n2 was cut off: $said; and a leader that appended a bare RoleBinding, a signed entry with its body changed, one with a replayed nonce and one with a command its signed body does not make: all three nodes refused each at apply, and hold the same"
+            echo "vm.sh: ok: three nodes; the admin writing through n2 and n3 by a RoleBinding deleted through n1 while n2 was cut off: $said; and a leader that appended a bare RoleBinding, a signed entry with its body changed, one with a replayed nonce, one with a command its signed body does not make and a bare Patch of a Node's certificate: all three nodes refused each at apply, and hold the same"
             exit 0

@@ -85,7 +85,7 @@ pub struct Asked<'a> {
 
 /// A header read ([`kith_store::header`]: a signed entry in the log carries one too), and
 /// its signature decoded.
-fn parse(header: &str) -> Result<(kith_store::Header<'_>, Vec<u8>), String> {
+pub(crate) fn parse(header: &str) -> Result<(kith_store::Header<'_>, Vec<u8>), String> {
     let read = kith_store::header(header)?;
     let sig = base64::engine::general_purpose::STANDARD.decode(read.sig);
     let sig = sig.map_err(|e| format!("{SIGNED}: sig is not base64: {e}"))?;
@@ -120,19 +120,13 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// The DER of a P-256 public key's SubjectPublicKeyInfo, before the point.
-const P256: [u8; 26] = [
-    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce,
-    0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
-];
-
 type Key = (&'static dyn VerificationAlgorithm, Vec<u8>);
 
 /// The point of the P-256 public key `pem` (an Identity's `publicKey`) holds, if it holds one.
 fn p256_point(pem: &str) -> Option<Vec<u8>> {
     use rustls::pki_types::pem::PemObject;
     let spki = rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(pem.as_bytes()).ok()?;
-    Some(spki.as_ref().strip_prefix(&P256[..])?.to_vec())
+    Some(spki.as_ref().strip_prefix(&crate::pki::P256_SPKI[..])?.to_vec())
 }
 
 /// Who `who` is, and the keys that sign as them.
@@ -405,10 +399,19 @@ pub fn new_identity(name: &str) -> Resource {
 /// whose render holds a Role, RoleBinding, Identity or KindDefinition (or prunes one) is bare, so
 /// it is refused here too. Their controllers do not propose it under `required`
 /// ([`refuses_render`]) and say so in the status.
-fn bare(store: &Store, command: &Command) -> Result<(), String> {
-    // (The command first: the scan of the store for `required` only runs for an access write.)
-    match crate::raft::changes_access(command) && store.checking() && required(store) {
-        true => Err("a bare write that changes access is refused under spec.signing: required".into()),
+pub(crate) fn bare(store: &Store, command: &Command) -> Result<(), String> {
+    // A Node's certificate or raft id is what its signature is checked by: a node's own, signed.
+    let node = |(key, fields): &(String, serde_json::Map<String, serde_json::Value>)| {
+        key.starts_with("Node/") && ["certificate", "raftId"].iter().any(|field| fields.contains_key(*field))
+    };
+    let what = match command {
+        _ if crate::raft::changes_access(command) => "changes access",
+        Command::Patch { statuses } if statuses.iter().any(node) => "sets a Node's certificate or raft id",
+        _ => return Ok(()),
+    };
+    // (The command first: the scan of the store for `required` only runs for such a write.)
+    match store.checking() && required(store) {
+        true => Err(format!("a bare write that {what} is refused under spec.signing: required")),
         false => Ok(()),
     }
 }
@@ -454,7 +457,8 @@ pub fn admit(store: &Store, cluster: &str, command: &Command, leader: kith_store
     if !store.checking() {
         return Err("the store is not in format 4, where every member checks signed entries".into());
     }
-    let target = kith_store::header(header)?.target;
+    let said = kith_store::header(header)?;
+    let target = said.target;
     if target != "*" && kith_store::node_id(target) != leader {
         return Err(format!("signed for {target}, not for the node that wrote it"));
     }
@@ -465,6 +469,10 @@ pub fn admit(store: &Store, cluster: &str, command: &Command, leader: kith_store
         path,
         body: &body,
     };
+    // A control node's own write, signed by its node key (`own_writes::sign`).
+    if let Some(node) = said.who.strip_prefix("node:") {
+        return crate::own_writes::admit(store, cluster, node, header, &asked, command);
+    }
     let (signer, read) = signature(header, cluster, &[target], &asked, store)?;
     match certificate_of(path) {
         Some(name) => certified(store, &signer, name, method, &body, command)?,

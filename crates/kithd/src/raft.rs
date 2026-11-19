@@ -525,7 +525,7 @@ fn held(
                 false => Err(format!("{WORKER} names {worker}, which is no worker here")),
             }
         }
-        None => crate::own_writes::checked(shared, &node, command).map(Some),
+        None => crate::own_writes::edge(shared, &node, command).map(Some),
     };
     checked.inspect_err(|why| {
         match headers.contains_key(WORKER) {
@@ -603,6 +603,14 @@ async fn write(
                 Command::Mark if format < 2 => Some("the store's format: only the leader changes it"),
                 Command::MarkSigned if format < 3 => Some("the store's format: only the leader changes it"),
                 Command::MarkChecked if format < 4 => Some("the store's format: only the leader changes it"),
+                // (A node's own write, signed by its key: every node checks it at apply.)
+                Command::Signed { ref header, .. }
+                    if who.is_none()
+                        && kith_store::header(header)
+                            .is_ok_and(|said| said.who.strip_prefix("node:") == Some(sent_by(&peer).as_str())) =>
+                {
+                    None
+                }
                 Command::Signed { .. } => {
                     Some("a signed entry: only the leader writes them, from the request it checked")
                 }
@@ -615,10 +623,13 @@ async fn write(
             audit(&shared, &sent_by(&peer), why.clone());
             return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
         }
-        let command = match held(&shared, &peer, &headers, who.as_ref(), command) {
-            Ok(Some(command)) => command,
-            Ok(None) => return Json(None::<(Reply, u64)>).into_response(),
-            Err(why) => return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response(),
+        let command = match command {
+            signed @ Command::Signed { .. } => signed,
+            command => match held(&shared, &peer, &headers, who.as_ref(), command) {
+                Ok(Some(command)) => command,
+                Ok(None) => return Json(None::<(Reply, u64)>).into_response(),
+                Err(why) => return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response(),
+            },
         };
         let signed = match signer(&shared, &peer, &headers, &uri, &bytes, who.as_ref()) {
             Ok(signed) => signed,
@@ -725,6 +736,11 @@ async fn passed(shared: &Shared, name: &str, command: Command) -> Option<(Reply,
 /// How long a change waits for a leader and a majority.
 const PATIENCE: Duration = Duration::from_secs(10);
 
+tokio::task_local! {
+    /// Set while a node's own write is made (`Shared::submit_node`).
+    static OWN: ();
+}
+
 fn unavailable(why: impl std::fmt::Display) -> Error {
     Error::Io(format!("the store cannot take changes now: {why}"))
 }
@@ -739,6 +755,12 @@ impl Shared {
     // state machine are the fix when that matters.
     pub async fn submit(&self, command: Command) -> Result<Done, Error> {
         self.submit_as(command, None).await
+    }
+
+    /// [`Shared::submit`] for this node's own write of what only it makes (a Volume it
+    /// provisions, a cron Job, an ACME secret, its own Node): signed by its key, where callers sign.
+    pub async fn submit_node(&self, command: Command) -> Result<Done, Error> {
+        OWN.scope((), self.submit(command)).await
     }
 
     /// [`Shared::submit`] for `who`: an Identity's write is decided again where it is put in
@@ -851,24 +873,33 @@ impl Shared {
         // the others'): its header, method, path and body with it, which every node checks
         // before it applies the change (`access_sign::admit`). (Sent on to a leader, it is sent
         // bare.)
-        let entry = {
-            let checking = self
-                .store
-                .lock()
-                .expect("a handler panicked holding the store")
-                .store
-                .checking();
-            let relay = access_sign::current().and_then(|signed| Some((signed.header, signed.relay?)));
-            match relay {
-                Some((header, relay)) if checking && relay.signs(&command) => Command::Signed {
-                    header,
-                    method: relay.method,
-                    path: relay.path,
-                    body: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &relay.body),
-                    command: Box::new(command.clone()),
-                },
-                _ => command.clone(),
-            }
+        let (checking, required) = {
+            let state = self.store.lock().expect("a handler panicked holding the store");
+            (state.store.checking(), access_sign::required(&state.store))
+        };
+        // A node's own write (`submit_node`) is signed by its key where callers sign, and goes
+        // to the leader so (`own_writes`).
+        let own = OWN
+            .try_with(|_| ())
+            .ok()
+            .filter(|()| checking && required)
+            .and(self.cluster.as_ref())
+            .and_then(|cluster| {
+                let id = pki::fingerprint(&cluster.me.ca).ok()?;
+                crate::own_writes::sign(&cluster.me, &id, &command)
+            });
+        let relay = access_sign::current().and_then(|signed| Some((signed.header, signed.relay?)));
+        let own_signed = own.is_some();
+        let entry = match (own, relay) {
+            (Some(entry), _) => entry,
+            (None, Some((header, relay))) if checking && relay.signs(&command) => Command::Signed {
+                header,
+                method: relay.method,
+                path: relay.path,
+                body: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &relay.body),
+                command: Box::new(command.clone()),
+            },
+            _ => command.clone(),
         };
         let deadline = Instant::now() + PATIENCE;
         let mut refused = None;
@@ -884,7 +915,7 @@ impl Shared {
                 Err(_) => return Err(no_majority(refused)),
             };
             if let Some((id, leader)) = leader {
-                match self.forward(id, &leader, &command, who).await {
+                match self.forward(id, &leader, if own_signed { &entry } else { &command }, who).await {
                     Forward::Done(reply, index) => return reply.map(|done| (done, index)),
                     Forward::Failed(e) => return Err(e),
                     Forward::Again(why) => refused = why.or(refused),
