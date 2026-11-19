@@ -719,8 +719,20 @@ async fn rollback(
     Path(key): Path<String>,
     Query(options): Query<RollbackOptions>,
 ) -> Reply<Change> {
-    allowed(&shared, &caller, |store| back_takes(store, &key, options.to))?;
-    let (to, at) = (options.to, kith_api::store::now());
+    rolled_back(&shared, &caller, key, options.to).await.map(Json)
+}
+
+/// Going back to revision `to` of `key`, with every check the route makes: what applying that
+/// revision takes, a NodeKey not rolled back, who acts for a writer, a Node's control staying.
+/// (The Kubernetes API's `kubectl rollout undo` goes through here as well.)
+pub(crate) async fn rolled_back(
+    shared: &Arc<Shared>,
+    caller: &Caller,
+    key: String,
+    to: u64,
+) -> Result<Change, ApiError> {
+    allowed(shared, caller, |store| back_takes(store, &key, to))?;
+    let at = kith_api::store::now();
     // (A NodeKey keeps no earlier version, and one control node may still hold some a
     // store from before that kept, where another has cut them: a rollback would differ.)
     if key.starts_with("NodeKey/") {
@@ -733,7 +745,7 @@ async fn rollback(
         .iter()
         .any(|kind| key.starts_with(kind))
     {
-        let Json(was) = read(&shared, |store| {
+        let Json(was) = read(shared, |store| {
             let history = store.history(&key)?;
             let was = history.iter().find(|was| was.resource.metadata.revision == Some(to));
             let mut was = was
@@ -743,11 +755,11 @@ async fn rollback(
             was.metadata.revision = None;
             Ok(was)
         })?;
-        let mut changes = applied(&shared, &caller, vec![was]).await?;
-        return changes.pop().map(Json).ok_or_else(odd);
+        let mut changes = applied(shared, caller, vec![was]).await?;
+        return changes.pop().ok_or_else(odd);
     }
     if let Some(node) = key.strip_prefix("Node/") {
-        let Json(()) = read(&shared, |store| {
+        let Json(()) = read(shared, |store| {
             let was = store
                 .history(&key)?
                 .iter()
@@ -757,8 +769,8 @@ async fn rollback(
         })?;
     }
     let what = vec![format!("{key} to revision {to}")];
-    match change(&shared, &caller, "rollback", what, Command::Rollback { key, to, at }).await? {
-        Done::Changes(mut changes) if changes.len() == 1 => Ok(Json(changes.remove(0))),
+    match change(shared, caller, "rollback", what, Command::Rollback { key, to, at }).await? {
+        Done::Changes(mut changes) if changes.len() == 1 => Ok(changes.remove(0)),
         _ => Err(odd()),
     }
 }
