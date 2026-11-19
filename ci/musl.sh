@@ -36,7 +36,14 @@ case "${KITHD_FEATURES:-}" in
         echo "$dir/forge/$target/release"
         exit 0
         ;;
-    *) echo "musl.sh: KITHD_FEATURES knows: forge" >&2; exit 1 ;;
+    # fido2-test: the one with a software security key on /dev/uhid (crates/kithd/src/fido2_test.rs,
+    # docs/adr-fido2.md section 2), for the fido2 VM test alone; its folder is its own too.
+    fido2-test)
+        CARGO_TARGET_DIR="$dir/fido2-test" cargo build --release --quiet --target "$target" -p kithd -p kith-cli --features kithd/fido2-test >&2
+        echo "$dir/fido2-test/$target/release"
+        exit 0
+        ;;
+    *) echo "musl.sh: KITHD_FEATURES knows: forge, fido2-test" >&2; exit 1 ;;
 esac
 out="$dir/$target/release"
 # kith with TLS to a node (cargo feature remote) is built first and kept as kith-remote, beside
@@ -52,6 +59,12 @@ cargo build --release --quiet --target "$target" -p kithd -p kith-cli >&2
 # forge build is the other thing only that build has.)
 if grep -aqE '/v1/forge([^t]|$)|built with forge: ' "$out/kithd"; then
     echo "musl.sh: $out/kithd has the forge route in it: a build that ships has none" >&2
+    exit 1
+fi
+# And no software security key: the startup line and the subcommand of a fido2-test build are
+# in nothing else (fido2_test.rs).
+if grep -aqE 'built with fido2-test: |fido2-authenticator' "$out/kithd"; then
+    echo "musl.sh: $out/kithd has the fido2-test authenticator in it: a build that ships has none" >&2
     exit 1
 fi
 # cargo reads a relative CARGO_TARGET_DIR from here; the line printed is absolute (order.py

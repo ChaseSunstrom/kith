@@ -1122,7 +1122,7 @@ pub mod hmac {
     }
 
     /// A COSE_Key for an ECDH P-256 public key (kty 2, alg -25, crv 1).
-    pub(super) fn cose(x: &[u8], y: &[u8]) -> Value {
+    pub(crate) fn cose(x: &[u8], y: &[u8]) -> Value {
         Value::Map(vec![
             (uint(1), uint(2)),
             (uint(3), Value::int(-25)),
@@ -1133,7 +1133,7 @@ pub mod hmac {
     }
 
     /// The uncompressed point (0x04, x, y) of a COSE key that is P-256 and nothing else.
-    pub(super) fn point(key: &Value) -> Result<[u8; 65], String> {
+    pub(crate) fn point(key: &Value) -> Result<[u8; 65], String> {
         if key.get(&uint(1)) != Some(&uint(2)) {
             return Err("the key's agreement key is not an EC2 key".into());
         }
@@ -1523,8 +1523,8 @@ pub mod flow {
 
     #[cfg(test)]
     mod tests {
-        use super::super::script::Key;
         use super::*;
+        use crate::fido2_test::auth::Key;
 
         const RP: &str = "kith.local";
 
@@ -1702,239 +1702,6 @@ pub mod flow {
             );
             assert!(credential_id(&Value::Map(vec![]), RP).is_err());
             assert!(credential_id(&attested(RP, 0xc1, &[]), RP).is_err());
-        }
-    }
-}
-
-/// A scripted key for the tests: the authenticator's side of CTAPHID, getInfo, clientPIN,
-/// makeCredential and getAssertion with `hmac-secret`, answering through the same framing
-/// the client uses. Its secrets come from a seed, so a test can say what they must be.
-#[cfg(test)]
-mod script {
-    use super::cbor::{self, Value};
-    use super::frame::{self, Device, REPORT};
-    use super::{cbc, hmac};
-    use ring::{agreement, digest, hmac as ring_hmac, rand};
-    use std::{collections::VecDeque, io};
-
-    fn u(n: u64) -> Value {
-        Value::Uint(n)
-    }
-    fn t(s: &str) -> Value {
-        Value::text(s)
-    }
-
-    pub struct Key {
-        pub seed: u8,
-        pub pin: bool,
-        pub protocols: Vec<u64>,
-        pub extensions: Vec<&'static str>,
-        /// What a made credential's extensions say about hmac-secret.
-        pub grant_hmac: bool,
-        pub creds: Vec<Vec<u8>>,
-        /// Every CTAP2 request received: its command byte and its map.
-        pub seen: Vec<(u8, Value)>,
-        agreement: Option<agreement::EphemeralPrivateKey>,
-        incoming: Option<(u32, u8, usize, Vec<u8>)>,
-        out: VecDeque<Vec<u8>>,
-    }
-
-    /// Where the key's answers are framed to.
-    struct Sink<'a>(&'a mut VecDeque<Vec<u8>>);
-    impl Device for Sink<'_> {
-        fn write(&mut self, r: &[u8; REPORT]) -> io::Result<()> {
-            self.0.push_back(r.to_vec());
-            Ok(())
-        }
-        fn read(&mut self) -> io::Result<Vec<u8>> {
-            unreachable!()
-        }
-    }
-
-    impl Key {
-        pub fn new() -> Key {
-            Key {
-                seed: 1,
-                pin: false,
-                protocols: vec![1],
-                extensions: vec!["hmac-secret"],
-                grant_hmac: true,
-                creds: vec![],
-                seen: vec![],
-                agreement: None,
-                incoming: None,
-                out: VecDeque::new(),
-            }
-        }
-
-        fn cred_random(&self, id: &[u8]) -> ring_hmac::Tag {
-            ring_hmac::sign(&ring_hmac::Key::new(ring_hmac::HMAC_SHA256, &[self.seed; 32]), id)
-        }
-
-        /// What the key's hmac-secret is for `salt` under credential `id`.
-        pub fn expected(&self, id: &[u8], salt: &[u8]) -> [u8; 32] {
-            let tag = ring_hmac::sign(
-                &ring_hmac::Key::new(ring_hmac::HMAC_SHA256, self.cred_random(id).as_ref()),
-                salt,
-            );
-            tag.as_ref().try_into().unwrap()
-        }
-
-        fn auth_data(rp: &str, flags: u8, tail: &[u8]) -> Vec<u8> {
-            let mut a = digest::digest(&digest::SHA256, rp.as_bytes()).as_ref().to_vec();
-            a.push(flags);
-            a.extend_from_slice(&[0, 0, 0, 1]);
-            a.extend_from_slice(tail);
-            a
-        }
-
-        fn text_at<'a>(v: &'a Value, key: u64, inner: &str) -> Result<&'a str, u8> {
-            match v.get(&u(key)).and_then(|m| m.get(&t(inner))) {
-                Some(Value::Text(s)) => Ok(s),
-                _ => Err(0x14), // MISSING_PARAMETER
-            }
-        }
-
-        fn ids(v: Option<&Value>) -> Vec<Vec<u8>> {
-            let Some(Value::Array(a)) = v else { return vec![] };
-            a.iter()
-                .filter_map(|d| match d.get(&t("id")) {
-                    Some(Value::Bytes(b)) => Some(b.clone()),
-                    _ => None,
-                })
-                .collect()
-        }
-
-        fn ctap(&mut self, cmd: u8, p: &Value) -> Result<Value, u8> {
-            match cmd {
-                0x04 => Ok(Value::Map(vec![
-                    (u(1), Value::Array(vec![t("FIDO_2_0")])),
-                    (u(2), Value::Array(self.extensions.iter().map(|e| t(e)).collect())),
-                    (u(6), Value::Array(self.protocols.iter().map(|n| u(*n)).collect())),
-                ])),
-                0x06 => {
-                    if p.get(&u(1)) != Some(&u(1)) || p.get(&u(2)) != Some(&u(2)) {
-                        return Err(0x02);
-                    }
-                    let k = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rand::SystemRandom::new())
-                        .unwrap();
-                    let public = k.compute_public_key().unwrap();
-                    let public = public.as_ref();
-                    self.agreement = Some(k);
-                    Ok(Value::Map(vec![(u(1), hmac::cose(&public[1..33], &public[33..]))]))
-                }
-                0x01 => {
-                    let rp = Self::text_at(p, 2, "id")?;
-                    if self.pin {
-                        return Err(0x36);
-                    }
-                    if Self::ids(p.get(&u(5))).iter().any(|id| self.creds.contains(id)) {
-                        return Err(0x19);
-                    }
-                    let id = vec![self.creds.len() as u8 + 1; 40];
-                    self.creds.push(id.clone());
-                    let mut tail = vec![0xaa; 16];
-                    tail.extend_from_slice(&(id.len() as u16).to_be_bytes());
-                    tail.extend_from_slice(&id);
-                    tail.extend_from_slice(&cbor::encode(&hmac::cose(&[1; 32], &[2; 32])));
-                    tail.extend_from_slice(&cbor::encode(&Value::Map(vec![(
-                        t("hmac-secret"),
-                        Value::Bool(self.grant_hmac),
-                    )])));
-                    Ok(Value::Map(vec![
-                        (u(1), t("none")),
-                        (u(2), Value::Bytes(Self::auth_data(rp, 0xc1, &tail))),
-                        (u(3), Value::Map(vec![])),
-                    ]))
-                }
-                0x02 => {
-                    let Value::Text(rp) = p.get(&u(1)).ok_or(0x14u8)? else {
-                        return Err(0x14);
-                    };
-                    let id = Self::ids(p.get(&u(3)))
-                        .into_iter()
-                        .find(|id| self.creds.contains(id))
-                        .ok_or(0x2eu8)?;
-                    let ext = p.get(&u(4)).and_then(|e| e.get(&t("hmac-secret"))).ok_or(0x14u8)?;
-                    let (Some(cose), Some(Value::Bytes(enc)), Some(Value::Bytes(auth))) =
-                        (ext.get(&u(1)), ext.get(&u(2)), ext.get(&u(3)))
-                    else {
-                        return Err(0x14);
-                    };
-                    let peer = hmac::point(cose).map_err(|_| 0x02u8)?;
-                    let k = self.agreement.take().ok_or(0x21u8)?; // PROCESSING
-                    let secret = agreement::agree_ephemeral(
-                        k,
-                        &agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, &peer[..]),
-                        hmac::derive,
-                    )
-                    .map_err(|_| 0x02u8)?;
-                    if hmac::mac16(&secret[..], enc) != auth[..] {
-                        return Err(0x33); // PIN_AUTH_INVALID
-                    }
-                    let salt = cbc::run(&secret, &[0; 16], enc, false).map_err(|_| 0x02u8)?;
-                    let sealed = cbc::run(&secret, &[0; 16], &self.expected(&id, &salt), true).unwrap();
-                    let ext = cbor::encode(&Value::Map(vec![(t("hmac-secret"), Value::Bytes(sealed))]));
-                    Ok(Value::Map(vec![
-                        (
-                            u(1),
-                            Value::Map(vec![(t("id"), Value::Bytes(id)), (t("type"), t("public-key"))]),
-                        ),
-                        (u(2), Value::Bytes(Self::auth_data(rp, 0x81, &ext))),
-                        (u(3), Value::Bytes(vec![0x30; 70])),
-                    ]))
-                }
-                _ => Err(0x01),
-            }
-        }
-
-        fn answer(&mut self, cid: u32, cmd: u8, data: Vec<u8>) {
-            let (cmd, body) = match cmd {
-                frame::INIT => {
-                    let mut a = data[..8].to_vec();
-                    a.extend_from_slice(&0x0a0b_0c0du32.to_be_bytes());
-                    a.extend_from_slice(&[2, 5, 1, 0, 0x04]);
-                    (frame::INIT, a)
-                }
-                frame::CBOR => {
-                    let p = if data.len() > 1 {
-                        cbor::decode(&data[1..]).unwrap()
-                    } else {
-                        Value::Map(vec![])
-                    };
-                    self.seen.push((data[0], p.clone()));
-                    match self.ctap(data[0], &p) {
-                        Ok(v) => (frame::CBOR, [&[0][..], &cbor::encode(&v)].concat()),
-                        Err(status) => (frame::CBOR, vec![status]),
-                    }
-                }
-                _ => (frame::ERROR, vec![1]),
-            };
-            frame::send(&mut Sink(&mut self.out), cid, cmd, &body).unwrap();
-        }
-    }
-
-    impl Device for Key {
-        fn write(&mut self, r: &[u8; REPORT]) -> io::Result<()> {
-            let cid = u32::from_be_bytes([r[0], r[1], r[2], r[3]]);
-            if r[4] & 0x80 != 0 {
-                let len = usize::from(u16::from_be_bytes([r[5], r[6]]));
-                self.incoming = Some((cid, r[4] & 0x7f, len, r[7..7 + len.min(REPORT - 7)].to_vec()));
-            } else if let Some(m) = &mut self.incoming {
-                let want = (m.2 - m.3.len()).min(REPORT - 5);
-                m.3.extend_from_slice(&r[5..5 + want]);
-            }
-            if self.incoming.as_ref().is_some_and(|m| m.3.len() >= m.2) {
-                let (cid, cmd, _, data) = self.incoming.take().unwrap();
-                self.answer(cid, cmd, data);
-            }
-            Ok(())
-        }
-
-        fn read(&mut self) -> io::Result<Vec<u8>> {
-            self.out
-                .pop_front()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "the key has nothing to say"))
         }
     }
 }
