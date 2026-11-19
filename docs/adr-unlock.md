@@ -566,6 +566,14 @@ Deferred, for reasons other than size:
 Captured as its own task at step 5. Until it is built, README and SECURITY.md say that it is
 not (criterion 5).
 
+**Decided since, in [adr-fido2.md](adr-fido2.md)** (T-0863): the client without a `cbc` crate (CBC by
+hand over the `aes` crate already in), the stand-in authenticator written in this tree behind
+`/dev/uhid` (QEMU here has neither `u2f-emulated` nor `canokey`), the three kernel options named
+(`CONFIG_UHID` only in a test build), the two-key enrolment, and the slices T-0953 to T-0956. It
+also corrects the size line above: kithd has about 30 kB under its budget now (13.20 MB, `ci/budgets.py`),
+so the client does not fit without a budget raise. The second disk, which also stands on the state's
+opening, is in [adr-second-disk.md](adr-second-disk.md) (T-0957, T-0958).
+
 ## Rivals
 
 1. **Delegate to systemd and LUKS2** (systemd-cryptenroll with `--tpm2-with-pin`,
@@ -809,7 +817,9 @@ resets the count. Item 8 is not: kithd refuses an M or an I of 0 before the TPM 
     before ExitBootServices included.
 19. A sealed blob is about 200 bytes. swtpm made it 272 ("The lock record" uses that).
 20. QEMU's emulated security key speaks U2F only; the kernel's merged configuration lacks
-    CONFIG_HIDRAW and CONFIG_USB_HID.
+    CONFIG_HIDRAW and CONFIG_USB_HID. (Checked since in [adr-fido2.md](adr-fido2.md): this
+    machine's QEMU 11.1.3 lists neither `u2f-emulated` nor `canokey`; the kernel options stay
+    unnamed in `os/`, and whether the defconfig gives them is still unverified.)
 21. A 4 KiB aligned write is whole after a power cut (depends on the disk).
 22. One maker's firmware TPM has had its secrets read out by faulting it (published; not
     checked here).
@@ -834,9 +844,11 @@ Decisions that are the owner's:
 - **The `aes` crate**, a new dependency, for the session's AES-128-CFB, and later FIDO2's CBC.
   Taken at step 2 (T-0585): `aes` 0.9, the block cipher alone, CFB written in tpm.rs; kithd
   grew by 16 KiB (12,026,656 to 12,043,040 bytes, musl release).
-- **FIDO2**: built as its own task, with a software authenticator for its tests.
+- **FIDO2**: designed in [adr-fido2.md](adr-fido2.md), built as the tasks it lists (T-0953 to
+  T-0956), with a software authenticator for its tests.
 - **A second copy of the lock record** against a torn write, and what a duress code and an
-  older kithd then do with it.
+  older kithd then do with it. (Built since, T-0596: a copy follows the record and is written
+  first, `crates/kithd/src/crypt.rs:96-100`, with a `sum:` line.)
 - **Taking back old seals**: a copy of an older record opens under the older signed system it
   was sealed for, on that machine, until the TPM is cleared. TPM2_PolicyNV with a counter
   would end that, at the cost of NV space and more commands.
