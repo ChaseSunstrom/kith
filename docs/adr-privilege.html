@@ -88,7 +88,7 @@
   execUnits: true        # a process of the node's root, with all of /dev
   rootContainers: true   # a container that is the node's root (root, and no range of ids of its own)
   unconfined: true       # seccomp unconfined, or refused calls allowed back by name, or a nested unit
-  hostUsers: true        # a container that keeps the node's own users, with no range of its own (a NodeWorkload)
+  hostUsers: true        # a container with host_users (a NodeWorkload's): the node's own users; hardened stops NodeWorkloads
   nodeNetwork: true      # containers that are no pod: the node's own network
   devices: [all]         # which classes a DeviceClaim may hand a container: gpu, input, usb, …
   vms: true

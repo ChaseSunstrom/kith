@@ -544,7 +544,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   what the node itself finds its hardware to be: one whose class, path or further nodes
   the store says otherwise, or one written by hand, is not handed out there (the store
   could call the node's disk a GPU). `hardened` is all of them off, with a GPU the only
-  Device. What a node refuses is not run there and the Workload's status says which word
+  Device; it also stops NodeWorkloads (DaemonSets), whose containers keep the node's users:
+  turn `host-users` back on to run them. (`host-users` holds a container's `host_users`, a
+  NodeWorkload's; a container given a device, or a mount on a file system that cannot be
+  id-mapped, keeps the node's users too, without it.) What a node refuses is not run there and the Workload's status says which word
   refused it; the Node's status says its policy. Every word is on where nothing is said:
   **a node with no policy is as before, and the paragraph above is all there is.** The
   scheduler places a Workload or Job only on nodes whose status says they allow what it
@@ -572,9 +575,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   write `/proc/sys` with file permissions alone; neither is covered by the cut. Untried on
   a cut node: a VM (qemu would be exec'd with the fourteen; `vm-paths` off already leaves
   no VM of use) and a passthrough device (vfio may want `IPC_LOCK` or a memlock limit,
-  which the list does not have); no VM test runs either. A pod on a hardened node can still be root inside
-  a user namespace of its own, with what that gives (above), and a container that keeps the node's
-  users and is not root is still the node's user of its number, with whatever files on
+  which the list does not have); no VM test runs either. On a hardened node a pod with `userNamespaces`
+  (which takes `unconfined`) and a NodeWorkload's container (which takes `host-users`) are not run; a
+  container that keeps the node's users for another reason (a device, or a mount that cannot be
+  id-mapped) and is not root is still the node's user of its number, with whatever files on
   the node that user owns; one that would be of root's group (its image says `1001:0`,
   say) is refused as root is. The policy is no defence against whoever can write the node's config partition
   or kithd's arguments and environment where it is started (`KITH_NODE_POLICY` and the

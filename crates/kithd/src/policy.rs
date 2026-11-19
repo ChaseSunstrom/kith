@@ -32,7 +32,7 @@ pub const KEYS: [(&str, &str, &str); 11] = [
     (
         "host-users",
         "hostUsers",
-        "containers that keep the node's own users, with no range of ids of their own",
+        "containers with host_users (a NodeWorkload's): the node's own users",
     ),
     (
         "node-network",
@@ -299,8 +299,8 @@ impl Policy {
 
     /// Why a template is not run on this node, if its policy refuses any of it: one line
     /// for each key, naming the key and where it is set ([`needs`]).
-    pub fn refuses(&self, template: &Template, pci: bool) -> Vec<String> {
-        let needs = needs(template, pci).into_iter();
+    pub fn refuses(&self, template: &Template, pci: bool, node_workload: bool) -> Vec<String> {
+        let needs = needs(template, pci, node_workload).into_iter();
         needs.filter_map(|key| self.refusal(key)).collect()
     }
 
@@ -319,8 +319,9 @@ impl Policy {
 
 /// The keys a template needs on to run on a node: one for each thing of it a node's policy
 /// may refuse. `pci` says a claim of the replica holds a PCI device (which a VM of it
-/// would be handed).
-pub fn needs(template: &Template, pci: bool) -> Vec<&'static str> {
+/// would be handed). `node_workload`: the template is a NodeWorkload's, whose containers
+/// keep the node's own users (`host_users`).
+pub fn needs(template: &Template, pci: bool, node_workload: bool) -> Vec<&'static str> {
     let unconfined = |seccomp: &kith_api::kinds::Seccomp| seccomp.unconfined == Some(true) || !seccomp.allow.is_empty();
     let paths = |vm: &kith_api::kinds::VmUnit| {
         let other = vm
@@ -336,8 +337,10 @@ pub fn needs(template: &Template, pci: bool) -> Vec<&'static str> {
             "unconfined",
             template
                 .containers()
-                .any(|c| c.seccomp.as_ref().is_some_and(unconfined)),
+                // (`userNamespaces` lets the refused calls back: `nested`.)
+                .any(|c| c.user_namespaces == Some(true) || c.seccomp.as_ref().is_some_and(unconfined)),
         ),
+        ("hostUsers", node_workload && template.containers().next().is_some()),
         (
             "nodeNetwork",
             template.containers().next().is_some() && template.pod != Some(true),
@@ -543,11 +546,11 @@ mod tests {
         let vm_other = template(json!({ "vms": [{ "name": "a", "memory": "1Gi", "hypervisor": "cloudHypervisor" }] }));
         let everything = Policy::default();
         for template in [&exec, &plain, &pod, &loose, &allowed, &vm, &vm_disk, &vm_other] {
-            assert_eq!(everything.refuses(template, true), Vec::<String>::new());
+            assert_eq!(everything.refuses(template, true, false), Vec::<String>::new());
         }
         let hardened = Policy::hardened();
         let keys = |template: &Template, pci: bool| -> Vec<&str> {
-            let said = hardened.refuses(template, pci);
+            let said = hardened.refuses(template, pci, false);
             assert!(said.iter().all(|line| line.contains("--node-policy ")), "{said:?}");
             let named = |line: &String| {
                 KEYS.iter()
@@ -567,7 +570,31 @@ mod tests {
         assert_eq!(keys(&vm_other, true), ["vms", "vmPaths", "passthrough"]);
         // One key back on, and only its thing is run.
         let vms: Policy = "hardened,vms".parse().unwrap();
-        assert_eq!(vms.refuses(&vm, false), Vec::<String>::new());
-        assert_eq!(vms.refuses(&vm_disk, false).len(), 1);
+        assert_eq!(vms.refuses(&vm, false, false), Vec::<String>::new());
+        assert_eq!(vms.refuses(&vm_disk, false, false).len(), 1);
+    }
+
+    #[test]
+    fn needs_asks_for_host_users_of_a_node_workload_and_unconfined_of_a_nested_container() {
+        use serde_json::json;
+        let pod = template(json!({ "pod": true, "containers": [{ "name": "a", "image": "x" }] }));
+        let nested =
+            template(json!({ "pod": true, "containers": [{ "name": "a", "image": "x", "userNamespaces": true }] }));
+        let kept =
+            template(json!({ "pod": true, "containers": [{ "name": "a", "image": "x", "userNamespaces": false }] }));
+        // A NodeWorkload's containers keep the node's users; a Workload's do not.
+        assert!(needs(&pod, false, true).contains(&"hostUsers"));
+        assert!(!needs(&pod, false, false).contains(&"hostUsers"));
+        // (One with no container has nothing to keep them.)
+        let exec = template(json!({ "exec": [{ "name": "a", "command": ["/bin/true"] }] }));
+        assert!(!needs(&exec, false, true).contains(&"hostUsers"));
+        assert!(needs(&nested, false, false).contains(&"unconfined"));
+        assert!(!needs(&kept, false, false).contains(&"unconfined"));
+        assert!(!needs(&pod, false, false).contains(&"unconfined"));
+        // Said to the operator by the key's name.
+        let hardened = Policy::hardened();
+        assert_eq!(hardened.refuses(&pod, false, true).len(), 1);
+        assert!(hardened.refuses(&pod, false, true)[0].contains("(hostUsers is off"));
+        assert!(hardened.refuses(&nested, false, false)[0].contains("(unconfined is off"));
     }
 }

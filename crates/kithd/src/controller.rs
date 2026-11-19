@@ -1317,7 +1317,11 @@ impl Controller {
             // What this node's own policy refuses of it is not run here, whoever wrote it and
             // whatever the store says (docs/adr-privilege.md): said where a replica is this
             // node's to run.
-            let mut refused = node_policy.refuses(&template, !crate::vm::pci(&devices).is_empty());
+            let mut refused = node_policy.refuses(
+                &template,
+                !crate::vm::pci(&devices).is_empty(),
+                resource.kind == "NodeWorkload",
+            );
             let kept = |(name, class): &&(String, kith_api::kinds::DeviceClass)| {
                 !node_policy.device(class) || found.as_ref().is_some_and(|found| !found.contains(name))
             };
