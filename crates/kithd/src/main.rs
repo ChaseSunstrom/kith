@@ -56,6 +56,7 @@ mod os;
 mod own_writes;
 mod people;
 mod pki;
+mod pod_exec;
 mod pods;
 mod policy;
 mod predict;

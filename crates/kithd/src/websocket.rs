@@ -1,12 +1,11 @@
 //! The WebSocket framing (RFC 6455) that kubectl exec, attach and cp speak to kithd, written here
 //! with no new dependency: the accept key, a frame decoder that refuses what is malformed and bounds
-//! every length before any of its body is read, and the encoder. No extension (RSV bits stay 0),
-//! no fragmentation, no continuation frames, except where the messages are one stream of bytes
-//! (`decode_with`: kubectl port-forward's SPDY).
-//!
-//! ponytail: the slice that carries stdin must accept continuation frames (opcode 0), capping the
-//! reassembled message at FRAME_MAX: kubectl's gorilla client splits its writes over a 4 KiB buffer.
-//! (Port-forward's `decode_with` takes each piece as it comes; exec's stdin is still to do.)
+//! every length before any of its body is read, and the encoder. No extension (RSV bits stay 0).
+//! A client's message may come as several frames (kubectl's gorilla client splits its writes over
+//! a 4 KiB buffer): the decoder hands each one over as it is, a continuation (opcode 0) as
+//! [`Op::Continue`], and what reads them keeps what the first one said. Where the messages are one
+//! stream of bytes (`decode_with`: kubectl port-forward's SPDY) a continuation comes back as `Binary`.
+//! kithd sends each message whole.
 
 use base64::Engine;
 
@@ -15,6 +14,8 @@ const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Op {
+    /// The rest of a message that an earlier frame began.
+    Continue,
     Text,
     Binary,
     Close,
@@ -76,11 +77,13 @@ pub(crate) fn decode_with(
     if b0 & 0x70 != 0 {
         return Err(FrameError::Malformed("a reserved bit is set"));
     }
-    if b0 & 0x80 == 0 && !(stream && matches!(b0 & 0x0f, 0 | 2)) {
+    let fin = b0 & 0x80 != 0;
+    if !fin && stream && !matches!(b0 & 0x0f, 0 | 2) {
         return Err(FrameError::Malformed("a fragmented frame"));
     }
     let op = match b0 & 0x0f {
         0 if stream => Op::Binary,
+        0 => Op::Continue,
         1 => Op::Text,
         2 => Op::Binary,
         8 => Op::Close,
@@ -90,6 +93,9 @@ pub(crate) fn decode_with(
     };
     if matches!(op, Op::Close | Op::Ping | Op::Pong) && b1 & 0x7f >= 126 {
         return Err(FrameError::Malformed("a control frame over 125 bytes"));
+    }
+    if matches!(op, Op::Close | Op::Ping | Op::Pong) && !fin {
+        return Err(FrameError::Malformed("a fragmented control frame"));
     }
     let masked = b1 & 0x80 != 0;
     if masked != from_client {
@@ -172,6 +178,7 @@ fn check_close(body: &[u8]) -> Result<(), FrameError> {
 /// for a server frame.
 pub(crate) fn encode(op: Op, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
     let opcode: u8 = match op {
+        Op::Continue => 0,
         Op::Text => 1,
         Op::Binary => 2,
         Op::Close => 8,
@@ -313,7 +320,6 @@ mod tests {
                 (frame.op, frame.payload.as_slice(), used),
                 (Op::Binary, &bytes[..], wire.len())
             );
-            assert!(refused(wire, true), "a message of whole frames refuses the piece");
         }
         // Text and a control frame without FIN are no piece of a stream.
         let mut text = encode(Op::Text, b"x", Some(KEY));
@@ -358,14 +364,18 @@ mod tests {
         assert!(refused(&[0xC2, 0x80, 1, 2, 3, 4], true), "RSV1 set");
         assert!(refused(&[0x83, 0x80, 1, 2, 3, 4], true), "opcode 3 is reserved");
         assert!(refused(&[0x8B, 0x80, 1, 2, 3, 4], true), "opcode 11 is reserved");
-        assert!(
-            refused(&[0x80, 0x80, 1, 2, 3, 4], true),
-            "a continuation with nothing to continue"
-        );
-        assert!(
-            refused(&[0x02, 0x80, 1, 2, 3, 4], true),
-            "a binary frame without FIN is fragmented"
-        );
+    }
+
+    /// A message that comes in parts (a data frame without FIN, then its continuations) is handed
+    /// over frame by frame; a control frame may not be one of the parts.
+    #[test]
+    fn websocket_a_message_in_parts_is_handed_over_frame_by_frame() {
+        let first = [0x02, 0x80 | 2, 1, 2, 3, 4, b'a' ^ 1, b'b' ^ 2];
+        let last = [0x80, 0x80 | 1, 1, 2, 3, 4, b'c' ^ 1];
+        let part = |wire: &[u8]| decode(wire, true, MAX).unwrap().unwrap().0;
+        assert_eq!((part(&first).op, part(&first).payload), (Op::Binary, b"ab".to_vec()));
+        assert_eq!((part(&last).op, part(&last).payload), (Op::Continue, b"c".to_vec()));
+        assert!(refused(&[0x08, 0x80, 1, 2, 3, 4], true), "a close without FIN");
     }
 
     #[test]

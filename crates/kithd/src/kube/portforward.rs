@@ -273,7 +273,7 @@ impl Session {
                     Ok(Some((frame, used))) => {
                         buf.drain(..used);
                         match frame.op {
-                            Op::Binary => spdy.push(&frame.payload),
+                            Op::Binary | Op::Continue => spdy.push(&frame.payload),
                             Op::Ping => {
                                 let pong = websocket::encode(Op::Pong, &frame.payload, None);
                                 if self.out.send(pong).await.is_err() {

@@ -724,6 +724,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
     // (The second hop of `kith run`: the caller was checked on the first node.)
     let hop = Router::new()
         .route("/v1/run-hop", post(api::run::hop))
+        .route("/v1/exec-hop", post(crate::pod_exec::hop))
         .route(POD_HOP, post(crate::kube::portforward::hop))
         .route("/v1/raft/stands", get(standing))
         .route("/v1/view", get(crate::view::serve))

@@ -1,6 +1,7 @@
 //! The real `kubectl` and `helm` against one kithd on 127.0.0.1: nothing of Kubernetes is
 //! started, and no image is pulled (the node has an empty one under each name these
-//! manifests use, so nothing here runs: what runs is `sh ci/vm.sh --test kube`'s to show).
+//! manifests use, so little here runs: the one test that runs a replica (`kubectl exec` and
+//! `cp`) fills its own image from this host's `sh`, and skips where the host takes no container).
 //! Skips where there is no kubectl (`KITH_KUBECTL` names one, or the one on `PATH`); the
 //! tests of Helm skip where `KITH_HELM` names none (`helm3:helm4`, each is used).
 //! `sh ci/kube.sh` fetches all three and runs this:
@@ -221,6 +222,65 @@ impl Cluster {
         (out.status.success(), text(out.stdout), text(out.stderr))
     }
 
+    /// kubectl as alice with `input` on its stdin; returns (it succeeded, stdout, stderr).
+    fn kubectl_in(&self, args: &[&str], input: &[u8]) -> (bool, Vec<u8>, String) {
+        use std::io::Write;
+        let mut child = Command::new(&self.kubectl)
+            .args(args)
+            .current_dir(&self.dir)
+            .env("KUBECONFIG", &self.config)
+            .env("HOME", &self.dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // (From a thread: a program that answers before it has read it all must not hold this.)
+        let mut stdin = child.stdin.take().unwrap();
+        let input = input.to_vec();
+        let writer = std::thread::spawn(move || drop(stdin.write_all(&input)));
+        let out = child.wait_with_output().unwrap();
+        let _ = writer.join();
+        (
+            out.status.success(),
+            out.stdout,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// The image `kith.test/box:1`, which is this host's own `sleep`, `sh`, `cat` and `tar` with the
+    /// libraries `ldd` names for them: what a replica that runs needs for `exec` and `cp`.
+    fn fill_box(&self) {
+        let rootfs = self
+            .dir
+            .join(format!("state/runtime/images/{:064x}/rootfs", IMAGES.len() - 1));
+        for dir in [
+            "dev", "etc", "proc", "run", "sys", "tmp", "bin", "lib", "lib64", "usr/lib",
+        ] {
+            std::fs::create_dir_all(rootfs.join(dir)).unwrap();
+        }
+        for bin in ["sleep", "sh", "cat", "tar", "test"] {
+            let from = Path::new("/usr/bin").join(bin);
+            std::fs::copy(&from, rootfs.join("bin").join(bin)).unwrap();
+            let listed = Command::new("ldd").arg(&from).output().unwrap();
+            for lib in String::from_utf8_lossy(&listed.stdout)
+                .lines()
+                .filter_map(|line| line.split_whitespace().find(|word| word.starts_with('/')))
+            {
+                let to = rootfs.join(lib.trim_start_matches('/'));
+                std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+                let _ = std::fs::copy(lib, to);
+            }
+        }
+        // A replica of a kithd that is not root has one id (its own): the `tar` of `kubectl cp` cannot
+        // give a file the ids of the one that sent it, so this image's tar does not try.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::rename(rootfs.join("bin/tar"), rootfs.join("bin/tar-real")).unwrap();
+        let script = "#!/bin/sh\nexec /bin/tar-real \"$@\" --no-same-owner\n";
+        std::fs::write(rootfs.join("bin/tar"), script).unwrap();
+        std::fs::set_permissions(rootfs.join("bin/tar"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// What kubectl gets of something, as JSON.
     fn got(&self, what: &[&str]) -> serde_json::Value {
         let out = self.ok(&[&["get", "-o", "json"], what].concat());
@@ -291,6 +351,8 @@ const IMAGES: &[&str] = &[
     "docker.io/library/nginx:1.28-alpine",
     "docker.io/library/nginx:1.16.0",
     "docker.io/library/busybox:1.36",
+    // (Last: `fill_box` puts programs in it.)
+    "kith.test/box:1",
 ];
 
 const WEB: &str = r#"apiVersion: apps/v1
@@ -778,6 +840,93 @@ fn workflows_kubectl_delete_pod_restarts_that_replica() {
     assert_eq!(cluster.held("workload/web")["spec"]["replicas"], 2);
     // A pod that no Workload runs is refused, and says its name.
     cluster.refused(&["delete", "pod", "bare"], &["bare"]);
+}
+
+/// The Deployment `web` of one replica whose image is `kith.test/box:1`, made and applied. Its
+/// container is `box`: a unit's id holds it, and the containers of the tests that run at once
+/// (each in a kithd of its own, in one cgroup tree) must not share an id, or one's delete ends the other's.
+fn apply_box(cluster: &Cluster) {
+    cluster.fill_box();
+    let web = WEB
+        .replace("- name: web\n", "- name: box\n")
+        .replace("mirror.gcr.io/library/busybox:1.36", "kith.test/box:1")
+        .replace("replicas: 2", "replicas: 1")
+        .replace("[sleep,", "[/bin/sleep,");
+    cluster.write("box.yaml", &web);
+    cluster.ok(&["apply", "-f", "box.yaml"]);
+}
+
+/// `kubectl exec` and `kubectl cp` (a tar run by exec, both ways) run in the replica's own mount and
+/// pid namespaces: stdin, stdout, stderr and the exit status come back as the channels of a
+/// WebSocket. Skips where this host's cgroup takes no container.
+#[test]
+fn workflows_kubectl_exec_and_cp_run_in_the_replica() {
+    let Some(cluster) = Cluster::start("kube-exec") else {
+        return;
+    };
+    // (alice's Role is for what kubectl applies and gets: what runs in a replica is a right of its own.)
+    let may = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: execer }\nspec:\n  rules:\n    - kinds: [Workload]\n      verbs: [exec]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: alice-execer }\nspec:\n  role: execer\n  subjects: [alice]\n";
+    cluster.write("execer.yaml", may);
+    cluster.kith(&["apply", "-f", "execer.yaml"]);
+    apply_box(&cluster);
+    // The replica is up when a process can be run in it (a unit starts a moment after its pod is listed).
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let (ok, _, err) = cluster.kubectl(&["exec", "web-0", "--", "sh", "-c", ":"]);
+        if ok {
+            break;
+        }
+        let status = cluster.kith(&["get", "workload/web", "-o", "json"]);
+        if status.contains("cgroup error") {
+            eprintln!("::warning title=SKIP::SKIP (not a pass): this host's cgroup takes no container");
+            return;
+        }
+        assert!(Instant::now() < deadline, "web-0 never took a process: {err}\n{status}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // In the container's pid namespace, its init is pid 1 and the shell has a small pid; its files are the image's.
+    says(
+        &cluster.ok(&["exec", "web-0", "--", "cat", "/proc/1/cmdline"]),
+        &["/bin/sleep"],
+    );
+    let pid = cluster.ok(&["exec", "web-0", "--", "sh", "-c", "echo $$"]);
+    assert!(pid.trim().parse::<u32>().unwrap() < 1000, "{pid}");
+    // (The host has /home, and the image does not.)
+    cluster.refused(&["exec", "web-0", "--", "sh", "-c", "test -e /home"], &["exit code 1"]);
+    // stdout and stderr each on their channel, and the exit status.
+    let (ok, out, err) = cluster.kubectl(&[
+        "exec",
+        "web-0",
+        "--",
+        "sh",
+        "-c",
+        "echo to-out; echo to-err >&2; exit 3",
+    ]);
+    assert!(!ok && out == "to-out\n", "{ok} {out:?} {err}");
+    says(&err, &["to-err", "exit code 3"]);
+    // stdin, to its end, and more of it than one frame holds.
+    let (ok, out, err) = cluster.kubectl_in(&["exec", "-i", "web-0", "--", "cat"], b"hello\n");
+    assert!(ok && out == b"hello\n", "{ok} {out:?} {err}");
+    let big: Vec<u8> = (0..3u32 << 20).map(|n| (n % 251) as u8).collect();
+    let (ok, out, err) = cluster.kubectl_in(&["exec", "-i", "web-0", "--", "cat"], &big);
+    assert!(
+        ok && out == big,
+        "{ok} {} bytes back of {}: {err}",
+        out.len(),
+        big.len()
+    );
+    // cp up, then down.
+    cluster.write("up.txt", "uploaded\n");
+    cluster.ok(&["cp", "up.txt", "web-0:/tmp/up.txt"]);
+    assert_eq!(cluster.ok(&["exec", "web-0", "--", "cat", "/tmp/up.txt"]), "uploaded\n");
+    cluster.ok(&["cp", "web-0:/tmp/up.txt", "down.txt"]);
+    assert_eq!(
+        std::fs::read_to_string(cluster.dir.join("down.txt")).unwrap(),
+        "uploaded\n"
+    );
+    // A program the image lacks is an error, and attach and a TTY are refused by name.
+    cluster.refused(&["exec", "web-0", "--", "nothing-here"], &[]);
+    cluster.refused(&["attach", "web-0"], &["attach to the main process is not carried"]);
 }
 
 #[test]
@@ -1509,6 +1658,40 @@ fn access_first_exec_attach_and_cp_are_refused_before_any_upgrade() {
         "Sec-WebSocket-Protocol: base64.channel.k8s.io",
     ];
     assert_eq!(cluster.reply("carol", "GET", exec, &other, None), "400");
+}
+
+/// With the real kubectl: a caller who may get but not exec is refused `exec` and `cp` both ways,
+/// and each refusal is written down; the replica's node asks again for itself (see the hop's tests).
+#[test]
+fn access_kubectl_exec_and_cp_are_refused_without_the_right_to_exec() {
+    let Some(cluster) = Cluster::start("kube-exec-refused") else {
+        return;
+    };
+    cluster.kith(&["identity", "cert", "bob", "--out", "."]);
+    let roles = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: reader }\nspec:\n  rules:\n    - kinds: [Workload]\n      verbs: [get, list, watch]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob-reader }\nspec:\n  role: reader\n  subjects: [bob]\n";
+    cluster.write("roles.yaml", roles);
+    cluster.kith(&["apply", "-f", "roles.yaml"]);
+    apply_box(&cluster);
+    eventually("web-0 is a pod", 30, || cluster.kubectl(&["get", "pod", "web-0"]).0);
+    let bob = cluster.as_("bob");
+    assert!(bob.kubectl(&["get", "pod", "web-0"]).0, "bob may get it");
+    cluster.write("up.txt", "uploaded\n");
+    for args in [
+        &["exec", "web-0", "--", "true"][..],
+        &["cp", "up.txt", "web-0:/tmp/up.txt"],
+        &["cp", "web-0:/tmp/up.txt", "down.txt"],
+    ] {
+        let (ok, _, err) = bob.kubectl(args);
+        assert!(!ok && err.contains("bob may not exec Workload"), "{args:?}: {ok} {err}");
+    }
+    assert!(!cluster.dir.join("down.txt").exists());
+    let audit = cluster.kith(&["audit"]);
+    let refused = audit
+        .lines()
+        .filter(|line| line.contains("pod default/web-0") && line.split_whitespace().nth(1) == Some("bob"))
+        .filter(|line| !line.ends_with(" ok"))
+        .count();
+    assert!(refused >= 1, "bob's refusals are in the audit log: {audit}");
 }
 
 /// A cluster with a NodeWorkload `agent` in `default`: dan may exec any pod of `default`, and

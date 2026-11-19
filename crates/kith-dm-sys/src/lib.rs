@@ -175,6 +175,19 @@ pub fn project(dir: &Path) -> Result<(u32, bool)> {
     ))
 }
 
+/// The user namespace that owns the namespace `ns` is an open file of (`/proc/PID/ns/pid`,
+/// say): `NS_GET_USERNS`.
+pub fn owner_userns(ns: &File) -> Result<File> {
+    // SAFETY: an ioctl on a descriptor `ns` holds open; it takes no memory and returns a new
+    // descriptor or -1.
+    let owner = unsafe { libc::ioctl(ns.as_raw_fd(), 0xb701) };
+    if owner < 0 {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: the descriptor the ioctl just made, whose only owner this is.
+    Ok(unsafe { File::from_raw_fd(owner) })
+}
+
 /// Put the directory `dir` in project `id`, and with `inherit` what is made in it from now on
 /// too (what it holds already stays as it is). Root's alone to do, outside a user namespace,
 /// on a file system that keeps projects: elsewhere it is refused.
