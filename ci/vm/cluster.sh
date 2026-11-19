@@ -34,8 +34,11 @@
         others='2 3' more='' inside=2049 lan='' base=$root/target/os out='' dumps='' gateway='' https=''
         seed() { :; }
         # (home: on the mesh, so the holder answers a WireGuard handshake to the house address
-        # (51820) and the nodes that roam dial it; and ingress, so it answers TCP 443 there.)
-        [ "$test" != home ] || more='--mesh --ingress'
+        # (51820) and the node that roams dials it; and ingress, so it answers TCP 443 there.
+        # Three voters, and a fourth node that roams: a roaming node never votes, so it joins as a
+        # learner, and the cluster says four nodes.)
+        nodes=three four=''
+        [ "$test" != home ] || { more='--mesh --ingress' others='2 3 4' nodes=four four=',[^,? ]+'; }
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
         others=2 more=--mesh project=''
         [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] || others=''
@@ -180,7 +183,7 @@
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
                 -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside${https:+,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:443}$out" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $dumps \
-                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
+                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway -- --listen ${listen:-0.0.0.0:7443} --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 8>&- &
             vms="$vms $!"
         }
@@ -244,8 +247,8 @@ EOF
             [ "${KITH_POD_NOUPSTREAM:-}" != 1 ] || { first='--dns-upstream 10.9.0.9:5353'; joined='--dns 0.0.0.0:5353 --dns-upstream 10.9.0.9:5353'; }
         fi
         # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
-        # (home: the joined ones roam (--roaming, as a laptop joins): a reset one dials the house endpoint.)
-        [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353 --roaming'; }
+        # (home: every joined one serves DNS too; node 4 roams (--roaming, as a laptop joins): it is reset, and dials the house endpoint.)
+        [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353'; }
         node 1 "--claim ${first:-}"
         tries=0
         until token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/n1.log" 2>/dev/null) && [ -n "$token" ] \
@@ -264,8 +267,11 @@ EOF
             [ "$test" != worker ] || asks='/v1/tokens?trust=worker'
             join=$(api 1 POST "$asks" | field token) || fail "no join token over TLS"
             # (pods: the second node takes its pods' addresses from another range than the first's.)
-            range=''
+            range='' listen=0.0.0.0:7443
             [ "$test$n" != pods2 ] || range='--pod-range 10.77.0.0/20'
+            # (home: node 4 roams, as a laptop joins. It listens on [::] as a roaming node does by default
+            # (main.rs): the leader reaches it at its mesh address, which is IPv6; 0.0.0.0 has no listener there.)
+            [ "$test$n" != home4 ] || { range='--roaming' listen='[::]:7443'; }
             node "$n" "--join 10.9.0.1:7443 --token $join $range ${joined:-}"
         done
         # What a resource's units say: "HOW-MANY-ARE-READY STATE ADDRESS ADDRESS ... and
@@ -356,7 +362,7 @@ EOF
         if [ "$test" = share ]; then
             . "$root/ci/vm/share.sh"
         fi
-        until_says "three nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+ "
+        until_says "$nodes nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+$four "
         was=${line#- 0 } was=${was%% *}
         if [ "$test" = access ]; then
             . "$root/ci/vm/access.sh"

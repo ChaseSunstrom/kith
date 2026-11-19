@@ -47,20 +47,37 @@
             answered() { # SINCE NODE
                 awk -v since="$1" -v house="$house" -v to="10.9.0.$2" '$1 > since && $2 == house && $3 == to { print; exit }' "$work/wg"
             }
-            # A joined node that is not the holder (n2 or n3) is reset: its WireGuard device is new,
-            # so it dials the house address once the Cluster names the holder. The house address
-            # must answer that handshake, from itself.
-            reset_roamer() { # HOLDER
-                if [ "$1" = 2 ]; then roam=3; else roam=2; fi
-                reset=$(now)
-                monitor "$roam" system_reset
+            # The roaming node is n4 (a learner: it never votes). The store must say so, in its
+            # Node's spec.roaming, and not only the flag passed.
+            roams() {
+                any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    found = []
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+print(any(r["kind"] == "Node" and r["metadata"]["name"] == "n4" and (r.get("spec") or {}).get("roaming") is True for r in found))
+'
+            }
+            # n4 is reset, and its WireGuard device is new: it dials the house address once the
+            # Cluster names the holder. The house address must answer that handshake, from itself.
+            reset_roamer() {
                 waited=0
-                until reply=$(answered "$reset" "$roam") && [ -n "$reply" ]; do
+                until [ "$(roams)" = True ]; do
                     waited=$((waited + 1))
-                    [ "$waited" -lt 240 ] || fail "n$roam was reset and no WireGuard handshake from $house answered it: $(tail -n 4 "$work/wg") $(cat "$work/wg.err") $(grep -aih 'house\|mesh' "$work/n$roam.log" | tail -n 6)"
+                    [ "$waited" -lt 60 ] || fail "the store does not say n4 roams: $(any GET /v1/resources 2>&1 | head -c 600)"
                     sleep 1
                 done
-                echo "vm.sh: n$roam was reset: its WireGuard handshake to $house was answered from $house ($reply)" >&2
+                reset=$(now)
+                monitor 4 system_reset
+                waited=0
+                until reply=$(answered "$reset" 4) && [ -n "$reply" ]; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 240 ] || fail "n4 was reset and no WireGuard handshake from $house answered it: $(tail -n 4 "$work/wg") $(cat "$work/wg.err") $(grep -aih 'house\|mesh' "$work/n4.log" | tail -n 6)"
+                    sleep 1
+                done
+                echo "vm.sh: n4 was reset: its WireGuard handshake to $house was answered from $house ($reply)" >&2
             }
 
             steady 120 "the cluster did not take up the house address"
@@ -93,7 +110,7 @@ print(next((((r.get("status") or {}).get("home") or {}).get("holder", "") for r 
             # (The nodes have no ip to show the address's valid_lft with: kithd says the time it
             # gives it, and a node that stopped renewing is shown below to lose it.)
             grep -aq "kithd: the house address $house is held on [a-z0-9]*, for up to 3 s at a time" "$work/n$had.log" || fail "n$had holds $house and did not say it holds it for up to 3 s at a time: $(grep -a 'house address' "$work/n$had.log" | tail -n 3)"
-            for other in 1 2 3; do
+            for other in 1 2 3 4; do
                 [ "$other" = "$had" ] || ! grep -aq "house address $house is held" "$work/n$other.log" || fail "n$other says it holds $house beside n$had"
             done
 
@@ -101,7 +118,7 @@ print(next((((r.get("status") or {}).get("home") or {}).get("holder", "") for r 
             # to it from there (a reset roaming node dials it).
             synack "$holder" || fail "nothing answered TCP 443 at $house (n$had holds it)"
             echo "vm.sh: n$had holds $house and answers TCP 443 at it" >&2
-            reset_roamer "$had"
+            reset_roamer
 
             # The holder loses power. Another takes the address, announces it, and the two are
             # never heard at once.
@@ -147,7 +164,7 @@ print(next((((r.get("status") or {}).get("home") or {}).get("holder", "") for r 
             # WireGuard handshake from a reset roaming node is answered from there.
             synack "$holder" || fail "nothing answered TCP 443 at $house after n$had was reset (n$now_holder holds it)"
             echo "vm.sh: n$now_holder holds $house after n$had was reset and answers TCP 443 at it" >&2
-            reset_roamer "$now_holder"
+            reset_roamer
 
             # The holder hangs: the hypervisor stops its processor, with its card plugged in
             # and its address on it. Another takes the address, and when the first goes on

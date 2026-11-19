@@ -42,7 +42,7 @@
 #                               disk never has another's, and what it does with no control node in reach
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
 #                               in turn losing power, then all at once; what was acknowledged is on all three
-#   sh ci/vm.sh --test home     three nodes with a house address in the Cluster: one MAC answers for it, and DNS, TCP 443 and WireGuard answer from it
+#   sh ci/vm.sh --test home     three voters and a roaming fourth, with a house address in the Cluster: one MAC answers for it, and DNS, TCP 443 and WireGuard answer from it
 #                               and DNS answers from it; the holder reset, and the next stopped: another
 #                               announces it within 10 s and two are never heard at once
 #   sh ci/vm.sh --test access   three nodes: a write let through by a node that had not heard its
@@ -234,7 +234,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    writes each time, a cut-off node acknowledges none, every write
                    that was acknowledged is on all three nodes at the end, and the
                    three hold the same; needs what --test rollout needs
-  --test home      instead: three nodes as for rollout, a house address (10.9.0.100/24)
+  --test home      instead: three voters as for rollout and a fourth that roams (a learner,
+                   reset by the hypervisor; its Node says spec.roaming), a house address (10.9.0.100/24)
                    in the Cluster, and a machine on their network (ci/lan_probe.py)
                    that asks who has it four times a second. Expected: one card
                    answers and announces it, the Cluster's status.home says whose
