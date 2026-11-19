@@ -424,6 +424,74 @@ fn readme_carries_the_measured_comparison() {
     }
 }
 
+/// The stress table under `## Under load` is the rows of ci/stress.txt: one row for each, in
+/// its order, with the cells ci/stress.txt's values give (not numbers typed in).
+#[test]
+fn readme_carries_the_stress_rows() {
+    let stress = std::fs::read_to_string(root().join("ci/stress.txt")).expect("ci/stress.txt");
+    let rows: Vec<&str> = stress
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    assert!(!rows.is_empty(), "ci/stress.txt has no rows");
+    let readme = DOCS[0].1;
+    let section = readme
+        .split("\n## Under load\n")
+        .nth(1)
+        .expect("README.md: ## Under load");
+    let section = section.split("\n## ").next().unwrap_or(section);
+    let table: Vec<&str> = section.lines().filter(|line| line.starts_with('|')).collect();
+    assert_eq!(
+        table.first().copied(),
+        Some(STRESS_HEADER),
+        "README.md's stress table has another header"
+    );
+    assert!(
+        table.get(1).is_some_and(|line| line.starts_with("| ---")),
+        "README.md's stress table has no separator line under its header"
+    );
+    let cells: Vec<Vec<String>> = table[2..]
+        .iter()
+        .map(|line| {
+            line.trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        cells.len(),
+        rows.len(),
+        "README.md's stress table and ci/stress.txt differ in rows"
+    );
+    for (row, said) in rows.iter().zip(&cells) {
+        assert_eq!(
+            said,
+            &stress_cells(row),
+            "README.md's stress table lacks the row of ci/stress.txt: {row}"
+        );
+    }
+}
+
+const STRESS_HEADER: &str = "| containers | nodes | system | max pods a node | ready (s) | memory each (MB) | Services (s) | answers | store | back (s) |";
+
+/// A row of ci/stress.txt, as the README's table shows it (`-` where the row has no such value).
+fn stress_cells(row: &str) -> Vec<String> {
+    // (A k3s row ends in its mark, `k3s max_pods=N`; a kith row has none.)
+    let (head, system, pods) = match row.rsplit_once(" k3s max_pods=") {
+        Some((head, pods)) => (head, "k3s", pods),
+        None => (row, "kith", "-"),
+    };
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let at = |i: usize| words.get(i).copied().unwrap_or("-");
+    // (A size that fails has `limit` in the fourth place, and nothing measured after it.)
+    let limit = at(3) == "limit";
+    let of = |i: usize| if limit { "-" } else { at(i) };
+    [at(0), at(1), system, pods, at(3), of(4), of(12), of(14), of(15), of(16)]
+        .map(str::to_string)
+        .to_vec()
+}
+
 #[test]
 fn readme_links_and_paths_lead_somewhere() {
     let mut seen = 0;
