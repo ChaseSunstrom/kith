@@ -140,6 +140,16 @@ tagged. Each section below says what works and, under "Not yet", what does not
 (some of it named by the plan); what was read for security,
 and what kith does not defend against, is in [SECURITY.md](SECURITY.md).
 
+A node's encrypted state can also be opened by its TPM, by its TPM plus a PIN typed at
+its console, by the cluster, by a recovery key or by a passphrase. A virtual TPM trusts its
+host: whoever runs the machine under a VM reads its memory and the virtual TPM's state, so
+no way keeps the key from them. Every test of the TPM and the PIN ran on a software TPM
+(swtpm); none ran on a real TPM, so the PIN is refused unless the owner passes
+`--untried-tpm`. Not yet: a FIDO2 security key as a way in, and a second encrypted disk,
+are designed ([docs/adr-fido2.md](docs/adr-fido2.md), [docs/adr-second-disk.md](docs/adr-second-disk.md))
+and not built. What each way leaves open is in [SECURITY.md](SECURITY.md) and
+[docs/adr-unlock.md](docs/adr-unlock.md#what-each-way-leaves-open).
+
 `kithd` runs as a service on an existing Linux distro (agent mode), or as the
 first process of [kith OS](docs/guide/os.md#kith-os-kithd-as-the-machines-first-process), where
 what it started keeps running while kithd itself is restarted (process 1 is the same file

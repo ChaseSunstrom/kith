@@ -28,7 +28,9 @@ nix = { version = "0.29", features = ["process", "user", "signal", "sched", "fs"
 caps = "0.5"
 # What a container's init process logs at error level, read back when its create fails (see
 # `logged_build`): libcontainer sends its parent only the top error's text.
-tracing = "0.1"
+# Only ERROR is kept in a release build (container.rs's InitLog is the one subscriber and wants
+# only that): no INFO or DEBUG callsite of libcontainer, openraft, hyper or oci-client is compiled.
+tracing = { version = "0.1", features = ["release_max_level_error"] }
 # Image signatures. (Both in the tree already: rustls verifies with ring.)
 ring = "0.17"
 base64 = "0.22"
