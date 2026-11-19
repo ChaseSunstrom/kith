@@ -181,9 +181,9 @@ struct Args {
     #[arg(long, env = "KITH_ROAMING", requires_all = ["join", "mesh"])]
     roaming: bool,
     /// What the cluster may not have this node do as its root, whoever asks: `hardened`
-    /// (none of it), or words with commas between, `no-` before one to turn it off:
-    /// exec-units, root-containers, unconfined, node-network, vms, vm-paths, passthrough,
-    /// run, wipe; and devices=gpu+input for the classes of Device handed out
+    /// (none of it, and no NodeWorkloads: add host-users to run them), or words with commas between, `no-` before one to turn it off:
+    /// exec-units, root-containers, unconfined, host-users, node-network, vms, vm-paths,
+    /// passthrough, host-paths, run, wipe; and devices=gpu+input for the classes of Device handed out
     #[arg(long, env = "KITH_NODE_POLICY", value_name = "WORDS")]
     node_policy: Option<String>,
     /// Serve HTTPS (port 443, and 80) for Services with `expose`; for edge nodes
