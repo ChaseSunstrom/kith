@@ -535,6 +535,18 @@ impl Keys {
         }
     }
 
+    /// Whether a TPM seal is made ahead for the system a release signed by `public` puts in
+    /// the other slot (docs/adr-unlock.md): only for a release signed by a key this node held
+    /// before it (given, kept, or its image's: not the first release's, which it takes on
+    /// trust, nor one a release hands over, which it holds only once it runs that release),
+    /// and never under `allowDowngrade` (`back`): a node that may go back is sealed for the
+    /// system it runs. (The floor is `above`'s, asked before anything is fetched.)
+    fn seals_ahead(&self, public: Option<&str>, back: bool) -> bool {
+        let Ok((mine, _)) = self.mine() else { return false };
+        let held = public.is_some_and(|public| mine.iter().any(|key| key.eq_ignore_ascii_case(public.trim())));
+        held && !back
+    }
+
     /// Where keys a release hands over wait until this node runs that release.
     fn next(&self) -> PathBuf {
         self.kept.with_extension("next")
@@ -797,6 +809,7 @@ async fn fetch(
     let (signature, public) = (text("signature"), text("publicKey"));
     above(&keys.floor, &wanted)?;
     let first = keys.refused(public.as_deref())?;
+    let ahead = keys.seals_ahead(public.as_deref(), back);
     let (kept, runs, keys, release) = (keys.kept.clone(), runs.to_string(), keys.clone(), release.clone());
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("the release's image, {url}: {e}"))?;
     let (host, addresses) = pinned(&parsed, lan).await?;
@@ -857,7 +870,13 @@ async fn fetch(
                 )),
             }
         };
-        crate::os::into_other_slot(&mut Arriving(&mut pieces, Vec::new(), 0), slot, &running, vouched)
+        crate::os::into_slot(
+            &mut Arriving(&mut pieces, Vec::new(), 0),
+            slot,
+            &running,
+            vouched,
+            ahead,
+        )
     });
     let mut cut = None;
     loop {
@@ -878,8 +897,23 @@ async fn fetch(
     drop(send);
     let wrote = writer.await.map_err(|e| e.to_string())?;
     match (wrote, cut) {
-        (Ok(Some(version)), _) => Ok(version),
-        (Ok(None), _) => Err("that release is what this node runs already, under another version".into()),
+        (Ok((Some(version), boots)), _) => {
+            // (The update is in the other slot whatever comes of this: a key not sealed ahead
+            // is a node that asks the cluster for it at its next start, as before.)
+            match boots {
+                Some(Ok(boots)) => match crate::crypt::ahead(boots).await {
+                    Ok(Some(_)) => {
+                        eprintln!("kithd: update: the key of this node's state is sealed ahead for {version}")
+                    }
+                    Ok(None) => {}
+                    Err(why) => eprintln!("kithd: update: no key is sealed ahead for {version}: {why}"),
+                },
+                Some(Err(why)) => eprintln!("kithd: update: no key is sealed ahead for {version}: {why}"),
+                None => {}
+            }
+            Ok(version)
+        }
+        (Ok((None, _)), _) => Err("that release is what this node runs already, under another version".into()),
         (Err(_), Some(cut)) => Err(cut),
         (Err(e), None) => Err(e),
     }
@@ -1065,6 +1099,38 @@ mod tests {
         let unread = Keys::new(Vec::new(), &dir.join("unread"));
         std::fs::create_dir_all(&unread.kept).unwrap();
         assert!(unread.refused(Some(theirs)).is_err());
+    }
+
+    #[test]
+    fn tpm_next_update_gate() {
+        let dir = scratch("tpm-next-gate");
+        // A key given, however cased: sealed ahead; another's, or none shown, not; nor under
+        // allowDowngrade.
+        let given = Keys::new(vec!["AA11".into()], &dir);
+        assert!(given.seals_ahead(Some("aa11"), false) && given.seals_ahead(Some(" AA11 "), false));
+        assert!(!given.seals_ahead(Some("aa11"), true));
+        assert!(!given.seals_ahead(Some("bb22"), false) && !given.seals_ahead(None, false));
+        // No key yet: the first release's is taken on trust, and nothing is sealed ahead for it.
+        let first = Keys::new(Vec::new(), &dir);
+        assert!(!first.seals_ahead(Some("aa11"), false));
+        // Once kept (a release it took signed it), it is held before the next one.
+        crate::pki::write_whole(&first.kept, b"aa11\n").unwrap();
+        assert!(first.seals_ahead(Some("aa11"), false) && !first.seals_ahead(Some("bb22"), false));
+        // The keys a release hands over are held only once it runs: they sign nothing sealed ahead.
+        crate::pki::write_whole(&first.next(), b"bb22\n").unwrap();
+        assert!(!first.seals_ahead(Some("bb22"), false));
+        // The key of the node's image: held before any release.
+        let image = dir.join("image-keys");
+        std::fs::write(&image, "cc33\n").unwrap();
+        let imaged = Keys {
+            image: Some(image),
+            ..Keys::new(Vec::new(), &dir.join("elsewhere"))
+        };
+        assert!(imaged.seals_ahead(Some("cc33"), false) && !imaged.seals_ahead(Some("aa11"), false));
+        // Keys that cannot be read: nothing is sealed.
+        let unread = Keys::new(Vec::new(), &dir.join("unread"));
+        std::fs::create_dir_all(&unread.kept).unwrap();
+        assert!(!unread.seals_ahead(Some("aa11"), false));
     }
 
     #[tokio::test]
