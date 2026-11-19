@@ -10,7 +10,7 @@
 // ponytail: kithd does not bind a device to vfio-pci (the node's owner does, on the kernel's
 // command line: `vfio-pci.ids=`); a machine reaches out through the hypervisor's own NAT
 // under QEMU and has no network under cloud-hypervisor; a disk is a raw image at a path on
-// the node, not a Volume; x86-64 and arm64 machine types only. Each has its own day.
+// the node, not a Volume; x86-64 and arm64 machine types only. Each is left for later.
 //
 // A template that is `confidential` runs its machines with their memory encrypted by the
 // processor (AMD SEV-SNP or Intel TDX), where the node has one of the two; nothing of it

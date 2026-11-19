@@ -51,6 +51,10 @@ pub struct Pods {
     /// Told when a pod is made or let go (its address may be given to the next): the
     /// Services' round, which keeps the kernel from passing to a pod gone, wakes.
     pub moved: Arc<Notify>,
+    /// Where a replica's pod id (`controller::pod_of`) is answered by another's: the second
+    /// generation of a rolling update, once it is the one that is ready. Only what Services
+    /// and published ports look up goes through it; a probe asks the pod it is of.
+    live: BTreeMap<String, String>,
     /// The mesh's link: an exit's pods pass on to the mesh by it, and by no other link of the node's.
     pub mesh: String,
     /// Set when the tables could not be made again for a change of egress rules: tried again.
@@ -246,6 +250,19 @@ impl Pods {
         }
         self.moved.notify_one();
         Ok(())
+    }
+
+    /// The pod that answers for `canonical` (a replica's `pod_of`): itself, or its second generation.
+    pub fn live_id<'a>(&'a self, canonical: &'a str) -> &'a str {
+        self.live.get(canonical).map_or(canonical, String::as_str)
+    }
+
+    /// Say which pods answer for which (`live_id`); the Services' round wakes where that changed.
+    pub fn set_live(&mut self, live: BTreeMap<String, String>) {
+        if self.live != live {
+            self.live = live;
+            self.moved.notify_one();
+        }
     }
 
     pub fn address(&self, id: &str) -> Option<IpAddr> {
@@ -692,7 +709,9 @@ fn published(shared: &Shared) -> (Asking, BTreeMap<(bool, u16), Vec<Asker>>) {
     let pods = shared.pods.lock().expect("nothing panics holding the pods");
     let mut wanted: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for (id, namespace, ports) in asked {
-        let Some(pod) = pods.made.get(&id) else { continue };
+        let Some(pod) = pods.made.get(pods.live_id(&id)) else {
+            continue;
+        };
         for port in ports {
             wanted
                 .entry(port)
@@ -747,8 +766,9 @@ const OWN: usize = 2;
 
 /// The connections and senders all of a node's published ports share, past their own: a
 /// connection holds two files, a sender one, so with [`PORTS`] listeners and their own the
-/// relays hold 448 files at most. kithd never raises RLIMIT_NOFILE (1024), and its
-/// listeners, these relays, its API and ingress all take of it.
+/// relays hold 448 files at most. kithd raises its RLIMIT_NOFILE soft limit to the
+/// hard one, 65536 at most (`raise_nofile`), and its listeners, these relays, its API
+/// and ingress (1024 connections, two files each) all take of it.
 static RELAYED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 
 /// A connection's or a sender's room: of its port's own, or of the node's.

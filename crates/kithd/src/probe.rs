@@ -45,6 +45,8 @@ struct Check {
     every: Duration,
     timeout: Duration,
     threshold: u32,
+    /// How long after the probe began a probe that has never passed counts as failing (`startSeconds`).
+    start: Option<Duration>,
 }
 
 fn check(container: &Container, probe: &Probe) -> Result<Check, String> {
@@ -77,6 +79,10 @@ fn check(container: &Container, probe: &Probe) -> Result<Check, String> {
         every: secs(probe.interval_seconds, 10),
         timeout: secs(probe.timeout_seconds, 1),
         threshold: probe.failure_threshold.unwrap_or(3).max(1),
+        start: probe
+            .start_seconds
+            .filter(|s| *s > 0)
+            .map(|s| Duration::from_secs(s.into())),
     })
 }
 
@@ -106,7 +112,7 @@ pub fn start(shared: Arc<Shared>, container: &Container, pod: Option<String>) ->
     let task = tokio::spawn(async move {
         // ponytail: liveness only counts once it has passed, so a container that never
         // listens is never restarted for it (it is never ready either, if it has a readiness
-        // probe). The API has no initialDelaySeconds; a start deadline comes with it.
+        // probe), unless it has a `startSeconds`: then failing that long after it started counts.
         let at = pod.as_deref().map(|pod| (&*shared, pod));
         let live = watch_one(at, liveness, &tx, &shared.changed, true, |health, ok| health.live = ok);
         let ready = watch_one(at, readiness, &tx, &shared.changed, false, |health, ok| {
@@ -129,7 +135,7 @@ async fn watch_one(
     let Some(check) = check else {
         return;
     };
-    let (mut failures, mut passed_once) = (0, false);
+    let (mut failures, mut passed_once, began) = (0, false, tokio::time::Instant::now());
     loop {
         let ok = tokio::time::timeout(check.timeout, probe(at, &check))
             .await
@@ -137,7 +143,8 @@ async fn watch_one(
         failures = if ok { 0 } else { failures + 1 };
         passed_once |= ok;
         // Up at the first success; down only after `threshold` failures in a row.
-        if ok || (failures >= check.threshold && (passed_once || !after_first)) {
+        let late = check.start.is_some_and(|start| began.elapsed() >= start);
+        if ok || (failures >= check.threshold && (passed_once || !after_first || late)) {
             let changed = tx.send_if_modified(|health| {
                 let before = *health;
                 set(health, ok);
@@ -238,6 +245,7 @@ mod tests {
             every: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             threshold: 1,
+            start: None,
         };
         assert!(probe(None, &check(port, None)).await);
         assert!(probe(None, &check(port, Some("/ok"))).await);
@@ -260,6 +268,7 @@ mod tests {
             every: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             threshold: 1,
+            start: None,
         };
         let (tx, mut health) = watch::channel(Health {
             live: true,
@@ -283,5 +292,56 @@ mod tests {
             _ = watching => unreachable!(),
             _ = story => {}
         }
+    }
+
+    #[test]
+    fn start_seconds_is_the_probes_start_deadline() {
+        let c = container(serde_json::json!({
+            "name": "web", "image": "x",
+            "liveness": { "tcp": { "port": 80 }, "startSeconds": 7 },
+            "readiness": { "tcp": { "port": 80 } },
+        }));
+        assert_eq!(
+            check(&c, c.liveness.as_ref().unwrap()).unwrap().start,
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(check(&c, c.readiness.as_ref().unwrap()).unwrap().start, None);
+    }
+
+    /// A container that never passes its liveness probe is restarted once `startSeconds` have
+    /// gone by (without it, never: it may still be starting).
+    #[tokio::test]
+    async fn start_seconds_end_the_wait_for_a_first_success() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let check = |start| Check {
+            port,
+            path: None,
+            every: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            threshold: 1,
+            start,
+        };
+        let down_within = |start: Option<Duration>, within: Duration| async move {
+            let (tx, mut health) = watch::channel(Health {
+                live: true,
+                ready: true,
+            });
+            let changed = Notify::new();
+            let watching = watch_one(None, Some(check(start)), &tx, &changed, true, |health, ok| {
+                health.live = ok
+            });
+            let down = tokio::time::timeout(within, health.wait_for(|health| !health.live));
+            tokio::select! {
+                _ = watching => unreachable!(),
+                down = down => down.is_ok(),
+            }
+        };
+        // Not before the deadline, and then within a probe or two.
+        assert!(!down_within(Some(Duration::from_secs(3)), Duration::from_millis(2000)).await);
+        assert!(down_within(Some(Duration::from_secs(2)), Duration::from_millis(4500)).await);
+        // No deadline: a container that never listens is not killed for it.
+        assert!(!down_within(None, Duration::from_millis(3500)).await);
     }
 }

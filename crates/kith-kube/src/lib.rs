@@ -271,8 +271,8 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("probe.periodSeconds", Carried, "5"),
     ("probe.timeoutSeconds", Carried, "2"),
     ("probe.failureThreshold", Carried, "3"),
-    // (To kith a container is not live before its liveness check first passes.)
-    ("probe.initialDelaySeconds", Hint, "10"),
+    // (To kith a container is not live before its liveness check first passes, or `startSeconds` pass.)
+    ("probe.initialDelaySeconds", Carried, "10"),
     ("probe.successThreshold", Hint, "1"),
     ("probe.terminationGracePeriodSeconds", Hint, "10"),
     ("container.startupProbe", Hint, r#"{"tcpSocket":{"port":80}}"#),
@@ -851,6 +851,12 @@ fn probe(cx: &mut Cx, container: &mut Map, key: &str, at: &str) -> Option<Value>
     let interval = cx.num(&mut pr, "periodSeconds", &p);
     let timeout = cx.num(&mut pr, "timeoutSeconds", &p);
     let failures = cx.num(&mut pr, "failureThreshold", &p);
+    // ponytail: only a liveness probe has a start deadline; a readiness probe's delay stays said
+    // as a hint (kith asks it at once and often, so the container is ready when it first answers).
+    let start = match key {
+        "livenessProbe" => cx.num(&mut pr, "initialDelaySeconds", &p).filter(|s| *s > 0),
+        _ => None,
+    };
     cx.rest(pr, &p);
     let Some((how, value)) = check else {
         cx.note(&p, "has no http, tcp or exec check kith can run: not translated");
@@ -861,6 +867,7 @@ fn probe(cx: &mut Cx, container: &mut Map, key: &str, at: &str) -> Option<Value>
         ("intervalSeconds", some(interval)),
         ("timeoutSeconds", some(timeout)),
         ("failureThreshold", some(failures)),
+        ("startSeconds", some(start)),
     ]))
 }
 
@@ -2379,6 +2386,40 @@ spec: { clusterIP: 10.96.0.9, selector: { app: db }, ports: [{ port: 80 }] }
         );
         assert!(
             !report.iter().any(|line| line.contains("web") || line.contains("api")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_liveness_initial_delay_is_the_start_deadline_and_a_readiness_one_is_said() {
+        let (all, report) = run(r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web, namespace: default }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: web } }
+  template:
+    metadata: { labels: { app: web } }
+    spec:
+      containers:
+        - name: web
+          image: nginx
+          livenessProbe: { tcpSocket: { port: 80 }, initialDelaySeconds: 10 }
+          readinessProbe: { tcpSocket: { port: 80 }, initialDelaySeconds: 5 }
+        - name: side
+          image: nginx
+          livenessProbe: { tcpSocket: { port: 81 }, initialDelaySeconds: 0 }
+"#);
+        let spec = &find(&all, "Workload", "web").spec;
+        let containers = spec["template"]["containers"].as_array().unwrap();
+        assert_eq!(containers[0]["liveness"]["startSeconds"], 10, "{spec:?}");
+        assert!(containers[0]["readiness"].get("startSeconds").is_none(), "{spec:?}");
+        assert!(containers[1]["liveness"].get("startSeconds").is_none(), "{spec:?}");
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("readinessProbe.initialDelaySeconds")),
             "{report:?}"
         );
     }

@@ -69,10 +69,10 @@ impl Held {
             None => Ok(held),
             Some(Err(why)) => Err(why.clone()),
             Some(Ok(own)) => {
-                if let (Some(one), Some(other)) = (&held.node, &own.node) {
-                    if one != other {
-                        return Err(format!("its volumes are on different nodes: {one}, {other}"));
-                    }
+                if let (Some(one), Some(other)) = (&held.node, &own.node)
+                    && one != other
+                {
+                    return Err(format!("its volumes are on different nodes: {one}, {other}"));
                 }
                 held.node = held.node.or_else(|| own.node.clone());
                 held.volumes.extend(own.dirs.clone());
