@@ -8,8 +8,8 @@
 //! (`mount_setattr(2)`), with such a namespace to see them through.
 //!
 //! The `unsafe` of the workspace is here: the ioctl, bpf and mount calls themselves (and
-//! taking the file descriptors they answer with), and the fork of a child that holds a
-//! user namespace while it is made. Each request is put together as bytes, so there is no
+//! taking the file descriptors they answer with), and the forks of a child that holds a
+//! user namespace while it is made and of one that makes a container (see [`forked`]). Each request is put together as bytes, so there is no
 //! struct whose layout has to match the kernel's.
 
 use std::fs::File;
@@ -585,6 +585,65 @@ pub fn user_namespace(from: u32, count: u32) -> Result<OwnedFd> {
         }
     };
     users
+}
+
+/// The most bytes [`forked`] brings back (a pipe holds 64 KiB, and the child has written
+/// before the parent reads).
+pub const FORKED_MOST: usize = 32 * 1024;
+
+/// Runs `f` in a child made by `fork(2)` and returns the first [`FORKED_MOST`] bytes it
+/// gives, once the child is gone and collected. Empty where the child ended without
+/// giving any (it panicked, or was killed).
+///
+/// For a call that clones a process itself with a raw `clone3`, as libcontainer does: from a
+/// process with other threads, the clone's child starts with whatever lock a thread held at
+/// that instant (the allocator's) and waits for it forever, since a raw `clone3` skips the
+/// handlers `fork` runs to put the allocator right. In a child of `fork` there is one thread,
+/// so the clone is safe. Whatever `f` makes with `clone` that outlives the child is the
+/// nearest child subreaper's afterwards.
+///
+/// The pipe is read after the child has ended, never to its end: a process `f` cloned holds
+/// the pipe's write end until it execs, which is not before it is told to.
+pub fn forked(f: impl FnOnce() -> Vec<u8>) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    let mut ends = [0; 2];
+    // SAFETY: pipe2 writes two descriptors into `ends`.
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: both are open, and this is their only owner.
+    let (mut read, mut write) = unsafe { (File::from_raw_fd(ends[0]), File::from_raw_fd(ends[1])) };
+    // SAFETY: the child runs `f` and `_exit`s; it returns nowhere, and runs no destructor of
+    // what this process holds. (Another thread's lock that `fork` does not put right, such as
+    // a `Mutex` of the program's own, is not the child's to take: `f` must not.)
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(Error::last_os_error());
+    }
+    if child == 0 {
+        let mut bytes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_default();
+        bytes.truncate(FORKED_MOST);
+        // (A short write is the parent's empty or cut answer: the pipe has room for all.)
+        let _ = write.write_all(&bytes);
+        // SAFETY: ends this process at once, with no handler or destructor.
+        unsafe { libc::_exit(0) }
+    }
+    drop(write);
+    loop {
+        // SAFETY: waitpid on this process's own child, with no status wanted.
+        let said = unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        if said == child {
+            break;
+        }
+        let e = Error::last_os_error();
+        if said < 0 && e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    let mut got = Vec::new();
+    // (Nonblocking: where nothing is left, or the child wrote none, it says so and stops.)
+    let _ = (&mut read).take(FORKED_MOST as u64).read_to_end(&mut got);
+    Ok(got)
 }
 
 /// What a mount made by [`mount_mapped`] is besides mapped: read-only, without setuid,
