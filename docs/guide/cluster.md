@@ -227,6 +227,34 @@ first ingress rule that fits wins, none means refused. Peers are a `node` or a `
 out) and egress is not enforced; the status says `partial` and why, or `enforced`. A connection
 to a node's own address bypasses it.
 
+### Rolling updates
+
+A changed Workload is replaced one replica at a time, on the node that runs it. The replacement
+starts beside the old replica (its own pod and address, a second copy of the storage limit) and the
+old one stops only once the replacement is ready and has been for 3 seconds, the time a Service
+on another node is given to move to the new address. So a `replicas: 1` Workload behind a Service
+is never without a ready replica.
+
+- **Stopped first.** A replica that holds one of something stops first, as an update did before:
+  a volume, a `scratch` mount, a device or seat, the node's own network (a unit that is not in a
+  pod, or a kithd that is not root), or CPU and memory the node has no room for twice. The unit's
+  `message` in the status says which (`rolling update: replica 0 is stopped first: it mounts a
+  volume`). A ConfigMap's files are shared by both copies and not counted: what is written is
+  what the new one wants.
+- **A replacement that does not come up.** The old replica goes on answering. After 30 seconds
+  (plus the `startSeconds` of its liveness probes) the status says what the replacement lacks,
+  with its own message, e.g. `replica 0's replacement is not ready after 41 s (web: pulling
+  nginx:2: no route to host); the old one still answers`. Change the Workload again to replace
+  the replacement; the old replica is let go only once one answers.
+- **A kithd restarted in the middle.** Both copies are taken back. The one that runs as the
+  Workload says now is the new one (where neither does, the one that started later); the other
+  is kept, its network and Service rules with it, until the new one answers, so a restart never
+  leaves a replica with nothing running. A replica found running as an older definition, with
+  nothing else of it running, is replaced the same way: the new copy starts beside it. A third
+  change within that stretch does not tell the copies apart: the older one is kept either way.
+- **Where it is said.** With one node, in the Workload's `notes`; with several, in the `message`
+  of the replica's units, as each node says only its own.
+
 ### Ingress: a host of its own, with a certificate
 
 With `--ingress` (and `--mesh`; for nodes with a public address) a node serves HTTPS on 443 for
@@ -293,7 +321,7 @@ metadata: {name: home}
 spec:
   home:
     address: 192.168.1.250/24
-    endpoint: house.example.org:51820   # kept, and not acted on yet
+    endpoint: house.example.org:51820   # where a roaming node calls home from outside
 ```
 
 The leader puts the address on that card, tells the LAN with ARP announcements, and the node's
@@ -316,8 +344,21 @@ Three voters are needed for it to move: with two, the one that is left cannot co
 leads. Choose an address outside the router's DHCP range. ARP cannot stop a hostile host on the
 LAN from claiming the address: the holder announces it again when it hears another card answer
 for it (at most once a second) and logs the other MAC, but a host that keeps claiming it can
-still take traffic. Only DNS answers on it so far; UDP 51820 and TCP 443 are for the nodes' own
+still take traffic. Only DNS answers on it so far; TCP 443 is for the nodes' own
 addresses still.
+
+**Calling home from outside.** The holder says so in the `Cluster` (`kith get cluster` shows the
+house address, the endpoint, the holder and since when; the next holder replaces it). To let a
+roaming laptop in, forward UDP 51820 (the mesh port) on the router to the house address, and
+point `endpoint` at the router's public name or address with that port. A laptop (`--roaming`)
+that has not shaken hands with the holder for three minutes (as long as any peer is called
+silent; a healthy tunnel shakes hands about every two) calls the holder at `endpoint`; it does
+not give it to any other node, and a node that calls it from somewhere keeps that address, so
+inside the house the laptop is reached where it is. When the leader moves, the forward still
+lands on the new holder, as the address moved with it. A name in `endpoint` is looked up beside
+the mesh's loop, never holding it: until the first answer the holder is called where it was, the
+answer is kept and looked up again each minute (each half minute while it does not resolve), and
+kithd logs when it starts or stops resolving, not on each try.
 
 ### Not yet
 

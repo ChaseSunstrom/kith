@@ -20,8 +20,9 @@
   </a>
   <nav aria-label="Sections">
     <a href="../guide/index.html">Guide</a>
-    <a href="../guide/index.html#decisions">Decisions</a>
-    <a href="../index.html#numbers">Numbers</a>
+    <a href="../install.html">Install</a>
+    <a class="more" href="../guide/index.html#decisions">Decisions</a>
+    <a class="more" href="../index.html#numbers">Numbers</a>
   </nav>
   <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
 </header>
@@ -49,7 +50,7 @@
 <p>Anything about many nodes, or about more containers than these. It is one shape of machine, a few runs, on a machine that was doing other work at the time (so the times under a second move, and so do the requests). Where the two differ in what they do, the numbers are not of the same thing:</p>
 <ul><li>A kith container on kith OS shares its node's network; a pod has a network of its own, with an address, set up before its containers start. Much of the difference in starting many replicas is that.</li><li>kith replaces all replicas of a changed workload that are on different nodes at once; Kubernetes goes a quarter at a time unless told otherwise.</li><li>A kith Service is on the mesh, TCP only, and kithd itself passes every byte on between the two connections; k3s's is rules in the kernel. What goes from one kith node to another over the mesh is encrypted (WireGuard); between k3s's nodes, as it comes, it is not. In these runs kith serves somewhat more on both rows; with a new connection for each request the two ranges overlap, with connections that are kept they do not. (An earlier sitting of the same script had k3s's kept connections at 27,000 to 68,000 a second, three runs: a connection to a web server on the node that asks is passed by the kernel's rules faster than kithd passes it.)</li><li>Where kith's time goes, from one run with one web server and connections that are kept (<a href="https://github.com/ChaseSunstrom/kith/blob/main/ci/compare.where.txt">ci/compare.where.txt</a>): asked directly on its own node it answered 218,000 requests a second, through its Service on that node 94,000 (kithd's copying), and from another node 20,900, where the mesh alone gave 21,800 and the nodes' network with no mesh 30,400. So between nodes the encryption is the bound, not kithd, and on one node kithd is.</li><li>nginx runs with a configuration of its own on both (it listens on 8080 and writes only under <code>/tmp</code>): as its image comes it wants to start as root and write into its image, which a kith container may not.</li><li>And the two are not the same thing: k3s is Kubernetes, with its whole API and all that is written for it. kith answers the part of that API <code>kubectl</code> and <code>helm</code> use for the core kinds (<a href="kubernetes.html#kubectl-and-helm-as-they-are">kubectl and Helm, as they are</a>) and refuses the rest by name; the kith side of these tables is measured through kith's own API.</li></ul>
 </article>
-<footer class="tail"><nav aria-label="Next page"><a class="before" href="development.html"><span>Before</span>Working on kith</a><a class="after" href="../adr-keyless.html"><span>After</span>image signatures made without a kept key (T-0463)</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/numbers.md">docs/guide/numbers.md</a>.</p></footer>
+<footer class="tail"><nav aria-label="Previous and next pages"><a class="prev" rel="prev" href="development.html"><span>Previous</span>Working on kith</a><a class="next" rel="next" href="../adr-keyless.html"><span>Next</span>image signatures made without a kept key (T-0463)</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/numbers.md">docs/guide/numbers.md</a>.</p></footer>
 </div>
 </div>
 </body>

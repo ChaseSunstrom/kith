@@ -295,6 +295,40 @@ pub struct Shared {
 /// How many dry runs at once.
 const DRY_RUNS: usize = 4;
 
+/// The most open files kithd asks for: ingress's 1024 connections hold two each, and the
+/// relays, the API and the listeners come on top (SECURITY.md).
+const NOFILE_WANTED: u64 = 65536;
+
+/// The soft limit of open files to set: the hard limit, but no more than [`NOFILE_WANTED`],
+/// and never below what it has now (a limit kithd lowered would be worse than none).
+fn nofile_soft(soft: u64, hard: u64) -> u64 {
+    hard.min(NOFILE_WANTED).max(soft).min(hard)
+}
+
+/// Raise the soft limit of open files ([`nofile_soft`]); the hard one is not touched. A
+/// failure leaves the limit as it was and is only said.
+fn raise_nofile() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let said = |e: &dyn std::fmt::Display| {
+        // (Not `eprintln!`: it panics when stderr cannot be written, and PID 1 may not.)
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!("kithd: could not raise its limit of open files: {e}\n"),
+        );
+    };
+    match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok((soft, hard)) => {
+            let want = nofile_soft(soft, hard);
+            if want != soft
+                && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, want, hard)
+            {
+                said(&e);
+            }
+        }
+        Err(e) => said(&e),
+    }
+}
+
 fn main() -> ExitCode {
     // First of all, before a thread or an argument (and before the shim below, which is
     // this same program started again): what musl's start code left writable is shut. A node
@@ -310,6 +344,8 @@ fn main() -> ExitCode {
     kith_runtime::exec_shim();
     // Started again to render a package's templates? Then this never returns either.
     releases::render_shim();
+    // Then, before the runtime and its listeners, the limit of open files they share.
+    raise_nofile();
     // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
     if std::process::id() == 1 {
         keeper::keep();
@@ -1231,6 +1267,17 @@ async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, m
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nofile_soft_is_the_hard_limit_up_to_65536_and_never_less_than_now() {
+        use super::nofile_soft;
+        assert_eq!(nofile_soft(1024, 4096), 4096);
+        assert_eq!(nofile_soft(1024, 524288), 65536);
+        assert_eq!(nofile_soft(1024, 1024), 1024);
+        assert_eq!(nofile_soft(100_000, 524288), 100_000);
+        assert_eq!(nofile_soft(1024, u64::MAX), 65536);
+        assert_eq!(nofile_soft(u64::MAX, u64::MAX), u64::MAX);
+    }
+
     #[test]
     fn advertise_is_an_address_not_a_name() {
         use clap::Parser;

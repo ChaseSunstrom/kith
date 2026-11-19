@@ -20,8 +20,9 @@
   </a>
   <nav aria-label="Sections">
     <a href="guide/index.html">Guide</a>
-    <a href="guide/index.html#decisions">Decisions</a>
-    <a href="index.html#numbers">Numbers</a>
+    <a href="install.html">Install</a>
+    <a class="more" href="guide/index.html#decisions">Decisions</a>
+    <a class="more" href="index.html#numbers">Numbers</a>
   </nav>
   <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
 </header>
@@ -120,7 +121,7 @@
 <h2 id="what-stays-open">What stays open <a class="anchor" href="#what-stays-open" aria-label="Link to this section">#</a></h2>
 <ul><li><strong>A taken node that leads,</strong> until layer 3 is built (captured as T-0742).</li><li><strong>The CA node mints.</strong> Whoever takes the node with the CA key (crates/kithd/src/pki.rs:261-266, crates/kithd/src/pki.rs:275) can issue any certificate (crates/kithd/src/pki.rs:125-160). With layer 3 a new node certificate still needs a Node admitted by a signed write, and a new person's still needs an Identity with that key. But <code>issue_user</code> makes the person's key on the CA node (crates/kithd/src/pki.rs:144), so the CA node saw every key it made. Moving key making to the person's side is its own task.</li><li><strong>Secrets are readable by any control node.</strong> Every control node keeps the whole store. Nothing here changes that. adr-workers.md does it for workers only.</li><li><strong>A passphrase typed at a taken node.</strong> It is the admin key, taken. Layers 1 to 3 stop a taken node the admin does not sign at.</li><li><strong>Snapshots and membership.</strong> A taken leader can send a forged snapshot, and add or remove voters. Checking a snapshot means carrying a signed hash of the store with it. Not decided here.</li><li><strong>Choices within the rules.</strong> A taken leader schedules and renders within what passes.</li></ul>
 </article>
-<footer class="tail"><nav aria-label="Next page"><a class="before" href="adr-privilege.html"><span>Before</span>kithd in two parts: what reads the network holds no root</a><a class="after" href="adr-unlock.html"><span>After</span>The ways into a node's encrypted state, and what each leaves open</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/adr-taken-node.md">docs/adr-taken-node.md</a>.</p></footer>
+<footer class="tail"><nav aria-label="Previous and next pages"><a class="prev" rel="prev" href="adr-privilege.html"><span>Previous</span>kithd in two parts: what reads the network holds no root</a><a class="next" rel="next" href="adr-unlock.html"><span>Next</span>The ways into a node's encrypted state, and what each leaves open</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/adr-taken-node.md">docs/adr-taken-node.md</a>.</p></footer>
 </div>
 </div>
 </body>
