@@ -29,8 +29,10 @@
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network
-#   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) imported with
-#                               kith import compose, applied, ready, each asked for by its compose name
+#   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) and media.yml
+#                               (eight, the media stack's shape) imported with kith import compose, applied,
+#                               ready, each asked for by its compose name; KITH_E2E=1 also runs media.yml
+#                               under docker compose up on an Alpine machine, timed beside kith's
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
 #                               kills in a minute restart the machine
@@ -189,11 +191,15 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    x86_64-unknown-linux-musl
   --test compose   instead: one node on the mesh, and on this machine `kith import
                    compose` of ci/compose/stack.yml (four services of the test pod,
-                   nothing in it left out) applied to it. Expected: each Workload ready,
-                   each Service given its backend, and a Job in a pod asking each service
-                   by its compose name (and the alias a container_name gives) is answered
-                   by that service's pod; the seconds from the apply to all four ready are
-                   printed (kith's side of T-0320's comparison with docker compose)
+                   nothing in it left out) and of ci/compose/media.yml (the eight services
+                   of the media stack, on the test pod) applied to it. Expected: each
+                   Workload ready, each Service given its backend, and a Job in a pod
+                   asking each service by its compose name (and the alias a container_name
+                   gives) is answered by that service's pod; the seconds from the apply to
+                   all ready are printed (kith's side of T-0320's comparison with docker
+                   compose). With KITH_E2E=1 also docker compose up of media.yml on an
+                   Alpine machine of its own (docker from Alpine's packages; three runs,
+                   the median printed beside kith's)
   --test quota     instead: one node on the mesh, its state disk made with project
                    quotas (as os/build.sh makes it). Expected: kithd says it holds
                    pods' storage limits at the write; a pod of 64Ki removed and the
