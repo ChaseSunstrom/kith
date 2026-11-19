@@ -240,7 +240,8 @@ pub fn standing(state: &Path, room: &[u8; ROOM]) -> Standing {
 /// A disk that names itself nothing is never offered.
 pub fn off_ours(verity: bool, ours: Option<&str>, state_disk: Option<&str>, disk: &str) -> bool {
     let ours = if verity { ours } else { state_disk };
-    !disk.is_empty() && ours.is_some_and(|ours| ours != disk)
+    // A name that is empty or a path is no disk's: fail closed, as `Root::new` does.
+    !disk.is_empty() && ours.is_some_and(|ours| !ours.is_empty() && !ours.contains('/') && ours != disk)
 }
 
 /// The mapping of a data disk, the part that needs root and device-mapper (T-0958). `add` and
@@ -254,7 +255,8 @@ pub trait Mapper {
     fn seed(&mut self) -> io::Result<()>;
     /// Whether the file system in the open mapping answers (the resume's check).
     fn answers(&mut self) -> io::Result<bool>;
-    /// Remove the mapping; an error while it is in use.
+    /// Remove the mapping; an error while it is in use. A mapping that is not there is `Ok`
+    /// (or `NotFound`, which `remove` also takes as done): a node restarted after a cut has none.
     fn unmap(&mut self) -> io::Result<()>;
 }
 
@@ -322,12 +324,19 @@ fn put_file(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-/// Every file in `dir` has its bytes overwritten with zeros, synced and removed (a key left
-/// in a cut write's `.key.tmp` too), then the directory; its `data` mount point goes first.
+/// Every file in `dir` has its bytes overwritten with zeros, synced and removed, the `entry`
+/// LAST (the key, and a key left in a cut write's `.key.tmp`, go first: a cut in between leaves
+/// an entry that a second remove still finds and finishes), then the `data` mount point and
+/// the directory.
 fn forget(state: &Path, id: &Id) -> io::Result<()> {
     let dir = dir_of(state, id);
+    let mut paths = Vec::new();
     for item in std::fs::read_dir(&dir)? {
-        let path = item?.path();
+        paths.push(item?.path());
+    }
+    // The mount point first (a busy one stops before any key is erased), the entry last.
+    paths.sort_by_key(|path| (!path.is_dir(), path.file_name().is_some_and(|name| name == "entry")));
+    for path in paths {
         if path.is_dir() {
             std::fs::remove_dir(&path)?;
         } else {
@@ -384,7 +393,8 @@ fn serial_ok(serial: &str) -> bool {
 /// the header last, the entry `ready`. The disk's first 4 KiB stay zero until the header. A disk
 /// that holds the header of this add (its id a `pending` entry of this `serial`) is resumed: it
 /// is mapped with the kept key and, if its file system answers, marked `ready`. `serial` is the
-/// one typed and matched with the disk's by the caller. An unknown disk is not written unless
+/// one typed and matched with the disk's by the caller (the code that runs this, T-0972: no
+/// `Dev` reports a serial, so it is not checked here). An unknown disk is not written unless
 /// `wipe` is said and what refuses it is [`Refused::wipeable`]. Leaves the mapping open.
 pub fn add<D: Dev>(
     state: &Path,
@@ -462,7 +472,8 @@ fn resume_mapped(
     let dir = dir_of(state, id);
     let key = read_key(&dir).ok_or_else(|| AddError::Half("its key is not kept".into()))?;
     mapper.map(&key)?;
-    if !mapper.answers().unwrap_or(false) {
+    // An error is not "does not answer": a `--wipe` must not discard a key over a failed read.
+    if !mapper.answers()? {
         return Err(AddError::Half("its file system does not answer".into()));
     }
     hit(Point::Ready)?;
@@ -525,7 +536,8 @@ fn pending_of(state: &Path, serial: &str) -> Option<Id> {
 /// Remove the data disk `id` (`disk` is the disk typed as `serial`): unmapped first (refused
 /// while in use, before anything is written), then its header's 4 KiB zeroed, then its key
 /// overwritten and its directory removed. A disk that is neither that header nor zero is not
-/// written, and a second call finishes a cut one (a zero header, an entry still there).
+/// written, and a second call finishes a cut one (a zero header, an entry still there). As for
+/// [`add`], the caller (T-0972) matches `serial` with the disk's own; here it is the entry's.
 pub fn remove<D: Dev>(state: &Path, disk: &D, id: &Id, serial: &str, mapper: &mut impl Mapper) -> Result<(), String> {
     let entry = read_entry(&dir_of(state, id)).ok_or("this node has no such disk")?;
     if entry.serial != serial {
@@ -538,7 +550,10 @@ pub fn remove<D: Dev>(state: &Path, disk: &D, id: &Id, serial: &str, mapper: &mu
     if !zero && parse(&room) != Ok(*id) {
         return Err("its header is not this disk's".into());
     }
-    mapper.unmap().map_err(|e| format!("the mapping is in use: {e}"))?;
+    match mapper.unmap() {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(format!("the mapping is in use: {e}")),
+        _ => {}
+    }
     if !zero {
         disk.write_first(&[0; ROOM])
             .map_err(|e| format!("zeroing its header: {e}"))?;
@@ -609,6 +624,8 @@ mod support {
         pub headed: Vec<&'static str>,
         pub fail: Option<&'static str>,
         pub answers: bool,
+        /// There is no mapping to remove: `unmap` says `NotFound`.
+        pub gone: bool,
     }
 
     impl Map {
@@ -619,6 +636,7 @@ mod support {
                 headed: vec![],
                 fail: None,
                 answers: true,
+                gone: false,
             }
         }
         fn call(&mut self, what: &'static str) -> io::Result<()> {
@@ -648,7 +666,11 @@ mod support {
             self.call("answers").map(|()| self.answers)
         }
         fn unmap(&mut self) -> io::Result<()> {
-            self.call("unmap")
+            self.call("unmap")?;
+            if self.gone {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            Ok(())
         }
     }
 
@@ -972,7 +994,10 @@ mod order {
             assert_eq!(left.len(), usize::from(at != Point::Pending), "{at:?}: {left:?}");
             let headed = matches!(at, Point::Ready);
             assert_eq!(room(&disk).iter().any(|&byte| byte != 0), headed, "{at:?}");
-            assert_ne!(standing(&state, &room(&disk)), Standing::Damaged(String::new()));
+            assert!(
+                !matches!(standing(&state, &room(&disk)), Standing::Damaged(_)),
+                "{at:?}"
+            );
             assert!(!matches!(standing(&state, &room(&disk)), Standing::Ours(_)), "{at:?}");
             let dir = state.join("disks").join(left.first().cloned().unwrap_or_default());
             let key = read_key(&dir);
@@ -1056,6 +1081,23 @@ mod order {
         assert_eq!(ids(&state), [crate::pki::hex(&id)]);
         assert_ne!(ids(&state), old);
         assert_eq!(standing(&state, &room(&disk)), Standing::Ours(id));
+    }
+
+    /// A resume whose check of the file system fails (an error, not "no answer") is `Failed`: the
+    /// mapping is removed and, even with `--wipe`, the key, the entry and the header are kept.
+    #[test]
+    fn order_a_resume_whose_check_errs_keeps_everything() {
+        let (_dir, disk, state) = rig("order-answers-err");
+        add_cut(&state, &disk, &mut Map::new(&disk), Some(Point::Ready)).unwrap_err();
+        let (before, old) = (room(&disk), ids(&state));
+        let key = read_key(&state.join("disks").join(&old[0])).unwrap();
+        let mut broken = Map::new(&disk);
+        broken.fail = Some("answers");
+        let r = add(&state, &disk, Some(&sda()), "SER1", (true, false), &mut broken);
+        assert!(matches!(r, Err(AddError::Failed(_))), "{r:?}");
+        assert_eq!(broken.calls, ["map", "answers", "unmap"]);
+        assert_eq!((room(&disk), ids(&state)), (before, old.clone()));
+        assert_eq!(read_key(&state.join("disks").join(&old[0])).unwrap()[..], key[..]);
     }
 
     /// A header of this add under another serial is not resumed (it is another disk's header).
@@ -1212,6 +1254,11 @@ mod ours {
         // A disk with no name.
         assert!(!off_ours(true, Some("vda"), None, ""));
         assert!(!off_ours(false, None, Some("vda"), ""));
+        // A root or state disk with no name, or a path, is no disk's: none, not every one.
+        assert!(!off_ours(true, Some(""), None, "vdb"));
+        assert!(!off_ours(false, None, Some(""), "vdb"));
+        assert!(!off_ours(true, Some("dev/vda"), None, "vdb"));
+        assert!(!off_ours(false, None, Some("/dev/vda"), "vdb"));
     }
 
     /// An unknown disk (another's header, a damaged one, a signature, data, a pending header of
@@ -1378,5 +1425,33 @@ mod remove {
         remove(&state, &disk, &id, "SER1", &mut Map::new(&disk)).unwrap();
         assert!(!dir.exists());
         assert!(ids(&state).is_empty());
+    }
+
+    /// The entry goes last: a remove cut after the key is gone leaves the entry, and the next
+    /// remove finishes. A mapping that is not there (`NotFound`) is no refusal.
+    #[test]
+    fn remove_goes_on_after_the_key_is_gone_and_with_no_mapping() {
+        let (_dir, disk, state, id) = added("remove-nokey");
+        let dir = dir_of(&state, &id);
+        std::fs::remove_file(dir.join("key")).unwrap();
+        assert!(dir.join("entry").exists());
+        let mut gone = Map::new(&disk);
+        gone.gone = true;
+        remove(&state, &disk, &id, "SER1", &mut gone).unwrap();
+        assert_eq!(gone.calls, ["unmap"]);
+        assert!(room(&disk).iter().all(|&byte| byte == 0));
+        assert!(!dir.exists());
+    }
+
+    /// A `data` that cannot be removed (still mounted, so not empty) stops `forget` before the
+    /// key is erased: the entry and the key are both still there for the next remove.
+    #[test]
+    fn remove_stops_at_a_busy_mount_point_with_the_key_kept() {
+        let (_dir, _disk, state, id) = added("remove-busy");
+        let dir = dir_of(&state, &id);
+        std::fs::create_dir(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data").join("f"), b"x").unwrap();
+        assert!(forget(&state, &id).is_err());
+        assert!(dir.join("entry").exists() && read_key(&dir).is_some());
     }
 }
