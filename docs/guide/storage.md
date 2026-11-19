@@ -147,7 +147,8 @@ spec:
   mutual TLS and replaces its own copy; `status.synced` says when.
 - When the primary is not heard from for `--lost-after`, the replica that synced last becomes
   primary and workloads that mount the volume are placed there. A node that comes back is not
-  given the volume back; what it had is kept as `PATH.was-TIME` (yours to delete).
+  given the volume back; what it had is kept beside it as `.PATH.was-TIME`, a hidden name (yours to
+  delete).
 - **A failover loses what was written after the last sync**, and a copy is the directory as read
   while in use: a database caught mid-write may need its own recovery.
 - A restore, a replica's first copy and each sync unpack no more than the Volume's `size` and
