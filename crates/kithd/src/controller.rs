@@ -2789,7 +2789,8 @@ impl Controller {
             // (A disk that cannot be asked is not under its reserve.)
             let low =
                 || nix::sys::statvfs::statvfs(&state).is_ok_and(|d| d.blocks_available() * d.fragment_size() < reserve);
-            let remove = |digest: &str, before| images.remove_image(digest, before).map_err(|e| e.to_string());
+            // (Asked of the root part: the path of an image is its own, from the digest.)
+            let remove = |digest: &str, before| crate::root_part::drop_image(images.clone(), digest, before);
             Ok(prune::prune(&unused, began, grace, low, remove, &stop))
         });
     }
@@ -3293,9 +3294,19 @@ async fn start(
                     signers(&rules, &c.image, &named)?
                 }
             };
+            // The layers are unpacked by the root part, which is asked for an image that is not
+            // here, with the layers as files; off this thread, which it would block.
+            let unpack = |digest: String, layers: Vec<kith_runtime::Layer>| -> kith_runtime::Unpacking {
+                let store = runtime.images.clone();
+                Box::pin(async move {
+                    tokio::task::spawn_blocking(move || crate::root_part::unpack(store, digest, layers))
+                        .await
+                        .map_err(|e| e.to_string())?
+                })
+            };
             let image = runtime
                 .images
-                .pull_signed(&c.image, policy, &signed_by)
+                .pull_with(&c.image, policy, &signed_by, &unpack)
                 .await
                 .map_err(|e| e.to_string())?;
             let (out, err) = (log("out")?, log("err")?);

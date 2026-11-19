@@ -5,7 +5,9 @@
 //! [`decode`] reading each one. Here are the Listeners family (`Bind`), the Pods family (`Pod`,
 //! `Sockets`, [`Root::create`] and [`Root::start`]) and, through the last, what Services and
 //! probes connect into a pod by, and the Mesh family (`MeshUp`, `Mesh`, `MeshSeen`, `MeshDown`:
-//! the WireGuard interface, its addresses and its peers).
+//! the WireGuard interface, its addresses and its peers) and the Images family (`Unpack`, with
+//! the layers as files beside the request, and `Drop`: both name a digest, and the path is
+//! derived from it here).
 //!
 //! A request is refused for what it is, never for who asked ([`check`], [`check_create`]): a
 //! mount outside the state directory, a device no claim of this node's granted, a network
@@ -20,7 +22,7 @@
 
 use crate::pods::{Given, Pods};
 use crate::policy::Policy;
-use kith_runtime::{Handle, Image, Mount, Runtime, Unit};
+use kith_runtime::{Handle, Image, ImageStore, Mount, Runtime, Unit};
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -44,6 +46,8 @@ const OWN_PORTS: [u16; 3] = [7443, 5000, 51820];
 const MOST_SOCKETS: u8 = 16;
 /// The most name servers a pod's `resolv.conf` is given (the C library reads three).
 const MOST_NAMESERVERS: usize = 8;
+/// The most layers an image is unpacked from.
+const MOST_LAYERS: usize = 256;
 
 /// What a socket is for: only these two, so a request for any other protocol does not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,11 +94,24 @@ pub enum Request {
     MeshSeen { interface: String },
     /// The interface taken away.
     MeshDown { interface: String },
+    /// The image `image` (a digest) unpacked from `layers` (each a digest and a media type, in
+    /// order), the files of which come beside the request, one each, in the same order. The
+    /// path is the root part's: it derives it from the digest, and hashes each layer as it
+    /// reads it, which must be the digest it is named by.
+    Unpack {
+        image: String,
+        layers: Vec<(String, String)>,
+    },
+    /// The unpacked image `image` (a digest) removed, if it was last used no later than `before`
+    /// (seconds since the epoch) and no pull holds the store.
+    Drop { image: String, before: u64 },
 }
 
 /// What a request gives back.
 #[derive(Debug)]
 pub enum Reply {
+    /// The bytes an image's removal freed, or `None` when it stayed.
+    Freed(Option<u64>),
     Socket(OwnedFd),
     Sockets(Vec<OwnedFd>),
     Pod(Given),
@@ -181,7 +198,20 @@ pub fn check(request: &Request) -> Result<(), String> {
         }
         // (Against what the root part was told of the mesh, which is not in the request: [`check_mesh`].)
         Request::MeshUp { .. } | Request::Mesh { .. } | Request::MeshSeen { .. } | Request::MeshDown { .. } => Ok(()),
+        // (Digests, and nothing else, become the names of files.)
+        Request::Unpack { image, layers } => {
+            digest(image)?;
+            if !(1..=MOST_LAYERS).contains(&layers.len()) {
+                return Err(format!("{} layers: from 1 to {MOST_LAYERS}", layers.len()));
+            }
+            layers.iter().try_for_each(|(layer, _)| digest(layer))
+        }
+        Request::Drop { image, .. } => digest(image),
     }
+}
+
+fn digest(text: &str) -> Result<(), String> {
+    kith_runtime::sha256_hex(text).map(drop).map_err(|e| e.to_string())
 }
 
 /// What the root part was told of the mesh, once: where its interface is kept, which cluster's
@@ -446,7 +476,7 @@ pub struct Book {
     mesh: Mutex<Option<MeshTold>>,
     /// Held by a mesh request from its check to its end: one at a time.
     meshing: Mutex<()>,
-    crossed: [AtomicUsize; 7],
+    crossed: [AtomicUsize; 9],
 }
 
 /// What a request is, for counting.
@@ -461,6 +491,10 @@ pub enum Kind {
     Mesh,
     /// A read of when the peers shook hands (`MeshSeen`): every pass of the mesh's loop.
     Seen,
+    /// An image unpacked (`Unpack`): once per image, and none for one that is here.
+    Unpack,
+    /// An image removed (`Drop`): the pruning job's.
+    Drop,
 }
 
 impl Book {
@@ -470,7 +504,7 @@ impl Book {
             devices: Mutex::new(BTreeSet::new()),
             mesh: Mutex::new(None),
             meshing: Mutex::new(()),
-            crossed: [const { AtomicUsize::new(0) }; 7],
+            crossed: [const { AtomicUsize::new(0) }; 9],
         }
     }
 
@@ -633,6 +667,11 @@ pub trait Hands {
         let device = DEVICE.lock().expect("nothing panics holding the device").take();
         device.ok_or("the mesh is not up")?.remove().map_err(|e| e.to_string())
     }
+
+    /// The images this node keeps, if these hands have any (`Unpack` and `Drop`).
+    fn images(&self) -> Option<&ImageStore> {
+        None
+    }
 }
 
 /// The root part, as the serving part sees it.
@@ -640,6 +679,13 @@ pub trait Root {
     type Made;
     /// Do `request` if [`check`] allows it.
     fn request(&self, request: Request) -> Result<Reply, String>;
+    /// [`Root::request`] with the files that come beside it (the layers of an `Unpack`).
+    fn request_with(&self, request: Request, files: Vec<File>) -> Result<Reply, String> {
+        match files.is_empty() {
+            true => self.request(request),
+            false => Err("this root part takes no files beside a request".into()),
+        }
+    }
     /// Create the container if [`check_create`] allows it.
     fn create(&self, create: Create) -> Result<Self::Made, String>;
     /// Start what [`Root::create`] made; `mark` is what it is started as (`Runtime::record`).
@@ -655,10 +701,13 @@ pub struct Direct<'a, H: Hands = Nobody> {
 }
 
 /// Hands for a Direct that is asked for sockets to listen on and for the mesh, and nothing else.
-pub struct Nobody;
+pub struct Nobody(pub Option<ImageStore>);
 
 impl Hands for Nobody {
     type Made = ();
+    fn images(&self) -> Option<&ImageStore> {
+        self.0.as_ref()
+    }
     fn pod(
         &self,
         _: &Path,
@@ -694,6 +743,10 @@ pub struct Today<'a> {
 
 impl Hands for Today<'_> {
     type Made = Handle;
+
+    fn images(&self) -> Option<&ImageStore> {
+        self.runtime.map(|r| &r.images)
+    }
 
     fn pod(
         &self,
@@ -752,7 +805,16 @@ impl Direct<'static, Nobody> {
     /// For the Listeners family alone.
     pub fn new() -> Self {
         Direct {
-            hands: Nobody,
+            hands: Nobody(None),
+            book: &BOOK,
+            policy: None,
+        }
+    }
+
+    /// For the Images family alone: this node's store.
+    pub fn of_images(store: ImageStore) -> Self {
+        Direct {
+            hands: Nobody(Some(store)),
             book: &BOOK,
             policy: None,
         }
@@ -846,15 +908,91 @@ impl<H: Hands> Root for Direct<'_, H> {
     type Made = H::Made;
 
     fn request(&self, request: Request) -> Result<Reply, String> {
+        self.act(request, Vec::new())
+    }
+
+    fn request_with(&self, request: Request, files: Vec<File>) -> Result<Reply, String> {
+        self.act(request, files)
+    }
+
+    fn create(&self, create: Create) -> Result<H::Made, String> {
+        self.book.count(Kind::Create);
+        check_create(&create, &self.ground(), &|path| self.hands.owns_netns(path))?;
+        self.hands.create(create)
+    }
+
+    fn start(&self, made: H::Made, id: &str, mark: &str) -> Result<H::Made, (H::Made, String)> {
+        self.book.count(Kind::Start);
+        let plain = !mark.is_empty() && mark.len() <= 256 && mark.chars().all(|c| c.is_ascii_alphanumeric());
+        let refused =
+            label("unit id", id).and_then(|()| plain.then_some(()).ok_or("the mark is not hexadecimal text".into()));
+        match refused {
+            Ok(()) => self.hands.start(made, id, mark),
+            Err(why) => Err((made, why)),
+        }
+    }
+}
+
+impl<H: Hands> Direct<'_, H> {
+    /// A request of the Images family: the store is the node's own, and under the state
+    /// directory (the path of an image is derived from its digest, never taken from the asker).
+    fn images_request(&self, request: Request, files: Vec<File>) -> Result<Reply, String> {
+        let store = self.hands.images().ok_or("this root part keeps no images")?;
+        let under = self.book.state().ok_or("this root part has no state directory")?;
+        match store.root().canonicalize() {
+            Ok(root) if root.starts_with(&under) => {}
+            _ => return Err("the image store is not under the state directory".into()),
+        }
+        match request {
+            Request::Unpack { image, layers } => {
+                if layers.len() != files.len() {
+                    return Err(format!(
+                        "{} layers, and {} file(s) beside the request",
+                        layers.len(),
+                        files.len()
+                    ));
+                }
+                let layers = layers
+                    .into_iter()
+                    .zip(files)
+                    .map(|((digest, media_type), file)| kith_runtime::Layer {
+                        digest,
+                        media_type,
+                        file,
+                    })
+                    .collect();
+                store
+                    .unpack(&image, layers)
+                    .map(|()| Reply::Done)
+                    .map_err(|e| e.to_string())
+            }
+            Request::Drop { image, before } => {
+                let before = std::time::UNIX_EPOCH + std::time::Duration::from_secs(before);
+                store
+                    .remove_image(&image, before)
+                    .map(Reply::Freed)
+                    .map_err(|e| e.to_string())
+            }
+            _ => Err("not a request of the images".into()),
+        }
+    }
+
+    fn act(&self, request: Request, files: Vec<File>) -> Result<Reply, String> {
         self.book.count(match request {
             Request::Bind { .. } => Kind::Bind,
             Request::Pod { .. } => Kind::Pod,
             Request::Sockets { .. } => Kind::Sockets,
             Request::MeshUp { .. } | Request::Mesh { .. } | Request::MeshDown { .. } => Kind::Mesh,
             Request::MeshSeen { .. } => Kind::Seen,
+            Request::Unpack { .. } => Kind::Unpack,
+            Request::Drop { .. } => Kind::Drop,
         });
         check(&request)?;
+        if !files.is_empty() && !matches!(request, Request::Unpack { .. }) {
+            return Err("only an unpack comes with files".into());
+        }
         match request {
+            images @ (Request::Unpack { .. } | Request::Drop { .. }) => self.images_request(images, files),
             mesh @ (Request::MeshUp { .. }
             | Request::Mesh { .. }
             | Request::MeshSeen { .. }
@@ -887,22 +1025,27 @@ impl<H: Hands> Root for Direct<'_, H> {
             Request::Sockets { pod, v6, count } => self.hands.sockets(&pod, v6, usize::from(count)).map(Reply::Sockets),
         }
     }
+}
 
-    fn create(&self, create: Create) -> Result<H::Made, String> {
-        self.book.count(Kind::Create);
-        check_create(&create, &self.ground(), &|path| self.hands.owns_netns(path))?;
-        self.hands.create(create)
+/// An image unpacked from `layers`, as the root part of this node does it: asked of it, with the
+/// files beside the request.
+pub fn unpack(store: ImageStore, image: String, layers: Vec<kith_runtime::Layer>) -> Result<(), String> {
+    let (layers, files) = layers.into_iter().map(|l| ((l.digest, l.media_type), l.file)).unzip();
+    match Direct::of_images(store).request_with(Request::Unpack { image, layers }, files)? {
+        Reply::Done => Ok(()),
+        _ => Err("the root part answered an unpack with another reply".into()),
     }
+}
 
-    fn start(&self, made: H::Made, id: &str, mark: &str) -> Result<H::Made, (H::Made, String)> {
-        self.book.count(Kind::Start);
-        let plain = !mark.is_empty() && mark.len() <= 256 && mark.chars().all(|c| c.is_ascii_alphanumeric());
-        let refused =
-            label("unit id", id).and_then(|()| plain.then_some(()).ok_or("the mark is not hexadecimal text".into()));
-        match refused {
-            Ok(()) => self.hands.start(made, id, mark),
-            Err(why) => Err((made, why)),
-        }
+/// The image `image` removed, if last used no later than `before`: what it freed, or `None`.
+pub fn drop_image(store: ImageStore, image: &str, before: std::time::SystemTime) -> Result<Option<u64>, String> {
+    let before = before.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    match Direct::of_images(store).request(Request::Drop {
+        image: image.into(),
+        before,
+    })? {
+        Reply::Freed(freed) => Ok(freed),
+        _ => Err("the root part answered a drop with another reply".into()),
     }
 }
 
@@ -2312,9 +2455,227 @@ mod tests {
         assert_eq!(book.crossed(Kind::Sockets), 2);
         // A refused refill is the connection's error, with nothing spare.
         let (broken, _) = (Book::new(), ());
-        let none = Direct::with(Nobody, &broken);
+        let none = Direct::with(Nobody(None), &broken);
         let pods = Mutex::new(Pods::default());
         assert!(crate::pods::through(&none, &pods, "w_a_b_0", port).await.is_err());
         assert_eq!(broken.crossed(Kind::Sockets), 1);
+    }
+
+    // The Images family: Unpack and Drop name a digest; the path is the root part's own.
+
+    const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+
+    fn sha(bytes: &[u8]) -> String {
+        let sum = ring::digest::digest(&ring::digest::SHA256, bytes);
+        format!(
+            "sha256:{}",
+            sum.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        )
+    }
+
+    /// A layer of one file, as the tar's bytes.
+    fn layer(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, name, body).unwrap();
+        tar.into_inner().unwrap()
+    }
+
+    /// `bytes` in a file of `dir`, opened.
+    fn held(dir: &Path, bytes: &[u8]) -> File {
+        let path = dir.join(sha(bytes).replace(':', "-"));
+        std::fs::write(&path, bytes).unwrap();
+        File::open(path).unwrap()
+    }
+
+    /// A root part whose images are in `state/runtime`, as kithd's are.
+    fn imaged(name: &str) -> (Book, PathBuf, kith_runtime::ImageStore) {
+        let (book, state) = book(name);
+        let store = kith_runtime::ImageStore::new(state.join("runtime")).unwrap();
+        (book, state, store)
+    }
+
+    fn unpack_ask(image: &str, layers: &[(&str, &str)]) -> Request {
+        Request::Unpack {
+            image: image.into(),
+            layers: layers.iter().map(|(d, m)| (d.to_string(), m.to_string())).collect(),
+        }
+    }
+
+    #[test]
+    fn an_unpack_naming_a_path_or_no_digest_is_refused_whatever_the_caller_says() {
+        let (book, state, store) = imaged("unpack-names");
+        let root = Direct::with(Nobody(Some(store.clone())), &book);
+        let bytes = layer("a", b"one");
+        let good = sha(&bytes);
+        // The image and every layer are digests: nothing else becomes a path.
+        for bad in [
+            "../../etc",
+            "/etc/passwd",
+            "sha256:../x",
+            &good.to_uppercase(),
+            "",
+            "sha512:ab",
+        ] {
+            let ask = unpack_ask(bad, &[(&good, TAR)]);
+            assert!(check(&ask).is_err(), "{bad}");
+            assert!(root.request_with(ask, vec![held(&state, &bytes)]).is_err(), "{bad}");
+            let ask = unpack_ask(&good, &[(bad, TAR)]);
+            assert!(
+                root.request_with(ask, vec![held(&state, &bytes)]).is_err(),
+                "layer {bad}"
+            );
+        }
+        // No layer, too many, or not a file for each: refused.
+        assert!(root.request_with(unpack_ask(&good, &[]), vec![]).is_err());
+        let many: Vec<(&str, &str)> = (0..300).map(|_| (good.as_str(), TAR)).collect();
+        assert!(check(&unpack_ask(&good, &many)).is_err());
+        assert!(
+            root.request_with(unpack_ask(&good, &[(&good, TAR)]), vec![])
+                .unwrap_err()
+                .contains("file")
+        );
+        assert!(
+            root.request_with(
+                unpack_ask(&good, &[(&good, TAR)]),
+                vec![held(&state, &bytes), held(&state, &bytes)]
+            )
+            .is_err()
+        );
+        // Nothing of it is in the store, and the wire reads it as pinned.
+        assert!(
+            std::fs::read_dir(store.root().join("images"))
+                .unwrap()
+                .flatten()
+                .all(|e| e.file_name() == ".lock")
+        );
+        let wire = format!(r#"{{"Unpack":{{"image":"{good}","layers":[["{good}","{TAR}"]]}}}}"#);
+        assert_eq!(decode(wire.as_bytes()).unwrap(), unpack_ask(&good, &[(&good, TAR)]));
+        assert!(decode(wire.replace("image", "path").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn an_unpack_into_a_store_outside_the_state_directory_is_refused() {
+        let (book, state) = book("unpack-outside");
+        let (_, other, store) = imaged("unpack-elsewhere");
+        let bytes = layer("a", b"one");
+        let ask = unpack_ask(&sha(&bytes), &[(&sha(&bytes), TAR)]);
+        let root = Direct::with(Nobody(Some(store)), &book);
+        let why = root.request_with(ask.clone(), vec![held(&state, &bytes)]).unwrap_err();
+        assert!(why.contains("state directory"), "{why}");
+        let drop = Request::Drop {
+            image: sha(&bytes),
+            before: u64::MAX / 2,
+        };
+        assert!(root.request(drop).unwrap_err().contains("state directory"));
+        assert!(
+            !other
+                .join("runtime/images")
+                .join(&sha(&bytes)["sha256:".len()..])
+                .exists()
+        );
+        // Nor is there a store to unpack into, where the root part has none.
+        let none = Direct::with(Nobody(None), &book);
+        assert!(none.request_with(ask, vec![held(&state, &bytes)]).is_err());
+    }
+
+    #[test]
+    fn a_layer_that_is_not_the_digest_it_is_named_by_is_refused_and_nothing_is_published() {
+        let (book, state, store) = imaged("unpack-hash");
+        let root = Direct::with(Nobody(Some(store.clone())), &book);
+        let (one, other) = (layer("a", b"one"), layer("a", b"another"));
+        let image = sha(b"the manifest");
+        let hex = &image["sha256:".len()..];
+        let published = || store.root().join("images").join(hex).join("config.json").exists();
+        let leftovers = || {
+            std::fs::read_dir(store.root().join("images"))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains("unpacking"))
+                .count()
+        };
+        // The bytes are another layer's: a good tar, and not the digest.
+        let ask = unpack_ask(&image, &[(&sha(&one), TAR)]);
+        let why = root.request_with(ask, vec![held(&state, &other)]).unwrap_err();
+        assert!(why.contains("digest"), "{why}");
+        assert!(!published() && leftovers() == 0);
+        // The tar is the digest's, with more after its end (read, then hashed): refused all the same.
+        let mut padded = one.clone();
+        padded.extend_from_slice(b"junk after the end");
+        let ask = unpack_ask(&image, &[(&sha(&one), TAR)]);
+        assert!(root.request_with(ask, vec![held(&state, &padded)]).is_err());
+        assert!(!published() && leftovers() == 0);
+        // The second of two is the one that is wrong: the first's files are not published either.
+        let ask = unpack_ask(&image, &[(&sha(&one), TAR), (&sha(&one), TAR)]);
+        assert!(
+            root.request_with(ask, vec![held(&state, &one), held(&state, &other)])
+                .is_err()
+        );
+        assert!(!published() && leftovers() == 0);
+        // A layer that is not a file (a directory) is no layer.
+        let ask = unpack_ask(&image, &[(&sha(&one), TAR)]);
+        assert!(root.request_with(ask, vec![File::open(&state).unwrap()]).is_err());
+        assert!(!published());
+        // What is the digest it is named by is unpacked, at the path the digest gives.
+        let ask = unpack_ask(&image, &[(&sha(&one), TAR), (&sha(&other), TAR)]);
+        let files = vec![held(&state, &one), held(&state, &other)];
+        assert!(matches!(root.request_with(ask.clone(), files), Ok(Reply::Done)));
+        assert!(published());
+        assert_eq!(
+            std::fs::read(store.root().join("images").join(hex).join("rootfs/a")).unwrap(),
+            b"another"
+        );
+        // Asked again, it is there: nothing is made over.
+        assert!(matches!(
+            root.request_with(ask, vec![held(&state, &one), held(&state, &other)]),
+            Ok(Reply::Done)
+        ));
+        assert_eq!(book.crossed(Kind::Unpack), 6);
+    }
+
+    #[test]
+    fn a_drop_names_a_digest_and_frees_the_image_it_names() {
+        let (book, state, store) = imaged("drop");
+        let root = Direct::with(Nobody(Some(store.clone())), &book);
+        let bytes = layer("a", b"one");
+        let image = sha(b"the manifest");
+        let ask = unpack_ask(&image, &[(&sha(&bytes), TAR)]);
+        root.request_with(ask, vec![held(&state, &bytes)]).unwrap();
+        for bad in ["../x", "sha256:", "/"] {
+            assert!(
+                root.request(Request::Drop {
+                    image: bad.into(),
+                    before: 1 << 40
+                })
+                .is_err()
+            );
+        }
+        // (Used no later than `before`: an image used since stays.)
+        let used = |before| Request::Drop {
+            image: image.clone(),
+            before,
+        };
+        assert!(matches!(root.request(used(0)), Ok(Reply::Freed(None))));
+        let Ok(Reply::Freed(Some(freed))) = root.request(used(1 << 40)) else {
+            panic!("not freed")
+        };
+        assert!(freed > 0);
+        assert!(!store.root().join("images").join(&image["sha256:".len()..]).exists());
+        assert_eq!((book.crossed(Kind::Drop), book.crossed(Kind::Unpack)), (5, 1));
+    }
+
+    #[test]
+    fn crossings_of_a_container_start_with_its_image_cached_have_no_unpack() {
+        let (book, state, _) = imaged("unpack-cached");
+        let root = Direct::with(Fake::default(), &book).under(policy("no-host-paths"));
+        let pods = Mutex::new(Pods::default());
+        pods.lock().unwrap().pretend("w_a_b_0", &state);
+        // A cached image is not unpacked again: the ADR's three, and no more.
+        start_one(&root, &pods, &state, "w_a_b_0", "first");
+        assert_eq!(book.total(), 3);
+        assert_eq!((book.crossed(Kind::Unpack), book.crossed(Kind::Drop)), (0, 0));
     }
 }

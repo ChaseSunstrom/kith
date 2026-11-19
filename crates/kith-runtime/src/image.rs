@@ -128,7 +128,7 @@ pub enum PullPolicy {
 
 /// The hex part of a `sha256:<64 hex>` digest. Digests come from the registry
 /// and become file names, so anything else is refused.
-pub(crate) fn sha256_hex(digest: &str) -> Result<&str> {
+pub fn sha256_hex(digest: &str) -> Result<&str> {
     match digest.strip_prefix("sha256:") {
         Some(hex) if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) => Ok(hex),
         _ => err(format!(
@@ -257,6 +257,62 @@ impl ImageStore {
     fn noted(&self, reference: &Reference) -> Option<String> {
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(self.ref_file(reference).ok()?).ok()?).ok()?;
         Some(sha256_hex(saved["digest"].as_str()?).ok()?.to_string())
+    }
+
+    /// Where the store keeps its files.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Unpacks the image `digest` from `layers` (in order) into the store, as the root part
+    /// does: the path is derived here from the digest, and each layer is hashed as it is read
+    /// (under the decompression, so what is unpacked is what was hashed) and must be the
+    /// digest it names, or nothing is published. A layer must be a regular file; no more than
+    /// its length at the start is read. An image that is here stays as it is.
+    pub fn unpack(&self, digest: &str, layers: Vec<Layer>) -> Result<()> {
+        let hex = sha256_hex(digest)?;
+        let dir = self.root.join("images").join(hex);
+        if dir.join("config.json").exists() {
+            return Ok(());
+        }
+        let names = layers
+            .iter()
+            .map(|l| sha256_hex(&l.digest))
+            .collect::<Result<Vec<_>>>()?;
+        let mut layers = layers.iter();
+        unpack_with(
+            &names,
+            &dir.with_extension(scratch_name("unpacking")),
+            &dir,
+            Some(&self.root.join(SHARED)),
+            Budget::IMAGE,
+            |rootfs, budget| {
+                layers.try_for_each(
+                    |Layer {
+                         digest,
+                         media_type,
+                         file,
+                     }| {
+                        let meta = file.metadata().ctx("reading a layer")?;
+                        if !meta.is_file() {
+                            return err(format!("layer {digest} is not a regular file"));
+                        }
+                        let mut hashed =
+                            Hashed(file.take(meta.len()), ring::digest::Context::new(&ring::digest::SHA256));
+                        unpack_layer_from(&mut hashed, &media_type, rootfs, budget)?;
+                        // What the tar's end left unread is the layer's too.
+                        std::io::copy(&mut hashed, &mut std::io::sink()).ctx("reading a layer")?;
+                        let got: String = hashed.1.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect();
+                        match digest.strip_prefix("sha256:") == Some(&got) {
+                            true => Ok(()),
+                            false => err(format!(
+                                "layer {digest} is not what its digest names (it is sha256:{got})"
+                            )),
+                        }
+                    },
+                )
+            },
+        )
     }
 
     /// Removes the unpacked image `digest` if it was last used no later than `before`, and no
@@ -429,6 +485,27 @@ impl ImageStore {
     /// made to name meanwhile. An image that is here counts as signed only by the keys a
     /// signature of it was found by, here, before.
     pub async fn pull_signed(&self, reference: &str, policy: PullPolicy, signed_by: &[String]) -> Result<Image> {
+        let unpack = |digest: String, layers: Vec<Layer>| -> Unpacking {
+            let store = self.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || store.unpack(&digest, layers).map_err(|e| e.0))
+                    .await
+                    .map_err(|e| e.to_string())?
+            })
+        };
+        self.pull_with(reference, policy, signed_by, &unpack).await
+    }
+
+    /// [`pull_signed`](Self::pull_signed) with what unpacks the image's layers (`unpack`: the
+    /// image's digest and its layers, in order) said by the caller: a node asks its root part.
+    /// The network, the signature and the choice of digest stay here.
+    pub async fn pull_with(
+        &self,
+        reference: &str,
+        policy: PullPolicy,
+        signed_by: &[String],
+        unpack: &(dyn Fn(String, Vec<Layer>) -> Unpacking + Sync),
+    ) -> Result<Image> {
         let reference: Reference = reference.parse().ctx(format!("image reference `{reference}`"))?;
         let keys: Vec<crate::signed::Key> = signed_by
             .iter()
@@ -532,13 +609,18 @@ impl ImageStore {
 
         let dir = self.root.join("images").join(sha256_hex(&digest)?);
         if !dir.join("config.json").exists() {
-            let staging = dir.with_extension(scratch_name("unpacking"));
-            let target = dir.clone();
-            let index = self.root.join(SHARED);
-            let unpacked = tokio::task::spawn_blocking(move || {
-                unpack_image(&layers, &staging, &target, Some(&index), Budget::IMAGE)
-            });
-            unpacked.await.ctx("unpacking")??;
+            let files = layers
+                .iter()
+                .map(|(blob, media_type)| {
+                    let name = blob.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+                    Ok(Layer {
+                        digest: format!("sha256:{name}"),
+                        media_type: media_type.clone(),
+                        file: File::open(blob).ctx(format!("opening {}", blob.display()))?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            unpack(digest.clone(), files).await.map_err(crate::Error)?;
         }
 
         let cfg = config.config.unwrap_or_default();
@@ -705,29 +787,45 @@ fn because(what: &str, e: std::io::Error) -> crate::Error {
 /// Unpack `layers` in order into `staging`, then publish it as `target`.
 /// However it fails, `staging` does not stay behind. With an `index`, the finished tree's
 /// files that other images hold too become one with theirs before it is published.
+#[cfg(test)]
 fn unpack_image(
     layers: &[(PathBuf, String)],
     staging: &Path,
     target: &Path,
     index: Option<&Path>,
+    budget: Budget,
+) -> Result<()> {
+    let names: Vec<_> = layers
+        .iter()
+        .filter_map(|(blob, _)| blob.file_name()?.to_str())
+        .collect();
+    unpack_with(&names, staging, target, index, budget, |rootfs, budget| {
+        layers
+            .iter()
+            .try_for_each(|(blob, media_type)| unpack_layer_capped(blob, media_type, rootfs, budget))
+    })
+}
+
+/// [`unpack_image`] for `layers` that are what `each` unpacks into the root of the image's files:
+/// `names` are the layers' (the marker's).
+fn unpack_with(
+    names: &[&str],
+    staging: &Path,
+    target: &Path,
+    index: Option<&Path>,
     mut budget: Budget,
+    each: impl FnOnce(&Path, &mut Budget) -> Result<()>,
 ) -> Result<()> {
     let _ = fs::remove_dir_all(staging);
     let unpacked = (|| {
         fs::create_dir_all(staging.join("rootfs")).ctx("unpacking")?;
-        for (blob, media_type) in layers {
-            unpack_layer_capped(blob, media_type, &staging.join("rootfs"), &mut budget)?;
-        }
+        each(&staging.join("rootfs"), &mut budget)?;
         // Once, over the whole tree: a file a later layer replaces was never worth sharing.
         if let Some(index) = index {
             share(&staging.join("rootfs"), index, |from, to| fs::hard_link(from, to));
         }
         // The marker that the image is complete, so it is written last. It says the layers
         // it was made of: a removal takes the ones no other image was.
-        let names: Vec<_> = layers
-            .iter()
-            .filter_map(|(blob, _)| blob.file_name()?.to_str())
-            .collect();
         let marker = serde_json::json!({ "layers": names });
         fs::write(staging.join("config.json"), marker.to_string()).ctx("unpacking")?;
         match fs::rename(staging, target) {
@@ -952,9 +1050,35 @@ fn unpack_layer(blob: &Path, media_type: &str, rootfs: &Path) -> Result<()> {
     unpack_layer_capped(blob, media_type, rootfs, &mut Budget::IMAGE.clone())
 }
 
+#[cfg(test)]
 fn unpack_layer_capped(blob: &Path, media_type: &str, rootfs: &Path, budget: &mut Budget) -> Result<()> {
     let file = File::open(blob).ctx(format!("opening {}", blob.display()))?;
-    let reader: Box<dyn Read> = match media_type.rsplit(['+', '.']).next() {
+    unpack_layer_from(file, media_type, rootfs, budget)
+}
+
+/// What unpacks an image, as [`ImageStore::pull_with`] is given it: done when the image is in the store.
+pub type Unpacking = std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
+
+/// A layer as the root part is given it: its digest, its media type and the file it is in.
+pub struct Layer {
+    pub digest: String,
+    pub media_type: String,
+    pub file: File,
+}
+
+/// A reader that hashes what it reads.
+struct Hashed<R>(R, ring::digest::Context);
+
+impl<R: Read> Read for Hashed<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.read(buf)?;
+        self.1.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+fn unpack_layer_from<'a>(file: impl Read + 'a, media_type: &str, rootfs: &Path, budget: &mut Budget) -> Result<()> {
+    let reader: Box<dyn Read + 'a> = match media_type.rsplit(['+', '.']).next() {
         Some("gzip") => Box::new(flate2::read::GzDecoder::new(std::io::BufReader::new(file))),
         Some("tar") => Box::new(file),
         _ => {
