@@ -1341,6 +1341,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   the node seals again for whatever system the cluster then handed the key to. A node
   taken back to a kithd older than the `tpm-parent:` line loses that line, so its next
   seal trusts the bus once again. And all of it has run against a software TPM only.
+- **A virtual TPM trusts its host, and nothing here has run on a real TPM.** A node in a
+  VM whose TPM is swtpm, or a cloud's virtual TPM, is open to whoever runs the machine under
+  it: they read the VM's memory, where the state's key is while the state is open, and the
+  virtual TPM's own state, where every seal's secret is. The seal, the PIN and a passphrase
+  keep nothing from them. Every test of the TPM seal and the PIN ran against swtpm, in VMs on
+  disk files; none ran on a real TPM, a real security key or a real disk, which is why
+  `kith node pin` is refused without `--untried-tpm`. What each way leaves open, attacker by
+  attacker, is the table in docs/adr-unlock.md. **FIDO2 is not built:** a security key touched
+  at the console as a way into the state, and a second encrypted disk, are designed in
+  docs/adr-fido2.md and docs/adr-second-disk.md; kith has neither today.
 - **A node with a PIN** (`kith node pin NAME --untried-tpm`, off unless given; the line
   `tpm-pin:` of its lock record) opens its state with its TPM and a PIN of 6 to 32 digits
   typed at its console, and no longer by its TPM alone: its record holds a half of the key
