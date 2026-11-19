@@ -195,7 +195,9 @@ and a node can do, and no part of it needs a typed line at a console that is not
 
 The record's lines follow `passphrase:` (`Record::text`, `crypt.rs:387-437`; `parse_said`,
 `crypt.rs:326-385`): `fido2: <credential id hex> <salt hex> <wrapped key hex>`, one line a key.
-A line that cannot be read is dropped and said, never "damaged". An older kithd ignores
+A line that cannot be read is dropped and said, never "damaged"; a third line is dropped and said
+at read and refused at enrolment (`Record::with_fido2`, T-0971, with the order of writes `Record::order`
+and the read-back proof `fido2_proves`). An older kithd ignores
 the lines it does not know, and loses them when it writes the record again, since `text()` writes
 only what `Record` holds (an inference from `text()`; the downgrade is stated in section 8).
 
