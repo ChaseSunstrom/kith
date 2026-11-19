@@ -800,6 +800,232 @@ pub mod uhid {
     }
 }
 
+/// `/dev/hidraw*`: the client's side of the kernel's HID layer, for the VM test. The client of
+/// the console (a later slice) brings a device of its own; this one is the test's, so what the VM
+/// proves is the framing through uhid and hidraw, not that device's code.
+pub mod hidraw {
+    use crate::fido2::frame::{Device, REPORT};
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::{
+        fs::File,
+        io::{self, Read, Write},
+        os::fd::AsFd,
+        time::{Duration, Instant},
+    };
+
+    /// One read waits this long for a report (the bound `Device` asks of a hidraw device).
+    const READ: Duration = Duration::from_secs(1);
+
+    /// A hidraw node (or anything with its framing), read and written whole reports at a time.
+    pub struct Hidraw {
+        file: File,
+        deadline: Instant,
+    }
+
+    impl Hidraw {
+        pub fn new(file: File) -> Hidraw {
+            Hidraw {
+                file,
+                deadline: Instant::now(),
+            }
+        }
+
+        /// Reads give up (`TimedOut`) this long from now, for one exchange: a touch withheld is
+        /// a wait of keep-alives that would otherwise run to the client's count of them.
+        pub fn arm(&mut self, within: Duration) {
+            self.deadline = Instant::now() + within;
+        }
+    }
+
+    impl Device for Hidraw {
+        /// The report with the report id 0 of an unnumbered one in front, as hidraw takes it.
+        fn write(&mut self, report: &[u8; REPORT]) -> io::Result<()> {
+            let mut out = [0u8; REPORT + 1];
+            out[1..].copy_from_slice(report);
+            self.file.write_all(&out)
+        }
+
+        fn read(&mut self) -> io::Result<Vec<u8>> {
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            let wait = left.min(READ);
+            let mut fds = [PollFd::new(self.file.as_fd(), PollFlags::POLLIN)];
+            let ready =
+                poll(&mut fds, PollTimeout::try_from(wait).unwrap_or(PollTimeout::MAX)).map_err(io::Error::from)?;
+            if ready == 0 {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let mut buf = [0u8; REPORT];
+            match self.file.read(&mut buf)? {
+                0 => Err(io::ErrorKind::UnexpectedEof.into()),
+                n => Ok(buf[..n].to_vec()),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use nix::unistd::pipe;
+
+        #[test]
+        fn a_write_is_65_bytes_and_a_read_is_one_report_and_a_silence_times_out() {
+            let (r, w) = pipe().unwrap();
+            let mut dev = Hidraw::new(File::from(w));
+            dev.write(&[7; REPORT]).unwrap();
+            let mut seen = [0u8; 100];
+            let n = File::from(r).read(&mut seen).unwrap();
+            assert_eq!((n, seen[0], seen[1], seen[REPORT]), (REPORT + 1, 0, 7, 7));
+            // (a pipe's other end, as a node that answers)
+            let (r, w) = pipe().unwrap();
+            let mut dev = Hidraw::new(File::from(r));
+            dev.arm(Duration::from_millis(50));
+            assert_eq!(dev.read().unwrap_err().kind(), io::ErrorKind::TimedOut);
+            let mut w = File::from(w);
+            w.write_all(&[9; REPORT]).unwrap();
+            dev.arm(Duration::from_secs(5));
+            assert_eq!(dev.read().unwrap(), vec![9; REPORT]);
+            // past its deadline it does not wait at all
+            dev.arm(Duration::ZERO);
+            let t = Instant::now();
+            assert!(dev.read().is_err() && t.elapsed() < Duration::from_millis(500));
+        }
+    }
+}
+
+/// The VM test's own run (`ci/vm/fido2.sh`, T-0973): in a kithd started as the machine's first
+/// process with `fido2-test` among the kernel's bare words, three stand-ins are made on
+/// `/dev/uhid` one after another, and the client of `fido2.rs` runs against each through the
+/// kernel's hidraw node: makeCredential and getAssertion with a known salt, the secret printed
+/// beside the credential id, for the script to compute again outside Rust from the seed.
+/// Seeds 1 and 2 are touched at once. Seed 3 waits for a touch file: first withheld (the client
+/// must give up), then given. Every line starts `kithd: fido2-test: `; a failure says `FAIL`.
+#[cfg(feature = "fido2-test")]
+pub fn vm_test() -> ! {
+    use std::time::Duration;
+    let failed = vm_run().map_err(|e| eprintln!("kithd: fido2-test: FAIL: {e}")).is_err();
+    if !failed {
+        eprintln!("kithd: fido2-test: done");
+    }
+    // A machine that powers off, either way: the script reads what was said.
+    crate::init::POWER_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(100));
+    crate::init::end(false)
+}
+
+/// The salt every key is asked for: bytes 0 to 31 (the script rebuilds it).
+#[cfg(feature = "fido2-test")]
+const SALT: [u8; 32] = {
+    let mut s = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        s[i] = i as u8;
+        i += 1;
+    }
+    s
+};
+#[cfg(feature = "fido2-test")]
+const TOUCH: &str = "/run/fido2-touch";
+#[cfg(feature = "fido2-test")]
+const RP: &str = "kith.local";
+
+#[cfg(feature = "fido2-test")]
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(feature = "fido2-test")]
+fn hidraws() -> std::collections::BTreeSet<String> {
+    std::fs::read_dir("/dev")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("hidraw"))
+        .collect()
+}
+
+/// A stand-in with `seed` made on `/dev/uhid` (on a thread of its own, for as long as the machine
+/// runs) and the client's device on the hidraw node that appeared for it.
+#[cfg(feature = "fido2-test")]
+fn plug(seed: u8, touch: bool) -> Result<hidraw::Hidraw, String> {
+    use std::time::{Duration, Instant};
+    let before = hidraws();
+    std::thread::spawn(move || {
+        let mut key = auth::Key::new();
+        key.seed = seed;
+        key.touch = touch.then(|| TOUCH.into());
+        let e = uhid::run(&mut key, &format!("kith FIDO2 test key {seed}"));
+        eprintln!("kithd: fido2-test: key {seed} ended: {e:?}");
+    });
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(node) = hidraws().difference(&before).next() {
+            let path = format!("/dev/{node}");
+            eprintln!("kithd: fido2-test: key {seed} is {path}");
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|e| format!("opening {path}: {e}"))?;
+            return Ok(hidraw::Hidraw::new(file));
+        }
+        if Instant::now() > until {
+            return Err(format!(
+                "no hidraw node for key {seed} in 15 s (is /dev/uhid there? CONFIG_UHID, CONFIG_HIDRAW)"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// makeCredential, then getAssertion with `SALT`; prints `key N: credential ID secret S`.
+#[cfg(feature = "fido2-test")]
+fn enrol(seed: u8, dev: &mut hidraw::Hidraw, within: std::time::Duration, touched: bool) -> Result<(), String> {
+    use crate::fido2::{flow, frame};
+    let touch = |on: bool| {
+        if on {
+            let _ = std::fs::write(TOUCH, b"");
+        }
+    };
+    dev.arm(within);
+    let nonce = *b"kith-vm\0";
+    let cid = frame::init(dev, nonce)?.cid;
+    touch(touched);
+    let id = flow::make_credential(dev, cid, RP, &[])?;
+    dev.arm(within);
+    touch(touched);
+    let secret = flow::get_assertion(dev, cid, RP, &id, &SALT)?;
+    eprintln!(
+        "kithd: fido2-test: key {seed}: credential {} secret {}",
+        hex(&id),
+        hex(&secret[..])
+    );
+    Ok(())
+}
+
+#[cfg(feature = "fido2-test")]
+fn vm_run() -> Result<(), String> {
+    use std::time::Duration;
+    let long = Duration::from_secs(20);
+    for seed in [1, 2] {
+        let mut dev = plug(seed, false)?;
+        enrol(seed, &mut dev, long, false)?;
+    }
+    // Seed 3, its touch withheld: both calls must end in "no answer" within the bound.
+    let mut dev = plug(3, true)?;
+    let _ = std::fs::remove_file(TOUCH);
+    match enrol(3, &mut dev, Duration::from_secs(5), false) {
+        Err(e) if e.contains("no answer") || e.contains("timed out") => {
+            eprintln!("kithd: fido2-test: key 3: touch withheld: gave up: {e}");
+        }
+        Err(e) => return Err(format!("key 3 with no touch: another error: {e}")),
+        Ok(()) => return Err("key 3 answered with no touch".into()),
+    }
+    // ... and given (a new INIT drops the request that still waits).
+    enrol(3, &mut dev, long, true)?;
+    Ok(())
+}
+
 /// `kithd fido2-authenticator [--seed N] [--touch FILE]`: the stand-in as a process of its own,
 /// started by the VM test. Without `--touch` it answers at once; with it, an operation waits for
 /// the file to exist. Never returns when it is asked for.

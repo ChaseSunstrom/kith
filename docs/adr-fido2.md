@@ -5,7 +5,9 @@ CTAPHID framing, the CBOR subset) and its second half (T-0968: AES-256-CBC, ECDH
 `makeCredential` and `getAssertion`), all tested on a scripted key and never yet on a real one;
 and the software key of section 2's test build (T-0970: `crates/kithd/src/fido2_test.rs`, the
 cargo feature `fido2-test`, with its four release guards in `os/build.sh`, `ci/vm/tests.sh` and
-`ci/musl.sh`; its VM test is not yet built).
+`ci/musl.sh`; its VM test is `sh ci/vm.sh --test fido2`, `ci/vm/fido2.sh`, T-0973: the client
+against the stand-in through uhid and hidraw, the hmac-secret checked from the seed outside Rust,
+a withheld touch timed out).
 This record settles what [adr-unlock.md](adr-unlock.md)
 left as "FIDO2: deferred", item by item, so that the build can be cut into slices that each
 stand alone. Where the code differs from a line here, the code is the word. A decision here

@@ -400,6 +400,13 @@ fn main() -> ExitCode {
         }
     }
     let mut boot = kept.map(|(start, _)| init::early(start > 1));
+    // The VM test of the client against the stand-in (ci/vm/fido2.sh): `fido2-test` among the
+    // kernel's bare words, handed to the first process, in a fido2-test build alone. It ends in a
+    // power off.
+    #[cfg(feature = "fido2-test")]
+    if first && std::env::args().skip(1).any(|a| a == "fido2-test") {
+        fido2_test::vm_test();
+    }
     if let Some(source) = boot.as_mut().and_then(|boot| boot.install.take()) {
         installer(boot.expect("there is one"), source);
     }

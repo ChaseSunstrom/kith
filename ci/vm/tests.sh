@@ -78,6 +78,9 @@
     if [ "$test" = modules ]; then
         . "$root/ci/vm/modules.sh"
     fi
+    if [ "$test" = fido2 ]; then
+        . "$root/ci/vm/fido2.sh"
+    fi
 
     # (The disk is longer than the image written to it, as a real one is: 40 GB, of which
     # the file holds what is written. Past 32 GB an ext4 as small as the image's has used
