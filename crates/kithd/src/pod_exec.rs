@@ -17,9 +17,9 @@
 //! Not carried, said in that Status: a TTY, resize, attach to the main process, and a
 //! NodeWorkload's pod (its unit runs on the host, not in a container).
 //!
-//! ponytail: a process that reads no stdin while its client has gone is ended when it ends, not
-//! when the client leaves (kithd is writing its stdin, not reading the client); its kill is the
-//! process's own, not what it started in turn.
+//! A process whose client has gone is killed (`pump` ends it, and `hop` ends one whose upgrade
+//! fails), but not while kithd is blocked writing its stdin: that one ends when it does.
+//! ponytail: its kill is the process's own, not what it started in turn.
 
 use crate::Shared;
 use crate::access::Caller;

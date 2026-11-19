@@ -1018,6 +1018,14 @@ pub struct Entered {
     _awaited: Awaited,
 }
 
+/// A process nobody holds any more is ended: one whose handler was cancelled before it took the
+/// pipes would otherwise run on, outside every cap. (A no-op once `wait` has its status.)
+impl Drop for Entered {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 impl Entered {
     pub fn pid(&self) -> i32 {
         self.pid.as_raw()
@@ -1052,6 +1060,14 @@ impl Entered {
     }
 }
 
+/// The process of an init's spec: one without it has no user to enter as, and is refused rather
+/// than entered as root in `/`.
+fn init_process(spec: &oci_spec::runtime::Spec) -> std::result::Result<&oci_spec::runtime::Process, String> {
+    spec.process()
+        .as_ref()
+        .ok_or_else(|| "its spec has no process".to_string())
+}
+
 /// Run `argv` in the running container `id` of the runtime kept under `root` (the `root` of
 /// [`Runtime::new`]): in its pid, mount, net and other namespaces, as its init's user, with its
 /// capabilities and its seccomp filter, and in its cgroup. What it reads and writes is the pipes
@@ -1076,8 +1092,8 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
     // libcontainer's tenant takes no user, groups or working directory of its init's: left
     // unsaid they are root, no groups and `/`, so they are read from the init's spec and said.
     let made = oci_spec::runtime::Spec::load(container.bundle().join("config.json")).ctx(&what)?;
-    let process = made.process().as_ref();
-    let who = process.map(|process| process.user());
+    let process = init_process(&made).ctx(&what)?;
+    let who = process.user();
     let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
         .with_root_path(root.join("state"))
         .ctx(&what)?
@@ -1088,10 +1104,10 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
         .with_executor(Entry)
         .as_tenant()
         .with_container_args(argv.to_vec())
-        .with_user(who.map(|who| who.uid()))
-        .with_group(who.map(|who| who.gid()))
-        .with_additional_gids(who.and_then(|who| who.additional_gids().clone()).unwrap_or_default())
-        .with_cwd(process.map(|process| process.cwd().clone()));
+        .with_user(Some(who.uid()))
+        .with_group(Some(who.gid()))
+        .with_additional_gids(who.additional_gids().clone().unwrap_or_default())
+        .with_cwd(Some(process.cwd().clone()));
     // libcontainer's tenant joins every namespace of its init but the user one, so a process
     // without the rights over the container's other namespaces (a rootless kithd) is refused
     // the first of them. The helper that makes it joins the user namespace that owns the
@@ -3537,6 +3553,23 @@ mod tests {
         };
         let (tenant, init) = (mine("self"), mine("1"));
         let missing = run(&["/bin/nothing"], "").map(|_| ());
+        // One dropped unwaited is ended (zombie or gone: its parent here has not reaped it).
+        let dropped = enter(&state, "enter1", &["/bin/sleep".into(), "300".into()]).map(|entered| {
+            let pid = entered.pid();
+            drop(entered);
+            let ended = || match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+                Err(_) => true,
+            };
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ended() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            ended()
+        });
         let _ = handle.kill();
         // (A process that failed to start is left a zombie in the container's pid namespace, which
         // its init waits for before it ends: kithd's reaper takes it, here the test does.)
@@ -3554,12 +3587,25 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(echoed.unwrap(), ("hello".into(), "oops\n".into(), 7));
         assert!(missing.is_err(), "a program the image lacks");
+        assert!(
+            dropped.unwrap(),
+            "a process dropped with no one to wait for it is ended"
+        );
         assert_eq!(tenant, init, "the tenant has its init's user, capabilities and filter");
         assert!(
             init.iter().any(|l| l.starts_with("Seccomp:") && l.ends_with('2')),
             "{init:?}"
         );
         assert!(init.len() >= 9, "{init:?}");
+    }
+
+    /// An init whose spec has no process is refused: there is no user to enter as.
+    #[test]
+    fn enter_refuses_an_init_with_no_process_in_its_spec() {
+        let mut spec = oci_spec::runtime::Spec::default();
+        assert!(init_process(&spec).is_ok());
+        spec.set_process(None);
+        assert_eq!(init_process(&spec).unwrap_err(), "its spec has no process");
     }
 
     /// A process entered into a container whose unit has a user and a working directory runs as
