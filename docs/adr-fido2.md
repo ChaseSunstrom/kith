@@ -201,7 +201,9 @@ and a node can do, and no part of it needs a typed line at a console that is not
 
 The record's lines follow `passphrase:` (`Record::text`, `crypt.rs:387-437`; `parse_said`,
 `crypt.rs:326-385`): `fido2: <credential id hex> <salt hex> <wrapped key hex>`, one line a key.
-A line that cannot be read is dropped and said, never "damaged". An older kithd ignores
+A line that cannot be read is dropped and said, never "damaged"; a third line is dropped and said
+at read and refused at enrolment (`Record::with_fido2`, T-0971, with the order of writes `Record::order`
+and the read-back proof `fido2_proves`). An older kithd ignores
 the lines it does not know, and loses them when it writes the record again, since `text()` writes
 only what `Record` holds (an inference from `text()`; the downgrade is stated in section 8).
 
@@ -305,6 +307,12 @@ record, so only T-0956 can open a state by touch and measure the size of what is
   `fido2:` lines it does not know. adr-unlock's rule for passphrase lines is the same; a
   guard is for the slice that writes them (the node refuses an OS slot older than the one that
   wrote them, if `os.rs` has the means).
+- **`remove` does not rotate the state's key.** It takes both `fido2:` lines off the record, but
+  the state's key under them is the same one: an old copy of the config partition (a backup, a
+  disk image, a replaced disk) together with the lost key still opens the state. A key lost is
+  to be treated as that, until the state's key is changed (a rekey, which no verb of this
+  record does). The cluster's lock or forget does drop the lines of the node it reaches
+  (`ways_left`, T-0971), but not a copy of the partition taken before.
 - **Swapping one of two keys**, and more than two keys enrolled at once (the record's room
   allows two lines, section 4).
 - **A hardware token the kernel does not give a hidraw** (a Bluetooth or NFC key): out of scope.
