@@ -274,6 +274,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    of a namespace the Exit does not list is refused; and in what
                    the node's two cards carried, no packet of the pod's but the
                    tunnel's own. Needs what --test pods needs, and ip and wg
+  --selftest-kill  instead: start this script with a stand-in for QEMU, kill its shell from
+                   outside (SIGKILL, then SIGTERM) and expect no QEMU left and the VM lock
+                   free; needs no QEMU, KVM or kernel
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
