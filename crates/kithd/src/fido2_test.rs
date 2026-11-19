@@ -144,7 +144,10 @@ pub mod auth {
             out
         }
 
-        /// The id of the `n`th credential: its number and a proof it is this key's.
+        /// The id of the `n`th credential: its number and a proof it is this key's. Stateless on
+        /// purpose: a key restarted with the same seed counts from 0 again and makes the same ids
+        /// (and so the same secrets) as before; that is what lets it know its credentials after
+        /// a restart, and a test double has no use for an id that differs.
         fn make_id(&self, n: u64) -> Vec<u8> {
             let mut id = vec![0u8; 16];
             id[8..].copy_from_slice(&n.to_be_bytes());
@@ -472,7 +475,8 @@ pub mod auth {
 
         /// The seed derivation against numbers computed outside Rust (Python's hmac): the
         /// credential's secret is HMAC(seed bytes, id) and the answer HMAC(that, salt); and the
-        /// first credential's id is its number and the first 16 bytes of HMAC(seed bytes, number).
+        /// first credential's id is 16 bytes (8 zero bytes, its number) and the first 16 bytes of
+        /// HMAC(seed bytes, those 16 bytes).
         #[test]
         fn the_secret_is_the_hmac_of_the_salt_under_the_credentials_hmac() {
             let key = Key::new(); // seed 1: thirty-two bytes of 0x01

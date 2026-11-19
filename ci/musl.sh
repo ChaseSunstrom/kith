@@ -57,13 +57,14 @@ cargo build --release --quiet --target "$target" -p kithd -p kith-cli >&2
 # Whatever the environment held, this kithd is the one that ships: it has no forge route. (Not
 # "/v1/forge" alone: it is the start of "/v1/forget", which kithd has; the startup line of a
 # forge build is the other thing only that build has.)
+[ -f "$out/kithd" ] || { echo "musl.sh: no $out/kithd to check" >&2; exit 1; }
 if grep -aqE '/v1/forge([^t]|$)|built with forge: ' "$out/kithd"; then
     echo "musl.sh: $out/kithd has the forge route in it: a build that ships has none" >&2
     exit 1
 fi
-# And no software security key: the startup line and the subcommand of a fido2-test build are
-# in nothing else (fido2_test.rs).
-if grep -aqE 'built with fido2-test: |fido2-authenticator' "$out/kithd"; then
+# And no software security key: the startup line of a fido2-test build (which names its
+# subcommand) is in nothing else (fido2_test.rs).
+if grep -aq 'built with fido2-test: ' "$out/kithd"; then
     echo "musl.sh: $out/kithd has the fido2-test authenticator in it: a build that ships has none" >&2
     exit 1
 fi

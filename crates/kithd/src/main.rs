@@ -373,7 +373,7 @@ fn main() -> ExitCode {
         &mut std::io::stderr(),
         b"kithd: built with forge: POST /v1/forge appends unchecked entries; never ship this\n",
     );
-    // The same for the software security key (ci/vm/fido2.sh looks for the line); started as
+    // The same for the software security key (the VM test, T-0955, looks for the line); started as
     // `kithd fido2-authenticator` it then answers on /dev/uhid and never returns.
     #[cfg(feature = "fido2-test")]
     {
