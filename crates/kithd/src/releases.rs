@@ -355,6 +355,8 @@ pub const RENDER: &str = "--kith-render";
 /// time it takes, and how much it answers.
 const RENDER_MEMORY: u64 = 256 << 20;
 const RENDER_CPU: u64 = 20;
+/// The files a render may hold open.
+const RENDER_FILES: u64 = 256;
 const RENDER_TIME: Duration = Duration::from_secs(30);
 const RENDER_ANSWER: u64 = 32 << 20;
 
@@ -371,6 +373,8 @@ pub fn render_shim() {
         (Resource::RLIMIT_AS, RENDER_MEMORY),
         (Resource::RLIMIT_CPU, RENDER_CPU),
         (Resource::RLIMIT_CORE, 0),
+        // (Not the raised 65536 kithd runs with, [`crate::raise_nofile`].)
+        (Resource::RLIMIT_NOFILE, RENDER_FILES),
     ];
     if held
         .into_iter()
