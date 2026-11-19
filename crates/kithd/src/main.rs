@@ -26,6 +26,11 @@ mod dhcp;
 mod dns;
 mod encrypted;
 mod exits;
+#[allow(
+    dead_code,
+    reason = "the CTAP2 client's wire half (T-0966): nothing calls it until the record slice (docs/adr-fido2.md section 6); its tests run"
+)]
+mod fido2;
 mod files;
 #[cfg(feature = "forge")]
 mod forge;
