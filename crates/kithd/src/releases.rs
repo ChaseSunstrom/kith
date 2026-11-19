@@ -586,48 +586,61 @@ fn fetched(store: &Store, release: &Resource, package: &Resource) -> bool {
     origin.is_some() && package.metadata.annotations.get(REPOSITORY) == origin.as_ref()
 }
 
-/// What an upgrade of `release` is rendered from: it does not follow, has something
-/// installed, and a newer Package fits. None for any other.
-fn newer<'a>(store: &'a Store, release: &Resource) -> Option<(Inputs, &'a Resource, Vec<Value>)> {
-    let installed = release.status.as_ref()?["version"].as_str()?;
-    if release.spec["autoUpgrade"] == true {
-        return None;
-    }
-    let found = inputs(store, release, true).ok()?;
-    (found.1.spec["version"] != installed).then_some(found)
+/// What the upgrade of each Release is rendered from, by its key: those that do not follow,
+/// have something installed, and have a newer Package that fits. Worked out once a pass (it
+/// reads the store, under its lock) and handed to [`prune`], [`upgrading`] and [`plan`].
+type Newer<'a> = BTreeMap<String, (Inputs, &'a Resource, Vec<Value>)>;
+
+fn newers(store: &Store) -> Newer<'_> {
+    let upgrade = |release: &Resource| {
+        let installed = release.status.as_ref()?["version"].as_str()?;
+        if release.spec["autoUpgrade"] == true {
+            return None;
+        }
+        let found = inputs(store, release, true).ok()?;
+        (found.1.spec["version"] != installed).then(|| (release.key(), found))
+    };
+    store.list(Some("Release")).filter_map(upgrade).collect()
 }
 
 /// Drop the renders of what is gone, and the upgrade of each Release that has none to preview.
-fn prune(store: &Store, renders: &mut Renders, upgrades: &mut Renders) {
+fn prune(store: &Store, renders: &mut Renders, upgrades: &mut Renders, newer: &Newer) {
     renders.retain(|key, _| store.get(key).is_some());
-    upgrades.retain(|key, _| store.get(key).is_some_and(|release| newer(store, release).is_some()));
+    upgrades.retain(|key, _| newer.contains_key(key));
 }
 
 /// The Releases whose render is missing or out of date.
 fn pending(store: &Store, renders: &Renders) -> Vec<(String, Inputs, Job)> {
-    jobs(store, renders, false)
+    jobs(store, renders, None)
 }
 
-/// The Releases whose upgrade has no render, or one out of date ([`newer`]).
-fn upgrading(store: &Store, upgrades: &Renders) -> Vec<(String, Inputs, Job)> {
-    jobs(store, upgrades, true)
+/// The Releases whose upgrade has no render, or one out of date ([`Newer`]).
+fn upgrading(store: &Store, upgrades: &Renders, newer: &Newer) -> Vec<(String, Inputs, Job)> {
+    jobs(store, upgrades, Some(newer))
 }
 
-fn jobs(store: &Store, renders: &Renders, upgrade: bool) -> Vec<(String, Inputs, Job)> {
+fn jobs(store: &Store, renders: &Renders, upgrade: Option<&Newer>) -> Vec<(String, Inputs, Job)> {
     let mut jobs = Vec::new();
     for release in store.list(Some("Release")) {
-        // (One that cannot be started says why in `plan`.)
-        let Some((inputs, package, layers)) = (if upgrade {
-            newer(store, release)
-        } else {
-            inputs(store, release, false).ok()
-        }) else {
-            continue;
-        };
         let key = release.key();
+        // (One that cannot be started says why in `plan`.)
+        let built;
+        let (inputs, package, layers) = match upgrade {
+            Some(newer) => match newer.get(&key) {
+                Some(found) => found,
+                None => continue,
+            },
+            None => match inputs(store, release, false) {
+                Ok(found) => {
+                    built = found;
+                    &built
+                }
+                Err(_) => continue,
+            },
+        };
         if renders
             .get(&key)
-            .is_some_and(|(had, _)| fresh(store, release, had, &inputs))
+            .is_some_and(|(had, _)| fresh(store, release, had, inputs))
         {
             continue;
         }
@@ -640,7 +653,7 @@ fn jobs(store: &Store, renders: &Renders, upgrade: bool) -> Vec<(String, Inputs,
         let (live, stamps, rights) = live(store, release, package, &files);
         let job = Job {
             files,
-            layers,
+            layers: layers.clone(),
             name: release.metadata.name.clone(),
             namespace: namespace(release),
             owner: key.clone(),
@@ -652,7 +665,7 @@ fn jobs(store: &Store, renders: &Renders, upgrade: bool) -> Vec<(String, Inputs,
             Inputs {
                 looked: stamps,
                 rights,
-                ..inputs
+                ..inputs.clone()
             },
             job,
         ));
@@ -717,12 +730,18 @@ fn same(live: &Resource, wanted: &Resource) -> bool {
 /// `installed` and that render make: the keys to apply (new or changed) and to delete. Taken
 /// from the two renders, not the store, so a hand edit or another Release's churn does not
 /// move it. Null when there is no newer Package; None when its render is not made yet.
-fn upgrade_of<'a>(store: &Store, release: &Resource, installed: &'a Output, upgrades: &'a Renders) -> Option<Value> {
-    let Some((now, package, _)) = newer(store, release) else {
+fn upgrade_of<'a>(
+    store: &Store,
+    release: &Resource,
+    installed: &'a Output,
+    upgrades: &'a Renders,
+    newer: &Newer,
+) -> Option<Value> {
+    let Some((now, package, _)) = newer.get(&release.key()) else {
         return Some(Value::Null);
     };
     let (had, rendered) = upgrades.get(&release.key())?;
-    if !fresh(store, release, had, &now) {
+    if !fresh(store, release, had, now) {
         return None;
     }
     let version = &package.spec["version"];
@@ -810,7 +829,7 @@ pub fn reconcile(
 
 /// What the store needs done for its Releases, given the renders there are and the upgrades
 /// previewed; `now` (unix seconds) is when a version newly installed is written down.
-fn plan(store: &Store, renders: &Renders, upgrades: &Renders, now: u64) -> Plan {
+fn plan(store: &Store, renders: &Renders, upgrades: &Renders, newer: &Newer, now: u64) -> Plan {
     let mut plan = Plan::default();
     for release in store.list(Some("Release")) {
         let key = release.key();
@@ -855,7 +874,7 @@ fn plan(store: &Store, renders: &Renders, upgrades: &Renders, now: u64) -> Plan 
                     "resources": done.kept, "notes": output.notes, "observedRevision": release.metadata.revision,
                 });
                 // (Left out when not known yet or unchanged: the status is written when a field differs.)
-                if let Some(pending) = upgrade_of(store, release, &output, upgrades) {
+                if let Some(pending) = upgrade_of(store, release, &output, upgrades, newer) {
                     status["pending"] = pending;
                 }
                 if let Some(history) = history_of(release, &output.version, now) {
@@ -967,6 +986,16 @@ fn failed(why: &str, revision: Option<u64>) -> Value {
     json!({ "state": "error", "message": why, "observedRevision": revision })
 }
 
+/// Plan from the store as it is now, and carry the plan out.
+async fn carry_out_plan(shared: &Shared, renders: &Renders, upgrades: &Renders) {
+    let plan = {
+        let state = shared.store.lock().expect("nothing panics holding the store");
+        let newer = newers(&state.store);
+        plan(&state.store, renders, upgrades, &newer, kith_api::store::now())
+    };
+    carry_out(shared, plan.steps, plan.orphans).await;
+}
+
 /// Install the Releases, as long as this node leads the store, until told to stop.
 pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     let (mut renders, mut upgrades) = (Renders::new(), Renders::new());
@@ -974,10 +1003,10 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     loop {
         let metrics = shared.raft.metrics().borrow().clone();
         if metrics.current_leader == Some(metrics.id) {
-            let (jobs, previews) = {
+            let jobs = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
-                prune(&state.store, &mut renders, &mut upgrades);
-                (pending(&state.store, &renders), upgrading(&state.store, &upgrades))
+                renders.retain(|key, _| state.store.get(key).is_some());
+                pending(&state.store, &renders)
             };
             // (Each in a kithd of its own, one at a time: a package is someone else's code, and
             // what it grows to, a panic or a stack it overflows ends only that one.)
@@ -985,15 +1014,23 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 let rendered = apart(&job).await;
                 renders.insert(key, learned(inputs, rendered));
             }
+            carry_out_plan(&shared, &renders, &upgrades).await;
+            // The previews come after what installs: a package that spins delays only what
+            // it says about itself. When one is made, what it says is written now.
+            let previews = {
+                let state = shared.store.lock().expect("nothing panics holding the store");
+                let newer = newers(&state.store);
+                prune(&state.store, &mut renders, &mut upgrades, &newer);
+                upgrading(&state.store, &upgrades, &newer)
+            };
+            let made = !previews.is_empty();
             for (key, inputs, job) in previews {
                 let rendered = apart(&job).await;
                 upgrades.insert(key, learned(inputs, rendered));
             }
-            let plan = {
-                let state = shared.store.lock().expect("nothing panics holding the store");
-                plan(&state.store, &renders, &upgrades, kith_api::store::now())
-            };
-            carry_out(&shared, plan.steps, plan.orphans).await;
+            if made {
+                carry_out_plan(&shared, &renders, &upgrades).await;
+            }
         }
         tokio::select! {
             _ = generation.changed() => {}
@@ -1171,14 +1208,15 @@ mod tests {
     /// `settle`, with the upgrades kept between calls and the clock at `now`.
     fn settle_at(store: &mut Store, renders: &mut Renders, upgrades: &mut Renders, now: u64) -> usize {
         for turn in 0..10 {
-            prune(store, renders, upgrades);
+            let newer = newers(store);
+            prune(store, renders, upgrades, &newer);
             for (key, inputs, job) in pending(store, renders) {
                 renders.insert(key, learned(inputs, render(&job)));
             }
-            for (key, inputs, job) in upgrading(store, upgrades) {
+            for (key, inputs, job) in upgrading(store, upgrades, &newer) {
                 upgrades.insert(key, learned(inputs, render(&job)));
             }
-            let plan = plan(store, renders, upgrades, now);
+            let plan = plan(store, renders, upgrades, &newer, now);
             if plan == Plan::default() {
                 return turn;
             }
@@ -1568,7 +1606,6 @@ mod tests {
         );
     }
 
-    /// The Identity bob, who may apply and delete `kinds` (a YAML list's insides) in shop.
     const SELF: &str = "Release/shop/mine";
 
     fn status_of(store: &Store) -> Value {
@@ -1610,9 +1647,28 @@ mod tests {
         assert_eq!(settle_at(&mut store, &mut renders, &mut upgrades, 30), 0);
 
         // A hand edit to a live resource is not what an upgrade changes.
-        let mut live = store.get("ConfigMap/shop/mine-maps").unwrap().clone();
+        // (`-extra` is the same in 1.5.0; planned, not carried out, so the edit is live
+        // in the store when `pending` is worked out, and not yet healed.)
+        let mut live = store.get("ConfigMap/shop/mine-maps-extra").unwrap().clone();
         live.spec["data"]["colour"] = json!("blue");
         store.apply(live).unwrap();
+        let newer = newers(&store);
+        let plan = plan(&store, &renders, &upgrades, &newer, 40);
+        let step = plan.steps.iter().find(|step| step.release == SELF).unwrap();
+        let healed: Vec<String> = step.apply.iter().map(|resource| resource.key()).collect();
+        assert_eq!(
+            healed,
+            ["ConfigMap/shop/mine-maps-extra"],
+            "the edit is live, and would be put back"
+        );
+        assert!(
+            step.status
+                .as_ref()
+                .is_none_or(|fields| !fields.contains_key("pending")),
+            "the edit moved pending: {:?}",
+            step.status
+        );
+        assert_eq!(pending(&store), expected);
         settle_at(&mut store, &mut renders, &mut upgrades, 40);
         assert_eq!(pending(&store), expected);
 
@@ -1718,6 +1774,7 @@ mod tests {
         );
     }
 
+    /// The Identity bob, who may apply and delete `kinds` (a YAML list's insides) in shop.
     fn bob(store: &mut Store, kinds: &str) {
         apply(
             store,
