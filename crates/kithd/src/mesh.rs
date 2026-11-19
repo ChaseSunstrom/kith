@@ -440,17 +440,6 @@ fn fresh(nexts: BTreeMap<String, Key>, seen: &mut BTreeMap<String, Instant>, now
         .collect()
 }
 
-/// Whether a node named before `me` that `reached` has a rotation asked and not done or given up:
-/// two that make their new keys together have none to call each other by, so the lower goes first.
-fn asks_before(store: &Store, me: &str, reached: impl Fn(&str) -> bool) -> bool {
-    store.list(Some("Node")).any(|node| {
-        let name = node.metadata.name.as_str();
-        let asked = node.spec["mesh"]["rotate"].as_str().filter(|id| rotate_name(id));
-        let said = |field: &str| node.status.as_ref().and_then(|status| status["mesh"][field].as_str());
-        name < me && reached(name) && asked.is_some_and(|id| said("rotated") != Some(id) && said("failed") != Some(id))
-    })
-}
-
 /// The peers with the keys they are to take: each member that has a `next` has it as a peer
 /// too, which answers its handshakes and has no addresses (so what it sends is not taken as
 /// anyone's) until it has shaken hands: then it is the member's peer, and the old key is not.
@@ -594,15 +583,13 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
             let services = crate::services::addresses(&state.store, prefix);
             let home = home_endpoint(&state.store, me, &members, &shook);
-            let reached = |name: &str| members.iter().any(|m| m.name == name && shook_lately(&shook, &m.key));
-            let earlier = asks_before(&state.store, me, reached);
-            let turns = (spec.filter(|id| rotated.as_ref() != Some(id)), took, nexts, earlier);
+            let turns = (spec.filter(|id| rotated.as_ref() != Some(id)), took, nexts);
             (members, mine, said, edge, services.into_values().collect(), home, turns)
         };
-        let (asking, took, nexts, earlier) = turns;
-        // The key replacement goes a step on (the next pass, at once, says it). It waits for a node
-        // that has its own to make (the lower name first) and one that is under way.
-        let waiting = !nexts.is_empty() || earlier;
+        let (asking, took, nexts) = turns;
+        // The key replacement goes a step on (the next pass, at once, says it). It waits while another
+        // node's is under way (it says a `next`), for `ROTATE_WAIT` of it at most.
+        let waiting = !nexts.is_empty();
         let shook_by_name: BTreeMap<String, Duration> = members
             .iter()
             .filter(|member| member.name != me)
@@ -1249,35 +1236,34 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Nodes asked to rotate at once go one at a time, the lowest name first: a node waits while
-    /// an earlier one that is reached still has its rotation to do (not done, not given up).
+    /// What holds this node's rotation back is a `next` another node says, and for `ROTATE_WAIT`
+    /// at most: a node that is asked to rotate (a lower name, say) and has not started says none,
+    /// and one whose `next` is older than that is not waited for.
     #[test]
-    fn the_lowest_named_node_rotates_first() {
+    fn a_node_that_has_not_started_or_never_finishes_holds_no_one_back() {
         let mut store = Store::default();
-        for name in ["a", "b", "c"] {
+        for name in ["a", "b"] {
             let source = format!(
                 "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{ mesh: {{ rotate: r1 }} }}\n"
             );
             let resource = kith_api::Resource::from_source(&source).unwrap().remove(0);
             store.apply(resource.unwrap()).unwrap();
         }
-        let all = |_: &str| true;
-        assert!(!asks_before(&store, "a", all));
-        assert!(asks_before(&store, "b", all));
-        assert!(asks_before(&store, "c", all));
-        // An earlier node that is not reached (down) is not waited for.
-        assert!(!asks_before(&store, "b", |name: &str| name != "a"));
-        assert!(asks_before(&store, "c", |name: &str| name != "a"));
-        // Done or given up: the next goes.
+        let key = |byte: u8| hex(&[byte; 32]);
+        // a is asked to rotate and has said no `next`: no one waits for it.
         store
-            .set_status("Node/a", Some(json!({ "mesh": { "rotated": "r1" } })))
+            .set_status("Node/a", Some(json!({ "mesh": { "key": key(1) } })))
             .unwrap();
-        assert!(!asks_before(&store, "b", all));
-        assert!(asks_before(&store, "c", all));
+        let (mut seen, start) = (BTreeMap::new(), Instant::now());
+        assert!(fresh(nexts(&store, "z", &[9; 32]), &mut seen, start).is_empty());
+        // Once it says one, this node waits, until it is older than ROTATE_WAIT.
         store
-            .set_status("Node/b", Some(json!({ "mesh": { "failed": "r1" } })))
+            .set_status("Node/a", Some(json!({ "mesh": { "key": key(1), "next": key(2) } })))
             .unwrap();
-        assert!(!asks_before(&store, "c", all));
+        let mut said = |at| fresh(nexts(&store, "z", &[9; 32]), &mut seen, at);
+        assert_eq!(said(start).len(), 1);
+        assert_eq!(said(start + ROTATE_WAIT - Duration::from_secs(1)).len(), 1);
+        assert!(said(start + ROTATE_WAIT).is_empty());
     }
 
     /// A key is exactly 64 lower-case hex digits: one text per key, so that comparing the texts

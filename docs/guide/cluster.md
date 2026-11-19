@@ -127,9 +127,10 @@ lost, and the same name is not tried again, so rotate under a new name to try ag
 know:
 
 - One node rotates at a time in a cluster, and only with a peer reached; a node with none is
-  refused (it would have nothing to prove the new key with). Nodes asked together go in order of
-  name, the lowest first, each when the one before has said `rotated` or `failed` (a node that is
-  down is not waited for).
+  refused (it would have nothing to prove the new key with). A node waits while another's rotation
+  is under way (it says a `next`), two minutes at most. Name the rotation on one Node at a time:
+  two that start in the same moment can each switch with no key to call the other by, and both
+  revert after two minutes and say `failed` (no node is left without a key).
 - Every peer that is reached has to take the new key. One on an older kithd, which does not, makes
   the rotation revert after two minutes: update the cluster's kithd first. A peer that says a
   `next` and never finishes holds the others back for two minutes, no longer.
