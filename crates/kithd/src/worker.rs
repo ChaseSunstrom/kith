@@ -419,7 +419,9 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
     let units = said.remove("containers");
     let units: Vec<Value> = units.as_ref().and_then(Value::as_array).cloned().unwrap_or_default();
     // (`hostUsers`: whether a container keeps the node's users, which the node says of its own unit.)
-    const UNIT: [&str; 10] = [
+    // (`gen`: which generation of a replica it is, the second where a rolling update started it beside the old.)
+    const UNIT: [&str; 11] = [
+        "gen",
         "name",
         "replica",
         "state",
@@ -1195,6 +1197,16 @@ spec: { volume: there, every: 1d }
         let said = json!({ "containers": [unit(0, json!({ "hostUsers": false }))] });
         let taken = reported(try_as(&store, "w", report_of("w", "Workload/default/web", said)).unwrap()).unwrap();
         assert_eq!(taken["containers"], json!([unit(0, json!({ "hostUsers": false }))]));
+    }
+
+    /// Which generation of a replica a unit is (`gen`: the one a rolling update started beside the
+    /// old) is the node's to say of its own unit.
+    #[test]
+    fn a_unit_says_which_generation_of_its_replica_it_is() {
+        let store = store();
+        let said = json!({ "containers": [unit(0, json!({ "gen": 1 }))] });
+        let taken = reported(try_as(&store, "w", report_of("w", "Workload/default/web", said)).unwrap()).unwrap();
+        assert_eq!(taken["containers"], json!([unit(0, json!({ "gen": 1 }))]));
     }
 
     #[test]
