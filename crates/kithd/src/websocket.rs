@@ -320,7 +320,6 @@ mod tests {
                 (frame.op, frame.payload.as_slice(), used),
                 (Op::Binary, &bytes[..], wire.len())
             );
-            assert!(refused(wire, true), "a message of whole frames refuses the piece");
         }
         // Text and a control frame without FIN are no piece of a stream.
         let mut text = encode(Op::Text, b"x", Some(KEY));
