@@ -291,6 +291,7 @@ pub fn may_answer(local: SocketAddr, mesh: Ipv6Addr) -> bool {
     }
 }
 
+#[cfg(test)]
 pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::Result<TlsListener> {
     listen_on(tcp, config, None)
 }
