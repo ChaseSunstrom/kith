@@ -438,6 +438,36 @@ fn sweep_until(replica: &Path, halted: &dyn Fn() -> bool) {
     }
 }
 
+/// One pod counted: held, what its project holds is read, and a project that cannot be read is
+/// counted; else its `roots` are walked, and the processes of its `cgroups` for the files they
+/// keep open after deleting them, each within `SPELL`. It removes nothing: a scratch set aside
+/// is the sweep's (`sweep`, a job of its own), so a huge one holds no pod's count.
+pub fn measure(mut pod: Pod, roots: &[PathBuf], cgroups: &[PathBuf], state: &Path, stop: &AtomicBool) -> Pod {
+    let usage = pod.held.then(|| Projects::usage(state, &pod.id)).flatten();
+    pod.held = usage.is_some();
+    if let Some((bytes, files, most)) = usage {
+        (pod.bytes, pod.files, pod.most) = (bytes, files, most);
+        return pod;
+    }
+    let until = Until {
+        at: Instant::now() + SPELL,
+        stop,
+    };
+    let limit = pod.limit.unwrap_or(u64::MAX);
+    (pod.bytes, pod.finished) = count(roots, limit, until);
+    if pod.finished && pod.bytes <= limit {
+        let mut pids = Vec::new();
+        for cgroup in cgroups {
+            let (more, all) = self::pids(cgroup, until);
+            pids.extend(more);
+            pod.finished &= all;
+        }
+        let (held, finished) = unlinked(&pids, roots, until);
+        (pod.bytes, pod.finished) = (pod.bytes.saturating_add(held), pod.finished && finished);
+    }
+    pod
+}
+
 /// How many steps of a removal (an entry looked at) pass between two looks at the stop.
 const BATCH: usize = 1024;
 
@@ -1684,5 +1714,29 @@ pub(crate) mod tests {
         sweep_until(&replica, &|| false);
         assert_eq!(std::fs::read_dir(&replica).unwrap().count(), 0);
         std::fs::remove_dir_all(replica).unwrap();
+    }
+
+    /// A pod's count reads its scratch and leaves a `scratch.N` beside it for the sweep job: one
+    /// huge removal does not hold the count, or the clock it starts.
+    #[test]
+    fn storage_count_leaves_a_scratch_set_aside_to_the_sweep_and_counts_what_is_live() {
+        let state = dir("count-leaves");
+        let replica = state.join(crate::files::REPLICAS).join("p");
+        let (live, aside) = (replica.join("scratch"), replica.join("scratch.1"));
+        for d in [&live, &aside] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("f"), vec![1u8; 1 << 20]).unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let counted = measure(pod("p", None, 0), std::slice::from_ref(&live), &[], &state, &stop);
+        assert!(
+            counted.finished && counted.bytes >= 1 << 20 && counted.bytes < 2 << 20,
+            "{}",
+            counted.bytes
+        );
+        assert!(aside.join("f").exists(), "the count swept");
+        sweep(&replica, &stop);
+        assert!(!aside.exists() && live.join("f").exists());
+        std::fs::remove_dir_all(state).unwrap();
     }
 }
