@@ -347,12 +347,12 @@ skip() { echo "skipped: $1"; exit 0; }
 # failing that, with that one record taken out (and its newline) and nothing else.
 said_in() {
     grep -aq "$2" "$1" 2>/dev/null && return 0
-    sed -z -E 's/\[ *[0-9]+\.[0-9]+\] [^ ()]+ \([0-9]+\) used greatest stack depth: [0-9]+ bytes left\n//g' "$1" 2>/dev/null | grep -aq "$2"
+    sed -z -E 's/\[ *[0-9]+\.[0-9]+\] [^ ()]+ \([0-9]+\) used greatest stack depth: [0-9]+ bytes left\n//g' "$1" | grep -aq "$2"
 }
 
 # --selftest-said: said_in on fixture logs. A kernel stack-depth record can land in the middle of a
 # line the guest writes; the line then reads as two. The match must hold for that, and must fail when
-# the line is absent. Needs nothing but sh and grep.
+# the line is absent. Needs sh, grep, sed and mktemp.
 if [ "$selftest" = said ]; then
     st=$(mktemp -d)
     rec='[    3.141592] cryptomgr_probe (83) used greatest stack depth: 15568 bytes left'
