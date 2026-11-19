@@ -525,10 +525,10 @@ KITH_VM_RUN=$$.$(date +%s%N); export KITH_VM_RUN
 reap='for sig in TERM KILL; do pids=; for f in $(grep -lzx "KITH_VM_RUN=$1" /proc/[0-9]*/environ 2>/dev/null); do p=${f#/proc/}; pids="$pids ${p%/environ}"; done; [ -z "$pids" ] || { kill -$sig $pids 2>/dev/null; sleep 1; }; done; true'
 setsid=''; ! command -v setsid >/dev/null 2>&1 || setsid=setsid
 env -u KITH_VM_RUN $setsid sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 1; done; exec sh -c "$2" sh "$3"' sh $$ "$reap" "$KITH_VM_RUN" </dev/null >/dev/null 2>&1 8>&- &
-trap 'kill $vms $web 2>/dev/null || true; env -u KITH_VM_RUN sh -c "$reap" sh "$KITH_VM_RUN"; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
+trap 'st=$?; kill $vms $web 2>/dev/null || true; env -u KITH_VM_RUN sh -c "$reap" sh "$KITH_VM_RUN"; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$work"/wg "$work"/wg.err "$work"/arp "$work"/arp.err "$KITH_VM_LOGS"/ 2>/dev/null || true; if [ "$st" -ne 0 ] && [ -n "${KITH_VM_LOGS:-}" ] && [ ! -e "$KITH_VM_LOGS/fail" ]; then echo "vm.sh: FAIL: exit $st without a fail file: a failure that did not go through fail(), see the log" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; fi; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
 trap 'exit 1' INT TERM
 said() { said_in "$work/log" "$1"; }
-fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
+fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; [ -z "${KITH_VM_LOGS:-}" ] || echo "vm.sh: FAIL: $1" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; exit 1; }
 
 if [ -n "$test" ] && [ "$test" != init ]; then
     . "$root/ci/vm/tests.sh"

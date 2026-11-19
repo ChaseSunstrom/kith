@@ -19,8 +19,9 @@ A TEXT that starts with `hex:` is sent as those bytes, and what comes back is pr
 "SECONDS-SINCE-START announce MAC" for each announcement of ADDRESS that goes by.
 
 `handshakes`: sends nothing. It prints "EPOCH SRC DST" for each WireGuard handshake answer
-(a UDP datagram from port 51820 to port 51820 whose body is type 2) that goes by from ADDRESS
-for SECONDS: the LAN carries every frame to this machine too. EPOCH is time.time().
+(a UDP datagram from port 51820 to port 51820 whose body is type 2) to ADDRESS for SECONDS, from
+whatever address it came from (SRC is the answer's source, not ADDRESS): the LAN carries every
+frame to this machine too. EPOCH is time.time().
 
 `syn` (in place of TEXT): sends a SYN from 10.9.0.77 to ADDRESS:PORT at MAC, once a second for
 five seconds. Prints "syn-ack" and exits 0 when ADDRESS:PORT answers it; exit 1 otherwise.
@@ -125,7 +126,7 @@ def handshakes(seconds):
         except TimeoutError:
             continue
         kind, rest = frame[12:14], frame[14:]
-        if kind != b"\x08\x00" or len(rest) < 20 or rest[9] != 17 or rest[12:16] != node:
+        if kind != b"\x08\x00" or len(rest) < 20 or rest[9] != 17 or rest[16:20] != node:
             continue
         header = (rest[0] & 15) * 4
         if len(rest) < header + 9:

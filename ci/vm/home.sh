@@ -16,9 +16,9 @@
             began=$(now)
             python3 -I "$root/ci/lan_probe.py" "$((port + 8))" arp "$house" 900 >"$work/arp" 2>"$work/arp.err" &
             vms="$vms $!"
-            # Who answers a WireGuard handshake sent to the house address: "EPOCH SRC DST" (EPOCH from
-            # date, as $(now) is; SRC is the address the reply came from).
-            python3 -I "$root/ci/lan_probe.py" "$((port + 8))" handshakes "$house" 900 >"$work/wg" 2>"$work/wg.err" &
+            # Every WireGuard handshake answer to n4's address (10.9.0.4), from whatever address
+            # it came from: "EPOCH SRC DST" (EPOCH from date, as $(now) is; SRC is the reply's source).
+            python3 -I "$root/ci/lan_probe.py" "$((port + 8))" handshakes 10.9.0.4 900 >"$work/wg" 2>"$work/wg.err" &
             vms="$vms $!"
             # The one MAC that has answered for the last three seconds, once one has.
             steady() { # SECONDS to wait, WHAT
