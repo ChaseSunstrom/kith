@@ -267,13 +267,15 @@ kith() { # the wait for a lost node, or nothing
         sh "$root/os/build.sh" >&2 || skip "this machine cannot build kith OS's image"
     fi
     more=${1:+--lost-after $1}
+    # (Its nodes reach nothing outside their forwards, unless KITH_E2E=1 asks for image pulls.)
+    [ "${KITH_E2E:-}" != 1 ] || net_restrict=''
     node() { # N [kithd's further arguments]
         # (A disk of 8 GB, as the Alpine machines have: the node's state grows to it.)
         # (A node started again is on the disk it had.)
         [ -f "$work/n$1.raw" ] || { cp "$root/target/os/kith-os.raw" "$work/n$1.raw" && truncate -s 8G "$work/n$1.raw"; }
         # shellcheck disable=SC2046
         machine "$1" -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -qmp "unix:$work/n$1.qmp,server=on,wait=off" $(lan "$1") \
-            -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
+            -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443${net_restrict-,restrict=on}" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
             -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 --mesh 51820 $more ${2:-}"
     }
     field() { python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]], end="")' "$1"; }
@@ -400,7 +402,7 @@ k3s() { # the wait for a lost node, or nothing
         qemu-img create -q -f qcow2 -b "$cache/$alpine" -F qcow2 "$work/n$1.qcow2" 8G
         # shellcheck disable=SC2046
         machine "$1" -drive "file=$work/n$1.qcow2,format=qcow2,if=virtio" -drive "file=$work/seed$1.iso,format=raw,if=virtio,readonly=on" \
-            -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:22,hostfwd=tcp:127.0.0.1:$((port + $1))-:6443" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $(lan "$1")
+            -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:22,hostfwd=tcp:127.0.0.1:$((port + $1))-:6443" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $(lan "$1") # unrestricted: the k3s nodes pull their binaries and images from github and dl-cdn.alpinelinux.org
     }
     begun=$(date +%s.%N)
     for n in 1 2 3; do node "$n"; done
