@@ -2064,7 +2064,7 @@ async fn serve(
             portforward::forward(&call, namespace, name, method, headers, upgrade).await?
         }
         (_, Some(_), Some("exec" | "attach" | "portforward")) => {
-            let why = "exec and attach are not answered here: `kith run` runs a command in a replica";
+            let why = "not answered here: exec and attach are not carried, and port-forward is a GET (a WebSocket); `kith run` runs a command in a replica";
             return Err(status(StatusCode::NOT_IMPLEMENTED, "NotImplemented", why.into()));
         }
         (method, ..) => {

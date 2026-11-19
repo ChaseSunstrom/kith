@@ -58,7 +58,12 @@ const QUEUE: usize = 64;
 const BACKLOG: usize = 4;
 
 fn idle() -> Duration {
-    let set = std::env::var("KITHD_PORTFORWARD_IDLE_MS").ok().filter(|_| cfg!(debug_assertions));
+    if !cfg!(debug_assertions) {
+        return IDLE;
+    }
+    let set = std::env::var("KITHD_PORTFORWARD_IDLE_MS")
+        .ok()
+        .filter(|_| cfg!(debug_assertions));
     set.and_then(|ms| ms.parse().ok()).map_or(IDLE, Duration::from_millis)
 }
 
@@ -141,14 +146,22 @@ fn decide(
         let why = "an upgrade that carries an Origin is refused: kubectl sends none";
         return Err(status(StatusCode::FORBIDDEN, "Forbidden", why.into()));
     }
-    let said = |name| headers.get(name).and_then(|value| value.to_str().ok()).unwrap_or_default();
-    let offered = said(header::SEC_WEBSOCKET_PROTOCOL).split(',').any(|one| one.trim() == PROTOCOL);
+    let said = |name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+    };
+    let offered = said(header::SEC_WEBSOCKET_PROTOCOL)
+        .split(',')
+        .any(|one| one.trim() == PROTOCOL);
     let upgrading = said(header::UPGRADE).eq_ignore_ascii_case("websocket")
         && said(header::CONNECTION).to_ascii_lowercase().contains("upgrade")
         && said(header::SEC_WEBSOCKET_VERSION) == "13";
     let accept = crate::websocket::accept_key(said(header::SEC_WEBSOCKET_KEY));
     let (Some(upgrade), Some(accept), true, true, "GET") = (upgrade, accept, offered, upgrading, method) else {
-        let why = format!("port-forward is a WebSocket: a GET that upgrades, with version 13 and the protocol {PROTOCOL}");
+        let why =
+            format!("port-forward is a WebSocket: a GET that upgrades, with version 13 and the protocol {PROTOCOL}");
         return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why));
     };
     let who = call.caller.to_string();
@@ -157,7 +170,12 @@ fn decide(
         return Err(status(StatusCode::TOO_MANY_REQUESTS, "TooManyRequests", why));
     };
     let shared = call.shared.clone();
-    let owner = Owner { key, replica, caller: call.caller.clone(), who };
+    let owner = Owner {
+        key,
+        replica,
+        caller: call.caller.clone(),
+        who,
+    };
     tokio::spawn(async move {
         if let Ok(upgraded) = upgrade.await {
             session(shared, owner, TokioIo::new(upgraded), held).await;
@@ -339,7 +357,9 @@ impl Session {
     /// A stream the client opens: the error stream of a new connection, or its data stream.
     async fn open(&mut self, id: u32, headers: &[(String, String)]) -> Result<(), (u16, String)> {
         let get = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, value)| value.as_str());
-        let port = get("port").and_then(|port| port.parse::<u16>().ok()).filter(|port| *port != 0);
+        let port = get("port")
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port != 0);
         let (Some(request), Some(kind), Some(port), true) = (get("requestid"), get("streamtype"), port, id % 2 == 1)
         else {
             return self.say(self.reply.reset(id, spdy::PROTOCOL)).await;
@@ -351,14 +371,22 @@ impl Session {
         self.last = id;
         // The right is asked again for each connection: a session that is upgraded does not outlast it being taken away.
         if kind == "data" && may_exec(&self.shared, &self.owner.caller, &self.owner.key).is_err() {
-            self.requests.remove(request);
+            if let Some(open) = self.requests.remove(request) {
+                open.abort.iter().for_each(|task| task.abort());
+            }
             return self.say(self.reply.reset(id, spdy::REFUSED)).await;
         }
         let full = self.requests.len() >= STREAMS_MAX;
         match (kind, self.requests.get_mut(request)) {
             ("error", None) if full => self.say(self.reply.reset(id, spdy::REFUSED)).await,
             ("error", None) => {
-                let new = Pending { port, error: id, data: None, input: None, abort: None };
+                let new = Pending {
+                    port,
+                    error: id,
+                    data: None,
+                    input: None,
+                    abort: None,
+                };
                 self.requests.insert(request.to_string(), new);
                 let reply = self.reply.reply(id);
                 self.say(reply).await
@@ -368,7 +396,15 @@ impl Session {
                 let (input, backlog) = mpsc::channel(BACKLOG);
                 open.input = Some(input);
                 let error = open.error;
-                let task = connection(self.shared.clone(), self.owner.clone(), request.to_string(), port, (error, id), backlog, self.out.clone());
+                let task = connection(
+                    self.shared.clone(),
+                    self.owner.clone(),
+                    request.to_string(),
+                    port,
+                    (error, id),
+                    backlog,
+                    self.out.clone(),
+                );
                 let abort = self.tasks.spawn(task);
                 if let Some(open) = self.requests.get_mut(request) {
                     open.abort = Some(abort);
@@ -427,7 +463,10 @@ async fn connection(
             };
             // (A silent connection that idles out is ended without a word: any text on the error stream ends kubectl
             // itself, and with it every other connection of the session.)
-            ended.err().filter(|e| e.kind() != std::io::ErrorKind::TimedOut).map(|e| e.to_string())
+            ended
+                .err()
+                .filter(|e| e.kind() != std::io::ErrorKind::TimedOut)
+                .map(|e| e.to_string())
         }
     };
     // (Each is given up on after the idle time, and a client that took none of them is not asked the next.)
@@ -456,7 +495,10 @@ fn place(shared: &Shared, key: &str, replica: u32) -> Result<Option<(String, Ups
     let state = shared.store.lock().expect("a handler panicked holding the store");
     let owner = state.store.get(key).ok_or("what runs the pod is gone")?;
     let units = owner.status.as_ref().and_then(|status| status["containers"].as_array());
-    let unit = units.into_iter().flatten().find(|unit| unit["replica"] == replica && unit["state"] != "exited");
+    let unit = units
+        .into_iter()
+        .flatten()
+        .find(|unit| unit["replica"] == replica && unit["state"] != "exited");
     let unit = unit.ok_or_else(|| format!("replica {replica} has no unit that runs"))?;
     let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str());
     let node = match (unit["node"].as_str(), me) {
@@ -498,7 +540,12 @@ async fn reach(shared: &Shared, owner: &Owner, port: u16) -> Result<Box<dyn Io>,
     };
     let cluster = shared.cluster.as_ref().ok_or("this kithd is not part of a cluster")?;
     let client = cluster.to(&there)?;
-    let spec = Spec { key: owner.key.clone(), replica: owner.replica, port, caller: owner.who.clone() };
+    let spec = Spec {
+        key: owner.key.clone(),
+        replica: owner.replica,
+        port,
+        caller: owner.who.clone(),
+    };
     let send = crate::access_sign::pass_on(client.post(format!("https://{}{POD_HOP}", there.address)))
         .header(header::CONNECTION, "upgrade")
         .header(header::UPGRADE, HOP_PROTOCOL)
@@ -516,7 +563,10 @@ async fn reach(shared: &Shared, owner: &Owner, port: u16) -> Result<Box<dyn Io>,
             .ok()
             .and_then(|said| said["error"].as_str().map(str::to_string))
             .unwrap_or(said);
-        return Err(format!("node {node} said {code}: {}", said.chars().take(512).collect::<String>()));
+        return Err(format!(
+            "node {node} said {code}: {}",
+            said.chars().take(512).collect::<String>()
+        ));
     }
     match reply.upgrade().await {
         Ok(far) => Ok(Box::new(Idle::new(far, idle(), None))),
@@ -564,7 +614,11 @@ pub(crate) async fn hop(
     }
     let signed = request.headers().get(crate::access_sign::SIGNED);
     let signed = signed.map(|header| header.to_str().unwrap_or_default().to_string());
-    let path = request.uri().path_and_query().map_or(POD_HOP, |path| path.as_str()).to_string();
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or(POD_HOP, |path| path.as_str())
+        .to_string();
     let upgrade = hyper::upgrade::on(&mut request);
     let body = match to_bytes(request.into_body(), 4 << 10).await {
         Ok(body) => body,
@@ -575,9 +629,16 @@ pub(crate) async fn hop(
         Err(e) => return say(StatusCode::BAD_REQUEST, e),
     };
     let Some(who) = Caller::named(&spec.caller) else {
-        return say(StatusCode::BAD_REQUEST, format!("caller: {:?} is no caller a node passes on", spec.caller));
+        return say(
+            StatusCode::BAD_REQUEST,
+            format!("caller: {:?} is no caller a node passes on", spec.caller),
+        );
     };
-    let asked = crate::access_sign::Asked { method: "POST", path: &path, body: &body };
+    let asked = crate::access_sign::Asked {
+        method: "POST",
+        path: &path,
+        body: &body,
+    };
     if let Err(why) = crate::access_sign::hop(&shared, from.as_str(), signed.as_deref(), &asked, Some(&who), false) {
         return say(StatusCode::FORBIDDEN, why);
     }
@@ -607,8 +668,12 @@ pub(crate) async fn hop(
     });
     let mut reply = Response::new(Body::empty());
     *reply.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    reply.headers_mut().insert(header::CONNECTION, "upgrade".parse().expect("a header value"));
-    reply.headers_mut().insert(header::UPGRADE, HOP_PROTOCOL.parse().expect("a header value"));
+    reply
+        .headers_mut()
+        .insert(header::CONNECTION, "upgrade".parse().expect("a header value"));
+    reply
+        .headers_mut()
+        .insert(header::UPGRADE, HOP_PROTOCOL.parse().expect("a header value"));
     reply
 }
 
@@ -618,7 +683,9 @@ mod tests {
 
     #[test]
     fn portforward_a_caller_has_as_many_sessions_as_the_bound_and_a_place_is_given_back() {
-        let held: Vec<_> = (0..SESSIONS_MAX).map(|_| Held::take("test-caller").expect("within the bound")).collect();
+        let held: Vec<_> = (0..SESSIONS_MAX)
+            .map(|_| Held::take("test-caller").expect("within the bound"))
+            .collect();
         assert!(Held::take("test-caller").is_none());
         assert!(Held::take("test-other").is_some(), "another caller's own");
         drop(held);
@@ -636,8 +703,13 @@ mod tests {
         // The third waits for room, until the writer gives up and the queue closes: an error, not a wait for ever.
         let third = put(&out, vec![1], Duration::from_secs(30)).await.unwrap_err();
         assert_ne!(third.kind(), std::io::ErrorKind::TimedOut, "{third}");
-        tokio::time::timeout(Duration::from_secs(5), out.closed()).await.expect("the queue is closed");
-        tokio::time::timeout(Duration::from_secs(5), writer).await.expect("the writer ended").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), out.closed())
+            .await
+            .expect("the queue is closed");
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("the writer ended")
+            .unwrap();
     }
 
     #[tokio::test]

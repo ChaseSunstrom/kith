@@ -1576,9 +1576,15 @@ fn access_port_forward_needs_the_run_right_on_the_owning_workload() {
         cluster.reply_in(2, who, method, &pod(name), headers, None)
     };
     // bob may get the pod and forwards nothing: refused before the upgrade is looked at, either way kubectl asks.
-    assert_eq!(cluster.reply("bob", "GET", "/api/v1/namespaces/team/pods/web-0", &[], None), "200");
+    assert_eq!(
+        cluster.reply("bob", "GET", "/api/v1/namespaces/team/pods/web-0", &[], None),
+        "200"
+    );
     assert_eq!(ask("bob", "GET", "web-0", &FORWARD), "403");
-    assert_eq!(ask("bob", "POST", "web-0", &["Connection: Upgrade", "Upgrade: SPDY/3.1"]), "403");
+    assert_eq!(
+        ask("bob", "POST", "web-0", &["Connection: Upgrade", "Upgrade: SPDY/3.1"]),
+        "403"
+    );
     // carol may run in `team`: the WebSocket is upgraded, and without one it is a 400.
     assert_eq!(ask("carol", "GET", "web-0", &FORWARD), "101");
     assert_eq!(ask("carol", "GET", "web-1", &FORWARD), "101");
@@ -1599,10 +1605,18 @@ fn access_port_forward_needs_the_run_right_on_the_owning_workload() {
         audit.lines().filter(ours).collect()
     };
     let (bob, carol) = (of("bob"), of("carol"));
-    assert!(bob.len() == 2 && bob.iter().all(|line| !line.ends_with(" ok")), "bob is refused twice: {audit}");
-    assert!(carol.iter().any(|line| line.ends_with(" ok")), "carol's upgrade is ok: {audit}");
     assert!(
-        bob.iter().chain(&carol).all(|line| line.split_whitespace().nth(2) == Some("portforward")),
+        bob.len() == 2 && bob.iter().all(|line| !line.ends_with(" ok")),
+        "bob is refused twice: {audit}"
+    );
+    assert!(
+        carol.iter().any(|line| line.ends_with(" ok")),
+        "carol's upgrade is ok: {audit}"
+    );
+    assert!(
+        bob.iter()
+            .chain(&carol)
+            .all(|line| line.split_whitespace().nth(2) == Some("portforward")),
         "written down as portforward: {audit}"
     );
 }
@@ -1632,8 +1646,24 @@ fn access_port_forward_sessions_are_bounded_per_caller() {
             // (stdbuf: openssl writes to a pipe in blocks, which keeps the 101 from being read.)
             let mut client = Command::new("stdbuf");
             client
-                .args(["-o0", "openssl", "s_client", "-quiet", "-CAfile", "ca.crt", "-cert", "carol.crt", "-key", "carol.key"])
-                .args(["-servername", "kith", "-connect", &format!("127.0.0.1:{}", cluster.port)])
+                .args([
+                    "-o0",
+                    "openssl",
+                    "s_client",
+                    "-quiet",
+                    "-CAfile",
+                    "ca.crt",
+                    "-cert",
+                    "carol.crt",
+                    "-key",
+                    "carol.key",
+                ])
+                .args([
+                    "-servername",
+                    "kith",
+                    "-connect",
+                    &format!("127.0.0.1:{}", cluster.port),
+                ])
                 .current_dir(&cluster.dir)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1673,7 +1703,10 @@ fn alone() -> std::sync::MutexGuard<'static, ()> {
 fn with_running(test: &str, host: bool) -> Cluster {
     let cluster = with_team_as(test, host);
     let sent = r#"{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"tool","namespace":"team"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"tool"}},"template":{"metadata":{"labels":{"app":"tool"}},"spec":{"containers":[{"name":"main","image":"busybox:1.36"}]}}}}"#;
-    let tool = format!("apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: tool\n  namespace: team\n  annotations:\n    {}: '{sent}'\nspec:\n  replicas: 1\n  template:\n    exec:\n      - name: main\n        command: [sleep, '3600']\n", "kube.kith.dev/sent");
+    let tool = format!(
+        "apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: tool\n  namespace: team\n  annotations:\n    {}: '{sent}'\nspec:\n  replicas: 1\n  template:\n    exec:\n      - name: main\n        command: [sleep, '3600']\n",
+        "kube.kith.dev/sent"
+    );
     cluster.write("tool.yaml", &tool);
     cluster.kith(&["apply", "-f", "tool.yaml"]);
     eventually("tool-0 to run", 60, || {
@@ -1699,7 +1732,15 @@ fn forward(cluster: &Cluster, remote: u16) -> (Forward, u16) {
     let carol = cluster.as_("carol");
     let ports = format!("{local}:{remote}");
     let child = Command::new(&carol.kubectl)
-        .args(["port-forward", "--address", "127.0.0.1", "-n", "team", "pod/tool-0", &ports])
+        .args([
+            "port-forward",
+            "--address",
+            "127.0.0.1",
+            "-n",
+            "team",
+            "pod/tool-0",
+            &ports,
+        ])
         .current_dir(&cluster.dir)
         .env("KUBECONFIG", &carol.config)
         .env("HOME", &cluster.dir)
@@ -1711,7 +1752,10 @@ fn forward(cluster: &Cluster, remote: u16) -> (Forward, u16) {
     let mut forward = Forward(child);
     let mut line = String::new();
     BufRead::read_line(&mut BufReader::new(forward.0.stdout.as_mut().unwrap()), &mut line).unwrap();
-    assert!(line.starts_with("Forwarding from 127.0.0.1"), "kubectl port-forward said: {line:?}");
+    assert!(
+        line.starts_with("Forwarding from 127.0.0.1"),
+        "kubectl port-forward said: {line:?}"
+    );
     (forward, local)
 }
 
@@ -1775,7 +1819,10 @@ fn workflows_kubectl_port_forward_ends_a_silent_stream_and_bounds_its_streams() 
     let mut one = [0u8; 1];
     assert_eq!(silent.read(&mut one).unwrap_or(0), 0, "ended, not answered");
     let took = began.elapsed();
-    assert!(took >= Duration::from_secs(8) && took < Duration::from_secs(40), "a silent stream ended after {took:?}");
+    assert!(
+        took >= Duration::from_secs(8) && took < Duration::from_secs(40),
+        "a silent stream ended after {took:?}"
+    );
 
     let mut held: Vec<TcpStream> = (0..16).map(|_| near(local)).collect();
     for stream in &mut held {
@@ -1784,7 +1831,11 @@ fn workflows_kubectl_port_forward_ends_a_silent_stream_and_bounds_its_streams() 
     }
     let mut over = near(local);
     let _ = over.write_all(b"y");
-    assert_eq!(over.read(&mut one).unwrap_or(0), 0, "the 17th connection is refused, not echoed");
+    assert_eq!(
+        over.read(&mut one).unwrap_or(0),
+        0,
+        "the 17th connection is refused, not echoed"
+    );
 }
 
 /// A pod this node has not made (here, one that runs on the host) has no network to reach: the connection is refused and
@@ -1800,7 +1851,11 @@ fn workflows_kubectl_port_forward_does_not_reach_the_host_through_a_pod_that_is_
     let mut stream = near(local);
     let _ = stream.write_all(b"hello");
     let mut back = [0u8; 5];
-    assert_eq!(stream.read(&mut back).unwrap_or(0), 0, "nothing is echoed: the host's loopback is not reached");
+    assert_eq!(
+        stream.read(&mut back).unwrap_or(0),
+        0,
+        "nothing is echoed: the host's loopback is not reached"
+    );
 }
 
 /// A session that takes no connection and hears nothing ends after the idle time (10 s here). (Not kubectl's: it pings
@@ -1814,8 +1869,24 @@ fn access_port_forward_ends_a_session_that_hears_nothing() {
     asked.push_str("\r\n");
     let mut client = Command::new("stdbuf");
     client
-        .args(["-o0", "openssl", "s_client", "-quiet", "-CAfile", "ca.crt", "-cert", "carol.crt", "-key", "carol.key"])
-        .args(["-servername", "kith", "-connect", &format!("127.0.0.1:{}", cluster.port)])
+        .args([
+            "-o0",
+            "openssl",
+            "s_client",
+            "-quiet",
+            "-CAfile",
+            "ca.crt",
+            "-cert",
+            "carol.crt",
+            "-key",
+            "carol.key",
+        ])
+        .args([
+            "-servername",
+            "kith",
+            "-connect",
+            &format!("127.0.0.1:{}", cluster.port),
+        ])
         .current_dir(&cluster.dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1834,7 +1905,11 @@ fn access_port_forward_ends_a_session_that_hears_nothing() {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    assert!(began.elapsed() >= Duration::from_secs(5), "ended after {:?}, before the idle time", began.elapsed());
+    assert!(
+        began.elapsed() >= Duration::from_secs(5),
+        "ended after {:?}, before the idle time",
+        began.elapsed()
+    );
 }
 
 /// The Exec right is asked again for each connection: a session whose caller lost it is upgraded still, and the
@@ -1857,7 +1932,11 @@ fn workflows_kubectl_port_forward_asks_the_right_again_for_each_connection() {
     cluster.kith(&["apply", "-f", "revoked.yaml"]);
     let mut second = near(local);
     let _ = second.write_all(b"hello");
-    assert_eq!(second.read(&mut back).unwrap_or(0), 0, "a connection of a session whose right is gone is refused");
+    assert_eq!(
+        second.read(&mut back).unwrap_or(0),
+        0,
+        "a connection of a session whose right is gone is refused"
+    );
 }
 
 /// A StatefulSet of several replicas has a claim and a Volume of each replica's own, named

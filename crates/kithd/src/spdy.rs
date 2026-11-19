@@ -35,9 +35,18 @@ pub const REFUSED: u32 = 3;
 #[derive(Debug, PartialEq)]
 pub enum Frame {
     /// SYN_STREAM: a stream the client opens, with the pairs of its header.
-    Open { id: u32, headers: Vec<(String, String)> },
-    Data { id: u32, fin: bool, data: Vec<u8> },
-    Reset { id: u32 },
+    Open {
+        id: u32,
+        headers: Vec<(String, String)>,
+    },
+    Data {
+        id: u32,
+        fin: bool,
+        data: Vec<u8>,
+    },
+    Reset {
+        id: u32,
+    },
     Ping(Vec<u8>),
     GoAway,
     /// A frame kithd has no use for (SETTINGS, WINDOW_UPDATE, HEADERS, a type it does not know).
@@ -55,7 +64,11 @@ pub struct Reader {
 
 impl Reader {
     pub fn new() -> Reader {
-        Reader { buf: Vec::new(), history: DICT.to_vec(), begun: false }
+        Reader {
+            buf: Vec::new(),
+            history: DICT.to_vec(),
+            begun: false,
+        }
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -81,7 +94,11 @@ impl Reader {
         let version = u16::from_be_bytes([head[0] & 0x7f, head[1]]);
         let body: Vec<u8> = self.buf.drain(..8 + len).skip(8).collect();
         if !control {
-            return Ok(Some(Frame::Data { id, fin: flags & 1 != 0, data: body }));
+            return Ok(Some(Frame::Data {
+                id,
+                fin: flags & 1 != 0,
+                data: body,
+            }));
         }
         if version != 3 {
             return Err(format!("SPDY version {version}: kithd speaks 3"));
@@ -94,7 +111,10 @@ impl Reader {
             1 => {
                 let block = body.get(10..).ok_or("a SYN_STREAM too short")?;
                 let headers = pairs(&self.inflate(block)?)?;
-                Frame::Open { id: stream(&body)?, headers }
+                Frame::Open {
+                    id: stream(&body)?,
+                    headers,
+                }
             }
             // (A block is inflated whether it is of use or not: the next one is made over it.)
             8 => {
@@ -228,7 +248,10 @@ mod tests {
     use super::*;
 
     fn hex(text: &str) -> Vec<u8> {
-        (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap()).collect()
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+            .collect()
     }
 
     fn headers(frame: Option<Frame>) -> (u32, Vec<(String, String)>) {
@@ -240,13 +263,18 @@ mod tests {
 
     fn port_forward(id: &str, kind: &str) -> (u32, Vec<(String, String)>) {
         let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
-        (id.parse().unwrap(), vec![pair("requestid", "0"), pair("streamtype", kind), pair("port", "8080")])
+        (
+            id.parse().unwrap(),
+            vec![pair("requestid", "0"), pair("streamtype", kind), pair("port", "8080")],
+        )
     }
 
     /// What kubectl v1.37 sent for its first stream (captured), and two of a zlib's, the second over the first.
     #[test]
     fn spdy_reads_the_syn_streams_kubectl_sends() {
-        let kubectl = hex("800300010000003e0000000100000000000078f9e3c6a7c202253a060606ce2248fc6482d22da30138e59514a526e6420b17d65450d0430aea22709eb030b03000000000ffff");
+        let kubectl = hex(
+            "800300010000003e0000000100000000000078f9e3c6a7c202253a060606ce2248fc6482d22da30138e59514a526e6420b17d65450d0430aea22709eb030b03000000000ffff",
+        );
         let mut reader = Reader::new();
         reader.push(&kubectl);
         assert_eq!(headers(reader.next().unwrap()), port_forward("1", "error"));
@@ -272,7 +300,14 @@ mod tests {
         reader.push(&writer.reset(5, 5));
         reader.push(&control(4, 0, 0));
         reader.push(&writer.ping(&[0, 0, 0, 1]));
-        assert_eq!(reader.next().unwrap(), Some(Frame::Data { id: 3, fin: true, data: b"hi".to_vec() }));
+        assert_eq!(
+            reader.next().unwrap(),
+            Some(Frame::Data {
+                id: 3,
+                fin: true,
+                data: b"hi".to_vec()
+            })
+        );
         assert_eq!(reader.next().unwrap(), Some(Frame::Reset { id: 5 }));
         assert_eq!(reader.next().unwrap(), Some(Frame::Skip));
         assert_eq!(reader.next().unwrap(), Some(Frame::Ping(vec![0, 0, 0, 1])));
@@ -330,7 +365,10 @@ mod tests {
         let first = writer.reply(1);
         // (Each block ends with the empty stored block `0 0 0 ff ff` Go's inflater needs to stop at.)
         assert_eq!(first[..8], [0x80, 3, 0, 2, 0, 0, 0, 20]);
-        assert_eq!(first[12..], [0x78, 0x01, 0, 4, 0, 0xfb, 0xff, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]);
+        assert_eq!(
+            first[12..],
+            [0x78, 0x01, 0, 4, 0, 0xfb, 0xff, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
+        );
         let second = writer.reply(3);
         assert_eq!(second[..8], [0x80, 3, 0, 2, 0, 0, 0, 18]);
         assert_eq!(second[12..], [0, 4, 0, 0xfb, 0xff, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]);

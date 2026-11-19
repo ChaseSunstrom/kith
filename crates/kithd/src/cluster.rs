@@ -603,7 +603,13 @@ async fn standing(State(shared): State<Arc<Shared>>, Query(asked): Query<Standin
 
 /// What a worker (`spec.trust`) is refused among the nodes' routes: the second hop of
 /// `kith run`, the hop of `kubectl port-forward` and Raft's own messages, which only one that votes or leads sends.
-const CONTROL_ONLY: [&str; 5] = ["/v1/raft/append", "/v1/raft/vote", "/v1/raft/snapshot", RUN_HOP, POD_HOP];
+const CONTROL_ONLY: [&str; 5] = [
+    "/v1/raft/append",
+    "/v1/raft/vote",
+    "/v1/raft/snapshot",
+    RUN_HOP,
+    POD_HOP,
+];
 const RUN_HOP: &str = "/v1/run-hop";
 pub(crate) const POD_HOP: &str = "/v1/pod-hop";
 
