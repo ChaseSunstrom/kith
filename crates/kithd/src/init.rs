@@ -907,7 +907,9 @@ pub fn hear_term() {
             let made = tokio::runtime::Builder::new_current_thread().enable_all().build();
             let Ok(runtime) = made else { return };
             runtime.block_on(async {
-                let Ok(mut term) = signal(SignalKind::terminate()) else { return };
+                let Ok(mut term) = signal(SignalKind::terminate()) else {
+                    return;
+                };
                 // (A kept kithd's mask holds it back: see `keeper::unblock_heard`.)
                 crate::keeper::unblock_heard();
                 let _ = ready.send(());
@@ -1001,7 +1003,8 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         // Raised before it starts (a stop kept from before): no tick is waited.
         let started = std::time::Instant::now();
-        assert!(rest(100_000, std::time::Duration::from_secs(60), || stop.load(Ordering::Relaxed)));
+        assert!(rest(100_000, std::time::Duration::from_secs(60), || stop
+            .load(Ordering::Relaxed)));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
@@ -1019,7 +1022,9 @@ mod tests {
         POWER_OFF.store(false, Ordering::Relaxed);
         nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
         // (A wait of the machine's: ends as soon as the signal has set the flag.)
-        let heard = rest(1000, std::time::Duration::from_millis(5), || POWER_OFF.load(Ordering::Relaxed));
+        let heard = rest(1000, std::time::Duration::from_millis(5), || {
+            POWER_OFF.load(Ordering::Relaxed)
+        });
         assert!(heard, "SIGTERM set POWER_OFF");
     }
 

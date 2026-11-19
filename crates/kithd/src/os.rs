@@ -773,11 +773,18 @@ mod tests {
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
-                    mounted(mount, unmount, || std::thread::sleep(std::time::Duration::from_millis(20))).unwrap();
+                    mounted(mount, unmount, || {
+                        std::thread::sleep(std::time::Duration::from_millis(20))
+                    })
+                    .unwrap();
                 });
             }
         });
-        assert_eq!((now.load(SeqCst), most.load(SeqCst)), (0, 1), "no two were mounted together");
+        assert_eq!(
+            (now.load(SeqCst), most.load(SeqCst)),
+            (0, 1),
+            "no two were mounted together"
+        );
         // A panic while mounted: unmounted, and the next caller is not refused.
         let panicked = std::thread::spawn(|| {
             let _ = mounted(|| Ok(()), || UNMOUNTED.store(true, SeqCst), || panic!("settle"));

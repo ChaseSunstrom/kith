@@ -220,7 +220,8 @@ static IN_MEMORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// Whether a disk is being written and sealed, and, until the recovery key has been shown,
 /// held after it: a stop (SIGTERM, the power button) waits for it to end (`stopped`), so that
 /// a disk is not cut off half written, nor a key powered off before it is read.
-static WRITING: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+static WRITING: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
 /// Set once the installer is told to stop: a write that has not begun then does not.
 static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -807,7 +808,9 @@ pub async fn run(source: String) -> ! {
         }
         // (The disk let go of first: the kernel takes it for the mapping.)
         drop(disk);
-        let recovery = encrypt.then(|| sealed(&image, &device, crate::crypt::seal)).transpose()?;
+        let recovery = encrypt
+            .then(|| sealed(&image, &device, crate::crypt::seal))
+            .transpose()?;
         Ok((recovery, writing))
     });
     // (A panic may come after the write began, so it is said the same way.)
