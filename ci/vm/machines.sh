@@ -1,7 +1,7 @@
 # shellcheck shell=sh
 # shellcheck disable=SC1091,SC2034,SC2154 # (names the driver and its parts share)
 # shellcheck disable=SC2016 # (as the script had them before it was cut)
-# Sourced by ci/vm.sh for --test install, vps, netboot, crypt and blackout: it runs inside the driver's shell, with its
+# Sourced by ci/vm.sh for --test install, vps, netboot, crypt, blackout and alone: it runs inside the driver's shell, with its
 # variables and functions; not a script to run alone.
         for tool in curl python3 cpio ${sealing:+swtpm}; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
@@ -72,6 +72,10 @@
 
         if [ "$test" = blackout ]; then
             . "$root/ci/vm/blackout.sh"
+        fi
+
+        if [ "$test" = alone ]; then
+            . "$root/ci/vm/alone.sh"
         fi
 
         if [ "$test" = netboot ] || [ "$test" = crypt ]; then

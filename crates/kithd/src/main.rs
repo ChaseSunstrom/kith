@@ -65,6 +65,7 @@ mod vm;
 mod volume_files;
 mod volumes;
 mod wasm;
+mod websocket;
 mod worker;
 mod workload_identity;
 
@@ -864,6 +865,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     let state = state
         .canonicalize()
         .map_err(|e| fail("resolving the state directory", &e))?;
+    // The root part's own word for where a mount may be (`root_part::check_create`).
+    root_part::set_state(state.clone());
     // Nobody answered and the state is ours: a socket here is a dead kithd's. Anything else is not ours to remove.
     use std::os::unix::fs::FileTypeExt;
     if std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()) {
@@ -1081,7 +1084,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             );
             let key = async {
                 if let Some(((record, config), opened)) = sealed.zip(opened) {
-                    crypt::keep(shared.clone(), config, record, opened, stopping.clone()).await;
+                    let keys = update::keys(args.release_key.clone(), &state);
+                    crypt::keep(shared.clone(), config, record, opened, keys, stopping.clone()).await;
                 }
             };
             let hardware = devices::run(shared.clone(), stopping.clone(), dmem);

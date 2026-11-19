@@ -635,13 +635,21 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   through the log); the node's own check before start still refuses an unlisted namespace.
   Of the node itself, an exit's pod reaches nothing (only answers to the node's own
   questions of it go back). A running pod keeps its tunnel after its namespace is taken
-  off its Exit's list, until it starts again (the node's check is at start). No NetworkPolicy's egress rules are enforced, for an exit's pod or any other (a
-  policy with them says so in its status). Not tested: a tunnel's link or table taken
+  off its Exit's list, until it starts again (the node's check is at start). Not tested: a tunnel's link or table taken
   away by hand on a running node (the code that makes it again is tested in a network
   namespace, not on kith OS), ICMP through or around a tunnel, kithd killed between
   starting a pod and making its rules (the rules come first; nothing shows the order
   holds under a kill), and names a pod's own resolver library cached before its exit
   changed.
+- **A NetworkPolicy's egress rules hold a pod's packets, on kith OS as root and for pod Workloads
+  and Jobs only.** The pods of the Workloads and Jobs a policy selects, an exit's pod included,
+  pass only what a rule allows, DNS included. Each pod is matched per pod link: its rules are the
+  chain `e-kpN` (`e-kpxN` for an exit's pod) in the node's `inet kith-pods` table, and its source
+  address is checked apart, so a packet from another address on its link is dropped. Exec and VM
+  Workloads are not held, and nothing is written when kithd is not root. A policy with a peer by
+  `namespace` or `selector`, or whose rules are not yet written on a node, says `partial` in its
+  status; `enforced` once they are. kithd writes the rules again when a policy changes. Not
+  tested: a policy changing under a running pod; access returning after the policy is deleted.
 - **What a replica writes outside its Volumes is held at the write where the state disk
   keeps project quotas, and counted elsewhere.** Its containers' writable roots and its
   disk scratch share the node's state disk. Where the state disk keeps project quotas (a
@@ -887,9 +895,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     What a worker may write is a list the control node it writes to holds it to,
     against that node's own store: what it says of the replicas the scheduler gave it
     (how many are ready is counted again; a unit's address has to be in the worker's
-    own part of the mesh), `os`, `mesh`, `serves` and `thumbprint` in its own Node's
-    status (not a mesh key another Node says, which would cut both off; a thumbprint
-    in a thumbprint's shape), its own NodeKey once, the Devices
+    own part of the mesh), `os`, `mesh`, `serves`, `thumbprint` and `alone` in its own
+    Node's status (not a mesh key another Node says, which would cut both off; a thumbprint
+    in a thumbprint's shape; `alone` null, or the times it ran alone and its risks), its own NodeKey once, the Devices
     and Seats whose `spec.node` is the worker (under a name that starts with the
     worker's own, with the labels discovery writes and no other, the node and the
     class among them its own), the status of an Image or a Backup of
@@ -945,7 +953,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     was deleted or made a worker meanwhile is still a control node to it. A worker
     that starts again meanwhile runs nothing until a control node answers (what
     was moved off it while it was away is not known to it), as any node that
-    starts with no leader in reach. Its API
+    starts with no leader in reach, unless its Node says `alone: run`
+    ([a node away from its cluster](docs/guide/cluster.md#a-node-away-from-its-cluster)). Its API
     port answers no person, reads included: it has no Identity and no Role to answer
     by (`this node is a worker and answers no one by their rights: ask a control
     node`). What a control node passes on to it for someone (a unit's output, `kith

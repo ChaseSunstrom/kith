@@ -61,7 +61,8 @@ join token": update the joiner first.)
   reads one. With no cluster: one copy if the selector is empty, else none.
 - A replica stays put. After its node is unreachable for five minutes (`--lost-after SECONDS`)
   it is started elsewhere and stays there; a Job starts over. A restarted node runs nothing
-  until it has caught up with the store, so not while there is no leader.
+  until it has caught up with the store, so not while there is no leader, unless its Node says
+  `alone: run` ([a node away from its cluster](#a-node-away-from-its-cluster)).
 
 ### The mesh
 
@@ -126,7 +127,7 @@ spec: { trust: worker }         # or `control`, which is what a Node without it 
 | A worker | |
 |---|---|
 | votes | never, and no Raft message from it is taken. A voter made a worker hands its vote on within seconds; to cut one off at once, delete its Node. Fewer than three control nodes: one votes |
-| writes | only what it says of itself: its units' state, its Node's `os`, `mesh`, `serves` and `thumbprint`, its Devices and Seats, its Volumes' backups and images. Anything else is refused and audited under its name (`kith audit`) |
+| writes | only what it says of itself: its units' state, its Node's `os`, `mesh`, `serves`, `thumbprint` and `alone`, its Devices and Seats, its Volumes' backups and images. Anything else is refused and audited under its name (`kith audit`) |
 | answers | no person: point `kith`, a kubeconfig, `curl` and the web UI at a control node (`this node is a worker and answers no one by their rights: ask a control node (ADDRESS)`). `kith logs`, `kith volume put`/`get`, `kith node passphrase`, a restore and `kith run` asked of a worker for another node are refused (`node NAME is a worker: its word for who asked is not taken: ask a control node`); asked of a control node they reach the worker as usual |
 | holds | no copy of the store, only a view (below); no blob it is not using; no encrypted Volume's key. Its replica of a Volume takes over only when no control node has one |
 | does not yet | order ACME certificates, or write `DNSRecord`/`DNSBlockList` status (it answers DNS; control nodes report) |
@@ -222,10 +223,20 @@ Service that selects its Workload.
   once and relays everything.
 
 A `NetworkPolicy` decides who may connect to the Workloads it selects through a Service: the
-first ingress rule that fits wins, none means refused. Peers are a `node` or a `cidr`; peers by
-`namespace` or `selector` cannot be told apart yet (allow lets nobody in, deny keeps everyone
-out) and egress is not enforced; the status says `partial` and why, or `enforced`. A connection
-to a node's own address bypasses it.
+first ingress rule that fits wins, none means refused. A connection to a node's own address
+bypasses the ingress rules. Its egress rules, which decide where a pod may connect, are below.
+
+- **Egress (kith OS as root; pod Workloads and Jobs only):** a `NetworkPolicy`'s egress rules
+  hold the pods of the Workloads and Jobs it selects, an exit's pod included. A pod reaches only
+  what a rule allows, its DNS included, so a policy that holds a pod names the resolver it
+  needs; answers to a connection that came in still pass. kithd writes the rules again when a
+  policy changes. Each pod is matched per pod link: its rules are the chain `e-kpN` (`e-kpxN`
+  for an exit's pod), and its source address is checked apart, so a packet from another
+  address on its link is dropped. Exec and VM Workloads are not held, and nothing is written
+  when kithd is not root. Peers are a `node` or a `cidr`; peers by `namespace` or `selector`
+  cannot be told apart yet (an allow rule fits nobody, a deny rule everybody), and the status
+  says `partial` and why until every rule is written on the node, then `enforced`. Not tested:
+  a policy changing under a running pod; access returning after the policy is deleted.
 
 ### Rolling updates
 
@@ -472,6 +483,41 @@ Writes the cluster acknowledged before the cut are there after it: the test chec
 each of the three control nodes. It starts the two sealed ones first and has them elect a leader
 with the third still off, then starts the third and a worker, which are handed their keys. Plan
 for the quorum, not for one machine: with three control nodes, two sealed and started are enough.
+
+## A node away from its cluster
+
+A node that starts with no leader in reach (a laptop at a café, an edge worker on a bad link)
+waits, by default, for one: it starts nothing until a write comes back from the cluster. Set
+`alone: run` on its Node and it does not wait forever:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: laptop }
+spec:
+  alone: run   # no leader for 30 s: run what this node's own copy of the store places here
+```
+
+After 30 seconds with no leader answering, the node starts the Workloads and NodeWorkloads its
+copy places on it. **Jobs are not started alone**: their runs are the cluster's to start, and a Job waits for a leader.
+The console says what the node runs alone and its risks, and the Node's status records
+`alone: {since, until, risks}`, the time it began and the time a leader answered. The status is
+written once a write comes back, because none can before then.
+
+The risks, said on the console and in that status:
+
+- a replica moved off this node while it was away runs twice, since the cluster started it elsewhere;
+- a Secret or a ConfigMap changed in the meantime is still the old one here;
+- a Job is not started alone.
+
+When a leader answers, the node catches up as it does on any store change: what was moved off is
+stopped, and what changed is replaced.
+
+Running alone needs state the node can open by itself: unencrypted, or sealed to its TPM. A node
+whose state key the cluster holds cannot run alone: its state opens only once a control node is up
+(see [when every node was off](#when-every-node-was-off)), and the `alone` setting is in that
+state, so kithd cannot read it before then. Such a node runs nothing alone whatever `alone: run`
+says, and waits for a leader as it does without the setting. The setting is not refused for it.
 
 ## DNS
 

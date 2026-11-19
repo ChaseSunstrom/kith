@@ -19,6 +19,9 @@
 #   sh ci/vm.sh --test blackout four encrypted nodes (three control, two of them with a TPM, and a worker)
 #                               losing power at once in the middle of writes and started again: nothing
 #                               typed, a leader from the two sealed ones, no write lost
+#   sh ci/vm.sh --test alone    two nodes, the worker set to run alone: the control node off and the worker
+#                               started again, it runs its replica and holds its Job after 30 s, with the risks
+#                               said; the control node back, the replica placed there is stopped on the worker
 #   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other;
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
@@ -29,8 +32,10 @@
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network
-#   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) imported with
-#                               kith import compose, applied, ready, each asked for by its compose name
+#   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) and media.yml
+#                               (eight, the media stack's shape) imported with kith import compose, applied,
+#                               ready, each asked for by its compose name; KITH_E2E=1 also runs media.yml
+#                               under docker compose up on an Alpine machine, timed beside kith's
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
 #                               kills in a minute restart the machine
@@ -133,6 +138,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    third still off, which then, and the worker, are handed their keys;
                    every acknowledged write is on all three control nodes and both
                    Workloads are started again; needs swtpm
+  --test alone    instead: two nodes the installer made, each with its state not
+                   encrypted: a control node and a worker set to `alone: run`, with a
+                   one-replica Workload and a Job on the worker; the control node is
+                   stopped and the worker started again: after about 30 s it says so,
+                   with the risks, runs the replica and holds the Job; the control node
+                   back, the worker says since when it ran alone and until when, and
+                   the replica placed on the control node is stopped on the worker
   --test share    instead: two nodes on the mesh, each with kith as a container image
                    already there: a file a container makes in a shared volume on the
                    node that does not hold it is there on the node that does, and the
@@ -150,7 +162,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    a pod of a user who is not root finds their Service
                    by its short name and its Kubernetes one, hears all three through
                    it, reaches this machine from behind its node's address, and
-                   writes to /dev/stdout by name; a pod that is root is kept from a
+                   writes to /dev/stdout by name; a NetworkPolicy's egress rule holds
+                   the pods of one app to this machine's address and one port (and
+                   port 80 of no other address): another port, or a pod's address on
+                   port 80, is silent, while an unfenced pod on the same node is
+                   answered by that pod and refused by the port nothing listens on;
+                   a pod that is root is kept from a
                    device it was not given (its node's disk); a container that asks for user
                    namespaces starts a sandbox in it (this machine's bwrap), one that
                    does not is refused, one that is root is not started; a USB keyboard
@@ -184,11 +201,15 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    x86_64-unknown-linux-musl
   --test compose   instead: one node on the mesh, and on this machine `kith import
                    compose` of ci/compose/stack.yml (four services of the test pod,
-                   nothing in it left out) applied to it. Expected: each Workload ready,
-                   each Service given its backend, and a Job in a pod asking each service
-                   by its compose name (and the alias a container_name gives) is answered
-                   by that service's pod; the seconds from the apply to all four ready are
-                   printed (kith's side of T-0320's comparison with docker compose)
+                   nothing in it left out) and of ci/compose/media.yml (the eight services
+                   of the media stack, on the test pod) applied to it. Expected: each
+                   Workload ready, each Service given its backend, and a Job in a pod
+                   asking each service by its compose name (and the alias a container_name
+                   gives) is answered by that service's pod; the seconds from the apply to
+                   all ready are printed (kith's side of T-0320's comparison with docker
+                   compose). With KITH_E2E=1 also docker compose up of media.yml on an
+                   Alpine machine of its own (docker from Alpine's packages; three runs,
+                   the median printed beside kith's)
   --test quota     instead: one node on the mesh, its state disk made with project
                    quotas (as os/build.sh makes it). Expected: kithd says it holds
                    pods' storage limits at the write; a pod of 64Ki removed and the
@@ -301,7 +322,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive) ;; *) echo "vm.sh: --test knows: init, image, update, modules, rollout, install, vps, netboot, crypt, tpm, duress, blackout, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | alone) ;; *) echo "vm.sh: --test knows: init, image, update, modules, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
