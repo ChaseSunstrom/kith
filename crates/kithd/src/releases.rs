@@ -267,7 +267,15 @@ pub fn fits(asked: Option<&str>, version: &str) -> bool {
 /// Repository it names, if it names one), the one it has installed, or the newest when
 /// it has none or `follow`s the newest (`autoUpgrade`; an upgrade's preview follows too).
 /// `1.0.0-rc1` is older than `1.0.0`.
-fn package<'a>(store: &'a Store, release: &Resource, spec: &ReleaseSpec, follow: bool) -> Result<&'a Resource, String> {
+/// With `pin` (the version a rolled-back spec had, [`pinned`]), that one and no other, and
+/// an error when it is gone: a rollback never moves to a version it did not have.
+fn package<'a>(
+    store: &'a Store,
+    release: &Resource,
+    spec: &ReleaseSpec,
+    follow: bool,
+    pin: Option<&str>,
+) -> Result<&'a Resource, String> {
     let (name, asked) = (&spec.package.name, spec.package.version.as_deref());
     let version = |package: &Resource| package.spec["version"].as_str().unwrap_or_default().to_string();
     let from = spec
@@ -281,8 +289,13 @@ fn package<'a>(store: &'a Store, release: &Resource, spec: &ReleaseSpec, follow:
             && fits(asked, &version(package))
     };
     let installed = release.status.as_ref().and_then(|status| status["version"].as_str());
-    let kept = installed.filter(|_| !follow);
+    let kept = pin.or(installed.filter(|_| !follow));
     let kept = kept.and_then(|installed| store.get(&format!("Package/{name}-{installed}")));
+    if let Some(pin) = pin {
+        return kept
+            .filter(fitting)
+            .ok_or(format!("there is no Package {name} {pin}, the version this spec installed before"));
+    }
     let newest = || {
         let packages = store.list(Some("Package")).filter(fitting);
         packages.max_by_key(|package| semver::Version::parse(&version(package)).ok())
@@ -328,7 +341,9 @@ fn inputs<'a>(
     preview: bool,
 ) -> Result<(Inputs, &'a Resource, Vec<Value>), String> {
     let spec: ReleaseSpec = serde_json::from_value(release.spec.clone()).map_err(|e| e.to_string())?;
-    let package = package(store, release, &spec, preview || spec.auto_upgrade == Some(true))?;
+    // (An upgrade's preview is what moving would do: it is not held back.)
+    let pin = pinned(store, release).filter(|_| !preview);
+    let package = package(store, release, &spec, preview || spec.auto_upgrade == Some(true), pin.as_deref())?;
     let (cluster, everywhere) = shared_values(store, "ConfigMap/kith-system/kith-values")?;
     let (local, here) = shared_values(store, &format!("ConfigMap/{}/{SHARED}", namespace(release)))?;
     let inputs = Inputs {
@@ -783,6 +798,26 @@ fn history_of(release: &Resource, version: &str, now: u64) -> Option<Value> {
     Some(Value::Array(seen))
 }
 
+/// The version a Release that follows the newest (`autoUpgrade`) is held to, when its spec is
+/// again what it was before: the spec is compared with the revisions before the run of equal
+/// ones it is in (a metadata edit is not a return), newest first, and the version is the last
+/// `history` entry at or before the revision found. None when there is none, or the history
+/// no longer reaches back so far. (One that stays on its version keeps it already, and turning
+/// `autoUpgrade` off to freeze it must not bring back an older one.)
+fn pinned(store: &Store, release: &Resource) -> Option<String> {
+    if release.spec["autoUpgrade"] != true {
+        return None;
+    }
+    let seen = release.status.as_ref()?["history"].as_array()?;
+    let revisions = store.history(&release.key()).ok()?.iter().rev();
+    let mut earlier = revisions.skip_while(|revision| revision.resource.spec == release.spec);
+    earlier.find(|revision| revision.resource.spec == release.spec).and_then(|revision| {
+        let at = revision.resource.metadata.revision?;
+        let entry = seen.iter().rev().find(|entry| entry["revision"].as_u64().is_some_and(|r| r <= at))?;
+        entry["version"].as_str().map(str::to_string)
+    })
+}
+
 /// Compare `resources` with the store for the owner `key`. Nothing of someone else's
 /// is taken over: one resource that is there already and not `key`'s refuses them all.
 pub fn reconcile(
@@ -872,6 +907,7 @@ fn plan(store: &Store, renders: &Renders, upgrades: &Renders, newer: &Newer, now
                 let mut status = json!({
                     "state": "installed", "message": message, "version": output.version,
                     "resources": done.kept, "notes": output.notes, "observedRevision": release.metadata.revision,
+                    "pinned": pinned(store, release).is_some(),
                 });
                 // (Left out when not known yet or unchanged: the status is written when a field differs.)
                 if let Some(pending) = upgrade_of(store, release, &output, upgrades, newer) {
@@ -1699,6 +1735,60 @@ mod tests {
         assert_eq!(settle_at(&mut store, &mut renders, &mut upgrades, 80), 0);
     }
 
+    /// A Release whose spec is again what an earlier revision held (a `kith rollback`) goes
+    /// back to the version it had then, even following the newest; what a later version made
+    /// is pruned, a spec that matches no earlier one follows again, and a Package that is gone
+    /// is an error that tears nothing down.
+    #[test]
+    fn a_rollback_brings_back_the_version_it_installed() {
+        let (mut store, mut renders, mut upgrades) = (Store::default(), Renders::new(), Renders::new());
+        let revision = |store: &Store| store.get(SELF).unwrap().metadata.revision.unwrap();
+        let mut at = 100;
+        let mut settled = |store: &mut Store| {
+            at += 100;
+            settle_at(store, &mut renders, &mut upgrades, at);
+            assert_eq!(settle_at(store, &mut renders, &mut upgrades, at + 1), 0);
+        };
+        let plain = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }} }\n\
+                     spec: { data: { colour: {{ values.colour }} } }\n";
+        store.apply(package("1.0.0", &[("map.yaml", plain)])).unwrap();
+        apply(&mut store, RELEASE);
+        settled(&mut store);
+        let first = revision(&store);
+        // An edit, then 2.0.0 (which makes an extra map) comes and is followed.
+        apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: blue"));
+        settled(&mut store);
+        store.apply(package("2.0.0", &[("map.yaml", MAP)])).unwrap();
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "2.0.0");
+        assert!(store.get("ConfigMap/shop/mine-maps-extra").is_some());
+        // Rolled back to the first revision: 1.0.0 again, the extra map pruned.
+        store.rollback(SELF, first).unwrap();
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
+        assert!(store.get("ConfigMap/shop/mine-maps-extra").is_none());
+        // A newer Package does not move it.
+        store.apply(package("3.0.0", &[("map.yaml", MAP)])).unwrap();
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
+        assert_eq!(status_of(&store)["pinned"], true);
+        // A spec equal to no earlier revision follows again.
+        apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: green"));
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "3.0.0");
+        assert_eq!(status_of(&store)["pinned"], false);
+        assert!(store.get("ConfigMap/shop/mine-maps-extra").is_some());
+        // Back again with 1.0.0 gone: an error, and nothing is torn down.
+        store.rollback(SELF, first).unwrap();
+        store.delete("Package/maps-1.0.0").unwrap();
+        settled(&mut store);
+        let status = status_of(&store);
+        assert_eq!(status["state"], "error");
+        assert!(status["message"].as_str().unwrap().contains("no Package maps 1.0.0"));
+        assert!(store.get("ConfigMap/shop/mine-maps-extra").is_some());
+        assert!(store.get("ConfigMap/shop/mine-maps").is_some());
+    }
+
     /// `status.history` has one entry per version installed (newest last, the last ten), so
     /// writing it never makes another turn.
     #[test]
@@ -1751,8 +1841,9 @@ mod tests {
         );
         assert_eq!(entries.as_array().unwrap().len(), 3);
 
-        // Eleven more installs keep the last ten.
-        apply(&mut store, RELEASE);
+        // Eleven more installs keep the last ten. (A spec that is new: one equal to an earlier
+        // one is a rollback, and holds its version.)
+        apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: teal"));
         for minor in 3..=13 {
             store
                 .apply(package(&format!("{minor}.0.0"), &[("map.yaml", MAP)]))
