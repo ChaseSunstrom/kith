@@ -1770,6 +1770,42 @@ fn release_installs_a_package() {
     assert!(there("Package/maps-1.0.0"));
 }
 
+/// A package with a pre-install and a post-install hook Job: each writes a line to a file, and
+/// the post one fails unless the pre one has. The Release is installed and both Jobs succeeded.
+#[test]
+fn release_hooks() {
+    if !e2e() {
+        return;
+    }
+    let daemon = Daemon::start("hooks");
+    let (order, package) = (daemon.dir.join("order"), daemon.dir.join("hooked"));
+    std::fs::create_dir_all(package.join("templates")).unwrap();
+    std::fs::write(package.join("package.yaml"), "name: hooked\nversion: 1.0.0\n").unwrap();
+    let job = |point: &str, script: String| {
+        format!(
+            "---\napiVersion: kith.dev/v1\nkind: Job\nmetadata: {{ name: {{{{ name }}}}-{point}, annotations: {{ 'kith.dev/hook': {point} }} }}\n\
+             spec:\n  template:\n    exec: [{{ name: main, command: [sh, -c, '{script}'] }}]\n"
+        )
+    };
+    let path = order.display();
+    let pre = job("pre-install", format!("echo pre >> {path}"));
+    let post = job("post-install", format!("grep -qx pre {path} && echo post >> {path}"));
+    let map = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }} }\nspec: { data: { a: b } }\n";
+    std::fs::write(package.join("templates/all.yaml"), format!("{map}{pre}{post}")).unwrap();
+    daemon.ok(&["package", "push", "hooked"]);
+    daemon.apply("apiVersion: kith.dev/v1\nkind: Release\nmetadata: { name: mine }\nspec: { package: { name: hooked } }\n");
+    wait_for("the release to be installed", || daemon.status("Release/mine")["state"] == "installed");
+    let said = |name: &str| daemon.status(&format!("Job/mine-hooked-{name}"))["state"].clone();
+    wait_for("the hooks to have succeeded", || {
+        said("pre-install") == "succeeded" && said("post-install") == "succeeded"
+    });
+    assert_eq!(std::fs::read_to_string(&order).unwrap(), "pre\npost\n");
+    assert_eq!(daemon.status("Release/mine")["resources"], serde_json::json!(["ConfigMap/default/mine-hooked"]));
+    // Gone with the Release.
+    daemon.ok(&["delete", "Release/mine"]);
+    wait_for("the hooks to go", || daemon.kith(&["get", "Job/mine-hooked-pre-install"]).0 != 0);
+}
+
 /// Stops a helper process when the test is over.
 struct Stop(Child);
 

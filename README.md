@@ -100,7 +100,7 @@ is still there when it starts again.
 | Make several machines one cluster | [More than one node](docs/guide/cluster.md#more-than-one-node) |
 | Give what runs a name, inside and outside | [DNS](docs/guide/cluster.md#dns); a host of its own with a certificate: [More than one node](docs/guide/cluster.md#more-than-one-node) |
 | Say a thing once: names, functions and imports instead of YAML repeated | [kith's own language](docs/guide/api.md#kiths-own-language) |
-| Install an app with its settings, and upgrade it | [Packages](docs/guide/packages.md#packages) |
+| Install an app with its settings, and upgrade it (a Job annotated `kith.dev/hook` runs before or after: `pre-install`, `post-install`, `pre-upgrade`, `post-upgrade`; delete hooks are not built) | [Packages](docs/guide/packages.md#packages) |
 | Keep a cluster in step with a git repository | [Sources (GitOps)](docs/guide/packages.md#sources-gitops) |
 | Use kubectl, Helm and the manifests you have, unchanged | [kubectl and Helm, as they are](docs/guide/kubernetes.md#kubectl-and-helm-as-they-are) |
 | Turn manifests or a chart into kith's own files | [Importing from Kubernetes and Helm](docs/guide/kubernetes.md#importing-from-kubernetes-and-helm) |
