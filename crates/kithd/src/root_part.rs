@@ -185,7 +185,12 @@ const RANGE: u32 = 65536;
 /// what the unit only reads, `None` of all else. The state and memory directories hold more
 /// than that (the node's keys, other pods' files): none of it is the unit's to mount, and
 /// neither is a directory that holds only what is.
-fn source(host: &Path, ground: &Ground, pod: &str, container: &str) -> Option<bool> {
+///
+/// `pod` is the unit's pod (its network's, where `resolv.conf` and `hosts` are) and `replica` the
+/// replica's, which keeps its files, scratch and identity: the same but in a rolling update's
+/// second generation, whose pod is the replica's with a `b` (`controller::pod_id`) and which
+/// mounts what the first does.
+fn source(host: &Path, ground: &Ground, pod: &str, replica: &str, container: &str) -> Option<bool> {
     let parts = |base: &Option<PathBuf>| -> Option<Vec<String>> {
         let rest = host.strip_prefix(base.as_ref()?.canonicalize().ok()?).ok()?;
         Some(
@@ -197,9 +202,9 @@ fn source(host: &Path, ground: &Ground, pod: &str, container: &str) -> Option<bo
     // (The pod's own, in either directory: a file of a map and a scratch; and in memory its
     // identity's files. The pod's directory itself, in memory, holds its key.)
     let own = |rest: &[&str], identity: bool| match rest {
-        ["replicas", p, "files", c, _, ..] => (p, c) == (&pod, &container),
-        ["replicas", p, "identity", c, ..] => identity && (p, c) == (&pod, &container),
-        ["replicas", p, "scratch", _, ..] => *p == pod,
+        ["replicas", p, "files", c, _, ..] => (p, c) == (&replica, &container),
+        ["replicas", p, "identity", c, ..] => identity && (p, c) == (&replica, &container),
+        ["replicas", p, "scratch", _, ..] => *p == replica,
         _ => false,
     };
     if let Some(rest) = parts(&ground.state) {
@@ -240,9 +245,14 @@ fn check_mount(mount: &Mount, ground: &Ground, id: &str) -> Result<(), String> {
         return refused("a path that does not resolve");
     };
     let (pod, container) = id.rsplit_once('_').unwrap_or((id, ""));
+    let replica = pod.strip_suffix('b').unwrap_or(pod);
     let given = "not a directory the node gives to a container's user: it may not be given";
-    match (source(&real, ground, pod, container), mount.give) {
-        (Some(true), _) | (Some(false), false) => Ok(()),
+    match (source(&real, ground, pod, replica, container), mount.give) {
+        (Some(true), _) => Ok(()),
+        // (The pod's resolv.conf and hosts are the node's, written for every container in it: one
+        // that could write them would answer for the others' names.)
+        (Some(false), false) if mount.read_only => Ok(()),
+        (Some(false), false) => refused("the pod's own file, mounted read-only or not at all"),
         // (Where the node's policy lets the store name a path, it does: a directory of the host's
         // that an admin named is theirs, and given to no one.)
         (None, false) if hostpaths => Ok(()),
@@ -261,8 +271,12 @@ pub fn check_create(create: &Create, ground: &Ground, owns: &dyn Fn(&Path) -> bo
         check_mount(mount, ground, create.id)?;
     }
     // What is given a user is chowned to it, tree and all, before the runtime looks at the
-    // user: where there are ranges (kithd is root), a user past the range is refused here.
+    // user: where there are ranges (kithd is root, and the runtime shifts this unit: one of its
+    // own network, not the host's users, no device), a user past the range is refused here.
     if ground.root
+        && unit.netns.is_some()
+        && !unit.host_users
+        && unit.devices.is_empty()
         && let Some(user) = unit.user.filter(|user| *user >= RANGE)
         && unit.mounts.iter().any(|mount| mount.give)
     {
@@ -867,9 +881,14 @@ mod tests {
 
     /// Why `unit` is refused (or `None`: it is made) under the ground.
     fn refused(unit: &Unit, ground: &Ground) -> Option<String> {
+        refused_as("w_a_b_0_c", unit, ground)
+    }
+
+    /// [`refused`], of the unit `id`.
+    fn refused_as(id: &str, unit: &Unit, ground: &Ground) -> Option<String> {
         let image = Image::default();
         let create = Create {
-            id: "w_a_b_0_c",
+            id,
             image: &image,
             unit,
             out: null(),
@@ -1056,10 +1075,33 @@ mod tests {
         for host in &mine {
             assert_eq!(refused(&with(host, true), &g), None, "{}", host.display());
         }
-        // The pod's own two files: read, never given.
+        // A rolling update's second generation (`w_a_b_0b`, a pod of its own) mounts what the
+        // replica keeps, under the first's name, as the first does.
+        for host in &mine {
+            assert_eq!(
+                refused_as("w_a_b_0b_c", &with(host, true), &g),
+                None,
+                "{}",
+                host.display()
+            );
+        }
+        // The pod's own two files: read, never given, and never written.
+        let read = |host: &Path| Unit {
+            mounts: vec![Mount {
+                read_only: true,
+                ..mount(host, "/etc/hosts")
+            }],
+            ..plain()
+        };
         let resolv = s("pods/w_a_b_0/resolv.conf");
-        assert_eq!(refused(&with(&resolv, false), &g), None);
+        assert_eq!(refused(&read(&resolv), &g), None);
+        assert!(refused(&with(&resolv, false), &g).unwrap().contains("read-only"));
         assert!(refused(&with(&resolv, true), &g).unwrap().contains("given"));
+        // Each generation's are its own pod's.
+        let second = s("pods/w_a_b_0b/hosts");
+        assert_eq!(refused_as("w_a_b_0b_c", &read(&second), &g), None);
+        assert!(refused_as("w_a_b_0b_c", &read(&resolv), &g).is_some());
+        assert!(refused(&read(&second), &g).is_some());
         // What the node keeps for itself is in the state and memory directories too, and no
         // mount of it is made whoever asks: the directories themselves, and their keys.
         let keys = s("pki/ca.key");
@@ -1118,12 +1160,28 @@ mod tests {
         // user, but not the chown of what is to be given it.
         let user = |user: u32, give: bool| Unit {
             user: Some(user),
+            netns: Some(PathBuf::from(NETNS)),
             ..with(&mine[0], give)
         };
         assert_eq!(refused(&user(65535, true), &g), None);
         assert!(refused(&user(65536, true), &g).unwrap().contains("range"));
         assert!(refused(&user(u32::MAX - 1, true), &g).unwrap().contains("range"));
         assert_eq!(refused(&user(65536, false), &g), None);
+        // Only where the runtime shifts ids: not for the host's users, or a unit with no pod,
+        // whose user is the host's own.
+        let unshifted = [
+            Unit {
+                host_users: true,
+                ..user(65536, true)
+            },
+            Unit {
+                netns: None,
+                ..user(65536, true)
+            },
+        ];
+        for unit in &unshifted {
+            assert_eq!(refused(unit, &g), None);
+        }
     }
 
     #[test]
@@ -1329,7 +1387,10 @@ mod tests {
             netns: Some(given.netns),
             hostname: Some(given.hostname),
             mounts: vec![
-                mount(&on_disk(given.files[0].clone()), "/etc/resolv.conf"),
+                Mount {
+                    read_only: true,
+                    ..mount(&on_disk(given.files[0].clone()), "/etc/resolv.conf")
+                },
                 mount(&on_disk(state.join("volumes/ns/data")), "/data"),
             ],
             ..Unit::default()

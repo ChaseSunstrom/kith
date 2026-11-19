@@ -274,7 +274,9 @@ pod's `resolv.conf` and `hosts`, read-only. Never the state directory itself, `p
 and people keys), the memory directory or another pod's. A host path outside these only where
 `hostPaths` is on, and never given to a user. `give` (the tree is made the container's user's)
 is refused for anything a unit does not own: only volumes, remote shares, seats and its own pod's
-files. A user past the 65536 ids a container's range has is refused where anything is given.
+files (a rolling update's second generation, pod `<pod>b`, mounts its replica's). A user past
+the 65536 ids a container's range has is refused where anything is given and the runtime
+shifts ids (a unit of its own network, not the host's users, with no device).
 T-0810 replaces the path forms with names (`Volume(name, sub-path)`), which makes this list
 the root part's own derivation.
 
