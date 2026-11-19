@@ -158,10 +158,6 @@ struct Fido2 {
     wrapped: Vec<u8>,
 }
 
-#[allow(
-    dead_code,
-    reason = "the record's half of fido2 (T-0971): the console opens by `open` (T-0974); the verbs call the rest next (docs/adr-fido2.md section 6)"
-)]
 impl Fido2 {
     /// A line of the sizes CTAP2 gives (an id of 128 bytes at most, a salt of 32) and a
     /// wrapped key of a nonce, a key and a tag: one that is none is not written, as it
@@ -841,7 +837,8 @@ const WRONG: &str = "kithd: init: that does not open this node's state";
 
 /// What a line typed at the waiting console is.
 enum Typed {
-    Opens(Vec<u8>, By),
+    /// (The key is wiped when this is dropped, as it is when the line did not stand.)
+    Opens(zeroize::Zeroizing<Vec<u8>>, By),
     Duress(ring::signature::Ed25519KeyPair),
     Wrong,
     /// Not tried: what is said instead of [`WRONG`] (the TPM refuses every PIN for now).
@@ -917,7 +914,7 @@ fn pin_way<T: std::io::Read + std::io::Write + Send + 'static>(
 fn judged(record: &Record, line: &str, pin: Option<&Pin>) -> Typed {
     let code = typed(line);
     if let Some(key) = code.as_ref().and_then(|recovery| unwrap(recovery, &record.recovery)) {
-        return Typed::Opens(key, By::Recovery);
+        return Typed::Opens(zeroize::Zeroizing::new(key), By::Recovery);
     }
     if let Some(pair) = code.map(|code| duress_key(&code)) {
         use ring::signature::KeyPair;
@@ -930,12 +927,12 @@ fn judged(record: &Record, line: &str, pin: Option<&Pin>) -> Typed {
     // (Only what can be a passphrase is tried.)
     let pass = record.pass.as_ref().filter(|_| chosen(line));
     if let Some(key) = pass.and_then(|pass| pass.open(line)) {
-        return Typed::Opens(key, By::Owner);
+        return Typed::Opens(zeroize::Zeroizing::new(key), By::Owner);
     }
     // (And a PIN last: a wrong one is counted. One the TPM refuses is said so, as the
     // right one is refused then too.)
     match pin.filter(|_| pin_shaped(line)).map(|pin| pin(line.as_bytes())) {
-        Some(Ok(key)) => Typed::Opens(key, By::Pin),
+        Some(Ok(key)) => Typed::Opens(zeroize::Zeroizing::new(key), By::Pin),
         Some(Err(why)) if why.starts_with(crate::tpm::LOCKED_OUT) => Typed::Refused(why),
         Some(Err(why)) if why != crate::tpm::NOT_THE_PIN => {
             // (Not the PIN's fault: the TPM failed. Said where the machine logs, not as
@@ -951,61 +948,158 @@ fn judged(record: &Record, line: &str, pin: Option<&Pin>) -> Typed {
 /// lines of the record, and `plugged`, which hands out each key plugged in once.
 struct Touch {
     lines: Vec<Fido2>,
-    plugged: Box<dyn FnMut() -> Vec<Box<dyn crate::fido2::frame::Device + Send>> + Send>,
+    /// The keys plugged in that were not tried yet, by name; asked with the names of those to
+    /// be tried again.
+    plugged: Finder,
+    /// Called each time keys are found: somebody is there (see [`touched`]).
+    present: Box<dyn Fn() + Send>,
+    /// The keys that timed out, by name, and when: tried again after [`RETRY_GAP`].
+    retry: Vec<(String, std::time::Instant)>,
 }
+
+/// A security key plugged in.
+type SecurityKey = Box<dyn crate::fido2::frame::Device + Send>;
+/// A security key with the name it was found under.
+type FoundKey = (String, SecurityKey);
+type Finder = Box<dyn FnMut(&[String]) -> Vec<FoundKey> + Send>;
+
+/// How long after a key timed out (or did not answer) it is tried again: no sooner, so a key
+/// that is stuck is not asked, and said of, every second.
+const RETRY_GAP: Duration = Duration::from_secs(5);
 
 /// A [`Touch`] for the node's record: none without `fido2:` lines, so a node that has no
 /// key never looks for one; the keys are those on this machine's hidraw devices.
 fn touch_of(record: &Record) -> Option<Arc<std::sync::Mutex<Touch>>> {
     let mut tried = std::collections::HashSet::new();
-    let plugged = Box::new(move || {
+    let plugged = Box::new(move |again: &[String]| {
+        // (A key to be tried again is one that is not tried: it is handed out again.)
+        tried.retain(|name| !again.contains(name));
         let keys = crate::fido2::hidraw::plugged_in(Path::new("/sys/class/hidraw"), Path::new("/dev"), &mut tried);
         keys.into_iter()
-            .map(|key| Box::new(key) as Box<dyn crate::fido2::frame::Device + Send>)
+            .map(|(name, key)| (name, Box::new(key) as SecurityKey))
             .collect()
     });
+    let present = Box::new(|| TYPED.notify_one());
     let lines = record.fido2.clone();
-    (!lines.is_empty()).then(|| Arc::new(std::sync::Mutex::new(Touch { lines, plugged })))
+    (!lines.is_empty()).then(|| {
+        Arc::new(std::sync::Mutex::new(Touch {
+            lines,
+            plugged,
+            present,
+            retry: Vec::new(),
+        }))
+    })
+}
+
+/// A security key that reads and writes until `stop` is set (the console is done with it).
+struct Stopping<'a>(
+    &'a mut (dyn crate::fido2::frame::Device + Send),
+    &'a std::sync::atomic::AtomicBool,
+);
+
+impl crate::fido2::frame::Device for Stopping<'_> {
+    fn write(&mut self, report: &[u8; crate::fido2::frame::REPORT]) -> std::io::Result<()> {
+        if self.1.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("the console is done with the key"));
+        }
+        self.0.write(report)
+    }
+
+    fn read(&mut self) -> std::io::Result<Vec<u8>> {
+        if self.1.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("the console is done with the key"));
+        }
+        self.0.read()
+    }
+}
+
+/// Said of a key that could not be used (where the machine logs, not as an answer: no secret
+/// is in `why`), and whether it is worth trying again: a touch not given in time or a key
+/// that said nothing is, a key that wants its PIN is not (and nothing but the PIN helps).
+fn unusable(name: &str, why: &str, stop: &std::sync::atomic::AtomicBool) -> bool {
+    use crate::fido2::frame;
+    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if why.contains(frame::PIN_REQUIRED) {
+        eprintln!(
+            "kithd: init: the security key {name} needs its PIN: kith asks for none at the console; use another way in"
+        );
+        return false;
+    }
+    let again = why.contains(frame::USER_ACTION_TIMEOUT) || why.contains("timed out");
+    let then = if again {
+        "it is tried again"
+    } else {
+        "unplug it and plug it in to try again"
+    };
+    eprintln!("kithd: init: the security key {name} could not be used: {why}: {then}");
+    again
 }
 
 /// Each key plugged in that was not tried yet, asked for its secret under each line (a
 /// touch, if the key holds the line's credential: one that does not says so at once), and
-/// the state's key from the first line it opens. None where no key is there; a key that
-/// opens nothing is [`Typed::Wrong`], as is a line that opens nothing.
+/// the state's key from the first line it opens. None where no key is there (or `stop`);
+/// a key that opens nothing is [`Typed::Wrong`], as is a line that opens nothing. A key
+/// that timed out is asked again after [`RETRY_GAP`], and each time keys are found the
+/// wait of a system on trial starts over (a key plugged in and never touched, for good,
+/// holds that off: somebody is there, or something is stuck).
 /// (Off the thread that asks the cluster: a key waits for a touch.)
-fn touched(touch: &mut Touch) -> Option<Typed> {
+fn touched(touch: &mut Touch, stop: &std::sync::atomic::AtomicBool) -> Option<Typed> {
     use crate::fido2::{flow, frame};
-    let keys = (touch.plugged)();
+    let (due, waiting) = std::mem::take(&mut touch.retry)
+        .into_iter()
+        .partition::<Vec<_>, _>(|(_, at)| at.elapsed() >= RETRY_GAP);
+    touch.retry = waiting;
+    let again: Vec<String> = due.into_iter().map(|(name, _)| name).collect();
+    let keys = (touch.plugged)(&again);
     if keys.is_empty() {
         return None;
     }
+    (touch.present)();
     eprintln!("kithd: init: a security key is plugged in: touch it, if it is this node's");
-    for mut key in keys {
-        let Ok(channel) = frame::init(&mut *key, random()) else {
-            continue;
+    for (name, mut key) in keys {
+        let mut key = Stopping(&mut *key, stop);
+        let channel = match frame::init(&mut key, random()) {
+            Ok(channel) => channel,
+            Err(why) => {
+                if unusable(&name, &why, stop) {
+                    touch.retry.push((name, std::time::Instant::now()));
+                }
+                continue;
+            }
         };
         for line in &touch.lines {
             let Ok(salt) = <[u8; crate::fido2::hmac::SALT]>::try_from(&line.salt[..]) else {
                 continue;
             };
-            match flow::get_assertion(&mut *key, channel.cid, flow::RP_ID, &line.id, &salt) {
+            match flow::get_assertion(&mut key, channel.cid, flow::RP_ID, &line.id, &salt) {
                 Ok(secret) => {
                     if let Some(opened) = line.open(&secret[..]) {
-                        return Some(Typed::Opens(opened.to_vec(), By::Key));
+                        return Some(Typed::Opens(opened, By::Key));
                     }
                 }
                 Err(why) if why.contains(frame::NO_CREDENTIALS) => {}
                 Err(why) => {
-                    // (Said where the machine logs, not as an answer: no secret is in it.)
-                    eprintln!(
-                        "kithd: init: a security key could not be used: {why}: unplug it and plug it in to try again"
-                    );
+                    if unusable(&name, &why, stop) {
+                        touch.retry.push((name, std::time::Instant::now()));
+                    }
                     break;
                 }
             }
         }
     }
-    Some(Typed::Wrong)
+    // (A key let go of, mid-attempt, is no wrong answer: nobody is left to hear it.)
+    (!stop.load(std::sync::atomic::Ordering::Relaxed)).then_some(Typed::Wrong)
+}
+
+/// Sets the flag it holds when dropped: [`touched`] stops at its key's next report.
+struct StopKeys(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopKeys {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A duress code that was typed: its key, for the cluster to be told with.
@@ -1034,6 +1128,9 @@ async fn console(
     // The key being tried (off this thread), when it began, and when the keys are looked for next.
     let mut trying: Option<(tokio::time::Instant, tokio::task::JoinHandle<Option<Typed>>)> = None;
     let mut looked = tokio::time::Instant::now();
+    // (Set when this returns, or is dropped because the cluster gave the key first: a key
+    // being tried is let go of at its next report, not at its touch timeout.)
+    let stop = StopKeys(Arc::new(std::sync::atomic::AtomicBool::new(false)));
     loop {
         while let Ok(line) = lines.try_recv() {
             let line = zeroize::Zeroizing::new(line);
@@ -1047,7 +1144,7 @@ async fn console(
             let judged = tokio::task::spawn_blocking(move || judged(&judge, &line, by.as_ref())).await;
             let gone = forget.borrow().is_some();
             let answer = match judged.unwrap_or(Typed::Wrong) {
-                Typed::Opens(key, by) if !gone => return (key, by),
+                Typed::Opens(mut key, by) if !gone => return (std::mem::take(&mut *key), by),
                 Typed::Duress(pair) if !gone => {
                     erased = erase();
                     // (And from memory: what was typed before no longer opens either.)
@@ -1066,8 +1163,13 @@ async fn console(
         // meanwhile is judged all the same), looked at when it is done, looked for each second.
         if let Some((started, handle)) = trying.take_if(|(_, handle)| handle.is_finished()) {
             let gone = forget.borrow().is_some();
-            match handle.await.ok().flatten() {
-                Some(Typed::Opens(key, by)) if !gone => return (key, by),
+            let found = handle.await.unwrap_or_else(|why| {
+                // (A thread that failed: said, and the keys are looked for again.)
+                eprintln!("kithd: init: a security key could not be tried: {why}");
+                None
+            });
+            match found {
+                Some(Typed::Opens(mut key, by)) if !gone => return (std::mem::take(&mut *key), by),
                 Some(_) => answers.push_back((started + ANSWER, WRONG.to_string())),
                 None => {}
             }
@@ -1075,9 +1177,12 @@ async fn console(
         let now = tokio::time::Instant::now();
         match &touch {
             Some(shared) if trying.is_none() && now >= looked => {
-                let shared = Arc::clone(shared);
-                let attempt =
-                    tokio::task::spawn_blocking(move || shared.lock().ok().and_then(|mut touch| touched(&mut touch)));
+                let (shared, stop) = (Arc::clone(shared), Arc::clone(&stop.0));
+                let attempt = tokio::task::spawn_blocking(move || {
+                    // (A thread that failed while it held this left nothing half-done in it.)
+                    let mut touch = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    touched(&mut touch, &stop)
+                });
                 (trying, looked) = (Some((now, attempt)), now + Duration::from_secs(1));
             }
             _ => {}
@@ -3418,7 +3523,7 @@ mod tests {
         let Tpm(wire) = tpm;
         let way = pin_way(&seal, None, with.parent.as_deref(), || Ok(Tpm(wire))).unwrap();
         let opens = |line: &str| judged(&with, line, Some(&way));
-        assert!(matches!(opens(pin), Typed::Opens(opened, By::Pin) if opened == key));
+        assert!(matches!(opens(pin), Typed::Opens(opened, By::Pin) if *opened == key));
         assert!(matches!(opens("40917254"), Typed::Wrong));
         // (Not a PIN's shape: not tried, not counted.)
         assert!(matches!(opens("40917"), Typed::Wrong) && matches!(opens("4091725x"), Typed::Wrong));
@@ -3427,7 +3532,7 @@ mod tests {
             Typed::Refused(why) => assert_eq!(why, format!("{LOCKED_OUT}: the next is taken within 40 seconds")),
             _ => panic!("the right PIN opened while the TPM refused every PIN"),
         }
-        assert!(matches!(opens(&shown(&recovery)), Typed::Opens(opened, By::Recovery) if opened == key));
+        assert!(matches!(opens(&shown(&recovery)), Typed::Opens(opened, By::Recovery) if *opened == key));
         drop(way);
 
         // Another system (a PCR moved): no PIN is asked, so none is counted.
@@ -4441,9 +4546,9 @@ mod tests {
             recovery: wrap(&old, &key),
             ..Record::default()
         };
-        assert!(matches!(judged(&record, &shown(&old), None), Typed::Opens(opened, By::Recovery) if opened == key));
+        assert!(matches!(judged(&record, &shown(&old), None), Typed::Opens(opened, By::Recovery) if *opened == key));
         let (with, new) = renewed(&record, &key);
-        assert!(matches!(judged(&with, &new, None), Typed::Opens(opened, By::Recovery) if opened == key));
+        assert!(matches!(judged(&with, &new, None), Typed::Opens(opened, By::Recovery) if *opened == key));
         assert!(matches!(judged(&with, &shown(&old), None), Typed::Wrong));
         // Whoever asked was shown it; nothing else of the record changed, and the key
         // shown is not in it.
@@ -4925,13 +5030,60 @@ mod touch_fixture {
 
     pub fn touch(
         record: &Record,
-        plugged: impl FnMut() -> Vec<Plugged> + Send + 'static,
+        mut plugged: impl FnMut() -> Vec<Plugged> + Send + 'static,
     ) -> Option<Arc<std::sync::Mutex<Touch>>> {
-        let lines = record.fido2.clone();
         Some(Arc::new(std::sync::Mutex::new(Touch {
-            lines,
-            plugged: Box::new(plugged),
+            lines: record.fido2.clone(),
+            plugged: Box::new(move |_| {
+                let keys = plugged();
+                keys.into_iter()
+                    .enumerate()
+                    .map(|(n, key)| (format!("key{n}"), key))
+                    .collect()
+            }),
+            present: Box::new(|| ()),
+            retry: Vec::new(),
         })))
+    }
+
+    /// `touched`, with nothing to stop it.
+    pub fn touch_once(touch: &mut Touch) -> Option<Typed> {
+        touched(touch, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// A key that waits for `release` (a message, or its sender dropped) before it answers, as
+    /// one waiting for a touch does; `started` is sent when it is first read, so a test goes
+    /// on when the key is waiting, not after a time. Gives up after ten seconds.
+    pub struct Gate {
+        pub key: Plugged,
+        pub started: std::sync::mpsc::Sender<()>,
+        pub release: std::sync::mpsc::Receiver<()>,
+        pub open: bool,
+    }
+
+    impl Device for Gate {
+        fn write(&mut self, report: &[u8; frame::REPORT]) -> std::io::Result<()> {
+            self.key.write(report)
+        }
+        fn read(&mut self) -> std::io::Result<Vec<u8>> {
+            if !std::mem::replace(&mut self.open, true) {
+                let _ = self.started.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(10));
+            }
+            self.key.read()
+        }
+    }
+
+    /// A `Gate` round `key`: the key, when it is first read, and what lets it go.
+    pub fn gated(key: Key) -> (Plugged, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let ((started, waiting), (release, go)) = (std::sync::mpsc::channel(), std::sync::mpsc::channel());
+        let gate = Gate {
+            key: Box::new(key),
+            started,
+            release: go,
+            open: false,
+        };
+        (Box::new(gate), waiting, release)
     }
 
     pub fn keyboard(lines: &[&str]) -> (std::sync::mpsc::Sender<String>, std::sync::mpsc::Receiver<String>) {
@@ -4940,20 +5092,6 @@ mod touch_fixture {
             type_it.send(line.to_string()).unwrap();
         }
         (type_it, typed)
-    }
-
-    /// A key that takes `wait` before its first answer, as one waiting for a touch does.
-    pub struct Slow(pub Plugged, pub Duration, pub bool);
-    impl Device for Slow {
-        fn write(&mut self, report: &[u8; frame::REPORT]) -> std::io::Result<()> {
-            self.0.write(report)
-        }
-        fn read(&mut self) -> std::io::Result<Vec<u8>> {
-            if !std::mem::replace(&mut self.2, true) {
-                std::thread::sleep(self.1);
-            }
-            self.0.read()
-        }
     }
 }
 
@@ -4969,21 +5107,108 @@ mod touch {
         let (record, a, b) = enrolled();
         for key in [a, b] {
             let touch = touch(&record, once(vec![Box::new(key)])).unwrap();
-            let opened = touched(&mut touch.lock().unwrap());
-            assert!(matches!(opened, Some(Typed::Opens(key, By::Key)) if key == STATE));
+            let opened = touch_once(&mut touch.lock().unwrap());
+            assert!(matches!(opened, Some(Typed::Opens(key, By::Key)) if *key == STATE));
             // (And handed out once: nothing is plugged in the next time.)
-            assert!(touched(&mut touch.lock().unwrap()).is_none());
+            assert!(touch_once(&mut touch.lock().unwrap()).is_none());
         }
+    }
+
+    /// A key that says nothing.
+    struct Dead;
+    impl crate::fido2::frame::Device for Dead {
+        fn write(&mut self, _: &[u8; crate::fido2::frame::REPORT]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn read(&mut self) -> std::io::Result<Vec<u8>> {
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+    }
+
+    #[test]
+    fn a_key_that_timed_out_is_handed_out_again_after_the_gap() {
+        let (record, ..) = enrolled();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let log = Arc::clone(&asked);
+        let mut dead = Some(Box::new(Dead) as Plugged);
+        let mut touch = Touch {
+            lines: record.fido2.clone(),
+            plugged: Box::new(move |again| {
+                log.lock().unwrap().push(again.to_vec());
+                dead.take()
+                    .map(|key| vec![("hidraw9".to_string(), key)])
+                    .unwrap_or_default()
+            }),
+            present: Box::new(|| ()),
+            retry: Vec::new(),
+        };
+        // A key that says nothing is a key that was tried, and is said of.
+        assert!(matches!(touch_once(&mut touch), Some(Typed::Wrong)));
+        assert_eq!(touch.retry.len(), 1);
+        // Not asked for again at once, and then, after the gap, it is.
+        assert!(touch_once(&mut touch).is_none());
+        touch.retry[0].1 = std::time::Instant::now().checked_sub(RETRY_GAP).unwrap();
+        assert!(touch_once(&mut touch).is_none());
+        assert!(touch.retry.is_empty());
+        let none = Vec::<String>::new();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [none.clone(), none, vec!["hidraw9".to_string()]]
+        );
+    }
+
+    #[test]
+    fn each_find_of_keys_says_somebody_is_there_and_no_find_does_not() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (record, a, _) = enrolled();
+        let said = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&said);
+        let touch = touch(&record, once(vec![Box::new(a)])).unwrap();
+        touch.lock().unwrap().present = Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(touch_once(&mut touch.lock().unwrap()).is_some());
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+        assert!(touch_once(&mut touch.lock().unwrap()).is_none());
+        assert_eq!(said.load(Ordering::SeqCst), 1, "no key, nobody there");
+    }
+
+    #[test]
+    fn a_key_is_let_go_of_when_the_console_is_done_with_it() {
+        let (record, a, _) = enrolled();
+        let touch = touch(&record, once(vec![Box::new(a)])).unwrap();
+        let stopped = std::sync::atomic::AtomicBool::new(true);
+        assert!(touched(&mut touch.lock().unwrap(), &stopped).is_none());
+        assert!(
+            touch.lock().unwrap().retry.is_empty(),
+            "a key let go of is not tried again"
+        );
+    }
+
+    #[test]
+    fn a_key_that_wants_its_pin_is_not_tried_again() {
+        let running = std::sync::atomic::AtomicBool::new(false);
+        let said = "the key answered status 0x36 (PIN_REQUIRED)";
+        assert!(!unusable("hidraw0", said, &running));
+        assert!(unusable("hidraw0", "reading from the key: timed out", &running));
+        assert!(unusable(
+            "hidraw0",
+            "the key answered status 0x2f (USER_ACTION_TIMEOUT)",
+            &running
+        ));
+        assert!(!unusable("hidraw0", "a report of 3 bytes: 64 expected", &running));
+        let stopped = std::sync::atomic::AtomicBool::new(true);
+        assert!(!unusable("hidraw0", "reading from the key: timed out", &stopped));
     }
 
     #[test]
     fn a_key_that_is_not_enrolled_opens_nothing() {
         let (record, ..) = enrolled();
         let touch = touch(&record, once(vec![Box::new(stranger())])).unwrap();
-        assert!(matches!(touched(&mut touch.lock().unwrap()), Some(Typed::Wrong)));
+        assert!(matches!(touch_once(&mut touch.lock().unwrap()), Some(Typed::Wrong)));
         // None plugged in: nothing to say.
         let none = super::touch_fixture::touch(&record, Vec::new).unwrap();
-        assert!(touched(&mut none.lock().unwrap()).is_none());
+        assert!(touch_once(&mut none.lock().unwrap()).is_none());
         // A node with no fido2 lines looks for no key.
         assert!(touch_of(&Record::default()).is_none());
     }
@@ -5090,23 +5315,22 @@ mod console_order {
         );
     }
 
-    /// (Real time: a key waiting for a touch holds a thread, not the console.)
+    /// (Real time, no margins: the passphrase is typed once the key is waiting for its touch, which
+    /// is not given until the console has opened.)
     #[tokio::test]
     async fn a_key_waiting_for_its_touch_does_not_hold_a_passphrase() {
         let (record, a, _) = enrolled();
-        let slow = Box::new(Slow(Box::new(a), Duration::from_millis(1500), false)) as Plugged;
-        let touch = touch(&record, once(vec![slow]));
+        let (gated, waiting, _release) = gated(a);
+        let touch = touch(&record, once(vec![gated]));
         let (told, _) = tokio::sync::watch::channel(None);
         let (type_it, lines) = keyboard(&[]);
         let typing = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            waiting.recv_timeout(Duration::from_secs(10)).unwrap();
             type_it.send(PASS.to_string()).unwrap();
         });
-        let began = Instant::now();
         let opened = console(record, lines, &|_: &str| (), &|| true, &told, None, touch).await;
         typing.join().unwrap();
         assert_eq!(opened, (STATE.to_vec(), By::Owner));
-        assert!(began.elapsed() < Duration::from_millis(1200), "{:?}", began.elapsed());
     }
 }
 
@@ -5160,27 +5384,49 @@ mod touch_duress {
         assert!(told.borrow().is_some());
     }
 
-    /// (Real time: the key is waiting for its touch when the code is typed.)
-    #[tokio::test(start_paused = true)]
+    /// (Real time, no margins: the code is typed once the key is waiting for its touch, and the key is
+    /// touched once the console has acted on the code, which it says by erasing the record. A
+    /// key in flight holds the paused clock still, so this one runs on the real one: two seconds.)
+    #[tokio::test]
     async fn a_key_touched_after_a_duress_code_opens_nothing() {
         let (record, duress, a, _) = with_duress();
-        let slow = Box::new(Slow(Box::new(a), Duration::from_millis(400), false)) as Plugged;
-        let touch = touch(&record, once(vec![slow]));
-        let said = std::cell::RefCell::new(Vec::new());
-        let say = |line: &str| said.borrow_mut().push(line.to_string());
+        let (gated, waiting_key, release) = gated(a);
+        let touch = touch(&record, once(vec![gated]));
+        let (say_it, said) = std::sync::mpsc::channel();
+        let say = move |line: &str| {
+            let _ = say_it.send(line.to_string());
+        };
         let (told, _) = tokio::sync::watch::channel(None);
         let (type_it, lines) = keyboard(&[]);
+        let (erased, erasing) = std::sync::mpsc::channel();
         let typing = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
+            waiting_key.recv_timeout(Duration::from_secs(10)).unwrap();
             type_it.send(duress).unwrap();
+            erasing.recv_timeout(Duration::from_secs(10)).unwrap();
+            release.send(()).unwrap();
             type_it
         });
-        let waiting = console(record, lines, &say, &|| true, &told, None, touch);
-        assert!(tokio::time::timeout(Duration::from_secs(60), waiting).await.is_err());
+        let erase = || {
+            let _ = erased.send(());
+            true
+        };
+        let waiting = console(record, lines, &say, &erase, &told, None, touch);
+        // The code is answered, and so is the key (as a wrong line is): nothing opened.
+        let heard = async {
+            let mut heard = Vec::new();
+            while heard.len() < 2 {
+                heard.extend(said.try_iter());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            heard
+        };
+        let heard = tokio::select! {
+            opened = waiting => panic!("opened: {opened:?}"),
+            heard = tokio::time::timeout(Duration::from_secs(20), heard) => heard.expect("two answers"),
+        };
         let _kept = typing.join().unwrap();
         assert!(told.borrow().is_some());
-        // (The key's answer is a wrong one's too: nothing opened.)
-        assert!(said.borrow().iter().all(|line| line == WRONG));
+        assert_eq!(heard, [WRONG, WRONG]);
     }
 
     #[test]

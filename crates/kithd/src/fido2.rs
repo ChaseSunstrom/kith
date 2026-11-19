@@ -189,6 +189,8 @@ pub mod frame {
 
     pub const CREDENTIAL_EXCLUDED: &str = "CREDENTIAL_EXCLUDED";
     pub const PIN_REQUIRED: &str = "PIN_REQUIRED";
+    /// What a key says when its touch was not given in time.
+    pub const USER_ACTION_TIMEOUT: &str = "USER_ACTION_TIMEOUT";
     /// What a key says of a credential it does not hold (no touch asked).
     pub const NO_CREDENTIALS: &str = "NO_CREDENTIALS";
 
@@ -202,7 +204,7 @@ pub mod frame {
             0x26 => "UNSUPPORTED_ALGORITHM",
             0x27 => "OPERATION_DENIED",
             0x2e => NO_CREDENTIALS,
-            0x2f => "USER_ACTION_TIMEOUT",
+            0x2f => USER_ACTION_TIMEOUT,
             0x31 => "PIN_INVALID",
             0x32 => "PIN_BLOCKED",
             0x35 => "PIN_NOT_SET",
@@ -1762,6 +1764,7 @@ pub mod hidraw {
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
     /// How long a read waits for a report: a key waiting for a touch sends a keep-alive
@@ -1791,18 +1794,42 @@ pub mod hidraw {
         }
     }
 
-    /// The keys in `class` (`/sys/class/hidraw`) not in `tried`, opened from `dev` (`/dev`),
-    /// and `tried` as it is now: the names still plugged in. A missing `class` is no keys.
-    pub fn plugged_in(class: &Path, dev: &Path, tried: &mut HashSet<String>) -> Vec<Hid> {
+    /// Whether `class`'s device `name` has a FIDO report descriptor.
+    fn is_fido(class: &Path, name: &str) -> bool {
+        let descriptor = std::fs::read(class.join(name).join("device/report_descriptor"));
+        descriptor.is_ok_and(|descriptor| descriptor.starts_with(&FIDO_PAGE))
+    }
+
+    /// `dev/name`, opened, if the file opened is the device `class/name` names (its number
+    /// is read off the open file, so a node swapped for another is refused) and that is
+    /// still a FIDO device: nothing is written to what is not.
+    fn open(class: &Path, dev: &Path, name: &str) -> io::Result<File> {
+        let file = File::options().read(true).write(true).open(dev.join(name))?;
+        let named = std::fs::read_to_string(class.join(name).join("dev"))?;
+        let number = named.trim().split_once(':').and_then(|(major, minor)| {
+            let (major, minor): (u64, u64) = (major.parse().ok()?, minor.parse().ok()?);
+            Some(nix::sys::stat::makedev(major, minor))
+        });
+        if number != Some(file.metadata()?.rdev()) {
+            return Err(io::Error::other("it is not the device the class names"));
+        }
+        if !is_fido(class, name) {
+            return Err(io::Error::other("it is no longer a FIDO device"));
+        }
+        Ok(file)
+    }
+
+    /// The keys in `class` (`/sys/class/hidraw`) not in `tried`, by name, opened from `dev`
+    /// (`/dev`), and `tried` as it is now: the names still plugged in. A missing `class` is
+    /// no keys. One that cannot be opened is said, and is not tried again until it is
+    /// unplugged (or its name is taken out of `tried`).
+    pub fn plugged_in(class: &Path, dev: &Path, tried: &mut HashSet<String>) -> Vec<(String, Hid)> {
         let names: HashSet<String> = std::fs::read_dir(class)
             .into_iter()
             .flatten()
             .flatten()
             .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| {
-                let descriptor = std::fs::read(class.join(name).join("device/report_descriptor"));
-                descriptor.is_ok_and(|descriptor| descriptor.starts_with(&FIDO_PAGE))
-            })
+            .filter(|name| is_fido(class, name))
             .collect();
         tried.retain(|name| names.contains(name));
         let mut new: Vec<_> = names.into_iter().filter(|name| !tried.contains(name)).collect();
@@ -1810,8 +1837,9 @@ pub mod hidraw {
         let mut keys = Vec::new();
         for name in new {
             tried.insert(name.clone());
-            if let Ok(file) = File::options().read(true).write(true).open(dev.join(&name)) {
-                keys.push(Hid(file));
+            match open(class, dev, &name) {
+                Ok(file) => keys.push((name, Hid(file))),
+                Err(why) => eprintln!("kithd: init: the security key {name} cannot be opened: {why}"),
             }
         }
         keys
@@ -1829,19 +1857,31 @@ pub mod hidraw {
             let mut tried = HashSet::new();
             assert!(plugged_in(&class, &dev, &mut tried).is_empty(), "no class: no keys");
             std::fs::create_dir_all(&dev).unwrap();
-            let add = |name: &str, descriptor: &[u8]| {
+            // (Every node here is /dev/null, the character device 1:3.)
+            let add = |name: &str, descriptor: &[u8], number: &str| {
                 std::fs::create_dir_all(class.join(name).join("device")).unwrap();
                 std::fs::write(class.join(name).join("device/report_descriptor"), descriptor).unwrap();
-                std::fs::write(dev.join(name), b"").unwrap();
+                std::fs::write(class.join(name).join("dev"), number).unwrap();
+                let _ = std::fs::remove_file(dev.join(name));
+                std::os::unix::fs::symlink("/dev/null", dev.join(name)).unwrap();
             };
-            add("hidraw0", &[0x05, 0x01, 0x09, 0x06]); // a keyboard
-            add("hidraw1", &[0x06, 0xd0, 0xf1, 0x09, 0x01]);
-            assert_eq!(plugged_in(&class, &dev, &mut tried).len(), 1);
+            add("hidraw0", &[0x05, 0x01, 0x09, 0x06], "1:3\n"); // a keyboard
+            add("hidraw1", &[0x06, 0xd0, 0xf1, 0x09, 0x01], "1:3\n");
+            let first = plugged_in(&class, &dev, &mut tried);
+            assert_eq!(
+                first.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+                ["hidraw1"]
+            );
             assert!(plugged_in(&class, &dev, &mut tried).is_empty(), "handed out once");
             std::fs::remove_dir_all(class.join("hidraw1")).unwrap();
             assert!(plugged_in(&class, &dev, &mut tried).is_empty());
-            add("hidraw1", &[0x06, 0xd0, 0xf1]);
+            add("hidraw1", &[0x06, 0xd0, 0xf1], "1:3");
             assert_eq!(plugged_in(&class, &dev, &mut tried).len(), 1, "plugged in again");
+            // A node that is not the device the class names is not opened for a key, nor is
+            // one whose number cannot be read.
+            add("hidraw2", &[0x06, 0xd0, 0xf1], "1:4");
+            add("hidraw3", &[0x06, 0xd0, 0xf1], "one:three");
+            assert!(plugged_in(&class, &dev, &mut tried).is_empty());
             std::fs::remove_dir_all(&root).unwrap();
         }
     }
