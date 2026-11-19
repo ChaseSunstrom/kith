@@ -256,9 +256,16 @@ Only the newest version is fixed. There are no security releases of older ones.
   connection is accepted: a client that fills one port and all that the node shares leaves
   each other port its 2, and a connection past that is ended at once. A new UDP sender
   past that takes the place of the one of its port heard from longest ago. A pod publishes
-  8 ports at most and a node 64, so the relays hold at most 448 files; kithd does not raise
-  its limit of open files (1024), and its listeners, API and ingress take of it too, so a
-  node with many clients of its API or ingress besides can still run out. A port another
+  8 ports at most and a node 64, so the relays hold at most 448 files. kithd raises its
+  soft limit of open files to the hard one at start, 65536 at most, and leaves the hard
+  limit as it is: on kith OS it is the first process, started with the kernel's 1024
+  soft and 4096 hard, so it runs with 4096; on a host under systemd (524288 hard
+  here) it runs with 65536. Its listeners, API and ingress (1024 connections, two files
+  each, so 2048) take of it too, with the relays 448 and 64 guests of the API: about 2700
+  at most, under 4096. The raised limit is passed on to what kithd starts, a pod's
+  processes included (no per-container limit is set): a program there that uses
+  select() with an FD_SETSIZE bitmap can be handed a file at or above 1024, so it must
+  lower its own limit (a per-container limit is a possible follow-up). A port another
   namespace's Workload or Job publishes is refused when written, and so is a pod through
   an Exit that does not list its namespace: both are asked of every writer (a person's
   apply, a Release, a Source, kithd's own controllers), where the write goes into the
@@ -838,8 +845,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     a write the admin signed; the first key is written unsigned (trust on first use), and
     `open`, the default, takes everything as before. What it does not close: a taken
     control node still writes into the log as itself (its own writes are held to a list
-    in layer 2), and one that leads still appends what it likes until every node checks
-    what the leader appends (layer 3, T-0742). Nonces are kept in memory: a node that starts
+    in layer 2), and one that leads still appends what it likes, but for what changes
+    access: under `required` at store format 4 every node refuses, at apply, a bare Role,
+    RoleBinding, Identity, KindDefinition or Cluster write and any import, so a taken leader
+    cannot grant itself rights (layer 3, slices 2 and 3, T-0783, T-0825). Still open: its
+    bare writes of any other spec, until every node also checks a node's own writes, ACME,
+    the scheduler and cron (slice 5) and a Release's, a Source's, the registry's, an
+    update's and wasm's (slice 6, T-0850). Nonces are kept in memory: a node that starts
     again, or a new leader, takes once more a request it took in the ten minutes before, if a
     node that saw it pass sends it again (layer 3 keeps them in the store). One Cluster that
     says `required` makes every node require a signature, and every Cluster's `adminKey`
@@ -882,7 +894,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     worker's own, with the labels discovery writes and no other, the node and the
     class among them its own), the status of an Image or a Backup of
     a Volume that is on it, a Blob it made, its own name among a Blob's holders, and
-    when it synced as a Volume's replica. Everything else is refused and written to
+    when it synced as a Volume's replica, the notes of a Job placed on it, and the delete of
+    a Volume that is on it whose data it was told to wipe (its claim gone, not retained, not
+    encrypted, and no unit placed on it mounts it). Everything else is refused and written to
     the audit log under the worker's name: a template, a Secret, a Role, a Node's
     spec (its own `trust` too), another node's status or Device, a report in another
     node's name. So a change asked of a worker's own API is refused as well (`ask a
@@ -1439,11 +1453,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   until a waiting node's own is pushed out of the 64 that are kept: the node asks
   again every few seconds, and is not told while they keep at it. Only a control
   node forgets: a worker that is asked refuses, and the waiting node asks the next.
-  A node the cluster's code forgot (not the one it was typed at) keeps its own code
-  and loses the cluster's; unlocked again, it has neither until they are made anew.
-  One that was off when the cluster's code was used still knows that code: typed at
-  it later, it erases itself, and the cluster, which had forgotten its key already,
-  goes on saying forgotten and not wiped.
+  A node the cluster's code forgot (not the one it was typed at) keeps both codes, its
+  own and the cluster's. One that was off when the cluster's code was used still has
+  its record: either code typed at it later erases it, and the cluster says wiped.
+  `kith node duress --all --off` and a new `--all` reach a forgotten key too, so a
+  revoked cluster code wipes no node, and the forgotten key stays forgotten. So does
+  `kith node duress NAME --off`: a node's own code that leaked is revoked there without
+  an unlock, and the key stays forgotten (lock, seal and a new code are still refused
+  on it until `kith node unlock`).
+  `kith node unlock` deletes a forgotten key: the node has neither code afterwards,
+  until they are made anew.
   **A new recovery key (`kith node recovery`) is written before it is shown**: an
   answer lost on its way leaves a key nobody saw, the old one opening no more and
   `recoverySeen` saying yes (the command says so when it fails: run it again). Where

@@ -223,10 +223,12 @@ Service that selects its Workload.
   once and relays everything.
 
 A `NetworkPolicy` decides who may connect to the Workloads it selects through a Service: the
-first ingress rule that fits wins, none means refused. Peers are a `node` or a `cidr`; peers by
-`namespace` or `selector` cannot be told apart yet (allow lets nobody in, deny keeps everyone
-out) and egress is not enforced; the status says `partial` and why, or `enforced`. A connection
-to a node's own address bypasses it.
+first ingress rule that fits wins, none means refused. Its egress rules hold what those
+Workloads' pods may reach, their DNS included, the same way: the first rule that fits wins,
+none means refused. Peers are a `node` or a `cidr`; peers by `namespace` or `selector` cannot be
+told apart yet (allow lets nobody in, deny keeps everyone out). The status says `partial` and
+why (such a peer, or a node that could not write its pods' rules yet), or `enforced`. A
+connection to a node's own address bypasses it.
 
 ### Rolling updates
 

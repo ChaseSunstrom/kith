@@ -860,7 +860,7 @@ impl Shared {
                 .checking();
             let relay = access_sign::current().and_then(|signed| Some((signed.header, signed.relay?)));
             match relay {
-                Some((header, relay)) if checking && relay.carries(&command) => Command::Signed {
+                Some((header, relay)) if checking && relay.signs(&command) => Command::Signed {
                     header,
                     method: relay.method,
                     path: relay.path,
@@ -947,8 +947,21 @@ impl Shared {
         // Patch, is this node's own: `relayed`.)
         let barrier = matches!(command, Command::Patch { statuses } if statuses.is_empty());
         if access_sign::current().is_some() && !barrier {
-            let why = "refused: a signed request's change that is not passed on as it came (the route is \
-                       not one the leader checks the signature of); send it to the leader directly";
+            // (The certificate route is signed but never passed on: the CA node writes the Identity
+            // with the key it made, and answers only while it leads.)
+            let certificate = access_sign::current()
+                .and_then(|signed| signed.relay)
+                .is_some_and(|relay| access_sign::certificate_of(&relay.path).is_some());
+            let why = match certificate {
+                true => {
+                    "refused: the certificate route answers only on the CA node while it leads, and is \
+                         not passed on to the leader; ask the CA node once it leads"
+                }
+                false => {
+                    "refused: a signed request's change that is not passed on as it came (the route is \
+                          not one the leader checks the signature of); send it to the leader directly"
+                }
+            };
             return Forward::Failed(Error::Invalid(why.into()));
         }
         let mut call = access_sign::pass_on(client.post(format!("https://{at}/v1/raft/write")));
@@ -1049,7 +1062,11 @@ impl Shared {
 }
 
 /// Whether `command` can change who may do what: it is put in the log alone ([`Shared::turn`]).
-fn changes_access(command: &Command) -> bool {
+/// An Apply, Delete or Rollback of an access kind, any Import, and a Signed entry's command.
+/// A `Patch`, `Status` or `Report` only sets a status, never a spec, and what access reads is
+/// spec; the few status fields it reads of a Node (address, ca, view) are the node's own, held
+/// by layer 2 (`own_writes`). So those are not access writes.
+pub(crate) fn changes_access(command: &Command) -> bool {
     let access = |kind: &str| {
         // (A KindDefinition says whether a kind is namespaced: which rule matches it. A
         // Cluster holds the admin's key, asked of in the same turn: `access_sign::guard`.)
@@ -2804,6 +2821,22 @@ mod tests {
             key: "ConfigMap/default/own".into()
         }));
         assert!(!changes_access(&Command::Status { statuses: vec![] }));
+        // A Patch sets fields of a status, never a spec: it cannot reach what access reads of a
+        // Role, RoleBinding, Identity, KindDefinition or Cluster, even when it names one.
+        let fields = serde_json::Map::from_iter([("signing".to_string(), serde_json::json!("open"))]);
+        let mut cluster = map("x");
+        cluster.kind = "Cluster".into();
+        cluster.metadata.namespace = None;
+        cluster.spec = serde_json::json!({"adminKey": "11".repeat(32), "signing": "required"});
+        let key = cluster.key();
+        let patch = Command::Patch {
+            statuses: vec![(key.clone(), fields.clone()), ("Role/x".into(), fields)],
+        };
+        assert!(!changes_access(&patch));
+        let mut store = kith_api::store::Store::default();
+        store.apply(cluster).unwrap();
+        kith_store::run(&mut store, patch).unwrap();
+        assert_eq!(store.get(&key).unwrap().spec["signing"], "required");
     }
 
     /// What the leader asks again of a rollback, a delete and anything else: the kind's own

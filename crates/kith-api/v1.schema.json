@@ -4336,6 +4336,13 @@
           ],
           "description": "A Volume, or a VolumeClaim's."
         },
+        "perReplica": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Of a `volume`: it names a VolumeClaim for each replica, `volume` and `-` and the\nreplica's number (`data-db` is `data-db-0` for the first). Each replica goes on\nthe node its own Volume is on, and waits while that Volume or its node is gone."
+        },
         "configMap": {
           "type": [
             "string",

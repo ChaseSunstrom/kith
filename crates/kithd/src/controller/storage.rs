@@ -409,6 +409,9 @@ fn scratch_name(near: &Path) -> PathBuf {
 /// (each a `scratch.*` of its own): they go at the next count of its pod's roots (which only a
 /// pod with running roots that is walked has), or when the pod is gone and its replica
 /// directory is removed. One that is gone or made while the directory is listed is no error.
+/// (Removals of a whole replica directory, of a pod's directory in `pods/` and of a sync's
+/// leftovers in `replicas/` make their levels beside the directory they remove: those are for
+/// `files::sweep` and `pods::forget`, not this.)
 pub fn sweep(replica: &Path, stop: &AtomicBool) {
     sweep_until(replica, &|| stop.load(Ordering::Relaxed));
 }
@@ -433,6 +436,36 @@ fn sweep_until(replica: &Path, halted: &dyn Fn() -> bool) {
             }
         }
     }
+}
+
+/// One pod counted: held, what its project holds is read, and a project that cannot be read is
+/// counted; else its `roots` are walked, and the processes of its `cgroups` for the files they
+/// keep open after deleting them, each within `SPELL`. It removes nothing: a scratch set aside
+/// is the sweep's (`sweep`, a job of its own), so a huge one holds no pod's count.
+pub fn measure(mut pod: Pod, roots: &[PathBuf], cgroups: &[PathBuf], state: &Path, stop: &AtomicBool) -> Pod {
+    let usage = pod.held.then(|| Projects::usage(state, &pod.id)).flatten();
+    pod.held = usage.is_some();
+    if let Some((bytes, files, most)) = usage {
+        (pod.bytes, pod.files, pod.most) = (bytes, files, most);
+        return pod;
+    }
+    let until = Until {
+        at: Instant::now() + SPELL,
+        stop,
+    };
+    let limit = pod.limit.unwrap_or(u64::MAX);
+    (pod.bytes, pod.finished) = count(roots, limit, until);
+    if pod.finished && pod.bytes <= limit {
+        let mut pids = Vec::new();
+        for cgroup in cgroups {
+            let (more, all) = self::pids(cgroup, until);
+            pids.extend(more);
+            pod.finished &= all;
+        }
+        let (held, finished) = unlinked(&pids, roots, until);
+        (pod.bytes, pod.finished) = (pod.bytes.saturating_add(held), pod.finished && finished);
+    }
+    pod
 }
 
 /// How many steps of a removal (an entry looked at) pass between two looks at the stop.
@@ -465,8 +498,11 @@ const BATCH: usize = 1024;
 /// into a level that holds its new name already (a level that was a pod's directory may) takes
 /// the next name.
 ///
-/// A halt leaves `root` and the levels where they are, each named `scratch.*` in the replica
-/// directory, for a sweep to remove as a tree of its own. A second remover of the same
+/// A halt leaves `root` and the levels where they are, each named `scratch.*` beside `root`:
+/// in a replica directory for a scratch of it (`sweep` removes them as trees of their own),
+/// and in `replicas/` (removed by `files::sweep`), in `pods/` (by the next `forget` of a pod)
+/// or beside an unpack (`.NAME.restoring`, where nothing removes them: a call that is never
+/// halted leaves levels only after an error, which it logs). A second remover of the same
 /// scratch at the same moment is harmless: what the first removed is `ENOENT` to the other,
 /// which ignores it (a directory that leaves not empty ends the removal at its own `rmdir`).
 /// Any other error that leaves an entry in place ends the removal with it, as `remove_dir_all`
@@ -780,7 +816,7 @@ pub fn choose(pods: &[Pod], free: u64, reserve: u64) -> Vec<(usize, String)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn dir(name: &str) -> PathBuf {
@@ -1397,9 +1433,45 @@ mod tests {
         std::fs::remove_dir_all(top).unwrap();
     }
 
+    /// Runs `body` as the test `name` (its `module_path!()` and function) in a child of this test
+    /// binary that may hold 256 files, as kithd, which raises nothing, may hold 1024: a chain
+    /// 2,000 deep ends what a removal that holds a descriptor per level does, where the
+    /// 500,000 or so a test run is let have do not.
+    pub(crate) fn few_files(name: &str, body: impl FnOnce()) {
+        // (The marker only the child below is given: one set in a run's own environment is no
+        // child, and its limit says so, so the body is not run with the limit it was to be run
+        // under left out.)
+        if std::env::var_os("KITHD_FEW_FILES").is_some() {
+            let limits = std::fs::read_to_string("/proc/self/limits").unwrap();
+            let soft = limits.lines().find_map(|line| line.strip_prefix("Max open files"));
+            let soft: u64 = soft
+                .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+                .unwrap();
+            assert!(
+                soft <= 256,
+                "KITHD_FEW_FILES is set, but this run may hold {soft} files"
+            );
+            return body();
+        }
+        let name = name.split_once("::").map_or(name, |(_, path)| path);
+        let run = std::process::Command::new("sh")
+            .args(["-c", "ulimit -n 256 && exec \"$0\" \"$@\""])
+            .arg(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--test-threads=1"])
+            .env("KITHD_FEW_FILES", "1")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success() && said.contains("1 passed"),
+            "{said}{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
     /// `depth` directories `d` inside one another below `top`, a file at the bottom: made through
     /// the handle of each (a path that long is no path).
-    fn chain(top: &Path, depth: usize) {
+    pub(crate) fn chain(top: &Path, depth: usize) {
         use crate::backups::{open_dir, within};
         let mut at = open_dir(top).unwrap();
         for _ in 0..depth {
@@ -1410,7 +1482,7 @@ mod tests {
     }
 
     /// How many directories `d` deep `top` goes.
-    fn deep(top: &Path) -> usize {
+    pub(crate) fn deep(top: &Path) -> usize {
         use crate::backups::{open_dir, within};
         let mut at = open_dir(top).unwrap();
         let mut down = 0;
@@ -1642,5 +1714,29 @@ mod tests {
         sweep_until(&replica, &|| false);
         assert_eq!(std::fs::read_dir(&replica).unwrap().count(), 0);
         std::fs::remove_dir_all(replica).unwrap();
+    }
+
+    /// A pod's count reads its scratch and leaves a `scratch.N` beside it for the sweep job: one
+    /// huge removal does not hold the count, or the clock it starts.
+    #[test]
+    fn storage_count_leaves_a_scratch_set_aside_to_the_sweep_and_counts_what_is_live() {
+        let state = dir("count-leaves");
+        let replica = state.join(crate::files::REPLICAS).join("p");
+        let (live, aside) = (replica.join("scratch"), replica.join("scratch.1"));
+        for d in [&live, &aside] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("f"), vec![1u8; 1 << 20]).unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let counted = measure(pod("p", None, 0), std::slice::from_ref(&live), &[], &state, &stop);
+        assert!(
+            counted.finished && counted.bytes >= 1 << 20 && counted.bytes < 2 << 20,
+            "{}",
+            counted.bytes
+        );
+        assert!(aside.join("f").exists(), "the count swept");
+        sweep(&replica, &stop);
+        assert!(!aside.exists() && live.join("f").exists());
+        std::fs::remove_dir_all(state).unwrap();
     }
 }

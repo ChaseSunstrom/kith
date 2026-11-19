@@ -234,6 +234,8 @@ struct Controller {
     count: Option<Job<Counted>>,
     /// When the last count ended.
     counted: Option<Instant>,
+    /// The removal of scratch set aside and left (`storage::sweep`), beside the count, on its way.
+    leftovers: Option<Job<()>>,
     /// The state disk is under its reserve with no pod to replace for it, and it was said.
     low: bool,
     /// The pods replaced for what they wrote, when, and the removal of what they wrote once no run
@@ -519,6 +521,7 @@ pub async fn run(
         reserve,
         count: None,
         counted: None,
+        leftovers: None,
         low: false,
         replacing: BTreeMap::new(),
         missed: BTreeSet::new(),
@@ -1445,6 +1448,19 @@ impl Controller {
                 .collect();
             let files: Vec<_> = units.iter().map(|unit| files_of(shared, &namespace, unit)).collect();
             for replica in replicas {
+                // A replica's own claim whose Volume is not here is not started, whatever else
+                // is: it would be on an empty directory, with its data on another node or lost.
+                let lacking = template.containers().flat_map(|c| &c.volume_mounts).find_map(|mount| {
+                    let name = format!("{}-{replica}", mount.volume.as_ref()?);
+                    (mount.per_replica == Some(true) && !volumes.contains_key(&name)).then_some(name)
+                });
+                if let Some(name) = lacking {
+                    let why = format!("replica {replica} waits: its Volume {name} is not ready on this node");
+                    if !note.contains(&why) {
+                        note.push(why);
+                    }
+                    continue;
+                }
                 // Which generation of the replica is wanted: the second where a rolling update has
                 // started it beside the old (see `gens`); one found running as it, by a kithd that
                 // was started again, is the one it was.
@@ -1519,7 +1535,7 @@ impl Controller {
                             devices: devices.clone(),
                             dmem: dmem.clone(),
                             seat: seat.clone(),
-                            volumes: mounts_of(unit, &volumes),
+                            volumes: mounts_of(unit, &volumes, replica),
                             files: files.clone(),
                             init: at < inits,
                             after: at.min(inits) as u32,
@@ -2499,6 +2515,14 @@ impl Controller {
                 removal.done(hung).is_none()
             })
         });
+        if let Some(job) = self.leftovers.as_mut() {
+            let hung = || {
+                "removing the scratch left by an earlier run has not ended in 60 s: it goes on, and holds no pod's count".to_string()
+            };
+            if job.done(hung).is_some() {
+                self.leftovers = None;
+            }
+        }
         let hung = || "the storage count has not ended in 60 s: no pod's storage is limited until it does".to_string();
         let done = self.count.as_mut().and_then(|job| Some((job.began, job.done(hung)?)));
         if let Some((began, counted)) = done {
@@ -2593,42 +2617,24 @@ impl Controller {
         if pods.is_empty() {
             return;
         }
+        // (A scratch set aside and not removed, by a kithd that stopped first, goes in a job of
+        // its own, one at a time: a huge one holds no pod's count, or its clock.)
+        if self.leftovers.is_none() {
+            let (dirs, stop) = (
+                pods.iter().map(|(pod, ..)| replicas.join(&pod.id)).collect::<Vec<_>>(),
+                self.stop.clone(),
+            );
+            self.leftovers = Job::start("storage", &shared.changed, move || {
+                dirs.iter().for_each(|replica| storage::sweep(replica, &stop));
+            });
+        }
         let state = state.to_path_buf();
         let stop = self.stop.clone();
         self.count = Job::start("storage", &shared.changed, move || {
             let pods: Vec<storage::Pod> = pods
                 .into_iter()
-                .map(|(mut pod, roots, cgroups)| {
-                    // (A scratch set aside and not removed, by a kithd that stopped first, goes now.)
-                    storage::sweep(&replicas.join(&pod.id), &stop);
-                    // Held, what it holds is read, not counted; a project that cannot be read
-                    // is counted.
-                    let usage = pod.held.then(|| storage::Projects::usage(&state, &pod.id)).flatten();
-                    pod.held = usage.is_some();
-                    if let Some((bytes, files, most)) = usage {
-                        (pod.bytes, pod.files, pod.most) = (bytes, files, most);
-                        return pod;
-                    }
-                    let until = storage::Until {
-                        at: Instant::now() + storage::SPELL,
-                        stop: &stop,
-                    };
-                    let limit = pod.limit.unwrap_or(u64::MAX);
-                    (pod.bytes, pod.finished) = storage::count(&roots, limit, until);
-                    if pod.finished && pod.bytes <= limit {
-                        let mut pids = Vec::new();
-                        for cgroup in &cgroups {
-                            let (more, all) = storage::pids(cgroup, until);
-                            pids.extend(more);
-                            pod.finished &= all;
-                        }
-                        let (held, finished) = storage::unlinked(&pids, &roots, until);
-                        (pod.bytes, pod.finished) = (pod.bytes.saturating_add(held), pod.finished && finished);
-                    }
-                    pod
-                })
+                .map(|(pod, roots, cgroups)| storage::measure(pod, &roots, &cgroups, &state, &stop))
                 .collect();
-            // Free once what was set aside is gone.
             let disk = nix::sys::statvfs::statvfs(&state).ok();
             let free = disk.map_or(free, |d| d.blocks_available() * d.fragment_size());
             (free, reserve, pods)
@@ -2985,16 +2991,23 @@ fn write_files(state: &Path, id: &str, slot: &Slot, files: &[Files]) -> Result<(
     Ok(())
 }
 
-/// What a unit mounts, from the Volumes its workload's mounts come to: only a container mounts.
-fn mounts_of(unit: &Run, volumes: &BTreeMap<String, crate::volumes::Dir>) -> Vec<(crate::volumes::Dir, String, bool)> {
+/// What a unit of replica `replica` mounts, from the Volumes its workload's mounts come to: only a
+/// container mounts. (A mount that is `perReplica` is of the replica's own claim, `NAME-REPLICA`.)
+fn mounts_of(
+    unit: &Run,
+    volumes: &BTreeMap<String, crate::volumes::Dir>,
+    replica: u32,
+) -> Vec<(crate::volumes::Dir, String, bool)> {
     let Run::Container(c) = unit else { return Vec::new() };
     let mounts = c.volume_mounts.iter();
     let found = mounts.filter_map(|m| {
-        Some((
-            volumes.get(m.volume.as_ref()?)?.clone(),
-            m.path.clone(),
-            m.read_only == Some(true),
-        ))
+        let name = m.volume.as_ref()?;
+        let name = if m.per_replica == Some(true) {
+            format!("{name}-{replica}")
+        } else {
+            name.clone()
+        };
+        Some((volumes.get(&name)?.clone(), m.path.clone(), m.read_only == Some(true)))
     });
     found.collect()
 }
@@ -3013,6 +3026,17 @@ fn running_said(note: Option<&str>, replaced: Option<String>) -> Option<String> 
         .into_iter()
         .chain(replaced)
         .reduce(|said, more| format!("{said}; {more}"))
+}
+
+/// A refusal of a node's root container, said with the policy that allows it: the runtime says what
+/// the container would be; here whose word refused it.
+fn node_root_refusal(said: String) -> String {
+    match said.contains(kith_runtime::NODE_ROOT) {
+        true => format!(
+            "this node's policy refuses containers that are the node's root (rootContainers is off: `--node-policy root-containers` where the node's kithd is started allows them): {said}"
+        ),
+        false => said,
+    }
 }
 
 /// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
@@ -3233,14 +3257,7 @@ async fn start(
                 .await
                 .map_err(|e| e.to_string())?;
             let created = runtime.create(id, &image, &unit, log("out")?, log("err")?);
-            // The runtime says what the container would be; here whose word refused it.
-            let whose = |e: kith_runtime::Error| match e.to_string().contains(kith_runtime::NODE_ROOT) {
-                true => format!(
-                    "this node's policy refuses containers that are the node's root (rootContainers is off: `--node-policy root-containers` where the node's kithd is started allows them): {e}"
-                ),
-                false => e.to_string(),
-            };
-            created.map_err(whose)
+            created.map_err(|e| node_root_refusal(e.to_string()))
         }
         Run::Exec(e) => {
             unit.command = e.command.clone();
@@ -3388,6 +3405,21 @@ mod tests {
         assert_eq!(running_said(Some(note), None), Some(note.to_string()));
         assert_eq!(running_said(None, Some(replaced.clone())), Some(replaced));
         assert_eq!(running_said(None, None), None);
+    }
+
+    /// A refusal the runtime made of a node's root container is said with the policy that allows
+    /// it, around the runtime's own text; any other refusal comes back as it was.
+    #[test]
+    fn node_root_refusal_names_the_policy() {
+        let root = format!("this container {}: its user is root's", kith_runtime::NODE_ROOT);
+        let said = node_root_refusal(root.clone());
+        assert!(said.contains("rootContainers is off"), "{said}");
+        assert!(said.contains("--node-policy root-containers"), "{said}");
+        assert!(said.ends_with(&root), "{said}");
+        assert_eq!(
+            node_root_refusal("an unrelated failure".to_string()),
+            "an unrelated failure"
+        );
     }
 
     /// A public key's text, as `signedBy` takes it: Ed25519, each `n` another.
@@ -4335,5 +4367,37 @@ spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volum
         for said in ["runs twice", "the old one", "Job"] {
             assert!(risks.contains(said), "{said} is not in {risks}");
         }
+    }
+
+    #[test]
+    fn per_replica_mount_is_the_replicas_own_claim_and_no_other() {
+        let source = "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db }
+spec: { replicas: 2, template: { containers: [{ name: run, image: img, volumeMounts: [{ volume: data, perReplica: true, path: /d }, { volume: log, path: /l }] }] } }
+";
+        let resource = Resource::from_source(source).unwrap().remove(0).unwrap();
+        let (template, _) = template_of(&resource).unwrap();
+        let unit = Run::Container(template.containers().next().unwrap().clone());
+        let dir = |name: &str| crate::volumes::Dir {
+            namespace: "default".into(),
+            name: name.into(),
+            path: name.into(),
+            node: "a".into(),
+            encrypted: false,
+        };
+        let dirs: BTreeMap<String, _> = ["data-0", "data-1", "log"]
+            .map(|name| (name.to_string(), dir(name)))
+            .into();
+        let names = |replica| -> Vec<(String, String)> {
+            mounts_of(&unit, &dirs, replica)
+                .into_iter()
+                .map(|(dir, at, _)| (dir.name, at))
+                .collect()
+        };
+        assert_eq!(names(1), [("data-1".into(), "/d".into()), ("log".into(), "/l".into())]);
+        // One that has no Volume here is left out (and `lacking` keeps the replica from starting).
+        assert_eq!(names(2), [("log".into(), "/l".into())]);
     }
 }
