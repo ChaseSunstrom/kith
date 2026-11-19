@@ -150,7 +150,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    a pod of a user who is not root finds their Service
                    by its short name and its Kubernetes one, hears all three through
                    it, reaches this machine from behind its node's address, and
-                   writes to /dev/stdout by name; a pod that is root is kept from a
+                   writes to /dev/stdout by name; a NetworkPolicy's egress rule holds
+                   the pods of one app to this machine's address and one port (and
+                   port 80 of no other address): another port, or a pod's address on
+                   port 80, is silent, while an unfenced pod on the same node is
+                   answered by that pod and refused by the port nothing listens on;
+                   a pod that is root is kept from a
                    device it was not given (its node's disk); a container that asks for user
                    namespaces starts a sandbox in it (this machine's bwrap), one that
                    does not is refused, one that is root is not started; a USB keyboard
