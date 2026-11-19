@@ -487,9 +487,11 @@ boot files (read back from the ESP; the new one proven to be the piece the heade
 `crypt::ahead`, only for a release signed by a key `Keys::mine` held before it, never under
 `allowDowngrade`, never from a stick. The prediction needs the running log's PCR 9 event to
 match one of the four command-line forms, or it seals nothing; a failure is logged and the
-update stands. One seal ahead at a time: while a `tpm-next:` waits, none is made. `crypt::keep`
-promotes (`tpm:` takes `tpm-next:`, which goes, in one read-back write) once `os::GOOD`, and
-only if the new seal opens to the key held. The wait is `open`'s, five minutes, restarted by a
+update stands. One seal ahead at a time: while a `tpm-next:` that opens on this system waits
+for promotion, none is made; one that does not open (a fallback left it) is replaced, and `tpm:`
+is untouched. `crypt::keep` promotes (`tpm:` takes `tpm-next:`, which goes, in one read-back
+write) once `os::GOOD`, and only if the new seal opens to the key held; a failed try is made
+again at a later wake, three times. The wait is `open`'s, five minutes, restarted by a
 typed line. Not built: dropping `tpm-next:` when the old slot runs again after a fallback.
 - A PIN node needs a person either way. With a person there, the PIN opens the new system
   when the prediction held; when it did not, k1 is refused, no PIN is asked for, and the five

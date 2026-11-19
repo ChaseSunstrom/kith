@@ -1265,31 +1265,48 @@ fn ahead_sealed<T: std::io::Read + std::io::Write>(
     config: &Path,
     over: &[(u8, [u8; 32])],
 ) -> Result<Record, String> {
-    if record.next.is_some() || record.pin_next.is_some() {
-        return Err(AHEAD_NOT_NOW.into());
-    }
     let parent = match &record.parent {
         Some(name) if name.len() == 34 => name,
         Some(_) => return Err(UNREAD.into()),
         None => return Err(AHEAD_NAMELESS.into()),
     };
-    let (with, now) = match (&record.pin, &record.tpm) {
+    // (The key that the PCR-bound seal holds: k1 in PIN mode.)
+    let now = zeroize::Zeroizing::new(if record.pin.is_some() {
+        k1_of(opened).to_vec()
+    } else {
+        opened.to_vec()
+    });
+    // A seal ahead that opens here is this system's, not promoted yet: it stays. One that does
+    // not is for a system that did not come up (the node fell back to this one): the new
+    // signed update's takes its place. (`tpm:` is untouched either way.)
+    let waiting = if record.pin.is_some() {
+        &record.pin_next
+    } else {
+        &record.next
+    };
+    let opens = |tpm: &mut crate::tpm::Tpm<T>, seal: &Vec<u8>| {
+        !seal.is_empty()
+            && tpm
+                .unseal(seal, Some(parent))
+                .is_ok_and(|key| zeroize::Zeroizing::new(key)[..] == now[..])
+    };
+    if waiting.as_ref().is_some_and(|seal| opens(tpm, seal)) {
+        return Err(AHEAD_NOT_NOW.into());
+    }
+    let with = match (&record.pin, &record.tpm) {
         (Some(_), _) => {
-            let k1 = k1_of(opened);
-            let (sealed, _) = tpm.seal_over(&k1[..], Some(parent), over)?;
-            let with = Record {
+            let (sealed, _) = tpm.seal_over(&now[..], Some(parent), over)?;
+            Record {
                 pin_next: Some(sealed),
                 ..record.clone()
-            };
-            (with, k1.to_vec())
+            }
         }
         (None, Some(_)) => {
-            let (sealed, _) = tpm.seal_over(opened, Some(parent), over)?;
-            let with = Record {
+            let (sealed, _) = tpm.seal_over(&now[..], Some(parent), over)?;
+            Record {
                 next: Some(sealed),
                 ..record.clone()
-            };
-            (with, opened.to_vec())
+            }
         }
         (None, None) => return Err("the record holds no TPM seal".into()),
     };
@@ -1360,6 +1377,29 @@ fn promoted<T: std::io::Read + std::io::Write>(
         return kept.map(Some);
     }
     Ok(None)
+}
+
+/// How many times promoting one seal made ahead is tried, a failure (the TPM would not
+/// open, the write did not read back) being tried again at a later wake of [`keep`].
+const PROMOTE_TRIES: u8 = 3;
+
+/// How many of those tries `seal` has used up, given what [`promotion_tried`] last said.
+fn promotions_used(tried: &Option<(Vec<u8>, u8)>, seal: &[u8]) -> u8 {
+    tried
+        .as_ref()
+        .filter(|(was, _)| was == seal)
+        .map_or(0, |(_, used)| *used)
+}
+
+/// What is known of the tries after one more at `seal`: all used up when it ended (done or
+/// refused, `ended`), one more when it failed.
+fn promotion_tried(tried: &Option<(Vec<u8>, u8)>, seal: &[u8], ended: bool) -> (Vec<u8>, u8) {
+    let used = if ended {
+        PROMOTE_TRIES
+    } else {
+        promotions_used(tried, seal) + 1
+    };
+    (seal.to_vec(), used)
 }
 
 /// How long a system on trial waits for the key of its state (see `open`) with nobody typing:
@@ -1437,7 +1477,7 @@ pub async fn keep(
     let mut shut = false;
     // The seal made ahead that was tried to be promoted last (once each: one that does not
     // open here is not asked of the TPM again every half minute).
-    let mut promote_tried = None::<Vec<u8>>;
+    let mut promote_tried = None::<(Vec<u8>, u8)>;
     // (Typed at the console: somebody has this disk's recovery key.)
     if by == By::Recovery && !record.seen {
         let with = Record {
@@ -1578,15 +1618,18 @@ pub async fn keep(
                     .or(record.pin_next.clone())
                     .filter(|seal| !seal.is_empty());
                 if let Some(seal) = ahead.filter(|seal| {
-                    crate::os::GOOD.load(std::sync::atomic::Ordering::Relaxed) && promote_tried.as_ref() != Some(seal)
+                    crate::os::GOOD.load(std::sync::atomic::Ordering::Relaxed)
+                        && promotions_used(&promote_tried, seal) < PROMOTE_TRIES
                 }) {
-                    promote_tried = Some(seal);
                     let (now, key, at) = (record.clone(), opened.clone(), config.clone());
                     let made = tokio::task::spawn_blocking(move || {
                         let mut tpm = crate::tpm::open()?;
                         promoted(&mut tpm, &now, &key, &at)
                     });
-                    match made.await.unwrap_or_else(|_| Err("promoting failed".into())) {
+                    let made = made.await.unwrap_or_else(|_| Err("promoting failed".into()));
+                    // (A failure is tried again at a later wake; done, or refused, is not.)
+                    promote_tried = Some(promotion_tried(&promote_tried, &seal, made.is_ok()));
+                    match made {
                         Ok(Some(with)) => {
                             eprintln!(
                                 "kithd: this machine's TPM seal for this system is the one made ahead: the old seal is dropped"
@@ -2592,20 +2635,34 @@ mod tests {
         assert_eq!(Record::read(&path), Ok(Some(with.clone())));
         // This system still opens by the seal it had, not by the one ahead.
         assert_eq!(unsealed(&mut tpm, &with), Ok((key.clone(), false)));
-        // One seal ahead waits at a time.
-        assert_eq!(
-            ahead_sealed(&mut tpm, &with, &key, &path, &over),
-            Err(AHEAD_NOT_NOW.to_string())
-        );
         // Not the next system yet: nothing is promoted, nothing is written.
         assert_eq!(promoted(&mut tpm, &with, &key, &path), Ok(None));
         assert_eq!(Record::read(&path), Ok(Some(with.clone())));
+        // A fallback: this system runs again and the seal ahead (for the system that did not
+        // come up) opens nothing here. The next signed update replaces it, and `tpm:` stays.
+        let other = [(4, [0x11; 32]), over[1]];
+        let again = ahead_sealed(&mut tpm, &with, &key, &path, &other).unwrap();
+        assert_eq!(again.tpm.as_ref(), Some(&old), "the old seal stays until promotion");
+        assert!(
+            again
+                .next
+                .as_ref()
+                .is_some_and(|next| !next.is_empty() && Some(next) != with.next.as_ref())
+        );
+        assert_eq!(Record::read(&path), Ok(Some(again.clone())));
+        assert_eq!(unsealed(&mut tpm, &again), Ok((key.clone(), false)));
 
         // The next system starts (the PCRs move to what was predicted): the seal ahead opens
         // and the old one no longer does.
         tpm.extend(4, &events[0]).unwrap();
         tpm.extend(9, &events[1]).unwrap();
         assert_eq!(unsealed(&mut tpm, &with), Ok((key.clone(), true)));
+        // That seal is this system's and not promoted yet: it is not replaced.
+        assert_eq!(
+            ahead_sealed(&mut tpm, &with, &key, &path, &over),
+            Err(AHEAD_NOT_NOW.to_string())
+        );
+        assert_eq!(Record::read(&path), Ok(Some(again)), "a refusal writes nothing");
         let now = promoted(&mut tpm, &with, &key, &path).unwrap().unwrap();
         assert_eq!((now.tpm.as_ref(), now.next.as_ref()), (with.next.as_ref(), None));
         assert_eq!(Record::read(&path), Ok(Some(now.clone())));
@@ -2692,6 +2749,31 @@ mod tests {
             new: vec![2; 64],
         };
         assert!(ahead_over(&mut tpm, &[], &boots).is_err());
+    }
+
+    /// A promotion that failed (the TPM could not be opened, a write did not read back) is
+    /// tried again, a few times; one that was done, or refused, is not tried again.
+    #[test]
+    fn tpm_next_promotion_is_retried_after_a_failure() {
+        let seal = vec![1u8, 2, 3];
+        let mut tried = None;
+        assert_eq!(promotions_used(&tried, &seal), 0);
+        tried = Some(promotion_tried(&tried, &seal, false));
+        assert_eq!(promotions_used(&tried, &seal), 1);
+        assert!(
+            promotions_used(&tried, &seal) < PROMOTE_TRIES,
+            "one failure is not the end"
+        );
+        // (A seal made ahead later is a new one.)
+        assert_eq!(promotions_used(&tried, &[9u8]), 0);
+        tried = Some(promotion_tried(&tried, &seal, false));
+        tried = Some(promotion_tried(&tried, &seal, false));
+        assert!(
+            promotions_used(&tried, &seal) >= PROMOTE_TRIES,
+            "a fault that stays is not tried for ever"
+        );
+        let done = promotion_tried(&None, &seal, true);
+        assert!(promotions_used(&Some(done), &seal) >= PROMOTE_TRIES);
     }
 
     /// A wait for the key ends after the limit, starts over with each line typed, and gives
