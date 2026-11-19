@@ -3232,8 +3232,9 @@ mod tests {
 
     /// A container made from a thread that blocks SIGINT, SIGTERM and SIGCHLD (as kithd's tokio
     /// threads do, from the keeper's mask) runs its process with nothing blocked: libcontainer
-    /// resets no mask, and a pod that has SIGTERM blocked never hears `kith stop`. (Read from the
-    /// init process's own status, which the program keeps when it execs.)
+    /// resets no mask, and a pod that has SIGTERM blocked never hears `kith stop`; nor does it
+    /// ignore SIGPIPE, which Rust's runtime sets in this process. (Read from the init process's
+    /// own status, which the program keeps when it execs.)
     #[test]
     fn container_starts_with_no_signal_blocked() {
         let root = std::env::temp_dir().join(format!("kith-sigblk-{}", std::process::id()));
@@ -3249,7 +3250,10 @@ mod tests {
             entrypoint: vec!["/bin/true".into()],
             ..Image::default()
         };
-        let (out, err) = (File::create(root.join("out")).unwrap(), File::create(root.join("err")).unwrap());
+        let (out, err) = (
+            File::create(root.join("out")).unwrap(),
+            File::create(root.join("err")).unwrap(),
+        );
         let made = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -3273,10 +3277,28 @@ mod tests {
             made => made.unwrap(),
         };
         let status = fs::read_to_string(format!("/proc/{}/status", handle.pid())).unwrap();
-        let blocked = status.lines().find_map(|line| line.strip_prefix("SigBlk:")).map(str::trim);
+        let blocked = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigBlk:"))
+            .map(str::trim);
+        let ignored = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigIgn:"))
+            .map(|hex| u64::from_str_radix(hex.trim(), 16).unwrap());
         handle.discard(&root.join("runtime/state/sigblk"));
         let _ = fs::remove_dir_all(&root);
-        assert_eq!(blocked, Some("0000000000000000"), "the container's process blocks signals");
+        assert_eq!(
+            blocked,
+            Some("0000000000000000"),
+            "the container's process blocks signals"
+        );
+        // (Rust's runtime ignores SIGPIPE in this process, and an ignored signal survives the exec:
+        // bit 13, 0x1000.)
+        assert_eq!(
+            ignored.map(|ignored| ignored & 0x1000),
+            Some(0),
+            "the container's process ignores SIGPIPE: {ignored:x?}"
+        );
     }
 
     /// Only the overlay's EPERM is the kernel refusing the overlay root: the other failures of a

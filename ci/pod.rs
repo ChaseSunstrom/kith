@@ -88,6 +88,22 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
+/// The signals ignored when the program began (SigIgn of its status), as its parent left them.
+/// Rust's runtime ignores SIGPIPE before `main`, so `main` reads a later SigIgn with that bit
+/// always set: this is read earlier, from `.init_array`, which the C runtime runs first.
+static INHERITED_SIGIGN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[used]
+#[unsafe(link_section = ".init_array")]
+static READ_SIGIGN: extern "C" fn() = {
+    extern "C" fn read_sigign() {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let found = status.lines().find_map(|l| l.strip_prefix("SigIgn:")).unwrap_or("?");
+        let _ = INHERITED_SIGIGN.set(found.trim().to_string());
+    }
+    read_sigign
+};
+
 /// The byte at `i` of what `pod check` sends: one no lost, doubled or swapped byte keeps in
 /// place (251 is prime, and no buffer's size is a multiple of it).
 fn byte(i: u64) -> u8 {
@@ -794,6 +810,7 @@ fn main() {
             let status = std::fs::read_to_string("/proc/self/status").expect("its status");
             let blocked = status.lines().find_map(|l| l.strip_prefix("SigBlk:")).unwrap_or("?").trim();
             println!("tick: blocked {blocked}");
+            println!("tick: ignored {}", INHERITED_SIGIGN.get().map_or("?", |s| s.as_str()));
             let last: u64 = times.first().map_or(u64::MAX, |n| n.parse().expect("N"));
             for n in 1..=last {
                 println!("tick {n}");
