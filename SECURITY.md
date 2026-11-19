@@ -895,9 +895,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     What a worker may write is a list the control node it writes to holds it to,
     against that node's own store: what it says of the replicas the scheduler gave it
     (how many are ready is counted again; a unit's address has to be in the worker's
-    own part of the mesh), `os`, `mesh`, `serves` and `thumbprint` in its own Node's
-    status (not a mesh key another Node says, which would cut both off; a thumbprint
-    in a thumbprint's shape), its own NodeKey once, the Devices
+    own part of the mesh), `os`, `mesh`, `serves`, `thumbprint` and `alone` in its own
+    Node's status (not a mesh key another Node says, which would cut both off; a thumbprint
+    in a thumbprint's shape; `alone` null, or the times it ran alone and its risks), its own NodeKey once, the Devices
     and Seats whose `spec.node` is the worker (under a name that starts with the
     worker's own, with the labels discovery writes and no other, the node and the
     class among them its own), the status of an Image or a Backup of
@@ -953,7 +953,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     was deleted or made a worker meanwhile is still a control node to it. A worker
     that starts again meanwhile runs nothing until a control node answers (what
     was moved off it while it was away is not known to it), as any node that
-    starts with no leader in reach. Its API
+    starts with no leader in reach, unless its Node says `alone: run`
+    ([a node away from its cluster](docs/guide/cluster.md#a-node-away-from-its-cluster)). Its API
     port answers no person, reads included: it has no Identity and no Role to answer
     by (`this node is a worker and answers no one by their rights: ask a control
     node`). What a control node passes on to it for someone (a unit's output, `kith
