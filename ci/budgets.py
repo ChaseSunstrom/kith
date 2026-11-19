@@ -42,9 +42,10 @@ RUNS = 5  # each time is the median of this many runs
 # 12.10 MB with storage (Phase 7: the NFS server's driver, the blob store with BLAKE3,
 # backups with tar and S3), which raised the size budget from 12 for the rest of that phase.
 # 13.02 MB with a phone's way in (T-0764: POST /v1/peers, its configuration and the QR
-# dialog; main was 12.997 MB), which raised it to 13.10. The way back under 13: the web UI's
-# text (about 107 KB of HTML, CSS and JS, embedded as it is) served compressed.
-KITHD_SIZE = 13.10
+# dialog; main was 12.997 MB), which raised it to 13.10; 13.13 MB with the people's levels held
+# on the --people node (T-0780: levels.rs), which raised it to 13.20. The way back under 13:
+# the web UI's text (about 107 KB of HTML, CSS and JS, embedded as it is) served compressed.
+KITHD_SIZE = 13.20
 KITHD_IDLE_RSS = 9 * MB
 # binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
 # 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.
@@ -55,7 +56,9 @@ KITHD_IDLE_RSS = 9 * MB
 # 3.61, not 3.60 (T-0900): the same tree built in another folder differs by one 4 KB page
 # (.text +768 B, .data.rel.ro +552 B on 1c33a26d: 3,773,816 B in the merge gate's folder,
 # 3,777,912 B in the checkout), so a budget set at the gate's size failed every finish on main.
-SIZE_BUDGETS = {"kith": 3 * MB, "kith-remote": int(3.61 * MB), "kithd": int(KITHD_SIZE * MB)}
+# 3.62 (T-0941): kith peer add (T-0764) made it 3,782,008 B in the gate's folder and 3,786,104 B
+# in the checkout, 745 B over 3.61, so every budgets run on main failed again.
+SIZE_BUDGETS = {"kith": 3 * MB, "kith-remote": int(3.62 * MB), "kithd": int(KITHD_SIZE * MB)}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
