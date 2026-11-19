@@ -57,6 +57,42 @@ fn every_guide_is_read() {
     );
 }
 
+/// The front page says how a compose stack becomes kith's and names each key the reader
+/// refuses: the names are read from compose.rs's REFUSED, so the list cannot drift from it.
+#[test]
+fn readme_says_how_a_compose_stack_becomes_kiths() {
+    let source = std::fs::read_to_string(root().join("crates/kith-kube/src/compose.rs")).unwrap();
+    let table = source.split("const REFUSED").nth(1).expect("compose.rs has no REFUSED");
+    let refused: Vec<&str> = table
+        .split("];")
+        .next()
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("(\"")?.split('"').next())
+        .collect();
+    assert!(refused.len() >= 8, "REFUSED was read as {refused:?}");
+    let page = DOCS[0].1;
+    let section = page
+        .split("\n## ")
+        .find(|s| s.to_lowercase().starts_with("coming from docker compose"))
+        .expect("README.md has no section on coming from docker compose");
+    for said in [
+        "Workload",
+        "Service",
+        "Volume",
+        "kith import compose",
+        "docs/guide/kubernetes.md#from-a-docker-compose-file",
+    ] {
+        assert!(section.contains(said), "the compose section does not say: {said}");
+    }
+    for key in refused {
+        assert!(
+            section.contains(&format!("`{key}`")),
+            "the compose section does not name `{key}`"
+        );
+    }
+}
+
 fn root() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
 }

@@ -116,6 +116,22 @@ is still there when it starts again.
 | Know what it costs beside Kubernetes | [Beside k3s](#beside-k3s), and [how it was measured](docs/guide/numbers.md#how-the-numbers-beside-k3s-were-taken) |
 | Find your way in the code and test it | [Layout](docs/guide/development.md#layout), [Development](docs/guide/development.md#development) |
 
+## Coming from docker compose
+
+```sh
+kith import compose docker-compose.yml --node n1 -n media > stack.yaml   # review it, then: kith apply -f stack.yaml
+```
+
+This is a translation, once; kith does not run compose. Each service becomes a Workload
+(a pod of its own, as in compose), its `ports` a Service of the compose name, and each host
+directory or named volume a Volume on the node `--node` names. Exit status 1 means something
+is in the report on stderr: the resources are still printed.
+
+kith refuses by path and name what it cannot carry: `cap_add` (kith only drops capabilities),
+`sysctls`, `devices` (a DeviceClaim hands hardware in), `privileged`, `env_file` (write the
+variables under `environment`), `build`, `security_opt` and `tmpfs`; the guide lists the rest.
+The whole table is [From a docker-compose file](docs/guide/kubernetes.md#from-a-docker-compose-file).
+
 ## How it works
 
 <picture>
