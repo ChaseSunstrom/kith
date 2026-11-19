@@ -38,7 +38,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   browser holds.)
   A connection holds one of 64 slots until it has shown a certificate, and one that
   shows none for at most 15 seconds; one address (an IPv4 address, an IPv6 /64) holds
-  at most 8 of them. The node's own loopback is not counted.
+  at most 8 of them. The node's own loopback is not counted. On a node started with
+  `--people` the people's addresses (`100.89.0.0/16` and their /64) have 16 slots of their
+  own, 8 to an address (an IPv6 peer counted whole, not by its /64), so a crowd of them
+  leaves the 64 free.
 - **The API** is behind a layer that works out who calls (the socket, a node, an
   Identity) and refuses what their Roles do not allow. A token is shown once, kept only
   as a hash, good for an hour, and spent by its first use.

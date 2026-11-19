@@ -232,6 +232,47 @@ impl Cidr {
         let shift = u32::from(width - self.bits);
         width == w2 && net.checked_shr(shift).unwrap_or(0) == ip.checked_shr(shift).unwrap_or(0)
     }
+
+    /// `allowed` with every address of `denied` taken out: each allowed network that holds a
+    /// denied one becomes the sibling halves around it (a /7 less a /64 is 57 networks), so a
+    /// list of networks can say "all but these" and the deny wins.
+    pub fn without(allowed: &[Cidr], denied: &[Cidr]) -> Vec<Cidr> {
+        let mut rest = allowed.to_vec();
+        for deny in denied {
+            rest = rest.into_iter().flat_map(|net| net.minus(deny)).collect();
+        }
+        rest
+    }
+
+    fn minus(self, deny: &Cidr) -> Vec<Cidr> {
+        let width = if self.addr.is_ipv4() { 32 } else { 128 };
+        if deny.addr.is_ipv4() != self.addr.is_ipv4() || deny.bits > width {
+            return vec![self];
+        }
+        if deny.bits <= self.bits {
+            // Inside the denied network whole, or apart from it.
+            return if deny.contains(self.addr) { vec![] } else { vec![self] };
+        }
+        if !self.contains(deny.addr) {
+            return vec![self];
+        }
+        // The denied network is inside this one: keep the other half at each bit between them.
+        let num = match deny.addr {
+            IpAddr::V4(a) => u128::from(u32::from(a)),
+            IpAddr::V6(a) => u128::from(a),
+        };
+        (self.bits + 1..=deny.bits)
+            .map(|len| {
+                let shift = u32::from(width - len);
+                let sibling = ((num >> shift) ^ 1) << shift;
+                let addr = match self.addr {
+                    IpAddr::V4(_) => Ipv4Addr::from(sibling as u32).into(),
+                    IpAddr::V6(_) => Ipv6Addr::from(sibling).into(),
+                };
+                Cidr { addr, bits: len }
+            })
+            .collect()
+    }
 }
 
 impl FromStr for Cidr {

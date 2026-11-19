@@ -1050,7 +1050,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 eprintln!("kithd: --admit-deleted-nodes: a deleted node's certificate is still taken here");
                 cluster::ADMIT_DELETED.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            let listener = cluster::listen(tcp, pki::server_config(&cluster.me)?).map_err(|e| fail("listening", &e))?;
+            let people64 = args.people.map(|_| people::prefix(&cluster.me.ca));
+            let listener = cluster::listen_for(tcp, pki::server_config(&cluster.me)?, people64)
+                .map_err(|e| fail("listening", &e))?;
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();
             let served = axum::serve(listener, app).with_graceful_shutdown(async move { drop(stop.changed().await) });
@@ -1178,7 +1180,13 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();
         let taken = args.ingress.then_some(taken);
         // (Without a mesh too: a node's Services answer its pods there as well, T-0723.)
-        let services = services::run(shared.clone(), args.mesh, taken, stopping.clone());
+        let services = services::run(
+            shared.clone(),
+            args.mesh,
+            args.people.is_some(),
+            taken,
+            stopping.clone(),
+        );
         // (What each pod may reach, kept in step with its policies: on a node alone too.)
         let held = pods::keep_held(shared.clone(), stopping.clone());
         let proxy = async {

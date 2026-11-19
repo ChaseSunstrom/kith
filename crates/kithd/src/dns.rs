@@ -21,7 +21,7 @@ use kith_api::store::Store;
 use kith_dns::{Cidr, Rdata, Record, Records, View, Zones};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
@@ -564,6 +564,22 @@ pub fn leads(shared: &Shared) -> bool {
     metrics.current_leader == Some(metrics.id)
 }
 
+/// The networks the resolver forwards for: the local ones and the pods', less the people's (their
+/// IPv4 range and /64, which fc00::/7 holds): a person is a guest of the Services, not of the
+/// resolver (docs/adr-people.md, Review 8).
+fn forwarders(pods: &str, people64: Option<Ipv6Addr>) -> Vec<Cidr> {
+    let nets = kith_dns::LOCAL_NETWORKS.into_iter().chain([pods]);
+    let nets: Vec<Cidr> = nets.filter_map(|net| net.parse().ok()).collect();
+    let range = format!("{}/16", crate::people::RANGE);
+    let people = people64.map(|net| format!("{net}/64"));
+    let denied: Vec<Cidr> = [Some(range), people]
+        .into_iter()
+        .flatten()
+        .filter_map(|net| net.parse().ok())
+        .collect();
+    Cidr::without(&nets, &denied)
+}
+
 /// Serve DNS until kithd stops.
 pub async fn run(
     shared: Arc<Shared>,
@@ -575,8 +591,11 @@ pub async fn run(
     // takes the place of the local networks, so they are named with it: a list of the pods'
     // network alone had every other client refused.)
     let pods = crate::pods::range().to_string();
-    let forwarders = kith_dns::LOCAL_NETWORKS.into_iter().chain([pods.as_str()]);
-    let forwarders: Vec<Cidr> = forwarders.filter_map(|net| net.parse().ok()).collect();
+    let people = shared
+        .cluster
+        .as_ref()
+        .map(|cluster| crate::people::prefix(&cluster.me.ca));
+    let forwarders = forwarders(&pods, people);
     let listen = tcp.local_addr().expect("a bound socket has an address");
     // The house address the Clusters name (held by this node or not): a resolver list that names
     // it (a router's DHCP) must not be asked by the node that holds it, nor dropped for good by
@@ -718,6 +737,50 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The resolver forwards for a mesh source (inside fc00::/7), not for a person: the people's
+    /// IPv4 range and /64 are refused, though fc00::/7 holds the /64 (docs/adr-people.md,
+    /// Review 8). Cidr::contains is what the server asks of each network.
+    #[test]
+    fn people_resolver_refuses_the_people_prefixes_and_forwards_for_the_mesh() {
+        let people64 = crate::people::prefix("a cluster");
+        let mesh = crate::mesh::prefix("a cluster");
+        let nets = forwarders("10.244.0.0/16", Some(people64));
+        let may = |ip: IpAddr| nets.iter().any(|net| net.contains(ip));
+        let at = |prefix: Ipv6Addr, id: u128| IpAddr::V6((u128::from(prefix) | id).into());
+        // Both families, and a person as the dual-stack socket shows it.
+        for person in [
+            at(people64, 2),
+            at(people64, 0xffff_ffff_ffff_fffe),
+            "100.89.0.2".parse().unwrap(),
+            "100.89.255.253".parse().unwrap(),
+            "::ffff:100.89.0.2".parse().unwrap(),
+        ] {
+            assert!(!may(person), "{person} is a person");
+        }
+        // The /64 is inside fc00::/7: it is the deny that wins, and the rest of fc00::/7 stays.
+        let unique_local: Cidr = "fc00::/7".parse().unwrap();
+        assert!(unique_local.contains(at(people64, 2)), "the allow would take a person");
+        for ours in [
+            at(mesh, 0x10),
+            at(Ipv6Addr::from(u128::from(people64) ^ (1 << 64)), 2),
+            "fd00::1".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+            "10.1.2.3".parse().unwrap(),
+            "10.244.1.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            "::1".parse().unwrap(),
+        ] {
+            assert!(may(ours), "{ours} is not a person");
+        }
+        for stranger in ["8.8.8.8", "100.88.0.1", "2001:db8::1"] {
+            assert!(!may(stranger.parse().unwrap()), "{stranger}");
+        }
+        // With no cluster there is no /64 to name: the IPv4 range alone is refused.
+        let alone = forwarders("10.244.0.0/16", None);
+        assert!(!alone.iter().any(|net| net.contains("100.89.0.2".parse().unwrap())));
+        assert!(alone.iter().any(|net| net.contains("fd00::1".parse().unwrap())));
+    }
 
     /// The socket on every address and the one on the house address share a port, and the
     /// second binds an address no card has yet.
