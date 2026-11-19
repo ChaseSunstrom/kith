@@ -45,7 +45,10 @@ impl Exits {
     /// What `levels.rs` needs of the tunnels: the held ones, and why the others are not.
     pub fn held(&self) -> Held {
         let failed = self.failed.iter().map(|(name, why)| (name.clone(), Err(why.clone())));
-        let up = self.up.iter().map(|(name, up)| (name.clone(), Ok((up.number, up.levels.clone()))));
+        let up = self
+            .up
+            .iter()
+            .map(|(name, up)| (name.clone(), Ok((up.number, up.levels.clone()))));
         // (One that failed is not up: a tunnel kept while its Exit now fails is the failure's.)
         up.chain(failed).collect()
     }

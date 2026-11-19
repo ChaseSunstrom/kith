@@ -2002,7 +2002,11 @@ fn an_exit_and_a_published_port_are_checked() {
     read("Exit", exit).unwrap();
     // (Levels of the people, with or without namespaces.)
     read("Exit", "{ node: n1, secret: vpn, levels: [family] }").unwrap();
-    read("Exit", "{ node: n1, secret: vpn, namespaces: [media], levels: [family] }").unwrap();
+    read(
+        "Exit",
+        "{ node: n1, secret: vpn, namespaces: [media], levels: [family] }",
+    )
+    .unwrap();
     assert!(!kind("Exit").unwrap().namespaced);
     for (bad, why) in [
         ("{ node: n1, secret: vpn, namespaces: [] }", "namespaces: at least one"),

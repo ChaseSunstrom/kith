@@ -184,7 +184,9 @@ fn level_of(
         match exits.get(exit) {
             Some(Ok((number, carried))) if carried.iter().any(|carried| carried == name) => Internet::Exit(*number),
             Some(Ok(_)) => {
-                notes.push(format!("level {name}: exit {exit} does not list level {name}: no internet"));
+                notes.push(format!(
+                    "level {name}: exit {exit} does not list level {name}: no internet"
+                ));
                 Internet::None
             }
             Some(Err(why)) => {
@@ -325,11 +327,15 @@ pub fn wanted(
             notes.extend(said);
             out.levels.push((one.level.clone(), level));
         }
-        let table = out.levels.iter().find(|(name, _)| *name == one.level).and_then(|(_, l)| match l.internet {
-            Internet::Home => Some(254),
-            Internet::Exit(number) => Some(kith_mesh::exit::table(number)),
-            Internet::None => None,
-        });
+        let table = out
+            .levels
+            .iter()
+            .find(|(name, _)| *name == one.level)
+            .and_then(|(_, l)| match l.internet {
+                Internet::Home => Some(254),
+                Internet::Exit(number) => Some(kith_mesh::exit::table(number)),
+                Internet::None => None,
+            });
         if let (Some(table), Some(v4)) = (table, one.person.v4) {
             out.internet.insert(v4, table);
         }
@@ -541,13 +547,21 @@ impl Tend {
         // is never sent by two, and between the two falls to 9012, nowhere.)
         let have: BTreeSet<(Ipv4Addr, u32)> = rules
             .iter()
-            .filter_map(|&(priority, six, from, table)| match (priority == 9011 && !six, from, table) {
-                (true, Some(from), Some(table)) => Some((from, table)),
-                _ => None,
-            })
+            .filter_map(
+                |&(priority, six, from, table)| match (priority == 9011 && !six, from, table) {
+                    (true, Some(from), Some(table)) => Some((from, table)),
+                    _ => None,
+                },
+            )
             .collect();
         let wanted: BTreeSet<(Ipv4Addr, u32)> = w.internet.iter().map(|(&from, &table)| (from, table)).collect();
-        let said = |table: u32| if table == 254 { String::new() } else { format!(" to table {table:#x}") };
+        let said = |table: u32| {
+            if table == 254 {
+                String::new()
+            } else {
+                format!(" to table {table:#x}")
+            }
+        };
         for &(address, table) in have.difference(&wanted) {
             self.steps.push(format!("rule 9011 - {address}{}", said(table)));
             (self.kernel.internet)(address, table, false)
@@ -555,7 +569,8 @@ impl Tend {
         }
         for &(address, table) in wanted.difference(&have) {
             self.steps.push(format!("rule 9011 + {address}{}", said(table)));
-            (self.kernel.internet)(address, table, true).map_err(|e| format!("routing rule 9011 for {address}: {e}"))?;
+            (self.kernel.internet)(address, table, true)
+                .map_err(|e| format!("routing rule 9011 for {address}: {e}"))?;
         }
         Ok(())
     }
@@ -849,7 +864,14 @@ pub(crate) mod tests {
         // (One that has no addresses yet.)
         apply(&mut store, &peer_yaml("phone-7", "n1", "family", 7));
 
-        let asked = wanted(&store, (mesh, people64), "n1", &config(&["192.168.0.0/16"]), Vec::new(), &Held::new());
+        let asked = wanted(
+            &store,
+            (mesh, people64),
+            "n1",
+            &config(&["192.168.0.0/16"]),
+            Vec::new(),
+            &Held::new(),
+        );
         let names: Vec<&str> = asked.levels.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(names, ["away", "named"], "{:?}", asked.notes);
 
@@ -877,7 +899,14 @@ pub(crate) mod tests {
         // Without the clash: phone-1 is held, with the whole level.
         let mut store = store;
         store.delete("RemotePeer/phone-8").unwrap();
-        let asked = wanted(&store, (mesh, people64), "n1", &config(&["192.168.0.0/16"]), vec![], &Held::new());
+        let asked = wanted(
+            &store,
+            (mesh, people64),
+            "n1",
+            &config(&["192.168.0.0/16"]),
+            vec![],
+            &Held::new(),
+        );
         let family = &asked
             .levels
             .iter()
@@ -1327,17 +1356,26 @@ pub(crate) mod tests {
     fn people_exit_rule_wanted_only_while_the_exit_is_held() {
         let (mesh, people64) = ids();
         let mut store = Store::default();
-        apply(&mut store, &level_yaml("away", "{ dns: '192.0.2.53', exit: somewhere }"));
+        apply(
+            &mut store,
+            &level_yaml("away", "{ dns: '192.0.2.53', exit: somewhere }"),
+        );
         apply(&mut store, &peer_yaml("phone-2", "n1", "away", 2));
         settle(&mut store);
         let ask = |held: &Held| wanted(&store, (mesh, people64), "n1", &config(&[]), Vec::new(), held);
         let v4 = |asked: &Wanted| asked.people.iter().find_map(|(person, _)| person.v4).expect("the peer");
         let up = |levels: &[&str]| {
-            Held::from([("somewhere".to_string(), Ok((7, levels.iter().map(|l| l.to_string()).collect())))])
+            Held::from([(
+                "somewhere".to_string(),
+                Ok((7, levels.iter().map(|l| l.to_string()).collect())),
+            )])
         };
 
         let asked = ask(&up(&["away"]));
-        assert_eq!(asked.internet, BTreeMap::from([(v4(&asked), kith_mesh::exit::table(7))]));
+        assert_eq!(
+            asked.internet,
+            BTreeMap::from([(v4(&asked), kith_mesh::exit::table(7))])
+        );
         assert_eq!(asked.internet.values().copied().collect::<Vec<_>>(), [0x6b78_0007]);
         assert_eq!(asked.levels[0].1.internet, Internet::Exit(7), "{:?}", asked.notes);
         assert!(asked.notes.is_empty(), "{:?}", asked.notes);
@@ -1381,7 +1419,10 @@ pub(crate) mod tests {
         let mut tend = tend();
         let notes = tend.pass(&exit(table));
         assert_eq!(notes, Vec::<String>::new());
-        assert_eq!(tend.steps, ["table", "rule 9011 + 100.89.0.2 to table 0x6b780007", "peers"]);
+        assert_eq!(
+            tend.steps,
+            ["table", "rule 9011 + 100.89.0.2 to table 0x6b780007", "peers"]
+        );
         assert_eq!(internet_rules(), [(phone, table)]);
         assert_eq!(peers_on_device(), 1);
         tend.steps.clear();
@@ -1403,7 +1444,10 @@ pub(crate) mod tests {
         tend.steps.clear();
         tend.pass(&exit(table));
         let steps = tend.steps.join(" | ");
-        let (old, new) = (steps.find("rule 9011 - 100.89.0.2"), steps.find("rule 9011 + 100.89.0.2 to table"));
+        let (old, new) = (
+            steps.find("rule 9011 - 100.89.0.2"),
+            steps.find("rule 9011 + 100.89.0.2 to table"),
+        );
         assert!(old.is_some() && new.is_some() && old < new, "{steps}");
         assert_eq!(internet_rules(), [(phone, table)]);
         tend.steps.clear();
