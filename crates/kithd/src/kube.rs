@@ -779,7 +779,9 @@ fn identity(template: &Value) -> String {
     if let Some(labels) = template.pointer_mut("/metadata/labels").and_then(Value::as_object_mut) {
         labels.remove("pod-template-hash");
     }
-    blake3::hash(bare(&template).unwrap_or_default().to_string().as_bytes()).to_hex().to_string()
+    blake3::hash(bare(&template).unwrap_or_default().to_string().as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 /// A pod template a Deployment's kept revisions held.
@@ -804,12 +806,19 @@ fn kept(store: &Store, key: &str) -> Vec<Kept> {
         let Some((_, object)) = raw(&old.resource).filter(|(kind, _)| kind.kind == "Deployment") else {
             continue;
         };
-        let Some(revision) = old.resource.metadata.revision else { continue };
+        let Some(revision) = old.resource.metadata.revision else {
+            continue;
+        };
         let template = object["spec"]["template"].clone();
         let id = identity(&template);
         match found.iter_mut().find(|held| held.id == id) {
             Some(held) => (held.revision, held.template) = (revision, template),
-            None => found.push(Kept { id, revision, at: old.at, template }),
+            None => found.push(Kept {
+                id,
+                revision,
+                at: old.at,
+                template,
+            }),
         }
     }
     found.sort_by_key(|held| held.revision);
@@ -2463,7 +2472,10 @@ fn going_back(store: &Store, key: &str, was: &Value, sent: &Value) -> Option<u64
     if now == template(was) || rest(was) != rest(sent) {
         return None;
     }
-    kept(store, key).into_iter().find(|held| held.id == now).map(|held| held.revision)
+    kept(store, key)
+        .into_iter()
+        .find(|held| held.id == now)
+        .map(|held| held.revision)
 }
 
 /// What a write came to: its HTTP status, the object as it now is, and what is said of it.
@@ -2592,14 +2604,18 @@ async fn write(
                 let mut patched = json_patch(&before, &body).map_err(invalid)?;
                 let empty = patched.pointer("/metadata/annotations").and_then(Value::as_object);
                 if bare && empty.is_some_and(|annotations| annotations.is_empty()) {
-                    patched["metadata"].as_object_mut().map(|meta| meta.remove("annotations"));
+                    patched["metadata"]
+                        .as_object_mut()
+                        .map(|meta| meta.remove("annotations"));
                 }
                 patched
             }
         };
         // A dry run only says what the write would do: it is not sent back.
         if how == How::JsonPatch && kind.kind == "Deployment" && !call.asked.contains_key("dryRun") {
-            undo = was.as_ref().and_then(|was| going_back(&state.store, &primary, was, &sent));
+            undo = was
+                .as_ref()
+                .and_then(|was| going_back(&state.store, &primary, was, &sent));
         }
         // A change of what was read is held to it: the revision, whatever its status did since.
         let based = sent.pointer("/metadata/resourceVersion").and_then(Value::as_str);
@@ -2664,7 +2680,11 @@ async fn write(
     if let Some(to) = undo {
         let back = api::rolled_back(&call.shared, &call.caller, primary, to).await;
         let object = back.map_err(refusal)?.after;
-        return Ok(Written(StatusCode::OK, served(&object).map(|(_, object)| object), hints));
+        return Ok(Written(
+            StatusCode::OK,
+            served(&object).map(|(_, object)| object),
+            hints,
+        ));
     }
     // Made only if it is not there, changed only as it was read: the store holds to that
     // (an apply is laid over what is there, so it is read from that revision too).
@@ -4665,10 +4685,19 @@ spec: {role: writer, subjects: [carol]}
 
     /// Makes the Deployment `x` of `image` and changes its image to each of `then`: a revision each.
     async fn revised(shared: &Arc<crate::Shared>, image: &str, then: &[&str]) {
-        let made = sent_as(shared, "POST", "application/json", DEPLOYMENTS, &[], deployment_of(image)).await;
+        let made = sent_as(
+            shared,
+            "POST",
+            "application/json",
+            DEPLOYMENTS,
+            &[],
+            deployment_of(image),
+        )
+        .await;
         assert_eq!(made.0, StatusCode::CREATED, "{}", made.1);
         for image in then {
-            let patch = json!({ "spec": { "template": { "spec": { "containers": [{ "name": "main", "image": image }] } } } });
+            let patch =
+                json!({ "spec": { "template": { "spec": { "containers": [{ "name": "main", "image": image }] } } } });
             let rest = format!("{DEPLOYMENTS}/x");
             let done = sent_as(shared, "PATCH", "application/merge-patch+json", &rest, &[], patch).await;
             assert_eq!(done.0, StatusCode::OK, "{}", done.1);
@@ -4687,7 +4716,12 @@ spec: {role: writer, subjects: [carol]}
                 let revision = set["metadata"]["annotations"]["deployment.kubernetes.io/revision"].as_str();
                 let image = set["spec"]["template"]["spec"]["containers"][0]["image"].as_str();
                 let replicas = set["spec"]["replicas"].as_u64();
-                (image.unwrap().to_string(), revision.unwrap().to_string(), replicas.unwrap(), set.clone())
+                (
+                    image.unwrap().to_string(),
+                    revision.unwrap().to_string(),
+                    replicas.unwrap(),
+                    set.clone(),
+                )
             })
             .collect();
         sets.sort_by_key(|(_, revision, ..)| revision.parse::<u64>().unwrap());
@@ -4707,7 +4741,10 @@ spec: {role: writer, subjects: [carol]}
         assert_eq!(identity(&plain).len(), 64, "the whole hash, not a prefix");
         let other = json!({ "metadata": { "labels": { "app": "y" } }, "spec": { "containers": [{ "name": "m", "image": "i" }] } });
         assert_ne!(identity(&plain), identity(&other));
-        let (a, b) = (json!({ "spec": { "x": ["1", "2"] } }), json!({ "spec": { "x": ["2", "1"] } }));
+        let (a, b) = (
+            json!({ "spec": { "x": ["1", "2"] } }),
+            json!({ "spec": { "x": ["2", "1"] } }),
+        );
         assert_ne!(identity(&a), identity(&b), "the order of a list is its meaning");
     }
 
@@ -4719,23 +4756,52 @@ spec: {role: writer, subjects: [carol]}
         let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
         revised(&shared, "v1", &["v2", "v3"]).await;
         let sets = replica_sets(&shared).await;
-        let seen: Vec<_> = sets.iter().map(|(image, revision, replicas, _)| (image.as_str(), revision.as_str(), *replicas)).collect();
+        let seen: Vec<_> = sets
+            .iter()
+            .map(|(image, revision, replicas, _)| (image.as_str(), revision.as_str(), *replicas))
+            .collect();
         assert_eq!(seen, [("v1", "1", 0), ("v2", "2", 0), ("v3", "3", 1)]);
-        let names: BTreeSet<_> = sets.iter().map(|set| set.3["metadata"]["name"].as_str().unwrap()).collect();
+        let names: BTreeSet<_> = sets
+            .iter()
+            .map(|set| set.3["metadata"]["name"].as_str().unwrap())
+            .collect();
         assert_eq!(names.len(), 3, "a name each");
         // Each is owned by the Deployment, which is what `kubectl rollout` finds them by.
-        let (_, owner) = sent_as(&shared, "GET", "application/json", &format!("{DEPLOYMENTS}/x"), &[], Value::Null).await;
+        let (_, owner) = sent_as(
+            &shared,
+            "GET",
+            "application/json",
+            &format!("{DEPLOYMENTS}/x"),
+            &[],
+            Value::Null,
+        )
+        .await;
         for (.., set) in &sets {
-            assert_eq!(set["metadata"]["ownerReferences"][0]["uid"], owner["metadata"]["uid"], "{set}");
+            assert_eq!(
+                set["metadata"]["ownerReferences"][0]["uid"], owner["metadata"]["uid"],
+                "{set}"
+            );
             assert_eq!(set["metadata"]["ownerReferences"][0]["controller"], true);
         }
         // A kept one runs nothing: no replicas wanted, none counted.
         for (_, _, _, set) in sets.iter().filter(|set| set.2 == 0) {
-            assert_eq!((&set["status"]["replicas"], &set["status"]["readyReplicas"]), (&json!(0), &json!(0)), "{set}");
+            assert_eq!(
+                (&set["status"]["replicas"], &set["status"]["readyReplicas"]),
+                (&json!(0), &json!(0)),
+                "{set}"
+            );
         }
         // One is got by its name, as `kubectl rollout history --revision` does.
         let name = sets[0].3["metadata"]["name"].as_str().unwrap();
-        let (code, one) = sent_as(&shared, "GET", "application/json", &format!("{REPLICA_SETS}/{name}"), &[], Value::Null).await;
+        let (code, one) = sent_as(
+            &shared,
+            "GET",
+            "application/json",
+            &format!("{REPLICA_SETS}/{name}"),
+            &[],
+            Value::Null,
+        )
+        .await;
         assert_eq!(code, StatusCode::OK, "{one}");
         assert_eq!(one["spec"]["template"]["spec"]["containers"][0]["image"], "v1");
         // Back to v2 (a revision 4) and a scale (5): v2 is the live one, with its newest
@@ -4746,7 +4812,10 @@ spec: {role: writer, subjects: [carol]}
         let scale = json!({ "spec": { "replicas": 3 } });
         sent_as(&shared, "PATCH", "application/merge-patch+json", &rest, &[], scale).await;
         let sets = replica_sets(&shared).await;
-        let seen: Vec<_> = sets.iter().map(|(image, revision, replicas, _)| (image.as_str(), revision.as_str(), *replicas)).collect();
+        let seen: Vec<_> = sets
+            .iter()
+            .map(|(image, revision, replicas, _)| (image.as_str(), revision.as_str(), *replicas))
+            .collect();
         assert_eq!(seen, [("v1", "1", 0), ("v3", "3", 0), ("v2", "5", 3)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4769,16 +4838,31 @@ spec: {role: writer, subjects: [carol]}
             ("DELETE", one.as_str(), "application/json"),
             ("POST", REPLICA_SETS, "application/json"),
             ("PATCH", &format!("{one}/scale"), "application/merge-patch+json"),
-            ("PUT", &format!("{REPLICA_SETS}/nothing-by-this-name"), "application/json"),
+            (
+                "PUT",
+                &format!("{REPLICA_SETS}/nothing-by-this-name"),
+                "application/json",
+            ),
         ] {
             let (code, said) = sent_as(&shared, method, kind, rest, &[], body.clone()).await;
             assert_eq!(code, StatusCode::METHOD_NOT_ALLOWED, "{method} {rest}: {said}");
-            assert!(said.as_str().is_some_and(|why| why.contains("Deployment")), "{method} {rest}: {said}");
+            assert!(
+                said.as_str().is_some_and(|why| why.contains("Deployment")),
+                "{method} {rest}: {said}"
+            );
         }
         // Nothing moved: the same ReplicaSets, and the Deployment at its revision.
         let again = replica_sets(&shared).await;
         assert_eq!(again.len(), 2);
-        let (_, owner) = sent_as(&shared, "GET", "application/json", &format!("{DEPLOYMENTS}/x"), &[], Value::Null).await;
+        let (_, owner) = sent_as(
+            &shared,
+            "GET",
+            "application/json",
+            &format!("{DEPLOYMENTS}/x"),
+            &[],
+            Value::Null,
+        )
+        .await;
         assert_eq!(owner["metadata"]["generation"], 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4787,7 +4871,10 @@ spec: {role: writer, subjects: [carol]}
     /// without the hash label, and the Deployment's annotations (it has none: an empty map).
     fn undo_patch(set: &Value) -> Value {
         let mut template = set["spec"]["template"].clone();
-        template["metadata"]["labels"].as_object_mut().unwrap().remove("pod-template-hash");
+        template["metadata"]["labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pod-template-hash");
         // (kubectl's own encoding of a container adds an empty `resources`: captured, `-v=8`.)
         template["spec"]["containers"][0]["resources"] = json!({});
         json!([
@@ -4810,26 +4897,56 @@ spec: {role: writer, subjects: [carol]}
         sent_as(&shared, "PATCH", "application/merge-patch+json", &rest, &[], v3).await;
         let sets = replica_sets(&shared).await;
         let v2 = sets.iter().find(|set| set.0 == "v2").unwrap().3.clone();
-        let (code, done) = sent_as(&shared, "PATCH", "application/json-patch+json", &rest, &[], undo_patch(&v2)).await;
+        let (code, done) = sent_as(
+            &shared,
+            "PATCH",
+            "application/json-patch+json",
+            &rest,
+            &[],
+            undo_patch(&v2),
+        )
+        .await;
         assert_eq!(code, StatusCode::OK, "{done}");
-        assert_eq!(done["spec"]["template"]["spec"]["containers"][0]["image"], "v2", "{done}");
+        assert_eq!(
+            done["spec"]["template"]["spec"]["containers"][0]["image"], "v2",
+            "{done}"
+        );
         assert_eq!(done["metadata"]["generation"], 4, "a new revision");
         assert_eq!(done["spec"]["replicas"], 1, "what revision 2 held, replicas and all");
         {
             let state = shared.store.lock().unwrap();
             let history = state.store.history("Workload/default/x").unwrap();
-            let [.., two, _, back] = history else { panic!("{history:?}") };
+            let [.., two, _, back] = history else {
+                panic!("{history:?}")
+            };
             assert_eq!(back.resource.metadata.revision, Some(4));
             assert_eq!(back.resource.spec, two.resource.spec);
-            assert_eq!(back.resource.metadata.annotations.get(SENT), two.resource.metadata.annotations.get(SENT));
+            assert_eq!(
+                back.resource.metadata.annotations.get(SENT),
+                two.resource.metadata.annotations.get(SENT)
+            );
         }
         // And the history says it: v2 is the live one at 4, v3 is kept at 3.
-        let seen: Vec<_> = replica_sets(&shared).await.into_iter().map(|(image, revision, ..)| (image, revision)).collect();
-        assert_eq!(seen, [("v1".into(), "1".into()), ("v3".into(), "3".into()), ("v2".into(), "4".into())]);
+        let seen: Vec<_> = replica_sets(&shared)
+            .await
+            .into_iter()
+            .map(|(image, revision, ..)| (image, revision))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("v1".into(), "1".into()),
+                ("v3".into(), "3".into()),
+                ("v2".into(), "4".into())
+            ]
+        );
         // The same again is the live template: nothing is done, and no revision is made.
         let live = replica_sets(&shared).await.pop().unwrap().3;
         let mut again = undo_patch(&live);
-        again[0]["value"]["spec"]["containers"][0].as_object_mut().unwrap().remove("resources");
+        again[0]["value"]["spec"]["containers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("resources");
         let (code, done) = sent_as(&shared, "PATCH", "application/json-patch+json", &rest, &[], again).await;
         assert_eq!(code, StatusCode::OK, "{done}");
         assert_eq!(done["metadata"]["generation"], 4, "{done}");
@@ -4852,8 +4969,15 @@ spec: {role: writer, subjects: [carol]}
             ops
         };
         // A dry run of the return writes nothing.
-        let (code, done) =
-            sent_as(&shared, "PATCH", "application/json-patch+json", &rest, &[("dryRun", "All")], undo_patch(&v1)).await;
+        let (code, done) = sent_as(
+            &shared,
+            "PATCH",
+            "application/json-patch+json",
+            &rest,
+            &[("dryRun", "All")],
+            undo_patch(&v1),
+        )
+        .await;
         assert_eq!(code, StatusCode::OK, "{done}");
         let (_, now) = sent_as(&shared, "GET", "application/json", &rest, &[], Value::Null).await;
         assert_eq!(now["metadata"]["generation"], 2, "{now}");
@@ -4861,7 +4985,10 @@ spec: {role: writer, subjects: [carol]}
         let both = patch(json!({ "op": "replace", "path": "/spec/replicas", "value": 4 }));
         let (code, done) = sent_as(&shared, "PATCH", "application/json-patch+json", &rest, &[], both).await;
         assert_eq!(code, StatusCode::OK, "{done}");
-        assert_eq!((done["spec"]["replicas"].clone(), done["metadata"]["generation"].clone()), (json!(4), json!(3)));
+        assert_eq!(
+            (done["spec"]["replicas"].clone(), done["metadata"]["generation"].clone()),
+            (json!(4), json!(3))
+        );
         // A template none of the revisions held is written as a patch.
         let mut new = undo_patch(&v1);
         new[0]["value"]["spec"]["containers"][0]["image"] = json!("v9");
@@ -4880,22 +5007,45 @@ spec: {role: writer, subjects: [carol]}
         let dir = std::env::temp_dir().join(format!("kithd-kube-undo-notes-{}", std::process::id()));
         let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
         let mut first = deployment_of("v1");
-        first["metadata"]["annotations"] = json!({ "meta.helm.sh/release-name": "x", "kubectl.kubernetes.io/last-applied-configuration": "{}" });
+        first["metadata"]["annotations"] =
+            json!({ "meta.helm.sh/release-name": "x", "kubectl.kubernetes.io/last-applied-configuration": "{}" });
         let made = sent_as(&shared, "POST", "application/json", DEPLOYMENTS, &[], first).await;
         assert_eq!(made.0, StatusCode::CREATED, "{}", made.1);
         let rest = format!("{DEPLOYMENTS}/x");
         let v2 = json!({ "spec": { "replicas": 3, "template": { "spec": { "containers": [{ "name": "main", "image": "v2" }] } } } });
         sent_as(&shared, "PATCH", "application/merge-patch+json", &rest, &[], v2).await;
         let v1 = replica_sets(&shared).await.remove(0).3;
-        let (code, done) = sent_as(&shared, "PATCH", "application/json-patch+json", &rest, &[], undo_patch(&v1)).await;
+        let (code, done) = sent_as(
+            &shared,
+            "PATCH",
+            "application/json-patch+json",
+            &rest,
+            &[],
+            undo_patch(&v1),
+        )
+        .await;
         assert_eq!(code, StatusCode::OK, "{done}");
-        assert_eq!(done["spec"]["template"]["spec"]["containers"][0]["image"], "v1", "{done}");
-        assert_eq!(done["spec"]["replicas"], 1, "the store's rollback: the whole revision, replicas too");
-        assert_eq!(done["metadata"]["annotations"]["meta.helm.sh/release-name"], "x", "{done}");
+        assert_eq!(
+            done["spec"]["template"]["spec"]["containers"][0]["image"], "v1",
+            "{done}"
+        );
+        assert_eq!(
+            done["spec"]["replicas"], 1,
+            "the store's rollback: the whole revision, replicas too"
+        );
+        assert_eq!(
+            done["metadata"]["annotations"]["meta.helm.sh/release-name"], "x",
+            "{done}"
+        );
         let state = shared.store.lock().unwrap();
         let history = state.store.history("Workload/default/x").unwrap();
-        let [first, _, back] = history else { panic!("{history:?}") };
-        assert_eq!(back.resource.spec, first.resource.spec, "a rollback: the first revision again");
+        let [first, _, back] = history else {
+            panic!("{history:?}")
+        };
+        assert_eq!(
+            back.resource.spec, first.resource.spec,
+            "a rollback: the first revision again"
+        );
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
