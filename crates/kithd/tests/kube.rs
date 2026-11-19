@@ -2086,29 +2086,37 @@ fn access_port_forward_sessions_are_bounded_per_caller() {
     });
 }
 
-/// One test at a time runs `with_running`'s unit: its systemd name (`w_team_tool_0_main`) is the same in every cluster
-/// here, and a kithd that sets it up kills the one another test's kithd runs (exit 137, restarts, a pod that is Pending).
-fn alone() -> std::sync::MutexGuard<'static, ()> {
-    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+/// A Workload name no other test or run shares: a unit's systemd name (`w_team_NAME_0_main`) and container id are made
+/// from it, and a kithd that sets up a name another kithd runs kills that one's unit (exit 137, restarts, a pod that is
+/// Pending). The process id tells runs (lanes) apart, the counter tests of one run; short, for the 52-character limit.
+fn unique(base: &str) -> String {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    format!(
+        "{base}{:x}x{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
-/// `with_team`, and a Workload `tool` of one exec unit that runs on this host, shown to kubectl as a Deployment
-/// (the images of the others are empty, so their pods are never Running, and kubectl asks no port of a pod that is not);
-/// None where this host's cgroup takes no container.
-fn with_running(test: &str, host: bool) -> Option<Cluster> {
+/// `with_team`, and a Workload of one exec unit that runs on this host (its unique name returned), shown to kubectl
+/// as a Deployment (the images of the others are empty, so their pods are never Running, and kubectl asks no port of a
+/// pod that is not); None where this host's cgroup takes no container.
+fn with_running(test: &str, host: bool) -> Option<(Cluster, String)> {
     let cluster = with_team_as(test, host);
-    let sent = r#"{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"tool","namespace":"team"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"tool"}},"template":{"metadata":{"labels":{"app":"tool"}},"spec":{"containers":[{"name":"main","image":"busybox:1.36"}]}}}}"#;
+    let name = unique("tool");
+    let sent = format!(
+        r#"{{"apiVersion":"apps/v1","kind":"Deployment","metadata":{{"name":"{name}","namespace":"team"}},"spec":{{"replicas":1,"selector":{{"matchLabels":{{"app":"{name}"}}}},"template":{{"metadata":{{"labels":{{"app":"{name}"}}}},"spec":{{"containers":[{{"name":"main","image":"busybox:1.36"}}]}}}}}}}}"#
+    );
     let tool = format!(
-        "apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: tool\n  namespace: team\n  annotations:\n    {}: '{sent}'\nspec:\n  replicas: 1\n  template:\n    exec:\n      - name: main\n        command: [sleep, '3600']\n",
+        "apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: {name}\n  namespace: team\n  annotations:\n    {}: '{sent}'\nspec:\n  replicas: 1\n  template:\n    exec:\n      - name: main\n        command: [sleep, '3600']\n",
         "kube.kith.dev/sent"
     );
     cluster.write("tool.yaml", &tool);
     cluster.kith(&["apply", "-f", "tool.yaml"]);
-    // A host whose cgroup takes no container (CI's runner, delegated or not) never runs tool-0: skip, as exec does.
+    // A host whose cgroup takes no container (CI's runner, delegated or not) never runs the tool: skip, as exec does.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let held = cluster.held("workload/team/tool");
+        let held = cluster.held(&format!("workload/team/{name}"));
         if held["status"]["containers"][0]["state"] == "running" {
             break;
         }
@@ -2123,13 +2131,13 @@ fn with_running(test: &str, host: bool) -> Option<Cluster> {
             );
             return None;
         }
-        assert!(Instant::now() < deadline, "tool-0 to run: not within 60 s\n{status}");
+        assert!(Instant::now() < deadline, "{name}-0 to run: not within 60 s\n{status}");
         std::thread::sleep(Duration::from_millis(250));
     }
-    Some(cluster)
+    Some((cluster, name))
 }
 
-/// A `kubectl port-forward` of `team`'s tool-0, as carol; it ends with this.
+/// A `kubectl port-forward` of `team`'s NAME-0, as carol; it ends with this.
 struct Forward(Child);
 
 impl Drop for Forward {
@@ -2141,7 +2149,7 @@ impl Drop for Forward {
 
 /// kubectl forwards a port of this host (with `host`, a pod that is not made reaches the host's loopback) as carol, who
 /// may run in `team`: the local port, once kubectl says it listens.
-fn forward(cluster: &Cluster, remote: u16) -> (Forward, u16) {
+fn forward(cluster: &Cluster, tool: &str, remote: u16) -> (Forward, u16) {
     let local = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let carol = cluster.as_("carol");
     let ports = format!("{local}:{remote}");
@@ -2152,7 +2160,7 @@ fn forward(cluster: &Cluster, remote: u16) -> (Forward, u16) {
             "127.0.0.1",
             "-n",
             "team",
-            "pod/tool-0",
+            &format!("pod/{tool}-0"),
             &ports,
         ])
         .current_dir(&cluster.dir)
@@ -2205,11 +2213,10 @@ fn workflows_kubectl_port_forward_carries_bytes_both_ways() {
         eprintln!("skipped: no delegated cgroup here");
         return;
     }
-    let _alone = alone();
-    let Some(cluster) = with_running("kube-forward-bytes", true) else {
+    let Some((cluster, tool)) = with_running("kube-forward-bytes", true) else {
         return;
     };
-    let (_forward, local) = forward(&cluster, echo());
+    let (_forward, local) = forward(&cluster, &tool, echo());
     let mut stream = near(local);
     stream.write_all(b"hello").unwrap();
     let mut hello = [0u8; 5];
@@ -2237,11 +2244,10 @@ fn workflows_kubectl_port_forward_ends_a_silent_stream_and_bounds_its_streams() 
         eprintln!("skipped: no delegated cgroup here");
         return;
     }
-    let _alone = alone();
-    let Some(cluster) = with_running("kube-forward-bound-streams", true) else {
+    let Some((cluster, tool)) = with_running("kube-forward-bound-streams", true) else {
         return;
     };
-    let (_forward, local) = forward(&cluster, echo());
+    let (_forward, local) = forward(&cluster, &tool, echo());
     let mut silent = near(local);
     let began = Instant::now();
     let mut one = [0u8; 1];
@@ -2278,11 +2284,10 @@ fn workflows_kubectl_port_forward_does_not_reach_the_host_through_a_pod_that_is_
         eprintln!("skipped: no delegated cgroup here");
         return;
     }
-    let _alone = alone();
-    let Some(cluster) = with_running("kube-forward-not-made", false) else {
+    let Some((cluster, tool)) = with_running("kube-forward-not-made", false) else {
         return;
     };
-    let (_forward, local) = forward(&cluster, echo());
+    let (_forward, local) = forward(&cluster, &tool, echo());
     let mut stream = near(local);
     let _ = stream.write_all(b"hello");
     let mut back = [0u8; 5];
@@ -2359,11 +2364,10 @@ fn workflows_kubectl_port_forward_asks_the_right_again_for_each_connection() {
         eprintln!("skipped: no delegated cgroup here");
         return;
     }
-    let _alone = alone();
-    let Some(cluster) = with_running("kube-forward-recheck", true) else {
+    let Some((cluster, tool)) = with_running("kube-forward-recheck", true) else {
         return;
     };
-    let (_forward, local) = forward(&cluster, echo());
+    let (_forward, local) = forward(&cluster, &tool, echo());
     let mut first = near(local);
     first.write_all(b"hello").unwrap();
     let mut back = [0u8; 5];
