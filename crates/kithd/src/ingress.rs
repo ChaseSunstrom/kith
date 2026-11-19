@@ -1261,7 +1261,7 @@ pub async fn run(
                         }
                         waited = waits;
                         // The leader's first order of a term follows a linearizable read: the store has then
-                        // applied what the old leader committed, its `tls.at` for each host, which an empty
+                        // applied what the old leader committed, its `tls.at` for each Service, which an empty
                         // `tried` cannot tell. A read that fails or is late orders nothing this round.
                         if leading && read_term != Some(term) {
                             let read = tokio::time::timeout(READ_AT_MOST, shared.raft.ensure_linearizable());
@@ -1394,6 +1394,80 @@ mod tests {
         // (Exactly `between` seconds ago is due again; one second less is not.)
         assert!(!asked_lately(None, Some(ago(between)), now, between));
         assert!(asked_lately(None, Some(ago(between - 1)), now, between));
+    }
+
+    /// A new leader's `tried` is empty: `order()` must hold a host off by its Service's `tls.at`
+    /// alone, asked a minute ago by the old leader. It returns before any ACME call. The directory
+    /// is a closed port on 127.0.0.1, so a call would fail and write an error into the status; the
+    /// status must keep the old `tls.at`, and nothing is tried or written for the account.
+    #[tokio::test]
+    async fn asked_lately_order_holds_a_host_off_by_the_stores_tls_at() {
+        use crate::cluster::{Cluster, pinned_peer};
+        let ca = crate::pki::Ca::create().unwrap();
+        let control = Cluster::new(pinned_peer::node(&ca, "a"), Some(ca)).unwrap();
+        let shared = pinned_peer::shared_of("asked-lately-order", control, &[]).await;
+        let id = shared.raft.metrics().borrow().id;
+        let leads = shared.raft.wait(Some(Duration::from_secs(30)));
+        leads.current_leader(id, "leads").await.unwrap();
+        let source = "\
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec: { selector: { app: web }, ports: [{ port: 80 }] }
+";
+        let resources = Resource::from_source(source).unwrap().into_iter().map(Result::unwrap);
+        let apply = kith_store::Command::Apply {
+            resources: resources.collect(),
+            at: now(),
+        };
+        shared.submit(apply).await.unwrap();
+        let asked = now() - 60;
+        let fields = serde_json::Map::from_iter([(
+            "tls".to_string(),
+            json!({ "state": "ordering", "by": "a", "at": asked }),
+        )]);
+        let patch = kith_store::Command::Patch {
+            statuses: vec![("Service/shop/web".to_string(), fields)],
+        };
+        shared.submit(patch).await.unwrap();
+
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let directory = format!("http://127.0.0.1:{closed}/directory");
+        let account = acme::Account::from_pkcs8(&acme::Account::generate().unwrap()).unwrap();
+        let of = routed(at(9), Vec::new(), &[]);
+        let mut tried = BTreeMap::new();
+        order(
+            &shared,
+            &directory,
+            &account,
+            "shop.example.org",
+            &of,
+            &mut tried,
+            BETWEEN_ORDERS,
+        )
+        .await;
+
+        assert!(tried.is_empty(), "a host the store says was asked lately is not tried");
+        let status = shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .get("Service/shop/web")
+            .unwrap()
+            .status
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (status["tls"]["state"].as_str(), status["tls"]["at"].as_u64()),
+            (Some("ordering"), Some(asked))
+        );
+        assert!(shared.store.lock().unwrap().store.get(ACCOUNT).is_none());
     }
 
     #[test]
