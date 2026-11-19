@@ -119,11 +119,16 @@ fn marker(state: &Path, dir: &Dir) -> PathBuf {
 }
 
 /// Puts the directory at `new` in the place of `dir`. What was in `dir` goes, unless it is
-/// not a copy this node was sent (`aside`): then it is kept beside it as `NAME.was-AT`.
+/// not a copy this node was sent (`aside`): then it is kept beside it as `.NAME.was-AT`.
 fn swap(new: &Path, dir: &Path, aside: Option<u64>) -> std::io::Result<()> {
-    let mut old = dir.as_os_str().to_owned();
-    old.push(aside.map_or(".old".to_string(), |at| format!(".was-{at}")));
-    let old = PathBuf::from(old);
+    // (A dot name, as `backups::beside` gives `.NAME.restoring`: `NAME.old` may be another Volume's.)
+    let mut name = std::ffi::OsString::from(".");
+    name.push(
+        dir.file_name()
+            .ok_or_else(|| std::io::Error::other("a directory with no name"))?,
+    );
+    name.push(aside.map_or(".old".to_string(), |at| format!(".was-{at}")));
+    let old = dir.with_file_name(name);
     // (One left here makes the rename below fail, so it is said.)
     if let Err(e) = crate::controller::storage::remove_tree(&old, &|| false)
         && e.kind() != std::io::ErrorKind::NotFound
@@ -630,7 +635,47 @@ mod tests {
         fill(&new, "three");
         swap(&new, &dir, Some(9)).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "three");
-        assert_eq!(std::fs::read_to_string(root.join("d.was-9/file")).unwrap(), "two");
+        assert_eq!(std::fs::read_to_string(root.join(".d.was-9/file")).unwrap(), "two");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A Volume named `data.old` or `data.was-1` is another Volume's directory beside `data`:
+    /// swapping `data` leaves it as it is, and what it sets aside is `.data.old` or `.data.was-N`,
+    /// a name no Volume has (a Volume's name starts with a letter or a digit).
+    #[test]
+    fn a_swap_leaves_a_sibling_volume_named_like_its_set_aside_directories() {
+        let root = std::env::temp_dir().join(format!("kith-replica-sibling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, new) = (root.join("data"), root.join(".data.restoring"));
+        let fill = |at: &Path, text: &str| {
+            std::fs::create_dir_all(at).unwrap();
+            std::fs::write(at.join("file"), text).unwrap();
+        };
+        fill(&root.join("data.old"), "sibling old");
+        fill(&root.join("data.was-1"), "sibling was");
+        fill(&dir, "copy");
+        fill(&new, "sent");
+        swap(&new, &dir, None).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "sent");
+        assert_eq!(
+            std::fs::read_to_string(root.join("data.old/file")).unwrap(),
+            "sibling old"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("data.was-1/file")).unwrap(),
+            "sibling was"
+        );
+        assert!(!root.join(".data.old").exists());
+        // What was this node's own is kept as `.data.was-9`, and the sibling is still there.
+        fill(&new, "kept");
+        swap(&new, &dir, Some(9)).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "kept");
+        assert_eq!(std::fs::read_to_string(root.join(".data.was-9/file")).unwrap(), "sent");
+        assert!(!root.join("data.was-9").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("data.old/file")).unwrap(),
+            "sibling old"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -696,7 +741,7 @@ mod tests {
         assert!(refused.contains("more than 98303 bytes"), "{refused}");
         // The copy as it was, nothing beside it and no archive left.
         assert_eq!(std::fs::read_to_string(into.join("old")).unwrap(), "before");
-        assert!(!root.join(".d.restoring").exists() && !root.join("d.old").exists());
+        assert!(!root.join(".d.restoring").exists() && !root.join(".d.old").exists());
         assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
         // As much as the volume holds: the copy.
         place(sent(&temp, 98_304), &temp, &into, 98_304, swapped).unwrap();
