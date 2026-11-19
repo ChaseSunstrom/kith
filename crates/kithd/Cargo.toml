@@ -10,6 +10,10 @@ license.workspace = true
 # says so, into a folder of its own): `POST /v1/forge` lets a leader append an entry it was not
 # asked for, so the access VM test can show every other node refuses it (forge.rs).
 forge = []
+# Test only, in no release (ci/musl.sh builds it into a folder of its own, os/build.sh lets only
+# that folder take it): `kithd fido2-authenticator` answers as a security key on /dev/uhid, so the
+# fido2 VM test can run the client against it (fido2_test.rs).
+fido2-test = []
 
 [dependencies]
 # The same as kith-runtime pulls images with.
@@ -61,8 +65,10 @@ tar = { version = "0.4", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure", "std"] }
 sha2 = "0.11"
 # The TPM's sessions encrypt what crosses its bus in AES-128-CFB (tpm.rs): ring has no AES
-# block alone. The block cipher only; CFB is a few lines in tpm.rs.
-aes = { version = "0.9", default-features = false }
+# block alone. The block cipher only; CFB is a few lines in tpm.rs, and CBC for a FIDO2
+# key's hmac-secret a few in fido2.rs. `zeroize`: the round keys are wiped when a cipher
+# drops (kithd's release size, measured with and without: 13424160 bytes both).
+aes = { version = "0.9", default-features = false, features = ["zeroize"] }
 # A PIN and the TPM's lockout authorization are zeroed once used (crypt.rs, tpm.rs); in the
 # tree already, through rustls.
 zeroize = "1"

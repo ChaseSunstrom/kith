@@ -26,6 +26,15 @@ mod dhcp;
 mod dns;
 mod encrypted;
 mod exits;
+#[allow(
+    dead_code,
+    reason = "the CTAP2 client's wire half (T-0966): nothing calls it until the record slice (docs/adr-fido2.md section 6); its tests run"
+)]
+mod fido2;
+// A software security key: in unit tests and in the `fido2-test` build, in no release
+// (docs/adr-fido2.md section 2, T-0970).
+#[cfg(any(test, feature = "fido2-test"))]
+mod fido2_test;
 mod files;
 #[cfg(feature = "forge")]
 mod forge;
@@ -365,6 +374,13 @@ fn main() -> ExitCode {
         &mut std::io::stderr(),
         b"kithd: built with forge: POST /v1/forge appends unchecked entries; never ship this\n",
     );
+    // The same for the software security key (the VM test, T-0955, looks for the line); started as
+    // `kithd fido2-authenticator` it then answers on /dev/uhid and never returns.
+    #[cfg(feature = "fido2-test")]
+    {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), fido2_test::STARTUP_LINE);
+        fido2_test::shim();
+    }
     // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
     if std::process::id() == 1 {
         keeper::keep();
@@ -451,6 +467,8 @@ fn installer(boot: init::Boot, source: String) -> ! {
                         _ = again.recv() => {}
                         () = init::BUTTON.notified() => {}
                     }
+                    // (A disk being written is finished first, then the machine stops.)
+                    install::stopped().await;
                     init::end(false)
                 });
             }
@@ -807,6 +825,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     if let Some(boot) = boot {
         let _in = rt.enter();
         early = stops().ok();
+        // (Also on a thread of its own: a stop heard from here on is kept for a failed start's `end`.)
+        init::hear_term();
         boot.network();
     }
     // Pods are made as root only; elsewhere the range is never used, so a clash is no matter.
