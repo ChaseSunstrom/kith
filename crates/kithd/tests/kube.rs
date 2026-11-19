@@ -895,6 +895,10 @@ fn workflows_rollout_history_and_undo() {
     cluster.refused(&["delete", "rs", name.as_str()], &["read only"]);
     cluster.refused(&["scale", "rs", name.as_str(), "--replicas=2"], &["read only"]);
     cluster.refused(&["patch", "rs", name.as_str(), "-p", r#"{"spec":{"replicas":2}}"#], &["read only"]);
+    // `apply` left its annotation: the undo's patch empties them, and is still taken for an undo.
+    let notes = cluster.got(&["deployment", "api"]);
+    let last = &notes["metadata"]["annotations"]["kubectl.kubernetes.io/last-applied-configuration"];
+    assert!(last.is_string(), "{notes}");
     // Undo to a revision: the Deployment has that template again, as a new revision.
     says(&cluster.ok(&["rollout", "undo", "deployment/api", "--to-revision=2"]), &["deployment.apps/api rolled back"]);
     assert_eq!(step(), "two");

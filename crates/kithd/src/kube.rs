@@ -816,6 +816,15 @@ fn kept(store: &Store, key: &str) -> Vec<Kept> {
     found
 }
 
+/// Whether a read of the ReplicaSet `name` (any, for `None`) can find one of the Deployment
+/// `owner`'s earlier revisions: the names made of them are the Deployment's, a dash and
+/// [`short_hash`]'s ten hex digits. For any other name the history is not read.
+fn may_be_history(owner: &str, name: Option<&str>) -> bool {
+    let Some(name) = name else { return true };
+    let hash = name.strip_prefix(owner).and_then(|rest| rest.strip_prefix('-'));
+    hash.is_some_and(|hash| hash.len() == 10 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// The ReplicaSets `kubectl rollout history` finds besides the live one: one for each
 /// template of an earlier revision of `owner` (the Deployment as it is, of `resource`), made
 /// up as the live one is, with no replicas and the number of the revision that last held it.
@@ -1083,7 +1092,11 @@ fn made(
         match kind.kind {
             "Pod" => found.extend(pods(&owner, resource).into_iter().map(|pod| (of.clone(), pod))),
             _ if owner["kind"] == "Deployment" => {
-                let before = history_sets(store, &owner, resource);
+                let before = if may_be_history(&resource.metadata.name, name) {
+                    history_sets(store, &owner, resource)
+                } else {
+                    Vec::new()
+                };
                 found.extend(before.into_iter().map(|old| (of.clone(), old)));
                 found.push((of, replica_set(&owner, resource)));
             }
@@ -2440,6 +2453,10 @@ fn going_back(store: &Store, key: &str, was: &Value, sent: &Value) -> Option<u64
     let rest = |object: &Value| {
         let mut object = object.clone();
         set(&mut object, "/spec/template", Value::Null);
+        // (Its annotations are not the ReplicaSet's, which holds only the revision's number: what
+        // kubectl sends for them is empty for a Deployment `apply` or Helm made. The rollback
+        // brings back the revision's own.)
+        set(&mut object, "/metadata/annotations", Value::Null);
         object
     };
     let now = template(sent);
@@ -4853,5 +4870,46 @@ spec: {role: writer, subjects: [carol]}
         assert_eq!(done["spec"]["template"]["spec"]["containers"][0]["image"], "v9");
         assert_eq!(done["spec"]["replicas"], 4, "a patch keeps what it does not say");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Deployment with annotations (`kubectl apply` leaves one, Helm several) is sent back
+    /// as well: kubectl's patch empties them (the ReplicaSet made up carries none of them),
+    /// and the rollback is the store's, bringing back what the revision held.
+    #[tokio::test]
+    async fn rollout_undo_of_an_annotated_deployment_is_still_the_rollback() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-undo-notes-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let mut first = deployment_of("v1");
+        first["metadata"]["annotations"] = json!({ "meta.helm.sh/release-name": "x", "kubectl.kubernetes.io/last-applied-configuration": "{}" });
+        let made = sent_as(&shared, "POST", "application/json", DEPLOYMENTS, &[], first).await;
+        assert_eq!(made.0, StatusCode::CREATED, "{}", made.1);
+        let rest = format!("{DEPLOYMENTS}/x");
+        let v2 = json!({ "spec": { "replicas": 3, "template": { "spec": { "containers": [{ "name": "main", "image": "v2" }] } } } });
+        sent_as(&shared, "PATCH", "application/merge-patch+json", &rest, &[], v2).await;
+        let v1 = replica_sets(&shared).await.remove(0).3;
+        let (code, done) = sent_as(&shared, "PATCH", "application/json-patch+json", &rest, &[], undo_patch(&v1)).await;
+        assert_eq!(code, StatusCode::OK, "{done}");
+        assert_eq!(done["spec"]["template"]["spec"]["containers"][0]["image"], "v1", "{done}");
+        assert_eq!(done["spec"]["replicas"], 1, "the store's rollback: the whole revision, replicas too");
+        assert_eq!(done["metadata"]["annotations"]["meta.helm.sh/release-name"], "x", "{done}");
+        let state = shared.store.lock().unwrap();
+        let history = state.store.history("Workload/default/x").unwrap();
+        let [first, _, back] = history else { panic!("{history:?}") };
+        assert_eq!(back.resource.spec, first.resource.spec, "a rollback: the first revision again");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a name that is a Deployment's name and ten hex digits can be an earlier revision's
+    /// ReplicaSet: a get of any other name does not read the history.
+    #[test]
+    fn rollout_history_is_read_only_for_a_name_it_could_have_made() {
+        assert!(may_be_history("x", None));
+        assert!(may_be_history("x", Some("x-0123456789")));
+        assert!(!may_be_history("x", Some("x-0123456789ab")));
+        assert!(!may_be_history("x", Some("x-0123456xyz")));
+        assert!(!may_be_history("x", Some("x-y-0123456789")));
+        assert!(!may_be_history("x", Some("x")));
+        assert!(!may_be_history("x", Some("xy-0123456789")));
     }
 }
