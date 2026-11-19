@@ -1662,6 +1662,34 @@ mod tests {
         fn start(&self, made: (), _: &str, _: &str) -> Result<(), ((), String)> {
             Err((made, "not asked".into()))
         }
+
+        fn exec(&self, _: &str, _: &kith_runtime::Unit, _: std::fs::File, _: std::fs::File) -> Result<(), String> {
+            Err("not asked".into())
+        }
+
+        fn adopt(&self) -> std::collections::BTreeMap<String, ((), String)> {
+            Default::default()
+        }
+
+        fn kill(&self, _: &mut (), _: &str) -> Result<(), String> {
+            Err("not asked".into())
+        }
+
+        fn delete(&self, made: (), _: &str) -> Result<(), (Option<()>, String)> {
+            Err((Some(made), "not asked".into()))
+        }
+
+        fn tune(&self, _: &(), _: &str, _: Option<u64>, _: Option<u64>) -> Result<Vec<String>, String> {
+            Err("not asked".into())
+        }
+
+        fn plug(&self, _: &(), _: &str, _: &Path) -> Result<(), String> {
+            Err("not asked".into())
+        }
+
+        fn unplug(&self, _: &(), _: &str, _: &Path) -> Result<(), String> {
+            Err("not asked".into())
+        }
     }
 
     /// Sockets made in a pod's namespace go to that pod only: where the pod was let go and
