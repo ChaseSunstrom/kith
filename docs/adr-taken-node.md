@@ -464,11 +464,14 @@ nodes too, and a replay decides alike.
   secret, the scheduler's Volume and a cron Job are `Signed` by the node's own key, header
   `who=node:<name>`, path `/v1/own`, carrying `key=<P-256 point>`. The point is accepted only
   when its fingerprint is the one in that Node's `status.certificate`, so another node's key
-  is refused, and so is a worker's. The body, parsed, must be the command (not its bytes); the
-  command must be the work of the node that signs it (`made`): the leader's scheduler makes a
-  Volume (new, for a claim that says `provision`, of the claim's size) and its cron a Job (new,
-  its spec the CronJob's `job`); a Secret (the ACME account or an exposed host's TLS secret) is
-  the leader's, or a node's whose status says it serves ingress. The nonce is taken once, and a
+  is refused, and so is a worker's. The body, parsed, must be the command (compared as values,
+  not bytes); the command must be the work of the node that signs it (`made`): the leader's
+  scheduler makes a Volume (new, for a claim that says `provision`, all of what
+  `volumes::made_for` builds) and its cron a Job (new, all of what `cron::job_for` builds, bar the
+  time a kube CronJob's Job is stamped with); a Secret (the ACME account or an exposed host's TLS
+  secret) is the leader's, or a non-leader control node's whose own status says it serves ingress
+  and whose `spec.ingress` the admin set, which never overwrites the account that is there.
+  The nonce is taken once, and a
   retry signs again with a fresh one; a node that cannot sign fails the write under `required`
   rather than send it bare. `own_writes::checked`
   is a pure function of the store and the entry. A follower forwards its signed entry to the
@@ -488,8 +491,17 @@ nodes too, and a replay decides alike.
   nothing under `required` (`releases::refuse_access`) and says so in the Release's or
   Source's status, once, not in an entry every node audits again each round. Slice 6
   (T-0850, `writer_may` for a Release and a Source) lifts it.
-- **What a taken control node can still do:** set `serves.ingress` on its own Node status
-  and then sign a Secret for an exposed host; the status is not itself signed yet.
+- **What a taken control node can still do:** a control node the admin set `spec.ingress` on
+  (that is how it is let order its own certificates, as a viewed worker is let serve them) can
+  still sign a Secret for an exposed host, and the TLS secret that is there (not the account).
+  A node whose `spec.ingress` the admin did not set cannot: its own status (`serves.ingress`) is
+  not enough. A control node that serves ingress and orders certificates without `spec.ingress`
+  set is refused under `required` (the leader's own orders are not).
+- **Not checked before the leader proposes it:** the signature of a follower's `Signed` entry is
+  checked at apply, on every node, not by the leader before it puts the entry in the log. The
+  leader's store may be a moment behind the follower's (a claim or an Ingress it has not applied),
+  and a refusal then would drop a valid write; a refused entry is audited by every node and takes
+  no nonce. The cost is a taken follower's entries in the log, bounded by what a node may write.
 - **What a taken leader can still do:** put its own `publicKey` on an Identity the admin
   signed the route for: `certified` checks the key is a valid P-256 point and that nothing
   else changed, but not whose it is, as the key is made after the signature (see "What

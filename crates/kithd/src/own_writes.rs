@@ -346,10 +346,11 @@ pub fn admit(
     }
     let message = crate::access_sign::bytes(cluster, read.target, asked, read.who, read.expires, read.nonce);
     let holds = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &point).verify(message.as_bytes(), &sig);
-    // (The body parsed is this command, as this build writes each: not the bytes another build wrote.)
-    let json = |command: &Command| serde_json::to_vec(command).ok();
-    let sent = serde_json::from_slice::<Command>(asked.body).ok();
-    if holds.is_err() || !sent.as_ref().and_then(json).is_some_and(|sent| json(command) == Some(sent)) {
+    // (The body parsed is this command: compared as values, not as the bytes this or another
+    // build writes, where a key's order or a number's spelling may differ.)
+    let value = |bytes: &[u8]| serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    let made = serde_json::to_vec(command).ok();
+    if holds.is_err() || !value(asked.body).is_some_and(|sent| made.as_deref().and_then(value) == Some(sent)) {
         return Err(not("its signature or body is not this entry's"));
     }
     let leads = kith_store::node_id(node) == leader;
@@ -372,31 +373,50 @@ fn signed(store: &Store, prefix: Ipv6Addr, by: (&str, bool), command: &Command) 
 
 /// May the control node `by` (its name, and whether it leads) make `resource`? Each is the work of
 /// the node that does it: the leader's scheduler makes a Volume and its cron a Job; a Secret is the
-/// leader's, or a node's that serves ingress (it orders its own certificates). A Volume: one a
-/// claim that says `provision` asks for (its size), on a Node, in its own `data` directory. A Job:
-/// new, of a CronJob that is there, with that CronJob's `job` as its spec. A Secret: the account
-/// of ACME, or the certificate of a host the Services expose.
+/// leader's, or a node's that serves ingress (it orders its own certificates). A Volume: new, for a
+/// claim that says `provision`, on a Node, and all of what `volumes::made_for` makes of them. A Job:
+/// new, of a CronJob that is there, and all of what `cron::job_for` makes of it. A Secret: the
+/// account of ACME, or the certificate of a host the Services expose; a node that is not the leader
+/// orders only where the admin set its `spec.ingress` as well as its own status says it serves
+/// ingress (the status is its own to say), and never overwrites the account.
 fn made(store: &Store, prefix: Ipv6Addr, by: (&str, bool), resource: &Resource) -> Result<(), String> {
     let key = resource.key();
     let there = |key: &str| store.get(key).is_some();
-    let spec = &resource.spec;
     let allowed = match resource.kind.as_str() {
         "Volume" => {
             let claim = store.get(&key.replacen("Volume", "VolumeClaim", 1));
-            let home = spec["node"].as_str().is_some_and(|node| there(&format!("Node/{node}")));
-            let asked = claim.is_some_and(|claim| claim.spec["provision"] == true && claim.spec["size"] == spec["size"]);
-            by.1 && !there(&key) && home && spec["path"] == "data" && asked
+            let node = resource.spec["node"].as_str().filter(|node| there(&format!("Node/{node}")));
+            let asked = claim.zip(node).is_some_and(|(claim, node)| {
+                let system = claim.metadata.namespace.as_deref() == Some(crate::volumes::SYSTEM);
+                claim.spec["provision"] == true && !system && *resource == crate::volumes::made_for(claim, node)
+            });
+            by.1 && !there(&key) && asked
         }
         "Job" => {
             let cron = crate::releases::owner(resource).filter(|owner| owner.starts_with("CronJob/"));
             let cron = cron.and_then(|owner| store.get(owner));
-            by.1 && !there(&key) && cron.is_some_and(|cron| cron.spec["job"] == *spec)
+            // (A CronJob sent here stamps its Job with when it was made, `kube::MADE`: not compared.)
+            let untimed = |job: &Resource| {
+                let mut job = job.clone();
+                job.metadata.annotations.remove("kube.kith.dev/made");
+                job
+            };
+            let same = |cron: &Resource| {
+                let named = resource.metadata.name.strip_prefix(&format!("{}-", cron.metadata.name));
+                let minute = named.is_some_and(|minute| !minute.is_empty() && minute.bytes().all(|b| b.is_ascii_digit()));
+                let job = crate::cron::job_for(cron, resource.metadata.name.clone());
+                minute && untimed(&job) == untimed(resource)
+            };
+            by.1 && !there(&key) && cron.is_some_and(same)
         }
         _ => {
-            let status = store.get(&format!("Node/{}", by.0)).and_then(|node| node.status.as_ref());
-            let orders = by.1 || status.is_some_and(|status| status["serves"]["ingress"] == true);
+            let node = store.get(&format!("Node/{}", by.0));
+            let serves = node.and_then(|node| node.status.as_ref()).is_some_and(|status| status["serves"]["ingress"] == true);
+            let said = node.is_some_and(|node| node.spec["ingress"] == true);
+            let account = key == crate::ingress::ACCOUNT;
+            let orders = by.1 || (serves && said && !(account && there(&key)));
             let (hosts, _) = crate::ingress::exposed(store, prefix);
-            orders && (key == crate::ingress::ACCOUNT || hosts.iter().any(|(host, e)| crate::ingress::tls_secret(host, e) == key))
+            orders && (account || hosts.iter().any(|(host, e)| crate::ingress::tls_secret(host, e) == key))
         }
     };
     match allowed {
@@ -942,18 +962,14 @@ mod tests {
         let cron = named("CronJob", "tick", serde_json::json!({
             "schedule": "* * * * *", "job": { "template": { "exec": [{ "name": "tick", "command": ["true"] }] } },
         }));
-        store.apply(cron).unwrap();
+        store.apply(cron.clone()).unwrap();
         let volume = |name: &str, node: &str, path: &str| {
-            named("Volume", name, serde_json::json!({ "node": node, "path": path, "size": "1Gi" }))
+            let claim = named("VolumeClaim", name, serde_json::json!({ "size": "1Gi", "provision": true }));
+            let mut volume = crate::volumes::made_for(&claim, node);
+            volume.spec["path"] = path.into();
+            volume
         };
-        let mut job = named(
-            "Job",
-            "tick-1",
-            serde_json::json!({ "template": { "exec": [{ "name": "tick", "command": ["true"] }] } }),
-        );
-        job.metadata
-            .annotations
-            .insert(crate::releases::OWNER.into(), "CronJob/default/tick".into());
+        let job = crate::cron::job_for(&cron, "tick-1".into());
         let mut orphan = job.clone();
         orphan.metadata.name = "other-1".into();
         orphan.metadata.annotations.insert(crate::releases::OWNER.into(), "CronJob/default/none".into());
@@ -1023,12 +1039,18 @@ mod tests {
         let id = pki::fingerprint(&ca.cert).unwrap();
         store.apply(named("Node", "w", serde_json::json!({ "trust": "worker" }))).unwrap();
         let template = serde_json::json!({ "template": { "exec": [{ "name": "tick", "command": ["true"] }] } });
-        store.apply(named("VolumeClaim", "db", serde_json::json!({ "size": "1Gi", "provision": true }))).unwrap();
-        store.apply(named("CronJob", "tick", serde_json::json!({ "schedule": "* * * * *", "job": template }))).unwrap();
-        let volume = |size: &str| named("Volume", "db", serde_json::json!({ "node": "b", "path": "data", "size": size }));
+        let claim = named("VolumeClaim", "db", serde_json::json!({ "size": "1Gi", "provision": true }));
+        let cron = named("CronJob", "tick", serde_json::json!({ "schedule": "* * * * *", "job": template }));
+        store.apply(claim.clone()).unwrap();
+        store.apply(cron.clone()).unwrap();
+        let volume = |size: &str| {
+            let mut volume = crate::volumes::made_for(&claim, "b");
+            volume.spec["size"] = size.into();
+            volume
+        };
         let job = |spec: serde_json::Value| {
-            let mut job = named("Job", "tick-1", spec);
-            job.metadata.annotations.insert(crate::releases::OWNER.into(), "CronJob/default/tick".into());
+            let mut job = crate::cron::job_for(&cron, "tick-1".into());
+            job.spec = spec;
             job
         };
         let secret = || resource(serde_json::json!({
@@ -1062,8 +1084,92 @@ mod tests {
         // ... unless that one serves ingress, and orders its own certificates.
         let status = serde_json::json!({ "certificate": pki::print_of(&b.cert).unwrap(), "serves": { "ingress": true } });
         store.set_status("Node/b", Some(status)).unwrap();
-        assert_eq!(admitted(&store, b, apply(vec![secret()])), Ok(()));
+        assert!(admitted(&store, b, apply(vec![secret()])).is_err(), "its own status says it: the admin did not");
+        store.apply(named("Node", "b", serde_json::json!({ "ingress": true }))).unwrap();
+        assert!(admitted(&store, b, apply(vec![secret()])).is_err(), "the account that is there is the leader's");
         assert!(admitted(&store, b, apply(vec![volume("1Gi")])).is_err());
+    }
+
+    /// Asked as each entry of the log is (`access_sign::hook`, with the id of the node that wrote
+    /// the entry), the work is the leader's whoever leads: after a change of leader the new one's
+    /// Volume is let in and the old one's is not. And what is there is never made again, a fresh
+    /// signature or not; a Volume or Job that is more than what the leader would make is refused.
+    #[test]
+    fn own_writes_signed_are_asked_of_the_node_that_wrote_the_entry() {
+        let ca = pki::Ca::create().unwrap();
+        let (mut store, nodes) = required(&ca, &["a", "b"]);
+        let (a, b) = (&nodes[0], &nodes[1]);
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        let audit = std::sync::Arc::new(crate::audit::Audit::new(
+            std::env::temp_dir().join(format!("kith-own-writes-{}.log", std::process::id())),
+        ));
+        let hook = crate::access_sign::hook(Some(id.clone()), audit);
+        let claim = named("VolumeClaim", "db", serde_json::json!({ "size": "1Gi", "provision": true, "shared": true }));
+        store.apply(claim.clone()).unwrap();
+        let template = serde_json::json!({ "template": { "exec": [{ "name": "tick", "command": ["true"] }] } });
+        let cron = named("CronJob", "tick", serde_json::json!({ "schedule": "* * * * *", "job": template }));
+        store.apply(cron.clone()).unwrap();
+        let (a_id, b_id) = (kith_store::node_id("a"), kith_store::node_id("b"));
+        let volume = crate::volumes::made_for(&claim, "b");
+        let job = crate::cron::job_for(&cron, "tick-1".into());
+        let entry = |me: &pki::Identity, resource: &Resource| sign(me, &id, &apply(vec![resource.clone()])).unwrap();
+
+        // Led by a: a's is let in, b's is not (b is a control node, and its key is its own).
+        assert!(hook(&store, &entry(b, &volume), a_id).is_err());
+        assert!(hook(&store, &entry(b, &job), a_id).is_err());
+        assert!(hook(&store, &entry(a, &volume), a_id).is_ok());
+        // Led by b since: the other way about.
+        assert!(hook(&store, &entry(a, &volume), b_id).is_err());
+        assert!(hook(&store, &entry(a, &job), b_id).is_err());
+        assert!(hook(&store, &entry(b, &volume), b_id).is_ok());
+
+        // More than the leader makes: a label, an annotation, a size or a name the claim does not say.
+        let mut more = vec![volume.clone(), volume.clone(), volume.clone(), job.clone(), job.clone()];
+        more[0].metadata.labels.insert("x".into(), "y".into());
+        more[1].metadata.annotations.insert("x".into(), "y".into());
+        more[2].spec["shared"] = false.into();
+        more[3].metadata.labels.insert("x".into(), "y".into());
+        more[4].metadata.name = "tick-soon".into();
+        for resource in &more {
+            assert!(hook(&store, &entry(a, resource), a_id).is_err(), "{resource:?}");
+        }
+
+        // What is there is not made again: its claim's or CronJob's Volume or Job, signed afresh.
+        for resource in [&volume, &job] {
+            kith_store::run(&mut store, apply(vec![resource.clone()])).unwrap();
+            let said = hook(&store, &entry(a, resource), a_id).unwrap_err().to_string();
+            assert!(said.contains("asks for it"), "{said}");
+        }
+    }
+
+    /// A node that is not the leader orders its own certificates only where its own Node says it
+    /// serves ingress and the admin's `spec.ingress` says so too, and the ACME account that is there
+    /// is the leader's to overwrite alone.
+    #[test]
+    fn own_writes_signed_secrets_of_a_node_that_serves_ingress_need_the_admins_word() {
+        let ca = pki::Ca::create().unwrap();
+        let (mut store, nodes) = required(&ca, &["a", "b"]);
+        let (a, b) = (&nodes[0], &nodes[1]);
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        let account = resource(serde_json::json!({
+            "apiVersion": kith_api::API_VERSION, "kind": "Secret",
+            "metadata": { "name": "acme-account", "namespace": "kith-system" }, "spec": { "data": {} },
+        }));
+        let admitted = |store: &Store, me: &pki::Identity| {
+            let entry = sign(me, &id, &apply(vec![account.clone()])).unwrap();
+            crate::access_sign::admit(store, &id, &entry, kith_store::node_id("a"))
+        };
+        let status = serde_json::json!({ "certificate": pki::print_of(&b.cert).unwrap(), "serves": { "ingress": true } });
+        store.set_status("Node/b", Some(status)).unwrap();
+        // Its own status says it serves ingress: not enough.
+        assert!(admitted(&store, b).unwrap_err().contains("asks for it"));
+        // The admin says so too: the account it has none of is made.
+        store.apply(named("Node", "b", serde_json::json!({ "ingress": true }))).unwrap();
+        assert_eq!(admitted(&store, b), Ok(()));
+        // Made: from then on the leader's to overwrite alone.
+        kith_store::run(&mut store, apply(vec![account.clone()])).unwrap();
+        assert!(admitted(&store, b).unwrap_err().contains("asks for it"));
+        assert_eq!(admitted(&store, a), Ok(()));
     }
 
     /// A try again of a write whose answer was lost (`raft.rs` `write_as` signs at each try) is
