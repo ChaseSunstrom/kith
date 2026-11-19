@@ -1702,7 +1702,7 @@ fn release_installs_a_package() {
 
     let release = |values: &str| {
         format!(
-            "apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: mine }}\nspec: {{ package: {{ name: maps }}, values: {values} }}\n"
+            "apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: mine }}\nspec: {{ package: {{ name: maps }}, autoUpgrade: true, values: {values} }}\n"
         )
     };
     let installed = |daemon: &Daemon, revision: u64| {
@@ -1732,9 +1732,24 @@ fn release_installs_a_package() {
     );
     assert!(!there("ConfigMap/mine-maps-extra"));
 
-    // Back to how it was: a rollback of the Release is a rollback of what it installed.
+    // A second version, followed (autoUpgrade), makes a map of its own.
+    std::fs::write(package.join("package.yaml"), "name: maps\nversion: 2.0.0\n").unwrap();
+    let two =
+        "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }}-two }\nspec: { data: { a: b } }\n";
+    std::fs::write(package.join("templates/two.yaml"), two).unwrap();
+    assert_eq!(daemon.ok(&["package", "push", "maps"]), "Package/maps-2.0.0 created\n");
+    wait_for("the release to follow 2.0.0", || {
+        daemon.status("Release/mine")["version"] == "2.0.0" && there("ConfigMap/mine-maps-two")
+    });
+
+    // Back to how it was: a rollback of the Release is a rollback of what it installed, the
+    // version too (not the newest, though it follows) and what that made.
     daemon.ok(&["rollback", "Release/mine", "--to", "1"]);
     installed(&daemon, 3);
+    wait_for("the release to be on 1.0.0 again", || {
+        daemon.status("Release/mine")["version"] == "1.0.0" && !there("ConfigMap/mine-maps-two")
+    });
+    assert_eq!(daemon.status("Release/mine")["pinned"], true);
     assert!(
         daemon
             .ok(&["get", "ConfigMap/mine-maps", "-o", "yaml"])
