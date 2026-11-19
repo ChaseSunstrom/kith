@@ -25,6 +25,14 @@ mod connect;
 mod link;
 mod receive;
 
+/// KITH_NO_LINK in the environment (ci/vm.sh --test services sets it on one node): this node
+/// says no `status.mesh.link` and opens no link, as a node of before does, so that a cluster of
+/// both is tried with one binary. Not a setting: nothing else reads or documents it.
+pub(crate) fn links_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("KITH_NO_LINK").is_some())
+}
+
 use crate::Shared;
 use crate::ingress::{Idle, Limits, Place};
 use futures_util::FutureExt;
@@ -544,7 +552,7 @@ impl Proxy {
             relay.ok_or_else(|| std::io::Error::other(format!("node {node} is not on the mesh")))?;
         let there = SocketAddr::new(kith_mesh::node_address(self.prefix, node).into(), relay);
         let replica = replica.map(|replica| format!(" {replica}")).unwrap_or_default();
-        if links {
+        if links && !links_off() {
             let line = format!("{port} {workload}{replica}\n");
             // (None: the node would not take the link, or this one holds as many streams as the
             // node takes; the connection kept to it is used instead, as it says it keeps them.)
