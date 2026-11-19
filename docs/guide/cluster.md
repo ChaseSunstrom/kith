@@ -134,6 +134,13 @@ know:
 - Every peer that is reached has to take the new key. One on an older kithd, which does not, makes
   the rotation revert after two minutes: update the cluster's kithd first. A peer that says a
   `next` and never finishes holds the others back for two minutes, no longer.
+- A peer that is off during a rotation (a roaming laptop asleep, a node down) keeps the old public
+  key for the rotated node until it is back and has read the store, which then names the new one.
+  If it cannot reach the cluster once it is back (every way in went with the old key), join it
+  again (`kithd --join`), as for any node that was away too long.
+- A peer's standby for the new key lives 120 seconds from when the node first says it. A slow
+  first phase (a peer that takes long to answer) can pass that and make the rotation revert; it
+  fails safe, on the old key, and you rotate again under a new name.
 - `failed` and `rotated` live in memory: a kithd that restarts forgets that a rotation was given up
   (a known limit).
 - Traffic between the node and its peers pauses from the switch until their next handshake, up to

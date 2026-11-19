@@ -406,13 +406,13 @@ fn turn(rotation: &Rotation, took: &BTreeSet<String>, shook: &BTreeMap<String, D
 /// The keys other nodes say they are to take next (`status.mesh.next`), by node name. One is
 /// taken only if it is a key, is no node's key (this node's `own` included) and is said by one
 /// node alone: a node that says another's cannot make this node call that one by another key.
-fn nexts(store: &Store, me: &str, own: &Key) -> BTreeMap<String, Key> {
+fn nexts(store: &Store, me: &str, own: &Key, pending: Option<&Key>) -> BTreeMap<String, Key> {
     let say = |node: &kith_api::Resource, field: &str| {
         let status = node.status.as_ref()?;
         key_of(status["mesh"][field].as_str()?).filter(|key| *key != [0; 32])
     };
     let mut keys: BTreeSet<Key> = store.list(Some("Node")).filter_map(|node| say(node, "key")).collect();
-    keys.insert(*own);
+    keys.extend([*own].into_iter().chain(pending.copied()));
     let said: Vec<(String, Key)> = store
         .list(Some("Node"))
         .filter(|node| node.metadata.name != me)
@@ -535,7 +535,8 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             let rotated = done
                 .clone()
                 .or_else(|| own?.status.as_ref()?["mesh"]["rotated"].as_str().map(str::to_string));
-            let nexts = fresh(nexts(&state.store, me, &public), &mut said_next, now);
+            let pending = rotation.as_ref().map(|rotation| &rotation.next);
+            let nexts = fresh(nexts(&state.store, me, &public, pending), &mut said_next, now);
             let took: BTreeSet<String> = match &rotation {
                 None => BTreeSet::new(),
                 Some(rotation) => {
@@ -567,7 +568,13 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
                     .as_ref()
                     .is_some_and(|(peers, _): &Told| peers.iter().any(|p| p.key == *key))
             };
-            let takes: Vec<String> = nexts.values().filter(|key| held(key)).map(|key| hex(key)).collect();
+            // (At most 64: what a node may say of it; the rest are taken on the next pass they are not.)
+            let takes: Vec<String> = nexts
+                .values()
+                .filter(|key| held(key))
+                .take(64)
+                .map(|key| hex(key))
+                .collect();
             if !takes.is_empty() {
                 mine["takes"] = json!(takes);
             }
@@ -1147,12 +1154,16 @@ mod tests {
         store.set_status("Node/f", Some(status(6, Some(1)))).unwrap();
         store.set_status("Node/g", Some(status(7, None))).unwrap();
         store.set_status("Node/h", Some(status(8, Some(12)))).unwrap();
-        let got = nexts(&store, "h", &[9; 32]);
+        let got = nexts(&store, "h", &[9; 32], None);
         // b and c say one key (neither is taken), d says b's key, e's is zeros, f says a's key.
         assert_eq!(got, BTreeMap::from([("a".to_string(), [10; 32])]));
         // This node's own key is not another's to take, and its own `next` is not one it takes.
         store.set_status("Node/a", Some(status(1, Some(9)))).unwrap();
-        assert!(nexts(&store, "h", &[9; 32]).is_empty());
+        assert!(nexts(&store, "h", &[9; 32], None).is_empty());
+        // Nor is the key this node has made and not yet switched to (a node that says it is refused).
+        store.set_status("Node/a", Some(status(1, Some(10)))).unwrap();
+        assert_eq!(nexts(&store, "h", &[9; 32], None).len(), 1);
+        assert!(nexts(&store, "h", &[9; 32], Some(&[10; 32])).is_empty());
     }
 
     /// A peer that is to change keys has the new key beside the old, with no addresses (and no
@@ -1255,12 +1266,12 @@ mod tests {
             .set_status("Node/a", Some(json!({ "mesh": { "key": key(1) } })))
             .unwrap();
         let (mut seen, start) = (BTreeMap::new(), Instant::now());
-        assert!(fresh(nexts(&store, "z", &[9; 32]), &mut seen, start).is_empty());
+        assert!(fresh(nexts(&store, "z", &[9; 32], None), &mut seen, start).is_empty());
         // Once it says one, this node waits, until it is older than ROTATE_WAIT.
         store
             .set_status("Node/a", Some(json!({ "mesh": { "key": key(1), "next": key(2) } })))
             .unwrap();
-        let mut said = |at| fresh(nexts(&store, "z", &[9; 32]), &mut seen, at);
+        let mut said = |at| fresh(nexts(&store, "z", &[9; 32], None), &mut seen, at);
         assert_eq!(said(start).len(), 1);
         assert_eq!(said(start + ROTATE_WAIT - Duration::from_secs(1)).len(), 1);
         assert!(said(start + ROTATE_WAIT).is_empty());
