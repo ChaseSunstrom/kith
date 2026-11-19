@@ -395,7 +395,8 @@ fn readme_carries_the_stress_rows() {
     let stress = std::fs::read_to_string(root().join("ci/stress.txt")).expect("ci/stress.txt");
     let rows: Vec<&str> = stress
         .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        // (the `nested` rows are not load rows: README's containers-in-containers section carries them)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("nested "))
         .collect();
     assert!(!rows.is_empty(), "ci/stress.txt has no rows");
     let readme = DOCS[0].1;
@@ -423,7 +424,11 @@ fn readme_carries_the_stress_rows() {
                 .collect()
         })
         .collect();
-    assert_eq!(cells.len(), rows.len(), "README.md's stress table and ci/stress.txt differ in rows");
+    assert_eq!(
+        cells.len(),
+        rows.len(),
+        "README.md's stress table and ci/stress.txt differ in rows"
+    );
     for (row, said) in rows.iter().zip(&cells) {
         assert_eq!(
             said,
