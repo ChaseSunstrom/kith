@@ -184,7 +184,7 @@ def say(api, node):
     said = api.reader_said(node, "limits")
     found = re.search(r"MemAvailable:\s+(\d+) kB (\d+)/(\d+) (\d+) (\d+)", said)
     if not found:  # (say why, as far as the reader's answer tells: a log request's status, or what it printed)
-        return f"{node}: no answer ({' '.join(said.split())[:60] or 'nothing logged'})"
+        return f"{node}: no answer ({plain(said)[:60] or 'nothing logged'})"
     free, running, tasks, files, cgroups = map(int, found.groups())
     pods = api.running(node)
     text = f"{node}: free={free // 1024}MB tasks={tasks} (running {running}) files={files} cgroups={cgroups}"
@@ -207,7 +207,7 @@ def console(n, lines):
 def look(api):
     """What the nodes say of themselves, now."""
     code, why = api.probe()
-    said = [f"api: {code if code else why.decode(errors='replace')[:80]}"] + [say(api, node) for node in api.nodes]
+    said = [f"api: {code if code else plain(why.decode(errors='replace'))[:80]}"] + [say(api, node) for node in api.nodes]
     ooms = sum(len(re.findall(r"Out of memory|oom-kill|Killed process", " ".join(console(n, 400)))) for n in (1, 2, 3))
     label = "console" if isinstance(api, KubeStress) else "kithd"  # (k3s's machines are Alpine: not kithd)
     return " | ".join(said + [f"oom_kills={ooms}", f"{label}: " + " / ".join(console(1, 3))])
@@ -218,7 +218,7 @@ def nodes_now(api):
     try:
         return look(api)
     except (Exception, SystemExit) as e:
-        return f"nodes not read: {type(e).__name__}: {e}"
+        return f"nodes not read: {type(e).__name__}: {plain(e)}"
 
 
 def load(api, out):
@@ -329,8 +329,15 @@ def after(api, out):
         out["where"] = nodes_now(api)
 
 
+def plain(text):
+    """The words of an error or a reading, on one line, with no ` | ` in them (that is a section's mark in a row)."""
+    return " ".join(str(text).split()).replace(" | ", " / ")
+
+
 def row(out):
     out = {k: " ".join(str(v).split()) for k, v in out.items()}  # (one line: an error's newlines would break the row)
+    if "limit" in out:
+        out["limit"] = plain(out["limit"])
     mem = out.get("mem_mb", MEMORY)
     # (A k3s row ends in its mark: the pods a node was let run. A kith row has none.)
     mark = f" k3s max_pods={out['max_pods']}" if out.get("system") == "k3s" else ""

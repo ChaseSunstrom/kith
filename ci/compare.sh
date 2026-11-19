@@ -364,7 +364,7 @@ EOF
                 ;;
             esac
         fi
-        echo "kith tried $said" >>"$raw"
+        printf '%s\n' "kith tried $said" >>"$raw"
         note "kith: $(tail -n 1 "$raw")"
         return 0
     fi
@@ -506,7 +506,7 @@ print(next(x["metadata"]["name"] for x in json.load(open(sys.argv[1]))["items"] 
     # (A change tried out, some workloads alone, or the stress adapter's row: as kith's, no node is
     # lost for it, and the row is for no table. k3s has no restart here: its row says so with `-`.)
     if [ -n "${KITH_COMPARE_ONLY:-}" ]; then
-        echo "k3s tried $more" >>"$raw"
+        printf '%s\n' "k3s tried $more" >>"$raw"  # (printf, not echo: dash's echo turns the JSON's \n escape into a newline)
         note "k3s: $(tail -n 1 "$raw")"
         return 0
     fi
