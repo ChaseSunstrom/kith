@@ -1091,17 +1091,15 @@ fn refused_is_said_with_the_field_and_nothing_is_dropped_in_silence() {
         &["apply", "-f", "never.yaml"],
         &["spec.schedule is no schedule", "`61` is not a minute"],
     );
-    // A pod alone, and the ways into a running one: each says what to do instead.
+    // A pod alone says what to do instead; the ways into a running one ask first for the
+    // right to exec into what owns it, which alice has not.
     cluster.refused(
         &["run", "one", "--image=busybox:1.36"],
         &["a pod is run by what owns it"],
     );
-    cluster.refused(
-        &["exec", "web-0", "--", "true"],
-        &["exec, attach and port-forward are not answered here", "kith run"],
-    );
-    cluster.refused(&["attach", "web-0"], &["not answered here"]);
-    cluster.refused(&["cp", "web-0:/etc/hostname", "hostname"], &["not answered here"]);
+    cluster.refused(&["exec", "web-0", "--", "true"], &["alice may not exec Workload"]);
+    cluster.refused(&["attach", "web-0"], &["may not exec Workload"]);
+    cluster.refused(&["cp", "web-0:/etc/hostname", "hostname"], &["may not exec Workload"]);
     // (kith keeps a resource's earlier revisions its own way: `kith rollback`.)
     cluster.refused(&["rollout", "undo", "deployment/web"], &["no rollout history found"]);
     // (kubectl asks for no port of a pod that is not running: `sh ci/vm.sh --test kube` does.)
