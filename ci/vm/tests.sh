@@ -35,7 +35,7 @@
     more=$serve once=1
     boot() { # [more of QEMU's arguments]: $once empty lets the guest restart itself
         : >"$work/log"
-        timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none ${once:+-no-reboot} \
+        timeout --foreground "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none ${once:+-no-reboot} \
             -machine q35 -bios "$firmware" -drive "file=$work/disk.raw,format=raw,if=virtio" \
             -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:7443${net_restrict-,restrict=on}" -device virtio-net-pci,netdev=n0 \
             -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=$more" "$@" \
