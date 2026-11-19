@@ -18,7 +18,9 @@
     dd if=/dev/urandom of="$work/other.raw" bs=1M count=4 conv=notrunc status=none
     dd if=/dev/urandom of="$work/other.raw" bs=1M count=4 seek=252 conv=notrunc status=none
     before=$(sha256sum <"$work/other.raw")
-    drives="-drive file=$work/known.raw,format=raw,if=virtio,serial=$known,discard=unmap -drive file=$work/other.raw,format=raw,if=virtio,serial=$unknown"
+    # (A serial is a property of the device, not of the drive: -device virtio-blk-pci.)
+    drives="-drive file=$work/known.raw,format=raw,if=none,id=known,discard=unmap -device virtio-blk-pci,drive=known,serial=$known"
+    drives="$drives -drive file=$work/other.raw,format=raw,if=none,id=other -device virtio-blk-pci,drive=other,serial=$unknown"
 
     cp "$osdir/kith-os.raw" "$work/disk.raw"
     more="kith.disk-add=$known $serve" once=1

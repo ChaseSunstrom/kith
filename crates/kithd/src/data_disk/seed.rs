@@ -342,11 +342,31 @@ mod tests {
             "mke2fs keeps at most {} of them, not {reserved}",
             BLOCK / 4
         );
-        // The journal of a file system this small (1024 blocks), 4096 inodes of 256 bytes, a
-        // group's descriptor, two bitmaps, and the reserved blocks.
-        let used = 1024 + 4096 * 256 / BLOCK + 1 + 2 + reserved;
+        // The journal (-J size=, in MiB), 4096 inodes of 256 bytes, a group's descriptor, two
+        // bitmaps, and the reserved blocks.
+        let journal = made()
+            .split("-J size=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|mb| mb.parse::<u64>().ok())
+            .expect("the journal's size in MB")
+            << 20
+            >> 12;
+        let used = journal + 4096 * 256 / BLOCK + 1 + 2 + reserved;
+        // (mke2fs refuses a journal over half the free blocks.)
+        assert!(
+            journal <= (blocks - used + journal) / 2,
+            "{journal} journal blocks are too many for {blocks}"
+        );
         assert!(used + 256 <= blocks, "{used} blocks of {blocks} are spoken for");
-        assert_eq!(blocks, 4096, "the seed is 4096 blocks");
+        // The grow is one transaction of 3 + 1 + the descriptor blocks it adds + every reserved
+        // one (ext4_flex_group_add), and jbd2 allows a quarter of the journal: a VM got ENOSPC
+        // from a journal of 1024 blocks and 512 reserved.
+        assert!(
+            journal / 4 >= 4 + reserved + 64,
+            "a journal of {journal} blocks is too small to grow in one go"
+        );
+        assert_eq!(blocks, 16384, "the seed is 64 MiB, 16384 blocks");
     }
 
     #[test]

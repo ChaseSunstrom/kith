@@ -195,7 +195,11 @@ file, `usr/share/kith/data.ext4`, so the Volume's seed and its image bytes stay 
 the cost being the reserved descriptor blocks inside the seed (a seed bigger than 8 MiB;
 measured in the image budget by that task), or makes the file system at add by another means.
 The VM test (section 3) grows a **sparse file of 16 GiB or larger**, over the 8 GiB the 8 MiB
-seed would allow, and says what it measured.
+seed would allow, and says what it measured. **Built (T-0972):** the seed is **64 MiB** (zeros, so
+it squashes to nothing in the root), `-b 4096 -N 4096 -J size=16 -E resize=1073741824` (4 TiB, the
+most a node takes: a bigger disk is refused). The journal is not the default: the grow is one
+transaction that holds the 512 reserved descriptor blocks, jbd2 allows a quarter of the journal,
+and the 4 MiB one of a 16 MiB seed got `ENOSPC` in the VM. The grow is at the mount, not at add.
 
 **Removing**, `kith node disk remove ID`: unmount (refused while in use), `crypt::remove`
 (`lib.rs:321`), then **the header's 4 KiB is zeroed** (the disk is then plainly unknown again, and

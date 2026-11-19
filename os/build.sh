@@ -450,10 +450,13 @@ assemble() { # DIR
         -E "hash_seed=$seed,root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0" "$r/usr/share/kith/volume.ext4" >&2
     # The same for a second disk's data (docs/adr-second-disk.md, section 4), with room kept for
     # the descriptor blocks of a disk of 2^30 blocks (4 TiB): an ext4 grows online only as far
-    # as it reserved, and one made this small reserves little. crates/kithd/src/data_disk/seed.rs
+    # as it reserved, and one made this small reserves little. The grow is one transaction that
+    # holds every reserved descriptor block (512 here), and a journal allows a transaction a
+    # quarter of itself: the default one of a file system this small (4 MiB) is too small for it
+    # (ENOSPC at the grow, seen in a VM), so -J size=16 (4096 blocks). crates/kithd/src/data_disk/seed.rs
     # pins these parameters (resize= is its CEILING); zeros squash to nothing in the root.
-    truncate -s 16M "$r/usr/share/kith/data.ext4"
-    E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -b 4096 -N 4096 -L kith-data -U "$seed" \
+    truncate -s 64M "$r/usr/share/kith/data.ext4"
+    E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -b 4096 -N 4096 -J size=16 -L kith-data -U "$seed" \
         -E "hash_seed=$seed,root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0,resize=1073741824" "$r/usr/share/kith/data.ext4" >&2
     msize=0 fsize=0
     if [ -n "$modules" ]; then
