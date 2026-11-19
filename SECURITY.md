@@ -648,8 +648,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   address is checked apart, so a packet from another address on its link is dropped. Exec and VM
   Workloads are not held, and nothing is written when kithd is not root. A policy with a peer by
   `namespace` or `selector`, or whose rules are not yet written on a node, says `partial` in its
-  status; `enforced` once they are. kithd writes the rules again when a policy changes. Not
-  tested: a policy changing under a running pod; access returning after the policy is deleted.
+  status; `enforced` once they are. kithd writes the rules again when a policy changes. A peer
+  `cidr` that cannot be read is refused when the policy is submitted; a stored one (a log an
+  older version took) fails closed: a deny rule with a cidr that cannot be read denies every
+  address in its direction, and an allow rule with one lets nothing through. Not tested: a policy
+  changing under a running pod; access returning after the policy is deleted.
 - **What a replica writes outside its Volumes is held at the write where the state disk
   keeps project quotas, and counted elsewhere.** Its containers' writable roots and its
   disk scratch share the node's state disk. Where the state disk keeps project quotas (a
