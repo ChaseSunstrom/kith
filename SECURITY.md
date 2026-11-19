@@ -40,8 +40,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   shows none for at most 15 seconds; one address (an IPv4 address, an IPv6 /64) holds
   at most 8 of them. The node's own loopback is not counted. On a node started with
   `--people` the people's addresses (`100.89.0.0/16` and their /64) have 16 slots of their
-  own, 8 to an address (an IPv6 peer counted whole, not by its /64), so a crowd of them
-  leaves the 64 free.
+  own, 2 to an address (an IPv6 peer counted whole, not by its /64), so a crowd of them
+  leaves the 64 free, and a crowd of strangers filling the 64 does not keep them from being
+  picked up. A NetworkPolicy sees a person as the node that serves it (a Service on this node
+  asks it with the node's address), so a person's reach is its level's Services alone.
 - **The API** is behind a layer that works out who calls (the socket, a node, an
   Identity) and refuses what their Roles do not allow. A token is shown once, kept only
   as a hash, good for an hour, and spent by its first use.

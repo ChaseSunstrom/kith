@@ -532,15 +532,26 @@ E2a). The Service listener, the per-peer limits and the resolver's refusal are s
   Services' listeners it has, a connection from the people's ranges (100.89.0.0/16, the people /64)
   as well as the mesh's; the relay for the other nodes, and the strays the ingress hands over, stay
   mesh-only. A person is served only if its address (exact, not the /64) is a RemotePeer's whose
-  level names that Service address and port (`levels::reach`, read from the store each round; no
-  port list is all ports): another level's Service, and a source in the ranges that is no peer's,
-  are hung up on. The kernel's table said so first; this is the second look.
+  level names that Service address and port (`levels::reach`, read from the store each round; a
+  Service with no port listed is reached on none: fail closed, though the level never makes one):
+  another level's Service, and a source in the ranges that is no peer's, are hung up on. The
+  kernel's table said so first; this is the second look. What `serve` and `accept` decide by
+  source is `Proxy::place` and `Proxy::takes`.
+- **NetworkPolicy sees a person as the serving node.** The Workload's NetworkPolicies are asked
+  with this node's mesh address as the source (`Proxy::reach`), as for every client of a Service
+  on this node, not the person's: a person's address is not passed down, because a connection
+  passed on to another node's replica is asked there as the caller node, so a rule on a person's
+  address could not hold on both paths. A level's Services are the person's reach; a policy that
+  must keep a person out of a Workload keeps the level's Service from naming it.
 - **Limits of their own.** Places for the people are apart from the mesh's 4096 (`Proxy.people`):
   a peer holds 8 of 4096 by its address at 128 bits, so two IPv6 peers of one /64 are two, and the
   table of sources holds only peers, so it is no bigger than the peers (and never the room). The
   API's handshakes (`cluster::Pools`) have 16 slots for the people besides the others' 64: a full
-  people pool leaves the 64 free; each peer holds 8 of the 16, by its address. The API port is
-  still not opened to peers by this slice.
+  people pool leaves the 64 free; each peer holds 2 of the 16 (`PEOPLE_GUESTS_EACH`; the others
+  hold 8 of 64), by its address, so eight peers fill it, not one. A connection is accepted first
+  and then asks its own pool for a slot (none: it is hung up on), so a crowd of strangers holding
+  the others' 64 does not keep a person's connection from being picked up. The API port is still
+  not opened to peers by this slice.
 - **The resolver does not forward for a person.** `kithd`'s forwarders are the local networks and
   the pods' range less the people's range and /64 (`dns::forwarders`, `Cidr::without`), so the deny
   wins over fc00::/7, which holds the /64; a mesh source is forwarded as before.
@@ -549,6 +560,11 @@ E2a). The Service listener, the per-peer limits and the resolver's refusal are s
 
 ## Open
 
+- **People do not reach the Services on an `--ingress` node's 443 and 80 (not built).** Those
+  ports are the ingress's: its listener hands the strays over to the Service listener, and that
+  hand-over is mesh-only, so a person's connection to a Service on them is hung up on, though the
+  kernel's table lets it in. A level that names such a Service is not served on those ports until
+  the ingress takes the people's ranges too (with the same places and the level's reach).
 - **Should the filter tell people apart?** Then the router routes `100.89.0.0/16` to the node
   and the node stops masquerading to the LAN; otherwise every peer is the node there.
 - **A resolver hard-coded on 53: refused (here), or answered by the level's resolver** (one

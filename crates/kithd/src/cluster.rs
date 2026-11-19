@@ -237,13 +237,21 @@ const GUESTS_EACH: u32 = GUESTS as u32 / 8;
 /// a crowd of them leaves the others' [`GUESTS`] free (docs/adr-people.md, slice E2b).
 const PEOPLE_GUESTS: usize = 16;
 
-/// How many slots each address holds now, and how much of an IPv6 address is one (64 bits: a
-/// /64 is one host's to hand out; a peer of the people has an address of its own, 128).
-struct Crowd(std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>, u32);
+/// Of the [`PEOPLE_GUESTS`], how many one peer holds: eight peers fill the pool, not one.
+const PEOPLE_GUESTS_EACH: u32 = 2;
+
+/// How many slots each address holds now, how much of an IPv6 address is one (64 bits: a /64 is
+/// one host's to hand out; a peer of the people has an address of its own, 128), and the most
+/// one holds.
+struct Crowd(
+    std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>,
+    u32,
+    u32,
+);
 
 impl Crowd {
-    fn new(bits: u32) -> Crowd {
-        Crowd(Default::default(), bits)
+    fn new(bits: u32, each: u32) -> Crowd {
+        Crowd(Default::default(), bits, each)
     }
 }
 
@@ -259,23 +267,25 @@ impl Pools {
     fn new(people64: Option<std::net::Ipv6Addr>) -> Pools {
         Pools {
             slots: Arc::new(Semaphore::new(GUESTS)),
-            crowd: Arc::new(Crowd::new(64)),
-            people: people64.map(|net| (net, Arc::new(Semaphore::new(PEOPLE_GUESTS)), Arc::new(Crowd::new(128)))),
+            crowd: Arc::new(Crowd::new(64, GUESTS_EACH)),
+            people: people64.map(|net| {
+                let room = Arc::new(Semaphore::new(PEOPLE_GUESTS));
+                (net, room, Arc::new(Crowd::new(128, PEOPLE_GUESTS_EACH)))
+            }),
         }
     }
 
-    /// The slot for a connection from `from`, given a slot of the others' pool: that one if
-    /// `from` is not a person (a mesh node, a member, anyone), else a people's, the others' given
-    /// back at once. None if the address holds its share or the pool has no room: it waits for itself.
-    fn pick(&self, slot: OwnedSemaphorePermit, from: std::net::IpAddr) -> Option<Slot> {
-        match &self.people {
-            Some((net, room, crowd)) if crate::people::holds(*net, from) => {
-                drop(slot);
-                let place = crowd.place(from)?;
-                Some((room.clone().try_acquire_owned().ok()?, place))
-            }
-            _ => Some((slot, self.crowd.place(from)?)),
-        }
+    /// The slot for a connection from `from`, out of the people's pool if `from` is a person, else
+    /// the others' (a mesh node, a member, anyone). None if the address holds its share or its pool
+    /// has no room: the connection is hung up on, and a full pool of the others' never waits the
+    /// people's behind it.
+    fn pick(&self, from: std::net::IpAddr) -> Option<Slot> {
+        let (room, crowd) = match &self.people {
+            Some((net, room, crowd)) if crate::people::holds(*net, from) => (room, crowd),
+            _ => (&self.slots, &self.crowd),
+        };
+        let place = crowd.place(from)?;
+        Some((room.clone().try_acquire_owned().ok()?, place))
     }
 }
 
@@ -301,7 +311,7 @@ impl Crowd {
         };
         let mut held = self.0.lock().expect("nothing panics holding the crowd");
         let count = held.entry(from).or_default();
-        if *count >= GUESTS_EACH {
+        if *count >= self.2 {
             return None;
         }
         *count += 1;
@@ -335,22 +345,24 @@ pub fn listen_for(
     config: Arc<rustls::ServerConfig>,
     people64: Option<std::net::Ipv6Addr>,
 ) -> std::io::Result<TlsListener> {
+    listen_pools(tcp, config, Pools::new(people64))
+}
+
+fn listen_pools(tcp: TcpListener, config: Arc<rustls::ServerConfig>, pools: Pools) -> std::io::Result<TlsListener> {
     let local = tcp.local_addr()?;
     let (tx, ready) = mpsc::channel(GUESTS + PEOPLE_GUESTS);
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
-    let pools = Pools::new(people64);
     tokio::spawn(async move {
         loop {
-            let Ok(slot) = pools.slots.clone().acquire_owned().await else {
-                return;
-            };
+            // Accepted before any slot is asked for: a crowd of the others holding every slot of
+            // theirs must not keep a person's connection from being picked up.
             let Ok((stream, addr)) = tcp.accept().await else {
                 // Out of file descriptors, most likely: let some close.
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
-            // An address that holds its share already is hung up on: it waits for itself.
-            let Some(slot) = pools.pick(slot, addr.ip()) else {
+            // An address that holds its share already, or a pool with no room, is hung up on: it waits for itself.
+            let Some(slot) = pools.pick(addr.ip()) else {
                 continue;
             };
             let (acceptor, tx) = (acceptor.clone(), tx.clone());
@@ -2684,7 +2696,7 @@ mod tests {
 
     #[test]
     fn guests_of_one_address_hold_only_their_share() {
-        let crowd = Arc::new(Crowd::new(64));
+        let crowd = Arc::new(Crowd::new(64, GUESTS_EACH));
         let from = |text: &str| -> std::net::IpAddr { text.parse().unwrap() };
         // One host fills its share and no more; another host is not kept out by it.
         let mut held: Vec<_> = (0..GUESTS_EACH)
@@ -2716,30 +2728,23 @@ mod tests {
         assert!(crowd.place(from("::1")).is_some());
     }
 
-    /// The people's handshakes have 16 places of their own, each peer holds GUESTS_EACH of them
-    /// by its own address (two of one /64 apart), and a full pool leaves the others' 64 free.
+    /// The people's handshakes have 16 places of their own, each peer holds PEOPLE_GUESTS_EACH of
+    /// them by its own address (two of one /64 apart), and a full pool leaves the others' 64 free.
     #[test]
     fn people_serving_handshakes_have_a_small_pool_of_their_own() {
         let people64: std::net::Ipv6Addr = "fd12:3456:789a:1::".parse().unwrap();
         let from = |text: &str| -> std::net::IpAddr { text.parse().unwrap() };
         let pools = Pools::new(Some(people64));
-        let pick = |text: &str| {
-            let slot = pools
-                .slots
-                .clone()
-                .try_acquire_owned()
-                .expect("the others' pool has room");
-            pools.pick(slot, from(text))
-        };
+        let pick = |text: &str| pools.pick(from(text));
         let mut held = Vec::new();
-        for peer in 0..2 {
-            for _ in 0..GUESTS_EACH {
+        for peer in 0..PEOPLE_GUESTS as u32 / PEOPLE_GUESTS_EACH {
+            for _ in 0..PEOPLE_GUESTS_EACH {
                 held.push(pick(&format!("100.89.0.{}", peer + 2)).expect("a peer holds its share"));
             }
         }
         assert_eq!(held.len(), PEOPLE_GUESTS);
         assert!(
-            pick("100.89.0.2").is_none() && pick("100.89.0.9").is_none(),
+            pick("100.89.0.2").is_none() && pick("100.89.0.99").is_none(),
             "the pool of 16 is full"
         );
         assert_eq!(
@@ -2751,21 +2756,46 @@ mod tests {
         assert_eq!(pools.slots.available_permits(), GUESTS - 1);
         let mesh = pick("fd00:1:2:3::1").expect("so is the mesh");
         drop((held, other, mesh));
-        // A peer's share is by its address: two IPv6 peers of one /64 are counted apart; a 9th is refused.
-        let one: Vec<_> = (0..GUESTS_EACH).map(|_| pick("fd12:3456:789a:1::2")).collect();
+        // One peer holds PEOPLE_GUESTS_EACH, not the pool: a 3rd is refused, another peer is not.
+        let one: Vec<_> = (0..PEOPLE_GUESTS_EACH).map(|_| pick("100.89.0.2")).collect();
         assert!(one.iter().all(Option::is_some));
+        assert!(pick("100.89.0.2").is_none());
+        assert!(pick("100.89.0.3").is_some());
+        // Peers of one /64 are counted apart: a neighbour has a share of its own.
+        let six: Vec<_> = (0..PEOPLE_GUESTS_EACH).map(|_| pick("fd12:3456:789a:1::2")).collect();
+        assert!(six.iter().all(Option::is_some));
         assert!(pick("fd12:3456:789a:1::2").is_none());
-        assert!(
-            pick("fd12:3456:789a:1::3").is_some(),
-            "a neighbour in the /64 has a share of its own"
-        );
+        assert!(pick("fd12:3456:789a:1::3").is_some());
         // Another /64 is not the people's: it is taken from the others' pool, by its /64.
         assert!(pick("fd12:3456:789a:2::2").is_some());
         // Without --people nothing is the people's.
         let none = Pools::new(None);
-        let slot = none.slots.clone().try_acquire_owned().unwrap();
+        let slot = none.pick(from("100.89.0.2"));
         assert_eq!(none.slots.available_permits(), GUESTS - 1);
-        drop(none.pick(slot, from("100.89.0.2")));
+        drop(slot);
         assert_eq!(none.slots.available_permits(), GUESTS);
+    }
+
+    /// With every slot of the others' taken, a connection is picked up at once (and hung up on),
+    /// not left to wait for a slot with the loop: so a person's, behind it, is not kept waiting.
+    #[tokio::test]
+    async fn people_serving_full_others_slots_do_not_stall_the_accept_loop() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = tcp.local_addr().unwrap();
+        let me = pinned_peer::node(&pki::Ca::create().unwrap(), "a");
+        let pools = Pools::new(Some("fd12:3456:789a:1::".parse().unwrap()));
+        let _full = pools.slots.clone().try_acquire_many_owned(GUESTS as u32).unwrap();
+        let _listener = listen_pools(tcp, pki::server_config(&me).unwrap(), pools).unwrap();
+        let mut stranger = tokio::net::TcpStream::connect(at).await.unwrap();
+        let mut byte = [0u8; 1];
+        let hung_up = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut stranger, &mut byte),
+        )
+        .await;
+        assert!(
+            matches!(hung_up, Ok(Ok(0)) | Ok(Err(_))),
+            "the stranger waits for a slot: {hung_up:?}"
+        );
     }
 }

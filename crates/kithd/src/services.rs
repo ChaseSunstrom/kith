@@ -516,7 +516,8 @@ impl People {
     }
 
     /// A place for a connection from the peer `from` to the Service at `(address, port)`: none
-    /// for another level's, nor for a source that is no peer's (it is not counted either).
+    /// for another level's, nor for a source that is no peer's (it is not counted either), nor
+    /// for a port the level does not list (a Service listing none is reached on none: fail closed).
     fn place(&self, from: IpAddr, (address, port): (Ipv6Addr, u16)) -> Option<Place> {
         let from = from.to_canonical();
         let allowed = {
@@ -524,7 +525,7 @@ impl People {
             let services = reach.get(&from)?;
             services
                 .iter()
-                .any(|(at, ports)| *at == address && (ports.is_empty() || ports.contains(&port)))
+                .any(|(at, ports)| *at == address && ports.contains(&port))
         };
         allowed.then(|| self.limits.take(from)).flatten()
     }
@@ -794,6 +795,24 @@ impl Proxy {
         });
     }
 
+    /// The place for a connection from `from` to the Service `key`: a person's (of the people's
+    /// ranges, `--people`) from the people's places, and only for its level's Services; anyone
+    /// else's from the mesh's.
+    fn place(&self, from: IpAddr, key: (Ipv6Addr, u16)) -> Option<Place> {
+        match &self.people {
+            Some(people) if people.holds(from) => people.place(from, key),
+            _ => self.serving.take(from),
+        }
+    }
+
+    /// Does a listener take a connection from `from` at all? The mesh's, and with `people` (the
+    /// listeners of the Services only) a person's. Whoever routes one of our addresses to this
+    /// machine from outside is neither.
+    fn takes(&self, from: IpAddr, people: bool) -> bool {
+        let mesh = matches!(from, IpAddr::V6(ip) if kith_mesh::in_mesh(self.prefix, ip));
+        mesh || (people && self.people.as_ref().is_some_and(|people| people.holds(from)))
+    }
+
     /// Someone connected to a Service: pass the connection to its next backend that
     /// takes it.
     async fn serve(&self, key: (Ipv6Addr, u16), mut client: TcpStream) {
@@ -801,11 +820,7 @@ impl Proxy {
         let Ok(from) = client.peer_addr().map(|from| from.ip()) else {
             return;
         };
-        let place = match (&self.people, from) {
-            (Some(people), from) if people.holds(from) => people.place(from, key),
-            _ => self.serving.take(from),
-        };
-        let Some(_place) = place else {
+        let Some(_place) = self.place(from, key) else {
             return;
         };
         let backends = {
@@ -914,10 +929,7 @@ impl Proxy {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
-            // Whoever routes one of our addresses to this machine from outside is not on the mesh.
-            let mesh = matches!(from.ip(), IpAddr::V6(ip) if kith_mesh::in_mesh(self.prefix, ip));
-            let person = people && self.people.as_ref().is_some_and(|people| people.holds(from.ip()));
-            if mesh || person {
+            if self.takes(from.ip(), people) {
                 tokio::spawn(with(self.clone(), stream));
             }
         }
@@ -1939,6 +1951,67 @@ mod tests {
             all.extend(held);
         }
         assert_eq!(people.limits.room.available_permits(), SERVING - 24, "of 4096 places");
+    }
+
+    /// A level's Service with no port listed is reached on no port (fail closed), not on all.
+    #[test]
+    fn people_serving_an_empty_port_list_reaches_nothing() {
+        let web = kith_mesh::service_address(kith_mesh::prefix(b"a cluster"), "default", "web");
+        let people = People::new("fd12:3456:789a:1::".parse().unwrap(), SERVING);
+        people.hold(BTreeMap::from([(
+            "100.89.0.5".parse().unwrap(),
+            Arc::new(vec![(web, Vec::new())]),
+        )]));
+        let from: IpAddr = "100.89.0.5".parse().unwrap();
+        for port in [0, 80, 443] {
+            assert!(people.place(from, (web, port)).is_none(), "port {port}");
+        }
+        assert!(people.limits.sources.lock().unwrap().is_empty());
+    }
+
+    /// What `serve` and `accept` do with a source, on a Proxy as `run` makes one: a person is
+    /// taken by the listeners of the Services only, and placed as a peer of its level; the mesh
+    /// keeps the mesh's places; a source in neither is not taken.
+    #[tokio::test]
+    async fn people_serving_admits_by_source_and_listener() {
+        let mut proxy = proxy_of(state_with_web("people-admit").await, 8080, "Workload/default/web", None);
+        let web = kith_mesh::service_address(proxy.prefix, "default", "web");
+        let (people, _) = people_of(&[("100.89.0.5", &[(web, 443)]), ("fd12:3456:789a:1::5", &[(web, 443)])]);
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        let (mesh, person, v6_person) = (
+            IpAddr::V6(kith_mesh::node_address(proxy.prefix, "b")),
+            ip("100.89.0.5"),
+            ip("fd12:3456:789a:1::5"),
+        );
+        // Without --people nobody of the ranges is taken, and none is placed as a person.
+        for from in [person, v6_person, ip("203.0.113.9"), ip("fd00:9::1")] {
+            assert!(!proxy.takes(from, true) && !proxy.takes(from, false), "{from}");
+        }
+        assert!(proxy.takes(mesh, true) && proxy.takes(mesh, false));
+        proxy.people = Some(people);
+        for from in [person, v6_person] {
+            assert!(proxy.takes(from, true), "{from}: the Service listeners take a person");
+            assert!(!proxy.takes(from, false), "{from}: the relay and the strays do not");
+            assert!(proxy.place(from, (web, 443)).is_some(), "{from}: its level's Service");
+            assert!(
+                proxy.place(from, (web, 80)).is_none(),
+                "{from}: not a port its level lists"
+            );
+        }
+        assert!(!proxy.takes(ip("203.0.113.9"), true));
+        assert!(
+            proxy.takes(ip("100.89.0.77"), true),
+            "a source of the range is taken, then refused a place"
+        );
+        assert!(proxy.place(ip("100.89.0.77"), (web, 443)).is_none());
+        // The mesh is placed from the mesh's places, whatever its port; a person from the people's.
+        let (kept_mesh, kept_person) = (proxy.place(mesh, (web, 80)), proxy.place(person, (web, 443)));
+        assert!(kept_mesh.is_some() && kept_person.is_some());
+        assert_eq!(proxy.serving.room.available_permits(), SERVING - 1);
+        assert_eq!(
+            proxy.people.as_ref().unwrap().limits.room.available_permits(),
+            SERVING - 1
+        );
     }
 
     #[test]

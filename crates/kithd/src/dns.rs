@@ -866,6 +866,63 @@ mod tests {
         assert!(reply.ends_with(&[198, 51, 100, 7]), "the upstream's address: {reply:?}");
     }
 
+    /// The server itself, not only the list: a client in a denied network is REFUSED over UDP and
+    /// its question never reaches the upstream, while one in the rest of the allowed network is
+    /// forwarded. (A test cannot send from a person's address: 127.0.0.2 is the denied one here,
+    /// the list built as [`forwarders`] builds it, by `Cidr::without`.)
+    #[tokio::test]
+    async fn people_resolver_refuses_a_denied_client_over_udp() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let told = upstream.local_addr().unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = upstream.recv_from(&mut buf).await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut reply = buf[..n].to_vec();
+                reply[2..4].copy_from_slice(&[0x81, 0x80]);
+                let _ = upstream.send_to(&reply, from).await;
+            }
+        });
+        let nets = Cidr::without(&["127.0.0.0/8".parse().unwrap()], &["127.0.0.2".parse().unwrap()]);
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = udp.local_addr().unwrap();
+        let (_zones, served) = watch::channel(Arc::new(Zones::default()));
+        let (_, upstreams) = watch::channel(Arc::from(vec![told]));
+        let cache = Arc::new(kith_dns::Cache::default());
+        tokio::spawn(kith_dns::serve(udp, tcp, served, upstreams, nets, cache));
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in ["outside", "example", "test"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let rcode = |from: &'static str| {
+            let (query, from) = (query.clone(), from.parse::<IpAddr>().unwrap());
+            async move {
+                let client = UdpSocket::bind((from, 0)).await.unwrap();
+                client.send_to(&query, listen).await.unwrap();
+                let mut buf = [0u8; 512];
+                let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), client.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(n > 3);
+                buf[3] & 0x0f
+            }
+        };
+        assert_eq!(rcode("127.0.0.2").await, 5, "REFUSED");
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the upstream was not asked"
+        );
+        assert_eq!(rcode("127.0.0.3").await, 0, "the rest of the network is forwarded for");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     fn store(yaml: &str) -> Store {
         let mut store = Store::default();
         for resource in Resource::from_source(yaml).unwrap() {
