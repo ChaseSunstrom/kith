@@ -65,6 +65,7 @@ mod vm;
 mod volume_files;
 mod volumes;
 mod wasm;
+mod websocket;
 mod worker;
 mod workload_identity;
 

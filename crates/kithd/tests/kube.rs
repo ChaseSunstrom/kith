@@ -18,6 +18,8 @@ struct Cluster {
     child: Child,
     dir: PathBuf,
     kubectl: String,
+    /// The port kithd listens on, on 127.0.0.1.
+    port: u16,
     /// The kubeconfig kubectl and helm are run with: alice's, who may do everything.
     config: PathBuf,
 }
@@ -31,6 +33,12 @@ impl Cluster {
             eprintln!("skipped: no kubectl (KITH_KUBECTL or PATH)");
             return None;
         }
+        Some(Cluster::boot(test))
+    }
+
+    /// A kithd of its own with its Identities, which need no kubectl: `curl` asks it directly.
+    fn boot(test: &str) -> Cluster {
+        let kubectl = std::env::var("KITH_KUBECTL").unwrap_or("kubectl".into());
         let built = Command::new(env!("CARGO"))
             .args(["build", "--quiet", "-p", "kith-cli"])
             .status();
@@ -67,6 +75,7 @@ impl Cluster {
             child,
             dir,
             kubectl,
+            port,
             config,
         };
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -94,7 +103,7 @@ impl Cluster {
             };
             cluster.write(&name, &config);
         }
-        Some(cluster)
+        cluster
     }
 
     /// The same cluster, asked as another Identity (its kubeconfig is `kubeconfig-NAME`).
@@ -104,8 +113,48 @@ impl Cluster {
             child: Command::new("true").spawn().unwrap(),
             dir: self.dir.clone(),
             kubectl: self.kubectl.clone(),
+            port: self.port,
             config: self.dir.join(format!("kubeconfig-{who}")),
         }
+    }
+
+    /// The status kithd answers one request of `who` (an Identity of this cluster) with, as
+    /// curl asks it. An upgrade to a WebSocket answers 101, and the session then waits for kithd's
+    /// 5 s cap, so the 101 comes back at about 5 s; curl's 10 s limit covers that under load.
+    fn reply(&self, who: &str, method: &str, path: &str, headers: &[&str], body: Option<&str>) -> String {
+        let mut args: Vec<String> = vec![
+            "-s".into(),
+            "-o".into(),
+            "/dev/null".into(),
+            "-w".into(),
+            "%{http_code}".into(),
+            "-m".into(),
+            "10".into(),
+            "-X".into(),
+            method.into(),
+            "--cacert".into(),
+            "ca.crt".into(),
+            "--cert".into(),
+            format!("{who}.crt"),
+            "--key".into(),
+            format!("{who}.key"),
+            "--resolve".into(),
+            format!("kith:{}:127.0.0.1", self.port),
+        ];
+        for header in headers {
+            args.extend(["-H".into(), header.to_string()]);
+        }
+        if let Some(body) = body {
+            args.extend(["--data-binary".into(), format!("@{body}")]);
+        }
+        args.push(format!("https://kith:{}{path}", self.port));
+        let out = Command::new("curl")
+            .args(&args)
+            .current_dir(&self.dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("curl runs");
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     fn write(&self, name: &str, text: &str) {
@@ -1245,6 +1294,175 @@ fn access_is_kiths_own_and_the_kubernetes_api_is_no_way_past_it() {
     // And a certificate that was taken back is nobody's.
     cluster.kith(&["delete", "identity/bob"]);
     bob.refused(&["get", "deployments", "-n", "team"], &[]);
+}
+
+/// `kubectl exec`, `attach` and `cp` (a tar run by exec) are refused before any upgrade to a
+/// WebSocket when the caller has no Exec right on the Workload or Job that owns the pod: bob
+/// may get alone, and carol may run in `team`. Asked with curl, so no kubectl is needed.
+#[test]
+fn access_first_exec_attach_and_cp_are_refused_before_any_upgrade() {
+    let cluster = Cluster::boot("kube-exec-access");
+    cluster.kith(&["identity", "cert", "bob", "--out", "."]);
+    cluster.kith(&["identity", "cert", "carol", "--out", "."]);
+    let roles = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: reader }\nspec:\n  rules:\n    - kinds: [Workload, Job]\n      verbs: [get, list, watch]\n      namespaces: [team]\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: runner }\nspec:\n  rules:\n    - kinds: [Workload, Job]\n      verbs: [get, list, exec]\n      namespaces: [team]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob-reader }\nspec:\n  role: reader\n  subjects: [bob]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: carol-runner }\nspec:\n  role: runner\n  subjects: [carol]\n";
+    cluster.write("roles.yaml", roles);
+    cluster.kith(&["apply", "-f", "roles.yaml"]);
+    // A Deployment `web` of two replicas and a Job `tidy`: their pods are web-0 and tidy-j0.
+    let json = ["Content-Type: application/json"];
+    cluster.write("web.json", r#"{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"web"},"spec":{"replicas":2,"selector":{"matchLabels":{"app":"web"}},"template":{"metadata":{"labels":{"app":"web"}},"spec":{"containers":[{"name":"web","image":"mirror.gcr.io/library/busybox:1.36","command":["sleep","3600"]}]}}}}"#);
+    cluster.write("tidy.json", r#"{"apiVersion":"batch/v1","kind":"Job","metadata":{"name":"tidy"},"spec":{"template":{"spec":{"restartPolicy":"Never","containers":[{"name":"tidy","image":"mirror.gcr.io/library/busybox:1.36","command":["true"]}]}}}}"#);
+    assert_eq!(
+        cluster.reply(
+            "alice",
+            "POST",
+            "/apis/apps/v1/namespaces/team/deployments",
+            &json,
+            Some("web.json")
+        ),
+        "201"
+    );
+    assert_eq!(
+        cluster.reply(
+            "alice",
+            "POST",
+            "/apis/batch/v1/namespaces/team/jobs",
+            &json,
+            Some("tidy.json")
+        ),
+        "201"
+    );
+    eventually("the pods of web and of tidy", 30, || {
+        cluster.reply("alice", "GET", "/api/v1/namespaces/team/pods/web-0", &[], None) == "200"
+            && cluster.reply("alice", "GET", "/api/v1/namespaces/team/pods/tidy-j0", &[], None) == "200"
+    });
+    let exec = "/api/v1/namespaces/team/pods/web-0/exec?command=true&stdin=true&stdout=true&stderr=true";
+    let attach = "/api/v1/namespaces/team/pods/web-0/attach?stdin=true&stdout=true&stderr=true";
+    let tar =
+        "/api/v1/namespaces/team/pods/web-0/exec?command=tar&command=xf&command=-&stdin=true&stdout=true&stderr=true";
+    let job = "/api/v1/namespaces/team/pods/tidy-j0/exec?command=true&stdout=true&stderr=true";
+    // (A WebSocket asks for its upgrade as kubectl does: a GET with these headers.)
+    let upgrade = [
+        "Connection: Upgrade",
+        "Upgrade: websocket",
+        "Sec-WebSocket-Version: 13",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+        "Sec-WebSocket-Protocol: v4.channel.k8s.io",
+    ];
+
+    // bob may get the pod (cp asks for it first), and no more: what runs in it is refused.
+    assert_eq!(
+        cluster.reply("bob", "GET", "/api/v1/namespaces/team/pods/web-0", &[], None),
+        "200"
+    );
+    for path in [exec, attach, tar, job] {
+        assert_eq!(cluster.reply("bob", "POST", path, &[], None), "403", "{path}");
+        // Refused before the upgrade is looked at: a WebSocket asked by bob is a 403, not a 101.
+        assert_eq!(cluster.reply("bob", "GET", path, &upgrade, None), "403", "{path}");
+    }
+
+    // carol may run in `team`: the upgrade is answered with 101 for each of them.
+    for path in [exec, attach, tar, job] {
+        assert_eq!(cluster.reply("carol", "GET", path, &upgrade, None), "101", "{path}");
+    }
+    // Without an upgrade, or with a channel protocol kithd does not speak, it is a 400.
+    assert_eq!(cluster.reply("carol", "POST", exec, &[], None), "400");
+    let other = [
+        "Connection: Upgrade",
+        "Upgrade: websocket",
+        "Sec-WebSocket-Version: 13",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+        "Sec-WebSocket-Protocol: base64.channel.k8s.io",
+    ];
+    assert_eq!(cluster.reply("carol", "GET", exec, &other, None), "400");
+}
+
+/// A cluster with a NodeWorkload `agent` in `default`: dan may exec any pod of `default`, and
+/// erin may exec the NodeWorkload's pods and also `Node`, which the host's run takes cluster-wide.
+fn with_node_agent(test: &str) -> Cluster {
+    let cluster = Cluster::boot(test);
+    cluster.kith(&["identity", "cert", "dan", "--out", "."]);
+    cluster.kith(&["identity", "cert", "erin", "--out", "."]);
+    let roles = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: anything-here }\nspec:\n  rules:\n    - kinds: [\"*\"]\n      verbs: [get, list, exec]\n      namespaces: [default]\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: agent-runner }\nspec:\n  rules:\n    - kinds: [NodeWorkload]\n      verbs: [get, list, exec]\n      namespaces: [default]\n    - kinds: [Node]\n      verbs: [exec]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: dan-anything }\nspec:\n  role: anything-here\n  subjects: [dan]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: erin-agent }\nspec:\n  role: agent-runner\n  subjects: [erin]\n";
+    cluster.write("roles.yaml", roles);
+    cluster.kith(&["apply", "-f", "roles.yaml"]);
+    // A DaemonSet is a NodeWorkload in kithd's store: its pods are `agent-nN`, in `default`.
+    let agent = r#"{"apiVersion":"apps/v1","kind":"DaemonSet","metadata":{"name":"agent"},"spec":{"selector":{"matchLabels":{"app":"agent"}},"template":{"metadata":{"labels":{"app":"agent"}},"spec":{"containers":[{"name":"agent","image":"mirror.gcr.io/library/busybox:1.36","command":["sleep","3600"]}]}}}}"#;
+    cluster.write("agent.json", agent);
+    let json = ["Content-Type: application/json"];
+    let made = cluster.reply(
+        "alice",
+        "POST",
+        "/apis/apps/v1/namespaces/default/daemonsets",
+        &json,
+        Some("agent.json"),
+    );
+    assert_eq!(made, "201");
+    cluster
+}
+
+/// A NodeWorkload's pod runs on the host, so exec into it also needs the Exec right on `Node`:
+/// dan is refused for it though he may exec `default`'s pods, and erin is upgraded. Each attempt
+/// is in the audit log, refused or ok.
+#[test]
+fn access_a_node_workload_pod_also_needs_exec_on_the_node() {
+    let cluster = with_node_agent("kube-exec-node");
+    let pod = "/api/v1/namespaces/default/pods/agent-n0/exec?command=true&stdout=true&stderr=true";
+    let upgrade = [
+        "Connection: Upgrade",
+        "Upgrade: websocket",
+        "Sec-WebSocket-Version: 13",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+        "Sec-WebSocket-Protocol: v4.channel.k8s.io",
+    ];
+    assert_eq!(cluster.reply("dan", "GET", pod, &upgrade, None), "403");
+    assert_eq!(cluster.reply("erin", "GET", pod, &upgrade, None), "101");
+
+    let audit = cluster.kith(&["audit"]);
+    let entries: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains("pod default/agent-n0"))
+        .collect();
+    let of = |who: &str| {
+        let found: Vec<&&str> = entries
+            .iter()
+            .filter(|line| line.split_whitespace().nth(1) == Some(who))
+            .collect();
+        assert_eq!(found.len(), 1, "one entry for {who} in:\n{audit}");
+        *found[0]
+    };
+    assert_eq!(of("dan").split_whitespace().nth(2), Some("exec"), "{audit}");
+    assert!(
+        !of("dan").ends_with(" ok"),
+        "dan's refusal is written down as one: {audit}"
+    );
+    assert!(
+        of("erin").ends_with(" ok"),
+        "erin's upgrade is written down as ok: {audit}"
+    );
+}
+
+/// A browser's upgrade carries an Origin, which kubectl never sends: it is refused with 403
+/// before the upgrade is answered, and written down as refused. Without it the same upgrade is 101.
+#[test]
+fn access_an_upgrade_that_carries_an_origin_is_refused() {
+    let cluster = with_node_agent("kube-exec-origin");
+    let pod = "/api/v1/namespaces/default/pods/agent-n0/exec?command=true&stdout=true&stderr=true";
+    let upgrade = [
+        "Connection: Upgrade",
+        "Upgrade: websocket",
+        "Sec-WebSocket-Version: 13",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+        "Sec-WebSocket-Protocol: v4.channel.k8s.io",
+    ];
+    let browser = [&upgrade[..], &["Origin: https://example.org"][..]].concat();
+    assert_eq!(cluster.reply("erin", "GET", pod, &browser, None), "403");
+    assert_eq!(cluster.reply("erin", "GET", pod, &upgrade, None), "101");
+
+    let audit = cluster.kith(&["audit"]);
+    let refused = audit
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some("erin") && !line.ends_with(" ok"));
+    assert!(refused, "the refused upgrade is in the audit log: {audit}");
 }
 
 /// A StatefulSet of several replicas has a claim and a Volume of each replica's own, named
