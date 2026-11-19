@@ -212,6 +212,10 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.stop();
+        // (Its console is in a file, not the terminal: a failing test still shows it.)
+        if std::thread::panicking() {
+            eprintln!("--- console of {} ---\n{}", self.dir.display(), self.said());
+        }
     }
 }
 
