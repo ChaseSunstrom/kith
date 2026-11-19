@@ -92,7 +92,8 @@ pub fn reach(store: &Store, prefixes: (Ipv6Addr, Ipv6Addr), node: &str) -> Reach
         api: 0,
         pods: (Ipv4Addr::UNSPECIFIED, 32),
     };
-    let asked = wanted(store, prefixes, node, &config, Vec::new());
+    // (No Exits either: a level's internet is not what a Service listener asks.)
+    let asked = wanted(store, prefixes, node, &config, Vec::new(), &Held::new());
     let mut reach = BTreeMap::new();
     for (person, _) in &asked.people {
         let Some((_, level)) = asked.levels.iter().find(|(name, _)| *name == person.level) else {

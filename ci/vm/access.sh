@@ -105,6 +105,226 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each held by al
             done
             echo "vm.sh: $said" >&2
 
+            # People (docs/adr-people.md, slice F): n1 ends the people's tunnels (--people, with
+            # --people-endpoint its address on this network). Two phones are two machines on
+            # that network, each started from memory with this machine's ip and wg and ci/pod.rs
+            # as its first process, whose only way to a Service is a WireGuard link set from the
+            # configuration `POST /v1/peers` (what `kith peer add` calls) answered once; a third
+            # is the Exit's provider (as --test tunnel has it). `pod watch` on a phone keeps one
+            # connection to a Service and tries a new one every third of a second, and says how
+            # many bytes came back: that, in the machine's console, is what these cases read.
+            # phone-a is on level guest (the Service echo, and not the Service hidden); phone-b on
+            # level roamer (echo, and the internet by the Exit vpn: "outside", 198.51.100.1, is
+            # the provider's, which no other way here reaches).
+            # (The admin's Role may apply what these need, until the next Role below.)
+            printf '%s' '[{"apiVersion":"kith.dev/v1","kind":"Role","metadata":{"name":"cluster-admin"},"spec":{"rules":[{"kinds":["*"],"verbs":["get","list","watch","delete","exec"]},{"kinds":["Role","RoleBinding","Workload","Service","AccessLevel","RemotePeer","Exit","Secret"],"verbs":["apply"]}]}}]' >"$work/people-role.json"
+            api 1 POST /v1/apply "$work/people-role.json" >/dev/null || fail "the admin was not allowed to apply the people's kinds"
+            cat >"$work/people.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"echo","labels":{"app":"echo"}},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"echo","image":"kith.test/pod:1","command":["/bin/pod","echo"],"ports":[{"port":80}],"readiness":{"tcp":{"port":80}}}]}}},
+ {"apiVersion":"kith.dev/v1","kind":"Service","metadata":{"name":"echo"},"spec":{"selector":{"app":"echo"},"ports":[{"port":80}]}},
+ {"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"hidden","labels":{"app":"hidden"}},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"hidden","image":"kith.test/pod:1","command":["/bin/pod","say"],"env":[{"name":"PASSWORD","value":"hidden"}],"ports":[{"port":80}],"readiness":{"tcp":{"port":80}}}]}}},
+ {"apiVersion":"kith.dev/v1","kind":"Service","metadata":{"name":"hidden"},"spec":{"selector":{"app":"hidden"},"ports":[{"port":80}]}}]
+EOF
+            api 1 POST /v1/apply "$work/people.json" >/dev/null || fail "the Services echo and hidden were not applied"
+            service_at() { # NAME: the Service's address, once it has a replica
+                any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+for r in found:
+    status = r.get("status") or {}
+    if r["kind"] == "Service" and r["metadata"]["name"] == sys.argv[1] and status.get("address") and status.get("backends"):
+        print(status["address"])
+        sys.exit(0)
+sys.exit(1)
+' "$1"
+            }
+            tries=0
+            until echo_at=$(service_at echo) && hidden_at=$(service_at hidden); do
+                tries=$((tries + 1))
+                [ "$tries" -lt 300 ] || fail "the Services echo and hidden were given no address with a replica: $(units Workload echo); $(units Workload hidden)"
+                sleep 1
+            done
+            level() { # NAME SPEC: an AccessLevel
+                printf '[{"apiVersion":"kith.dev/v1","kind":"AccessLevel","metadata":{"name":"%s"},"spec":%s}]' "$1" "$2" >"$work/level-$1.json"
+                api 1 POST /v1/apply "$work/level-$1.json" >/dev/null || fail "the AccessLevel $1 was not applied"
+            }
+            level guest '{"services":["default/echo"]}'
+            level roamer '{"services":["default/echo"],"exit":"vpn","dns":"10.9.0.9"}'
+            # The machines' root: pod, ip and wg with what they are linked to; each machine
+            # takes a copy with its own script (and the key a phone's link is made with).
+            mkdir -p "$work/vmroot/bin"
+            cp "$work/pod" "$work/vmroot/bin/pod"
+            : >"$work/vmlinked"
+            for tool in ip wg; do
+                cp -L "$(command -v "$tool")" "$work/vmroot/bin/$tool"
+                ldd "$(command -v "$tool")" | awk '$2 == "=>" && $3 ~ /^\// { print ($1 ~ /^\// ? $1 : $3), $3 } $1 ~ /^\// && $2 != "=>" { print $1, $1 }' >>"$work/vmlinked"
+            done
+            while read -r to from; do
+                mkdir -p "$work/vmroot${to%/*}"
+                cp -L "$from" "$work/vmroot$to"
+            done <"$work/vmlinked"
+            lanbox() { # N NAME: start the machine NAME at 10.9.0.N on the cluster's network from $work/NAME, and wait for its script to end
+                (cd "$work/$2" && find . | LC_ALL=C sort | cpio -o -H newc --owner=0:0 --quiet) >"$work/$2.cpio"
+                timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 256 -smp 1 -display none -no-reboot \
+                    -kernel "$base/vmlinuz" -initrd "$work/$2.cpio" -append "console=ttyS0 panic=-1 rdinit=/bin/pod -- init /script" \
+                    -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:0$1:0$1" \
+                    -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 8>&- &
+                vms="$vms $!"
+                tries=0
+                until grep -aq 'init: ready' "$work/n$1.log" 2>/dev/null; do
+                    tries=$((tries + 1))
+                    [ "$tries" -lt 120 ] || fail "the machine $2 did not start"
+                    sleep 1
+                done
+                ! grep -a 'init: failed' "$work/n$1.log" || fail "the machine $2 did not run its script"
+            }
+            # The provider: the node's end of the Exit's tunnel at 10.9.0.9 and, beyond it,
+            # "outside": 198.51.100.1, which answers on port 80 with "outside".
+            (umask 077 && wg genkey >"$work/node.key" && wg genkey >"$work/provider.key")
+            provider_public=$(wg pubkey <"$work/provider.key")
+            cp -a "$work/vmroot" "$work/provider"
+            cp "$work/provider.key" "$work/provider/provider.key"
+            cat >"$work/provider/script" <<EOF
+/bin/ip link set lo up
+/bin/ip address add 198.51.100.1/32 dev lo
+/bin/ip link set eth0 up
+/bin/ip address add 10.9.0.9/24 dev eth0
+/bin/ip link add wg0 type wireguard
+/bin/wg set wg0 private-key /provider.key listen-port 51820 peer $(wg pubkey <"$work/node.key") allowed-ips 10.2.0.2/32
+/bin/ip address add 10.2.0.1/24 dev wg0
+/bin/ip link set wg0 up
+& PASSWORD=outside /bin/pod say
+EOF
+            lanbox 9 provider
+            printf '[Interface]\nPrivateKey = %s\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 0.0.0.0/0\nEndpoint = 10.9.0.9:51820\nPersistentKeepalive = 5\n' \
+                "$(cat "$work/node.key")" "$provider_public" | python3 -c '
+import json, sys
+print(json.dumps([{"apiVersion": "kith.dev/v1", "kind": "Secret", "metadata": {"name": "vpn", "namespace": "kith-system"}, "spec": {"data": {"wg0.conf": sys.stdin.read()}}},
+                  {"apiVersion": "kith.dev/v1", "kind": "Exit", "metadata": {"name": "vpn"}, "spec": {"node": "n1", "secret": "vpn", "levels": ["roamer"]}}]))
+' >"$work/exit.json"
+            api 1 POST /v1/apply "$work/exit.json" >/dev/null || fail "the Exit vpn, held for the level roamer, was not applied"
+            tries=0
+            until grep -aq 'kithd: exit vpn: tunnel kx[0-9]* up' "$work/n1.log"; do
+                tries=$((tries + 1))
+                [ "$tries" -lt 120 ] || fail "the Exit's tunnel did not come up: $(grep -a 'kithd: exit' "$work/n1.log")"
+                sleep 1
+            done
+            # The peers, made as `kith peer add` makes them: once n1 has said its people's key,
+            # `POST /v1/peers` answers each one's configuration, the only copy of its private key.
+            tries=0
+            until any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+sys.exit(0 if any(r["kind"] == "Node" and r["metadata"]["name"] == "n1" and ((r.get("status") or {}).get("people") or {}).get("publicKey") for r in found) else 1)
+'; do
+                tries=$((tries + 1))
+                [ "$tries" -lt 120 ] || fail "n1 never said its people's key: $(grep -a 'people' "$work/n1.log" | tail -n 5)"
+                sleep 1
+            done
+            umask 077
+            for peer in phone-a:guest phone-b:roamer; do
+                printf '{"name":"%s","node":"n1","level":"%s"}' "${peer%%:*}" "${peer##*:}" >"$work/${peer%%:*}.json"
+                api 1 POST /v1/peers "$work/${peer%%:*}.json" | field config >"$work/${peer%%:*}.conf" || fail "kithd made no configuration for ${peer%%:*}"
+                grep -q '^PrivateKey = ' "$work/${peer%%:*}.conf" || fail "the configuration of ${peer%%:*} holds no private key"
+            done
+            umask 022
+            # A phone: its LAN address (N), then its link as its configuration makes it (what
+            # the WireGuard app does), then what it watches: NAME HOST PORT each.
+            phone() { # N NAME PEER WATCH...
+                n=$1 name=$2 peer=$3
+                shift 3
+                cp -a "$work/vmroot" "$work/$name"
+                python3 -I - "$work/$peer.conf" "$work/$name" "$n" "$@" <<'PY'
+import sys
+conf, out, n = sys.argv[1:4]
+have = {}
+for line in open(conf):
+    if "=" in line and not line.startswith("["):
+        key, value = line.split("=", 1)
+        have[key.strip()] = value.strip()
+split = lambda text: [item.strip() for item in text.split(",")]
+inet = lambda item: ["-6"] if ":" in item else []
+open(out + "/phone.key", "w").write(have["PrivateKey"] + "\n")
+lines = ["/bin/ip link set lo up", "/bin/ip link set eth0 up", "/bin/ip address add 10.9.0." + n + "/24 dev eth0",
+         "/bin/ip link add wg0 type wireguard",
+         "/bin/wg set wg0 private-key /phone.key peer " + have["PublicKey"] + " endpoint " + have["Endpoint"] + " allowed-ips " + ",".join(split(have["AllowedIPs"])) + " persistent-keepalive 25"]
+lines += ["/bin/ip " + " ".join(inet(a) + ["address", "add", a, "dev", "wg0", "nodad"] if ":" in a else ["address", "add", a, "dev", "wg0"]) for a in split(have["Address"])]
+lines += ["/bin/ip link set wg0 up"]
+lines += ["/bin/ip " + " ".join(inet(a) + ["route", "add", a, "dev", "wg0"]) for a in split(have["AllowedIPs"])]
+lines += ["& /bin/pod watch " + watch for watch in sys.argv[4:]]
+open(out + "/script", "w").write("\n".join(lines) + "\n")
+PY
+                lanbox "$n" "$name"
+            }
+            phone 8 phone-a-box phone-a "a-echo $echo_at 80" "a-hidden $hidden_at 80"
+            phone 7 phone-b-box phone-b "b-echo $echo_at 80" "b-out 198.51.100.1 80"
+            # What a phone's last complete line says of one of its counts (the line it is
+            # writing now may be cut): KIND is held (bytes the kept connection had back), fresh
+            # (new connections answered) or failed.
+            count() { # N NAME KIND
+                grep -a "$2: held=" "$work/n$1.log" | tail -n 2 | head -n 1 | grep -ao "$3=[0-9]*" | cut -d = -f 2
+            }
+            grew() { # N NAME KIND AT-LEAST WHAT
+                tries=0
+                until [ "$(count "$1" "$2" "$3")" -ge "$4" ] 2>/dev/null; do
+                    tries=$((tries + 1))
+                    [ "$tries" -lt 120 ] || fail "$5: $2 never got $4 of $3: $(grep -a "$2: held=" "$work/n$1.log" | tail -n 1)"
+                    sleep 1
+                done
+            }
+            counts() { # N NAME KIND...
+                set -- "$@" ''
+                for kind in "$@"; do
+                    [ "$kind" != '' ] && [ "$kind" != "$1" ] && [ "$kind" != "$2" ] && printf '%s ' "$(count "$1" "$2" "$kind")"
+                done
+                :
+            }
+            stopped() { # N NAME WHAT KIND...: five seconds on, no more of KIND comes though the phone tries on
+                sn=$1 sname=$2 swhat=$3
+                shift 3
+                sleep 5
+                sbefore=$(counts "$sn" "$sname" "$@") stried=$(count "$sn" "$sname" failed)
+                sleep 4
+                safter=$(counts "$sn" "$sname" "$@")
+                [ "$safter" = "$sbefore" ] || fail "$swhat: $sname still had $* of $sbefore a few seconds after five: $safter"
+                [ "$(count "$sn" "$sname" failed)" -gt "$stried" ] || fail "$swhat: $sname made no new tries, so it says nothing"
+            }
+            # (1) Each phone reaches what its level names: a kept connection and new ones, to
+            # the Service echo; phone-b also "outside", by the Exit. Neither reaches hidden.
+            grew 8 a-echo held 20 "phone-a (guest) reaching the Service echo"
+            grew 8 a-echo fresh 3 "phone-a (guest) reaching the Service echo"
+            grew 7 b-echo held 20 "phone-b (roamer) reaching the Service echo"
+            grew 7 b-out fresh 3 "phone-b (roamer) leaving by the Exit vpn"
+            grew 8 a-hidden failed 5 "phone-a (guest) trying the Service hidden"
+            [ "$(count 8 a-hidden fresh)" = 0 ] || fail "phone-a (guest) reached the Service hidden, which its level does not name"
+            echo "vm.sh: people: phone-a reaches the Service echo and not hidden; phone-b reaches echo and outside by the Exit" >&2
+            # (2) A level narrowed (to nothing): no byte either way within five seconds, the
+            # kept connection and new ones. Widened again: it is let through again.
+            level guest '{}'
+            stopped 8 a-echo "the level guest narrowed" held fresh
+            level guest '{"services":["default/echo"]}'
+            sbefore=$(count 8 a-echo held)
+            grew 8 a-echo held $((sbefore + 20)) "the level guest widened again"
+            # (3) The Exit deleted: nothing of phone-b's leaves.
+            api 1 DELETE /v1/resources/Exit/vpn >/dev/null || fail "the Exit vpn was not deleted"
+            stopped 7 b-out "the Exit vpn deleted" fresh
+            # (4) A peer removed: the connection it has open is ended and no byte comes either way.
+            api 1 DELETE /v1/resources/RemotePeer/phone-a >/dev/null || fail "the RemotePeer phone-a was not deleted"
+            stopped 8 a-echo "the peer phone-a removed" held fresh
+            [ "$(count 8 a-hidden fresh)" = 0 ] || fail "phone-a (guest) reached the Service hidden, which its level does not name"
+            ! grep -aq 'panicked at' "$work/n7.log" "$work/n8.log" "$work/n9.log" || fail "a phone or the provider panicked"
+            echo "vm.sh: people: the level guest narrowed, the Exit deleted and the peer phone-a removed each cut what was open and new tries within five seconds" >&2
+
             # What a taken leader could append, and no more (T-0848): these nodes run the image of a kithd
             # built with the feature forge, whose POST /v1/forge puts one entry in the log as it is, with
             # none of the checks a request gets before it is written. Only what every node does with an
@@ -113,7 +333,7 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each held by al
             # The nodes check signed entries once the store is in format 4, which the leader moves it to
             # when every member reads it.
             # Each says on its console that it is a forge build, which a build that ships never does.
-            for log in "$work"/n?.log; do
+            for log in "$work"/n[123].log; do
                 grep -aq 'kithd: built with forge: POST /v1/forge appends unchecked entries; never ship this' "$log" || fail "$log has no line saying kithd is built with forge"
             done
             tries=0
@@ -236,5 +456,5 @@ sys.exit(0 if any(e["verb"] == "signed" and not e["ok"] and e["who"] == who and 
             ! grep -q 'forged\|mallory' "$work/held" || fail "a forged RoleBinding is held: $(cat "$work/held")"
             echo "vm.sh: four entries the leader was not asked for, a bare RoleBinding, a signed one with its body changed, one with a replayed nonce and one with a command its signed body does not make, each refused by all three nodes at apply" >&2
             ! grep -al 'Kernel panic\|panicked at' "$work"/n?.log || fail "a node panicked"
-            echo "vm.sh: ok: three nodes; the admin writing through n2 and n3 by a RoleBinding deleted through n1 while n2 was cut off: $said; and a leader that appended a bare RoleBinding, a signed entry with its body changed, one with a replayed nonce and one with a command its signed body does not make: all three nodes refused each at apply, and hold the same"
+            echo "vm.sh: ok: three nodes; the admin writing through n2 and n3 by a RoleBinding deleted through n1 while n2 was cut off: $said; and a leader that appended a bare RoleBinding, a signed entry with its body changed, one with a replayed nonce and one with a command its signed body does not make: all three nodes refused each at apply, and hold the same; and a phone added by POST /v1/peers whose tunnel reached its level's Service, was cut when the level narrowed, lost its open connection when the peer was removed, and left an exit level by its Exit"
             exit 0

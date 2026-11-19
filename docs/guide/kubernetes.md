@@ -140,7 +140,7 @@ is kith OS. What each kind of guest becomes, and what is still missing:
 | a reverse proxy | kith's own ingress: a Service's `expose`, a certificate by ACME or your own | by host name and by path, with headers set; no rewriting of paths, no login in front of an app, no HTTP/2 to a host read by path |
 | a DNS filter | kith's own [DNS](cluster.md#dns) with a `DNSBlockList`: hosts files and filter lists' plain rules | works; no per-client statistics or query log |
 | a mail relay, or anything on a port of the LAN that is not HTTPS | a pod whose port says [`publish: true`](workloads.md#a-pod-behind-a-vpn-exit), or a Workload that shares its node's network (root, not a pod) | works; a published port is on one node, the first pod's there to ask for it |
-| a VPN endpoint for people (phones, laptops) | kith's own, with levels of access | not yet |
+| a VPN endpoint for people (phones, laptops) | kith's own: `kithd --people`, an AccessLevel and `kith peer add` ([Let a person's phone in](access.md#let-a-persons-phone-in)) | kith's own, built |
 | an app that must go out through a VPN | a Workload with an [exit](workloads.md#a-pod-behind-a-vpn-exit), its web UI a published port | WireGuard; tested against a provider in a VM, not a real one |
 | a VM with no image (an appliance) | a [`vms` unit](hardware.md#virtual-machines) | outbound network only, its disk not a Volume, not on kith OS: not yet |
 

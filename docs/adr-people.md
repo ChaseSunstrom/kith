@@ -587,6 +587,33 @@ Not built: IPv6 through an Exit, the Exit of another node, the API or DNS throug
 - Not built: bandwidth limits (the table has no rate); a person to a Service on port 443 or 80 of
   a node with the ingress (those are the ingress's: the strays are mesh-only).
 
+## Built: slice F
+
+`sh ci/vm.sh --test access` drives a person's tunnel end to end (`ci/vm/access.sh`, before its
+"signing required" step; `ci/pod.rs` gains `pod watch`). Its three nodes all start with `--mesh`,
+n1 also with `--people --people-endpoint 10.9.0.1:51821`. Two phone machines and an Exit's
+provider are not nodes: each starts from memory with `ip`, `wg` and `pod` as its first process,
+on the nodes' network, and a phone sets its WireGuard link from the configuration `POST /v1/peers`
+answered (the CLI's `kith peer add` is not built into VM tests; the route is what it calls).
+`pod watch NAME HOST PORT` holds one connection to a `pod echo` and makes a new one every third
+of a second, each of which counts a byte back, and prints `held`, `fresh` and `failed`: the
+test reads those from the console.
+
+| Case | Read |
+|---|---|
+| phone-a on `guest` (Service `echo`) reaches echo; the Service `hidden`, in no level, is refused | `held` and `fresh` grow; `fresh` of hidden stays 0 while `failed` grows |
+| phone-b on `roamer` (echo, and `exit: vpn`) leaves by the Exit | a TCP connection to the provider's `198.51.100.1`, an address only it has, answers |
+| `guest` narrowed to an empty level | five seconds on, neither `held` nor `fresh` of echo grows, and the phone keeps trying |
+| `guest` widened again | `held` grows again (a new connection) |
+| the Exit deleted | phone-b's connections to the provider stop |
+| the RemotePeer phone-a deleted | its open connection and new ones stop |
+
+Not driven, and said: IPv6 people (the IPv6 half of a configuration is set on the phone and not
+exercised), a real phone, the stock app, a real router, UDP, the forged-source, resolver and "no
+new way in" cases of the table under "Tests" (those that need a second LAN machine or a capture:
+the unit tests and `kith-mesh`'s namespace tests hold them). The "Tests" plan above is the
+design; this is what was built.
+
 ## Open
 
 - **People do not reach the Services on an `--ingress` node's 443 and 80 (not built).** Those

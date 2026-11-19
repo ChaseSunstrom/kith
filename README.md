@@ -107,6 +107,7 @@ is still there when it starts again.
 | Add a kind of your own, with its controller | [Kinds of your own](docs/guide/api.md#kinds-of-your-own) |
 | Let other people and programs in, each with their own rights | [Who may do what](docs/guide/access.md#who-may-do-what) |
 | Run `kith` on a laptop, over TLS to a node | [Use kith from a laptop](docs/guide/access.md#use-kith-from-a-laptop) |
+| Let a person's phone into the home network over WireGuard, with a level of what it reaches (and what bounds it) | [Let a person's phone in](docs/guide/access.md#let-a-persons-phone-in); [SECURITY.md](SECURITY.md) |
 | Hand out GPUs and seats, run virtual machines | [Hardware](docs/guide/hardware.md#hardware) |
 | Run a Flatpak app in a seat's window | [Running a Flatpak app in a session](docs/guide/hardware.md#running-a-flatpak-app-in-a-session) |
 | Keep data: volumes, shares, replicas, backups | [Storage](docs/guide/storage.md#storage) |
@@ -147,6 +148,11 @@ You say what should exist, in files. `kithd` makes each node match:
 - With more than one node, the store is copied to the others by Raft.
 - Started with `--mesh`, the nodes also set up WireGuard tunnels between themselves, so
   what runs on one node reaches what runs on another.
+- Started also with `--people`, a node ends WireGuard tunnels for people's phones and laptops
+  (`kith peer add`, with the stock app): each device gets an AccessLevel's Services, ranges,
+  resolver and internet (or an Exit's), held on that node by the kernel and cut within seconds
+  when the level narrows or the peer goes. It is not on the mesh and holds nothing else;
+  [what it does not hold](SECURITY.md) is stated.
 
 ## Status
 
