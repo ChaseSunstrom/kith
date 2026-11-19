@@ -157,4 +157,4 @@ Moving a guest's data, one guest at a time:
 
 kith does not need the hypervisor gone first: a kith OS image boots as a guest (UEFI, virtio
 disk and network), the way to try it beside what runs today. It is tested in QEMU, not on
-Proxmox itself.
+Proxmox itself: see [As a guest on Proxmox VE](os.md#as-a-guest-on-proxmox-ve).
