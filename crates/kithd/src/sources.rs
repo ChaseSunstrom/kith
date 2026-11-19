@@ -6,6 +6,8 @@
 //! `approval: manual` holds a new revision in `status.pending` until `spec.approve`
 //! names it. What a Source applied and someone changed since is put back, and listed in
 //! `status.drift`: the source is what is true.
+//! Applying one of these by hand is checked by `releases::claims` (releases.rs:470), not by
+//! claims.rs, which covers DeviceClaims only.
 //
 // ponytail: git is the node's `git`, run as a program (a git inside kithd is several MB
 // for what the program does); nothing is ever checked out, so no link in a repository

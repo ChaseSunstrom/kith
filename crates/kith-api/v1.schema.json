@@ -3380,6 +3380,15 @@
           ],
           "format": "uint32",
           "minimum": 0
+        },
+        "startSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "A liveness probe's start deadline: the container is restarted if it has not passed once\nthis long after it started (until then a failure does not count). Kubernetes'\n`initialDelaySeconds` becomes this."
         }
       },
       "description": "Exactly one of `http`, `tcp` or `exec`."
@@ -4308,6 +4317,13 @@
             "null"
           ],
           "description": "A Volume, or a VolumeClaim's."
+        },
+        "perReplica": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Of a `volume`: it names a VolumeClaim for each replica, `volume` and `-` and the\nreplica's number (`data-db` is `data-db-0` for the first). Each replica goes on\nthe node its own Volume is on, and waits while that Volume or its node is gone."
         },
         "configMap": {
           "type": [

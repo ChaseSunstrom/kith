@@ -173,7 +173,7 @@ type Stamp = (
 
 /// What the rights of `definition`'s writer are read from, as one number: its Identity, and
 /// every Role and RoleBinding. (A right granted later is a reason to run again what was refused.)
-fn rights(store: &Store, definition: &Resource) -> u64 {
+pub(crate) fn rights(store: &Store, definition: &Resource) -> u64 {
     use std::hash::{Hash, Hasher};
     let writer = definition.metadata.annotations.get(releases::WRITER);
     let identity = writer.and_then(|writer| store.get(&format!("Identity/{writer}")));

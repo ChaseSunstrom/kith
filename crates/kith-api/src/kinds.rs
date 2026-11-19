@@ -589,6 +589,11 @@ spec! {
         /// A Volume, or a VolumeClaim's.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub volume: Option<String>,
+        /// Of a `volume`: it names a VolumeClaim for each replica, `volume` and `-` and the
+        /// replica's number (`data-db` is `data-db-0` for the first). Each replica goes on
+        /// the node its own Volume is on, and waits while that Volume or its node is gone.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub per_replica: Option<bool>,
         /// A ConfigMap of the namespace: each key a file, read-only, and changed when the
         /// ConfigMap is (all its files at once).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -649,6 +654,11 @@ spec! {
         pub timeout_seconds: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub failure_threshold: Option<u32>,
+        /// A liveness probe's start deadline: the container is restarted if it has not passed once
+        /// this long after it started (until then a failure does not count). Kubernetes'
+        /// `initialDelaySeconds` becomes this.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub start_seconds: Option<u32>,
     }
 
     pub struct HttpProbe {
@@ -1992,6 +2002,9 @@ impl VolumeMount {
                 ("scratch", self.scratch.is_some()),
             ],
         )?;
+        if self.per_replica.is_some() && self.volume.is_none() {
+            return Err("`perReplica` is a `volume`'s".into());
+        }
         let data = self.config_map.is_some() || self.secret.is_some();
         if !data && (!self.items.is_empty() || self.mode.is_some()) {
             return Err("`items` and `mode` are a `configMap`'s or a `secret`'s".into());

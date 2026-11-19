@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en" class="still">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="robots" content="noindex">
+<title>Not found: kith</title>
+<meta name="description" content="There is no page here. The front page, the guide and the installer are where they were.">
+<!-- GitHub Pages serves this file for a missing page at any depth: the base makes the links below mean the site's, not the missing page's, folder. -->
+<script>
+if (location.protocol !== "file:") {
+  const base = document.createElement("base");
+  base.href = location.hostname.endsWith(".github.io") ? `/${location.pathname.split("/")[1]}/` : "/";
+  document.head.prepend(base);
+}
+</script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+
+<header class="bar">
+  <a class="brand" href="index.html" aria-label="kith: the front page">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true">
+      <line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/>
+      <circle cx="22" cy="14" r="4"/><circle cx="22" cy="50" r="4"/><circle cx="43" cy="19" r="4.5"/><circle cx="43" cy="50" r="4.5"/>
+      <circle class="ring" cx="24" cy="37" r="5.5"/><circle class="hub" cx="24" cy="37" r="5.5"/>
+    </svg>
+    <b>kith</b>
+  </a>
+  <a class="button quiet" href="guide/index.html" style="margin-left:auto">Guide</a>
+  <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+</header>
+
+<main id="top">
+<section class="hero lost">
+  <div class="say">
+    <p class="word"><b>404</b> <i>(n.)</i> a stop the line does not reach.</p>
+    <h1>Nothing here. <span class="under">The rest is where it was.</span></h1>
+    <p class="lead">The page you asked for is not on this site: the address may be mistyped, or the page may have moved.</p>
+    <p class="acts">
+      <a class="button" href="index.html">The front page</a>
+      <a class="button quiet" href="guide/index.html">The guide</a>
+      <a class="button quiet" href="install.html">Install kith OS</a>
+    </p>
+  </div>
+  <svg class="map" viewBox="0 0 340 120" role="img" aria-label="The kith mark as a map: a hub, and a dotted line to a stop that is not there.">
+    <g class="lines"><path class="gone" d="M96 60 226 60"/></g>
+    <circle class="halo" cx="96" cy="60" r="16"/>
+    <circle class="hub" cx="96" cy="60" r="17"/>
+    <circle class="stopped gone" cx="226" cy="60" r="12"/>
+    <text x="96" y="104">kith</text>
+    <text class="gone" x="226" y="104">this page</text>
+  </svg>
+</section>
+<i class="end" aria-hidden="true"></i>
+</main>
+
+<footer>
+  <p><b>kith</b> <span class="dim">is written in Rust, under the Apache-2.0 licence.</span></p>
+  <nav aria-label="Elsewhere">
+    <a href="guide/index.html">Guide</a>
+    <a href="install.html">Install</a>
+    <a href="https://github.com/ChaseSunstrom/kith/blob/main/SECURITY.md">Security</a>
+    <a href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+  </nav>
+</footer>
+
+</body>
+</html>

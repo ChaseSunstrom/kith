@@ -128,9 +128,15 @@ const P256: [u8; 26] = [
 
 type Key = (&'static dyn VerificationAlgorithm, Vec<u8>);
 
+/// The point of the P-256 public key `pem` (an Identity's `publicKey`) holds, if it holds one.
+fn p256_point(pem: &str) -> Option<Vec<u8>> {
+    use rustls::pki_types::pem::PemObject;
+    let spki = rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(pem.as_bytes()).ok()?;
+    Some(spki.as_ref().strip_prefix(&P256[..])?.to_vec())
+}
+
 /// Who `who` is, and the keys that sign as them.
 fn keys(store: &Store, who: &str) -> Result<(Caller, Vec<Key>), String> {
-    use rustls::pki_types::pem::PemObject;
     match Caller::named(who) {
         Some(Caller::Admin) => {
             let keys = admin_keys(store.list(Some("Cluster")).map(|cluster| &cluster.spec));
@@ -147,10 +153,7 @@ fn keys(store: &Store, who: &str) -> Result<(Caller, Vec<Key>), String> {
         Some(Caller::Identity(name)) => {
             let identity = store.get(&format!("Identity/{name}"));
             let pem = identity.and_then(|identity| identity.spec["publicKey"].as_str());
-            let spki =
-                pem.and_then(|pem| rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(pem.as_bytes()).ok());
-            let point = spki.and_then(|spki| Some(spki.as_ref().strip_prefix(&P256[..])?.to_vec()));
-            match point {
+            match pem.and_then(p256_point) {
                 Some(point) => Ok((
                     Caller::Identity(name),
                     vec![(&signature::ECDSA_P256_SHA256_ASN1 as _, point)],
@@ -339,8 +342,96 @@ fn same(store: &Store, derived: Command, carried: &Command) -> Result<(), String
     }
 }
 
-/// May a node apply `command`, an entry of the log the node `leader` wrote, to `store`? Anything
-/// but a signed entry may. A signed one only where all of these hold, in this order: `store` is
+/// The Identity a certificate route's `path` (`/v1/identities/NAME/certificate`, no query) names.
+pub fn certificate_of(path: &str) -> Option<&str> {
+    let name = path.strip_prefix("/v1/identities/")?.strip_suffix("/certificate")?;
+    crate::pki::valid_name(name).ok().map(|()| name)
+}
+
+/// Is `carried` what the certificate route makes for `name` (the admin's `POST` of no body)? The
+/// key is made by the node that holds the CA, after the admin has signed, so it cannot be derived:
+/// the entry is one Apply of the Identity `name` as `store` has it (or a new one), its `publicKey`
+/// a P-256 key, and no more changed. (A taken leader can still put another key there: the admin
+/// signed no key. It cannot change another Identity or another field.)
+fn certified(
+    store: &Store,
+    signer: &Caller,
+    name: &str,
+    method: &str,
+    body: &[u8],
+    carried: &Command,
+) -> Result<(), String> {
+    let differs = || format!("the command it carries is not what a certificate for {name} makes");
+    if method != "POST" || !body.is_empty() || *signer != Caller::Admin {
+        return Err(format!("a certificate for {name} is the admin's POST with no body"));
+    }
+    let Command::Apply { resources, .. } = carried else {
+        return Err(differs());
+    };
+    let [made] = resources.as_slice() else {
+        return Err(differs());
+    };
+    let key = made.spec["publicKey"].as_str();
+    if key.and_then(p256_point).is_none() {
+        return Err(format!("the publicKey of Identity {name} is not a P-256 public key"));
+    }
+    // Everything else is as it stands (the revision is the store's).
+    let mut was = store
+        .get(&format!("Identity/{name}"))
+        .cloned()
+        .unwrap_or_else(|| new_identity(name));
+    was.spec["publicKey"] = made.spec["publicKey"].clone();
+    was.metadata.revision = None;
+    let mut made = made.clone();
+    made.metadata.revision = None;
+    (made == was).then_some(()).ok_or_else(differs)
+}
+
+/// The Identity `name` as the certificate route makes it where there is none: no spec yet.
+pub fn new_identity(name: &str) -> Resource {
+    let new = serde_json::json!({
+        "apiVersion": kith_api::API_VERSION, "kind": "Identity", "metadata": { "name": name }, "spec": {},
+    });
+    serde_json::from_value(new).expect("an Identity with a valid name")
+}
+
+/// May a bare entry (not a signed one) be applied to `store`? Under `spec.signing: required`
+/// in format 4 not one that changes access ([`crate::raft::changes_access`]: a Role,
+/// RoleBinding, Identity, KindDefinition or Cluster, and any import): only a signed entry
+/// does, so a taken leader cannot write what the admin did not sign. Every other bare write
+/// stays bare here (a node's own, a spec a Release or Source writes: later slices).
+///
+/// A cost, until slice 6 (T-0850: `writer_may` for a Release and a Source): a Release or Source
+/// whose render holds a Role, RoleBinding, Identity or KindDefinition (or prunes one) is bare, so
+/// it is refused here too. Their controllers do not propose it under `required`
+/// ([`refuses_render`]) and say so in the status.
+fn bare(store: &Store, command: &Command) -> Result<(), String> {
+    // (The command first: the scan of the store for `required` only runs for an access write.)
+    match crate::raft::changes_access(command) && store.checking() && required(store) {
+        true => Err("a bare write that changes access is refused under spec.signing: required".into()),
+        false => Ok(()),
+    }
+}
+
+/// Would the cluster refuse `command` bare, a controller's own write (a Release's or a Source's
+/// render), under `spec.signing: required`? Then the controller proposes nothing and says so,
+/// rather than write an entry every node refuses and audits, again each round.
+pub fn refuses_render(store: &Store, command: &Command) -> Option<String> {
+    bare(store, command).err()
+}
+
+/// What a command touches, for the audit log: its resources' keys (an import: the whole store).
+fn targets(command: &Command) -> Vec<String> {
+    match command {
+        Command::Apply { resources, .. } => resources.iter().map(|resource| resource.key()).collect(),
+        Command::Delete { key } | Command::Rollback { key, .. } => vec![key.clone()],
+        Command::Import { .. } => vec!["(the whole store)".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// May a node apply `command`, an entry of the log the node `leader` wrote, to `store`? A bare
+/// entry may unless [`bare`] refuses it. A signed one only where all of these hold, in this order: `store` is
 /// in format 4 ([`Store::checking`]); its
 /// signature holds by `store`'s keys, for `*` or for `leader`; its method, path and body make
 /// its command ([`derived`], [`same`]); its signer may make it ([`crate::api::refused`], and
@@ -356,7 +447,7 @@ pub fn admit(store: &Store, cluster: &str, command: &Command, leader: kith_store
         command,
     } = command
     else {
-        return Ok(());
+        return bare(store, command);
     };
     // Before format 4 a member may be on a kithd that refuses every signed entry (T-0779's):
     // refused here too, so the stores stay alike.
@@ -375,7 +466,10 @@ pub fn admit(store: &Store, cluster: &str, command: &Command, leader: kith_store
         body: &body,
     };
     let (signer, read) = signature(header, cluster, &[target], &asked, store)?;
-    same(store, derived(store, &signer, method, path, &body)?, command)?;
+    match certificate_of(path) {
+        Some(name) => certified(store, &signer, name, method, &body, command)?,
+        None => same(store, derived(store, &signer, method, path, &body)?, command)?,
+    }
     if let Some(why) = crate::api::refused(store, &signer, command) {
         return Err(why);
     }
@@ -390,7 +484,10 @@ pub fn admit(store: &Store, cluster: &str, command: &Command, leader: kith_store
 pub fn hook(cluster: Option<String>, audit: Arc<crate::audit::Audit>) -> kith_store::Check {
     Arc::new(move |store, command, leader| {
         let Command::Signed { header, path, .. } = command else {
-            return Ok(());
+            return bare(store, command).map_err(|why| {
+                audit.record(&"unsigned", "signed", targets(command), Err(why.clone()));
+                kith_api::store::Error::Invalid(format!("refused: {why}"))
+            });
         };
         let decided = match &cluster {
             Some(cluster) => admit(store, cluster, command, leader),
@@ -444,11 +541,23 @@ pub struct Relay {
 }
 
 impl Relay {
-    /// Is this request the route `command` is made by? Only then is it passed on as it came: a
-    /// write a handler makes on its own (a `Mark`, a restore's, a lock's) is not this request. A
-    /// Release, Source, KindDefinition or Package rollback is applied as it goes back, so it is an
-    /// Apply made by a rollback route.
+    /// Is this request passed on as it came to make `command`? The routes [`Relay::signs`] names
+    /// but the certificate route's, which is the local socket's alone.
     pub fn carries(&self, command: &Command) -> bool {
+        self.signs(command) && certificate_of(&self.path).is_none()
+    }
+
+    /// Is this request the route `command` is made by? Only then is `command` written as signed,
+    /// the entry holding this request: a write a handler makes on its own (a `Mark`, a restore's,
+    /// a lock's) is not this request. A Release, Source, KindDefinition or Package rollback is
+    /// applied as it goes back, so it is an Apply made by a rollback route. The certificate route
+    /// makes an Apply of its Identity ([`certified`]).
+    pub fn signs(&self, command: &Command) -> bool {
+        if let Some(name) = certificate_of(&self.path) {
+            let identity = matches!(command, Command::Apply { resources, .. }
+                if resources.iter().all(|resource| resource.kind == "Identity" && resource.metadata.name == name));
+            return self.method == "POST" && identity;
+        }
         let route = self.path.split('?').next().unwrap_or("");
         match command {
             Command::Apply { .. } => {
@@ -1330,7 +1439,9 @@ mod tests {
                     applies(vec![map("b")]),
                 ),
             ];
-            let (mut one, mut two) = (signing_store(), signing_store());
+            // (One store and its clone: two built apart can differ in the second they were stamped.)
+            let mut one = signing_store();
+            let mut two = one.clone();
             let taken = [true, false, false, false, false, false, true];
             assert_eq!(feed(&mut one, &log), taken, "expires {expires}");
             assert_eq!(feed(&mut two, &log), taken, "expires {expires}");
@@ -1384,6 +1495,362 @@ mod tests {
         changed.spec = serde_json::json!({ "data": { "a": "c" } });
         let entry = by_admin_entry(LEADER, NOW, &nonce(4), &a, &a, applies(vec![changed]));
         assert!(admit(&store, CLUSTER, &entry, leader).is_err());
+    }
+
+    /// A store in format 4 that says `spec.signing: required`.
+    fn required_store() -> Store {
+        let mut store = store_with(admin().public_key().as_ref(), ", signing: required");
+        kith_store::run(&mut store, Command::MarkChecked).unwrap();
+        store
+    }
+
+    /// Every bare write that changes access, and an import.
+    fn bare_access() -> Vec<Command> {
+        let kind = |kind: &str| {
+            let mut of = map("x");
+            of.kind = kind.to_string();
+            of.spec = serde_json::json!({});
+            of
+        };
+        let mut writes: Vec<Command> = ["Role", "RoleBinding", "Identity", "KindDefinition", "Cluster"]
+            .iter()
+            .map(|of| applies(vec![map("a"), kind(of)]))
+            .collect();
+        writes.push(Command::Delete { key: "Role/x".into() });
+        writes.push(Command::Rollback {
+            key: "Identity/x".into(),
+            to: 1,
+            at: 7,
+        });
+        writes.push(Command::Import {
+            store: Store::default(),
+        });
+        writes
+    }
+
+    /// Under `required` at format 4 every node refuses a bare write that changes access, and
+    /// any import, as the hook; what does not change access, and what is signed, is taken.
+    /// A bare refusal is audited with what it touched, not with nothing.
+    #[test]
+    fn signed_bare_refusals_name_their_targets_for_the_audit() {
+        let writes = bare_access();
+        assert_eq!(targets(&writes[0]).len(), 2, "an apply: each resource's key");
+        assert_eq!(targets(&Command::Delete { key: "Role/x".into() }), ["Role/x"]);
+        assert_eq!(targets(writes.last().unwrap()), ["(the whole store)"]);
+        assert!(writes.iter().all(|write| !targets(write).is_empty()));
+        // The scan of the store for `required` is for an access write only: a plain one is not asked.
+        assert_eq!(refuses_render(&required_store(), &applies(vec![map("a")])), None);
+        assert!(refuses_render(&required_store(), &writes[0]).is_some());
+    }
+
+    #[test]
+    fn signed_required_refuses_bare_access_writes_and_imports() {
+        let leader = kith_store::node_id(LEADER);
+        let store = required_store();
+        for write in bare_access() {
+            let said = admit(&store, CLUSTER, &write, leader).unwrap_err();
+            assert!(said.contains("bare"), "{write:?}: {said}");
+        }
+        for write in [
+            applies(vec![map("a")]),
+            Command::Delete {
+                key: "ConfigMap/a".into(),
+            },
+            Command::Status { statuses: Vec::new() },
+        ] {
+            assert!(admit(&store, CLUSTER, &write, leader).is_ok(), "{write:?}");
+        }
+        // Signed, the same change is the admin's and is taken (the hook asks no more of it).
+        let role = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: maps}\nspec: {rules: []}\n";
+        let body = serde_json::to_vec(&[resource(role)]).unwrap();
+        let command = applies(vec![resource(role)]);
+        let signed = by_admin_entry(LEADER, NOW, &nonce(1), &body, &body, command);
+        assert!(admit(&store, CLUSTER, &signed, leader).is_ok());
+        // Run in a log: the refused entries leave the store as it was, on two nodes alike.
+        let log: Vec<Command> = bare_access().into_iter().chain([signed]).collect();
+        // (One store and its clone: two built apart can differ in the second they were stamped.)
+        let mut one = required_store();
+        let mut two = one.clone();
+        let taken = [vec![false; bare_access().len()], vec![true]].concat();
+        assert_eq!(feed(&mut one, &log), taken);
+        assert_eq!(feed(&mut two, &log), taken);
+        assert_eq!(one, two);
+        assert!(one.get("Role/maps").is_some() && one.get("Role/x").is_none());
+    }
+
+    /// An open cluster, or a store below format 4, takes the same bare writes as before.
+    #[test]
+    fn signed_open_cluster_or_old_format_takes_bare_access_writes() {
+        let leader = kith_store::node_id(LEADER);
+        let open = signing_store();
+        let mut old = store_with(admin().public_key().as_ref(), ", signing: required");
+        kith_store::run(&mut old, Command::MarkSigned).unwrap();
+        assert!(!old.checking() && required(&old) && !required(&open));
+        for write in bare_access() {
+            assert!(admit(&open, CLUSTER, &write, leader).is_ok(), "open: {write:?}");
+            assert!(admit(&old, CLUSTER, &write, leader).is_ok(), "format 3: {write:?}");
+        }
+    }
+
+    /// The entry the certificate route writes for `name`: the admin's signature over `POST
+    /// /v1/certificate` of `signed`, carrying `body` and `command`.
+    fn certificate_entry(name: &str, n: u32, signed: &[u8], body: &[u8], command: Command) -> Command {
+        let path = format!("/v1/identities/{name}/certificate");
+        let asked = Asked {
+            method: "POST",
+            path: &path,
+            body: signed,
+        };
+        let message = bytes(CLUSTER, LEADER, &asked, "local socket", NOW, &nonce(n));
+        let sig = base64::engine::general_purpose::STANDARD.encode(admin().sign(message.as_bytes()));
+        Command::Signed {
+            header: format!(
+                "v1; who=local socket; target={LEADER}; expires={NOW}; nonce={}; sig={sig}",
+                nonce(n)
+            ),
+            method: "POST".into(),
+            path,
+            body: base64::engine::general_purpose::STANDARD.encode(body),
+            command: Box::new(command),
+        }
+    }
+
+    /// The Identity `name` with `public` as its key, as the route applies it.
+    fn certified_identity(name: &str, public: &str) -> Command {
+        let mut identity = new_identity(name);
+        identity.spec["publicKey"] = public.into();
+        applies(vec![identity])
+    }
+
+    /// The certificate route's entry, signed by the admin, is taken on every node alike and
+    /// the Identity has its key; a forged or changed one, or another sort of entry on its path, is not.
+    #[test]
+    fn access_certificate_route_writes_a_signed_identity_the_hook_takes() {
+        let leader = kith_store::node_id(LEADER);
+        let ca = crate::pki::Ca::create().unwrap();
+        let (_, _, public) = ca.issue_user("alice").unwrap();
+        let (_, _, other) = ca.issue_user("alice").unwrap();
+        let good = certificate_entry("alice", 1, b"", b"", certified_identity("alice", &public));
+        let mut identity = new_identity("alice");
+        identity.spec = serde_json::json!({ "publicKey": public, "more": 1 });
+        let forged = |entry: Command| {
+            // (One store and its clone: two built apart can differ in the second they were stamped.)
+            let mut one = required_store();
+            let mut two = one.clone();
+            let log = [entry, good.clone()];
+            (feed(&mut one, &log), feed(&mut two, &log), one == two)
+        };
+        // Taken, where nothing else is: the Identity has its key.
+        // (One store and its clone: two built apart can differ in the second they were stamped.)
+        let mut one = required_store();
+        let mut two = one.clone();
+        assert_eq!(
+            feed(&mut one, &[good.clone(), good.clone()]),
+            [true, false],
+            "the nonce is spent"
+        );
+        assert_eq!(feed(&mut two, &[good.clone(), good.clone()]), [true, false]);
+        assert_eq!(one, two);
+        assert_eq!(one.get("Identity/alice").unwrap().spec["publicKey"], public.as_str());
+        // A key other than a P-256 public key, another field, a second resource, another name,
+        // a body: refused (the good one that follows it is taken, as no nonce was spent).
+        let not_a_key = certified_identity("alice", "not a key");
+        let more = applies(vec![identity.clone()]);
+        let two_of = applies(vec![new_identity("alice"), new_identity("bob")]);
+        let bob = certified_identity("bob", &public);
+        for (what, entry) in [
+            ("not a key", certificate_entry("alice", 2, b"", b"", not_a_key)),
+            ("another field", certificate_entry("alice", 3, b"", b"", more)),
+            ("two Identities", certificate_entry("alice", 4, b"", b"", two_of)),
+            ("another name", certificate_entry("alice", 5, b"", b"", bob)),
+            (
+                "a body",
+                certificate_entry("alice", 6, b"x", b"x", certified_identity("alice", &other)),
+            ),
+            (
+                "a ConfigMap",
+                certificate_entry("alice", 7, b"", b"", applies(vec![map("a")])),
+            ),
+            (
+                "a delete",
+                certificate_entry(
+                    "alice",
+                    8,
+                    b"",
+                    b"",
+                    Command::Delete {
+                        key: "Identity/alice".into(),
+                    },
+                ),
+            ),
+        ] {
+            let (first, second, alike) = forged(entry);
+            assert_eq!(
+                (first, second, alike),
+                (vec![false, true], vec![false, true], true),
+                "{what}"
+            );
+        }
+        // A signature that is not the admin's, and one over another path or body.
+        let Command::Signed {
+            header,
+            method,
+            body,
+            command,
+            ..
+        } = good.clone()
+        else {
+            unreachable!()
+        };
+        let bob_path = "/v1/identities/bob/certificate".to_string();
+        let moved = Command::Signed {
+            header: header.clone(),
+            method: method.clone(),
+            path: bob_path,
+            body: body.clone(),
+            command: command.clone(),
+        };
+        let forged_sig = Command::Signed {
+            header: header.replace("sig=", "sig=AA"),
+            method,
+            path: "/v1/identities/alice/certificate".into(),
+            body,
+            command,
+        };
+        for (what, entry) in [("another path", moved), ("another signature", forged_sig)] {
+            let (first, second, alike) = forged(entry);
+            assert_eq!(
+                (first, second, alike),
+                (vec![false, true], vec![false, true], true),
+                "{what}"
+            );
+        }
+        // An Identity it had: its labels and the rest are kept, and only the key changes.
+        let mut had = new_identity("alice");
+        had.metadata.labels.insert("team".into(), "a".into());
+        had.spec = serde_json::json!({ "publicKey": other, "groups": ["x"] });
+        let mut store = required_store();
+        store.apply(had.clone()).unwrap();
+        let mut renewed = store.get("Identity/alice").unwrap().clone();
+        renewed.spec["publicKey"] = public.clone().into();
+        assert!(
+            admit(
+                &store,
+                CLUSTER,
+                &certificate_entry("alice", 9, b"", b"", applies(vec![renewed.clone()])),
+                leader
+            )
+            .is_ok()
+        );
+        renewed.metadata.labels.clear();
+        assert!(
+            admit(
+                &store,
+                CLUSTER,
+                &certificate_entry("alice", 10, b"", b"", applies(vec![renewed])),
+                leader
+            )
+            .is_err()
+        );
+    }
+
+    /// A signed request for the certificate route is written as signed, and never passed on to
+    /// another node (the route is the local socket's): [`Relay::signs`], [`Relay::carries`].
+    #[test]
+    fn access_certificate_route_is_signed_not_relayed() {
+        let relay = |method: &str, path: &str| Relay {
+            method: method.into(),
+            path: path.into(),
+            body: axum::body::Bytes::new(),
+            who: Caller::Admin,
+            room: Arc::new(HOLDING.try_acquire_many(1).unwrap()),
+        };
+        let cert = relay("POST", "/v1/identities/alice/certificate");
+        let identity = certified_identity("alice", "k");
+        assert!(cert.signs(&identity) && !cert.carries(&identity));
+        assert!(!cert.signs(&applies(vec![map("a")])), "only its Identity");
+        assert!(!cert.signs(&certified_identity("bob", "k")), "only the one it names");
+        assert!(!relay("GET", "/v1/identities/alice/certificate").signs(&identity));
+        let apply = relay("POST", "/v1/apply");
+        assert!(apply.signs(&applies(vec![map("a")])) && apply.carries(&applies(vec![map("a")])));
+    }
+
+    /// A signed request is written as signed, and the hook takes it, at a node of its own:
+    /// the certificate route, under `required`; and a bare access write is refused there.
+    #[tokio::test]
+    async fn access_certificate_route_through_a_node_under_required() {
+        use crate::cluster::pinned_peer::{node, shared_with};
+        let ca = crate::pki::Ca::create().unwrap();
+        let shared = shared_with("signed-cert", node(&ca, "cert-c"), &[]).await;
+        let id = shared.raft.metrics().borrow().id;
+        let one = BTreeMap::from([(id, kith_store::openraft::BasicNode::new(""))]);
+        shared.raft.initialize(one).await.unwrap();
+        let leads = shared.raft.wait(Some(std::time::Duration::from_secs(30)));
+        leads.current_leader(id, "leads").await.unwrap();
+        let key = crate::pki::hex(admin().public_key().as_ref());
+        let cluster = |signing: &str| {
+            resource(&format!(
+                "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec: {{ adminKey: {key}{signing} }}\n"
+            ))
+        };
+        shared.write(applies(vec![cluster("")])).await.unwrap();
+        shared.write(Command::MarkSigned).await.unwrap();
+        shared.write(Command::MarkChecked).await.unwrap();
+        let cluster_id = crate::pki::fingerprint(&shared.cluster.as_ref().unwrap().me.ca).unwrap();
+        let expires = now() + 300;
+        let signed = |n: u32, path: &str, body: &[u8]| {
+            let asked = Asked {
+                method: "POST",
+                path,
+                body,
+            };
+            let message = bytes(&cluster_id, "*", &asked, "local socket", expires, &nonce(n));
+            let sig = base64::engine::general_purpose::STANDARD.encode(admin().sign(message.as_bytes()));
+            Signed {
+                header: format!(
+                    "v1; who=local socket; target=*; expires={expires}; nonce={}; sig={sig}",
+                    nonce(n)
+                ),
+                who: Caller::Admin,
+                relay: Some(Relay {
+                    method: "POST".into(),
+                    path: path.into(),
+                    body: axum::body::Bytes::copy_from_slice(body),
+                    who: Caller::Admin,
+                    room: Arc::new(HOLDING.try_acquire_many(1).unwrap()),
+                }),
+            }
+        };
+        // Required, by the admin's signature.
+        let required = cluster(", signing: required");
+        let body = serde_json::to_vec(std::slice::from_ref(&required)).unwrap();
+        let flip = shared.submit_as(applies(vec![required]), Some(&Caller::Admin));
+        within(Some(signed(2, "/v1/apply", &body)), flip).await.unwrap();
+        assert!(requires(&shared));
+        // A bare access write: refused, on the node that wrote it and so on every one.
+        let bare = shared
+            .submit_as(certified_identity("bob", "k"), Some(&Caller::Admin))
+            .await;
+        assert!(bare.is_err(), "{bare:?}");
+        let path = "/v1/identities/alice/certificate";
+        let signed = signed(1, path, b"");
+        let (_, _, public) = ca.issue_user("alice").unwrap();
+        let wrote = within(
+            Some(signed),
+            shared.submit_as(certified_identity("alice", &public), Some(&Caller::Admin)),
+        )
+        .await;
+        wrote.unwrap();
+        let state = shared.store.lock().unwrap();
+        assert_eq!(
+            state.store.get("Identity/alice").unwrap().spec["publicKey"],
+            public.as_str()
+        );
+        assert!(state.store.get("Identity/bob").is_none());
+        assert!(
+            state.store.takes_nonce("local socket", expires, &nonce(1)).is_err(),
+            "it was signed: its nonce is spent"
+        );
     }
 
     /// A signer is held to its Roles where the entry is applied, as the store then stands.

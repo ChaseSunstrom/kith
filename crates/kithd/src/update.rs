@@ -435,6 +435,8 @@ fn version_in(os_release: &str) -> Option<String> {
 #[derive(Clone)]
 pub struct Keys {
     given: Vec<String>,
+    /// This node's state directory: where its kept keys, floor and kept headers are.
+    state: PathBuf,
     kept: PathBuf,
     /// Where the floor is kept: see `floor`.
     floor: PathBuf,
@@ -457,15 +459,38 @@ pub(crate) fn keys_in(file: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// This node's keys for releases: the given ones, else kept, else the system's own.
+pub fn keys(given: Vec<String>, state: &Path) -> Keys {
+    Keys {
+        image: Some(PathBuf::from("/etc/kith/release-keys")),
+        ..Keys::new(given, state)
+    }
+}
+
 impl Keys {
     pub fn new(given: Vec<String>, state: &Path) -> Keys {
         let (kept, floor) = (state.join("os-release-keys"), state.join("os-release-floor"));
         Keys {
             given,
+            state: state.to_path_buf(),
             kept,
             floor,
             image: None,
         }
+    }
+
+    /// Check 3 of docs/adr-unlock.md for the system in `slot`, which runs the image `running`:
+    /// its header, as kept, is signed by a key this node takes releases from, is not under the
+    /// floor, and is the piece of the image that runs. Says which of those does not hold.
+    pub fn signed_system(&self, slot: char, running: &[u8]) -> Result<(), String> {
+        let (signature, public, block) = crate::os::kept_signed(&self.state, slot)?;
+        let (mine, _) = self.mine()?;
+        if !mine.iter().any(|key| key.eq_ignore_ascii_case(public.trim())) {
+            return Err("the system's release is signed by a key this node does not take releases from".into());
+        }
+        crate::os::signed(Some(&signature), Some(&public))(&block)?;
+        let version = crate::os::piece_of(&block, slot, running)?;
+        above(&self.floor, &version)
     }
 
     /// The keys this node takes releases from, and whose they are: `given`, `kept`,
@@ -533,6 +558,18 @@ impl Keys {
                 self.kept.display()
             )),
         }
+    }
+
+    /// Whether a TPM seal is made ahead for the system a release signed by `public` puts in
+    /// the other slot (docs/adr-unlock.md): only for a release signed by a key this node held
+    /// before it (given, kept, or its image's: not the first release's, which it takes on
+    /// trust, nor one a release hands over, which it holds only once it runs that release),
+    /// and never under `allowDowngrade` (`back`): a node that may go back is sealed for the
+    /// system it runs. (The floor is `above`'s, asked before anything is fetched.)
+    fn seals_ahead(&self, public: Option<&str>, back: bool) -> bool {
+        let Ok((mine, _)) = self.mine() else { return false };
+        let held = public.is_some_and(|public| mine.iter().any(|key| key.eq_ignore_ascii_case(public.trim())));
+        held && !back
     }
 
     /// Where keys a release hands over wait until this node runs that release.
@@ -797,6 +834,7 @@ async fn fetch(
     let (signature, public) = (text("signature"), text("publicKey"));
     above(&keys.floor, &wanted)?;
     let first = keys.refused(public.as_deref())?;
+    let ahead = keys.seals_ahead(public.as_deref(), back);
     let (kept, runs, keys, release) = (keys.kept.clone(), runs.to_string(), keys.clone(), release.clone());
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("the release's image, {url}: {e}"))?;
     let (host, addresses) = pinned(&parsed, lan).await?;
@@ -849,7 +887,11 @@ async fn fetch(
                         let keep = crate::pki::write_whole(&kept, keys.first_kept(public).as_bytes());
                         keep.map_err(|e| format!("keeping the release's key ({}): {e}", kept.display()))?;
                     }
-                    keys.pend(&release, version, header, &runs)
+                    keys.pend(&release, version, header, &runs)?;
+                    // (The header is kept for the slot it writes, with its signature: check 3 of
+                    // docs/adr-unlock.md reads it there.)
+                    let into = crate::os::other(slot);
+                    crate::os::keep_signed(&keys.state, into, signature.as_deref(), public.as_deref(), header)
                 }
                 version => Err(format!(
                     "the update at that address is kith OS {}",
@@ -857,7 +899,13 @@ async fn fetch(
                 )),
             }
         };
-        crate::os::into_other_slot(&mut Arriving(&mut pieces, Vec::new(), 0), slot, &running, vouched)
+        crate::os::into_slot(
+            &mut Arriving(&mut pieces, Vec::new(), 0),
+            slot,
+            &running,
+            vouched,
+            ahead,
+        )
     });
     let mut cut = None;
     loop {
@@ -878,8 +926,23 @@ async fn fetch(
     drop(send);
     let wrote = writer.await.map_err(|e| e.to_string())?;
     match (wrote, cut) {
-        (Ok(Some(version)), _) => Ok(version),
-        (Ok(None), _) => Err("that release is what this node runs already, under another version".into()),
+        (Ok((Some(version), boots)), _) => {
+            // (The update is in the other slot whatever comes of this: a key not sealed ahead
+            // is a node that asks the cluster for it at its next start, as before.)
+            match boots {
+                Some(Ok(boots)) => match crate::crypt::ahead(boots).await {
+                    Ok(Some(_)) => {
+                        eprintln!("kithd: update: the key of this node's state is sealed ahead for {version}")
+                    }
+                    Ok(None) => {}
+                    Err(why) => eprintln!("kithd: update: no key is sealed ahead for {version}: {why}"),
+                },
+                Some(Err(why)) => eprintln!("kithd: update: no key is sealed ahead for {version}: {why}"),
+                None => {}
+            }
+            Ok(version)
+        }
+        (Ok((None, _)), _) => Err("that release is what this node runs already, under another version".into()),
         (Err(_), Some(cut)) => Err(cut),
         (Err(e), None) => Err(e),
     }
@@ -893,10 +956,7 @@ pub async fn node(
     lan: bool,
     mut stopping: watch::Receiver<bool>,
 ) {
-    let keys = Keys {
-        image: Some(PathBuf::from("/etc/kith/release-keys")),
-        ..Keys::new(keys, &state)
-    };
+    let keys = crate::update::keys(keys, &state);
     if let Some(cluster) = &shared.cluster {
         let _ = MESH.set(crate::mesh::prefix(&cluster.me.ca));
     }
@@ -1041,6 +1101,48 @@ mod tests {
         dir
     }
 
+    /// Check 3 of docs/adr-unlock.md: the running system's header, kept for its slot, is signed
+    /// by a key this node takes releases from, is not under the floor, and vouches for the image
+    /// that runs. Each of those failing is a node that does not seal again.
+    #[test]
+    fn seals_again_the_running_system_is_signed_by_a_key_this_node_takes() {
+        let state = scratch("seals-again");
+        let (sign, public) = pair();
+        let running = b"the kernel image that runs".to_vec();
+        let sum = |bytes: &[u8]| crate::pki::hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+        let header = serde_json::json!({
+            "format": 1, "version": "9.9", "hash": "0".repeat(64),
+            "pieces": [
+                {"name": "root", "size": 0, "sha256": sum(&[])},
+                {"name": "verity", "size": 0, "sha256": sum(&[])},
+                {"name": "a", "size": 0, "sha256": sum(&[])},
+                {"name": "b", "size": running.len(), "sha256": sum(&running)},
+            ],
+        })
+        .to_string();
+        let mut block = header.into_bytes();
+        block.resize(4096, b' ');
+        let signature = sign(&block);
+        crate::os::keep_signed(&state, 'b', Some(&signature), Some(&public), &block).unwrap();
+        let keys = Keys::new(vec![public.clone()], &state);
+        assert_eq!(keys.signed_system('b', &running), Ok(()));
+        // A key this node does not take, or no key at all: refused.
+        let (_, stranger) = pair();
+        assert!(Keys::new(vec![stranger], &state).signed_system('b', &running).is_err());
+        assert!(Keys::new(Vec::new(), &state).signed_system('b', &running).is_err());
+        // An image that is not the piece the header names: refused.
+        assert!(keys.signed_system('b', b"another image").is_err());
+        // A signature that is not the header's: refused.
+        let (forge, _) = pair();
+        let forged = forge(&block);
+        crate::os::keep_signed(&state, 'b', Some(&forged), Some(&public), &block).unwrap();
+        assert!(keys.signed_system('b', &running).is_err());
+        // A floor above the header's version: refused.
+        crate::os::keep_signed(&state, 'b', Some(&signature), Some(&public), &block).unwrap();
+        crate::pki::write_whole(&keys.floor, b"10\n").unwrap();
+        assert!(keys.signed_system('b', &running).is_err());
+    }
+
     #[test]
     fn release_key_is_the_given_ones_or_the_first_kept() {
         let dir = scratch("given");
@@ -1065,6 +1167,38 @@ mod tests {
         let unread = Keys::new(Vec::new(), &dir.join("unread"));
         std::fs::create_dir_all(&unread.kept).unwrap();
         assert!(unread.refused(Some(theirs)).is_err());
+    }
+
+    #[test]
+    fn tpm_next_update_gate() {
+        let dir = scratch("tpm-next-gate");
+        // A key given, however cased: sealed ahead; another's, or none shown, not; nor under
+        // allowDowngrade.
+        let given = Keys::new(vec!["AA11".into()], &dir);
+        assert!(given.seals_ahead(Some("aa11"), false) && given.seals_ahead(Some(" AA11 "), false));
+        assert!(!given.seals_ahead(Some("aa11"), true));
+        assert!(!given.seals_ahead(Some("bb22"), false) && !given.seals_ahead(None, false));
+        // No key yet: the first release's is taken on trust, and nothing is sealed ahead for it.
+        let first = Keys::new(Vec::new(), &dir);
+        assert!(!first.seals_ahead(Some("aa11"), false));
+        // Once kept (a release it took signed it), it is held before the next one.
+        crate::pki::write_whole(&first.kept, b"aa11\n").unwrap();
+        assert!(first.seals_ahead(Some("aa11"), false) && !first.seals_ahead(Some("bb22"), false));
+        // The keys a release hands over are held only once it runs: they sign nothing sealed ahead.
+        crate::pki::write_whole(&first.next(), b"bb22\n").unwrap();
+        assert!(!first.seals_ahead(Some("bb22"), false));
+        // The key of the node's image: held before any release.
+        let image = dir.join("image-keys");
+        std::fs::write(&image, "cc33\n").unwrap();
+        let imaged = Keys {
+            image: Some(image),
+            ..Keys::new(Vec::new(), &dir.join("elsewhere"))
+        };
+        assert!(imaged.seals_ahead(Some("cc33"), false) && !imaged.seals_ahead(Some("aa11"), false));
+        // Keys that cannot be read: nothing is sealed.
+        let unread = Keys::new(Vec::new(), &dir.join("unread"));
+        std::fs::create_dir_all(&unread.kept).unwrap();
+        assert!(!unread.seals_ahead(Some("aa11"), false));
     }
 
     #[tokio::test]

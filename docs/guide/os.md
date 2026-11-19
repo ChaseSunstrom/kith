@@ -465,6 +465,23 @@ made longer since, it and its file system grow to the end of the disk (`the stat
 ends where its disk does: 228936 MB`). `kith.grow=off` keeps the disk as it is, with room for
 almost nothing: a large image's first pull fails with `No space left`.
 
+### As a guest on Proxmox VE
+
+Tried in QEMU with the settings Proxmox gives a VM, not on Proxmox itself. Make a VM with:
+
+- **BIOS: OVMF (UEFI)**, and untick **Pre-Enroll keys** on its EFI disk: the boot file is not
+  signed for Secure Boot, so a firmware that enrolled Microsoft's keys refuses it.
+- **Disks:** the installer image (`kith-os-installer.raw`, imported with `qm importdisk`) as
+  the first disk, and a second disk for the node, 8 GB or more. The installer never lists the disk
+  it started from, so the second is the one to name. Its bus can be VirtIO Block, SCSI (VirtIO
+  SCSI) or SATA; the serial Proxmox gives each disk works with `serial:`. Detach the installer
+  disk after it powers off.
+- **CPU: `host`**, as `ci/vm.sh` runs it. A VM with the default `kvm64` has not been tried.
+- **Network:** a VirtIO NIC.
+
+The node grows its state partition to the end of the second disk at its first start, and again
+after you make the disk longer in Proxmox (`qm resize`) and restart the VM.
+
 ### Installing from the network
 
 A node installs the machines beside it: told their network cards' addresses, it answers those

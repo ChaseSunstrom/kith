@@ -34,7 +34,7 @@
             -machine q35 -bios "$firmware" -drive "file=$work/disk.raw,format=raw,if=virtio" \
             -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:7443" -device virtio-net-pci,netdev=n0 \
             -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=$more" "$@" \
-            -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" </dev/null >/dev/null 2>&1 &
+            -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" </dev/null >/dev/null 2>&1 8>&- &
         vm=$!
     }
     heard() { # TEXT: wait for the guest to say it

@@ -11,6 +11,9 @@
 //!                              PASSWORD says, writing nowhere (its root may take no file)
 //!   pod ask HOST PORT [...]    ask each 40 times, and say each different answer's first
 //!                              and last line once, to /dev/stdout opened by that name
+//!   pod once HOST PORT [...]   knock each once (two seconds): say "HOST:PORT answered: FIRST
+//!                              LAST" (then one request's first and last line), "refused" (a
+//!                              reset), or "silent" (nothing back), one line each
 //!   pod seen DIR [SOCKET]      for as long as it runs, say the names in DIR each time they
 //!                              change: those it can open with a `+`, the others with a `-`;
 //!                              and answer whoever connects to SOCKET (a path) with a line
@@ -581,6 +584,27 @@ fn main() {
                 let _ = stream.write_all(said.as_bytes());
             }
         }
+        // HOST PORT SECONDS: asks it ten times a second for that long and says how many
+        // answers came, how many failed (the first, with why) and what the rest said: a
+        // rolling update's check that something always answered.
+        ["hammer", host, port, seconds] => {
+            let until = std::time::Instant::now() + Duration::from_secs(seconds.parse().expect("seconds"));
+            let (mut asked_n, mut failed, mut heard) = (0, Vec::new(), std::collections::BTreeSet::new());
+            while std::time::Instant::now() < until {
+                asked_n += 1;
+                match asked(host, port) {
+                    Ok(said) if said.starts_with("HTTP/1.0 200") => drop(heard.insert(said)),
+                    Ok(said) => failed.push(format!("said {said:?}")),
+                    Err(e) => failed.push(e.to_string()),
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            println!(
+                "hammer: {asked_n} asked, {} failed ({}), heard {heard:?}",
+                failed.len(),
+                failed.first().map_or("none", String::as_str)
+            );
+        }
         ["ask", pairs @ ..] if !pairs.is_empty() && pairs.len() % 2 == 0 => {
             let mut heard = std::collections::BTreeSet::new();
             for pair in pairs.chunks(2) {
@@ -593,6 +617,28 @@ fn main() {
             let mut out = out.expect("/dev/stdout, by its name");
             for line in heard {
                 writeln!(out, "{line}").expect("a line out");
+            }
+        }
+        // Once each, two seconds at most (knocked): the egress cases, where a denied packet
+        // hangs and asking forty times would take minutes.
+        ["once", pairs @ ..] if !pairs.is_empty() && pairs.len() % 2 == 0 => {
+            let out = std::fs::OpenOptions::new().write(true).open("/dev/stdout");
+            let mut out = out.expect("/dev/stdout, by its name");
+            for pair in pairs.chunks(2) {
+                let resolved = std::net::ToSocketAddrs::to_socket_addrs(&(pair[0], pair[1].parse::<u16>().expect("a port")))
+                    .ok()
+                    .and_then(|mut found| found.next());
+                let said = match resolved {
+                    None => "unresolved".to_string(),
+                    Some(addr) => match knocked(addr) {
+                        "answered" => match asked(pair[0], pair[1]) {
+                            Ok(first_last) => format!("answered: {first_last}"),
+                            Err(e) => format!("answered, then failed: {e}"),
+                        },
+                        state => state.to_string(),
+                    },
+                };
+                writeln!(out, "{}:{} {said}", pair[0], pair[1]).expect("a line out");
             }
         }
         // NAME...: the addresses this container's resolver gives each (what /etc/resolv.conf
