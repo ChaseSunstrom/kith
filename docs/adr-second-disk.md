@@ -163,7 +163,9 @@ a node with no cluster, and if it does not, says in the verb's answer that it ca
    fails it), and **its first 4 KiB must be zero**, with no GPT or MBR signature, ext4 or LUKS
    magic, nor a kith header. A disk that is not empty is refused unless the same request says
    `--wipe`, which is then logged as such in the audit log (as the passphrase's audit entry is,
-   without the secret) with the serial.
+   without the secret) with the serial. Only those 4 KiB are read, so a signature past them
+   passes as empty (md 1.2 and bcachefs at 4 KiB, btrfs at 64 KiB, ZFS labels, a GPT whose only
+   copy is the backup at the end); the overwrite through the mapping at add is what destroys it.
 3. A state that is not encrypted refuses.
 4. **Written in this order, each step surviving a cut**: the entry `disks/<id>/entry` is written
    `pending` and `disks/<id>/key` made and synced (the key is made and kept before anything uses
