@@ -271,7 +271,8 @@ fn decide(store: &Store, seen: Seen, grace: Duration, drain: Option<&str>) -> (V
         // What of it a node's policy may refuse: it goes where all of that is allowed. (Not
         // its claimed Devices or its Volumes: those are on one node, which says so itself.)
         let template = crate::controller::template_of(resource).ok();
-        let needs = template.map(|(template, _)| crate::policy::needs(&template, false));
+        let needs =
+            template.map(|(template, _)| crate::policy::needs(&template, false, resource.kind == "NodeWorkload"));
         let needs = needs.unwrap_or_default();
         if !needs.is_empty() {
             let (require, prefer) = Default::default();

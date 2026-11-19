@@ -212,7 +212,7 @@ fn unconfined(resource: &Resource) -> bool {
             .map(|(template, _)| template),
         _ => None,
     };
-    template.is_some_and(|template| crate::policy::needs(&template, false).contains(&"unconfined"))
+    template.is_some_and(|template| crate::policy::needs(&template, false, false).contains(&"unconfined"))
 }
 
 /// What resources known by kind and namespace alone reach into besides themselves.
@@ -1214,6 +1214,14 @@ spec: {size: 1Gi}
             assert!(
                 takes_of(&allowing).contains(&unconfined),
                 "{kind} with an allow-list takes Unconfined"
+            );
+            assert!(
+                takes_of(&of(kind, ", userNamespaces: true")).contains(&unconfined),
+                "{kind} with userNamespaces takes Unconfined: it lets the refused calls back"
+            );
+            assert!(
+                !takes_of(&of(kind, ", userNamespaces: false")).contains(&unconfined),
+                "{kind} with userNamespaces off takes nothing"
             );
             assert!(
                 !takes_of(&of(kind, "")).contains(&unconfined),

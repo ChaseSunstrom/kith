@@ -171,12 +171,12 @@
     <legend class="lab">What the cluster may have this node do as its root</legend>
     <div class="choices">
       <label class="choice"><input type="radio" name="policyKind" value="all" checked><i class="stop"></i><span class="say">Everything <small>Leave it out, as before.</small></span></label>
-      <label class="choice"><input type="radio" name="policyKind" value="hardened"><i class="stop"></i><span class="say">Hardened <small><code>hardened</code>: none of it, and a GPU the only device handed out.</small></span></label>
+      <label class="choice"><input type="radio" name="policyKind" value="hardened"><i class="stop"></i><span class="say">Hardened <small><code>hardened</code>: none of it, and a GPU the only device handed out. Also no NodeWorkloads (DaemonSets): add <code>host-users</code> to run them.</small></span></label>
       <label class="choice"><input type="radio" name="policyKind" value="custom"><i class="stop"></i><span class="say">Its own words <small>Words with commas between, read left to right.</small></span></label>
       <div class="branch" data-when="policyKind=custom"><div>
         <div class="field"><label class="lab" for="policyWords">The words</label><input type="text" id="policyWords" name="policyWords" placeholder="hardened,vms" maxlength="300" spellcheck="false" autocapitalize="none">
           <details class="words"><summary>Which words</summary>
-            <p><code>hardened</code> turns every one off. <code>no-KEY</code> turns one off, and <code>KEY</code> turns it on again. <code>devices=gpu+input</code> names the classes of device a claim may hand out (<code>devices=all</code>, or <code>devices=</code> for none).</p>
+            <p><code>hardened</code> turns every one off, so no NodeWorkloads (DaemonSets) run: <code>hardened,host-users</code> keeps them. <code>no-KEY</code> turns one off, and <code>KEY</code> turns it on again. <code>devices=gpu+input</code> names the classes of device a claim may hand out (<code>devices=all</code>, or <code>devices=</code> for none).</p>
             <p>The keys: <code>exec-units</code>, <code>root-containers</code>, <code>unconfined</code>, <code>node-network</code>, <code>vms</code>, <code>vm-paths</code>, <code>passthrough</code>, <code>host-paths</code>, <code>run</code>, <code>wipe</code>. The classes: <code>gpu</code>, <code>display</code>, <code>input</code>, <code>audio</code>, <code>usb</code>, <code>camera</code>, <code>other</code>. <a href="guide/access.html#what-a-node-refuses-whatever-the-cluster-says">What a node refuses</a>.</p>
           </details>
         </div>

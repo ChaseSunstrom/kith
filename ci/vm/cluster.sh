@@ -167,8 +167,7 @@
         public2=$("$root/target/debug/kith" package keygen "$work/key2")
         handed() { sh "$root/os/update.sh" --handover "$work/$1" "$work/www/next.update" "$public2"; } # KEYFILE
         by=$public more='' allow=''
-        (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
-        web=$!
+        web_up "$work/www" $((port + 9)) || fail "the web server on port $((port + 9)) did not start"
         # (The nodes' port 80 is this server: only where it runs, as a guest with no listener there cannot start.)
         # (cmd: each guest connection gets its own socat to that port.)
         guest=",guestfwd=tcp:10.0.2.100:80-cmd:socat - TCP:127.0.0.1:$((port + 9))"

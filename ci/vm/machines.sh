@@ -102,10 +102,11 @@
         hears alpha 'kithd: node alpha serving other nodes on 0.0.0.0:7443'
         hears alpha 'sends this token to /v1/claim does: kith1.'
         token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/alpha.log")
-        tries=0
+        # (Its first listen is as slow as the host is loaded, so the claim waits for as long as the
+        # test's time, as hears() does; a count of tries would give about ten seconds on a busy host.)
+        end=$(($(date +%s) + time))
         until claimed=$(curl -sfk --max-time 10 -H 'Content-Type: application/json' -d "{\"token\":\"${token##* }\",\"name\":\"root\"}" "https://127.0.0.1:$((port + 1))/v1/claim"); do
-            tries=$((tries + 1))
-            [ "$tries" -lt 50 ] || fail "the installed node's cluster could not be claimed"
+            [ "$(date +%s)" -lt "$end" ] || fail "the installed node's cluster could not be claimed"
             sleep 0.2
         done
         field() { python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]], end="")' "$1"; }
@@ -125,8 +126,7 @@
         printf 'disk: serial:kith-beta\nhostname: beta\n' >"$work/www/beta.yaml"
         # (Over plain http the answers are taken only with their hash pinned in the URL.)
         pin=$(sha256sum "$work/www/beta.yaml" | cut -d' ' -f1)
-        (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
-        web=$!
+        web_up "$work/www" $((port + 9)) || fail "the web server on port $((port + 9)) did not start"
         stick beta
         blank beta
         blank spare

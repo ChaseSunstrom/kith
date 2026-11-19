@@ -7,17 +7,9 @@
             # at 10.0.2.2, and only from an address their card out has (a pod's own is not
             # one the network out there knows).
             mkdir "$work/www"
-            (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>"$work/web.err" &
-            web=$!
             # (A port something else holds kills this server at once, and the Jobs that ask it then hear
-            # nothing: so it is said here, with the server's own error, until it answers.)
-            waited=0
-            until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$((port + 9))/"; do
-                kill -0 "$web" 2>/dev/null || fail "the web server on port $((port + 9)) is not running: $(cat "$work/web.err")"
-                waited=$((waited + 1))
-                [ "$waited" -lt 20 ] || fail "the web server on port $((port + 9)) did not answer: $(cat "$work/web.err")"
-                sleep 1
-            done
+            # nothing: web_up says that with the server's own error, and waits until it answers.)
+            web_up "$work/www" $((port + 9)) || fail "the web server on port $((port + 9)) did not start"
             # NAME and the rest of its one container: three pods of it on the two nodes, so
             # two of them on one, each listening on port 80, and a Service of that name.
             three() {
