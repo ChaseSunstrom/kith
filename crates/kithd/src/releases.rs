@@ -294,7 +294,7 @@ fn package<'a>(
     if let Some(pin) = pin {
         return kept
             .filter(fitting)
-            .ok_or(format!("there is no Package {name} {pin}, the version this spec installed before"));
+            .ok_or(format!("there is no Package {name} {pin}, the version this spec installed before: push it again, or change the spec to follow the newest"));
     }
     let newest = || {
         let packages = store.list(Some("Package")).filter(fitting);
@@ -813,8 +813,12 @@ fn pinned(store: &Store, release: &Resource) -> Option<String> {
     let mut earlier = revisions.skip_while(|revision| revision.resource.spec == release.spec);
     earlier.find(|revision| revision.resource.spec == release.spec).and_then(|revision| {
         let at = revision.resource.metadata.revision?;
-        let entry = seen.iter().rev().find(|entry| entry["revision"].as_u64().is_some_and(|r| r <= at))?;
-        entry["version"].as_str().map(str::to_string)
+        let entry = seen.iter().rev().find(|entry| entry["revision"].as_u64().is_some_and(|r| r <= at));
+        // (Installing the oldest entry's version drops it from the ten: the pin it made, said in
+        // the status, is the version then.)
+        let status = release.status.as_ref()?;
+        let held = (status["pinned"] == true).then(|| &status["version"]);
+        entry.map(|entry| &entry["version"]).or(held)?.as_str().map(str::to_string)
     })
 }
 
@@ -919,7 +923,11 @@ fn plan(store: &Store, renders: &Renders, upgrades: &Renders, newer: &Newer, now
                 status
             }
             // (What was installed before stays as it is.)
-            Err(e) => failed(&e, release.metadata.revision),
+            // (And whether it is pinned: a patch merges, so it would else keep the last pass's.)
+            Err(e) => json!({
+                "state": "error", "message": e, "observedRevision": release.metadata.revision,
+                "pinned": pinned(store, release).is_some(),
+            }),
         };
         let Value::Object(status) = status else {
             unreachable!("an object")
@@ -1784,9 +1792,101 @@ mod tests {
         settled(&mut store);
         let status = status_of(&store);
         assert_eq!(status["state"], "error");
-        assert!(status["message"].as_str().unwrap().contains("no Package maps 1.0.0"));
+        let message = status["message"].as_str().unwrap();
+        assert!(message.contains("no Package maps 1.0.0") && message.contains("push it again"), "{message}");
+        // (Said in the error too: a patch merges, so it would else keep the last pass's.)
+        assert_eq!(status["pinned"], true);
         assert!(store.get("ConfigMap/shop/mine-maps-extra").is_some());
         assert!(store.get("ConfigMap/shop/mine-maps").is_some());
+    }
+
+    /// A rollback to the oldest version the history remembers stays: installing it pushes the
+    /// eleventh entry and drops the one the pin was read from.
+    #[test]
+    fn a_rollback_to_the_oldest_remembered_version_stays() {
+        let (mut store, mut renders, mut upgrades) = (Store::default(), Renders::new(), Renders::new());
+        let mut at = 100;
+        let mut settled = |store: &mut Store| {
+            at += 100;
+            settle_at(store, &mut renders, &mut upgrades, at);
+            assert_eq!(settle_at(store, &mut renders, &mut upgrades, at + 1), 0);
+        };
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, RELEASE);
+        settled(&mut store);
+        let first = store.get(SELF).unwrap().metadata.revision.unwrap();
+        apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: blue"));
+        for major in 2..=10 {
+            store.apply(package(&format!("{major}.0.0"), &[("map.yaml", MAP)])).unwrap();
+            settled(&mut store);
+        }
+        assert_eq!(status_of(&store)["history"].as_array().unwrap().len(), 10);
+        store.rollback(SELF, first).unwrap();
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
+        assert_eq!(status_of(&store)["pinned"], true);
+        // (Still, with the entry it came from gone, and after one more pass.)
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
+        assert_eq!(status_of(&store)["history"].as_array().unwrap().len(), 10);
+    }
+
+    /// An edit back to an earlier spec pins like a rollback, whatever it was made by: the
+    /// toggle of `autoUpgrade` off and on again does; a change to the metadata alone is not
+    /// one; and a Release that does not follow is never pinned.
+    #[test]
+    fn an_edit_back_to_an_earlier_spec_pins_and_a_new_field_follows() {
+        let (mut store, mut renders, mut upgrades) = (Store::default(), Renders::new(), Renders::new());
+        let mut at = 100;
+        let mut settled = |store: &mut Store| {
+            at += 100;
+            settle_at(store, &mut renders, &mut upgrades, at);
+            assert_eq!(settle_at(store, &mut renders, &mut upgrades, at + 1), 0);
+        };
+        let version = |store: &Store| status_of(store)["version"].clone();
+        let pinned = |store: &Store| status_of(store)["pinned"].clone();
+        let push = |store: &mut Store, version: &str| store.apply(package(version, &[("map.yaml", MAP)])).unwrap();
+        push(&mut store, "1.0.0");
+        apply(&mut store, RELEASE);
+        settled(&mut store);
+        push(&mut store, "2.0.0");
+        settled(&mut store);
+        // A freeze (autoUpgrade off) stays; on again it is the first spec: pinned, not following.
+        apply(&mut store, &RELEASE.replace("autoUpgrade: true", "autoUpgrade: false"));
+        push(&mut store, "3.0.0");
+        settled(&mut store);
+        assert_eq!((version(&store), pinned(&store)), (json!("2.0.0"), json!(false)));
+        apply(&mut store, RELEASE);
+        push(&mut store, "4.0.0");
+        settled(&mut store);
+        assert_eq!((version(&store), pinned(&store)), (json!("2.0.0"), json!(true)));
+        // Any field that is new follows again.
+        apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: blue"));
+        settled(&mut store);
+        assert_eq!((version(&store), pinned(&store)), (json!("4.0.0"), json!(false)));
+        // A change to the annotations alone is not a return to anything.
+        let noted = RELEASE.replace("extra: true", "extra: true, colour: blue");
+        apply(&mut store, &noted.replace("'local socket' }", "'local socket', note: x }"));
+        push(&mut store, "5.0.0");
+        settled(&mut store);
+        assert_eq!((version(&store), pinned(&store)), (json!("5.0.0"), json!(false)));
+    }
+
+    #[test]
+    fn a_release_that_stays_is_never_pinned() {
+        let (mut store, mut renders, mut upgrades) = (Store::default(), Renders::new(), Renders::new());
+        let stays = RELEASE.replace("autoUpgrade: true", "autoUpgrade: false");
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, &stays);
+        settle_at(&mut store, &mut renders, &mut upgrades, 10);
+        let first = store.get(SELF).unwrap().metadata.revision.unwrap();
+        apply(&mut store, &stays.replace("extra: true", "extra: false"));
+        settle_at(&mut store, &mut renders, &mut upgrades, 20);
+        store.apply(package("2.0.0", &[("map.yaml", MAP)])).unwrap();
+        store.rollback(SELF, first).unwrap();
+        settle_at(&mut store, &mut renders, &mut upgrades, 30);
+        assert_eq!(status_of(&store)["pinned"], false);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
     }
 
     /// `status.history` has one entry per version installed (newest last, the last ten), so
