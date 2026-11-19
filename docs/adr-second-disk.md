@@ -1,6 +1,6 @@
 # A second disk for a node's data, under the state's key
 
-Status: design, nothing built (T-0863). It decides how a disk other than the one kith OS runs
+Status: built in part: the core on files (T-0957), the real mapping, the seed made with `resize=` and grown at the mount, and the task that mounts the known disks after `STATE_OPEN` (T-0972, with `ci/vm.sh --test disk` on disk files, which uses a build with the cargo feature `disk-test`: the verbs `add`, `remove` and `list` are T-0958's other half and not built). It decides how a disk other than the one kith OS runs
 from holds data, encrypted, and how it is opened, with what kithd does to a disk it does not
 know. Where the code differs from a line here, the code is the word. It builds on
 [adr-unlock.md](adr-unlock.md), which settled how a node's state is opened, and on the ways of

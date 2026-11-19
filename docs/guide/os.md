@@ -116,6 +116,7 @@ card the catalogue does not list yet) is chosen by hand, as above.
 KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
 KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
 sh ci/vm.sh --test modules   # the same image: drivers load at start, on a device added, and a bad signature is refused
+sh ci/vm.sh --test disk      # a disk file made a data disk (a build with the feature disk-test) and mounted; another file left alone, unchanged
 ```
 
 For a node whose hardware is not known when the image is built, `features: [all]` turns on

@@ -1001,6 +1001,10 @@ pub async fn node(
         let mut said = report(&state, &version, slot, keys.whose());
         said["storage"] = json!(storage);
         said["wants"] = json!(wants);
+        // The data disks it looked at at the start (none before it has, and on a node that is not init).
+        if let Some(disks) = crate::data_disk::boot::said() {
+            said["disks"] = disks;
+        }
         // What the store has of this node, and a plan that says it is this node's turn.
         let (known, turn, named, back) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
