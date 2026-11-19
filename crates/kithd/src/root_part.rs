@@ -154,11 +154,9 @@ pub enum Request {
     /// `volumes::host_dir` does): the one a unit mounts, a backup, a replica or a download reads.
     Volume { volume: Place },
     /// The directory of the Volume to be written into, as for `Volume`: an upload's, a replica's
-    /// copy. The files made take `owner` (none: the Volume directory's own, as unpacking derives
-    /// it); one that is not 0 is refused where the node's policy has `hostUsers` off.
-    Open { volume: Place, owner: Option<u32> },
-    /// The directory of the Volume a backup is restored into, as for `Open`, with the files' owner
-    /// the Volume directory's own.
+    /// copy. The files made take the Volume directory's own owner, as unpacking derives it.
+    Open { volume: Place },
+    /// The directory of the Volume a backup is restored into, as for `Open`.
     Restore { volume: Place },
     /// The data of the Volume `namespace`/`name` removed: `<state>/volumes/<namespace>/<name>`
     /// and nothing beside it (`volumes::wipe`).
@@ -301,7 +299,7 @@ pub fn check(request: &Request) -> Result<(), String> {
         Request::Usage { pod } => label("pod id", pod),
         // (The place is of this node's state directory, the root part's own: the form of the names
         // and the path only here, and where it may be, in `act`, under the node's policy.)
-        Request::Volume { volume } | Request::Open { volume, .. } | Request::Restore { volume } => {
+        Request::Volume { volume } | Request::Open { volume } | Request::Restore { volume } => {
             names(&volume.namespace, &volume.name)?;
             crate::volumes::check_path(&volume.namespace, &volume.path)
         }
@@ -1421,7 +1419,7 @@ impl<H: Hands> Direct<'_, H> {
     /// of `kith-system` says one, only where the policy has `hostPaths`).
     fn volumes_request(&self, request: Request) -> Result<Reply, String> {
         let state = self.book.state().ok_or("this root part has no state directory")?;
-        let (volume, owner) = match request {
+        let volume = match request {
             Request::VolumeGone { namespace, name } => {
                 let dir = Dir {
                     namespace,
@@ -1432,18 +1430,9 @@ impl<H: Hands> Direct<'_, H> {
                 };
                 return crate::volumes::wipe(&state, &dir).map(|()| Reply::Done);
             }
-            Request::Volume { volume } | Request::Restore { volume } => (volume, None),
-            Request::Open { volume, owner } => (volume, owner),
+            Request::Volume { volume } | Request::Open { volume } | Request::Restore { volume } => volume,
             _ => return Err("not a request of the volumes".into()),
         };
-        // (The files an unpack makes are owned by the one that owns the directory it is into, which
-        // is the owner of the Volume as the node made it; any other is for the policy to allow.)
-        let policy = self.policy();
-        if owner.is_some_and(|uid| uid != 0) {
-            if let Some(why) = policy.refusal("hostUsers") {
-                return Err(why);
-            }
-        }
         let dir = Dir {
             namespace: volume.namespace,
             name: volume.name,
@@ -1451,7 +1440,7 @@ impl<H: Hands> Direct<'_, H> {
             node: String::new(),
             encrypted: volume.encrypted,
         };
-        crate::volumes::host_dir_under(&state, &dir, &policy).map(Reply::Path)
+        crate::volumes::host_dir_under(&state, &dir, &self.policy()).map(Reply::Path)
     }
 
     fn act(&self, request: Request, files: Vec<File>) -> Result<Reply, String> {
@@ -1475,6 +1464,12 @@ impl<H: Hands> Direct<'_, H> {
             Request::VolumeGone { .. } => Kind::VolumeGone,
             Request::Run { .. } => Kind::Run,
         });
+        // (Where run is off that is what is said, not the shape of what was asked.)
+        if matches!(request, Request::Run { .. }) {
+            if let Some(why) = self.policy().refusal("run") {
+                return Err(why);
+            }
+        }
         check(&request)?;
         if !files.is_empty() && !matches!(request, Request::Unpack { .. }) {
             return Err("only an unpack comes with files".into());
@@ -1499,10 +1494,7 @@ impl<H: Hands> Direct<'_, H> {
             | Request::Restore { .. }
             | Request::VolumeGone { .. }) => self.volumes_request(volumes),
             // (The program is the serving part's to start: it holds the connection it is joined to.)
-            Request::Run { .. } => match self.policy().refusal("run") {
-                Some(why) => Err(why),
-                None => Ok(Reply::Done),
-            },
+            Request::Run { .. } => Ok(Reply::Done),
             mesh @ (Request::MeshUp { .. }
             | Request::Mesh { .. }
             | Request::MeshSeen { .. }
@@ -1594,10 +1586,7 @@ pub fn volume(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
 pub fn open(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
     path_of(
         state,
-        Request::Open {
-            volume: Place::of(dir),
-            owner: None,
-        },
+        Request::Open { volume: Place::of(dir) },
     )
 }
 
@@ -3699,10 +3688,7 @@ mod tests {
     fn volume_asks(place: Place) -> [Request; 3] {
         [
             Request::Volume { volume: place.clone() },
-            Request::Open {
-                volume: place.clone(),
-                owner: None,
-            },
+            Request::Open { volume: place.clone() },
             Request::Restore { volume: place },
         ]
     }
@@ -3774,22 +3760,29 @@ mod tests {
     }
 
     #[test]
-    fn an_open_of_an_owner_that_is_not_0_is_refused_unless_the_policy_allows() {
-        let (book, _) = book("volume-owner");
-        let at = |words: &str, owner: Option<u32>| {
-            Direct::with(Nobody, &book)
-                .under(policy(words))
-                .request(Request::Open {
-                    volume: place("shop", "owned", "data"),
-                    owner,
-                })
-        };
-        let why = at("hardened", Some(1000)).unwrap_err();
-        assert!(why.contains("hostUsers"), "{why}");
-        // The node's own owner of the directory, and none said, are not another owner.
-        assert!(at("hardened", Some(0)).is_ok());
-        assert!(at("hardened", None).is_ok());
-        assert!(at("hardened,host-users", Some(1000)).is_ok());
+    fn a_node_path_that_climbs_is_refused_even_where_the_policy_has_host_paths() {
+        let (book, _) = book("volume-climb");
+        let outside = std::env::temp_dir().join(format!("kith-root-part-climb-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let root = Direct::with(Nobody, &book).under(policy("hardened,host-paths"));
+        let at = outside.to_str().unwrap();
+        for path in [
+            "/a/../../etc".to_string(),
+            format!("{at}/../escaped"),
+            format!("{at}/./x"),
+            format!("{at}//x"),
+            format!("{at}/"),
+        ] {
+            for ask in volume_asks(place("kith-system", "data", &path)) {
+                assert!(root.request(ask).is_err(), "{path}");
+            }
+        }
+        // Nothing was made beside the directory, and one that does not climb is.
+        assert!(!outside.join("../escaped").exists());
+        assert!(!outside.join("x").exists());
+        let ask = Request::Volume { volume: place("kith-system", "data", &format!("{at}/own")) };
+        assert!(matches!(root.request(ask), Ok(Reply::Path(_))));
+        std::fs::remove_dir_all(&outside).unwrap();
     }
 
     #[test]
@@ -3840,16 +3833,17 @@ mod tests {
         assert!(run("hardened,run", "waypipe", &[wide.as_str()]).is_err());
         // Each, refused or not, was one crossing.
         assert_eq!(book.crossed(Kind::Run), 7);
+        // Where it is off, the policy is what is said, not the shape of the request.
+        let why = run("hardened", "", &[]).unwrap_err();
+        assert!(!why.starts_with("run: a program"), "{why}");
+        assert_eq!(why, run("hardened", "waypipe", &["firefox"]).unwrap_err());
     }
 
     #[test]
     fn the_volumes_and_run_requests_are_on_the_wire() {
         for request in [
             Request::Volume { volume: place("shop", "data", "x") },
-            Request::Open {
-                volume: place("shop", "data", "x"),
-                owner: Some(1000),
-            },
+            Request::Open { volume: place("shop", "data", "x") },
             Request::Restore { volume: place("shop", "data", "x") },
             Request::VolumeGone {
                 namespace: "shop".into(),
