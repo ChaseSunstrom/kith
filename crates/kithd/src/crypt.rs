@@ -967,20 +967,22 @@ fn system_vouched(keys: &crate::update::Keys) -> Result<(), String> {
     let log = measurements()?;
     let mut tpm = crate::tpm::open()?;
     let (read4, read9) = (tpm.read(4)?, tpm.read(9)?);
-    let predicted = crate::predict::predict_pcrs(&log, &read4, &read9, &running, &running)?;
-    vouched(predicted, (read4, read9), || keys.signed_system(slot, &running))
+    // (predict_pcrs refuses unless the running image is in the log once in PCR 4 and once in PCR 9.)
+    crate::predict::predict_pcrs(&log, &read4, &read9, &running, &running)?;
+    let events = crate::predict::parse_log(&log)?;
+    vouched(&events, &[(4, read4), (9, read9)], || {
+        keys.signed_system(slot, &running)
+    })
 }
 
-/// [`system_vouched`]'s decision on values: the PCRs predicted are the ones read, and
-/// `signed` (the release header, and the piece of it that runs) vouches for the system.
+/// [`system_vouched`]'s decision on values: the log explains PCRs 4 and 9 as read, and `signed`
+/// (the release header, and the piece of it that runs) vouches for the system.
 fn vouched(
-    predicted: ([u8; 32], [u8; 32]),
-    read: ([u8; 32], [u8; 32]),
+    events: &[crate::predict::Event],
+    read: &[(u32, [u8; 32])],
     signed: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    if predicted != read {
-        return Err("the TPM's PCR 4 and 9 are not the ones this system's boot predicts".into());
-    }
+    crate::predict::explains(events, read)?;
     signed()
 }
 
@@ -1097,6 +1099,30 @@ fn adopt(record: &mut Record, left: Record) {
 /// What a `tpm-parent:` line that cannot be read is: present, so the seal beside it is not
 /// opened without the check it stands for.
 const UNREAD: &str = "the lock record's tpm-parent: line cannot be read, so its TPM seal is not opened (kith node seal NAME --off, then kith node seal NAME, makes a new one)";
+
+/// NodeKey's status of a node's key: sealed when the seal fits this system (`fits`: it opened
+/// this start, or was made again), else why the last try refused, when a seal is wanted; and
+/// the secrets the node holds.
+fn sealed_status(record: &Record, fits: bool, unsealed: Option<&(Instant, String)>, seal: bool) -> Value {
+    let sealed = fits && (record.tpm.is_some() || record.pin.is_some());
+    let mut status = match unsealed.filter(|_| seal && !sealed) {
+        Some((_, why)) => json!({ "sealed": false, "message": why }),
+        None => json!({ "sealed": sealed }),
+    };
+    for (name, set) in [
+        ("passphrase", record.pass.is_some()),
+        // (Not while a plain seal is beside it: that opens with no PIN.)
+        ("pin", record.pin.is_some() && record.tpm.is_none()),
+        ("recoverySeen", record.seen),
+        ("duress", record.duress.is_some()),
+        ("duressAll", record.duress_all.is_some()),
+    ] {
+        if set {
+            status[name] = true.into();
+        }
+    }
+    status
+}
 
 /// Whether a seal may be made again now (docs/adr-unlock.md): the NodeKey says `seal`, a
 /// cluster handed this node's key out this start, and `system` vouches for the running
@@ -1541,7 +1567,7 @@ pub async fn keep(
     // and stays open.)
     let mut was_locked = (!matches!(by, By::Owner | By::Recovery)).then_some(false);
     // Whether the record's seal is one this system opens, and why none could be made.
-    let (mut fits, mut unsealed) = (by == By::Tpm, None::<(Instant, String)>);
+    let (mut fits, mut unsealed) = (matches!(by, By::Tpm | By::Pin), None::<(Instant, String)>);
     let (chosen, mut chosen_here) = tokio::sync::mpsc::channel::<Chosen>(1);
     let _ = CHOSEN.set(chosen);
     let mut shut = false;
@@ -1752,23 +1778,7 @@ pub async fn keep(
                         }
                     }
                 }
-                let sealed = record.tpm.is_some() || (record.pin.is_some() && fits);
-                let mut status = match unsealed.as_ref().filter(|_| seal && !sealed) {
-                    Some((_, why)) => json!({ "sealed": false, "message": why }),
-                    None => json!({ "sealed": sealed }),
-                };
-                for (name, set) in [
-                    ("passphrase", record.pass.is_some()),
-                    // (Not while a plain seal is beside it: that opens with no PIN.)
-                    ("pin", record.pin.is_some() && record.tpm.is_none()),
-                    ("recoverySeen", record.seen),
-                    ("duress", record.duress.is_some()),
-                    ("duressAll", record.duress_all.is_some()),
-                ] {
-                    if set {
-                        status[name] = true.into();
-                    }
-                }
+                let status = sealed_status(&record, fits, unsealed.as_ref(), seal);
                 if said.flatten() != Some(status.clone()) {
                     let statuses = vec![(me.clone(), Some(status))];
                     if let Err(e) = shared.submit(Command::Status { statuses }).await {
@@ -2737,25 +2747,54 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// Check 3 on values: the system is vouched only when PCR 4 and 9 are the ones its boot
-    /// predicts, and then the signed check (the header and its piece) decides. A PCR that
-    /// differs refuses before the signed check is asked; a refusal by the check is the refusal.
+    /// Check 3 on values: the log must explain PCRs 4 and 9 as read (`explains`), and only then
+    /// does the signed check (the header and its piece) decide. A log that does not explain them
+    /// refuses before the signed check is asked; a refusal by the check is the refusal.
     #[test]
-    fn seals_again_vouched_refuses_a_pcr_the_boot_does_not_predict() {
-        let (four, nine, other) = ([4; 32], [9; 32], [1; 32]);
-        assert_eq!(vouched((four, nine), (four, nine), || Ok(())), Ok(()));
-        assert!(
-            vouched((four, nine), (other, nine), || panic!("asked"))
-                .unwrap_err()
-                .contains("PCR 4 and 9")
-        );
-        assert!(
-            vouched((four, nine), (four, other), || panic!("asked"))
-                .unwrap_err()
-                .contains("PCR 4 and 9")
+    fn seals_again_vouched_refuses_a_log_that_does_not_explain_the_pcrs() {
+        use crate::predict::{Event, UNEXPLAINED, replay};
+        let events = vec![Event {
+            pcr: 4,
+            kind: 0,
+            digest: [1; 32],
+        }];
+        let replayed = replay(&events).unwrap();
+        let read = [(4, replayed[4]), (9, replayed[9])];
+        assert_eq!(vouched(&events, &read, || Ok(())), Ok(()));
+        let other = [(4, [2; 32]), (9, replayed[9])];
+        assert_eq!(
+            vouched(&events, &other, || panic!("asked")),
+            Err(UNEXPLAINED.to_string())
         );
         let refused = || Err("the image that runs is not the piece the release names for slot b".to_string());
-        assert_eq!(vouched((four, nine), (four, nine), refused), refused());
+        assert_eq!(vouched(&events, &read, refused), refused());
+    }
+
+    /// The status shows why a seal is refused, when one is wanted and does not fit (even with
+    /// an old TPM record beside the key); a PIN seal that fits says sealed, and no message.
+    #[test]
+    fn seals_again_status_shows_the_refusal_and_is_quiet_for_a_fitting_pin_seal() {
+        let refused = (Instant::now(), "the system is not signed".to_string());
+        let plain = Record {
+            tpm: Some(vec![1]),
+            parent: Some(vec![2; 34]),
+            ..Record::default()
+        };
+        let shown = sealed_status(&plain, false, Some(&refused), true);
+        assert_eq!(shown["sealed"], false);
+        assert_eq!(shown["message"], "the system is not signed");
+        let pin = Record {
+            pin: Some(PinSeal {
+                k1: vec![1],
+                k2: vec![2],
+                wrapped: vec![3],
+            }),
+            parent: Some(vec![2; 34]),
+            ..Record::default()
+        };
+        let quiet = sealed_status(&pin, true, None, true);
+        assert_eq!(quiet["sealed"], true);
+        assert!(quiet.get("message").is_none());
     }
 
     fn holds(bytes: &[u8], secret: &[u8]) -> bool {
