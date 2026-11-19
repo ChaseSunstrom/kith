@@ -3341,6 +3341,62 @@ fn roaming_node_is_sent_the_store_over_the_mesh() {
     assert_ne!(alpha.kith(&["get", "node/twin"]).0, 0);
 }
 
+/// A node that joined over the LAN (no mesh in its join) and has the mesh on, serving on every
+/// address: once it says its key the leader records it at its mesh address (its LAN one kept
+/// beside), and the store goes on coming to it, now over the mesh.
+#[test]
+fn mesh_address_of_a_lan_joined_node() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    if std::env::var_os("KITH_IN_NAMESPACE").is_none() {
+        let unshare = |args: &[&str]| Command::new("unshare").arg("-Urn").args(args).status();
+        if !unshare(&["true"]).is_ok_and(|status| status.success()) {
+            return eprintln!("skipped: no unprivileged user namespaces here (unshare -Urn)");
+        }
+        let me = std::env::current_exe().unwrap();
+        // (10.9.0.1 is the LAN here: the root part will not call a peer at a loopback address.)
+        let again = "ip link set lo up && ip addr add 10.9.0.1/32 dev lo && KITH_IN_NAMESPACE=1 exec \"$0\" --exact mesh_address_of_a_lan_joined_node --nocapture";
+        let status = unshare(&["sh", "-c", again, me.to_str().unwrap()]).unwrap();
+        assert!(status.success(), "the test failed inside its namespace");
+        return;
+    }
+    let ports = (free_port().to_string(), free_port().to_string());
+    let mesh = ["--mesh", &ports.0, "--mesh-interface", "kith-alpha"];
+    let alpha = Node::start_in(None, "10.9.0.1", free_port(), "mesh-lan", "alpha", &mesh);
+    wait_for("alpha to lead", || alpha.kith(&["get", "node"]).0 == 0);
+    let token = alpha.ok(&["node", "token"]);
+    // (No --roaming: it joins as a LAN node, calling alpha on its LAN address.)
+    let join = ["--join", &alpha.address(), "--token", token.trim()];
+    let mesh = ["--mesh", &ports.1, "--mesh-interface", "kith-beta"];
+    let beta = Node::start_in(None, "[::]", free_port(), "mesh-lan", "beta", &[join, mesh].concat());
+    let node =
+        || -> serde_json::Value { serde_json::from_str(&alpha.ok(&["get", "node/beta", "-o", "json"])).unwrap() };
+    let lan = format!("10.9.0.1:{}", beta.port);
+    assert_eq!(node()["status"]["address"], lan.as_str(), "it joined over the LAN");
+    wait_for("beta to be recorded at its mesh address", || {
+        node()["status"]["address"]
+            .as_str()
+            .is_some_and(|at| at.starts_with("[fd"))
+    });
+    let node = node();
+    let at = node["status"]["address"].as_str().unwrap();
+    assert!(at.ends_with(&format!("]:{}", beta.port)), "{at}");
+    assert_eq!(node["status"]["lan"], lan.as_str(), "{node}");
+    assert_eq!(node["status"]["mesh"]["api"], true, "{node}");
+    // The store comes to it there: a change made on alpha arrives, and the mesh stays up.
+    let made = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: over-mesh }\nspec: { data: { a: b } }\n";
+    std::fs::write(alpha.dir.join("over-mesh.yaml"), made).unwrap();
+    alpha.ok(&["apply", "-f", "over-mesh.yaml"]);
+    wait_for("the change to reach beta", || {
+        beta.kith(&["get", "configmap/over-mesh"]).0 == 0
+    });
+    let status = alpha.ok(&["node", "status"]);
+    let line = status.lines().find(|line| line.starts_with("mesh:      beta at fd"));
+    assert!(line.is_some_and(|line| line.contains(", handshake ")), "{status}");
+}
+
 /// Two nodes with the mesh on, in a network namespace of their own (this test runs itself
 /// again inside one, where it may make interfaces): each learns the other's key from the
 /// store, they shake hands, and a node that stops takes its interface with it.

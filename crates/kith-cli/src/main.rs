@@ -2625,6 +2625,15 @@ mod drain_tests {
         );
         assert_eq!(lan.lan_address().map(|ip| ip.to_string()).as_deref(), Some("192.0.2.7"));
         assert_eq!(table_row(&lan)[4], "ready at 192.0.2.7:7443; serves dns 53, ingress");
+        // Moved onto the mesh by the leader: its LAN address is the one it was moved from.
+        let moved = node(
+            json!({}),
+            json!({ "address": "[fd00::7]:7443", "lan": "192.0.2.7:7443", "state": "ready" }),
+        );
+        assert_eq!(
+            moved.lan_address().map(|ip| ip.to_string()).as_deref(),
+            Some("192.0.2.7")
+        );
         let roaming = node(
             json!({ "roaming": true }),
             json!({ "address": "10.8.0.4:7443", "state": "ready" }),

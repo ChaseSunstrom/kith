@@ -79,6 +79,13 @@ the plan allowed 0.3 ms).
 - Each node gets a stable IPv6 address derived from the CA and its name; `kith get node/NAME -o
   yaml` shows it and the public key (`mesh`), `kith node status` the peers and their last
   handshakes. The private key stays in `<state>/pki`.
+- Raft and the node API ride the mesh for LAN-joined nodes too. A node with `--mesh` listens on
+  every address (`[::]:7443`, when `bindv6only` is 0 and `--listen` is not given), says so
+  (`status.mesh.api`), and once the leader has shaken hands with it the leader records its
+  address as the mesh one (derived from the CA and the name, never the node's own claim); the
+  LAN address it joined at stays in `status.lan`, where the tunnel's endpoint and ingress DNS
+  still read it. A node left out of this (no `--mesh`, or listening on one address) stays at its
+  LAN address, and nothing moves until every node has a mesh key.
 - A peer silent for three minutes is reached through a node with the `edge` role until it
   answers again. The edge machine must forward (`net.ipv6.conf.all.forwarding=1`; kithd warns
   but leaves it alone) and sees what it passes on.
@@ -379,9 +386,8 @@ kithd logs when it starts or stops resolving, not on each try.
 
 ### Not yet
 
-- Non-roaming nodes talk at their plain addresses, not over the mesh; workloads have no mesh
-  addresses (Services do); two nodes behind NATs that give a port per address meet only
-  through an edge node.
+- Workloads have no mesh addresses (Services do); two nodes behind NATs that give a port per
+  address meet only through an edge node.
 - A changed Workload's replicas on different nodes are replaced all at once (one at a time on
   one node; a NodeWorkload always all at once). Replicas on an unreachable node count as ready
   until `--lost-after`; a roaming node's, indefinitely.
@@ -557,7 +563,7 @@ Every node started with `--dns` answers the same names.
   out.
 - **Who serves:** a node's `status.serves` says its `dns` port and `ingress: true`, from its own
   flags (cleared by a restart without them). Its LAN address is the one it was admitted from
-  (`status.address`); NAT, a moved node or `127.0.0.1` do not count. A roaming node has its mesh
+  (`status.address`, or `status.lan` once the leader has moved that to the mesh); NAT, a moved node or `127.0.0.1` do not count. A roaming node has its mesh
   address. `kith get node` shows both.
 
 **Block lists** answer names as not there, for `clients` (none: everyone):

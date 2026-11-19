@@ -365,6 +365,10 @@ fn cluster(shared: &Shared) -> Result<&Cluster, Refusal> {
 pub const EVICTED: &str = "this certificate is not a node of this cluster's any more: its Node was deleted, or the \
      name has joined again with another";
 
+/// Set when the node API listens on every IPv6 address (the mesh's too): the node says so under
+/// `status.mesh.api`, and the leader may then move its address onto the mesh (`raft::to_mesh`).
+pub static SERVES_MESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Set by `--admit-deleted-nodes`: [`admitted`] says yes to every node certificate.
 pub static ADMIT_DELETED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
