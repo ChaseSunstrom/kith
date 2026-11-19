@@ -8,6 +8,11 @@ metrics and storage k3s starts by itself). It measures both from outside, the sa
 runs the same workloads on both, and writes the tables to
 [ci/compare.txt](../../ci/compare.txt).
 
+## The numbers, drawn
+
+The same middle runs, a pair of bars for each row that both systems have a number for, read
+from [docs/numbers.json](../numbers.json) in the browser. Under the bars, the same numbers as a table.
+
 ## What each row is
 
 | Row | How it is measured |
