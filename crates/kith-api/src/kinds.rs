@@ -1597,9 +1597,36 @@ impl Spec for ClusterSpec {
     }
 }
 
+/// A peer's `cidr` is an address and a length within its family (`10.0.0.0/8`, `fd00::/8`): a
+/// deny whose cidr could not be read would keep nothing out. (Read as kithd's `parse_cidr` does.)
+impl Spec for NetworkPolicySpec {
+    fn check(&self) -> Result<(), String> {
+        for (side, rules) in [("ingress", &self.ingress), ("egress", &self.egress)] {
+            for (i, rule) in rules.iter().enumerate() {
+                for (j, peer) in rule.peers.iter().enumerate() {
+                    let Some(cidr) = &peer.cidr else { continue };
+                    let read = cidr.split_once('/').and_then(|(address, length)| {
+                        let size = if address.parse::<std::net::IpAddr>().ok()?.is_ipv4() {
+                            32
+                        } else {
+                            128
+                        };
+                        length.parse::<u8>().ok().filter(|length| *length <= size)
+                    });
+                    if read.is_none() {
+                        return Err(format!(
+                            "{side}[{i}].peers[{j}].cidr: `{cidr}` is not ADDR/LEN (`10.0.0.0/8`, `fd00::/8`, a length within its family)"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 no_checks!(
     BlobSpec,
-    NetworkPolicySpec,
     VolumeClaimSpec,
     ConfigMapSpec,
     SecretSpec,
@@ -2898,6 +2925,38 @@ mod access_tests {
     fn access_level_accepts_a_range_beside_the_people_range() {
         for net in ["100.90.0.0/16", "100.64.0.0/16", "100.128.0.0/9", "100.87.255.255/32"] {
             read("AccessLevel", &format!("{{ networks: [{net}] }}")).unwrap_or_else(|e| panic!("{net}: {e}"));
+        }
+    }
+
+    /// A deny whose cidr cannot be read would hold nothing back, so a policy is refused for one.
+    #[test]
+    fn network_policy_cidr_is_an_address_and_a_length_in_its_family() {
+        let ingress = |cidr: &str| format!("{{ ingress: [{{ action: deny, peers: [{{ cidr: '{cidr}' }}] }}] }}");
+        let egress = |cidr: &str| format!("{{ egress: [{{ action: allow, peers: [{{ cidr: '{cidr}' }}] }}] }}");
+        for cidr in [
+            "10.0.0.0/8",
+            "fd00::/8",
+            "0.0.0.0/0",
+            "::/0",
+            "10.0.0.1/32",
+            "fd00::1/128",
+        ] {
+            read("NetworkPolicy", &ingress(cidr)).unwrap_or_else(|e| panic!("{cidr}: {e}"));
+            read("NetworkPolicy", &egress(cidr)).unwrap_or_else(|e| panic!("{cidr}: {e}"));
+        }
+        for cidr in [
+            "nonsense",
+            "10.0.0.0/40",
+            "10.0.0.1",
+            "fd00::/129",
+            "10.0.0.0/",
+            "/8",
+            "10.0.0.0/-1",
+        ] {
+            let refused = read("NetworkPolicy", &ingress(cidr)).unwrap_err();
+            assert!(refused.contains("ingress[0].peers[0].cidr"), "{cidr}: {refused}");
+            let refused = read("NetworkPolicy", &egress(cidr)).unwrap_err();
+            assert!(refused.contains("egress[0].peers[0].cidr"), "{cidr}: {refused}");
         }
     }
 

@@ -283,7 +283,7 @@ fn told_apart(peer: &Peer) -> bool {
 /// `workload` on `port`? Yes when no NetworkPolicy is for the Workload; otherwise the
 /// first ingress rule that fits says, and when none fits, no. Where a rule names peers
 /// that cannot be told apart yet, it errs on the side of no: an allow rule lets nobody
-/// in for them, a deny rule keeps everybody out.
+/// in for them, a deny rule keeps everybody out; so does a deny peer whose cidr cannot be read.
 pub fn admits(store: &Store, workload: &str, node: Option<&str>, from: IpAddr, port: u16) -> bool {
     let Some(target) = store.get(workload) else {
         return false;
@@ -294,6 +294,9 @@ pub fn admits(store: &Store, workload: &str, node: Option<&str>, from: IpAddr, p
         for rule in &spec.ingress {
             let allow = rule.action == PolicyAction::Allow;
             let fits = |peer: &Peer| {
+                if !allow && unreadable(peer) {
+                    return true;
+                }
                 let here = peer.node.as_deref().is_none_or(|name| Some(name) == node);
                 let there = peer.cidr.as_deref().is_none_or(|cidr| within_cidr(cidr, from));
                 here && there && (told_apart(peer) || !allow)
@@ -314,8 +317,10 @@ pub fn admits(store: &Store, workload: &str, node: Option<&str>, from: IpAddr, p
 /// `cidr` is one, `node` and `cidr` together are the node's address if it is within the
 /// cidr, and neither is everything (both families). One that cannot be told apart by
 /// `namespace` or `selector` fits nothing in an allow (as for ingress) and, but for what its
-/// `node` or `cidr` say, everything in a deny. A rule whose peers hold no network is left out
-/// (it would fit anything). Nothing is let through that no rule allows: the node's resolver
+/// `node` or `cidr` say, everything in a deny; so does a deny peer whose `cidr` cannot be read
+/// (one stored before the API refused it): a deny never fails open. A rule whose peers hold no
+/// network is left out (it would fit anything): so is a deny of a `node` where there is no
+/// mesh prefix, as that is only without a cluster, where no node has an address to keep out. Nothing is let through that no rule allows: the node's resolver
 /// too (DNS to the gateway), so a policy that holds a pod must name it.
 pub fn egress_of(store: &Store, workload: &str, prefix: Option<Ipv6Addr>) -> Option<Vec<Egress>> {
     let target = store.get(workload)?;
@@ -345,11 +350,27 @@ fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
     Some((address, length.parse::<u8>().ok().filter(|length| *length <= size)?))
 }
 
+/// Both families whole: what a deny that must keep everything out names.
+const EVERYTHING: [(IpAddr, u8); 2] = [
+    (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+    (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+];
+
+/// Does the peer name a `cidr` that cannot be read? The API refuses one; this is one stored
+/// before it did. In a deny it fits everything (it must never fail open), in an allow nothing.
+fn unreadable(peer: &Peer) -> bool {
+    peer.cidr.as_deref().is_some_and(|cidr| parse_cidr(cidr).is_none())
+}
+
 fn egress_rule(rule: &PolicyRule, prefix: Option<Ipv6Addr>) -> Option<Egress> {
     let allow = rule.action == PolicyAction::Allow;
     let mut to = Vec::new();
     for peer in &rule.peers {
         if allow && !told_apart(peer) {
+            continue;
+        }
+        if !allow && unreadable(peer) {
+            to.extend(EVERYTHING);
             continue;
         }
         match (&peer.node, &peer.cidr) {
@@ -362,7 +383,7 @@ fn egress_rule(rule: &PolicyRule, prefix: Option<Ipv6Addr>) -> Option<Egress> {
                 }
             }
             (None, Some(cidr)) => to.extend(parse_cidr(cidr)),
-            (None, None) => to.extend([(Ipv4Addr::UNSPECIFIED.into(), 0), (Ipv6Addr::UNSPECIFIED.into(), 0)]),
+            (None, None) => to.extend(EVERYTHING),
         }
     }
     (rule.peers.is_empty() || !to.is_empty()).then(|| Egress {
@@ -1861,6 +1882,82 @@ spec:
         let settled = settle(&mut store).unwrap();
         assert_eq!(settled, json!({ "state": "enforced", "message": null }));
         assert!(settle(&mut store).is_none());
+    }
+
+    /// A policy whose peer cidr cannot be read: the API refuses one now, so it is written into
+    /// the store as an older version left it. A deny with such a peer keeps everything out (ingress
+    /// and egress both), so the allow after it opens nothing; an allow with one lets nothing in.
+    #[test]
+    fn a_deny_with_a_peer_that_cannot_be_read_keeps_everything_out() {
+        let stored = |ingress: &str, egress: &str| {
+            let mut store = Store::default();
+            for source in [
+                HOME.to_string(),
+                format!(
+                    "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: {{ name: p }}\n\
+                     spec:\n  selector: {{ app: web }}\n  ingress: {ingress}\n  egress: {egress}\n"
+                ),
+            ] {
+                for resource in Resource::from_source(&source).unwrap() {
+                    let mut resource = resource.unwrap();
+                    // (The good cidr `10.0.0.0/8` is the one made unreadable, and `put` keeps it
+                    // as it is, as a store from before the check does.)
+                    let text = resource.spec.to_string().replace("10.0.0.0/8", "nonsense");
+                    resource.spec = serde_json::from_str(&text).unwrap();
+                    store.put(resource);
+                }
+            }
+            store
+        };
+        let web = "Workload/default/web";
+        let prefix = kith_mesh::prefix(b"test");
+        let from: IpAddr = "10.1.2.3".parse().unwrap();
+        let deny = "{ action: deny, peers: [{ cidr: '10.0.0.0/8' }] }";
+        let nodes = "{ action: deny, peers: [{ node: b, cidr: '10.0.0.0/8' }] }";
+        let (all, none) = ("{ action: allow }", "[]");
+        for deny in [deny, nodes] {
+            let store = stored(&format!("[{deny}, {all}]"), &format!("[{deny}, {all}]"));
+            for node in [None, Some("a"), Some("b")] {
+                assert!(!admits(&store, web, node, from, 80), "{deny}, {node:?}");
+                assert!(
+                    !admits(&store, web, node, "fd00::1".parse().unwrap(), 80),
+                    "{deny}, {node:?}"
+                );
+            }
+            let net = |cidr: &str| {
+                let (address, bits) = cidr.split_once('/').unwrap();
+                (address.parse::<IpAddr>().unwrap(), bits.parse::<u8>().unwrap())
+            };
+            let got = egress_of(&store, web, Some(prefix)).unwrap();
+            assert_eq!(got.len(), 2, "{deny}");
+            assert_eq!(got[0].to, vec![net("0.0.0.0/0"), net("::/0")], "{deny}");
+            assert!(!got[0].allow && got[1].allow, "{deny}");
+        }
+        // An allow with one lets nobody in, and holds nothing out of its egress.
+        let store = stored("[{ action: allow, peers: [{ cidr: '10.0.0.0/8' }] }]", none);
+        assert!(!admits(&store, web, Some("a"), from, 80));
+        let store = stored(
+            "[{ action: allow }]",
+            "[{ action: allow, peers: [{ cidr: '10.0.0.0/8' }] }]",
+        );
+        assert_eq!(egress_of(&store, web, Some(prefix)).unwrap(), vec![]);
+    }
+
+    /// A deny of a node, on a node with no mesh prefix, is left out: `mesh_prefix` is `None`
+    /// only where there is no cluster, so there is no node address to keep out.
+    #[test]
+    fn a_deny_of_a_node_without_a_mesh_is_left_out() {
+        let mut store = Store::default();
+        let policy = "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: { name: p }\n\
+             spec:\n  selector: { app: web }\n  egress: [{ action: deny, peers: [{ node: b }] }, { action: allow }]\n";
+        for source in [HOME, policy] {
+            for resource in Resource::from_source(source).unwrap() {
+                store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        let got = egress_of(&store, "Workload/default/web", None).unwrap();
+        assert_eq!(got.len(), 1, "the deny has no address to hold out");
+        assert!(got[0].allow && got[0].to.is_empty());
     }
 
     #[test]

@@ -225,7 +225,11 @@ A `NetworkPolicy` decides who may connect to the Workloads it selects through a 
 first ingress rule that fits wins, none means refused. Peers are a `node` or a `cidr`; peers by
 `namespace` or `selector` cannot be told apart yet (allow lets nobody in, deny keeps everyone
 out) and egress is not enforced; the status says `partial` and why, or `enforced`. A connection
-to a node's own address bypasses it.
+to a node's own address bypasses it. A `cidr` must be an address and a length within its
+family (`10.0.0.0/8`, `fd00::/8`), or the policy is refused. One stored before that check, whose
+`cidr` cannot be read, fails closed: in a deny it keeps everything out (ingress and egress), in an
+allow it lets nothing in. A deny of a `node` on a node with no cluster has no node address to keep
+out and is left out.
 
 ### Rolling updates
 
