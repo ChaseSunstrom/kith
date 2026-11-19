@@ -456,6 +456,25 @@ fn kith_templates_are_held_and_see_only_the_package() {
 /// `lookup(kind, namespace, name)` is the live resource's spec, or an empty map; the keys it
 /// was asked for come back, found or not.
 #[test]
+fn lookup_by_hand_finds_nothing_and_does_not_stop_a_render() {
+    let mut files = BTreeMap::new();
+    files.insert("package.yaml".to_string(), "name: peek\nversion: 0.1.0\n".to_string());
+    files.insert(
+        "templates/a.yaml".to_string(),
+        "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: copy }\nspec:\n  data:\n    \
+         port: \"{{ lookup('Service', release.namespace, 'db').port | default('none') }}\"\n"
+            .to_string(),
+    );
+    let package = Package::from_files(files).unwrap();
+    assert_eq!(
+        package.render(SHOP, &[]).unwrap().resources[0].spec["data"]["port"],
+        "none"
+    );
+    assert_eq!(package.lint(), Vec::<String>::new());
+}
+
+#[test]
+#[cfg(feature = "live")]
 fn lookup_finds_a_live_resource_and_is_empty_when_absent() {
     let mut files = BTreeMap::new();
     files.insert("package.yaml".to_string(), "name: peek\nversion: 0.1.0\n".to_string());

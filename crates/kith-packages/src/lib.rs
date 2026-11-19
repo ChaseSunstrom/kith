@@ -94,9 +94,13 @@ pub struct Rendered {
     pub looked: std::collections::BTreeSet<String>,
 }
 
+/// The keys `lookup` was asked for, as it fills them in.
+type Looked = std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>;
+
 /// What `lookup(kind, namespace, name)` sees: the specs of the live resources of the
 /// release's namespace, by key (`Kind/namespace/name`). The caller gives it (a render
 /// has no store), and says in `refused` why it could not, when it could not.
+#[cfg(feature = "live")]
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
 pub struct Live {
     pub specs: BTreeMap<String, Value>,
@@ -288,13 +292,51 @@ impl Package {
 
     /// The package's resources for `release`, with `layers` of values over the defaults.
     /// Each resource is labelled as the release's, and is in the release's namespace
-    /// unless its template says another.
+    /// unless its template says another. `lookup` finds nothing here (an empty list): no
+    /// store to look in; `render_live` is the one that looks.
     pub fn render(&self, release: Release<'_>, layers: &[Value]) -> Fallible<Rendered> {
-        self.render_live(release, layers, &Live::default())
+        self.render_with(release, layers, |environment| {
+            let nothing = |_: minijinja::value::Rest<minijinja::Value>| Vec::<minijinja::Value>::new();
+            environment.add_function("lookup", nothing);
+            Looked::default()
+        })
     }
 
-    /// [`render`](Self::render) where `lookup` sees `live`.
+    /// [`render`](Self::render) where `lookup` sees `live`. (A feature only kithd takes: the
+    /// `kith` that renders by hand has no store, and its size is held.)
+    #[cfg(feature = "live")]
     pub fn render_live(&self, release: Release<'_>, layers: &[Value], live: &Live) -> Fallible<Rendered> {
+        self.render_with(release, layers, |environment| {
+            let looked = Looked::default();
+            let (seen, live, home) = (looked.clone(), live.clone(), release.namespace.to_string());
+            // `lookup(kind, namespace, name)`: the live resource's spec, an empty map when there
+            // is none. Only the release's own namespace is seen.
+            environment.add_function("lookup", move |kind: String, namespace: String, name: String| {
+                let wrong = |why: String| minijinja::Error::new(ErrorKind::InvalidOperation, why);
+                if let Some(why) = &live.refused {
+                    return Err(wrong(format!("lookup: {why}")));
+                }
+                if namespace != home {
+                    let said = format!("lookup: a release sees only its own namespace ({home}), not `{namespace}`");
+                    return Err(wrong(said));
+                }
+                let key = format!("{kind}/{namespace}/{name}");
+                let spec = live.specs.get(&key).cloned().unwrap_or_else(|| json!({}));
+                seen.lock().map_err(|e| wrong(e.to_string()))?.insert(key);
+                Ok(minijinja::Value::from(minijinja::value::Serde(spec)))
+            });
+            looked
+        })
+    }
+
+    /// The render, with `lookup` put in the environment by `equip` (which gives the keys it
+    /// is asked for).
+    fn render_with(
+        &self,
+        release: Release<'_>,
+        layers: &[Value],
+        equip: impl FnOnce(&mut Environment<'_>) -> Looked,
+    ) -> Fallible<Rendered> {
         named("package.yaml: the name", &self.meta.name)?;
         named("the release's name", release.name)?;
         named("the release's namespace", release.namespace)?;
@@ -308,24 +350,7 @@ impl Package {
             "labels": labels,
         });
         let mut environment = self.environment()?;
-        // `lookup(kind, namespace, name)`: the live resource's spec, an empty map when there
-        // is none. Only the release's own namespace is seen.
-        let looked = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
-        let (seen, live, home) = (looked.clone(), live.clone(), release.namespace.to_string());
-        environment.add_function("lookup", move |kind: String, namespace: String, name: String| {
-            let wrong = |why: String| minijinja::Error::new(ErrorKind::InvalidOperation, why);
-            if let Some(why) = &live.refused {
-                return Err(wrong(format!("lookup: {why}")));
-            }
-            if namespace != home {
-                let said = format!("lookup: a release sees only its own namespace ({home}), not `{namespace}`");
-                return Err(wrong(said));
-            }
-            let key = format!("{kind}/{namespace}/{name}");
-            let spec = live.specs.get(&key).cloned().unwrap_or_else(|| json!({}));
-            seen.lock().map_err(|e| wrong(e.to_string()))?.insert(key);
-            Ok(minijinja::Value::from(minijinja::value::Serde(spec)))
-        });
+        let looked = equip(&mut environment);
         let rendered = std::cell::Cell::new(0);
         let text = |path: &str| -> Fallible<String> {
             let template = environment.get_template(path).map_err(|e| template_error(&e))?;
@@ -401,7 +426,7 @@ impl Package {
             }
         }
         let notes = self.notes.as_ref().map(|_| text(NOTES)).transpose()?;
-        let looked = looked.lock().map_err(|e| e.to_string())?.clone();
+        let looked = std::mem::take(&mut *looked.lock().map_err(|e| e.to_string())?);
         Ok(Rendered {
             resources,
             notes,
