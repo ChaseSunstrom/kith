@@ -481,7 +481,9 @@ impl<T: Read + Write> Tpm<T> {
 
     /// What a policy session comes to once it has been shown the PCRs as they are now:
     /// what a key sealed now asks of whoever wants it back.
-    fn policy(&mut self) -> Result<[u8; 32], String> {
+    /// `over`: PCRs whose value is not the one read but the one given (what the system a
+    /// key is sealed ahead for will have in them).
+    fn policy(&mut self, over: &[(u8, [u8; 32])]) -> Result<[u8; 32], String> {
         let read = self.run(NO_SESSIONS, PCR_READ, &selection())?;
         let mut read = Reply(&read);
         read.number()?;
@@ -492,6 +494,7 @@ impl<T: Read + Write> Tpm<T> {
         let mut values = Vec::new();
         for pcr in PCRS {
             let value = read.sized(false)?;
+            let value = over.iter().find(|o| o.0 == pcr).map_or(value, |o| &o.1[..]);
             if NEVER_EMPTY.contains(&pcr) && value.iter().all(|byte| *byte == 0) {
                 return Err(format!(
                     "PCR {pcr} of this machine's TPM holds nothing (its firmware, or this start, measured nothing into it): a key sealed here would open for any system"
@@ -513,10 +516,37 @@ impl<T: Read + Write> Tpm<T> {
     /// to keep, and the storage key's name, to give [`Tpm::unseal`]. `kept`: the name of
     /// the one it was sealed under before, if it was.
     pub fn seal(&mut self, key: &[u8], kept: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.seal_over(key, kept, &[])
+    }
+
+    /// [`Tpm::seal`] for the PCRs as they are now, but for those in `over`, which are as
+    /// given: a key sealed ahead for the system an update will start.
+    pub fn seal_over(
+        &mut self,
+        key: &[u8],
+        kept: Option<&[u8]>,
+        over: &[(u8, [u8; 32])],
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
         let parent = self.parent(kept)?;
-        let made = self.sealed(key, &parent, None);
+        let made = self.sealed(key, &parent, None, over);
         self.flush(parent.handle);
         Ok((made?, parent.name))
+    }
+
+    /// The value of one PCR (SHA-256) as it is now.
+    pub fn read(&mut self, pcr: u8) -> Result<[u8; 32], String> {
+        let mut bits = [0u8; 3];
+        bits[usize::from(pcr / 8)] |= 1 << (pcr % 8);
+        let asked = [&1u32.to_be_bytes()[..], &SHA256.to_be_bytes(), &[3], &bits].concat();
+        let read = self.run(NO_SESSIONS, PCR_READ, &asked)?;
+        let mut read = Reply(&read);
+        read.number()?;
+        if read.take(10)? != asked || read.number()? != 1 {
+            return Err("this TPM does not keep the PCRs in SHA-256".into());
+        }
+        read.sized(false)?
+            .try_into()
+            .map_err(|_| "the TPM gave a PCR that is not 32 bytes".to_string())
     }
 
     /// `key` sealed under `pin` (its digits, as typed), whatever the PCRs: only a policy
@@ -526,7 +556,7 @@ impl<T: Read + Write> Tpm<T> {
     /// end). What to keep, and the storage key's name, as [`Tpm::seal`] gives them.
     pub fn seal_pin(&mut self, key: &[u8], pin: &[u8], kept: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>), String> {
         let parent = self.parent(kept)?;
-        let made = self.sealed(key, &parent, Some(pin));
+        let made = self.sealed(key, &parent, Some(pin), &[]);
         self.flush(parent.handle);
         let (made, name) = (made?, parent.name);
         if self.unseal_pin(&made, pin, Some(&name))? != key {
@@ -553,11 +583,17 @@ impl<T: Read + Write> Tpm<T> {
     }
 
     /// `key` sealed under `parent`: to the PCRs as they are now, or to `pin`.
-    fn sealed(&mut self, key: &[u8], parent: &Parent, pin: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    fn sealed(
+        &mut self,
+        key: &[u8],
+        parent: &Parent,
+        pin: Option<&[u8]>,
+        over: &[(u8, [u8; 32])],
+    ) -> Result<Vec<u8>, String> {
         let (policy, attributes) = match pin {
             // Data kept under a hash, of this TPM and this parent only, with no password (so
             // none to guess, and no guess counted): the policy alone opens it.
-            None => (self.policy()?, 0x0000_0412u32),
+            None => (self.policy(over)?, 0x0000_0412u32),
             // Of this TPM and this parent only, its password the PIN, and each wrong one
             // counted; no password alone opens it, only a policy session told it.
             Some(_) => {
@@ -971,6 +1007,39 @@ pub(crate) mod tests {
         let (sealed, _) = tpm.seal(&key, name).unwrap();
         extend(&mut tpm, 14, 1);
         assert_eq!(tpm.unseal(&sealed, name).as_ref(), Ok(&key));
+    }
+
+    /// Against a software TPM: a key sealed ahead for PCRs 4 and 9 as an update will make
+    /// them is not given now, and is given once they are so; the old seal still is until
+    /// then; a PCR that would be empty is still refused.
+    #[test]
+    fn tpm_next_seal_over() {
+        let Some((_software, wire)) = software() else { return };
+        let mut tpm = Tpm(wire);
+        let key: Vec<u8> = (0..64).collect();
+        measured(&mut tpm);
+        let (now4, now9) = (tpm.read(4).unwrap(), tpm.read(9).unwrap());
+        assert_eq!(now4, Sha256::digest([&[0u8; 32][..], &[4; 32]].concat()).as_slice());
+        let (event4, event9) = ([0x44u8; 32], [0x99u8; 32]);
+        let after =
+            |now: [u8; 32], event: [u8; 32]| -> [u8; 32] { Sha256::digest([&now[..], &event[..]].concat()).into() };
+        let over = [(4, after(now4, event4)), (9, after(now9, event9))];
+        let (old, name) = tpm.seal(&key, None).unwrap();
+        let name = Some(&name[..]);
+        let (ahead, _) = tpm.seal_over(&key, name, &over).unwrap();
+        assert_eq!(tpm.unseal(&old, name).as_ref(), Ok(&key));
+        let refused = tpm.unseal(&ahead, name).unwrap_err();
+        assert!(refused.contains("not the system it was sealed for"), "{refused}");
+        // the system that is started with those boot file and command line has it
+        tpm.extend(4, &event4).unwrap();
+        tpm.extend(9, &event9).unwrap();
+        assert_eq!(tpm.read(4).unwrap(), over[0].1);
+        assert_eq!(tpm.unseal(&ahead, name).as_ref(), Ok(&key));
+        let refused = tpm.unseal(&old, name).unwrap_err();
+        assert!(refused.contains("not the system it was sealed for"), "{refused}");
+        // an empty PCR is refused whether read or given
+        let empty = tpm.seal_over(&key, name, &[(4, [0; 32])]).unwrap_err();
+        assert!(empty.contains("holds nothing"), "{empty}");
     }
 
     /// The name the TPM itself gives the storage key, as the last of what CreatePrimary

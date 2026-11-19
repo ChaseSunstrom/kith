@@ -320,6 +320,30 @@ pub fn into_other_slot(
     running: &str,
     vouched: impl FnOnce(&[u8]) -> Result<(), String>,
 ) -> Result<Option<String>, String> {
+    Ok(into_slot(from, slot, running, vouched, false)?.0)
+}
+
+/// The two boot files a key is sealed ahead from (docs/adr-unlock.md): what the node
+/// started from, and what the update has put in the other slot, which it will start.
+pub struct Boots {
+    pub running: Vec<u8>,
+    pub new: Vec<u8>,
+}
+
+/// What [`into_slot`] says: the version written (`None`: what runs already) and, when asked
+/// and something was written, the boot files (or why they could not be had).
+pub type Written = (Option<String>, Option<Result<Boots, String>>);
+
+/// [`into_other_slot`], and with `ahead`, when something was written, the boot files too
+/// (read back from the ESP, and the new one proven to be the piece the header promised);
+/// that may fail without the update failing.
+pub fn into_slot(
+    from: &mut impl Read,
+    slot: char,
+    running: &str,
+    vouched: impl FnOnce(&[u8]) -> Result<(), String>,
+    ahead: bool,
+) -> Result<Written, String> {
     let into = if slot == 'a' { 'b' } else { 'a' };
     let part = |name: String| crate::init::labelled(&name).ok_or(format!("no partition is labelled {name}"));
     let (root, verity) = (part(format!("root-{into}"))?, part(format!("verity-{into}"))?);
@@ -329,8 +353,53 @@ pub fn into_other_slot(
             verity,
             esp: esp.into(),
         };
-        install(from, running, into, &places, vouched)
+        let mut block = Vec::new();
+        let version = install(from, running, into, &places, |header| {
+            block = header.to_vec();
+            vouched(header)
+        })?;
+        let boots = (ahead && version.is_some()).then(|| boots(esp, slot, into, &block));
+        Ok((version, boots))
     })?
+}
+
+/// The boot files on the ESP for `running` (its image, marked good) and `into` (the one
+/// just written, still counting its tries), where `block` is the header of what was written.
+fn boots(esp: &Path, running: char, into: char, block: &[u8]) -> Result<Boots, String> {
+    let listed = entries(esp);
+    let find = |slot: char, counting: bool| {
+        let newest = listed
+            .iter()
+            .filter(|(_, _, its, tries)| *its == slot && tries.is_some() == counting)
+            .max_by_key(|(_, generation, ..)| *generation);
+        newest
+            .map(|(name, ..)| esp.join(name))
+            .ok_or(format!("no kernel image for slot {slot} on the ESP"))
+    };
+    let read = |from: PathBuf| std::fs::read(&from).map_err(|e| format!("reading {}: {e}", from.display()));
+    let (running, new) = (read(find(running, false)?)?, read(find(into, true)?)?);
+    let promised = header(block)?
+        .pieces
+        .into_iter()
+        .find(|piece| piece.name == into.to_string())
+        .map(|piece| piece.sha256.to_ascii_lowercase());
+    if promised.as_deref() != Some(sha256(&new).as_str()) {
+        return Err(format!(
+            "the kernel image on the ESP for slot {into} is not the piece the update promised"
+        ));
+    }
+    Ok(Boots { running, new })
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    crate::pki::hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
+}
+
+/// Is `slot` on the ESP in `esp` still counting its tries: an update that has not come up yet?
+pub fn trial(slot: char, esp: &Path) -> bool {
+    entries(esp)
+        .iter()
+        .any(|(_, _, its, tries)| *its == slot && tries.is_some())
 }
 
 #[cfg(test)]
@@ -444,6 +513,33 @@ mod tests {
         );
         assert_eq!(again, Ok(None));
         assert_eq!(names(&places.esp), ["kith-1-a.efi", "kith-2-b+3.efi"]);
+    }
+
+    #[test]
+    fn tpm_next_boots_are_the_two_images_and_the_new_one_is_proven() {
+        let places = places("boots");
+        let update = packed(&PIECES, HASH);
+        assert!(!trial('b', &places.esp));
+        install(&mut update.as_slice(), "kith.slot=a", 'b', &places, |_| Ok(())).unwrap();
+        assert!(trial('b', &places.esp));
+        assert!(!trial('a', &places.esp));
+        let got = boots(&places.esp, 'a', 'b', &update[..HEADER]).unwrap();
+        assert_eq!((&got.running[..], &got.new[..]), (&b"old a"[..], &b"for b"[..]));
+        // a header that promises another image than the one on the ESP
+        let mut other = PIECES;
+        other[3] = ("b", b"for B");
+        let why = boots(&places.esp, 'a', 'b', &packed(&other, HASH)[..HEADER])
+            .err()
+            .unwrap();
+        assert!(why.contains("not the piece the update promised"), "{why}");
+        // a header that is no header, a running slot with no good image, a new one with none
+        assert!(boots(&places.esp, 'a', 'b', b"{}").is_err());
+        assert!(boots(&places.esp, 'b', 'b', &update[..HEADER]).is_err());
+        assert!(boots(&places.esp, 'a', 'a', &update[..HEADER]).is_err());
+        // once the new slot is good it is no longer counting
+        std::fs::rename(places.esp.join("kith-2-b+3.efi"), places.esp.join("kith-2-b.efi")).unwrap();
+        assert!(!trial('b', &places.esp));
+        assert!(boots(&places.esp, 'a', 'b', &update[..HEADER]).is_err());
     }
 
     #[test]

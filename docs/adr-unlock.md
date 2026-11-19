@@ -2,8 +2,8 @@
 
 Status: decided (T-0189 step 1). Steps 2 (the session, T-0585) and 3 (TPM plus PIN, T-0612)
 are built and have run against swtpm only; `kith node pin` is refused unless the owner passes
-`--untried-tpm`, which says the owner's checklist has not run on that machine's TPM. Steps 4
-and 5 are not built. They follow "Steps, in order". A security review reads this record before any code is written. Nothing in this
+`--untried-tpm`, which says the owner's checklist has not run on that machine's TPM. Step 4
+is built but for dropping `tpm-next:` on a fallback (T-0858 to T-0860); step 5 is not built. They follow "Steps, in order". A security review reads this record before any code is written. Nothing in this
 task runs on a real TPM, a real FIDO2 key or a real disk: a software TPM (swtpm) and VM disk
 files only. What the owner would run on hardware is the checklist near the end. Every claim
 about the TPM that tpm.rs does not already exercise against swtpm is marked "unverified" where
@@ -481,6 +481,16 @@ How a seal that does not open is undone with nobody at the node:
   because the other choice leaves a node whose new system cannot reach its peers down until
   someone comes; the update plan sees the node on the old version and pauses. Whether such a
   node should hold on the trial slot instead is the owner's ("Open").
+
+As built (T-0860): after `os::signed` and the slot's hash check, `update::fetch` hands the two
+boot files (read back from the ESP; the new one proven to be the piece the header named) to
+`crypt::ahead`, only for a release signed by a key `Keys::mine` held before it, never under
+`allowDowngrade`, never from a stick. The prediction needs the running log's PCR 9 event to
+match one of the four command-line forms, or it seals nothing; a failure is logged and the
+update stands. One seal ahead at a time: while a `tpm-next:` waits, none is made. `crypt::keep`
+promotes (`tpm:` takes `tpm-next:`, which goes, in one read-back write) once `os::GOOD`, and
+only if the new seal opens to the key held. The wait is `open`'s, five minutes, restarted by a
+typed line. Not built: dropping `tpm-next:` when the old slot runs again after a fallback.
 - A PIN node needs a person either way. With a person there, the PIN opens the new system
   when the prediction held; when it did not, k1 is refused, no PIN is asked for, and the five
   minutes lead back to the old system, where the PIN opens.
