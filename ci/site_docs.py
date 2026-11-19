@@ -374,8 +374,9 @@ def shell(title, description, up, rail_html, body, foot, source=None):
   </a>
   <nav aria-label="Sections">
     <a href="{up}guide/index.html">Guide</a>
-    <a href="{up}guide/index.html#decisions">Decisions</a>
-    <a href="{up}index.html#numbers">Numbers</a>
+    <a href="{up}install.html">Install</a>
+    <a class="more" href="{up}guide/index.html#decisions">Decisions</a>
+    <a class="more" href="{up}index.html#numbers">Numbers</a>
   </nav>
   <a class="button quiet" href="{REPO}">GitHub</a>
 </header>
@@ -417,9 +418,9 @@ def build():
                 problems.append(f"{src}: a link to {target}#{frag}, which has no such heading")
     for n, p in enumerate(allp):
         up = "../" * (p.out.count("/") - 1)
-        near = [("Before", allp[n - 1]) if n else None, ("After", allp[n + 1]) if n + 1 < len(allp) else None]
-        links = "".join(f'<a class="{w.lower()}" href="{posixpath.relpath(q.out, posixpath.dirname(p.out))}"><span>{w}</span>{esc(q.label)}</a>' for w, q in filter(None, near))
-        foot = f'<footer class="tail"><nav aria-label="Next page">{links}</nav><p class="fine">This page is <a href="{REPO}/blob/main/{p.src}">{p.src}</a>.</p></footer>'
+        near = [("Previous", "prev", allp[n - 1]) if n else None, ("Next", "next", allp[n + 1]) if n + 1 < len(allp) else None]
+        links = "".join(f'<a class="{r}" rel="{r}" href="{posixpath.relpath(q.out, posixpath.dirname(p.out))}"><span>{w}</span>{esc(q.label)}</a>' for w, r, q in filter(None, near))
+        foot = f'<footer class="tail"><nav aria-label="Previous and next pages">{links}</nav><p class="fine">This page is <a href="{REPO}/blob/main/{p.src}">{p.src}</a>.</p></footer>'
         body = f'<article>\n{p.doc.body}\n</article>'
         out[p.out] = shell(p.title, p.doc.summary(), up, rail(pages, notes, p), body, foot, p.src)
     out["docs/guide/index.html"] = shell("The guide", "kith's guide and the decisions behind it, one page for each part.", "../", rail(pages, notes, None), index_body(pages, notes), "")
@@ -428,7 +429,7 @@ def build():
         search.append({"u": p.url, "t": p.title, "h": ""})
         search += [{"u": f"{p.url}#{i}", "t": p.title, "h": t} for lv, i, t in p.doc.heads if lv in (2, 3)]
     out["docs/guide/search.json"] = "[\n" + ",\n".join(json.dumps(e, separators=(",", ":"), ensure_ascii=False) for e in search) + "\n]\n"
-    return out, problems
+    return out, problems + chrome(out)
 
 
 def index_body(pages, notes):
@@ -444,12 +445,92 @@ def index_body(pages, notes):
             f'<ol class="pages">{"".join(entry(p) for p in notes)}</ol>\n</article>')
 
 
+def mark_whole(svg=MARK):
+    """What of the mark's drawing (strokes and rings included) lies outside its viewBox: [] when it is all there."""
+    x0, y0, w, h = map(float, re.search(r'viewBox="([^"]+)"', svg).group(1).split())
+    num = lambda tag, name: float(re.search(rf'{name}="([-\d.]+)"', tag).group(1))
+    out = []
+    for tag in re.findall(r"<line [^>]*>", svg):  # stroke 4, round caps: 2 each way
+        for x, y in ((num(tag, "x1"), num(tag, "y1")), (num(tag, "x2"), num(tag, "y2"))):
+            if not (x0 <= x - 2 and x + 2 <= x0 + w and y0 <= y - 2 and y + 2 <= y0 + h):
+                out.append(tag)
+    for tag in re.findall(r"<circle [^>]*>", svg):
+        x, y, r = num(tag, "cx"), num(tag, "cy"), num(tag, "r")
+        if not (x0 <= x - r and x + r <= x0 + w and y0 <= y - r and y + r <= y0 + h):
+            out.append(tag)
+    return out
+
+
+def chrome(out):
+    """What every page of the site's docs must carry: a whole mark, an Install link, a way to the page before and after;
+    and the script and styles that give code its Copy button and the page its reading line, calm under reduced motion."""
+    bad = [f"the header's mark has a part outside its viewBox: {t}" for t in mark_whole()]
+    for f, text in out.items():
+        if not f.endswith(".html"):
+            continue
+        for want in ('<a href="%sinstall.html">Install</a>' % ("../" * (f.count("/") - 1)), MARK):
+            if want not in text:
+                bad.append(f"{f}: no {want[:30]} in its header")
+        if f != "docs/guide/index.html" and not re.search(r'<footer class="tail"><nav aria-label="Previous and next pages"><a class="(prev|next)" rel=', text):
+            bad.append(f"{f}: no link to the page before or after")
+    js, css = ((ROOT / "docs" / n).read_text(encoding="utf-8") for n in ("docs.js", "docs.css"))
+    for what, ok in (
+        ("docs.js: a Copy button that writes a block's text to the clipboard", "navigator.clipboard.writeText" in js and '"Copied"' in js and "1500" in js),
+        ("docs.js: the reading line (--run)", '"--run"' in js),
+        ("docs.css: the Copy button and the reading line kept calm with prefers-reduced-motion",
+         bool(re.search(r"prefers-reduced-motion: no-preference\)[^{]*\{[^}]*\.copy", css)) and ".page::before" in css and "--run" in css),
+    ):
+        if not ok:
+            bad.append(f"missing: {what}")
+    return bad
+
+
 def used_tokens():
     """Every var(--x) of docs.css must be one site.css defines (the page may be redrawn there)."""
     have = set(re.findall(r"(--[\w-]+)\s*:", (ROOT / "docs/site.css").read_text(encoding="utf-8")))
     mine = (ROOT / "docs/docs.css").read_text(encoding="utf-8")
     own = set(re.findall(r"(--[\w-]+)\s*:", mine))
     return sorted(set(re.findall(r"var\((--[\w-]+)", mine)) - have - own)
+
+
+HAND = ["docs/index.html", "docs/install.html", "docs/404.html"]
+LOOK = re.compile(r'(?<![\w-])(?:href|src|srcset)="([^"]*)"')
+IDS = re.compile(r'(?<![\w-])id="([^"]+)"')
+TITLE = re.compile(r"<title>\s*[^<\s][^<]*</title>")
+OG = r'<meta property="%s" content="\s*[^"\s][^"]*"'
+
+
+def hand_problems():
+    """The pages written by hand: each relative link goes to a file of docs/ (and its #anchor to an id there); the two that
+    are shared and found need a title, a description and a type for what shows a link."""
+    found, problems = {}, []
+    for rel in HAND:
+        page = ROOT / rel
+        text = page.read_text(encoding="utf-8")
+        for url in LOOK.findall(text):
+            if url.startswith(("#", "data:", "mailto:")) or SCHEME.match(url) or url.startswith("//"):
+                if url.startswith("#"):
+                    found.setdefault(rel, set()).update([url])
+                continue
+            path, _, anchor = url.partition("#")
+            target = ROOT / "docs" / path
+            if not target.resolve().is_relative_to(ROOT / "docs") or not target.is_file():
+                problems.append(f"{rel}: {url} is not a file of docs/")
+            elif anchor and target.suffix == ".html" and anchor not in IDS.findall(target.read_text(encoding="utf-8")):
+                problems.append(f"{rel}: {url} has no #{anchor} on that page")
+        for url in found.get(rel, ()):
+            if url != "#" and url[1:] not in IDS.findall(text):
+                problems.append(f"{rel}: {url} has no id on the page")
+    for rel in HAND:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        if not TITLE.search(text):
+            problems.append(f"{rel}: no title")
+        for prop in ["og:title", "og:description", "og:type"] if rel.endswith("index.html") else []:
+            if not re.search(OG % prop, text):
+                problems.append(f"{rel}: no {prop}, or it is empty")
+        if rel != "docs/install.html" and not re.search(r'<meta name="description" content="\s*[^"\s]', text):
+            problems.append(f"{rel}: no description")
+    return problems
 
 
 def main():
@@ -460,7 +541,8 @@ def main():
     if args.self_test:
         return self_test()
     out, problems = build()
-    stale = [f for f, text in out.items() if not (ROOT / f).is_file() or (ROOT / f).read_text(encoding="utf-8") != text]
+    problems += hand_problems()
+    stale =[f for f, text in out.items() if not (ROOT / f).is_file() or (ROOT / f).read_text(encoding="utf-8") != text]
     # what is ours and no longer made: the pages of docs/guide, and the ADR and review pages of docs/. Never another docs/*.html.
     ours = [*(ROOT / "docs/guide").glob("*.html"), *(ROOT / "docs").glob("adr-*.html"), *(ROOT / "docs").glob("security-review-*.html")]
     stale += [str(f.relative_to(ROOT)) for f in ours if str(f.relative_to(ROOT)) not in out]
@@ -531,6 +613,13 @@ def self_test():
     # a summary skips a paragraph that only introduces what follows
     eq(one("# T\n\nThe parts:\n\n- a\n\nReal one.").summary(), "Real one.")
     eq(one("# T\n\nOnly this:\n").summary(), "Only this:")
+    # the pages written by hand: the links resolve and the landing page carries its metadata
+    assert hand_problems() == [], hand_problems()
+    assert LOOK.findall('<a href="x.html#a"><source srcset="b.png"><i data-href="no">') == ["x.html#a", "b.png"]
+    assert IDS.findall('<i id="a" data-id="no" aria-id="no">') == ["a"]
+    assert TITLE.search("<title>x</title>") and not TITLE.search("<title> </title>") and not re.search(OG % "og:type", '<meta property="og:type" content="">')
+    # the header's mark is checked against its own viewBox: a part outside it is named
+    assert mark_whole() == [] and mark_whole(MARK.replace("12 6 40 52", "12 6 20 52")) != []
     print("site_docs self-test: ok")
     return 0
 

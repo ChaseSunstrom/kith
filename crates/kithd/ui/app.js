@@ -259,6 +259,7 @@ function drawTable() {
   $('list-kind').textContent = kind?.kind ?? 'Resources';
   $('list-about').textContent = kind?.about ?? '';
   $('new').hidden = !may('apply');
+  $('peer-add').hidden = !(kind?.kind === 'RemotePeer' && may('apply'));
   const table = $('table');
   if (!kind) return table.replaceChildren();
   const columns = kind.columns.length ? kind.columns : [{ name: 'Status', path: null }];

@@ -66,6 +66,7 @@ mod vm;
 mod volume_files;
 mod volumes;
 mod wasm;
+mod websocket;
 mod worker;
 mod workload_identity;
 
@@ -109,7 +110,7 @@ struct Args {
     /// Serve the API to other nodes on this address (TLS); the first start makes this node a cluster of one
     #[arg(long, env = "KITH_LISTEN", value_name = "ADDR:PORT")]
     listen: Option<std::net::SocketAddr>,
-    /// Join the cluster of the node at this address (needs --token; listens on 0.0.0.0:7443 unless --listen says otherwise)
+    /// Join the cluster of the node at this address (needs --token; listens on 0.0.0.0:7443, or [::]:7443 for a roaming or mesh-joined node, unless --listen says otherwise)
     #[arg(long, env = "KITH_JOIN", value_name = "ADDR:PORT", requires = "token")]
     join: Option<String>,
     /// A join token, from `kith node token` on a node of that cluster
@@ -261,7 +262,7 @@ pub struct Shared {
     /// Where the output of every unit goes: `<unit id>.out` and `.err`.
     pub logs: PathBuf,
     /// Who changed what, and who was refused.
-    pub audit: audit::Audit,
+    pub audit: Arc<audit::Audit>,
     /// The WASM modules of `KindDefinition`s, compiled.
     pub wasm: Arc<wasm::Modules>,
     /// Counts changes to the store, for `GET /v1/watch`. Bumped while the store is
@@ -278,6 +279,9 @@ pub struct Shared {
     pub stop: watch::Sender<bool>,
     /// The pods of this node, and their networks.
     pub pods: Mutex<pods::Pods>,
+    /// The replicas a `kubectl delete pod` asked to restart here: (owner key, replica). The
+    /// controller takes them at its next pass; a restart is not kept over a restart of kithd.
+    pub restarts: Mutex<std::collections::BTreeSet<(String, u32)>>,
     /// The tunnels of the Exits this node holds.
     pub exits: Mutex<exits::Exits>,
     /// Dry runs (`/v1/diff`, `apply?dryRun`) at once, from asking admission to the answer:
@@ -301,6 +305,40 @@ pub struct Shared {
 /// How many dry runs at once.
 const DRY_RUNS: usize = 4;
 
+/// The most open files kithd asks for: ingress's 1024 connections hold two each, and the
+/// relays, the API and the listeners come on top (SECURITY.md).
+const NOFILE_WANTED: u64 = 65536;
+
+/// The soft limit of open files to set: the hard limit, but no more than [`NOFILE_WANTED`],
+/// and never below what it has now (a limit kithd lowered would be worse than none).
+fn nofile_soft(soft: u64, hard: u64) -> u64 {
+    hard.min(NOFILE_WANTED).max(soft).min(hard)
+}
+
+/// Raise the soft limit of open files ([`nofile_soft`]); the hard one is not touched. A
+/// failure leaves the limit as it was and is only said.
+fn raise_nofile() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let said = |e: &dyn std::fmt::Display| {
+        // (Not `eprintln!`: it panics when stderr cannot be written, and PID 1 may not.)
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!("kithd: could not raise its limit of open files: {e}\n"),
+        );
+    };
+    match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok((soft, hard)) => {
+            let want = nofile_soft(soft, hard);
+            if want != soft
+                && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, want, hard)
+            {
+                said(&e);
+            }
+        }
+        Err(e) => said(&e),
+    }
+}
+
 fn main() -> ExitCode {
     // First of all, before a thread or an argument (and before the shim below, which is
     // this same program started again): what musl's start code left writable is shut. A node
@@ -316,6 +354,8 @@ fn main() -> ExitCode {
     kith_runtime::exec_shim();
     // Started again to render a package's templates? Then this never returns either.
     releases::render_shim();
+    // Then, before the runtime and its listeners, the limit of open files they share.
+    raise_nofile();
     // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
     if std::process::id() == 1 {
         keeper::keep();
@@ -617,13 +657,25 @@ async fn replica(
             _ => {}
         }
     }
-    let replica = kith_store::open(&state.join("raft"), kith_store::node_id(name), network, poke).await?;
+    // What each entry is asked once the store is in format 3: a signed one is applied only
+    // where its signature, command, signer's rights and nonce hold by the store
+    // (`access_sign::admit`; under the store's lock, and deterministic). A CA whose fingerprint
+    // cannot be read stops the start: without it every signed entry would be refused here
+    // alone, and this store would part from the others'.
+    let audit = Arc::new(audit::Audit::new(state.join("audit.log")));
+    let id = cluster
+        .as_ref()
+        .map(|cluster| pki::fingerprint(&cluster.me.ca))
+        .transpose()
+        .map_err(|e| format!("the cluster CA's fingerprint: {e}"))?;
+    let check = access_sign::hook(id, audit.clone());
+    let replica = kith_store::open(&state.join("raft"), kith_store::node_id(name), network, poke, check).await?;
     let shared = Arc::new(Shared {
         store: replica.state,
         raft: replica.raft,
         changed,
         logs: state.join("logs"),
-        audit: audit::Audit::new(state.join("audit.log")),
+        audit,
         wasm: Arc::default(),
         generation,
         members: members::Members::new(name),
@@ -631,6 +683,7 @@ async fn replica(
         cluster,
         stop: watch::channel(false).0,
         pods: Mutex::default(),
+        restarts: Mutex::default(),
         exits: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
         order: tokio::sync::RwLock::default(),
@@ -643,9 +696,12 @@ async fn replica(
     let _ = reach.set(Arc::downgrade(&shared));
     // ponytail: an empty Raft is opened and ended again, so that what reads `shared.raft`
     // (who leads, who votes) needs no second path on a worker: it leads nothing and has no members.
-    if let Some((store, at, _)) = view {
+    if let Some((mut store, at, _)) = view {
         let _ = shared.raft.shutdown().await;
-        shared.store.lock().expect("nothing panics holding the store").store = store;
+        let mut state = shared.store.lock().expect("nothing panics holding the store");
+        store.continue_changes(&state.store);
+        state.store = store;
+        drop(state);
         shared.view.send_replace(Some(at));
         return Ok(shared);
     }
@@ -832,6 +888,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     let state = state
         .canonicalize()
         .map_err(|e| fail("resolving the state directory", &e))?;
+    // The root part's own word for where a mount may be (`root_part::check_create`).
+    root_part::set_state(state.clone());
     // Nobody answered and the state is ours: a socket here is a dead kithd's. Anything else is not ours to remove.
     use std::os::unix::fs::FileTypeExt;
     if std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()) {
@@ -1049,7 +1107,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             );
             let key = async {
                 if let Some(((record, config), opened)) = sealed.zip(opened) {
-                    crypt::keep(shared.clone(), config, record, opened, stopping.clone()).await;
+                    let keys = update::keys(args.release_key.clone(), &state);
+                    crypt::keep(shared.clone(), config, record, opened, keys, stopping.clone()).await;
                 }
             };
             let hardware = devices::run(shared.clone(), stopping.clone(), dmem);
@@ -1111,7 +1170,12 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();
         let taken = args.ingress.then_some(taken);
         // (Without a mesh too: a node's Services answer its pods there as well, T-0723.)
-        let proxy = services::run(shared.clone(), args.mesh, taken, stopping.clone());
+        let services = services::run(shared.clone(), args.mesh, taken, stopping.clone());
+        // (What each pod may reach, kept in step with its policies: on a node alone too.)
+        let held = pods::keep_held(shared.clone(), stopping.clone());
+        let proxy = async {
+            tokio::join!(services, held);
+        };
         let ingress = async {
             // (A control node with --acme alone orders for the workers that serve ingress.)
             if args.ingress || args.acme.is_some() {
@@ -1243,6 +1307,17 @@ async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, m
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nofile_soft_is_the_hard_limit_up_to_65536_and_never_less_than_now() {
+        use super::nofile_soft;
+        assert_eq!(nofile_soft(1024, 4096), 4096);
+        assert_eq!(nofile_soft(1024, 524288), 65536);
+        assert_eq!(nofile_soft(1024, 1024), 1024);
+        assert_eq!(nofile_soft(100_000, 524288), 100_000);
+        assert_eq!(nofile_soft(1024, u64::MAX), 65536);
+        assert_eq!(nofile_soft(u64::MAX, u64::MAX), u64::MAX);
+    }
+
     #[test]
     fn advertise_is_an_address_not_a_name() {
         use clap::Parser;
@@ -1385,6 +1460,16 @@ mod tests {
         assert!(unreachable_listen(any, true, true).is_none());
         assert!(unreachable_listen(some, false, true).is_none());
         assert!(unreachable_listen(any, false, false).is_none());
+    }
+
+    /// The `--join` help names both addresses the node may listen on: 0.0.0.0 for a LAN node, and
+    /// [::] for a roaming or mesh-joined one (see `listen` in `membership`).
+    #[test]
+    fn join_help_names_both_binds() {
+        let cmd = Args::command();
+        let join = cmd.get_arguments().find(|arg| arg.get_id() == "join").expect("--join");
+        let help = join.get_help().expect("--join has help").to_string();
+        assert!(help.contains("0.0.0.0:7443") && help.contains("[::]:7443"), "{help}");
     }
 
     #[test]

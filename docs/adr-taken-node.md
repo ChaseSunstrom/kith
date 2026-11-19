@@ -253,8 +253,8 @@ Every node, applying an entry, decides the same way from the entry and its own s
 2. Checks the signer may do the command, with the rights in that store
    (`Grants::of`, crates/kithd/src/access.rs:102-131).
 3. Checks the nonce. Nonces are kept in the store, per signer, with their `expires`. A nonce
-   seen is refused. An entry whose `expires` is more than five minutes before the newest
-   `expires` of the same signer is refused, and nonces older than that are dropped.
+   seen is refused. An entry whose `expires` is five minutes or more before the newest
+   `expires` of the same signer is refused, and nonces that old are dropped.
 4. Takes time from the envelope's `expires`. Never the clock: two nodes must decide alike.
 
 Kept per signer, a forged far-future `expires` spoils only the forger's own key. A refused
@@ -362,6 +362,103 @@ text above, the safe way was taken, and each is said here:
 - **A signed request's body is read whole**, up to 96 MiB, to be hashed.
 - The first `adminKey` is written unsigned, while the cluster is `open`; after that the
   key and `spec.signing` change only by a write the admin signed.
+
+### Layer 3 as built: slice 2 (T-0783)
+
+Slice 1 (T-0779) put `Signed { header, method, path, body, command }` in the store, its
+per-signer nonce book, and FORMAT 3 (`MarkSigned`), proposed once every member reads it.
+Slice 2 makes the entry mean something:
+
+- **FORMAT 4 (`MarkChecked`).** A T-0779 kithd reads format 3 and refuses every Signed
+  entry at apply; one that checks it would take it, and the stores would part in a rolling
+  upgrade. So the leader proposes `MarkChecked` only once every member says it reads 4
+  (as for 2 and 3), and below 4 every node refuses a Signed entry, as T-0779's does.
+- **The leader writes it.** At format 4, a signed apply, delete or rollback the leader
+  applies goes in the log as `Signed`, with the header, method, path (query included) and
+  body (base64) it came with, around the command (`Shared::write_as`). Below format 4 it
+  is written bare. Any other signed route (a drain, a `kith run`) stays bare, as before.
+- **Every node checks it at apply** (`access_sign::admit`, run under the store's lock by
+  the hook main.rs hands the state machine), in this order, from the entry and its store
+  only: the signature holds by the store's keys (`access_sign::signature`: `verify` split,
+  no clock and no nonce); the target is `*` or the node that wrote the entry; the method,
+  path and body make the carried command over that store (re-derived as the route does:
+  `stamped`, a release's history for its rollback; never trusted); `Grants::of` lets the
+  signer do it, and the admin's key and `spec.signing` change only by the admin; and the
+  signer's book takes the nonce. A refusal applies nothing, on every node alike, and is
+  written in the audit log as `signed`. The edge keeps its clock and its in-memory nonce
+  cache (`verify`, as before).
+- **What a kind's admission may rewrite is taken as carried.** A custom kind's module runs
+  once, at the leader, and its answer is not deterministic to re-run: for those resources
+  only spec, labels and annotations come from the carried command; all else must match.
+  An apply's `at` is the leader's and is not compared.
+- **The nonce book is capped**: 4096 entries per signer within five minutes of each other
+  (`SIGNED_NONCES`), past which a signed entry is refused, so a key can't grow the store
+  without bound. Time is only the entries' `expires`.
+- **Only the leader moves the format and writes Signed.** `/v1/raft/write` and a control
+  node's own writes (`own_writes::checked`) refuse a Signed entry from any other node, and
+  a `Mark`, `MarkSigned` or `MarkChecked` above the store's format. One at or below it is a
+  no-op and is taken: an older follower's relayed write waits on a `Mark` as its barrier.
+  This build's barrier is an empty `Patch`.
+- **What slice 2 leaves:**
+  - A taken leader can still write any bare `Apply` or `Delete`. Slice 2 stops only
+    forged Signed entries. Bare access writes are refused by slice 3 (below); every
+    other bare spec write only with slice 6.
+  - A Signed entry's `at` is not compared on `Apply` or `Rollback`: the revision and
+    `born` the leader stamps are taken as carried.
+  - A header held back can be applied late, past its `expires`, and after a newer one
+    from the same signer. Apply has no clock. Each signer's book is measured only by
+    that signer's newest `expires`, so a header stays good until the book holds one
+    expiring 300 s (`SIGNED_SKEW`) or more after it.
+  - A newest `expires` across all signers was weighed and not done. One signer, or a
+    taken leader, writing a far-future `expires` would lock every other signer out for
+    good.
+  - A definition or a key that changes between the write and its apply can refuse a
+    write the leader took. The signer sends it again.
+  - A refused entry replayed from the log is audited again.
+  - The controllers' entries (the table above) are not signed yet.
+
+### Layer 3 as built: slice 3 (T-0825)
+
+Under `spec.signing: required` at format 4, `access_sign::admit` refuses a bare command
+that changes access, on every node, from the entry alone (`bare`). It is the same
+predicate the leader's edge uses, so a taken leader's bare write is refused by the other
+nodes too, and a replay decides alike.
+
+- **What is refused bare:** an `Apply`, `Delete` or `Rollback` of a Role, RoleBinding,
+  Identity, KindDefinition or Cluster (`raft::changes_access`, which looks into a Signed
+  entry's command), and any `Import`. A `Patch`, `Status` or `Report` is not one: each sets
+  a status, never a spec, and access reads spec (what it reads of a Node's status, its
+  address, `ca` and `view`, is the node's own, held by layer 2). A refusal applies nothing
+  and is audited as `signed`, with the keys it touched as its targets. An open cluster, and a store below format 4, take
+  them as before: the hook decides nothing until `Store::checking()`.
+- **The certificate route writes its Identity Signed.** The admin signs an empty
+  `POST /v1/identities/NAME/certificate` at the CA node's local socket; the node makes the
+  key after the signature and writes the Identity (with its `publicKey`) as a Signed entry
+  around it. Every node takes it through `certified`: one `Apply` of the Identity as the
+  store has it, with only a valid P-256 `publicKey` changed. A forged or changed entry is
+  refused. The route is signed but never relayed (`Relay::signs` is the wrap predicate,
+  `Relay::carries` the relay one): the route answers only on the CA node while it leads. A
+  CA node that does not lead says so (and the leader, not holding the CA key, answers
+  `CA_ELSEWHERE`); passing the request on is a follow-up, not built here.
+- **A signed write sent to a follower over TLS** is relayed as it came (method, path, body
+  and header unchanged), and the leader writes it Signed; both nodes apply it alike. Bare,
+  the follower and the local socket refuse it, as in layer 1.
+- **What stays bare, for later slices:** the node's own writes, ACME, the scheduler and
+  cron (slice 5); a Release, Source, registry, update or wasm write, and refusing every
+  bare spec write (slice 6). The forge VM test is slice 4.
+- **What it costs:** `kith node claim` (a bare Identity, Role and RoleBinding) and a
+  restore (`Import`) are refused under `required`; sign them as a change, or set `open`
+  first. A rolling upgrade from slice 2 can part: a slice 2 node takes a bare access write
+  at format 4 that a slice 3 node refuses, so update every node before `required`.
+  A Release or Source that renders (or prunes) a Role, RoleBinding, Identity or
+  KindDefinition is a bare write too, so it is refused at apply: its controller proposes
+  nothing under `required` (`releases::refuse_access`) and says so in the Release's or
+  Source's status, once, not in an entry every node audits again each round. Slice 6
+  (T-0850, `writer_may` for a Release and a Source) lifts it.
+- **What a taken leader can still do:** put its own `publicKey` on an Identity the admin
+  signed the route for: `certified` checks the key is a valid P-256 point and that nothing
+  else changed, but not whose it is, as the key is made after the signature (see "What
+  stays open").
 
 ## Why not short-lived node certificates
 

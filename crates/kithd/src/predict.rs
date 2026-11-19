@@ -1,14 +1,13 @@
-//! What PCR 4 will read after an update, from a TCG event log and the new boot file alone
-//! (docs/adr-unlock.md, "How the new values are predicted", steps 1 to 3 for PCR 4).
+//! What PCR 4 and PCR 9 will read after an update, from a TCG event log and the two boot
+//! files alone (docs/adr-unlock.md, "How the new values are predicted", steps 1 to 3).
 //!
 //! Pure functions over bytes: no TPM command, no file, no device. The log is the TCG
 //! crypto-agile one the kernel gives (SHA-256 digests); it is replayed, and only where the
 //! replay is what TPM2_PCR_Read gave is anything predicted. The event that holds the
-//! running boot file's PE Authenticode hash is then made again from the new file.
-//! (PCR 9's command line, `tpm-next:` and the update's hook are later slices.)
-
-// Nothing calls these until the update's hook does (the next slice of step 4).
-#![allow(dead_code)]
+//! running boot file's PE Authenticode hash (PCR 4) is then made again from the new file,
+//! and so is the one that holds its command line (PCR 9), in the form the running log's
+//! event proves: where no event matches the running file's command line in any of the
+//! four forms, nothing is predicted.
 
 use sha2::{Digest, Sha256};
 
@@ -17,6 +16,8 @@ type Hash = [u8; 32];
 /// What a refusal says when the replay is not what the TPM reads.
 pub const UNEXPLAINED: &str = "the event log does not explain this start";
 const NO_BOOT_FILE: &str = "the event log has no event for the running boot file";
+const NO_CMDLINE: &str =
+    "the event log has no event in PCR 9 that is the running boot file's command line in any of the four forms tried";
 const ALG_SHA256: u16 = 0x000B;
 const EV_NO_ACTION: u32 = 3;
 const PCRS: usize = 24;
@@ -184,18 +185,86 @@ pub fn explains(events: &[Event], read: &[(u32, Hash)]) -> Result<(), String> {
     Ok(())
 }
 
-/// The PCR 4 a start will read with `new` as the boot file instead of `running`, which
-/// the log must hold exactly one event for, and whose PCR 4 (`read`) the log must explain.
-pub fn predict_pcr4(log: &[u8], read: &Hash, running: &[u8], new: &[u8]) -> Result<Hash, String> {
-    let mut events = parse_log(log)?;
-    explains(&events, &[(4, *read)])?;
-    let (running, new) = (authenticode(running)?, authenticode(new)?);
-    let mut held = events.iter_mut().filter(|e| e.pcr == 4 && e.digest == running);
-    match (held.next(), held.next()) {
-        (Some(e), None) => e.digest = new,
-        _ => return Err(NO_BOOT_FILE.into()),
+/// The command line a boot file (a unified kernel image) carries: its `.cmdline` section,
+/// as text, without the zeros that pad it. A line with a zero inside it is refused.
+fn cmdline(pe: &[u8]) -> Result<&str, String> {
+    let nt = le32(pe, 0x3c)?;
+    let table = nt + 24 + le16(pe, nt + 20)?;
+    for i in 0..le16(pe, nt + 6)? {
+        let at = table + 40 * i;
+        if take(pe, at, 8)? != b".cmdline" {
+            continue;
+        }
+        let (virtual_size, raw_size, start) = (le32(pe, at + 8)?, le32(pe, at + 16)?, le32(pe, at + 20)?);
+        // (What the section holds is VirtualSize long; the file pads it to SizeOfRawData.)
+        let size = if virtual_size == 0 {
+            raw_size
+        } else {
+            virtual_size.min(raw_size)
+        };
+        let padded = take(pe, start, size)?;
+        let line = &padded[..padded.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1)];
+        if line.contains(&0) {
+            return Err("a command line with a zero in it".into());
+        }
+        return std::str::from_utf8(line).map_err(|_| "a command line that is not UTF-8".to_string());
     }
-    Ok(replay(&events)?[4])
+    Err("the boot file has no .cmdline section".into())
+}
+
+/// What the firmware or the stub may have extended for `text`: the SHA-256 of it as UTF-16
+/// little-endian or as UTF-8, with the ending zero or without (the ADR's four forms).
+fn forms(text: &str) -> [Hash; 4] {
+    let wide: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let of = |bytes: &[u8], zero: &[u8]| -> Hash { Sha256::digest([bytes, zero].concat()).into() };
+    [
+        of(&wide, &[0, 0]),
+        of(&wide, &[]),
+        of(text.as_bytes(), &[0]),
+        of(text.as_bytes(), &[]),
+    ]
+}
+
+/// The one event of `pcr` whose digest is `from`, made `to`; any other count is `why`.
+fn swap(events: &mut [Event], pcr: u32, from: &Hash, to: Hash, why: &str) -> Result<(), String> {
+    let mut held = events.iter_mut().filter(|e| e.pcr == pcr && e.digest == *from);
+    match (held.next(), held.next()) {
+        (Some(e), None) => {
+            e.digest = to;
+            Ok(())
+        }
+        _ => Err(why.into()),
+    }
+}
+
+/// The PCR 4 and PCR 9 a start will read with `new` as the boot file instead of `running`
+/// (the files as they lie on the ESP, whose PCRs `read4` and `read9` are the TPM's now).
+/// The log must explain both values, and hold exactly one event for the running file in
+/// PCR 4 (its Authenticode hash) and one in PCR 9 (its `.cmdline` in one of the four forms:
+/// the form that is there makes the new one). Anything else predicts nothing.
+pub fn predict_pcrs(
+    log: &[u8],
+    read4: &Hash,
+    read9: &Hash,
+    running: &[u8],
+    new: &[u8],
+) -> Result<(Hash, Hash), String> {
+    let mut events = parse_log(log)?;
+    explains(&events, &[(4, *read4), (9, *read9)])?;
+    let (old_hash, new_hash) = (authenticode(running)?, authenticode(new)?);
+    swap(&mut events, 4, &old_hash, new_hash, NO_BOOT_FILE)?;
+    let (old, new) = (forms(cmdline(running)?), forms(cmdline(new)?));
+    let present = |form: &usize| events.iter().any(|e| e.pcr == 9 && e.digest == old[*form]);
+    let mut found = (0..4).filter(present);
+    let form = found.next().ok_or(NO_CMDLINE)?;
+    // (Two forms that are both there and would make different events: which one the stub
+    // made is not known. An empty line is one such: UTF-16 and UTF-8 of it are the same.)
+    if found.any(|other| old[other] != old[form] || new[other] != new[form]) {
+        return Err(NO_CMDLINE.into());
+    }
+    swap(&mut events, 9, &old[form], new[form], NO_CMDLINE)?;
+    let replayed = replay(&events)?;
+    Ok((replayed[4], replayed[9]))
 }
 
 #[cfg(test)]
@@ -370,46 +439,158 @@ mod tests {
         assert!(parse_log(&algs).is_err());
     }
 
+    /// A boot file like `pe`'s with `line` for its `.cmdline` section (the first, at
+    /// 0x400, padded with zeros), and a byte of the other section flipped by `flip`.
+    fn uki(line: &str, flip: u8) -> Vec<u8> {
+        let (mut file, _) = pe(1, &[]);
+        put(&mut file, 0x148, b".cmdline");
+        put(&mut file, 0x148 + 8, &(line.len() as u32).to_le_bytes());
+        file[0x400..0x500].fill(0);
+        put(&mut file, 0x400, line.as_bytes());
+        file[0x210] ^= flip;
+        file
+    }
+
     #[test]
-    fn tpm_predict_changed() {
-        let (running, _) = pe(1, &[]);
-        let (mut new, _) = pe(1, &[]);
-        new[0x210] ^= 0xFF;
+    fn tpm_next_predict_changed() {
+        let running = uki("root=/dev/vda quiet", 0);
+        let new = uki("root=/dev/vdb quiet", 0xFF);
         let (r, n) = (authenticode(&running).unwrap(), authenticode(&new).unwrap());
         assert_ne!(r, n);
         let (fw, other) = (sha("firmware"), sha("other"));
+        let (c9, c9n) = (forms("root=/dev/vda quiet")[0], forms("root=/dev/vdb quiet")[0]);
+        let read9 = chain(&[c9, other]);
         let bytes = log(&[
             (4, 0x8000_0003, fw),
             (4, 0x8000_0003, r),
             (4, 0x8000_0003, other),
             (7, 1, r),
+            (9, 0x0D, c9),
+            (9, 0x0D, other),
         ]);
         let read = chain(&[fw, r, other]);
         // the event for the running file is the new file's, and PCR 7 is not touched
-        assert_eq!(predict_pcr4(&bytes, &read, &running, &new), Ok(chain(&[fw, n, other])));
-        // a log that is not this start's predicts nothing
         assert_eq!(
-            predict_pcr4(&bytes, &chain(&[fw, r]), &running, &new),
+            predict_pcrs(&bytes, &read, &read9, &running, &new),
+            Ok((chain(&[fw, n, other]), chain(&[c9n, other])))
+        );
+        // a log that is not this start's predicts nothing: not in PCR 4, not in PCR 9
+        assert_eq!(
+            predict_pcrs(&bytes, &chain(&[fw, r]), &read9, &running, &new),
+            Err(UNEXPLAINED.into())
+        );
+        assert_eq!(
+            predict_pcrs(&bytes, &read, &chain(&[c9]), &running, &new),
             Err(UNEXPLAINED.into())
         );
         // no event for the running boot file
-        let (elsewhere, _) = pe(2, &[]);
-        let mut moved = elsewhere.clone();
-        moved[0x300] ^= 1;
-        assert_eq!(predict_pcr4(&bytes, &read, &moved, &new), Err(NO_BOOT_FILE.into()));
-        // the running file's digest in PCR 7 only is no event of PCR 4
-        let seven = log(&[(4, 1, fw), (7, 1, r)]);
+        let mut moved = running.clone();
+        moved[0x210] ^= 1;
         assert_eq!(
-            predict_pcr4(&seven, &chain(&[fw]), &running, &new),
+            predict_pcrs(&bytes, &read, &read9, &moved, &new),
+            Err(NO_BOOT_FILE.into())
+        );
+        // the running file's digest in PCR 7 only is no event of PCR 4
+        let seven = log(&[(4, 1, fw), (7, 1, r), (9, 1, c9)]);
+        assert_eq!(
+            predict_pcrs(&seven, &chain(&[fw]), &chain(&[c9]), &running, &new),
             Err(NO_BOOT_FILE.into())
         );
         // two events for it: which one is the boot file is not known
-        let twice = log(&[(4, 1, r), (4, 1, r)]);
+        let twice = log(&[(4, 1, r), (4, 1, r), (9, 1, c9)]);
         assert_eq!(
-            predict_pcr4(&twice, &chain(&[r, r]), &running, &new),
+            predict_pcrs(&twice, &chain(&[r, r]), &chain(&[c9]), &running, &new),
             Err(NO_BOOT_FILE.into())
         );
         // a new file that is not a PE
-        assert!(predict_pcr4(&bytes, &read, &running, b"not a PE").is_err());
+        assert!(predict_pcrs(&bytes, &read, &read9, &running, b"not a PE").is_err());
+    }
+
+    #[test]
+    fn tpm_next_predict_forms() {
+        let (running, new) = (uki("root=/dev/vda quiet", 0), uki("root=/dev/vdb quiet", 0xFF));
+        let (r, n) = (authenticode(&running).unwrap(), authenticode(&new).unwrap());
+        let (old, next) = (forms("root=/dev/vda quiet"), forms("root=/dev/vdb quiet"));
+        let (read4, other) = (chain(&[r]), sha("other"));
+        // each of the four forms is matched, and the new line is made in that form
+        for form in 0..4 {
+            for first in [0, 1] {
+                let mut nine = [other, other];
+                nine[first] = old[form];
+                let bytes = log(&[(4, 0x8000_0003, r), (9, 1, nine[0]), (9, 1, nine[1])]);
+                let mut want = nine;
+                want[first] = next[form];
+                assert_eq!(
+                    predict_pcrs(&bytes, &read4, &chain(&nine), &running, &new),
+                    Ok((chain(&[n]), chain(&want))),
+                    "form {form}"
+                );
+            }
+        }
+        // the form is told by the event: a line measured in no form tried predicts nothing
+        let at = |events: &[(u32, u32, Hash)]| {
+            let nine: Vec<Hash> = events.iter().filter(|e| e.0 == 9).map(|e| e.2).collect();
+            let bytes = log(&[&[(4, 0x8000_0003, r)][..], events].concat());
+            predict_pcrs(&bytes, &read4, &chain(&nine), &running, &new)
+        };
+        assert_eq!(at(&[(9, 1, other)]), Err(NO_CMDLINE.into()));
+        assert_eq!(at(&[(9, 1, forms("root=/dev/vda debug")[0])]), Err(NO_CMDLINE.into()));
+        assert_eq!(at(&[]), Err(NO_CMDLINE.into()));
+        // an event of another PCR is not the command line's
+        assert_eq!(at(&[(8, 1, old[0]), (9, 1, other)]), Err(NO_CMDLINE.into()));
+        // two forms both there, or one form twice: which one is the stub's is not known
+        assert_eq!(at(&[(9, 1, old[0]), (9, 1, old[3])]), Err(NO_CMDLINE.into()));
+        assert_eq!(at(&[(9, 1, old[1]), (9, 1, old[1])]), Err(NO_CMDLINE.into()));
+        // an empty running line has one digest for UTF-16 without its zero and UTF-8
+        // without its zero alike: a new line that would differ between them is refused
+        let empty = uki("", 0);
+        let e = authenticode(&empty).unwrap();
+        let blank = forms("");
+        assert_eq!(blank[1], blank[3]);
+        let measured = log(&[(4, 1, e), (9, 1, blank[3])]);
+        assert_eq!(
+            predict_pcrs(&measured, &chain(&[e]), &chain(&[blank[3]]), &empty, &new),
+            Err(NO_CMDLINE.into())
+        );
+        // and one that is the same in both is predicted
+        let still = uki("", 0xFF);
+        let s = authenticode(&still).unwrap();
+        assert_eq!(
+            predict_pcrs(&measured, &chain(&[e]), &chain(&[blank[3]]), &empty, &still),
+            Ok((chain(&[s]), chain(&[blank[3]])))
+        );
+        // a boot file without a .cmdline, with a zero in it, or that is not UTF-8
+        let (plain, _) = pe(1, &[]);
+        assert!(cmdline(&plain).is_err());
+        let mut inner = uki("abc", 0);
+        inner[0x401] = 0;
+        assert!(cmdline(&inner).is_err());
+        let mut bad = uki("ab", 0);
+        bad[0x400] = 0xFF;
+        assert!(cmdline(&bad).is_err());
+        // padding after the line is not the line, and a section cut short is no line
+        assert_eq!(cmdline(&running), Ok("root=/dev/vda quiet"));
+        assert!(cmdline(&running[..0x410]).is_err());
+        assert!(cmdline(b"MZ").is_err());
+    }
+
+    #[test]
+    fn tpm_next_forms_by_hand() {
+        let h = |b: &[u8]| -> Hash { Sha256::digest(b).into() };
+        // "ab" in the four forms, written out by hand, in the order forms() lists them
+        assert_eq!(
+            forms("ab"),
+            [
+                h(&[0x61, 0, 0x62, 0, 0, 0]),
+                h(&[0x61, 0, 0x62, 0]),
+                h(&[0x61, 0x62, 0]),
+                h(&[0x61, 0x62]),
+            ]
+        );
+        // U+1F600 is past the BMP: a surrogate pair, D83D DE00, little-endian 3D D8 00 DE
+        assert_eq!(forms("\u{1F600}")[1], h(&[0x3D, 0xD8, 0x00, 0xDE]));
+        // é is one UTF-16 unit and two UTF-8 bytes
+        assert_eq!(forms("é")[1], h(&[0xE9, 0]));
+        assert_eq!(forms("é")[3], h(&[0xC3, 0xA9]));
     }
 }

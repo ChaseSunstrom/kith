@@ -1,9 +1,30 @@
 # kithd in two parts: what reads the network holds no root
 
-Status: design, before any code (T-0334). Nothing here is built. A security review reads
-this record before the first line of the split is written; what it finds is decided at
-the end ("Review"). The first cut ("Step A") ships by itself and is worth having even if
-the rest is never built.
+Status: design, partly built (T-0334). Built: Step A, the node's own policy
+(`crates/kithd/src/policy.rs`, read and applied in `main.rs:729-734`), and the seam of the
+split in `crates/kithd/src/root_part.rs`, with listeners as its first family. Not built:
+the socket, the second process, every other family, the serving part's confinement. A
+security review read this record before the split was written; what it found is decided
+at the end ("Review"). Step A ships by itself and is worth having even if the rest is
+never built.
+
+What is built, where the code is the word where this record differs:
+
+- **Step A** (`policy.rs`): `read` takes `KITH_NODE_POLICY` or the flag, `cut` applies it,
+  `set`/`get` hold it for the process; its status is in the node's status (`main.rs:1121`).
+- **`root_part.rs`**: the `Request` enum (only `Bind` so far, `deny_unknown_fields`), its
+  wire (`decode`: JSON, at most `MAX_REQUEST` = 256 KiB, unknown fields and variants
+  refused; nothing reads a wire yet, the tests do), `check` (a request is refused for what
+  it is, never for who asks; `Bind` refuses kithd's own ports 7443, 5000, 51820 and
+  multicast addresses), and the `Root` trait with its in-process `Direct`.
+- **`Bind`** is used by `share.rs`'s NFS listener (`share.rs:397`).
+- There is no socket and no second process yet.
+
+The carve of the rest, one task each: T-0808 pods and Services behind `Root`, with a
+counter of crossings; T-0809 mesh, images, units, volumes and node; T-0810 the socket
+pair transport, `--split` off by default; T-0811 confinement of the serving part, tied
+lifetimes of the two parts, and the VM test of privilege; T-0812 the before and after
+runs, the budgets, and `--split` on by default.
 
 ## The problem
 
@@ -231,6 +252,57 @@ Sockets made ahead cost kernel memory while idle: 16 unconnected TCP sockets a p
 Measured in step 4; if it shows in the idle budget the count becomes 4 until a pod has
 taken its first connection.
 
+As built in one process (T-0808, `kithd/src/root_part.rs`): `Direct` does `Pod`, `Sockets`
+(16 a request, asked for when 8 are left, and only for a pod's address family that
+connections use), and `Create` and `Start`, each after `check` or `check_create` has
+looked at what is asked and never at who asks: a mount from anywhere but the places a unit's
+mounts are made from, a device no claim granted, a network namespace that is no pod's of this
+node, and what the node's policy has none of are refused. A `Book` counts what crosses, and the
+`crossings` tests assert this table against it. `Create` and `Start` take an image and a handle
+that have no wire form yet, so they are methods of `Root` and not variants of `Request` until the
+root part is a process (T-0810). The bound of 32 unused sockets a pod and their time is kept by
+the serving part, since a root part in this process cannot tell which are unused. A pod let go
+and made again under its id while sockets are being made for it gets none of them: the serving
+part notes which making of the pod it asked about, and closes the batch if it is another.
+
+**Mounts: an allow-list of places, not Volume names, and why.** A `Create` here carries host
+paths, because the controller already resolved a Volume to its directory and a wire form of
+"Volume name and sub-path" would change what a container is given (a non-goal of T-0808). So
+`check_mount` allows only what the controller makes a mount from, after resolving the path
+(a path that does not resolve is refused, and so is a relative one): `state/volumes/<ns>/<name>`,
+`state/remote/<node>/<ns>/<name>`, `state/seats/<seat>`, the unit's own pod's `replicas/<pod>/files`
+(its container's own), `scratch` and, in memory, its pod's `identity` (its container's own); the
+pod's `resolv.conf` and `hosts`, read-only. Never the state directory itself, `pki` (the CA, node
+and people keys), the memory directory or another pod's. A host path outside these only where
+`hostPaths` is on, and never given to a user. `give` (the tree is made the container's user's)
+is refused for anything a unit does not own: only volumes, remote shares, seats and its own pod's
+files (a rolling update's second generation, pod `<pod>b`, mounts its replica's). A user past
+the 65536 ids a container's range has is refused where anything is given and the runtime
+shifts ids (a unit of its own network, not the host's users, with no device).
+T-0810 replaces the path forms with names (`Volume(name, sub-path)`), which makes this list
+the root part's own derivation.
+
+**For T-0810, what the two-process step must check against the root part's own configuration
+and sysfs, as one process cannot:**
+
+- *A path swapped after the check.* `check_mount` resolves a path and the container is made
+  later: a symlink put in its place between the two is followed. In one process, with the serving
+  part trusted, that is the same hands; across the socket it is a hole. The root part must open
+  each mount source itself with `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`) beneath the
+  directory it derived, and pass the descriptor on (`SCM_RIGHTS`, mounted through `/proc/self/fd`
+  or `open_tree`), never the path again.
+- *The pod's network.* The pod's address in the mesh /80, its exit tunnel and its DNS are what
+  the asker says and are not verified; the root part must derive them from its own `--pod-range`,
+  tunnels and gateway.
+- *Devices.* They are checked against the asker's own claim set, which is a union across every
+  workload, not the claims of the workload this unit is of; the root part must hold each claim
+  against the device's name in its own sysfs inventory and the unit it was granted to.
+- *Exec units and VMs skip `Create`'s check* today (they have their own start path): each needs
+  a check of its own at the same boundary, not none.
+- *`check_create` ignores `host_users`, `drop`, `nested`, `project` and `dmem`.* Each is a
+  widening or a limit that the asker chooses; the root part must hold them to its own policy and
+  to limits it set, not to what is sent.
+
 **The sixth criterion is corrected by this record**: it said "none for a Service
 connection". With sockets made ahead it is "at most N/8 + 1 for N connections into a
 pod, and none for any other". The rival that reaches zero, a rule in each pod's
@@ -410,7 +482,8 @@ used by `share.rs`'s NFS listener). No socket and no second process yet.
 Taken in step 4 on the commit before Step A and again after the split, three runs each
 on the same VMs: apply to ready, and requests a second through a Service
 (`ci/compare.sh`'s rows by those names), and idle memory of both parts together (each
-part's proportional share, summed). The before runs are written here when taken. Two
+part's proportional share, summed). The before and after runs are taken and written here
+by T-0812, not before. Two
 processes of one binary share its text; the root part's own memory is what is added.
 The 9.00 MB idle budget is not moved by this task: if the sum passes what the single
 process holds today, the owner is asked.

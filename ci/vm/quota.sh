@@ -331,7 +331,9 @@ EOF
             number=$(sfdisk -d "$work/n1.raw" | sed -n 's/^[^ ]*[^0-9]\([0-9][0-9]*\) :.*name="state".*/\1/p')
             timeout 600 qemu-system-x86_64 -enable-kvm -cpu host -m 1024 -smp 2 -display none -no-reboot -machine q35 \
                 -kernel "$base/vmlinuz" -initrd "$work/unit.cpio" -append "console=ttyS0 panic=-1 -- tests /dev/vda$number" \
-                -drive "file=$work/n1.raw,format=raw,if=virtio" -serial "file:$work/unit.log" -monitor none </dev/null >/dev/null 2>&1 \
+                -drive "file=$work/n1.raw,format=raw,if=virtio" -serial "file:$work/unit.log" -monitor none </dev/null >/dev/null 2>&1 8>&- &
+            vms="$vms $!"
+            wait "$!" \
                 || fail "the machine of kithd's unit tests did not power off: $(tail -n 20 "$work/unit.log")"
             want=$(grep -c 'fn storage_projects_' "$root/crates/kithd/src/controller/storage.rs")
             grep -aq "test result: ok. $want passed" "$work/unit.log" || fail "kithd's storage_projects_ tests, not $want passed: $(grep -a -e 'test result' -e panicked -e 'tests:' "$work/unit.log")"

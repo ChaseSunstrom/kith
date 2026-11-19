@@ -1,0 +1,97 @@
+# The eight services of crates/kith-cli/tests/fixtures/media-stack.yml on kith's test pod (ci/pod.rs):
+# every image is kith.test/pod:1, and each runs one of the pod's own commands: `serve` answers every
+# connection on port 80 with its hostname, `stays` waits. The import carries every key here (it exits 0).
+# Left out, because kith does not carry them or the test pod cannot run them: networks (a namespace is
+# one network), depends_on, labels and platform, capabilities but NET_RAW (serve binds port 80 as root),
+# read_only (serve writes its root), devices, env files, host paths and ports, UDP, user, tmpfs, pull
+# policy, and a secret-named variable (PASSWORD). downloader shares vpn's pod (network_mode), so it has
+# no Service of its own and is ready with vpn.
+services:
+  vpn:
+    image: kith.test/pod:1
+    entrypoint: ["/bin/pod"]
+    command: ["serve"]
+    expose:
+      - "80"
+    volumes:
+      - ./config/vpn:/config
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+  downloader:
+    image: kith.test/pod:1
+    entrypoint: ["/bin/pod"]
+    command: ["stays"]
+    network_mode: "service:vpn"
+    volumes:
+      - downloads:/downloads
+  indexer:
+    image: kith.test/pod:1
+    entrypoint: ["/bin/pod"]
+    command: ["serve"]
+    environment:
+      GREETING: indexing
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+  shows:
+    image: kith.test/pod:1
+    entrypoint: ["/bin/pod"]
+    command: ["serve"]
+    expose:
+      - "80"
+    cap_drop:
+      - NET_RAW
+  films:
+    image: kith.test/pod:1
+    entrypoint: ["/bin/pod"]
+    command: ["serve"]
+    expose:
+      - "80"
+    volumes:
+      - library:/media
+      - ./config/films:/config
+  requests:
+    image: kith.test/pod:1
+    entrypoint: ["/bin/pod"]
+    command: ["serve"]
+    environment:
+      TZ: UTC
+      PUID: "1000"
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+  media:
+    image: kith.test/pod:1
+    container_name: mediaserver
+    entrypoint: ["/bin/pod"]
+    command: ["serve"]
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+    expose:
+      - "80"
+    volumes:
+      - library:/library:ro
+      - downloads:/downloads
+  subtitles:
+    image: kith.test/pod:1
+    entrypoint: ["/bin/pod"]
+    command: ["serve"]
+    environment:
+      TZ: UTC
+    expose:
+      - "80"
+volumes:
+  library:
+  downloads:

@@ -151,22 +151,21 @@ impl Link {
         };
         // A marked store is sent whole only to a kithd that said it reads one: a kithd from
         // before would take the snapshot, drop when each resource was made, and order by what
-        // is left. (It is heard before: a link sends entries, or a heartbeat, first.)
-        let marked = shared
-            .store
-            .lock()
-            .expect("nothing panics holding the store")
-            .store
-            .marked();
+        // is left. (It is heard before: a link sends entries, or a heartbeat, first.) So too
+        // a store in format 3, to one that does not read that.
+        let format = kith_store::format_of(&shared.store.lock().expect("nothing panics holding the store").store);
+        let newer = |said: u32| format > 1 && said < format;
         let said = heard(self.target).map(|(format, _)| format);
         let to = name.map_or(String::new(), |name| format!(" to node {name}"));
-        if marked && what == "snapshot" && said.is_none_or(|said| said < kith_store::FORMAT) {
-            let why = "no snapshot is sent: the store is in format 2, and its kithd has not said it reads that";
+        if what == "snapshot" && newer(said.unwrap_or(0)) {
+            let why = format!(
+                "no snapshot is sent: the store is in format {format}, and its kithd has not said it reads that"
+            );
             self.say(format!(
                 "raft link{to} at {}: {why} (update it, if it is older)",
                 self.address
             ));
-            return Err(unreachable(why).into());
+            return Err(unreachable(&why).into());
         }
         let call = client.post(format!("https://{}/v1/raft/{what}", self.address));
         let reply = call.timeout(option.hard_ttl()).json(rpc).send().await;
@@ -185,11 +184,10 @@ impl Link {
         let reply = reply.and_then(reqwest::Response::error_for_status);
         let reply = reply.map_err(|e| {
             // (An entry a kithd from before cannot read is refused by it as a bad request.)
-            let older = marked && heard(self.target).is_some_and(|(said, _)| said < kith_store::FORMAT);
-            let update = if older {
-                " (the store is in format 2, which its kithd does not read: update it)"
-            } else {
-                ""
+            let older = heard(self.target).is_some_and(|(said, _)| newer(said));
+            let update = match older {
+                true => format!(" (the store is in format {format}, which its kithd does not read: update it)"),
+                false => String::new(),
             };
             self.say(format!(
                 "raft link{to} at {}: {}{update}",
@@ -387,7 +385,7 @@ fn throttled(said: &mut Said, name: &str, kind: &'static str, now: Instant) -> O
     Some(said.insert(key, (now, 0)).map_or(0, |(_, unwritten)| unwritten))
 }
 
-/// Put worker `name`'s refused write in the audit log.
+/// Put the refused write of node `name` (a worker, or a control node) in the audit log.
 fn audit(shared: &Shared, name: &str, why: String) {
     let who = crate::access::Caller::Node(name.to_string());
     shared
@@ -592,6 +590,30 @@ async fn write(
         };
         if !leads {
             return Json(None::<(Reply, u64)>).into_response();
+        }
+        // The store's format is the leader's own to change (`tend_format`, where it leads): a
+        // Mark, MarkSigned or MarkChecked sent here is taken only as a no-op, the barrier an
+        // older follower's relayed write waits for (T-0779). A signed entry is the leader's own
+        // to write, from a signed request it checked (`Shared::write_as`): never taken from
+        // another node, whoever the headers say it is for (T-0783).
+        let why = {
+            let state = shared.store.lock().expect("a handler panicked holding the store");
+            let format = kith_store::format_of(&state.store);
+            match command {
+                Command::Mark if format < 2 => Some("the store's format: only the leader changes it"),
+                Command::MarkSigned if format < 3 => Some("the store's format: only the leader changes it"),
+                Command::MarkChecked if format < 4 => Some("the store's format: only the leader changes it"),
+                Command::Signed { .. } => {
+                    Some("a signed entry: only the leader writes them, from the request it checked")
+                }
+                _ => None,
+            }
+        };
+        if let Some(why) = why {
+            let why = why.to_string();
+            eprintln!("kithd: refused {}'s write: {why}", sent_by(&peer));
+            audit(&shared, &sent_by(&peer), why.clone());
+            return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
         }
         let command = match held(&shared, &peer, &headers, who.as_ref(), command) {
             Ok(Some(command)) => command,
@@ -824,11 +846,35 @@ impl Shared {
         if viewing {
             return crate::view::write(self, &command).await;
         }
+        // A signed request's change goes in the log as signed once every member checks that
+        // (format 4; a format 3 kithd refuses every signed entry, and its store would part from
+        // the others'): its header, method, path and body with it, which every node checks
+        // before it applies the change (`access_sign::admit`). (Sent on to a leader, it is sent
+        // bare.)
+        let entry = {
+            let checking = self
+                .store
+                .lock()
+                .expect("a handler panicked holding the store")
+                .store
+                .checking();
+            let relay = access_sign::current().and_then(|signed| Some((signed.header, signed.relay?)));
+            match relay {
+                Some((header, relay)) if checking && relay.signs(&command) => Command::Signed {
+                    header,
+                    method: relay.method,
+                    path: relay.path,
+                    body: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &relay.body),
+                    command: Box::new(command.clone()),
+                },
+                _ => command.clone(),
+            }
+        };
         let deadline = Instant::now() + PATIENCE;
         let mut refused = None;
         loop {
             let turn = self.turn(&command, who).await?;
-            let written = tokio::time::timeout(PATIENCE, self.raft.client_write(command.clone())).await;
+            let written = tokio::time::timeout(PATIENCE, self.raft.client_write(entry.clone())).await;
             // (Let go before the leader is asked: it holds its own.)
             drop(turn);
             let leader = match written {
@@ -897,10 +943,25 @@ impl Shared {
             return self.relayed(access_sign::pass_on(call), at, &relay).await;
         }
         // A signed request's change that is not carried is not sent on as this node's own write: the
-        // leader would take it as none, with no signature checked there. (A Mark is this node's own.)
-        if access_sign::current().is_some() && !matches!(command, Command::Mark) {
-            let why = "refused: a signed request's change that is not passed on as it came (the route is \
-                       not one the leader checks the signature of); send it to the leader directly";
+        // leader would take it as none, with no signature checked there. (The barrier, an empty
+        // Patch, is this node's own: `relayed`.)
+        let barrier = matches!(command, Command::Patch { statuses } if statuses.is_empty());
+        if access_sign::current().is_some() && !barrier {
+            // (The certificate route is signed but never passed on: the CA node writes the Identity
+            // with the key it made, and answers only while it leads.)
+            let certificate = access_sign::current()
+                .and_then(|signed| signed.relay)
+                .is_some_and(|relay| access_sign::certificate_of(&relay.path).is_some());
+            let why = match certificate {
+                true => {
+                    "refused: the certificate route answers only on the CA node while it leads, and is \
+                         not passed on to the leader; ask the CA node once it leads"
+                }
+                false => {
+                    "refused: a signed request's change that is not passed on as it came (the route is \
+                          not one the leader checks the signature of); send it to the leader directly"
+                }
+            };
             return Forward::Failed(Error::Invalid(why.into()));
         }
         let mut call = access_sign::pass_on(client.post(format!("https://{at}/v1/raft/write")));
@@ -923,13 +984,15 @@ impl Shared {
                 Forward::Wait(wait, format!("the leader at {at} asked to wait {} s", wait.as_secs()))
             }
             Ok(reply) => {
-                if let Ok(Some((reply, index))) = reply.json::<Option<(Reply, u64)>>().await {
+                let status = reply.status();
+                let said = reply.text().await.unwrap_or_default();
+                let answer = answered(status, &said, at);
+                if let Forward::Done(_, index) = &answer {
                     // What a client writes through this node, it can read from this node.
                     let caught_up = self.raft.wait(Some(PATIENCE));
-                    let _ = caught_up.applied_index_at_least(Some(index), "own write").await;
-                    return Forward::Done(reply, index);
+                    let _ = caught_up.applied_index_at_least(Some(*index), "own write").await;
                 }
-                Forward::Again(None)
+                answer
             }
             // Never reached it (or refused it, which is the same to the change): nothing
             // happened, and asking again is safe.
@@ -972,7 +1035,9 @@ impl Shared {
                     let why = format!("the leader at {at} did not answer with the changes it made");
                     return Forward::Failed(unavailable(why));
                 };
-                let index = match Box::pin(self.write_as(Command::Mark, None)).await {
+                // (An empty Patch: a write that changes nothing, which any node may send on.)
+                let barrier = Command::Patch { statuses: vec![] };
+                let index = match Box::pin(self.write_as(barrier, None)).await {
                     Ok((_, index)) => index,
                     Err(e) => return Forward::Failed(e),
                 };
@@ -999,7 +1064,11 @@ impl Shared {
 }
 
 /// Whether `command` can change who may do what: it is put in the log alone ([`Shared::turn`]).
-fn changes_access(command: &Command) -> bool {
+/// An Apply, Delete or Rollback of an access kind, any Import, and a Signed entry's command.
+/// A `Patch`, `Status` or `Report` only sets a status, never a spec, and what access reads is
+/// spec; the few status fields it reads of a Node (address, ca, view) are the node's own, held
+/// by layer 2 (`own_writes`). So those are not access writes.
+pub(crate) fn changes_access(command: &Command) -> bool {
     let access = |kind: &str| {
         // (A KindDefinition says whether a kind is namespaced: which rule matches it. A
         // Cluster holds the admin's key, asked of in the same turn: `access_sign::guard`.)
@@ -1012,7 +1081,13 @@ fn changes_access(command: &Command) -> bool {
         Command::Apply { resources, .. } => resources.iter().any(|resource| access(&resource.kind)),
         Command::Delete { key } | Command::Rollback { key, .. } => keyed(key),
         Command::Import { .. } => true,
-        Command::Status { .. } | Command::Patch { .. } | Command::Report { .. } | Command::Mark => false,
+        Command::Signed { command, .. } => changes_access(command),
+        Command::Status { .. }
+        | Command::Patch { .. }
+        | Command::Report { .. }
+        | Command::Mark
+        | Command::MarkSigned
+        | Command::MarkChecked => false,
     }
 }
 
@@ -1024,6 +1099,20 @@ enum Forward {
     Again(Option<String>),
     /// Refused for now (a worker that wrote too much): ask again after this long.
     Wait(Duration, String),
+}
+
+/// What a leader's answer (not a 429) to a forwarded write is: its reply and index; a refusal
+/// of this node itself (401, 403: asking again gets the same, and the leader's words say why) at
+/// once; and for anything else (`null`: not the leader any more; a 5xx) ask again.
+fn answered(status: reqwest::StatusCode, said: &str, at: &str) -> Forward {
+    if matches!(status.as_u16(), 401 | 403) {
+        let said: String = said.chars().take(300).collect();
+        return Forward::Failed(Error::Invalid(format!("the leader at {at} refused ({status}): {said}")));
+    }
+    match serde_json::from_str::<Option<(Reply, u64)>>(said) {
+        Ok(Some((reply, index))) => Forward::Done(reply, index),
+        _ => Forward::Again(None),
+    }
 }
 
 /// The change was not taken in time; `refused` is why the last leader called was not reached.
@@ -1099,25 +1188,28 @@ fn heard(member: NodeId) -> Option<(u32, Instant)> {
 /// back on an older kithd since.
 const FRESH: Duration = Duration::from_secs(30);
 
-/// Which of `members` (but `me`) are not known to read the store's newest format: not
-/// heard lately, or heard saying less. While there is one the leader does not mark the
-/// store ([`Command::Mark`]), which such a kithd could not read.
+/// Which of `members` (but `me`) are not known to read format `wanted`: not heard lately,
+/// or heard saying less. While there is one the leader does not move the store to it
+/// ([`Command::Mark`], [`Command::MarkSigned`], [`Command::MarkChecked`]), which such a kithd
+/// could not read.
 fn not_reading(
     heard: &BTreeMap<NodeId, (u32, Instant)>,
     members: &BTreeSet<NodeId>,
     me: NodeId,
     now: Instant,
+    wanted: u32,
 ) -> BTreeSet<NodeId> {
     let reads = |member: &NodeId| {
         let said = heard.get(member);
-        said.is_some_and(|(format, at)| *format >= kith_store::FORMAT && now.duration_since(*at) < FRESH)
+        said.is_some_and(|(format, at)| *format >= wanted && now.duration_since(*at) < FRESH)
     };
     let others = members.iter().filter(|member| **member != me);
     others.filter(|member| !reads(member)).copied().collect()
 }
 
-/// On the leader, until the store is marked: mark it once every member's kithd reads a
-/// marked one. On every node that keeps the store, in a cluster or not: any may come to lead.
+/// On the leader, until the store is in this build's format: move it a format on once every
+/// member's kithd reads that (marked, then keeping signers' nonces). On every node that
+/// keeps the store, in a cluster or not: any may come to lead.
 pub async fn tend_format(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     // (A worker that runs from a view keeps no store, and marks none.)
     if shared.view.borrow().is_some() {
@@ -1125,13 +1217,8 @@ pub async fn tend_format(shared: Arc<Shared>, mut stopping: watch::Receiver<bool
     }
     let mut said = Vec::new();
     loop {
-        if shared
-            .store
-            .lock()
-            .expect("nothing panics holding the store")
-            .store
-            .marked()
-        {
+        let format = kith_store::format_of(&shared.store.lock().expect("nothing panics holding the store").store);
+        if format >= kith_store::FORMAT {
             return;
         }
         if let Err(e) = mark(&shared, &mut said).await {
@@ -1144,8 +1231,8 @@ pub async fn tend_format(shared: Arc<Shared>, mut stopping: watch::Receiver<bool
     }
 }
 
-/// One look: where this node leads, mark the store, or say (in `said`, and in the log when
-/// it changes) who is waited for.
+/// One look: where this node leads, move the store a format on, or say (in `said`, and in
+/// the log when it changes) who is waited for.
 async fn mark(shared: &Shared, said: &mut Vec<String>) -> Result<(), String> {
     let metrics = shared.raft.metrics().borrow().clone();
     if metrics.current_leader != Some(metrics.id) {
@@ -1154,16 +1241,24 @@ async fn mark(shared: &Shared, said: &mut Vec<String>) -> Result<(), String> {
     // The members, and the Nodes about to be: one that joined on an older kithd is waited for.
     let members = metrics.membership_config.membership().nodes().map(|(id, _)| *id);
     let members: BTreeSet<NodeId> = members.chain(nodes_of_store(shared).into_keys()).collect();
+    let format = kith_store::format_of(&shared.store.lock().expect("nothing panics holding the store").store);
+    let wanted = format + 1;
     let waiting = {
         let heard = HEARD.lock().expect("nothing panics holding what was heard");
-        not_reading(&heard, &members, metrics.id, Instant::now())
+        not_reading(&heard, &members, metrics.id, Instant::now(), wanted)
     };
     if waiting.is_empty() {
-        let marked = shared.submit(Command::Mark).await;
-        marked.map_err(|e| format!("marking the store: {e}"))?;
-        eprintln!(
-            "kithd: the store keeps from now on when each resource was first made (format 2: an older kithd does not read it)"
-        );
+        let (command, what) = match wanted {
+            2 => (Command::Mark, "when each resource was first made"),
+            3 => (Command::MarkSigned, "the nonces of signed entries"),
+            _ => (
+                Command::MarkChecked,
+                "signed requests as signed entries, every node checking them",
+            ),
+        };
+        let marked = shared.submit(command).await;
+        marked.map_err(|e| format!("moving the store to format {wanted}: {e}"))?;
+        eprintln!("kithd: the store keeps from now on {what} (format {wanted}: an older kithd does not read it)");
         return Ok(());
     }
     let named = |id: &NodeId| match voter(shared, *id) {
@@ -1174,7 +1269,7 @@ async fn mark(shared: &Shared, said: &mut Vec<String>) -> Result<(), String> {
     if *said != waiting {
         let names = waiting.join(", ");
         eprintln!(
-            "kithd: the store stays in format 1 until every member's kithd reads format 2: {names} did not say so (down, or on an older kithd)"
+            "kithd: the store stays in format {format} until every member's kithd reads format {wanted}: {names} did not say so (down, or on an older kithd)"
         );
         *said = waiting;
     }
@@ -1370,6 +1465,39 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leader's refusal of this node (401, 403) ends a forwarded write at once with the leader's
+    /// words; a 5xx or a `null` is asked again; a reply and an index are the answer.
+    #[test]
+    fn a_leaders_refusal_is_not_asked_again() {
+        use reqwest::StatusCode as S;
+        for status in [S::UNAUTHORIZED, S::FORBIDDEN] {
+            match answered(status, "evicted: join again", "10.0.0.1:1") {
+                Forward::Failed(Error::Invalid(why)) => {
+                    assert!(
+                        why.contains("evicted: join again") && why.contains(status.as_str()),
+                        "{why}"
+                    )
+                }
+                _ => panic!("{status} is not refused at once"),
+            }
+        }
+        for (status, said) in [
+            (S::SERVICE_UNAVAILABLE, "overloaded"),
+            (S::OK, "null"),
+            (S::BAD_GATEWAY, ""),
+        ] {
+            assert!(
+                matches!(answered(status, said, "a"), Forward::Again(None)),
+                "{status} {said}"
+            );
+        }
+        let said = serde_json::to_string(&Some((Reply::Err(Error::NotFound("x".into())), 7u64))).unwrap();
+        assert!(matches!(
+            answered(S::OK, &said, "a"),
+            Forward::Done(Err(Error::NotFound(_)), 7)
+        ));
+    }
 
     /// A worker is held to one barrier a second, and the map keeps no name whose second is over
     /// (a deleted worker's, or one of many names that came and went).
@@ -2082,11 +2210,66 @@ mod tests {
         // 2 reads it, 3 said nothing (a kithd from before), 4 read it a while ago (put
         // back since, or down), 5 was never heard, 6 reads a later format.
         let heard = BTreeMap::from([(2, (2, ago(1))), (3, (1, ago(1))), (4, (2, ago(31))), (6, (3, ago(29)))]);
-        let waits = |members: &[u64]| not_reading(&heard, &set(members), 1, now);
+        let waits = |members: &[u64]| not_reading(&heard, &set(members), 1, now, 2);
         // (The leader is not asked: it runs this.)
         assert_eq!(waits(&[1]), set(&[]));
         assert_eq!(waits(&[1, 2, 6]), set(&[]));
         assert_eq!(waits(&[1, 2, 3, 4, 5, 6]), set(&[3, 4, 5]));
+    }
+
+    /// Format 3 (signers' nonces kept: [`Command::MarkSigned`]) waits the same way, for every
+    /// member to say it reads 3: one that reads 2 holds back 3, not 2.
+    #[test]
+    fn store_format_3_waits_for_every_member_to_say_it_reads_it() {
+        assert_eq!(kith_store::FORMAT, 4);
+        let now = Instant::now() + Duration::from_secs(3600);
+        let ago = |seconds: u64| now - Duration::from_secs(seconds);
+        let set = |ids: &[u64]| ids.iter().copied().collect::<BTreeSet<_>>();
+        // 2 reads 3, 3 reads 2, 4 read 3 a while ago, 5 was never heard.
+        let heard = BTreeMap::from([(2, (3, ago(1))), (3, (2, ago(1))), (4, (3, ago(31)))]);
+        let waits = |members: &[u64], wanted| not_reading(&heard, &set(members), 1, now, wanted);
+        assert_eq!(waits(&[1, 2], 3), set(&[]));
+        assert_eq!(waits(&[1, 2, 3], 2), set(&[]));
+        assert_eq!(waits(&[1, 2, 3], 3), set(&[3]));
+        assert_eq!(waits(&[1, 2, 3, 4, 5], 3), set(&[3, 4, 5]));
+        // What a store in each format waits for: the next, and nothing once it is in this build's.
+        let mut store = kith_api::store::Store::default();
+        assert_eq!(kith_store::format_of(&store) + 1, 2);
+        kith_store::run(&mut store, Command::Mark).unwrap();
+        assert_eq!(kith_store::format_of(&store) + 1, 3);
+        kith_store::run(&mut store, Command::MarkSigned).unwrap();
+        assert_eq!(kith_store::format_of(&store) + 1, 4);
+        kith_store::run(&mut store, Command::MarkChecked).unwrap();
+        assert_eq!(kith_store::format_of(&store), kith_store::FORMAT);
+    }
+
+    /// A store in format 3 whose members do not all say they read 4 is not moved to 4 (and in 3
+    /// the leader writes a signed request's change bare: `signed_wrap_at_format_4_and_bare_below`):
+    /// a T-0779 kithd, which reads 3, refuses every signed entry at apply, and its store would part
+    /// from the others' (T-0783).
+    #[tokio::test]
+    async fn store_format_3_with_a_member_reading_3_gets_no_signed_entry() {
+        let (shared, _ca) = leading("format-3-held", &[]).await;
+        shared.write(Command::MarkSigned).await.unwrap();
+        // A Node about to be a member, whose kithd says it reads 3, lately.
+        let id = 7_233_003;
+        let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: format-3-old}\nspec: {}\n";
+        let node = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
+        let status = serde_json::json!({ "address": "10.0.0.3:7443", "raftId": id.to_string() });
+        {
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(node).unwrap();
+            store.set_status("Node/format-3-old", Some(status)).unwrap();
+        }
+        HEARD.lock().unwrap().insert(id, (3, Instant::now()));
+        let format = |shared: &Shared| kith_store::format_of(&shared.store.lock().unwrap().store);
+        let mut said = Vec::new();
+        mark(&shared, &mut said).await.unwrap();
+        assert_eq!((format(&shared), said.len()), (3, 1), "{said:?}");
+        // Once it says 4, the store moves.
+        HEARD.lock().unwrap().insert(id, (4, Instant::now()));
+        mark(&shared, &mut said).await.unwrap();
+        assert_eq!(format(&shared), 4);
     }
 
     #[test]
@@ -2514,6 +2697,81 @@ mod tests {
         assert!(!holds(&shared, "ConfigMap/default/via-4") && holds(&shared, "ConfigMap/default/via-1"));
     }
 
+    /// The store's format is changed only by the leader's own `tend_format`, and a signed entry is
+    /// written only by the leader that checked the request: a mark another node sends is taken
+    /// only once the store is in its format (a no-op then), and a Signed entry is refused
+    /// whoever it says it is for, in every format (T-0783).
+    #[tokio::test]
+    async fn raft_write_refuses_the_format_and_signed_entries_from_outside() {
+        use crate::cluster::pinned_peer::{at, node};
+        use crate::cluster::{Cluster, listen, node_router};
+        let (shared, ca) = leading("format-out", &["format-out-f"]).await;
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        let listener = listen(tcp, pki::server_config(&node(&ca, "format-out-c")).unwrap()).unwrap();
+        let app = node_router(shared.clone()).into_make_service_with_connect_info::<Peer>();
+        tokio::spawn(async move { drop(axum::serve(listener, app).await) });
+        let client = Cluster::new(node(&ca, "format-out-f"), None).unwrap();
+        let client = client.to(&at("format-out-c", &address, None)).unwrap();
+        let url = format!("https://{address}/v1/raft/write");
+        let send = |command: Command, headers: &[(&str, &str)]| {
+            let mut call = client.post(&url).json(&command);
+            for (name, value) in headers {
+                call = call.header(*name, *value);
+            }
+            async move {
+                let said = call.send().await.unwrap().text().await.unwrap();
+                serde_json::from_str::<Option<(Reply, u64)>>(&said).unwrap_or_else(|e| panic!("{e}: {said}"))
+            }
+        };
+        let format = |shared: &Shared| kith_store::format_of(&shared.store.lock().unwrap().store);
+        let headers: [&[(&str, &str)]; 5] = [
+            &[],
+            &[(access::FOR, "local socket")],
+            &[(access::FOR, "alice")],
+            &[(WORKER, "format-out-f")],
+            &[(access::FOR, "local socket"), (WORKER, "format-out-f")],
+        ];
+        let refused = |said: &Option<(Reply, u64)>, why: &str| matches!(said, Some((Err(Error::Invalid(said)), 0)) if said.contains(why));
+        let signed = || Command::Signed {
+            header: String::new(),
+            method: "POST".into(),
+            path: "/v1/apply".into(),
+            body: String::new(),
+            command: Box::new(Command::Patch { statuses: vec![] }),
+        };
+        // In each format: a mark of it or below is an older follower's barrier, a no-op, and
+        // taken (said to be alice's or a worker's, it is held to what they may write, and
+        // refused); a mark above is refused; a signed entry always is.
+        for (now, mark) in [
+            (1, None),
+            (2, Some(Command::Mark)),
+            (3, Some(Command::MarkSigned)),
+            (4, Some(Command::MarkChecked)),
+        ] {
+            if let Some(mark) = mark {
+                shared.write(mark).await.unwrap();
+            }
+            assert_eq!(format(&shared), now);
+            for (n, headers) in headers.into_iter().enumerate() {
+                for (made, mark) in [(2, Command::Mark), (3, Command::MarkSigned), (4, Command::MarkChecked)] {
+                    let said = send(mark, headers).await;
+                    match (made <= now, n) {
+                        (true, 2 | 3) => assert!(matches!(said, Some((Err(_), 0))), "{headers:?}: {said:?}"),
+                        (true, _) => assert!(
+                            matches!(said, Some((Ok(_), index)) if index > 0),
+                            "{headers:?}: {said:?}"
+                        ),
+                        (false, _) => assert!(refused(&said, "only the leader changes it"), "{headers:?}: {said:?}"),
+                    }
+                }
+                let said = send(signed(), headers).await;
+                assert!(refused(&said, "only the leader writes"), "{headers:?}: {said:?}");
+            }
+            assert_eq!(format(&shared), now, "the format moved only by the leader");
+        }
+    }
+
     /// A write passed on to a node that does not lead (any more) is not decided there, on a
     /// store that may be behind: it is sent back, to be passed to whichever leads.
     #[tokio::test]
@@ -2612,6 +2870,22 @@ mod tests {
             key: "ConfigMap/default/own".into()
         }));
         assert!(!changes_access(&Command::Status { statuses: vec![] }));
+        // A Patch sets fields of a status, never a spec: it cannot reach what access reads of a
+        // Role, RoleBinding, Identity, KindDefinition or Cluster, even when it names one.
+        let fields = serde_json::Map::from_iter([("signing".to_string(), serde_json::json!("open"))]);
+        let mut cluster = map("x");
+        cluster.kind = "Cluster".into();
+        cluster.metadata.namespace = None;
+        cluster.spec = serde_json::json!({"adminKey": "11".repeat(32), "signing": "required"});
+        let key = cluster.key();
+        let patch = Command::Patch {
+            statuses: vec![(key.clone(), fields.clone()), ("Role/x".into(), fields)],
+        };
+        assert!(!changes_access(&patch));
+        let mut store = kith_api::store::Store::default();
+        store.apply(cluster).unwrap();
+        kith_store::run(&mut store, patch).unwrap();
+        assert_eq!(store.get(&key).unwrap().spec["signing"], "required");
     }
 
     /// What the leader asks again of a rollback, a delete and anything else: the kind's own

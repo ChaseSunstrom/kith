@@ -299,11 +299,20 @@ spec! {
         pub ingress: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub mesh: Option<NodeMesh>,
+        /// What this node does when no leader answers at its start (its own copy of the store
+        /// says so). `wait` (the default) starts nothing until a write comes back. `run` starts
+        /// what its copy places on it after 30 seconds, Jobs excepted, and says the risks on the
+        /// console and in its status (`alone`: since when, until when). A leader that answers
+        /// catches it up as on any store change.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub alone: Option<Alone>,
     }
 
     pub enum NodeRole { Voter, Worker, Edge }
 
     pub enum Trust { Control, Worker }
+
+    pub enum Alone { Run, Wait }
 
     pub struct NodeMesh {
         /// `never`: this node's traffic goes straight to the other node or not at all,
@@ -589,6 +598,11 @@ spec! {
         /// A Volume, or a VolumeClaim's.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub volume: Option<String>,
+        /// Of a `volume`: it names a VolumeClaim for each replica, `volume` and `-` and the
+        /// replica's number (`data-db` is `data-db-0` for the first). Each replica goes on
+        /// the node its own Volume is on, and waits while that Volume or its node is gone.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub per_replica: Option<bool>,
         /// A ConfigMap of the namespace: each key a file, read-only, and changed when the
         /// ConfigMap is (all its files at once).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -649,6 +663,11 @@ spec! {
         pub timeout_seconds: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub failure_threshold: Option<u32>,
+        /// A liveness probe's start deadline: the container is restarted if it has not passed once
+        /// this long after it started (until then a failure does not count). Kubernetes'
+        /// `initialDelaySeconds` becomes this.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub start_seconds: Option<u32>,
     }
 
     pub struct HttpProbe {
@@ -1592,6 +1611,49 @@ impl Spec for ClusterSpec {
     }
 }
 
+/// `10.0.0.0/8` as an address and its length; `None` for one that cannot be read: not ADDR/LEN, a
+/// length over its family's size, or an IPv4 address written as IPv6 (`::ffff:10.0.0.0/104`: a
+/// pod's IPv4 packets never meet an IPv6 match, so it would hold nothing).
+pub fn parse_cidr(cidr: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (address, length) = cidr.split_once('/')?;
+    let address: std::net::IpAddr = address.parse().ok()?;
+    let size = if address.is_ipv4() { 32 } else { 128 };
+    if matches!(address, std::net::IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some()) {
+        return None;
+    }
+    Some((address, length.parse::<u8>().ok().filter(|length| *length <= size)?))
+}
+
+impl NetworkPolicySpec {
+    /// What a new policy must meet beyond its shape (`Resource::submitted`, not `check`: replay
+    /// takes one an older binary logged, and one that vanished would leave its pods open): a
+    /// peer's `cidr` is one `parse_cidr` reads, and on ingress an IPv6 one (a caller comes from
+    /// the mesh's IPv6 addresses, so an IPv4 cidr names none). A deny whose cidr kept nothing out
+    /// would be a hole; the enforcer keeps everything out for a stored one.
+    pub fn submitted(&self) -> Result<(), String> {
+        for (side, rules) in [("ingress", &self.ingress), ("egress", &self.egress)] {
+            for (i, rule) in rules.iter().enumerate() {
+                for (j, peer) in rule.peers.iter().enumerate() {
+                    let Some(cidr) = &peer.cidr else { continue };
+                    let at = format!("{side}[{i}].peers[{j}].cidr: `{cidr}`");
+                    match parse_cidr(cidr) {
+                        None => {
+                            return Err(format!(
+                                "{at} is not ADDR/LEN (`fd00::/8`, `10.0.0.0/8`, a length within its family, not IPv4 written as IPv6)"
+                            ));
+                        }
+                        Some((address, _)) if side == "ingress" && address.is_ipv4() => {
+                            return Err(format!("{at} is IPv4: a caller comes from an IPv6 mesh address"));
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 no_checks!(
     BlobSpec,
     NetworkPolicySpec,
@@ -1992,6 +2054,9 @@ impl VolumeMount {
                 ("scratch", self.scratch.is_some()),
             ],
         )?;
+        if self.per_replica.is_some() && self.volume.is_none() {
+            return Err("`perReplica` is a `volume`'s".into());
+        }
         let data = self.config_map.is_some() || self.secret.is_some();
         if !data && (!self.items.is_empty() || self.mode.is_some()) {
             return Err("`items` and `mode` are a `configMap`'s or a `secret`'s".into());
@@ -2893,6 +2958,65 @@ mod access_tests {
     fn access_level_accepts_a_range_beside_the_people_range() {
         for net in ["100.90.0.0/16", "100.64.0.0/16", "100.128.0.0/9", "100.87.255.255/32"] {
             read("AccessLevel", &format!("{{ networks: [{net}] }}")).unwrap_or_else(|e| panic!("{net}: {e}"));
+        }
+    }
+
+    /// A deny whose cidr cannot be read would hold nothing back, so a policy is refused for one.
+    #[test]
+    fn network_policy_cidr_is_an_address_and_a_length_in_its_family() {
+        // Refused when submitted, not parsed: replay parses what an older binary logged.
+        let submit = |side: &str, action: &str, cidr: &str| {
+            let spec = format!("{{ {side}: [{{ action: {action}, peers: [{{ cidr: '{cidr}' }}] }}] }}");
+            let text = format!("apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: {{ name: p }}\nspec: {spec}\n");
+            let docs = Resource::from_source(&text).unwrap();
+            docs.into_iter().next().unwrap().unwrap().submitted_by_node()
+        };
+        for cidr in ["fd00::/8", "::/0", "fd00::1/128"] {
+            submit("ingress", "deny", cidr).unwrap_or_else(|e| panic!("{cidr}: {e}"));
+        }
+        for cidr in [
+            "10.0.0.0/8",
+            "fd00::/8",
+            "0.0.0.0/0",
+            "::/0",
+            "10.0.0.1/32",
+            "fd00::1/128",
+        ] {
+            submit("egress", "allow", cidr).unwrap_or_else(|e| panic!("{cidr}: {e}"));
+            submit("egress", "deny", cidr).unwrap_or_else(|e| panic!("{cidr}: {e}"));
+        }
+        // Not an address and a length within its family, or an IPv4 address as IPv6 (a pod's
+        // IPv4 packets never meet it).
+        let bad = [
+            "nonsense",
+            "10.0.0.0/40",
+            "10.0.0.1",
+            "fd00::/129",
+            "10.0.0.0/",
+            "/8",
+            "10.0.0.0/-1",
+        ];
+        for cidr in bad.into_iter().chain(["::ffff:10.0.0.0/104", "::ffff:0:0/96"]) {
+            for (side, action) in [
+                ("ingress", "deny"),
+                ("ingress", "allow"),
+                ("egress", "deny"),
+                ("egress", "allow"),
+            ] {
+                let refused = submit(side, action, cidr).unwrap_err();
+                assert!(
+                    refused.contains(&format!("{side}[0].peers[0].cidr")),
+                    "{cidr}: {refused}"
+                );
+            }
+        }
+        // Callers of an ingress rule come from the mesh's IPv6 addresses: an IPv4 cidr names none.
+        for cidr in ["10.0.0.0/8", "0.0.0.0/0"] {
+            let refused = submit("ingress", "deny", cidr).unwrap_err();
+            assert!(
+                refused.contains("ingress[0].peers[0].cidr") && refused.contains("IPv6"),
+                "{refused}"
+            );
         }
     }
 

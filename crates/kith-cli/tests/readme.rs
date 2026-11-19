@@ -90,8 +90,9 @@ fn blocks(tag: &str) -> Vec<(usize, String)> {
 }
 
 /// Blocks that are not a whole resource, and so are not checked: two `spec:` parts shown
-/// inside a list, the installer's file, and an OS spec (`os/build.sh --spec`).
-const PARTS: usize = 5;
+/// inside a list, the installer's file, an OS spec (`os/build.sh --spec`) and a
+/// `perReplica` mount (docs/guide/storage.md).
+const PARTS: usize = 6;
 
 #[test]
 fn readme_examples_are_taken_by_this_build() {
@@ -152,6 +153,24 @@ fn readme_says_nothing_that_was_true_once() {
             "README.md: {stale:?} is from when the plan was not done"
         );
     }
+}
+
+/// What deleting a claim that provisioned its Volume takes with it, and how to keep it.
+#[test]
+fn readme_says_what_a_deleted_claim_takes_with_it_and_how_to_retain() {
+    let storage = DOCS.iter().find(|(path, _)| path.ends_with("storage.md")).unwrap().1;
+    let flat = storage.split_whitespace().collect::<Vec<_>>().join(" ");
+    for said in [
+        "Deleting a claim that provisioned its Volume deletes the Volume and its data",
+        "`kith.dev/reclaim: retain`",
+        "A Volume you applied yourself is never deleted with a claim, nor is its data",
+    ] {
+        assert!(flat.contains(said), "storage.md no longer says {said:?}");
+    }
+    assert!(
+        !flat.contains("its directory stays. Whoever"),
+        "storage.md says the data of a deleted claim stays"
+    );
 }
 
 /// Who has a host two Services name is said in both documents: the one made first, a

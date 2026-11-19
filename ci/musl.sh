@@ -13,17 +13,19 @@ if [ -z "${CC_x86_64_unknown_linux_musl:-}" ] && ! command -v musl-gcc >/dev/nul
     export CC_x86_64_unknown_linux_musl="$root/ci/musl-cc.sh"
 fi
 cd "$root"
-# Made first: the folder is resolved to an absolute path below, before cargo would make it.
-mkdir -p "${CARGO_TARGET_DIR:-target}"
+# Where cargo puts what it builds, as cargo says (absolute): CARGO_TARGET_DIR, a
+# .cargo/config.toml's build.target-dir (a Sampo lane has one), or target.
+dir=$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+[ -n "$dir" ] || { echo "musl.sh: cargo metadata names no target directory" >&2; exit 1; }
 if [ "${1:-}" = --tests ]; then
     # (Or with --tests: kithd's unit tests, built the same way, and the path of that one file.
     # In a target directory of their own: their link writes kithd.map too, and in kithd's
     # it would leave ci/order.py the test binary's map for kithd.)
-    built=$(CARGO_TARGET_DIR="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/tests" cargo test --release --quiet --target "$target" -p kithd --bin kithd --no-run --message-format=json)
+    built=$(CARGO_TARGET_DIR="$dir/tests" cargo test --release --quiet --target "$target" -p kithd --bin kithd --no-run --message-format=json)
     printf '%s\n' "$built" | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1
     exit 0
 fi
-out="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/$target/release"
+out="$dir/$target/release"
 # kith with TLS to a node (cargo feature remote) is built first and kept as kith-remote, beside
 # the default kith, which the size budget weighs; the default build after it leaves kith as it was.
 # Only when KITH_MUSL_REMOTE=1, which the budgets script sets: the other callers want kith alone.

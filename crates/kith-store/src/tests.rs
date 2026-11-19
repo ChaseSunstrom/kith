@@ -29,13 +29,29 @@ impl Drop for Scratch {
     }
 }
 
+/// A check at apply that takes every entry.
+fn any() -> crate::Check {
+    Arc::new(|_, _, _| Ok(()))
+}
+
+/// `command`, signed by `who` until `expires`, with the nonce `nonce` (as 32 hex).
+fn signed(who: &str, expires: u64, nonce: u8, command: Command) -> Command {
+    Command::Signed {
+        header: format!("v1; who={who}; target=*; expires={expires}; nonce={nonce:032x}; sig=AAAA"),
+        method: "POST".into(),
+        path: "/v1/apply".into(),
+        body: String::new(),
+        command: Box::new(command),
+    }
+}
+
 struct Builder;
 
 impl StoreBuilder<TypeConfig, Log, Machine, Scratch> for Builder {
     async fn build(&self) -> Result<(Scratch, Log, Machine), StorageError<u64>> {
         let scratch = Scratch::new();
         let log = Log::open(&scratch.0.join("log.redb")).unwrap();
-        let machine = Machine::open(&scratch.0, Arc::new(|| {})).unwrap();
+        let machine = Machine::open(&scratch.0, Arc::new(|| {}), any()).unwrap();
         Ok((scratch, log, machine))
     }
 }
@@ -278,6 +294,55 @@ fn fixture_2_entries() -> Vec<openraft::Entry<TypeConfig>> {
     entries
 }
 
+/// A state as format 3's builds wrote it: format 2's log, then the entry that starts the
+/// signers' book, two signed writes and a blank. Its snapshot ends after the first signed
+/// write, so both files hold what format 2 has not.
+const FIXTURE_3: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/format-3");
+const SNAPSHOT_3: usize = 16;
+
+fn fixture_3_entries() -> Vec<openraft::Entry<TypeConfig>> {
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let mut entries = fixture_2_entries();
+    let made = |name: &str, at| Command::Apply {
+        resources: vec![config(name, "1")],
+        at,
+    };
+    for payload in [
+        EntryPayload::Normal(Command::MarkSigned),
+        EntryPayload::Normal(signed("local socket", 1000, 1, made("d", 500))),
+        EntryPayload::Normal(signed("local socket", 1100, 2, made("e", 600))),
+        EntryPayload::Blank,
+    ] {
+        let log_id = LogId::new(CommittedLeaderId::new(3, 7), entries.len() as u64 + 1);
+        entries.push(Entry { log_id, payload });
+    }
+    entries
+}
+
+/// A state as format 4's builds wrote it: format 3's log, then the entry from which every
+/// node checks signed entries, a signed write and a blank. Its snapshot ends after the signed
+/// write, so both files hold what format 3 has not.
+const FIXTURE_4: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/format-4");
+const SNAPSHOT_4: usize = 20;
+
+fn fixture_4_entries() -> Vec<openraft::Entry<TypeConfig>> {
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let mut entries = fixture_3_entries();
+    let made = Command::Apply {
+        resources: vec![config("f", "1")],
+        at: 700,
+    };
+    for payload in [
+        EntryPayload::Normal(Command::MarkChecked),
+        EntryPayload::Normal(signed("local socket", 1200, 3, made)),
+        EntryPayload::Blank,
+    ] {
+        let log_id = LogId::new(CommittedLeaderId::new(3, 7), entries.len() as u64 + 1);
+        entries.push(Entry { log_id, payload });
+    }
+    entries
+}
+
 /// Every command of `entries` run in turn, each as its place in the log.
 fn whole(entries: Vec<openraft::Entry<TypeConfig>>) -> Store {
     let mut whole = Store::default();
@@ -310,19 +375,19 @@ fn formats(dir: &std::path::Path) -> (u32, u32) {
 fn format_fixture_is_written() {
     use openraft::RaftSnapshotBuilder;
     use openraft::storage::{RaftLogStorage, RaftStateMachine};
-    let dir = std::path::Path::new(FIXTURE_2);
+    let dir = std::path::Path::new(FIXTURE_4);
     std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
     std::fs::create_dir(dir).expect("this format's fixture is there already, and stays as it was written");
     let mut log = Log::open(&dir.join("log.redb")).unwrap();
-    let mut machine = Machine::open(dir, Arc::new(|| {})).unwrap();
-    let entries = fixture_2_entries();
+    let mut machine = Machine::open(dir, Arc::new(|| {}), any()).unwrap();
+    let entries = fixture_4_entries();
     log.put(entries.clone()).unwrap();
     block(async {
         log.save_vote(&fixture_vote()).await.unwrap();
         log.save_committed(entries.last().map(|entry| entry.log_id))
             .await
             .unwrap();
-        machine.apply(entries[..SNAPSHOT_2].to_vec()).await.unwrap();
+        machine.apply(entries[..SNAPSHOT_4].to_vec()).await.unwrap();
         machine.build_snapshot().await.unwrap();
         log.purge(entries[PURGED - 1].log_id).await.unwrap();
     });
@@ -358,6 +423,36 @@ fn format_2_state_is_read_whole_by_this_build() {
     assert_eq!(formats(&dir.0), (2, 2));
 }
 
+#[test]
+fn format_3_state_is_read_whole_by_this_build() {
+    let (read, dir) = read_whole(FIXTURE_3, fixture_3_entries(), SNAPSHOT_3);
+    // What the signed writes made, at their place in the log; the mark before kept.
+    assert_eq!(read.born("ConfigMap/default/d"), Some((16, 500)));
+    assert_eq!(read.born("ConfigMap/default/e"), Some((17, 600)));
+    assert_eq!(read.born("ConfigMap/default/c"), Some((13, 400)));
+    // The signer's book, `[newest, {nonce: expires}]`: its newest expires, both nonces.
+    let book = serde_json::to_value(&read).unwrap()["signers"]["local socket"].clone();
+    assert_eq!(book[0], 1100);
+    let nonces = book[1].as_object().unwrap();
+    assert_eq!(
+        nonces.keys().map(|nonce| &nonce[30..]).collect::<Vec<_>>(),
+        ["01", "02"]
+    );
+    assert!(read.signing());
+    assert_eq!(formats(&dir.0), (3, 3));
+}
+
+#[test]
+fn format_4_state_is_read_whole_by_this_build() {
+    let (read, dir) = read_whole(FIXTURE_4, fixture_4_entries(), SNAPSHOT_4);
+    assert_eq!(read.born("ConfigMap/default/f"), Some((20, 700)));
+    assert_eq!(read.born("ConfigMap/default/d"), Some((16, 500)));
+    let book = serde_json::to_value(&read).unwrap()["signers"]["local socket"].clone();
+    assert_eq!(book[0], 1200);
+    assert!(read.checking() && read.signing());
+    assert_eq!(formats(&dir.0), (4, 4));
+}
+
 /// A copy of the state in `fixture`, opened by this build: the log reads as `entries`,
 /// and the snapshot (which goes `snapshot` entries in) with the log after it ends where
 /// running every command does. The store that gives, and the copy.
@@ -370,7 +465,7 @@ fn read_whole(fixture: &str, entries: Vec<openraft::Entry<TypeConfig>>, snapshot
         std::fs::copy(std::path::Path::new(fixture).join(file), scratch.0.join(file)).unwrap();
     }
     let mut log = Log::open(&scratch.0.join("log.redb")).unwrap();
-    let mut machine = Machine::open(&scratch.0, Arc::new(|| {})).unwrap();
+    let mut machine = Machine::open(&scratch.0, Arc::new(|| {}), any()).unwrap();
     let index = |id: Option<openraft::LogId<u64>>| id.map(|id| id.index as usize);
     block(async {
         assert_eq!(log.read_vote().await.unwrap(), Some(fixture_vote()));
@@ -435,7 +530,7 @@ fn born_is_the_same_on_every_replica_and_kept_through_a_snapshot_and_a_restart()
     };
     let entries: Vec<Entry<TypeConfig>> = commands.into_iter().enumerate().map(entry).collect();
     let (one, two, behind) = (Scratch::new(), Scratch::new(), Scratch::new());
-    let open = |dir: &Scratch| Machine::open(&dir.0, Arc::new(|| {})).unwrap();
+    let open = |dir: &Scratch| Machine::open(&dir.0, Arc::new(|| {}), any()).unwrap();
     let store = |machine: &Machine| machine.state.lock().unwrap().store.clone();
     let (mut a, mut b, mut c) = (open(&one), open(&two), open(&behind));
     block(async {
@@ -514,6 +609,320 @@ fn format_of_the_log_is_2_with_the_mark_and_not_before() {
     assert_eq!(formats(&scratch.0).0, 2);
 }
 
+/// A Mark after the store is in format 3 (the barrier a relayed write ends with) is a no-op
+/// to the store, and leaves the log in format 3: a format 2 kithd still cannot read it.
+#[test]
+fn format_of_the_log_stays_3_after_a_mark_barrier() {
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let scratch = Scratch::new();
+    let path = scratch.0.join("log.redb");
+    std::fs::write(scratch.0.join("snapshot.json"), r#"{"format":1}"#).unwrap();
+    let entry = |index, command| Entry {
+        log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+        payload: EntryPayload::Normal(command),
+    };
+    let log = Log::open(&path).unwrap();
+    log.put([entry(1, Command::Mark), entry(2, Command::MarkSigned)])
+        .unwrap();
+    drop(log);
+    assert_eq!(formats(&scratch.0).0, 3);
+    let log = Log::open(&path).unwrap();
+    log.put([entry(3, Command::Mark)]).unwrap();
+    drop(log);
+    assert_eq!(formats(&scratch.0).0, 3);
+    let log = Log::open(&path).unwrap();
+    log.put([entry(4, Command::Mark)]).unwrap();
+    drop(log);
+    assert_eq!(formats(&scratch.0).0, 3);
+    // A signed entry is not: before a MarkSigned it is refused at apply, a no-op, and the log
+    // stays in the store's format (the leader takes none from another node until then, T-0779).
+    let other = Scratch::new();
+    std::fs::write(other.0.join("snapshot.json"), r#"{"format":1}"#).unwrap();
+    let log = Log::open(&other.0.join("log.redb")).unwrap();
+    log.put([entry(1, Command::Mark), entry(2, signed("ann", 1000, 1, Command::Mark))])
+        .unwrap();
+    drop(log);
+    assert_eq!(formats(&other.0).0, 2);
+    // And the store: marked again, still in format 3.
+    let mut store = Store::default();
+    run(&mut store, Command::MarkSigned).unwrap();
+    run(&mut store, Command::Mark).unwrap();
+    assert_eq!(crate::format_of(&store), 3);
+}
+
+/// Format 4 (every node checks signed entries) is the MarkChecked's, in the log and the store,
+/// and the marks before it, sent again as barriers, leave both in 4 (T-0783).
+#[test]
+fn format_of_the_log_is_4_with_mark_checked_and_stays() {
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let scratch = Scratch::new();
+    let path = scratch.0.join("log.redb");
+    std::fs::write(scratch.0.join("snapshot.json"), r#"{"format":1}"#).unwrap();
+    let entry = |index, command| Entry {
+        log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+        payload: EntryPayload::Normal(command),
+    };
+    let log = Log::open(&path).unwrap();
+    log.put([entry(1, Command::Mark), entry(2, Command::MarkSigned)])
+        .unwrap();
+    drop(log);
+    assert_eq!(formats(&scratch.0).0, 3);
+    let log = Log::open(&path).unwrap();
+    log.put([
+        entry(3, Command::MarkChecked),
+        entry(4, Command::Mark),
+        entry(5, Command::MarkSigned),
+    ])
+    .unwrap();
+    drop(log);
+    assert_eq!(formats(&scratch.0).0, 4);
+    let mut store = Store::default();
+    run(&mut store, Command::MarkSigned).unwrap();
+    assert_eq!(crate::format_of(&store), 3);
+    run(&mut store, Command::MarkChecked).unwrap();
+    run(&mut store, Command::Mark).unwrap();
+    run(&mut store, Command::MarkSigned).unwrap();
+    assert!(store.checking() && store.signing() && store.marked());
+    assert_eq!(crate::format_of(&store), 4);
+    // An import keeps it: what comes in is a store, not the cluster's format.
+    run(
+        &mut store,
+        Command::Import {
+            store: Store::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!(crate::format_of(&store), 4);
+}
+
+/// Two nodes fed one log, a signed entry in it the check at apply refuses: both stores end
+/// equal, and equal to one fed the log without that entry. The check is asked of nothing
+/// before the store is in format 3: what comes before applies as it did.
+#[test]
+fn signed_entry_refused_is_nothing_on_both_stores() {
+    use openraft::storage::RaftStateMachine;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    use std::sync::atomic::AtomicUsize;
+    let made = |name: &str, at| Command::Apply {
+        resources: vec![config(name, "1")],
+        at,
+    };
+    let commands = vec![
+        made("a", 100),
+        // (Before the mark: refused by the store itself, the check not asked.)
+        signed("ann", 1000, 1, made("early", 150)),
+        Command::Mark,
+        Command::MarkSigned,
+        signed("ann", 1000, 2, made("b", 200)),
+        made("c", 300),
+        Command::Mark,
+    ];
+    let entry = |(index, command)| Entry {
+        log_id: LogId::new(CommittedLeaderId::new(4, 9), index as u64 + 1),
+        payload: EntryPayload::Normal(command),
+    };
+    let entries: Vec<Entry<TypeConfig>> = commands.into_iter().enumerate().map(entry).collect();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let refusing = |asked: Arc<AtomicUsize>| -> crate::Check {
+        Arc::new(move |store, command, leader| {
+            assert!(store.signing() && leader == 9);
+            asked.fetch_add(1, Ordering::Relaxed);
+            match command {
+                Command::Signed { .. } => Err(Error::Invalid("refused: not checked".into())),
+                _ => Ok(()),
+            }
+        })
+    };
+    let (one, two, without) = (Scratch::new(), Scratch::new(), Scratch::new());
+    let store = |machine: &Machine| machine.state.lock().unwrap().store.clone();
+    let mut a = Machine::open(&one.0, Arc::new(|| {}), refusing(asked.clone())).unwrap();
+    let mut b = Machine::open(&two.0, Arc::new(|| {}), refusing(Arc::new(AtomicUsize::new(0)))).unwrap();
+    let mut c = Machine::open(&without.0, Arc::new(|| {}), any()).unwrap();
+    let replies = block(async {
+        // (One at a time on the second node: the same.)
+        for entry in &entries {
+            b.apply([entry.clone()]).await.unwrap();
+        }
+        let kept = |entry: &&Entry<TypeConfig>| ![2, 5].contains(&entry.log_id.index);
+        c.apply(entries.iter().filter(kept).cloned().collect::<Vec<_>>())
+            .await
+            .unwrap();
+        a.apply(entries.clone()).await.unwrap()
+    });
+    assert!(
+        matches!(&replies[1], Err(Error::Invalid(why)) if why.contains("format 3")),
+        "{:?}",
+        replies[1]
+    );
+    assert!(matches!(&replies[4], Err(Error::Invalid(why)) if why == "refused: not checked"));
+    assert!(
+        replies
+            .iter()
+            .enumerate()
+            .all(|(n, reply)| [1, 4].contains(&n) || reply.is_ok())
+    );
+    // Asked of the three entries from the mark on, and of nothing before.
+    assert_eq!(asked.load(Ordering::Relaxed), 3);
+    assert_eq!(store(&a), store(&b));
+    assert_eq!(store(&a), store(&c));
+    assert!(store(&a).get("ConfigMap/default/b").is_none());
+    assert_eq!(store(&a).born("ConfigMap/default/c"), Some((6, 300)));
+    // The nonce of the refused entry was not taken.
+    assert!(
+        serde_json::to_value(store(&a)).unwrap()["signers"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A signed entry refused changes no key, whatever it wraps: a signed import refused (before
+/// format 3, its nonce seen, inside another, or by the check at apply) leaves what a reader
+/// reads again as it was, rather than sending every reader to read the whole store.
+#[test]
+fn signed_refused_changes_no_keys() {
+    use openraft::storage::RaftStateMachine;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let made = |name: &str| Command::Apply {
+        resources: vec![config(name, "1")],
+        at: 100,
+    };
+    let import = || Command::Import {
+        store: Store::default(),
+    };
+    let commands = vec![
+        made("a"),
+        signed("ann", 1000, 1, import()),
+        Command::MarkSigned,
+        signed("ann", 1000, 1, made("b")),
+        signed("ann", 1000, 1, import()),
+        signed("ann", 1000, 2, signed("ann", 1000, 3, import())),
+        Command::Signed {
+            header: "v1; who=ann".into(),
+            method: "POST".into(),
+            path: "/v1/apply".into(),
+            body: String::new(),
+            command: Box::new(import()),
+        },
+    ];
+    let entry = |(index, command)| Entry {
+        log_id: LogId::new(CommittedLeaderId::new(4, 9), index as u64 + 1),
+        payload: EntryPayload::Normal(command),
+    };
+    let entries: Vec<Entry<TypeConfig>> = commands.into_iter().enumerate().map(entry).collect();
+    let both = ["ConfigMap/default/a", "ConfigMap/default/b"];
+    let dir = Scratch::new();
+    let mut machine = Machine::open(&dir.0, Arc::new(|| {}), any()).unwrap();
+    let replies = block(async { machine.apply(entries.clone()).await.unwrap() });
+    let refused: Vec<_> = replies.iter().map(Result::is_err).collect();
+    assert_eq!(refused, [false, true, false, false, true, true, true], "{replies:?}");
+    let touched = |machine: &Machine| {
+        let state = machine.state.lock().unwrap();
+        state
+            .touched(0)
+            .map(|keys| keys.into_iter().map(String::from).collect::<Vec<_>>())
+    };
+    assert_eq!(touched(&machine), Some(both.map(String::from).to_vec()));
+    // Refused by the check at apply: the same.
+    let refusing: crate::Check = Arc::new(|_, command, _| match command {
+        Command::Signed { command, .. } if matches!(**command, Command::Import { .. }) => {
+            Err(Error::Invalid("refused".into()))
+        }
+        _ => Ok(()),
+    });
+    let dir = Scratch::new();
+    let mut machine = Machine::open(&dir.0, Arc::new(|| {}), refusing).unwrap();
+    let entries = [&entries[..4], &[entry((4, signed("ann", 1000, 9, import())))]].concat();
+    let replies = block(async { machine.apply(entries).await.unwrap() });
+    assert!(replies[4].is_err());
+    assert_eq!(touched(&machine), Some(both.map(String::from).to_vec()));
+}
+
+/// The signers' book: a nonce seen is refused and changes nothing, one whose `expires` is
+/// five minutes or more before the signer's newest is refused, and nonces that old are dropped.
+#[test]
+fn signed_nonce_seen_is_a_no_op() {
+    let made = |name: &str| Command::Apply {
+        resources: vec![config(name, "1")],
+        at: 100,
+    };
+    let mut store = Store::default();
+    run(&mut store, Command::MarkSigned).unwrap();
+    let nonces = |store: &Store, who: &str| {
+        let book = serde_json::to_value(store).unwrap()["signers"][who][1].clone();
+        let nonces = book.as_object().cloned().unwrap_or_default();
+        nonces.keys().map(|nonce| nonce[30..].to_string()).collect::<Vec<_>>()
+    };
+    let refused = |store: &mut Store, command: Command, why: &str| {
+        let before = store.clone();
+        let reply = run(store, command);
+        assert!(
+            matches!(&reply, Err(Error::Invalid(said)) if said.contains(why)),
+            "{reply:?}"
+        );
+        assert_eq!(*store, before);
+    };
+    run(&mut store, signed("ann", 1000, 1, made("a"))).unwrap();
+    // Seen: refused, and nothing of it is done.
+    refused(&mut store, signed("ann", 1000, 1, made("b")), "seen");
+    assert!(store.get("ConfigMap/default/b").is_none());
+    // Each signer's book is its own.
+    run(&mut store, signed("bob", 1000, 1, made("b"))).unwrap();
+    // Ann's newest moves on: a nonce five minutes before it is refused, one less is taken,
+    // and the nonce of the first (1000, five minutes before 1300) is dropped.
+    run(&mut store, signed("ann", 1300, 2, made("c"))).unwrap();
+    assert_eq!(nonces(&store, "ann"), ["02"]);
+    refused(&mut store, signed("ann", 1000, 3, made("d")), "five minutes");
+    run(&mut store, signed("ann", 1001, 4, made("d"))).unwrap();
+    assert_eq!(nonces(&store, "ann"), ["02", "04"]);
+    // The dropped nonce is still refused: its expires is too old.
+    refused(&mut store, signed("ann", 1000, 1, made("e")), "five minutes");
+    // Bob's far-future expires spoils only his own key.
+    run(&mut store, signed("bob", u64::MAX, 5, made("e"))).unwrap();
+    refused(&mut store, signed("bob", 2000, 6, made("f")), "five minutes");
+    run(&mut store, signed("ann", 1300, 7, made("f"))).unwrap();
+    // A refused command still takes its nonce: it cannot be sent again once it would work.
+    let bad = Command::Delete {
+        key: "ConfigMap/default/nothing".into(),
+    };
+    assert!(matches!(
+        run(&mut store, signed("ann", 1300, 8, bad)),
+        Err(Error::NotFound(_))
+    ));
+    assert_eq!(nonces(&store, "ann"), ["02", "04", "07", "08"]);
+    // A header that does not read, and one signed inside another: refused, nothing taken.
+    let mut torn = signed("ann", 1300, 9, made("g"));
+    if let Command::Signed { header, .. } = &mut torn {
+        *header = header.replace("nonce=", "nonse=");
+    }
+    refused(&mut store, torn, "x-kith-signed");
+    let twice = signed("ann", 1300, 10, signed("ann", 1300, 11, made("g")));
+    refused(&mut store, twice, "inside");
+    // Below format 3 there is no book: a signed entry is refused, the store left as it was.
+    let mut old = Store::default();
+    refused(&mut old, signed("ann", 1000, 1, made("a")), "format 3");
+}
+
+/// A signed Import replaces the store, not the signers' book: sent again with the same nonce,
+/// it is refused as seen (the book came across the first), and the store is still in format 3.
+#[test]
+fn signed_import_keeps_the_book() {
+    let mut store = Store::default();
+    run(&mut store, Command::MarkSigned).unwrap();
+    let import = || {
+        let mut imported = Store::default();
+        imported.apply(config("in", "1")).unwrap();
+        signed("ann", 1000, 1, Command::Import { store: imported })
+    };
+    run(&mut store, import()).unwrap();
+    assert!(store.signing() && store.get("ConfigMap/default/in").is_some());
+    let again = run(&mut store, import());
+    assert!(
+        matches!(&again, Err(Error::Invalid(said)) if said.contains("seen")),
+        "{again:?}"
+    );
+}
+
 #[test]
 fn format_newer_than_this_build_is_refused_and_no_number_is_the_first() {
     use openraft::storage::RaftLogStorage;
@@ -525,7 +934,7 @@ fn format_newer_than_this_build_is_refused_and_no_number_is_the_first() {
             said.contains(&format!("format {newer}")) && said.contains(&format!("up to format {}", crate::FORMAT));
         assert!(both, "{said}");
     };
-    let open = || Machine::open(&scratch.0, Arc::new(|| {}));
+    let open = || Machine::open(&scratch.0, Arc::new(|| {}), any());
     let write = |snapshot: &serde_json::Value| {
         std::fs::write(scratch.0.join("snapshot.json"), snapshot.to_string()).unwrap();
     };
@@ -589,7 +998,7 @@ fn the_keys_commands_changed_are_kept_for_a_reader_that_is_behind() {
     use openraft::RaftSnapshotBuilder;
     use openraft::storage::RaftStateMachine;
     let scratch = Scratch::new();
-    let mut machine = Machine::open(&scratch.0, Arc::new(|| {})).unwrap();
+    let mut machine = Machine::open(&scratch.0, Arc::new(|| {}), any()).unwrap();
     block(async { machine.apply(fixture_entries()).await.unwrap() });
     let (a, b) = ("ConfigMap/default/a", "ConfigMap/default/b");
     {
@@ -618,7 +1027,7 @@ fn the_keys_commands_changed_are_kept_for_a_reader_that_is_behind() {
     }
     // A node that starts again knows nothing of what changed before it did.
     block(async { machine.build_snapshot().await.unwrap() });
-    let again = Machine::open(&scratch.0, Arc::new(|| {})).unwrap();
+    let again = Machine::open(&scratch.0, Arc::new(|| {}), any()).unwrap();
     let state = again.state.lock().unwrap();
     assert_eq!((state.index(), state.touched(5990)), (5999, None));
     assert_eq!(state.touched(5999).map(|keys| keys.len()), Some(0));
@@ -763,7 +1172,7 @@ fn forgotten_key_is_in_no_snapshot_or_log_entry() {
         let net = Net::default();
         let start = async |id: u64| {
             let dir = &dirs[id as usize - 1].0;
-            let replica = crate::open(dir, id, net.clone(), Arc::new(|| {})).await.unwrap();
+            let replica = crate::open(dir, id, net.clone(), Arc::new(|| {}), any()).await.unwrap();
             net.0.lock().unwrap().insert(id, replica.raft.clone());
             replica
         };
@@ -876,7 +1285,9 @@ fn purge_asked_at_any_index_leaves_raft_running() {
     runtime.block_on(async {
         let dir = Scratch::new();
         let net = Net::default();
-        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {})).await.unwrap();
+        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {}), any())
+            .await
+            .unwrap();
         net.0.lock().unwrap().insert(1, replica.raft.clone());
         let members = [(1, openraft::BasicNode::default())];
         replica
@@ -968,7 +1379,7 @@ fn stopped_before_the_log_was_dropped(dir: &std::path::Path, old_way: bool) {
     let entries: Vec<_> = payloads.into_iter().enumerate().map(entry).collect();
     block(async {
         let mut log = Log::open(&dir.join("log.redb")).unwrap();
-        let mut machine = Machine::open(dir, Arc::new(|| {})).unwrap();
+        let mut machine = Machine::open(dir, Arc::new(|| {}), any()).unwrap();
         log.put(entries.clone()).unwrap();
         log.save_vote(&openraft::Vote::new_committed(1, 1)).await.unwrap();
         log.save_committed(Some(entries[3].log_id)).await.unwrap();
@@ -1000,7 +1411,9 @@ fn forgotten_key_left_in_the_log_is_dropped_at_open() {
             "the log holds the key, as a node that stopped there left it"
         );
         let net = Net::default();
-        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {})).await.unwrap();
+        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {}), any())
+            .await
+            .unwrap();
         net.0.lock().unwrap().insert(1, replica.raft.clone());
         caught_up(&replica.raft, 3, 3).await;
         // Entries past the snapshot, then one taken at the last of them, which keeps them.
@@ -1021,7 +1434,9 @@ fn forgotten_key_left_in_the_log_is_dropped_at_open() {
         drop(replica);
         assert!(!holds(&dir.0, WRAPPED).await);
 
-        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {})).await.unwrap();
+        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {}), any())
+            .await
+            .unwrap();
         caught_up(&replica.raft, last, 3).await;
         // (What is not done can only be waited for: a drop at open is asked for at once.)
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1044,11 +1459,70 @@ fn forgotten_key_kept_from_before_is_cut_at_open() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let replica = crate::open(&dir.0, 1, Net::default(), Arc::new(|| {})).await.unwrap();
+        let replica = crate::open(&dir.0, 1, Net::default(), Arc::new(|| {}), any())
+            .await
+            .unwrap();
         caught_up(&replica.raft, 3, 3).await;
         replica.raft.shutdown().await.unwrap();
         drop(replica);
         assert!(!holds(&dir.0, WRAPPED).await);
+    });
+}
+
+/// A store that has Node/a at `address`, and one change of its kind.
+fn node_at(address: &str) -> Store {
+    let mut store = Store::default();
+    store.put(
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kith.dev/v1", "kind": "Node",
+            "metadata": { "name": "a" }, "spec": {}, "status": { "address": address },
+        }))
+        .unwrap(),
+    );
+    store
+}
+
+/// A snapshot another node sends, at `index`, with `store` as its state.
+async fn install(machine: &mut Machine, store: &Store, index: u64) {
+    use openraft::storage::RaftStateMachine;
+    let meta = openraft::SnapshotMeta {
+        last_log_id: Some(openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index)),
+        last_membership: Default::default(),
+        snapshot_id: format!("sent-{index}"),
+    };
+    let mut state = serde_json::to_value(crate::State::default()).unwrap();
+    state["store"] = serde_json::to_value(store).unwrap();
+    let sent = std::io::Cursor::new(serde_json::to_vec(&state).unwrap());
+    machine.install_snapshot(&meta, Box::new(sent)).await.unwrap();
+}
+
+/// A store brought in whole (Import, or a snapshot) counts the kinds it changes on from the store
+/// it replaces: a reader that kept the counts sees a changed Node come in.
+#[test]
+fn a_brought_in_store_moves_the_counts_of_the_kinds_it_changes() {
+    let mut store = node_at("10.1.2.3:7443");
+    let before = store.changes("Node");
+    run(
+        &mut store,
+        Command::Import {
+            store: node_at("10.9.9.9:7443"),
+        },
+    )
+    .unwrap();
+    assert!(
+        store.changes("Node") > before,
+        "Import: {before} then {}",
+        store.changes("Node")
+    );
+
+    let dir = Scratch::new();
+    block(async {
+        let mut machine = Machine::open(&dir.0, Arc::new(|| {}), any()).unwrap();
+        install(&mut machine, &node_at("10.1.2.3:7443"), 3).await;
+        let before = machine.state.lock().unwrap().store.changes("Node");
+        install(&mut machine, &node_at("10.9.9.9:7443"), 4).await;
+        let after = machine.state.lock().unwrap().store.changes("Node");
+        assert!(after > before, "a snapshot: {before} then {after}");
     });
 }
 
@@ -1058,7 +1532,7 @@ fn forgotten_key_kept_from_before_is_cut_as_it_comes_in() {
     use openraft::storage::RaftStateMachine;
     let dir = Scratch::new();
     block(async {
-        let mut machine = Machine::open(&dir.0, Arc::new(|| {})).unwrap();
+        let mut machine = Machine::open(&dir.0, Arc::new(|| {}), any()).unwrap();
         let mut state = serde_json::to_value(crate::State::default()).unwrap();
         state["store"] = serde_json::to_value(old_store()).unwrap();
         let meta = openraft::SnapshotMeta {
@@ -1082,7 +1556,9 @@ fn forgotten_key_kept_from_before_is_cut_as_it_comes_in() {
         .unwrap();
     runtime.block_on(async {
         let net = Net::default();
-        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {})).await.unwrap();
+        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {}), any())
+            .await
+            .unwrap();
         net.0.lock().unwrap().insert(1, replica.raft.clone());
         let alone = std::collections::BTreeMap::from([(1, openraft::BasicNode::default())]);
         replica.raft.initialize(alone).await.unwrap();
@@ -1113,7 +1589,9 @@ fn forgotten_key_refused_write_is_in_no_log_entry() {
     runtime.block_on(async {
         let dir = Scratch::new();
         let net = Net::default();
-        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {})).await.unwrap();
+        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {}), any())
+            .await
+            .unwrap();
         net.0.lock().unwrap().insert(1, replica.raft.clone());
         let alone = std::collections::BTreeMap::from([(1, openraft::BasicNode::default())]);
         replica.raft.initialize(alone).await.unwrap();
@@ -1139,7 +1617,9 @@ fn import_over_a_key_scrubs_the_log() {
     runtime.block_on(async {
         let dir = Scratch::new();
         let net = Net::default();
-        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {})).await.unwrap();
+        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {}), any())
+            .await
+            .unwrap();
         net.0.lock().unwrap().insert(1, replica.raft.clone());
         let members = [(1, openraft::BasicNode::default())];
         replica

@@ -1,0 +1,12 @@
+# kith OS for a node whose hardware is not known when the image is built: the drivers of
+# GPUs (AMD, Intel, nouveau), sound, Wi-Fi and network cards as modules, signed with a key
+# made for this build and thrown away after it, and all of linux-firmware beside them.
+#
+#   KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
+#
+# The modules and the firmware are in the root (/lib/modules, /lib/firmware), which is
+# checked block by block like the rest of it; the ESP stays 64 MB. `firmware: [all]` is the
+# whole of linux-firmware; a list of paths there (amdgpu/*, iwlwifi-*) is those files, and
+# the files each module names with MODULE_FIRMWARE.
+features: [all]
+firmware: [all]

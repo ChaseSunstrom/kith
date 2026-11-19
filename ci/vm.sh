@@ -1,5 +1,5 @@
 #!/bin/sh
-# shellcheck disable=SC1091,SC2034 # (names the driver and its parts share)
+# shellcheck disable=SC1091,SC2034,SC2016,SC2089,SC2090 # (names the driver and its parts share; $reap is a script kept in a variable)
 # Boot a kernel in QEMU and print what it said: by default the host's kernel with the
 # static kithd as init (so, the kernel and kithd, nothing else). The image,
 # installer, update and cluster tests reuse it with their own kernel, initramfs and disk image.
@@ -19,6 +19,9 @@
 #   sh ci/vm.sh --test blackout four encrypted nodes (three control, two of them with a TPM, and a worker)
 #                               losing power at once in the middle of writes and started again: nothing
 #                               typed, a leader from the two sealed ones, no write lost
+#   sh ci/vm.sh --test alone    two nodes, the worker set to run alone: the control node off and the worker
+#                               started again, it runs its replica and holds its Job after 30 s, with the risks
+#                               said; the control node back, the replica placed there is stopped on the worker
 #   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other;
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
@@ -29,8 +32,10 @@
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network
-#   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) imported with
-#                               kith import compose, applied, ready, each asked for by its compose name
+#   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) and media.yml
+#                               (eight, the media stack's shape) imported with kith import compose, applied,
+#                               ready, each asked for by its compose name; KITH_E2E=1 also runs media.yml
+#                               under docker compose up on an Alpine machine, timed beside kith's
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
 #                               kills in a minute restart the machine
@@ -85,6 +90,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    (refused), a good one (it restarts into its other slot, marks it
                    good, and is the same node), then one whose root is broken (three
                    tries, and it is back on the slot that worked); same needs
+  --test modules   instead: the 'all' image (its drivers are modules, signed with the key of its
+                   build): kithd loads the driver of an HDA controller at start, and of a USB
+                   audio device the monitor adds later, in the same boot; the same spec built
+                   with one byte of snd-usb-audio changed is refused on one console line; same
+                   needs as image, and the image is built twice
   --test rollout   instead: three nodes on a network of their own, claimed and joined
                    over TLS, their image built with a release key; a first release by
                    another key (refused), one with another file's signature (refused), a signed
@@ -128,6 +138,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    third still off, which then, and the worker, are handed their keys;
                    every acknowledged write is on all three control nodes and both
                    Workloads are started again; needs swtpm
+  --test alone    instead: two nodes the installer made, each with its state not
+                   encrypted: a control node and a worker set to `alone: run`, with a
+                   one-replica Workload and a Job on the worker; the control node is
+                   stopped and the worker started again: after about 30 s it says so,
+                   with the risks, runs the replica and holds the Job; the control node
+                   back, the worker says since when it ran alone and until when, and
+                   the replica placed on the control node is stopped on the worker
   --test share    instead: two nodes on the mesh, each with kith as a container image
                    already there: a file a container makes in a shared volume on the
                    node that does not hold it is there on the node that does, and the
@@ -145,7 +162,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    a pod of a user who is not root finds their Service
                    by its short name and its Kubernetes one, hears all three through
                    it, reaches this machine from behind its node's address, and
-                   writes to /dev/stdout by name; a pod that is root is kept from a
+                   writes to /dev/stdout by name; a NetworkPolicy's egress rule holds
+                   the pods of one app to this machine's address and one port (and
+                   port 80 of no other address): another port, or a pod's address on
+                   port 80, is silent, while an unfenced pod on the same node is
+                   answered by that pod and refused by the port nothing listens on;
+                   a pod that is root is kept from a
                    device it was not given (its node's disk); a container that asks for user
                    namespaces starts a sandbox in it (this machine's bwrap), one that
                    does not is refused, one that is root is not started; a USB keyboard
@@ -179,11 +201,15 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    x86_64-unknown-linux-musl
   --test compose   instead: one node on the mesh, and on this machine `kith import
                    compose` of ci/compose/stack.yml (four services of the test pod,
-                   nothing in it left out) applied to it. Expected: each Workload ready,
-                   each Service given its backend, and a Job in a pod asking each service
-                   by its compose name (and the alias a container_name gives) is answered
-                   by that service's pod; the seconds from the apply to all four ready are
-                   printed (kith's side of T-0320's comparison with docker compose)
+                   nothing in it left out) and of ci/compose/media.yml (the eight services
+                   of the media stack, on the test pod) applied to it. Expected: each
+                   Workload ready, each Service given its backend, and a Job in a pod
+                   asking each service by its compose name (and the alias a container_name
+                   gives) is answered by that service's pod; the seconds from the apply to
+                   all ready are printed (kith's side of T-0320's comparison with docker
+                   compose). With KITH_E2E=1 also docker compose up of media.yml on an
+                   Alpine machine of its own (docker from Alpine's packages; three runs,
+                   the median printed beside kith's)
   --test quota     instead: one node on the mesh, its state disk made with project
                    quotas (as os/build.sh makes it). Expected: kithd says it holds
                    pods' storage limits at the write; a pod of 64Ki removed and the
@@ -207,7 +233,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    the one on PATH) asking the first as the cluster's admin: the
                    manifests of ci/kube applied, rolled out and running, a
                    StatefulSet's claim given a volume that outlives its
-                   pod, a Job and a CronJob's Job reading all of it through their
+                   pod, a StatefulSet of three with a claim and a volume for each
+                   replica across the nodes, a Job and a CronJob's Job reading all of it through their
                    Services, kubectl create, expose, scale, set image, rollout
                    restart, wait and logs, helm install, upgrade and uninstall
                    with --wait, and nothing left when all is deleted. Skipped
@@ -231,7 +258,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --test home      instead: three nodes as for rollout, a house address (10.9.0.100/24)
                    in the Cluster, and a machine on their network (ci/lan_probe.py)
                    that asks who has it four times a second. Expected: one card
-                   answers and announces it, DNS asked of it answers from it, with
+                   answers and announces it, the Cluster's status.home says whose
+                   it is (and the next holder's after a reset), DNS asked of it answers from it, with
                    the holder reset by the hypervisor and then (after it is back)
                    the next one stopped, another announces it within 10 s (the
                    seconds are printed), and two cards are never heard answering at
@@ -268,6 +296,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    of a namespace the Exit does not list is refused; and in what
                    the node's two cards carried, no packet of the pod's but the
                    tunnel's own. Needs what --test pods needs, and ip and wg
+  --selftest-kill  instead: start this script with a stand-in for QEMU, kill its shell from
+                   outside (SIGKILL, then SIGTERM) and expect no QEMU left and the VM lock
+                   free; needs no QEMU, KVM or kernel
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -275,11 +306,12 @@ compiler when there is no musl-gcc: ci/musl.sh) and needs cpio and zstd.
 EOF
 }
 
-kernel='' initrd='' disk='' time=60 test=''
+kernel='' initrd='' disk='' time=60 test='' selftest=''
 append="console=ttyS0 panic=-1"
 while [ $# -gt 0 ]; do
     case $1 in
     --help | -h) usage; exit 0 ;;
+    --selftest-kill) selftest=1; shift ;;
     --kernel | --initrd | --disk | --append | --time | --test)
         [ $# -ge 2 ] || { echo "vm.sh: $1 needs a value" >&2; exit 2; }
         case $1 in
@@ -290,7 +322,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, blackout, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | alone) ;; *) echo "vm.sh: --test knows: init, image, update, modules, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -305,8 +337,54 @@ if [ -n "$disk" ]; then
 fi
 
 skip() { echo "skipped: $1"; exit 0; }
+
+# --selftest-kill: this script, with a stand-in for QEMU (a sleep that writes its pid), killed from
+# outside by SIGKILL (no trap runs) and by SIGTERM: nothing of it may be left, and its lock must be
+# free. Needs no QEMU, no KVM and no kernel. Stops only the pid the stand-in wrote, if it survives.
+if [ -n "$selftest" ]; then
+    st=$(mktemp -d)
+    mkdir "$st/bin"
+    printf '#!/bin/sh\necho $$ >"%s/pid"\nexec sleep 300\n' "$st" >"$st/bin/qemu-system-x86_64"
+    chmod +x "$st/bin/qemu-system-x86_64"
+    : >"$st/kernel"; : >"$st/initrd"
+    bad=0 alive=''
+    for sig in KILL TERM; do
+        rm -f "$st/pid"
+        KITH_VM_STUB=1 KITH_VM_LOCK="$st/lock" PATH="$st/bin:$PATH" \
+            sh "$0" --kernel "$st/kernel" --initrd "$st/initrd" --time 300 >/dev/null 2>&1 8>&- &
+        shell=$!
+        n=0
+        until [ -s "$st/pid" ]; do
+            n=$((n + 1)); [ "$n" -lt 100 ] || { echo "vm.sh: selftest: the stand-in never started" >&2; kill -9 "$shell"; exit 1; }
+            sleep 0.1
+        done
+        qemu=$(cat "$st/pid")
+        kill -"$sig" "$shell"
+        n=0
+        while kill -0 "$qemu" 2>/dev/null && [ "$n" -lt 50 ]; do n=$((n + 1)); sleep 0.1; done
+        if kill -0 "$qemu" 2>/dev/null; then
+            echo "vm.sh: selftest: FAIL: after SIG$sig to the shell its QEMU ($qemu) still runs" >&2
+            bad=1 alive=1
+        fi
+        # (up to 5 s for the lock: the shell's own exit frees it; a QEMU that kept the descriptor never does)
+        if command -v flock >/dev/null 2>&1 && ! flock -w 5 "$st/lock" true; then
+            echo "vm.sh: selftest: FAIL: after SIG$sig to the shell its lock is still held" >&2
+            bad=1
+        fi
+        kill -9 "$shell" 2>/dev/null || true # (only if it ignored the signal; reaped here)
+        wait "$shell" 2>/dev/null || true
+        [ -z "$alive" ] || kill -9 "$qemu" 2>/dev/null || true # (its own pid, as it survived)
+        alive=''
+    done
+    rm -rf "$st"
+    [ "$bad" = 0 ] || exit 1
+    echo "vm.sh: selftest ok: killed from outside (SIGKILL, SIGTERM), no QEMU left and the lock free"
+    exit 0
+fi
+
+# (KITH_VM_STUB is for that selftest: a stand-in QEMU on PATH, no KVM needed.)
 command -v qemu-system-x86_64 >/dev/null 2>&1 || skip "no qemu-system-x86_64"
-if ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; then skip "no usable /dev/kvm"; fi
+if [ -z "${KITH_VM_STUB:-}" ] && { ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; }; then skip "no usable /dev/kvm"; fi
 
 # One VM test at a time for a user on a machine: two at once starve each other into waits
 # that run out, which reads as a failure. KITH_VM_LOCK names another file; empty, no wait.
@@ -318,14 +396,22 @@ fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
-vms='' web=''
+vms='' web='' found=''
 # (What a test left running goes with it; its consoles' logs are kept where KITH_VM_LOGS
 # names a directory, for a failure that does not come again. Stopped, it ends there: a trap on
 # TERM alone would clean up and then go on running the test.)
 # A write a control node makes as itself that the leader refused (raft.rs `write`, own_writes.rs)
 # is a call site no suite expects: the run fails whatever the suite said, and names the lines.
 refusals() { grep -ahs "refused a control node.s own write" "$work"/log "$work"/*.log | head -n 3; }
-trap 'kill $vms $web 2>/dev/null || true; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
+# Everything this run starts carries KITH_VM_RUN in its environment, and $reap ends what carries it
+# (TERM, then KILL for what is left a second later): the QEMU itself, which a `kill` of its `timeout`
+# wrapper does not reach when the shell is gone, and no process by name. The EXIT trap runs it; so does a
+# watcher of its own (own session, no lock descriptor) for the shell killed with SIGKILL, which runs no trap.
+KITH_VM_RUN=$$.$(date +%s%N); export KITH_VM_RUN
+reap='for sig in TERM KILL; do pids=; for f in $(grep -lzx "KITH_VM_RUN=$1" /proc/[0-9]*/environ 2>/dev/null); do p=${f#/proc/}; pids="$pids ${p%/environ}"; done; [ -z "$pids" ] || { kill -$sig $pids 2>/dev/null; sleep 1; }; done; true'
+setsid=''; ! command -v setsid >/dev/null 2>&1 || setsid=setsid
+env -u KITH_VM_RUN $setsid sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 1; done; exec sh -c "$2" sh "$3"' sh $$ "$reap" "$KITH_VM_RUN" </dev/null >/dev/null 2>&1 8>&- &
+trap 'kill $vms $web 2>/dev/null || true; env -u KITH_VM_RUN sh -c "$reap" sh "$KITH_VM_RUN"; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
 trap 'exit 1' INT TERM
 said() { grep -aq "$1" "$work/log" 2>/dev/null; }
 fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
@@ -367,7 +453,7 @@ if [ "$test" = init ]; then
         shift 2
         rm -f "$work/log" "$work/keys"
         timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
-            -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" "$@" </dev/null >/dev/null 2>&1 &
+            -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" "$@" </dev/null >/dev/null 2>&1 8>&- &
         vm=$!
         until said 'kithd: serving '; do
             kill -0 "$vm" 2>/dev/null || fail "the VM ended before kithd served"
@@ -395,7 +481,10 @@ fi
 
 # panic=-1 reboots at once, -no-reboot turns that into QEMU exiting: a kithd that
 # stops (as init, it must not) ends the run; the timeout ends one that does not.
-timeout "$time" qemu-system-x86_64 "$@" </dev/null >"$work/log" 2>&1 || true
+# (In the background and waited for: a signal's trap waits for a command in the foreground.)
+timeout "$time" qemu-system-x86_64 "$@" </dev/null >"$work/log" 2>&1 8>&- &
+vms=$!
+wait "$vms" || true
 cat "$work/log"
 if grep -qi kithd "$work/log"; then
     echo "vm.sh: ok: kithd spoke"

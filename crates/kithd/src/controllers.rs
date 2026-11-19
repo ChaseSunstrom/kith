@@ -78,6 +78,17 @@ fn checks(store: &Store, resources: &mut [Resource]) -> Result<Vec<Check>, Strin
     Ok(checks)
 }
 
+/// Which of `resources` a kind's admission module is asked of, and so may rewrite (each set in
+/// the namespace it is written in, as [`Shared::admitted`] sets it).
+pub(crate) fn admits(store: &Store, resources: &mut [Resource]) -> Result<Vec<usize>, String> {
+    let checks = checks(store, resources)?.into_iter();
+    let admits = checks.filter_map(|check| match check {
+        Check::Admit { at, .. } => Some(at),
+        Check::Module(..) => None,
+    });
+    Ok(admits.collect())
+}
+
 /// What the module made of `resource`: only its spec, labels and annotations are its to change.
 fn changed(resource: &Resource, answer: Value) -> Result<Resource, String> {
     let mut changed: Resource =
@@ -162,7 +173,7 @@ type Stamp = (
 
 /// What the rights of `definition`'s writer are read from, as one number: its Identity, and
 /// every Role and RoleBinding. (A right granted later is a reason to run again what was refused.)
-fn rights(store: &Store, definition: &Resource) -> u64 {
+pub(crate) fn rights(store: &Store, definition: &Resource) -> u64 {
     use std::hash::{Hash, Hasher};
     let writer = definition.metadata.annotations.get(releases::WRITER);
     let identity = writer.and_then(|writer| store.get(&format!("Identity/{writer}")));

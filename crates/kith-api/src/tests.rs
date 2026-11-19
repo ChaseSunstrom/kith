@@ -162,6 +162,36 @@ fn session_example_carries_the_client_settings() {
     assert_eq!(find("DeviceClaim/desktop/desk-apps")["access"], json!("client"));
 }
 
+/// A liveness probe's `startSeconds` is on the wire as that name, a whole number, and is kept
+/// through the typed read: it is not `start_seconds` or Kubernetes' `initialDelaySeconds`.
+#[test]
+fn a_probe_has_start_seconds_on_the_wire() {
+    let probe = |field: &str| {
+        workload(&format!(
+            "        liveness:\n          tcp: {{ port: 80 }}\n          {field}\n"
+        ))
+    };
+    let r = one(&probe("startSeconds: 45"));
+    assert_eq!(
+        r.spec["template"]["containers"][0]["liveness"]["startSeconds"],
+        json!(45)
+    );
+    for bad in [
+        "startSeconds: '45'",
+        "startSeconds: -1",
+        "start_seconds: 45",
+        "initialDelaySeconds: 45",
+    ] {
+        let (_, _, msg) = err(&probe(bad));
+        assert!(!msg.is_empty(), "{bad}");
+    }
+    let workload = KINDS.iter().find(|info| info.kind == "Workload").unwrap();
+    assert!(
+        workload.schema().to_string().contains("\"startSeconds\""),
+        "the schema names it"
+    );
+}
+
 #[test]
 fn strings_are_never_coerced() {
     let r = one(&workload(
@@ -721,6 +751,24 @@ fn replay_takes_a_dotted_service_an_older_binary_logged() {
     store.apply_all(vec![old, dotted_ns]).unwrap();
     assert!(store.get("Service/default/db-0.db-replicas").is_some());
     assert!(store.get("Service/db.prod/db-0").is_some());
+}
+
+/// Replay takes a NetworkPolicy an older binary logged with a cidr that cannot be read: refused
+/// when submitted (`submitted`), not in `validated`, or the policy would vanish on replay and
+/// the pods it holds would be open. (The enforcer keeps everybody out for it.)
+#[test]
+fn network_policy_cidr_replay_takes_one_an_older_binary_logged() {
+    let logged = Resource {
+        api_version: API_VERSION.into(),
+        kind: "NetworkPolicy".into(),
+        metadata: serde_json::from_value(json!({ "name": "old" })).unwrap(),
+        spec: json!({ "ingress": [{ "action": "deny", "peers": [{ "cidr": "nonsense" }] }, { "action": "allow" }] }),
+        status: None,
+    };
+    assert!(logged.submitted_by_node().is_err(), "a new one is refused");
+    let mut store = Store::default();
+    store.apply_all(vec![logged]).unwrap();
+    assert!(store.get("NetworkPolicy/default/old").is_some());
 }
 
 /// A headless Service has no address to send a host to: it is refused with `expose` at apply,
@@ -2206,4 +2254,55 @@ fn an_identity_names_the_workloads_that_run_as_it() {
             .into(),
     );
     assert!(exec.unwrap_err().contains("only containers"));
+}
+
+const ALPHA: &str = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: alpha }\nspec: {}\n";
+const HOME_ZONE: &str =
+    "apiVersion: kith.dev/v1\nkind: DNSZone\nmetadata: { name: home }\nspec: { domain: home.example }\n";
+
+#[test]
+fn changes_count_an_apply_a_status_and_a_delete_of_their_kind_only() {
+    let mut store = Store::default();
+    assert_eq!(store.changes("Node"), 0);
+    store.apply(one(ALPHA)).unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (1, 0));
+    store.apply(one(HOME_ZONE)).unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (1, 1));
+    store.set_status("Node/alpha", Some(json!({"state": "ready"}))).unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (2, 1));
+    store.delete("DNSZone/home").unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (2, 2));
+    assert_eq!(store.changes("Service"), 0);
+}
+
+#[test]
+fn changes_of_a_write_that_changes_nothing_move_nothing() {
+    let mut store = Store::default();
+    store.apply(one(ALPHA)).unwrap();
+    store.set_status("Node/alpha", Some(json!({"state": "ready"}))).unwrap();
+    let before = store.changes("Node");
+    // The same spec again, and the same status again: no change.
+    assert_eq!(store.apply(one(ALPHA)).unwrap().action, Action::Unchanged);
+    store.set_status("Node/alpha", Some(json!({"state": "ready"}))).unwrap();
+    // A delete that finds nothing, and a status for a key there is not.
+    assert!(store.delete("Node/ghost").is_err());
+    assert!(store.set_status("Node/ghost", None).is_err());
+    assert_eq!(store.changes("Node"), before);
+    assert_eq!(store.changes("DNSZone"), 0);
+}
+
+#[test]
+fn changes_go_on_when_a_store_is_replaced_whole() {
+    let mut before = Store::default();
+    before.apply(one(ALPHA)).unwrap();
+    // A store brought in (an import, a snapshot) keeps no counts, and has a zone this one lacks.
+    let mut brought = Store::default();
+    brought.apply(one(HOME_ZONE)).unwrap();
+    brought.apply(one(ALPHA)).unwrap();
+    let mut brought: Store = serde_json::from_str(&serde_json::to_string(&brought).unwrap()).unwrap();
+    assert_eq!(brought.changes("Node"), 0);
+    brought.continue_changes(&before);
+    assert!(brought.changes("Node") > before.changes("Node"));
+    assert!(brought.changes("DNSZone") > before.changes("DNSZone"));
+    assert!(brought.get("Node/alpha").is_some());
 }

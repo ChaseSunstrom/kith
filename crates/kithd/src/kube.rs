@@ -26,13 +26,16 @@
 use crate::Shared;
 use crate::access::{Caller, Certificate, Grants};
 use crate::api::{self, ApiError, LogOptions};
+use crate::websocket;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as Route, Query, State};
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
+use hyper::upgrade::OnUpgrade;
+use hyper_util::rt::TokioIo;
 use kith_api::kinds::Verb;
 use kith_api::store::{Action, Error, Store, now, rfc3339};
 use kith_api::{Metadata, Resource};
@@ -40,6 +43,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The annotation a resource made here carries: the object as the client sent it. What
 /// `kubectl apply` works its next change out from is in it, so it is given back whole.
@@ -886,8 +890,11 @@ fn pods(owner: &Value, resource: &Resource) -> Vec<Value> {
         if !node.is_null() {
             set(&mut spec, "/nodeName", node.clone());
         }
+        // A replica a delete restarted starts at its restart; the rest at their owner's making.
+        let since = all.iter().filter_map(|unit| unit["restarted"].as_u64()).max();
+        let started = since.map_or(meta["creationTimestamp"].clone(), |at| rfc3339(at).into());
         let mut status = json!({
-            "phase": phase, "startTime": meta["creationTimestamp"],
+            "phase": phase, "startTime": started,
             "conditions": [
                 condition("Initialized", begun, ""), condition("PodScheduled", true, ""),
                 condition("ContainersReady", ready, ""), condition("Ready", ready, ""),
@@ -1369,6 +1376,179 @@ fn merged(have: &mut Value, items: Vec<Value>, by: &str) {
     }
 }
 
+/// The most operations a JSON patch has, and the most bytes its copies make in all: a copy of
+/// a whole document doubles it, so the copies are what is bounded.
+// ponytail: one budget for the whole patch; per-copy limits if a real patch ever meets these.
+const PATCH_OPS: usize = 256;
+const PATCH_COPY_BYTES: usize = 16 << 20;
+
+/// RFC 6902's operations applied in order to a copy of `live`, which is what comes back. One
+/// that fails (a `test` not so, a path not there, a pointer not written as one) refuses the
+/// whole patch, and `live` is not changed: the caller writes nothing then.
+fn json_patch(live: &Value, ops: &Value) -> Result<Value, String> {
+    let Value::Array(ops) = ops else {
+        return Err("the patch is a list of operations, each { op, path, ... }".into());
+    };
+    if ops.len() > PATCH_OPS {
+        return Err(format!("a patch has at most {PATCH_OPS} operations"));
+    }
+    let mut doc = live.clone();
+    let mut copied = 0;
+    for op in ops {
+        let kind = op.get("op").and_then(Value::as_str).ok_or("an operation has no op")?;
+        let pointer = op
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{kind}: needs a path"))?;
+        let value = || {
+            op.get("value")
+                .cloned()
+                .ok_or_else(|| format!("{kind} {pointer}: needs a value"))
+        };
+        let source = || {
+            op.get("from")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{kind} {pointer}: needs a from"))
+        };
+        match kind {
+            "add" => insert(&mut doc, pointer, value()?)?,
+            "replace" => {
+                let value = value()?;
+                *find(&mut doc, pointer)? = value;
+            }
+            "remove" => drop(take(&mut doc, pointer)?),
+            "test" => {
+                let want = value()?;
+                if !same(find(&mut doc, pointer)?, &want) {
+                    return Err(format!("test {pointer}: the value is not the one given"));
+                }
+            }
+            "copy" => {
+                let made = find(&mut doc, source()?)?;
+                copied += made.to_string().len();
+                if copied > PATCH_COPY_BYTES {
+                    return Err(format!(
+                        "copy {pointer}: the copies make more than {PATCH_COPY_BYTES} bytes"
+                    ));
+                }
+                let made = made.clone();
+                insert(&mut doc, pointer, made)?;
+            }
+            "move" => {
+                let from = source()?;
+                // (A value is not moved into itself: `from` is not a proper prefix of `pointer`.)
+                if pointer.len() > from.len() && pointer.starts_with(from) && pointer[from.len()..].starts_with('/') {
+                    return Err(format!("move {pointer}: {from} is above it"));
+                }
+                let moved = take(&mut doc, from)?;
+                insert(&mut doc, pointer, moved)?;
+            }
+            other => return Err(format!("{other}: not one of add, remove, replace, move, copy, test")),
+        }
+    }
+    Ok(doc)
+}
+
+/// The steps of an RFC 6901 pointer: `""` is the whole document, `/a/0` is `a` then `0`, and a
+/// `~` in a step is `~0` or `~1`, nothing else.
+fn tokens(pointer: &str) -> Result<Vec<String>, String> {
+    if pointer.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(rest) = pointer.strip_prefix('/') else {
+        return Err(format!("{pointer}: a path starts with /"));
+    };
+    rest.split('/')
+        .map(|step| {
+            if !step.split('~').skip(1).all(|after| after.starts_with(['0', '1'])) {
+                return Err(format!("{pointer}: a ~ is written ~0 or ~1"));
+            }
+            Ok(step.replace("~1", "/").replace("~0", "~"))
+        })
+        .collect()
+}
+
+/// An index of a list as RFC 6901 writes one: digits, with no leading zero (`-` is not one).
+fn index(step: &str, pointer: &str) -> Result<usize, String> {
+    let digits =
+        !step.is_empty() && step.bytes().all(|b| b.is_ascii_digit()) && !(step.len() > 1 && step.starts_with('0'));
+    digits
+        .then(|| step.parse::<usize>().ok())
+        .flatten()
+        .ok_or_else(|| format!("{pointer}: {step} is not an index"))
+}
+
+/// The place `pointer` names in `doc`, which must be there.
+fn find<'a>(doc: &'a mut Value, pointer: &str) -> Result<&'a mut Value, String> {
+    let mut at = doc;
+    for step in tokens(pointer)? {
+        let next = match at {
+            Value::Object(map) => map.get_mut(&step),
+            Value::Array(items) => items.get_mut(index(&step, pointer)?),
+            _ => None,
+        };
+        at = next.ok_or_else(|| format!("{pointer}: the path is not there"))?;
+    }
+    Ok(at)
+}
+
+/// Puts `value` at `pointer`: a key of a mapping (made if it is not there), or an index of a
+/// list where `-` is its end. The parent must be there; the root is replaced whole.
+fn insert(doc: &mut Value, pointer: &str, value: Value) -> Result<(), String> {
+    let Some(last) = tokens(pointer)?.pop() else {
+        *doc = value;
+        return Ok(());
+    };
+    let parent = find(doc, &pointer[..pointer.rfind('/').unwrap_or(0)])?;
+    match parent {
+        Value::Object(map) => drop(map.insert(last, value)),
+        Value::Array(items) if last == "-" => items.push(value),
+        Value::Array(items) => {
+            let at = index(&last, pointer)?;
+            if at > items.len() {
+                return Err(format!("add {pointer}: the index is past the end"));
+            }
+            items.insert(at, value);
+        }
+        _ => return Err(format!("add {pointer}: the parent is not a list or a mapping")),
+    }
+    Ok(())
+}
+
+/// Takes out what `pointer` names, which must be there, and says what it was.
+fn take(doc: &mut Value, pointer: &str) -> Result<Value, String> {
+    let Some(last) = tokens(pointer)?.pop() else {
+        return Err("the whole document cannot be removed".into());
+    };
+    let parent = find(doc, &pointer[..pointer.rfind('/').unwrap_or(0)])?;
+    let gone = match parent {
+        Value::Object(map) => map.remove(&last),
+        Value::Array(items) => {
+            let at = index(&last, pointer)?;
+            (at < items.len()).then(|| items.remove(at))
+        }
+        _ => None,
+    };
+    gone.ok_or_else(|| format!("{pointer}: the path is not there"))
+}
+
+/// Whether two values are the same as RFC 6902 has it: a number is its value (2 and 2.0 are one
+/// number), a mapping has the same keys with the same values, a list the same items in order.
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64(), x.as_u64(), y.as_u64()) {
+            (Some(x), Some(y), _, _) => x == y,
+            (_, _, Some(x), Some(y)) => x == y,
+            _ => x.as_f64() == y.as_f64(),
+        },
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y)),
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(key, x)| y.get(key).is_some_and(|y| same(x, y)))
+        }
+        _ => a == b,
+    }
+}
+
 // ---- Who set which field: server-side apply ----
 
 /// A field's place in an object, a step at a time as Kubernetes's `fieldsV1` spells it:
@@ -1707,6 +1887,8 @@ enum How {
     Patch {
         strategic: bool,
     },
+    /// An RFC 6902 list of operations, applied to what is there (`kubectl patch --type json`).
+    JsonPatch,
     /// A server-side apply: what is sent is the object, made if it is not there.
     Apply,
 }
@@ -1827,10 +2009,11 @@ async fn serve(
             let how = match said(header::CONTENT_TYPE).split(';').next().unwrap_or_default().trim() {
                 "application/strategic-merge-patch+json" => How::Patch { strategic: true },
                 "application/merge-patch+json" => How::Patch { strategic: false },
+                "application/json-patch+json" => How::JsonPatch,
                 "application/apply-patch+yaml" => How::Apply,
                 other => {
                     let why = format!(
-                        "a patch as {other} is not read: send a merge patch, a strategic merge patch or an apply"
+                        "a patch as {other} is not read: send a merge patch, a strategic merge patch, a JSON patch or an apply"
                     );
                     return Err(status(StatusCode::UNSUPPORTED_MEDIA_TYPE, "UnsupportedMediaType", why));
                 }
@@ -1858,6 +2041,20 @@ async fn serve(
         ("PUT" | "PATCH", Some(_), Some("status")) => {
             let why = "status is kithd's own: it is written from what runs and is not taken from a client";
             return Err(status(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", why.into()));
+        }
+        ("GET" | "POST", Some(name), Some(verb @ ("exec" | "attach"))) if kind.kind == "Pod" => {
+            let upgrade = parts.extensions.get::<OnUpgrade>().cloned();
+            let (method, headers) = (parts.method.as_str(), &parts.headers);
+            pod_stream(
+                &call,
+                verb,
+                namespace.unwrap_or_default(),
+                name,
+                method,
+                headers,
+                upgrade,
+            )
+            .await?
         }
         (_, Some(_), Some("exec" | "attach" | "portforward")) => {
             let why = "exec, attach and port-forward are not answered here: `kith run` runs a command in a replica";
@@ -2065,11 +2262,17 @@ fn held_as(
     resources.extend(taken.resources);
     // A StatefulSet's claims are objects of their own in Kubernetes: each is shown as its template says.
     for template in sent["spec"]["volumeClaimTemplates"].as_array().into_iter().flatten() {
-        let claim = format!("{}-{name}-0", template["metadata"]["name"].as_str().unwrap_or_default());
-        let held = resources
-            .iter_mut()
-            .find(|held| held.kind == "VolumeClaim" && held.metadata.name == claim);
-        if let Some(held) = held.filter(|held| !held.metadata.annotations.contains_key(SENT)) {
+        // (One for each replica: TEMPLATE-NAME-ORDINAL.)
+        let base = format!("{}-{name}-", template["metadata"]["name"].as_str().unwrap_or_default());
+        let each = |held: &Resource| {
+            let ordinal = held.metadata.name.strip_prefix(&base);
+            held.kind == "VolumeClaim" && ordinal.is_some_and(|n| n.parse::<u32>().is_ok())
+        };
+        for held in resources.iter_mut().filter(|held| each(held)) {
+            if held.metadata.annotations.contains_key(SENT) {
+                continue;
+            }
+            let claim = held.metadata.name.clone();
             let mut object = json!({
                 "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                 "metadata": { "name": claim, "namespace": place }, "spec": template["spec"],
@@ -2177,7 +2380,7 @@ async fn write(
     // Who may not write here is told that, and nothing of what is there; and a change
     // of what is there (a patch is answered with all of it) is for who may read it.
     call.allowed(kind, namespace, Verb::Apply)?;
-    if matches!(how, How::Patch { .. }) {
+    if matches!(how, How::Patch { .. } | How::JsonPatch) {
         call.allowed(kind, namespace, Verb::Get)?;
     }
     let primary = key(kind, namespace, &name);
@@ -2222,7 +2425,11 @@ async fn write(
     let read = {
         let state = call.shared.store.lock().expect("a handler panicked holding the store");
         let live = state.store.get(&primary);
-        let before = live.and_then(raw).filter(|(of, _)| std::ptr::eq(*of, kind));
+        // A JSON patch is laid over the object as kubectl reads it (defaults and server fields
+        // in), so its base and what it is diffed against are served; the rest work on what was sent.
+        let before = live
+            .and_then(|live| if how == How::JsonPatch { served(live) } else { raw(live) })
+            .filter(|(of, _)| std::ptr::eq(*of, kind));
         if live.is_some() && !there && how == How::Apply {
             let why = format!("{primary} was made since: apply it again");
             return Err(status(StatusCode::CONFLICT, "Conflict", why));
@@ -2245,6 +2452,8 @@ async fn write(
                 patched(&mut before, body, strategic);
                 before
             }
+            // A refused operation refuses the whole patch: what is there is not written.
+            (How::JsonPatch, Some((_, before))) => json_patch(&before, &body).map_err(invalid)?,
         };
         // A change of what was read is held to it: the revision, whatever its status did since.
         let based = sent.pointer("/metadata/resourceVersion").and_then(Value::as_str);
@@ -2297,7 +2506,7 @@ async fn write(
                 let force = call.asked.get("force").is_some_and(|force| force == "true");
                 sent = apply(was, sent, manager, &version_of(kind.group), force)?;
             }
-            (How::Replace | How::Patch { .. }, Some(was)) => updated(&was, &mut sent),
+            (How::Replace | How::Patch { .. } | How::JsonPatch, Some(was)) => updated(&was, &mut sent),
             _ => {}
         }
         held_as(&state.store, kind, place, &name, &sent).map(|held| (held, revision))
@@ -2349,6 +2558,9 @@ async fn delete(
         hints.push(format!(
             "{kind}/{name}: gracePeriodSeconds is taken and changes nothing: what it runs is stopped as kith stops it"
         ));
+    }
+    if kind.kind == "Pod" {
+        return delete_pod(call, kind, namespace, name, hints).await;
     }
     // (Asked first: who may not delete here is not told what is there.)
     call.allowed(kind, namespace, Verb::Delete)?;
@@ -2420,6 +2632,57 @@ async fn delete(
         format!("Namespace/{name}: {stay} resources in it were not made through this API, and stay: `kith delete` removes them")
     });
     hints.extend(stay);
+    Ok(Written(StatusCode::OK, Some(done), hints).into_response())
+}
+
+/// `kubectl delete pod NAME` restarts that one replica: its node stops it and its Workload starts
+/// it again, with the same name and number and a new start time. Needs the apply right on the
+/// Workload; a pod that is no Workload's replica (a bare pod, a Job's run, a NodeWorkload's copy)
+/// is refused by name. No grace period and no force: what runs is stopped as kith stops it.
+async fn delete_pod(
+    call: &Call,
+    kind: &'static Kind,
+    namespace: Option<&str>,
+    name: &str,
+    hints: Vec<String>,
+) -> Result<Response, No> {
+    let namespace = namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE);
+    let Some(("Workload", owner, replica)) = pod_owner(name) else {
+        let why = format!(
+            "Pod/{name}: only a replica of a Workload is restarted by a delete: kith runs no other pod that is restarted so"
+        );
+        return Err(invalid(why));
+    };
+    // (Asked before the Workload is looked at: who may not restart it is not told what is there.)
+    api::permit(&call.shared, &call.caller, Verb::Apply, |_| {
+        vec![("Workload".to_string(), Some(namespace.to_string()))]
+    })
+    .map_err(refusal)?;
+    let key = format!("Workload/{namespace}/{owner}");
+    let running = {
+        let state = call.shared.store.lock().expect("a handler panicked holding the store");
+        state
+            .store
+            .get(&key)
+            .filter(|held| raw(held).is_some())
+            .is_some_and(|held| {
+                held.status.as_ref().is_some_and(|status| {
+                    status["containers"]
+                        .as_array()
+                        .is_some_and(|units| units.iter().any(|u| u["replica"] == replica))
+                })
+            })
+    };
+    if !running {
+        return Err(not_found(kind, name));
+    }
+    let _ = api::restart_replica(&call.shared, &call.caller, &key, replica, false)
+        .await
+        .map_err(refusal)?;
+    let done = json!({
+        "kind": "Status", "apiVersion": "v1", "status": "Success",
+        "details": { "name": name, "group": kind.group, "kind": kind.plural },
+    });
     Ok(Written(StatusCode::OK, Some(done), hints).into_response())
 }
 
@@ -2692,17 +2955,7 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
         let why = format!("{asked}: a unit's output is kept as it was written, all its runs in one file and not when");
         return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why));
     }
-    // Which replica of what: the name says (a Job's and a Workload's of one name are two).
-    let owner = pod_owner(pod).and_then(|(holder, owner, replica)| {
-        let state = call.shared.store.lock().expect("a handler panicked holding the store");
-        let key = format!("{holder}/{namespace}/{owner}");
-        state
-            .store
-            .get(&key)
-            .is_some_and(|held| raw(held).is_some())
-            .then_some((key, replica))
-    });
-    let (key, replica) = owner.ok_or_else(|| not_found(&KINDS[0], pod))?;
+    let (key, replica) = held_owner(call, namespace, pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
     // What a unit wrote is read by who may read the resource that runs it.
     let holder = key.split('/').next().unwrap_or_default().to_string();
     let place = vec![(holder, Some(namespace.to_string()))];
@@ -2737,9 +2990,287 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
     Ok(([(header::CONTENT_TYPE, "text/plain")], Body::from_stream(chunks)).into_response())
 }
 
+/// The resource that runs `pod` in `namespace` and the replica the pod is, if the store holds
+/// that resource: what the pod's name says, checked against what is there.
+fn held_owner(call: &Call, namespace: &str, pod: &str) -> Option<(String, u32)> {
+    let (holder, owner, replica) = pod_owner(pod)?;
+    let state = call.shared.store.lock().expect("a handler panicked holding the store");
+    let key = format!("{holder}/{namespace}/{owner}");
+    state
+        .store
+        .get(&key)
+        .is_some_and(|held| raw(held).is_some())
+        .then_some((key, replica))
+}
+
+/// The channel protocols kithd answers for exec and attach, in the order it prefers them.
+const CHANNELS: [&str; 2] = ["v5.channel.k8s.io", "v4.channel.k8s.io"];
+
+/// The largest frame a client may send: a frame longer than this is refused before its body is read.
+// ponytail: one frame's bytes held at a time; a stdin larger than this comes as more frames.
+const FRAME_MAX: usize = 1 << 20;
+
+/// `kubectl exec`, `attach` and `cp` (a tar run by exec): the Exec right on the Workload, Job or
+/// NodeWorkload that runs the pod is checked first, and only then is the WebSocket upgrade looked at.
+/// Each decision is written in the audit log, as `kith run`'s is.
+async fn pod_stream(
+    call: &Call,
+    verb: &str,
+    namespace: &str,
+    pod: &str,
+    method: &str,
+    headers: &HeaderMap,
+    upgrade: Option<OnUpgrade>,
+) -> Result<Response, No> {
+    let decided = pod_decision(call, namespace, pod, method, headers, upgrade).await;
+    let outcome = decided.as_ref().map(|_| ()).map_err(|no| no.why.clone());
+    call.shared
+        .audit
+        .record(&call.caller, verb, vec![format!("pod {namespace}/{pod}")], outcome);
+    decided
+}
+
+async fn pod_decision(
+    call: &Call,
+    namespace: &str,
+    pod: &str,
+    method: &str,
+    headers: &HeaderMap,
+    upgrade: Option<OnUpgrade>,
+) -> Result<Response, No> {
+    // (What the pod's name says is enough to ask: a caller without the right is refused whether or not the pod is there.)
+    let (holder, _, _) = pod_owner(pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
+    let place = vec![(holder.to_string(), Some(namespace.to_string()))];
+    api::permit(&call.shared, &call.caller, Verb::Exec, |_| place).map_err(refusal)?;
+    // A NodeWorkload's pod runs on the host, as `kith run` runs there: that takes Exec on `Node`, cluster-wide.
+    if holder == "NodeWorkload" {
+        let node = vec![("Node".to_string(), None)];
+        api::permit(&call.shared, &call.caller, Verb::Exec, |_| node).map_err(refusal)?;
+    }
+    if held_owner(call, namespace, pod).is_none() {
+        return Err(not_found(&KINDS[0], pod));
+    }
+    // kubectl sends no Origin: one is a browser's, and a browser is not let upgrade to a shell.
+    if headers.contains_key(header::ORIGIN) {
+        let why = "an upgrade that carries an Origin is refused: kubectl sends none";
+        return Err(status(StatusCode::FORBIDDEN, "Forbidden", why.into()));
+    }
+    let said = |name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+    };
+    let offered: Vec<&str> = said(header::SEC_WEBSOCKET_PROTOCOL).split(',').map(str::trim).collect();
+    let chosen = CHANNELS.into_iter().find(|channel| offered.contains(channel));
+    let accept = websocket::accept_key(said(header::SEC_WEBSOCKET_KEY));
+    let upgrading = said(header::UPGRADE).eq_ignore_ascii_case("websocket")
+        && said(header::CONNECTION).to_ascii_lowercase().contains("upgrade")
+        && said(header::SEC_WEBSOCKET_VERSION) == "13";
+    let (Some(upgrade), Some(chosen), Some(accept), true) = (upgrade, chosen, accept, upgrading) else {
+        let why = "exec, attach and cp are a WebSocket: a GET that upgrades, with version 13 and a channel protocol kithd answers";
+        return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why.into()));
+    };
+    if method != "GET" {
+        let why = "a WebSocket is asked by GET";
+        return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why.into()));
+    }
+    tokio::spawn(async move {
+        if let Ok(upgraded) = upgrade.await {
+            pod_channels(TokioIo::new(upgraded)).await;
+        }
+    });
+    Ok((
+        StatusCode::SWITCHING_PROTOCOLS,
+        [
+            (header::UPGRADE, "websocket".to_string()),
+            (header::CONNECTION, "Upgrade".to_string()),
+            (header::SEC_WEBSOCKET_ACCEPT, accept),
+            (header::SEC_WEBSOCKET_PROTOCOL, chosen.to_string()),
+        ],
+    )
+        .into_response())
+}
+
+/// What a session says once it is upgraded: the channels are not carried to the replica yet,
+/// so the error channel (3) says so as a Status and the WebSocket is closed. Then the client's
+/// close is read back, for at most five seconds.
+// ponytail: the replica's exec (kith run's hop to its node) is the next slice; until then nothing runs.
+async fn pod_channels<IO: AsyncReadExt + AsyncWriteExt + Unpin>(mut io: IO) {
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        talk(&mut io).await;
+        let _ = io.shutdown().await;
+    })
+    .await;
+}
+
+/// The reply and the reading back of the client's close, which [`pod_channels`] bounds in time.
+async fn talk<IO: AsyncReadExt + AsyncWriteExt + Unpin>(io: &mut IO) {
+    use websocket::Op;
+    let why = json!({
+        "kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure",
+        "reason": "NotImplemented", "code": 501,
+        "message": "exec, attach and cp into a replica are not carried yet: kithd answers the access, not the run",
+    });
+    let mut error = vec![3u8];
+    error.extend_from_slice(why.to_string().as_bytes());
+    let closing = websocket::close_body(1011, "not carried yet");
+    let reply = [
+        websocket::encode(Op::Binary, &error, None),
+        websocket::encode(Op::Close, &closing, None),
+    ]
+    .concat();
+    if io.write_all(&reply).await.is_err() {
+        return;
+    }
+    let mut buf = Vec::new();
+    loop {
+        match websocket::decode(&buf, true, FRAME_MAX) {
+            Ok(Some((frame, used))) => {
+                buf.drain(..used);
+                match frame.op {
+                    Op::Close => return,
+                    Op::Ping => {
+                        let pong = websocket::encode(Op::Pong, &frame.payload, None);
+                        if io.write_all(&pong).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => {
+                let mut chunk = [0u8; 4096];
+                match io.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+    /// The next frame the server sends, read from `client` with what `buf` already holds.
+    async fn frame(client: &mut DuplexStream, buf: &mut Vec<u8>) -> websocket::Frame {
+        loop {
+            match websocket::decode(buf, false, FRAME_MAX) {
+                Ok(Some((frame, used))) => {
+                    buf.drain(..used);
+                    return frame;
+                }
+                Ok(None) => {}
+                Err(_) => panic!("the server sent a malformed frame"),
+            }
+            let mut chunk = [0u8; 4096];
+            let n = client.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "the server ended before its frame");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// A stream whose shutdown never completes, as a peer that stopped answering leaves it.
+    struct StuckShutdown(DuplexStream);
+
+    impl AsyncRead for StuckShutdown {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for StuckShutdown {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// talk answers the client's masked ping with a pong that echoes its payload.
+    #[tokio::test]
+    async fn websocket_talk_answers_a_masked_ping_with_its_pong() {
+        use websocket::Op;
+        let (mut server, mut client) = tokio::io::duplex(1 << 16);
+        let talking = tokio::spawn(async move { talk(&mut server).await });
+        let mut buf = Vec::new();
+        assert_eq!(frame(&mut client, &mut buf).await.op, Op::Binary);
+        assert_eq!(frame(&mut client, &mut buf).await.op, Op::Close);
+        client
+            .write_all(&websocket::encode(Op::Ping, b"hi", Some([1, 2, 3, 4])))
+            .await
+            .unwrap();
+        let pong = frame(&mut client, &mut buf).await;
+        assert_eq!((pong.op, pong.payload.as_slice()), (Op::Pong, &b"hi"[..]));
+        drop(client);
+        talking.await.unwrap();
+    }
+
+    /// talk ends at the client's masked close, and not before: the client stays connected.
+    #[tokio::test]
+    async fn websocket_talk_ends_when_the_client_closes() {
+        use websocket::Op;
+        let (mut server, mut client) = tokio::io::duplex(1 << 16);
+        let talking = tokio::spawn(async move { talk(&mut server).await });
+        let mut buf = Vec::new();
+        assert_eq!(frame(&mut client, &mut buf).await.op, Op::Binary);
+        assert_eq!(frame(&mut client, &mut buf).await.op, Op::Close);
+        let closing = websocket::close_body(1000, "bye");
+        client
+            .write_all(&websocket::encode(Op::Close, &closing, Some([9, 8, 7, 6])))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), talking)
+            .await
+            .expect("talk ends")
+            .unwrap();
+    }
+
+    /// A client that never reads its reply does not hold the session past the five seconds.
+    #[tokio::test(start_paused = true)]
+    async fn websocket_pod_channels_returns_within_the_cap_when_the_client_never_reads() {
+        // A 16-byte buffer cannot take the reply, and the client keeps its end open without reading.
+        let (server, _client) = tokio::io::duplex(16);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), pod_channels(server))
+            .await
+            .expect("pod_channels returned");
+        assert!(started.elapsed() <= Duration::from_secs(6), "{:?}", started.elapsed());
+    }
+
+    /// The shutdown is inside the five seconds too: a shutdown that never completes is given up.
+    #[tokio::test(start_paused = true)]
+    async fn websocket_pod_channels_gives_up_a_shutdown_that_never_completes() {
+        use websocket::Op;
+        let (server, mut client) = tokio::io::duplex(1 << 16);
+        // The client's close is already sent, so talk ends at once and only the shutdown is left.
+        let closing = websocket::close_body(1000, "");
+        client
+            .write_all(&websocket::encode(Op::Close, &closing, Some([1, 1, 1, 1])))
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), pod_channels(StuckShutdown(server)))
+            .await
+            .expect("pod_channels returned");
+        assert!(started.elapsed() <= Duration::from_secs(6), "{:?}", started.elapsed());
+    }
 
     /// A status is kithd's own word for what runs: a client's PUT or PATCH of it is refused
     /// in those words, not with the bare 405 of a path nothing is done to.
@@ -2922,6 +3453,134 @@ spec: {role: writer, subjects: [carol]}
             patched(&mut live.clone(), odd.clone(), true);
             patched(&mut json!(7), odd, true);
         }
+    }
+
+    /// RFC 6902's six operations, in order, over a document: each as the RFC says it works,
+    /// and a pointer's escapes (`~1` for a `/` in a key, `~0` for a `~`).
+    #[test]
+    fn json_patch_applies_the_six_operations_in_order() {
+        let live = json!({ "spec": { "replicas": 2, "tags": ["a", "b"] }, "metadata": { "labels": { "app": "web" } } });
+        let ops = json!([
+            { "op": "add", "path": "/metadata/labels/tier", "value": "front" },
+            { "op": "replace", "path": "/spec/replicas", "value": 3 },
+            { "op": "test", "path": "/metadata/labels/app", "value": "web" },
+            { "op": "copy", "from": "/spec/replicas", "path": "/spec/copied" },
+            { "op": "move", "from": "/spec/tags/0", "path": "/spec/tags/-" },
+            { "op": "remove", "path": "/metadata/labels/app" },
+            { "op": "add", "path": "/spec/tags/0", "value": "first" },
+        ]);
+        let want = json!({
+            "spec": { "replicas": 3, "copied": 3, "tags": ["first", "b", "a"] },
+            "metadata": { "labels": { "tier": "front" } },
+        });
+        assert_eq!(json_patch(&live, &ops), Ok(want));
+        let escaped = json!([
+            { "op": "add", "path": "/a~1b~0c", "value": 1 },
+            { "op": "test", "path": "/a~1b~0c", "value": 1 },
+        ]);
+        assert_eq!(json_patch(&json!({}), &escaped), Ok(json!({ "a/b~c": 1 })));
+        let whole = json!([{ "op": "replace", "path": "", "value": { "whole": true } }]);
+        assert_eq!(json_patch(&live, &whole), Ok(json!({ "whole": true })));
+    }
+
+    /// Each way a patch can fail is named, and a patch with one in it is refused whole: what
+    /// its earlier operations did is not kept, and nothing is added where a path is not there.
+    #[test]
+    fn json_patch_refuses_each_way_it_can_fail_and_changes_nothing() {
+        let live = json!({ "spec": { "replicas": 2, "tags": ["a"] } });
+        let refused = [
+            (
+                json!([{ "op": "test", "path": "/spec/replicas", "value": 9 }]),
+                "test /spec/replicas",
+            ),
+            (
+                json!([{ "op": "replace", "path": "/spec/nope", "value": 1 }]),
+                "/spec/nope: the path is not there",
+            ),
+            (
+                json!([{ "op": "remove", "path": "/spec/nope" }]),
+                "/spec/nope: the path is not there",
+            ),
+            (
+                json!([{ "op": "add", "path": "/spec/nope/deeper", "value": 1 }]),
+                "/spec/nope: the path is not there",
+            ),
+            (
+                json!([{ "op": "add", "path": "/spec/tags/9", "value": 1 }]),
+                "/spec/tags/9: the index is past the end",
+            ),
+            (
+                json!([{ "op": "replace", "path": "/spec/tags/-", "value": 1 }]),
+                "/spec/tags/-: - is not an index",
+            ),
+            (
+                json!([{ "op": "copy", "from": "/spec/nope", "path": "/x" }]),
+                "/spec/nope: the path is not there",
+            ),
+            (
+                json!([{ "op": "move", "from": "/spec", "path": "/spec/inside" }]),
+                "/spec is above it",
+            ),
+            (
+                json!([{ "op": "add", "path": "spec", "value": 1 }]),
+                "spec: a path starts with /",
+            ),
+            (
+                json!([{ "op": "replace", "path": "/spec/~2", "value": 1 }]),
+                "/spec/~2: a ~ is written ~0 or ~1",
+            ),
+            (
+                json!([{ "op": "replace", "path": "/spec/replicas" }]),
+                "replace /spec/replicas: needs a value",
+            ),
+            (json!([{ "op": "move", "path": "/x" }]), "move /x: needs a from"),
+            (json!([{ "op": "twist", "path": "/x" }]), "twist: not one of"),
+            (json!([{ "path": "/x" }]), "an operation has no op"),
+            (json!({ "op": "test", "path": "" }), "the patch is a list"),
+            (
+                json!([{ "op": "replace", "path": "/spec/replicas", "value": 3 }, { "op": "test", "path": "/spec/replicas", "value": 2 }]),
+                "test /spec/replicas",
+            ),
+        ];
+        for (ops, why) in refused {
+            let got = json_patch(&live, &ops);
+            assert!(got.as_ref().is_err_and(|e| e.contains(why)), "{ops}: {got:?}");
+        }
+        // A patch of too many operations, and copies that would double a document again and again.
+        let many = Value::Array(vec![
+            json!({ "op": "test", "path": "/spec/replicas", "value": 2 });
+            PATCH_OPS + 1
+        ]);
+        assert!(json_patch(&live, &many).is_err_and(|e| e.contains("operations")));
+        let doubling: Vec<Value> = (0..24)
+            .map(|n| json!({ "op": "copy", "from": "", "path": format!("/k{n}") }))
+            .collect();
+        assert!(json_patch(&live, &Value::Array(doubling)).is_err_and(|e| e.contains("copies")));
+    }
+
+    /// RFC 6902's `test` compares by value: 2 and 2.0 are one number, at any depth.
+    #[test]
+    fn json_patch_test_compares_numbers_by_value() {
+        let live = json!({ "spec": { "replicas": 2, "ratio": 2.0, "by": { "n": 7 } } });
+        let equal = json!([
+            { "op": "test", "path": "/spec/replicas", "value": 2.0 },
+            { "op": "test", "path": "/spec/ratio", "value": 2 },
+            { "op": "test", "path": "/spec/by", "value": { "n": 7.0 } },
+        ]);
+        assert_eq!(json_patch(&live, &equal), Ok(live.clone()));
+        let other = json!([{ "op": "test", "path": "/spec/replicas", "value": 2.5 }]);
+        assert!(json_patch(&live, &other).is_err_and(|e| e.contains("test /spec/replicas")));
+    }
+
+    /// A copy makes as many bytes as the value it copies has: a megabyte string copied again and
+    /// again is refused, where a count of values would let all 256 copies through.
+    #[test]
+    fn json_patch_bounds_the_bytes_its_copies_make() {
+        let live = json!({ "big": "x".repeat(1 << 20) });
+        let copies: Vec<Value> = (0..256)
+            .map(|n| json!({ "op": "copy", "from": "/big", "path": format!("/c{n}") }))
+            .collect();
+        assert!(json_patch(&live, &Value::Array(copies)).is_err_and(|e| e.contains("copies")));
     }
 
     #[test]
@@ -3173,6 +3832,194 @@ spec: {role: writer, subjects: [carol]}
             let (code, said) = ask("GET", "", &format!("namespaces/default/pods/{pod}/log"), Value::Null).await;
             assert_eq!((code, said.as_str()), (StatusCode::OK, wrote), "{pod}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What `serve` answers a request by `caller`: the status and the body as text.
+    async fn answer_as(
+        shared: Arc<crate::Shared>,
+        caller: Caller,
+        method: &str,
+        group: &str,
+        rest: &str,
+        body: Value,
+    ) -> (StatusCode, String) {
+        let mut request = axum::http::Request::builder().method(method).body(()).unwrap();
+        request.extensions_mut().insert(caller);
+        let (parts, ()) = request.into_parts();
+        match serve(shared, parts, group, rest, Asked::new(), body.to_string().as_bytes()).await {
+            Ok(answer) => {
+                let (code, body) = (answer.status(), answer.into_body());
+                let text = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                (code, String::from_utf8_lossy(&text).into_owned())
+            }
+            Err(no) => (no.code, no.why),
+        }
+    }
+
+    /// A Deployment `x` of two replicas, both running here, and the pods of it by name.
+    async fn two_replicas_of_x(shared: &Arc<crate::Shared>) {
+        let deployment = json!({
+            "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "x" },
+            "spec": { "replicas": 2, "selector": { "matchLabels": { "app": "x" } }, "template": {
+                "metadata": { "labels": { "app": "x" } }, "spec": { "containers": [{ "name": "main", "image": "i" }] },
+            } },
+        });
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "POST",
+            "apps",
+            "namespaces/default/deployments",
+            deployment,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let units = json!({ "containers": [
+            { "name": "main", "replica": 0, "state": "running", "ready": true, "restarts": 0 },
+            { "name": "main", "replica": 1, "state": "running", "ready": true, "restarts": 0 },
+        ] });
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .set_status("Workload/default/x", Some(units))
+            .unwrap();
+    }
+
+    /// `kubectl delete pod x-0` restarts that one replica: its slot is marked for the
+    /// controller to stop and start again, and the other replica and the pods are as they were.
+    /// (The controller's side is `delete_pod_stops_the_replica_and_starts_it_again_ignoring_policy`.)
+    #[tokio::test]
+    async fn delete_pod_restarts_only_that_replica() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-delete-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        two_replicas_of_x(&shared).await;
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{said}");
+        let marked: Vec<(String, u32)> = shared.restarts.lock().unwrap().iter().cloned().collect();
+        assert_eq!(marked, [("Workload/default/x".to_string(), 0)]);
+        let (code, listed) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "GET",
+            "",
+            "namespaces/default/pods",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{listed}");
+        let listed: Value = serde_json::from_str(&listed).unwrap();
+        let mut names: Vec<_> = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pod| pod["metadata"]["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["x-0", "x-1"], "{listed}");
+        // A pod kith runs no Workload replica of is refused by name, and marks nothing.
+        for no in ["bare", "x-j0"] {
+            let (code, said) = answer_as(
+                shared.clone(),
+                Caller::Admin,
+                "DELETE",
+                "",
+                &format!("namespaces/default/pods/{no}"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{no}: {said}");
+            assert!(said.contains(no), "{no}: {said}");
+        }
+        // A Workload that is not there has no such replica.
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-1-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
+        // A replica that is not there is no pod.
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-5",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
+        assert_eq!(shared.restarts.lock().unwrap().len(), 1, "only x-0 is marked");
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a pod of a Workload needs the apply right on that Workload: get alone is
+    /// refused 403 and nothing is marked; apply takes it. Reading the pod stays get's.
+    #[tokio::test]
+    async fn delete_pod_access_needs_apply_on_the_workload() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-delete-access-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let roles = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: readers}\nspec: {rules: [{kinds: [Workload], verbs: [get]}]}\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: writers}\nspec: {rules: [{kinds: [Workload], verbs: [apply]}]}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: ann-reads}\nspec: {role: readers, subjects: [ann]}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: bob-writes}\nspec: {role: writers, subjects: [bob]}\n---\napiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: ann}\nspec: {}\n---\napiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: bob}\nspec: {}\n";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(roles).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        two_replicas_of_x(&shared).await;
+        let ann = Caller::Identity("ann".into());
+        let (code, said) = answer_as(
+            shared.clone(),
+            ann.clone(),
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{said}");
+        assert!(
+            shared.restarts.lock().unwrap().is_empty(),
+            "a refused delete marks nothing"
+        );
+        let (code, said) = answer_as(
+            shared.clone(),
+            ann,
+            "GET",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{said}");
+        let bob = Caller::Identity("bob".into());
+        let (code, said) = answer_as(
+            shared.clone(),
+            bob,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{said}");
+        assert_eq!(shared.restarts.lock().unwrap().len(), 1);
+        drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

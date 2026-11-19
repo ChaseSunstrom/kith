@@ -159,6 +159,11 @@ enum Command {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    /// Remote peers: a phone or a laptop that joins the mesh over WireGuard
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
+    },
     /// Identities: who may call the API over the network, as their Roles allow
     Identity {
         #[command(subcommand)]
@@ -399,6 +404,37 @@ fn set_value(assignment: &str) -> Result<serde_json::Value, String> {
     let value = kith_yaml::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.into()));
     let nest = |inside, key: &str| serde_json::json!({ key: inside });
     Ok(path.rsplit('.').fold(value, nest))
+}
+
+#[derive(Subcommand)]
+enum PeerCommand {
+    /// Make a key for a new peer, let it in at a level, and print its WireGuard configuration, once
+    Add {
+        /// The peer's name
+        name: String,
+        /// The node (started with --people and --people-endpoint) it connects to
+        #[arg(long)]
+        node: String,
+        /// The AccessLevel it gets: what it may reach
+        #[arg(long)]
+        level: String,
+        /// The name already has a key: give it a new one, which ends the old (its phone stops)
+        #[arg(long)]
+        replace: bool,
+    },
+}
+
+/// What `kith peer add` prints from kithd's answer: the configuration, which holds the peer's
+/// private key, with the word that it is shown this once.
+fn peer_text(answer: &serde_json::Value) -> Result<String, String> {
+    let Some(config) = answer["config"].as_str().filter(|config| !config.is_empty()) else {
+        return fail("kithd's answer holds no configuration: update kithd");
+    };
+    let name = answer["name"].as_str().unwrap_or("the peer");
+    let node = answer["node"].as_str().unwrap_or("its node");
+    Ok(format!(
+        "{name}'s WireGuard configuration for {node}, shown this once and kept nowhere: put it in the WireGuard app (scan the QR code of the web UI's Add a peer instead, or paste this) before you lose it. It holds {name}'s private key: whoever has it is this peer. Take the peer away with `kith delete RemotePeer {name}`.\n\n{config}"
+    ))
 }
 
 #[derive(Subcommand)]
@@ -1576,6 +1612,22 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 }
             );
         }
+        Command::Peer {
+            command:
+                PeerCommand::Add {
+                    name,
+                    node,
+                    level,
+                    replace,
+                },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("keys are made by kithd: leave out --store");
+            };
+            let body = serde_json::json!({"name": name, "node": node, "level": level, "replace": replace});
+            let made = request::<serde_json::Value>(&kithd, "POST", "/v1/peers", body.to_string().as_bytes())?;
+            print!("{}", peer_text(&made)?);
+        }
         Command::Node {
             command: NodeCommand::Recovery { name },
         } => {
@@ -2163,11 +2215,22 @@ fn watch_get(kithd: &Kithd, kind: Option<&str>, keep: impl Fn(&Resource) -> bool
 
 /// The STATUS column: what a controller reported, in a few words.
 fn status_summary(resource: &Resource) -> String {
+    // First line only, and nothing that could drive the terminal: messages quote image names and output.
+    let clean = |m: &str| m.lines().next().unwrap_or_default().replace(char::is_control, "");
+    // A Cluster's house address (T-0730): its endpoint, and which node holds it since when.
+    if let (Some(address), "Cluster") = (resource.spec["home"]["address"].as_str(), resource.kind.as_str()) {
+        let said = |value: &serde_json::Value| value.as_str().map(clean);
+        let endpoint = said(&resource.spec["home"]["endpoint"]).map(|at| format!(", endpoint {at}"));
+        let held = resource.status.as_ref().map(|status| &status["home"]);
+        let held = match held.and_then(|home| Some((said(&home["holder"])?, said(&home["since"])?))) {
+            Some((holder, since)) => format!(", held by {holder} since {since}"),
+            None => ", held by no one yet".to_string(),
+        };
+        return format!("house {}{}{held}", clean(address), endpoint.unwrap_or_default());
+    }
     let Some(status) = &resource.status else {
         return String::new();
     };
-    // First line only, and nothing that could drive the terminal: messages quote image names and output.
-    let clean = |m: &str| m.lines().next().unwrap_or_default().replace(char::is_control, "");
     match (status["ready"].as_u64(), status["replicas"].as_u64()) {
         (Some(ready), Some(replicas)) => {
             // Why it is not ready, if a container said so.
@@ -2467,6 +2530,53 @@ mod passphrase_tests {
 }
 
 #[cfg(test)]
+mod peer_tests {
+    use super::{Cli, peer_text};
+    use clap::Parser;
+    use serde_json::json;
+
+    #[test]
+    fn peer_add_asks_for_a_name_a_node_and_a_level() {
+        let cli = Cli::try_parse_from(["kith", "peer", "add", "phone", "--node", "n1", "--level", "family"]);
+        assert!(cli.is_ok());
+        assert!(Cli::try_parse_from(["kith", "peer", "add", "phone", "--node", "n1"]).is_err());
+        assert!(Cli::try_parse_from(["kith", "peer", "add", "--node", "n1", "--level", "family"]).is_err());
+    }
+
+    #[test]
+    fn peer_add_replace_is_a_flag_and_off_unless_given() {
+        use super::{Command, PeerCommand};
+        let replace_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Command::Peer {
+                command: PeerCommand::Add { replace, .. },
+            } => replace,
+            _ => panic!("not peer add"),
+        };
+        let base = ["kith", "peer", "add", "phone", "--node", "n1", "--level", "family"];
+        assert!(!replace_of(&base));
+        assert!(replace_of(&[&base[..], &["--replace"]].concat()));
+    }
+
+    #[test]
+    fn peer_add_prints_the_configuration_and_says_it_is_shown_once() {
+        let answer = json!({
+            "name": "phone", "node": "n1", "level": "family",
+            "publicKey": "cHVibGlj",
+            "addresses": {"ipv4": "100.89.0.2", "ipv6": "fd00::2"},
+            "config": "[Interface]\nPrivateKey = c2VjcmV0\nAddress = 100.89.0.2/32\n\n[Peer]\nPublicKey = bm9kZQ==\n",
+        });
+        let text = peer_text(&answer).unwrap();
+        assert!(text.contains("shown this once"), "{text}");
+        assert!(text.contains("kept nowhere"), "{text}");
+        assert!(text.contains("whoever has it is this peer"), "{text}");
+        assert!(text.contains("[Interface]\nPrivateKey = c2VjcmV0\n"), "{text}");
+        assert!(text.contains("phone"), "{text}");
+        // An answer with no configuration is no answer: nothing is printed as one.
+        assert!(peer_text(&json!({"name": "phone"})).is_err());
+    }
+}
+
+#[cfg(test)]
 mod drain_tests {
     use super::drain_text;
     use serde_json::json;
@@ -2526,6 +2636,34 @@ mod drain_tests {
             json!({ "address": "198.51.100.9:7443", "state": "ready", "serves": {} }),
         );
         assert_eq!(table_row(&plain)[4], "ready at 198.51.100.9:7443");
+    }
+
+    #[test]
+    fn get_cluster_home_says_the_house_address_endpoint_holder_and_since() {
+        use crate::table_row;
+        use kith_api::Resource;
+        let cluster = |spec: serde_json::Value, status: Option<serde_json::Value>| {
+            let mut cluster = json!({ "apiVersion": "kith.dev/v1", "kind": "Cluster", "metadata": { "name": "house" }, "spec": spec });
+            cluster["status"] = status.unwrap_or(serde_json::Value::Null);
+            serde_json::from_value::<Resource>(cluster).unwrap()
+        };
+        let home = json!({ "home": { "address": "192.168.1.250/24", "endpoint": "house.example.org:51820" } });
+        let held = json!({ "home": { "holder": "n1", "since": "2026-11-18T09:00:00Z" } });
+        assert_eq!(
+            table_row(&cluster(home.clone(), Some(held)))[4],
+            "house 192.168.1.250/24, endpoint house.example.org:51820, held by n1 since 2026-11-18T09:00:00Z"
+        );
+        // Not held yet, and no endpoint: it says so, and no more.
+        let bare = json!({ "home": { "address": "192.168.1.250/24" } });
+        assert_eq!(
+            table_row(&cluster(bare, None))[4],
+            "house 192.168.1.250/24, held by no one yet"
+        );
+        // A Cluster with no house says nothing here.
+        assert_eq!(table_row(&cluster(json!({}), None))[4], "");
+        // What a node writes there cannot drive the terminal.
+        let held = json!({ "home": { "holder": "n\u{1b}[2J", "since": "now" } });
+        assert!(!table_row(&cluster(home, Some(held)))[4].contains('\u{1b}'));
     }
 
     #[test]
