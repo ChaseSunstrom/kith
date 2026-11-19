@@ -22,7 +22,7 @@
 // that long; nothing stops the kernel's server once started; four server threads; leases and
 // the grace period after a restart are 30 seconds, with no record of clients kept across one.
 
-use crate::root_part::{Direct, Proto, Request, Root};
+use crate::root_part::{Direct, Proto, Reply, Request, Root};
 use crate::volumes::Dir;
 use kith_api::kinds::ShareSpec;
 use kith_api::store::Store;
@@ -394,11 +394,14 @@ fn start(address: Ipv6Addr) -> Result<(), String> {
 
 /// Have the kernel's server listen on `address` too (a socket bound here and handed over).
 fn listen(address: IpAddr) -> Result<(), String> {
-    let listener = Direct.request(Request::Bind {
+    let listener = Direct::new().request(Request::Bind {
         address,
         port: PORT,
         proto: Proto::Tcp,
     })?;
+    let Reply::Socket(listener) = listener else {
+        return Err("the root part answered a bind with something else".into());
+    };
     let told = std::fs::write("/proc/fs/nfsd/portlist", format!("{}\n", listener.as_raw_fd()));
     told.map_err(|e| format!("portlist: {e}"))
 }
