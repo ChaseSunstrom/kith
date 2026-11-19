@@ -26,13 +26,16 @@
 use crate::Shared;
 use crate::access::{Caller, Certificate, Grants};
 use crate::api::{self, ApiError, LogOptions};
+use crate::websocket;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as Route, Query, State};
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
+use hyper::upgrade::OnUpgrade;
+use hyper_util::rt::TokioIo;
 use kith_api::kinds::Verb;
 use kith_api::store::{Action, Error, Store, now, rfc3339};
 use kith_api::{Metadata, Resource};
@@ -40,6 +43,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The annotation a resource made here carries: the object as the client sent it. What
 /// `kubectl apply` works its next change out from is in it, so it is given back whole.
@@ -2035,6 +2039,11 @@ async fn serve(
             let why = "status is kithd's own: it is written from what runs and is not taken from a client";
             return Err(status(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", why.into()));
         }
+        ("GET" | "POST", Some(name), Some("exec" | "attach")) if kind.kind == "Pod" => {
+            let upgrade = parts.extensions.get::<OnUpgrade>().cloned();
+            let (method, headers) = (parts.method.as_str(), &parts.headers);
+            pod_stream(&call, namespace.unwrap_or_default(), name, method, headers, upgrade).await?
+        }
         (_, Some(_), Some("exec" | "attach" | "portforward")) => {
             let why = "exec, attach and port-forward are not answered here: `kith run` runs a command in a replica";
             return Err(status(StatusCode::NOT_IMPLEMENTED, "NotImplemented", why.into()));
@@ -2880,17 +2889,7 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
         let why = format!("{asked}: a unit's output is kept as it was written, all its runs in one file and not when");
         return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why));
     }
-    // Which replica of what: the name says (a Job's and a Workload's of one name are two).
-    let owner = pod_owner(pod).and_then(|(holder, owner, replica)| {
-        let state = call.shared.store.lock().expect("a handler panicked holding the store");
-        let key = format!("{holder}/{namespace}/{owner}");
-        state
-            .store
-            .get(&key)
-            .is_some_and(|held| raw(held).is_some())
-            .then_some((key, replica))
-    });
-    let (key, replica) = owner.ok_or_else(|| not_found(&KINDS[0], pod))?;
+    let (key, replica) = held_owner(call, namespace, pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
     // What a unit wrote is read by who may read the resource that runs it.
     let holder = key.split('/').next().unwrap_or_default().to_string();
     let place = vec![(holder, Some(namespace.to_string()))];
@@ -2923,6 +2922,131 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
         }
     });
     Ok(([(header::CONTENT_TYPE, "text/plain")], Body::from_stream(chunks)).into_response())
+}
+
+/// The resource that runs `pod` in `namespace` and the replica the pod is, if the store holds
+/// that resource: what the pod's name says, checked against what is there.
+fn held_owner(call: &Call, namespace: &str, pod: &str) -> Option<(String, u32)> {
+    let (holder, owner, replica) = pod_owner(pod)?;
+    let state = call.shared.store.lock().expect("a handler panicked holding the store");
+    let key = format!("{holder}/{namespace}/{owner}");
+    state
+        .store
+        .get(&key)
+        .is_some_and(|held| raw(held).is_some())
+        .then_some((key, replica))
+}
+
+/// The channel protocols kithd answers for exec and attach, in the order it prefers them.
+const CHANNELS: [&str; 2] = ["v5.channel.k8s.io", "v4.channel.k8s.io"];
+
+/// The largest frame a client may send: a frame longer than this is refused before its body is read.
+// ponytail: one frame's bytes held at a time; a stdin larger than this comes as more frames.
+const FRAME_MAX: usize = 1 << 20;
+
+/// `kubectl exec`, `attach` and `cp` (a tar run by exec): the Exec right on the Workload or Job
+/// that runs the pod is checked first, and only then is the WebSocket upgrade looked at.
+async fn pod_stream(
+    call: &Call,
+    namespace: &str,
+    pod: &str,
+    method: &str,
+    headers: &HeaderMap,
+    upgrade: Option<OnUpgrade>,
+) -> Result<Response, No> {
+    // (What the pod's name says is enough to ask: a caller without the right is refused whether or not the pod is there.)
+    let (holder, _, _) = pod_owner(pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
+    let place = vec![(holder.to_string(), Some(namespace.to_string()))];
+    api::permit(&call.shared, &call.caller, Verb::Exec, |_| place).map_err(refusal)?;
+    if held_owner(call, namespace, pod).is_none() {
+        return Err(not_found(&KINDS[0], pod));
+    }
+    let said = |name| headers.get(name).and_then(|value| value.to_str().ok()).unwrap_or_default();
+    let offered: Vec<&str> = said(header::SEC_WEBSOCKET_PROTOCOL).split(',').map(str::trim).collect();
+    let chosen = CHANNELS.into_iter().find(|channel| offered.contains(channel));
+    let accept = websocket::accept_key(said(header::SEC_WEBSOCKET_KEY));
+    let upgrading = said(header::UPGRADE).eq_ignore_ascii_case("websocket")
+        && said(header::CONNECTION).to_ascii_lowercase().contains("upgrade")
+        && said(header::SEC_WEBSOCKET_VERSION) == "13";
+    let (Some(upgrade), Some(chosen), Some(accept), true) = (upgrade, chosen, accept, upgrading) else {
+        let why = "exec, attach and cp are a WebSocket: a GET that upgrades, with version 13 and a channel protocol kithd answers";
+        return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why.into()));
+    };
+    if method != "GET" {
+        let why = "a WebSocket is asked by GET";
+        return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why.into()));
+    }
+    tokio::spawn(async move {
+        if let Ok(upgraded) = upgrade.await {
+            pod_channels(TokioIo::new(upgraded)).await;
+        }
+    });
+    Ok((
+        StatusCode::SWITCHING_PROTOCOLS,
+        [
+            (header::UPGRADE, "websocket".to_string()),
+            (header::CONNECTION, "Upgrade".to_string()),
+            (header::SEC_WEBSOCKET_ACCEPT, accept),
+            (header::SEC_WEBSOCKET_PROTOCOL, chosen.to_string()),
+        ],
+    )
+        .into_response())
+}
+
+/// What a session says once it is upgraded: the channels are not carried to the replica yet,
+/// so the error channel (3) says so as a Status and the WebSocket is closed. Then the client's
+/// close is read back, for at most five seconds.
+// ponytail: the replica's exec (kith run's hop to its node) is the next slice; until then nothing runs.
+async fn pod_channels<IO: AsyncReadExt + AsyncWriteExt + Unpin>(mut io: IO) {
+    let _ = tokio::time::timeout(Duration::from_secs(5), talk(&mut io)).await;
+    let _ = io.shutdown().await;
+}
+
+/// The reply and the reading back of the client's close, which [`pod_channels`] bounds in time.
+async fn talk<IO: AsyncReadExt + AsyncWriteExt + Unpin>(io: &mut IO) {
+    use websocket::Op;
+    let why = json!({
+        "kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure",
+        "reason": "NotImplemented", "code": 501,
+        "message": "exec, attach and cp into a replica are not carried yet: kithd answers the access, not the run",
+    });
+    let mut error = vec![3u8];
+    error.extend_from_slice(why.to_string().as_bytes());
+    let closing = websocket::close_body(1011, "not carried yet");
+    let reply = [
+        websocket::encode(Op::Binary, &error, None),
+        websocket::encode(Op::Close, &closing, None),
+    ]
+    .concat();
+    if io.write_all(&reply).await.is_err() {
+        return;
+    }
+    let mut buf = Vec::new();
+    loop {
+        match websocket::decode(&buf, true, FRAME_MAX) {
+            Ok(Some((frame, used))) => {
+                buf.drain(..used);
+                match frame.op {
+                    Op::Close => return,
+                    Op::Ping => {
+                        let pong = websocket::encode(Op::Pong, &frame.payload, None);
+                        if io.write_all(&pong).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => {
+                let mut chunk = [0u8; 4096];
+                match io.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 #[cfg(test)]
