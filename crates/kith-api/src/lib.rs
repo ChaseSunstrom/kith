@@ -376,6 +376,17 @@ impl Resource {
         if matches!(self.kind.as_str(), "Service" | "Namespace") {
             one_label(&self.kind, &self.metadata.name)?;
         }
+        // A Workload's replicas are named `NAME-N`: one DNS label too, as a Service names them.
+        if self.kind == "Workload" {
+            let replicas = self.spec.get("replicas").and_then(Value::as_u64).unwrap_or(1);
+            let last = format!("{}-{}", self.metadata.name, replicas.saturating_sub(1));
+            if replicas > 0 && last.len() > 63 {
+                return Err(format!(
+                    "Workload `{}`: its replica name `{last}` is over 63 characters (a DNS label): use a shorter name",
+                    self.metadata.name
+                ));
+            }
+        }
         self.metadata
             .namespace
             .as_deref()
