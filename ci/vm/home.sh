@@ -45,7 +45,7 @@
             # The first WireGuard handshake answer since SINCE (a $(now)) from the house address to
             # node NODE's address, or nothing yet.
             answered() { # SINCE NODE
-                awk -v since="$1" -v house="$house" -v to="10.9.0.$2" '$1 > since && $2 == house && $3 == to { print; exit }' "$work/wg"
+                awk -v since="$1" -v house="$house" -v to="10.9.0.$2" '$1 > since && $2 == house && $3 == to && $4 == 2 { print; exit }' "$work/wg"
             }
             # The roaming node is n4 (a learner: it never votes). The store must say so, in its
             # Node's spec.roaming, and not only the flag passed.
@@ -74,7 +74,7 @@ print(any(r["kind"] == "Node" and r["metadata"]["name"] == "n4" and (r.get("spec
                 waited=0
                 until reply=$(answered "$reset" 4) && [ -n "$reply" ]; do
                     waited=$((waited + 1))
-                    [ "$waited" -lt 240 ] || fail "n4 was reset and no WireGuard handshake from $house answered it: $(tail -n 4 "$work/wg") $(cat "$work/wg.err") $(grep -aih 'house\|mesh' "$work/n4.log" | tail -n 6)"
+                    [ "$waited" -lt 240 ] || fail "n4 was reset and no WireGuard handshake from $house answered it: (reset at $reset, holder n$had, then n${now_holder:-?}) $(awk -v since="$reset" '$1 > since' "$work/wg" | tail -n 30) $(cat "$work/wg.err") $(grep -aih 'house\|mesh' "$work/n4.log" | tail -n 6)"
                     sleep 1
                 done
                 echo "vm.sh: n4 was reset: its WireGuard handshake to $house was answered from $house ($reply)" >&2

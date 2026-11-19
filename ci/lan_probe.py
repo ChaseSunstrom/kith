@@ -18,9 +18,10 @@ A TEXT that starts with `hex:` is sent as those bytes, and what comes back is pr
 "SECONDS-SINCE-START MAC[,MAC...]" (the cards that answered, or "-" when none did), and
 "SECONDS-SINCE-START announce MAC" for each announcement of ADDRESS that goes by.
 
-`handshakes`: sends nothing. It prints "EPOCH SRC DST" for each WireGuard handshake answer
-(a UDP datagram from port 51820 to port 51820 whose body is type 2) to ADDRESS for SECONDS, from
-whatever address it came from (SRC is the answer's source, not ADDRESS): the LAN carries every
+`handshakes`: sends nothing. It prints "EPOCH SRC DST TYPE" for each WireGuard handshake packet
+(a UDP datagram from port 51820 to port 51820 whose body is type 1, an initiation, or type 2, an
+answer) that ADDRESS sends (type 1: DST is where it dials) or is sent (type 2: SRC is the address
+the answer came from, which need not be one of the node's own) for SECONDS: the LAN carries every
 frame to this machine too. EPOCH is time.time().
 
 `syn` (in place of TEXT): sends a SYN from 10.9.0.77 to ADDRESS:PORT at MAC, once a second for
@@ -126,14 +127,15 @@ def handshakes(seconds):
         except TimeoutError:
             continue
         kind, rest = frame[12:14], frame[14:]
-        if kind != b"\x08\x00" or len(rest) < 20 or rest[9] != 17 or rest[16:20] != node:
+        if kind != b"\x08\x00" or len(rest) < 20 or rest[9] != 17:
             continue
         header = (rest[0] & 15) * 4
         if len(rest) < header + 9:
             continue
         source_port, port = struct.unpack(">HH", rest[header:header + 4])
-        if source_port == 51820 and port == 51820 and rest[header + 8] == 2:
-            print(f"{time.time():.2f} {socket.inet_ntoa(rest[12:16])} {socket.inet_ntoa(rest[16:20])}", flush=True)
+        wanted = (1, rest[12:16]) if rest[12:16] == node else (2, rest[16:20])
+        if source_port == 51820 and port == 51820 and rest[header + 8] == wanted[0] and wanted[1] == node:
+            print(f"{time.time():.2f} {socket.inet_ntoa(rest[12:16])} {socket.inet_ntoa(rest[16:20])} {rest[header + 8]}", flush=True)
 
 
 if arp_mode:
