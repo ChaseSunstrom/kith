@@ -137,7 +137,6 @@ pub fn plan(asked: &[Asked], people: Ipv6Addr) -> BTreeMap<String, Said> {
         }
     }
     // Keepers first: a refused peer's held address is kept only where no keeper holds it.
-    // Keepers first: a refused peer's held address is kept only where no keeper holds it.
     lot.sort_by(|a, b| (a.1.is_some(), &a.0.name).cmp(&(b.1.is_some(), &b.0.name)));
 
     let mut said = BTreeMap::new();
@@ -182,7 +181,7 @@ pub fn plan(asked: &[Asked], people: Ipv6Addr) -> BTreeMap<String, Said> {
 
 /// Why an AccessLevel's network lies over the cluster's mesh /48 or its people /64: the first
 /// `min` bits of the two agree. IPv4 networks are not these; the people's IPv4 ranges are kith-api's.
-fn over(net: &str, mesh: Ipv6Addr, people: Ipv6Addr) -> Option<String> {
+pub(crate) fn over(net: &str, mesh: Ipv6Addr, people: Ipv6Addr) -> Option<String> {
     let (address, length) = net.split_once('/')?;
     let IpAddr::V6(address) = address.parse::<IpAddr>().ok()? else {
         return None;
@@ -201,7 +200,7 @@ fn over(net: &str, mesh: Ipv6Addr, people: Ipv6Addr) -> Option<String> {
     }
 }
 
-fn held(resource: &Resource) -> Option<(Ipv4Addr, Ipv6Addr)> {
+pub(crate) fn held(resource: &Resource) -> Option<(Ipv4Addr, Ipv6Addr)> {
     let addresses = resource.status.as_ref()?.get("addresses")?;
     let four = addresses.get("ipv4")?.as_str()?.parse().ok()?;
     let six = addresses.get("ipv6")?.as_str()?.parse().ok()?;
@@ -320,15 +319,41 @@ pub fn up(state: &Path, port: u16, interface: &str, people64: Ipv6Addr) -> std::
 }
 
 /// `up`, with the table made by `table` (the tests make theirs without masquerade: see `table_here`).
-fn up_with(
+pub(crate) fn up_with(
     state: &Path,
     port: u16,
     people64: Ipv6Addr,
     table: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<kith_mesh::Key> {
-    let key = crate::mesh::private_key(&state.join("pki").join("people.key"))?;
-    table()?;
-    Ok(kith_mesh::people::device(&key, port, people64)?.public_key)
+    let made = (|| {
+        let key = crate::mesh::private_key(&state.join("pki").join("people.key"))?;
+        // (The order of docs/adr-people.md: the table with its drops, the rules that send nowhere, the
+        // device with no peers. `levels` adds the levels' chains and the peers, after.)
+        table()?;
+        kith_mesh::exit::people_hold()?;
+        kith_mesh::people::device(&key, port, people64)
+    })();
+    match made {
+        Ok(found) => {
+            crate::levels::DEVICE_UP.store(true, std::sync::atomic::Ordering::Release);
+            Ok(found.public_key)
+        }
+        Err(e) => {
+            // (An old kwg0 would keep last run's peers and rules, with nothing tending them.)
+            take_away();
+            Err(e)
+        }
+    }
+}
+
+/// Take kwg0, its rules and its table away (best effort), once no pass of `levels` is in flight and
+/// none will start: else one would make the table and the rules again.
+pub(crate) fn take_away() {
+    crate::levels::DEVICE_UP.store(false, std::sync::atomic::Ordering::Release);
+    let _tending = crate::levels::TENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = kith_mesh::people::remove() {
+        eprintln!("kithd: people: taking away {}'s people: {e}", kith_mesh::people::DEVICE);
+    }
 }
 
 /// A kernel with no nftables masquerade (CONFIG_NFT_MASQ) refuses the table's post chain: that
@@ -410,9 +435,7 @@ pub async fn device(
             _ = stopping.changed() => break,
         }
     }
-    if let Err(e) = kith_mesh::people::remove() {
-        eprintln!("kithd: people: taking away {}'s people: {e}", kith_mesh::people::DEVICE);
-    }
+    take_away();
     if let Err(e) = crate::mesh::say(&shared, &node, "people", Value::Null).await {
         eprintln!("kithd: people: taking back this node's people: {e}");
     }
@@ -1183,6 +1206,7 @@ mod tests {
     /// its public key is said; a second start keeps the key and empties the peers. Without the
     /// flag, the start itself takes all of that away.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn people_device() {
         use base64::Engine as _;
         use std::os::unix::fs::PermissionsExt;
@@ -1194,6 +1218,8 @@ mod tests {
         if !alone {
             return eprintln!("skipped: not in a network namespace of its own");
         }
+        // (One at a time with the levels' tests, which share this namespace.)
+        let _kernel = crate::levels::tests::KERNEL.lock().unwrap_or_else(|e| e.into_inner());
         let state = std::env::temp_dir().join(format!("kithd-people-{}", std::process::id()));
         std::fs::create_dir_all(state.join("pki")).unwrap();
         let (port, people64) = (51821, people());
