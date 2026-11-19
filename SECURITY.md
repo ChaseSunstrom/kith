@@ -1454,7 +1454,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   own and the cluster's. One that was off when the cluster's code was used still has
   its record: either code typed at it later erases it, and the cluster says wiped.
   `kith node duress --all --off` and a new `--all` reach a forgotten key too, so a
-  revoked cluster code wipes no node, and the forgotten key stays forgotten.
+  revoked cluster code wipes no node, and the forgotten key stays forgotten. So does
+  `kith node duress NAME --off`: a node's own code that leaked is revoked there without
+  an unlock, and the key stays forgotten (lock, seal and a new code are still refused
+  on it until `kith node unlock`).
   `kith node unlock` deletes a forgotten key: the node has neither code afterwards,
   until they are made anew.
   **A new recovery key (`kith node recovery`) is written before it is shown**: an
