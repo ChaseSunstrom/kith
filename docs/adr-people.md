@@ -202,7 +202,9 @@ hard-coded on 53 is refused and sees no answer.
 To LAN hosts every peer is the node (masquerade), so the filter sees one client (see Open).
 `.kith` names are answered by kithd's DNS only: the filter forwards `kith.` there. kithd's
 resolver forwards only for private and ULA clients (`may_forward`, `kith-dns/src/server.rs`),
-where `100.64.0.0/10` is not private: by IPv4 a peer gets no name it does not hold.
+where `100.64.0.0/10` is not private: by IPv4 a peer gets no name it does not hold. The people's
+/64 is inside fc00::/7, so kithd refuses it by name: the forwarders are less the people's prefixes
+(slice E2b, below).
 
 ## Exits
 
@@ -304,7 +306,7 @@ is "anyone who reaches a node's port" (SECURITY.md).
 | A stolen unlocked phone | What its level reaches, no more; deleting the peer holds within seconds, open connections too | Until deleted it is the peer: the app asks no unlock to turn on, and kith has no expiry |
 | A guest screenshots or re-shares the QR | The copy reaches only the guest's level, and one delete ends both; two devices on one key take turns (the last handshake wins), which shows in the handshake age | kith cannot tell a copy from the phone; a photo in a cloud backup is a copy |
 | A peer sets another's address | WireGuard drops it (allowed addresses per key); the table jumps by source after that; a people source in by any other link is dropped in `pre` | Nothing known |
-| A peer floods | It reaches only its level; the Service proxy's limits per address (`services.rs`, `serving`) and the API's slots (SECURITY.md) hold each peer | No rate in the table: a peer can fill the uplink. Over IPv6 all peers are one /64, so they share the API's 8 slots of a /64 |
+| A peer floods | It reaches only its level; the Service proxy holds each peer to 8 of 4096 places by its own address (`services.rs`, `People`, built in slice E2b), and the API's handshakes have 16 slots for the people, 8 to a peer, apart from the mesh's 64 | No rate in the table: a peer can fill the uplink |
 | The node that ends tunnels is taken | Peers' private keys are not there; the API still asks peers for certificates | Beyond what it has today (a control node is the cluster, a worker what its view holds): the people key, so it can be the server to every phone; peers' traffic in clear where not TLS; any rule. Choose a node you trust with your phones' traffic |
 | Whoever may write a level widens their own | Cluster-scoped kinds: only a Role with no namespace grants them; every write is audited by Identity and decided again where the log is kept | Roles go by kind, not name: who may write one level or peer may write all, and put any peer at admin |
 | An Exit provider sees traffic | Only the internet traffic of levels that name it, as the tunnel's address; not the LAN, not the phones' addresses | Destinations and whatever is not TLS. Names asked of the home's filter leave by its upstream instead |
@@ -521,9 +523,9 @@ RemotePeers, their AccessLevels and Services) and makes what the kernel holds ma
   lines of 200 characters; a worker may say only its own).
 
 Not built: a conntrack flush for a peer deleted while kithd was down; the node's own IPv6 links
-in the table's link list (IPv4 only); the kithd resolver's own `may_forward` check that a people
-prefix may be forwarded to (condition 8's other half); a start failure's reason beyond stderr;
-exit levels (slice E2a, below), the Service listener and per-peer limits (slice E2).
+in the table's link list (IPv4 only); a start failure's reason beyond stderr; exit levels (slice
+E2a, below). The Service listener, the per-peer limits and the resolver's refusal are slice E2b,
+below.
 
 ## Built: slice E2a
 
@@ -553,8 +555,45 @@ A level that names an `exit` leaves by that Exit, on the node that holds it:
 
 Not built: IPv6 through an Exit, the Exit of another node, the API or DNS through an Exit.
 
+## Built: slice E2b
+
+- **The Service listener takes the people.** A node started with `--people` accepts, on the
+  Services' listeners it has, a connection from the people's ranges (100.89.0.0/16, the people /64)
+  as well as the mesh's; the relay for the other nodes, and the strays the ingress hands over, stay
+  mesh-only. A person is served only if its address (exact, not the /64) is a RemotePeer's whose
+  level names that Service address and port (`levels::reach`, read from the store each round; a
+  Service with no port listed is reached on none: fail closed, though the level never makes one):
+  another level's Service, and a source in the ranges that is no peer's, are hung up on. The
+  kernel's table said so first; this is the second look. What `serve` and `accept` decide by
+  source is `Proxy::place` and `Proxy::takes`.
+- **NetworkPolicy sees a person as the serving node.** The Workload's NetworkPolicies are asked
+  with this node's mesh address as the source (`Proxy::reach`), as for every client of a Service
+  on this node, not the person's: a person's address is not passed down, because a connection
+  passed on to another node's replica is asked there as the caller node, so a rule on a person's
+  address could not hold on both paths. A level's Services are the person's reach; a policy that
+  must keep a person out of a Workload keeps the level's Service from naming it.
+- **Limits of their own.** Places for the people are apart from the mesh's 4096 (`Proxy.people`):
+  a peer holds 8 of 4096 by its address at 128 bits, so two IPv6 peers of one /64 are two, and the
+  table of sources holds only peers, so it is no bigger than the peers (and never the room). The
+  API's handshakes (`cluster::Pools`) have 16 slots for the people besides the others' 64: a full
+  people pool leaves the 64 free; each peer holds 2 of the 16 (`PEOPLE_GUESTS_EACH`; the others
+  hold 8 of 64), by its address, so eight peers fill it, not one. A connection is accepted first
+  and then asks its own pool for a slot (none: it is hung up on), so a crowd of strangers holding
+  the others' 64 does not keep a person's connection from being picked up. The API port is still
+  not opened to peers by this slice.
+- **The resolver does not forward for a person.** `kithd`'s forwarders are the local networks and
+  the pods' range less the people's range and /64 (`dns::forwarders`, `Cidr::without`), so the deny
+  wins over fc00::/7, which holds the /64; a mesh source is forwarded as before.
+- Not built: bandwidth limits (the table has no rate); a person to a Service on port 443 or 80 of
+  a node with the ingress (those are the ingress's: the strays are mesh-only).
+
 ## Open
 
+- **People do not reach the Services on an `--ingress` node's 443 and 80 (not built).** Those
+  ports are the ingress's: its listener hands the strays over to the Service listener, and that
+  hand-over is mesh-only, so a person's connection to a Service on them is hung up on, though the
+  kernel's table lets it in. A level that names such a Service is not served on those ports until
+  the ingress takes the people's ranges too (with the same places and the level's reach).
 - **Should the filter tell people apart?** Then the router routes `100.89.0.0/16` to the node
   and the node stops masquerading to the LAN; otherwise every peer is the node there.
 - **A resolver hard-coded on 53: refused (here), or answered by the level's resolver** (one

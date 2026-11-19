@@ -432,8 +432,8 @@ pub type Strays = mpsc::UnboundedSender<TcpStream>;
 /// How many connections are held at a time, in all and by each source.
 #[derive(Clone)]
 pub struct Limits {
-    room: Arc<Semaphore>,
-    sources: Arc<Mutex<BTreeMap<IpAddr, usize>>>,
+    pub(crate) room: Arc<Semaphore>,
+    pub(crate) sources: Arc<Mutex<BTreeMap<IpAddr, usize>>>,
     per_source: usize,
     /// How much of an IPv6 address is one source.
     bits: u32,
@@ -459,6 +459,12 @@ impl Limits {
     /// For callers on the mesh: a source is a node, which has a /80 of it.
     pub fn per_node(self) -> Self {
         Limits { bits: 80, ..self }
+    }
+
+    /// For the people: a source is one address, whole (a peer has an address of its own, and
+    /// the peers of one /64 are not one).
+    pub fn per_address(self) -> Self {
+        Limits { bits: 128, ..self }
     }
 
     /// A place for a connection from `from`, unless it or its source has none left.
@@ -1892,6 +1898,30 @@ spec: { selector: { app: web }, ports: [{ port: 80 }] }
         // (And a refusal for want of room does not keep a count against its source.)
         drop(_one);
         assert!(full.take(at("203.0.113.9:1").ip()).is_some());
+    }
+
+    /// Limits for the people: a peer is its own address (never its /64), and what is counted
+    /// is no bigger than the room, so a flood of new sources cannot grow it.
+    #[test]
+    fn people_serving_limits_count_each_address_and_bound_their_table() {
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        let limits = Limits::new(100, 2).per_address();
+        let held: Vec<_> = ["fd00:0:0:1::1", "fd00:0:0:1::1", "fd00:0:0:1::2", "fd00:0:0:1::2"]
+            .into_iter()
+            .map(|from| limits.take(ip(from)))
+            .collect();
+        assert!(held.iter().all(Option::is_some), "two peers of one /64 count apart");
+        assert!(limits.take(ip("fd00:0:0:1::1")).is_none() && limits.take(ip("fd00:0:0:1::2")).is_none());
+        assert!(limits.take(ip("fd00:0:0:1::3")).is_some());
+        // A flood of new sources: the table never holds more than the room.
+        let small = Limits::new(4, 1).per_address();
+        let places: Vec<_> = (0..200u32)
+            .filter_map(|n| small.take(ip(&format!("fd00:0:0:1::{n:x}"))))
+            .collect();
+        assert_eq!(places.len(), 4);
+        assert!(small.sources.lock().unwrap().len() <= 4);
+        drop(places);
+        assert!(small.sources.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -36,6 +36,14 @@ pub fn prefix(ca: &str) -> Ipv6Addr {
     bytes.into()
 }
 
+/// Is `from` in the people's IPv4 range or their /64? (A v4 address as the dual-stack socket shows it too.)
+pub fn holds(people64: Ipv6Addr, from: IpAddr) -> bool {
+    match from.to_canonical() {
+        IpAddr::V4(v4) => v4.octets()[..2] == RANGE.octets()[..2],
+        IpAddr::V6(v6) => v6.octets()[..8] == people64.octets()[..8],
+    }
+}
+
 /// A RemotePeer as the leader reads it: its name, its public key, and the addresses its status holds.
 pub struct Asked {
     pub name: String,
