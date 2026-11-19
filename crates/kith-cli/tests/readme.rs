@@ -86,7 +86,10 @@ fn readme_says_how_a_compose_stack_becomes_kiths() {
         assert!(section.contains(said), "the compose section does not say: {said}");
     }
     for key in refused {
-        assert!(section.contains(&format!("`{key}`")), "the compose section does not name `{key}`");
+        assert!(
+            section.contains(&format!("`{key}`")),
+            "the compose section does not name `{key}`"
+        );
     }
 }
 
