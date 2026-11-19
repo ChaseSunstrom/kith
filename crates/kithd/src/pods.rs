@@ -493,8 +493,15 @@ pub async fn connect(pod: Option<(&Shared, &str)>, port: u16) -> std::io::Result
 /// A connection to `port` of pod `id` through the pod's own namespace and no other way: a pod this node has not
 /// made (pending, or between two makings) is an error, where [`connect`] would reach this machine's loopback.
 pub async fn connect_made(pods: &std::sync::Mutex<Pods>, id: &str, port: u16) -> std::io::Result<TcpStream> {
-    if !pods.lock().expect("nothing panics holding the pods").made.contains_key(id) {
-        return Err(std::io::Error::other("the pod has no network on this node (not started, or starting again)"));
+    if !pods
+        .lock()
+        .expect("nothing panics holding the pods")
+        .made
+        .contains_key(id)
+    {
+        return Err(std::io::Error::other(
+            "the pod has no network on this node (not started, or starting again)",
+        ));
     }
     through(&crate::root_part::Direct::today(pods, None), pods, id, port).await
 }
@@ -1728,7 +1735,10 @@ mod tests {
         let pods = std::sync::Mutex::new(Pods::default());
         let refused = connect_made(&pods, "w_a_b_0", port).await.unwrap_err();
         assert!(refused.to_string().contains("no network"), "{refused}");
-        assert!(connect(None, port).await.is_ok(), "the port is reachable on the loopback, which is the point");
+        assert!(
+            connect(None, port).await.is_ok(),
+            "the port is reachable on the loopback, which is the point"
+        );
     }
 
     /// A published UDP port stopped (its pod gone) is free at once for the pod made again,
