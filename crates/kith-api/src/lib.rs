@@ -17,7 +17,8 @@ pub const API_VERSION: &str = "kith.dev/v1";
 pub const DEFAULT_NAMESPACE: &str = "default";
 
 /// Is `method` `path` a request one node passes on to another for whoever asked it: a unit's logs,
-/// a Volume's files, a node's passphrase or new recovery key, a backup's restore, and a change to
+/// a Volume's files, a node's passphrase or new recovery key, a backup's restore, a replica's
+/// restart (a `kubectl delete pod`), and a change to
 /// the store a control node that is not the leader passes on as it came (an apply, a delete, a
 /// rollback). kithd reads the signer of such a request from the node that passed it on (`FOR`);
 /// the CLI signs a read of one, and any other request it signs anyway. The one list for both.
@@ -35,6 +36,7 @@ pub fn passed_on(method: &str, path: &str) -> bool {
         ["apply"] => method == "POST",
         ["resources", ..] => method == "DELETE",
         ["rollback", ..] => method == "POST",
+        ["restart", _, ..] => method == "POST",
         _ => false,
     }
 }
@@ -378,6 +380,21 @@ impl Resource {
             .namespace
             .as_deref()
             .map_or(Ok(()), |ns| one_label("namespace", ns))
+    }
+
+    /// `submitted`, and a NetworkPolicy's peer cidrs can be read (`NetworkPolicySpec::submitted`).
+    /// Asked by kithd where it takes a resource (apply, plan, access sign), not by the CLI: kith
+    /// speaks to a node's kithd, which asks it, and a local store enforces no policy; the CLI
+    /// binaries (kith-remote's size is held to a budget) do not link the cidr parser for it.
+    pub fn submitted_by_node(&self) -> Result<(), String> {
+        self.submitted()?;
+        if self.kind == "NetworkPolicy" {
+            // (A spec that cannot be read is `validated`'s to say, not this.)
+            if let Ok(spec) = serde_json::from_value::<kinds::NetworkPolicySpec>(self.spec.clone()) {
+                spec.submitted().map_err(|msg| format!("spec.{msg}"))?;
+            }
+        }
+        Ok(())
     }
 
     /// What can be checked of a resource whose kind is not kith's own without the

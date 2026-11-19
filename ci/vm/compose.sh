@@ -115,9 +115,10 @@ dock() {
     vms=''
     # (Installing and three runs take longer than the kith machines' time.)
     time=1800
+    dock_net="user,id=out,hostfwd=tcp:127.0.0.1:$((port + 20))-:22" # unrestricted: KITH_E2E=1 only; the machine installs docker from Alpine's mirrors
     timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 2048 -smp 2 -display none -machine q35 \
         -drive "file=$work/dock.qcow2,format=qcow2,if=virtio" -drive "file=$work/dock-seed.iso,format=raw,if=virtio,readonly=on" \
-        -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + 20))-:22" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:04" \
+        -netdev "$dock_net" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:04" \
         -serial "file:$work/n4.log" -monitor none </dev/null >"$work/n4.err" 2>&1 &
     vms="$vms $!"
     ssh_dock() { ssh -q -i "$work/dock-id" -p "$((port + 20))" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5 alpine@127.0.0.1 "$@"; }
