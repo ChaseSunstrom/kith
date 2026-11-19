@@ -1457,16 +1457,29 @@ mod tests {
         for status in [S::UNAUTHORIZED, S::FORBIDDEN] {
             match answered(status, "evicted: join again", "10.0.0.1:1") {
                 Forward::Failed(Error::Invalid(why)) => {
-                    assert!(why.contains("evicted: join again") && why.contains(status.as_str()), "{why}")
+                    assert!(
+                        why.contains("evicted: join again") && why.contains(status.as_str()),
+                        "{why}"
+                    )
                 }
                 _ => panic!("{status} is not refused at once"),
             }
         }
-        for (status, said) in [(S::SERVICE_UNAVAILABLE, "overloaded"), (S::OK, "null"), (S::BAD_GATEWAY, "")] {
-            assert!(matches!(answered(status, said, "a"), Forward::Again(None)), "{status} {said}");
+        for (status, said) in [
+            (S::SERVICE_UNAVAILABLE, "overloaded"),
+            (S::OK, "null"),
+            (S::BAD_GATEWAY, ""),
+        ] {
+            assert!(
+                matches!(answered(status, said, "a"), Forward::Again(None)),
+                "{status} {said}"
+            );
         }
         let said = serde_json::to_string(&Some((Reply::Err(Error::NotFound("x".into())), 7u64))).unwrap();
-        assert!(matches!(answered(S::OK, &said, "a"), Forward::Done(Err(Error::NotFound(_)), 7)));
+        assert!(matches!(
+            answered(S::OK, &said, "a"),
+            Forward::Done(Err(Error::NotFound(_)), 7)
+        ));
     }
 
     /// A worker is held to one barrier a second, and the map keeps no name whose second is over
