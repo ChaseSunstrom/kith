@@ -217,7 +217,12 @@ capability drop, no `no_new_privs`, no filter, no tied lives (T-0811).
   refused whole. A unit the root part made is held by it under its id, and the caller's handle
   (`Held`) is the id; a handle is checked against the id it is used with before anything is sent.
 - **A slow or hostile peer is bounded** by one reader thread that decodes each message and puts it
-  in a queue of 16 (`Limits::queue`); a request that finds the queue full is told so at once, by its
+  in a queue of 16 (`Limits::queue`; the brief said 64, and 16 is what is built: a queued message
+  holds its descriptors open, up to 256 for an unpack, so the queue is what bounds the root part's
+  open files, and one worker with a 30 s wait does not need a deeper one; a call is refused at read,
+  before it is queued, when it has more files than its kind takes: two for a `Create` or an `Exec`,
+  a layer each for an `Unpack`, none otherwise; and the two of a unit must be regular files,
+  pipes or sockets: a directory or a device node is refused); a request that finds the queue full is told so at once, by its
   `seq`, and never waits; a request that waited more than 30 s (`wait`) in it is refused unread; a
   reply that the peer does not take in 10 s (`reply`) closes the socket; and 8 messages in a row that
   are no request (`bad`) close it too (a good one resets the count). The one worker does the
@@ -230,7 +235,9 @@ capability drop, no `no_new_privs`, no filter, no tied lives (T-0811).
 
 **Not done, said here**: a single worker serializes the requests, and a long one (an unpack) holds the
 rest behind it, up to their deadline (T-0812 measures it before it is changed); a caller waiting for the
-lock has no deadline of its own; more than 253 layers cannot be sent in one `Unpack` though the
+lock has no deadline of its own; `send_fds` and `recv_fds` take up a call a signal cut short
+(`EINTR`) but wait the socket's whole timeout again, rather than what was left of it (kithd takes few
+signals; an absolute deadline is T-0811's, with the worker thread's restart); more than 253 layers cannot be sent in one `Unpack` though the
 limit on layers is 256; a caller that gives up after a `Create` leaves the unit held by the root
 part, to be taken by `Adopt` or deleted; a layer that is a FIFO is refused; the serving thread is
 not started again if the peer ends (the root part is a thread of kithd until T-0811 makes it a

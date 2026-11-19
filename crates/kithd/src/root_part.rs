@@ -556,10 +556,16 @@ fn check_mount(mount: &Mount, ground: &Ground, id: &str) -> Result<(), String> {
 /// Why a container is not created, or `Ok`: what the root part would not have made itself.
 /// `owns`: whether a path is the namespace of a pod this node made.
 pub fn check_create(create: &Create, ground: &Ground, owns: &dyn Fn(&Path) -> bool) -> Result<(), String> {
-    let (unit, policy) = (create.unit, &ground.policy);
-    label("unit id", create.id)?;
+    check_unit(create.id, create.unit, ground, owns)
+}
+
+/// The same for a unit that is made with no image (an exec): what a unit may be, whoever
+/// supplied it, so the root part checks a peer's unit as it checks the controller's.
+pub fn check_unit(id: &str, unit: &Unit, ground: &Ground, owns: &dyn Fn(&Path) -> bool) -> Result<(), String> {
+    let policy = &ground.policy;
+    label("unit id", id)?;
     for mount in &unit.mounts {
-        check_mount(mount, ground, create.id)?;
+        check_mount(mount, ground, id)?;
     }
     // What is given a user is chowned to it, tree and all, before the runtime looks at the
     // user: where there are ranges (kithd is root, and the runtime shifts this unit: one of its
@@ -1273,7 +1279,7 @@ impl<H: Hands> Root for Direct<'_, H> {
 
     fn exec(&self, id: &str, unit: &Unit, out: File, err: File) -> Result<H::Made, String> {
         self.book.count(Kind::Create);
-        label("unit id", id)?;
+        check_unit(id, unit, &self.ground(), &|path| self.hands.owns_netns(path))?;
         let made = self.hands.exec(id, unit, out, err)?;
         self.book.made(id.into())?;
         Ok(made)
@@ -2623,8 +2629,8 @@ mod tests {
             id: &unit_id,
             image: &image,
             unit: &unit,
-            out: null(),
-            err: null(),
+            out: regular(),
+            err: regular(),
         };
         let made = root.create(create).unwrap();
         root.start(made, &unit_id, "ab12").map_err(|(_, why)| why).unwrap();
@@ -2805,6 +2811,32 @@ mod tests {
         for id in ["a..b", "../x", "-x", ""] {
             let why = root.exec(id, &plain(), null(), null()).unwrap_err();
             assert!(why.contains("not a name"), "{why}");
+        }
+        assert_eq!(root.hands.reached(), ["exec", "kill"]);
+        // A unit is checked as a created one is, whoever supplied it: a device no claim granted, a
+        // network that is no pod's of this node's, a mount outside the state directory.
+        let device = Unit {
+            devices: vec![PathBuf::from("/dev/mem")],
+            ..plain()
+        };
+        let netns = Unit {
+            netns: Some(PathBuf::from("/proc/1/ns/net")),
+            ..plain()
+        };
+        let mounted = Unit {
+            mounts: vec![Mount {
+                give: true,
+                ..mount(Path::new("/etc"), "/etc")
+            }],
+            ..plain()
+        };
+        for (unit, why) in [
+            (device, "no claim of this node's granted this device"),
+            (netns, "not the network of a pod this node made"),
+            (mounted, "may not be given"),
+        ] {
+            let got = root.exec("w_a_b_1_c", &unit, null(), null()).unwrap_err();
+            assert!(got.contains(why) && !got.is_empty(), "{got}");
         }
         assert_eq!(root.hands.reached(), ["exec", "kill"]);
         // What a run before this one made, and this takes back, is made here; what is no name is
@@ -3994,6 +4026,11 @@ mod tests {
         serving(root, limits, move |fd| then(Socket::new(fd, Duration::from_secs(20))))
     }
 
+    /// A regular file to stand for a unit's output (`/dev/null` is a device node: refused).
+    fn regular() -> File {
+        File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap()
+    }
+
     /// An end that is a peer by hand, which gives up on a reply after five seconds.
     fn raw(fd: OwnedFd) -> UnixDatagram {
         let end = UnixDatagram::from(fd);
@@ -4095,8 +4132,8 @@ mod tests {
                     id,
                     image: &image,
                     unit: &plain(),
-                    out: null(),
-                    err: null(),
+                    out: regular(),
+                    err: regular(),
                 })
             };
             let id = "w_a_b_0_c";
@@ -4157,7 +4194,7 @@ mod tests {
             let (mut five, mark) = taken.remove("w_a_b_5_c").unwrap();
             assert_eq!((&five, mark.as_str()), (&Held("w_a_b_5_c".into()), "mark"));
             assert!(socket.kill(&mut five, "w_a_b_5_c").is_ok());
-            let mut exec = socket.exec("w_a_b_6_x", &plain(), null(), null()).unwrap();
+            let mut exec = socket.exec("w_a_b_6_x", &plain(), regular(), regular()).unwrap();
             assert!(socket.kill(&mut exec, "w_a_b_6_x").is_ok());
             assert!(socket.delete(five, "w_a_b_5_c").is_ok());
         });
@@ -4199,25 +4236,27 @@ mod tests {
         let root = Direct::with(Fake::default(), &book).under(policy(""));
         serving(&root, &Limits::default(), |fd| {
             let end = raw(fd);
-            let file = null();
-            let text = std::fs::File::open(state.parent().unwrap()).unwrap();
+            let file = regular();
+            let dir = std::fs::File::open(state.parent().unwrap()).unwrap();
+            let device = null();
             let (pipe, _held) = UnixStream::pair().unwrap();
             let create = json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain()}});
-            let cases: [(Value, Vec<BorrowedFd>, &str); 6] = [
-                // A file beside what is no unpack, a create with one file or three: refused whole.
+            let exec = json!({"Exec": {"id": "w_a_b_0_x", "unit": plain()}});
+            let cases: [(Value, Vec<BorrowedFd>, &str); 9] = [
+                // More files than the call takes is refused as it is read, before it is queued...
                 (
                     as_call(ask("127.0.0.1", 0, Proto::Tcp)),
                     vec![file.as_fd()],
-                    "only an unpack",
+                    "at most 0",
                 ),
+                (create.clone(), vec![file.as_fd(); 3], "at most 2"),
+                (exec.clone(), vec![file.as_fd(); 200], "at most 2"),
+                // ... and fewer than it needs, or ones that are not a unit's output, at the worker.
                 (create.clone(), vec![file.as_fd()], "two files"),
-                (create.clone(), vec![file.as_fd(); 3], "two files"),
                 (create.clone(), vec![], "two files"),
-                (
-                    json!({"Exec": {"id": "w_a_b_0_x", "unit": plain()}}),
-                    vec![file.as_fd()],
-                    "two files",
-                ),
+                (exec.clone(), vec![file.as_fd()], "two files"),
+                (create.clone(), vec![dir.as_fd(), file.as_fd()], "not a file, a pipe"),
+                (exec.clone(), vec![file.as_fd(), device.as_fd()], "not a file, a pipe"),
                 // A layer that is no regular file would be read for ever.
                 (
                     as_call(unpack_ask(&sha(b"x"), "{}")),
@@ -4225,7 +4264,6 @@ mod tests {
                     "not a regular file",
                 ),
             ];
-            let _ = text;
             for (at, (call, fds, why)) in cases.iter().enumerate() {
                 raw_ask(&end, at as u64 + 1, call, fds);
                 let (back, given) = raw_back(&end).expect("an answer");
@@ -4234,11 +4272,16 @@ mod tests {
                 assert!(given.is_empty());
             }
             // The same peer is served still, with the files it has to bring.
-            raw_ask(&end, 7, &create, &[file.as_fd(), file.as_fd()]);
+            raw_ask(&end, 10, &create, &[file.as_fd(), file.as_fd()]);
+            let (back, _) = raw_back(&end).unwrap();
+            assert_eq!(back["said"], json!({"Ok": "Done"}), "{back}");
+            // A pipe and a socket are a unit's output too.
+            let exec = json!({"Exec": {"id": "w_a_b_0_y", "unit": plain()}});
+            raw_ask(&end, 11, &exec, &[pipe.as_fd(), file.as_fd()]);
             let (back, _) = raw_back(&end).unwrap();
             assert_eq!(back["said"], json!({"Ok": "Done"}), "{back}");
         });
-        assert_eq!(root.hands.reached(), ["create"]);
+        assert_eq!(root.hands.reached(), ["create", "exec"]);
     }
 
     #[test]

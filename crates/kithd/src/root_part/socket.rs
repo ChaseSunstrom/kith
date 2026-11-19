@@ -387,9 +387,21 @@ fn read(end: &UnixDatagram, queue: SyncSender<Job>, limits: &Limits) {
     let mut buf = vec![0u8; MAX_REQUEST];
     let mut bad = 0;
     loop {
+        // (The seq a refusal is told under: the message's own when it was read, else 0.)
+        let mut seq = 0;
         let why = match recv_fds(end.as_fd(), &mut buf, MOST_FDS) {
             Ok((0, _)) => return,
             Ok((n, fds)) => match serde_json::from_slice::<Ask>(&buf[..n]) {
+                // (More files than the call takes: refused here, closed with `fds`, not queued
+                // holding them; counted as a bad message.)
+                Ok(ask) if fds.len() > most_fds(&ask.call) => {
+                    seq = ask.seq;
+                    format!(
+                        "{} files come with a call that takes at most {}",
+                        fds.len(),
+                        most_fds(&ask.call)
+                    )
+                }
                 Ok(ask) => {
                     bad = 0;
                     match queue.try_send(Job {
@@ -421,7 +433,7 @@ fn read(end: &UnixDatagram, queue: SyncSender<Job>, limits: &Limits) {
         };
         bad += 1;
         let back = Back {
-            seq: 0,
+            seq,
             kept: false,
             said: Err(why),
         };
@@ -462,10 +474,32 @@ impl Out {
 }
 
 /// The two files of a `Create` or an `Exec`: the unit's output and its error, and no others.
+/// Each is a regular file, a pipe or a socket: not a directory, nor a device node, which a unit's
+/// output is never and which the runtime would write to.
 fn two(fds: Vec<OwnedFd>) -> Result<(File, File), String> {
-    match <[OwnedFd; 2]>::try_from(fds) {
-        Ok([out, err]) => Ok((out.into(), err.into())),
-        Err(fds) => Err(format!("a unit comes with two files, not {}", fds.len())),
+    use std::os::unix::fs::FileTypeExt;
+    let [out, err] =
+        <[OwnedFd; 2]>::try_from(fds).map_err(|fds| format!("a unit comes with two files, not {}", fds.len()))?;
+    let (out, err) = (File::from(out), File::from(err));
+    for file in [&out, &err] {
+        let kind = file
+            .metadata()
+            .map_err(|e| format!("a unit's output: {e}"))?
+            .file_type();
+        if !(kind.is_file() || kind.is_fifo() || kind.is_socket()) {
+            return Err("a unit's output is not a file, a pipe or a socket".into());
+        }
+    }
+    Ok((out, err))
+}
+
+/// How many descriptors a call may come with: two for a unit's output and error, a layer each for
+/// an unpack, none for the rest.
+fn most_fds(call: &Call) -> usize {
+    match call {
+        Call::Create { .. } | Call::Exec { .. } => 2,
+        Call::Request(Request::Unpack { .. }) => MOST_LAYERS,
+        _ => 0,
     }
 }
 
