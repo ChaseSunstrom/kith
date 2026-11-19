@@ -4,7 +4,8 @@
 //! the root part as a second process takes the same [`Request`]s over a socket pair, with
 //! [`decode`] reading each one. Here are the Listeners family (`Bind`), the Pods family (`Pod`,
 //! `Sockets`, [`Root::create`] and [`Root::start`]) and, through the last, what Services and
-//! probes connect into a pod by.
+//! probes connect into a pod by, and the Mesh family (`MeshUp`, `Mesh`, `MeshSeen`, `MeshDown`:
+//! the WireGuard interface, its addresses and its peers).
 //!
 //! A request is refused for what it is, never for who asked ([`check`], [`check_create`]): a
 //! mount outside the state directory, a device no claim of this node's granted, a network
@@ -24,7 +25,7 @@ use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -74,6 +75,21 @@ pub enum Request {
     /// `count` stream sockets made inside the pod `pod`'s namespace, for connections to its
     /// loopback: one thread and one `setns` for all of them.
     Sockets { pod: String, v6: bool, count: u8 },
+    /// The mesh's interface up (made if it is not there), with the node's own `address`: its
+    /// private key, port and key file are the root part's own (the Book), and its public key
+    /// comes back.
+    MeshUp { interface: String, address: Ipv6Addr },
+    /// The interface as the serving part wants it: these `peers` and these further `addresses`
+    /// (the services'), and no others.
+    Mesh {
+        interface: String,
+        peers: Vec<kith_mesh::Peer>,
+        addresses: BTreeSet<Ipv6Addr>,
+    },
+    /// When each peer last shook hands (a read: it changes nothing).
+    MeshSeen { interface: String },
+    /// The interface taken away.
+    MeshDown { interface: String },
 }
 
 /// What a request gives back.
@@ -82,6 +98,11 @@ pub enum Reply {
     Socket(OwnedFd),
     Sockets(Vec<OwnedFd>),
     Pod(Given),
+    /// The public key of the mesh's interface.
+    Key(kith_mesh::Key),
+    Seen(Vec<kith_mesh::Seen>),
+    /// Done, and there is nothing to give back.
+    Done,
 }
 
 /// A container to make, as the serving part has it made: the unit, what its image is, and
@@ -158,6 +179,87 @@ pub fn check(request: &Request) -> Result<(), String> {
                 count => Err(format!("{count} sockets: from 1 to {MOST_SOCKETS}")),
             }
         }
+        // (Against what the root part was told of the mesh, which is not in the request: [`check_mesh`].)
+        Request::MeshUp { .. } | Request::Mesh { .. } | Request::MeshSeen { .. } | Request::MeshDown { .. } => Ok(()),
+    }
+}
+
+/// What the root part was told of the mesh, once: where its interface is kept and which
+/// cluster's it is. `own` is the node's address, once the interface is up with it.
+#[derive(Clone)]
+struct MeshTold {
+    interface: String,
+    port: u16,
+    key: PathBuf,
+    prefix: Option<Ipv6Addr>,
+    own: Option<Ipv6Addr>,
+}
+
+/// Is `address` the first of a node's /80 of the cluster `prefix` (`kith_mesh::node_address`)?
+fn is_node_address(prefix: Ipv6Addr, address: Ipv6Addr) -> bool {
+    let bytes = address.octets();
+    kith_mesh::in_mesh(prefix, address)
+        && !kith_mesh::is_service_address(prefix, address)
+        && bytes[10..15] == [0; 5]
+        && bytes[15] == 1
+}
+
+/// Why a mesh request is refused, or `Ok`: what the root part would not have made itself. The
+/// interface is the one kith made, the addresses are the cluster's range: this node's alone as
+/// its own, services' as addresses, and peers may be allowed the /80s of other nodes and no
+/// other address (so no peer gets this node's traffic, or the host's, or another cluster's).
+fn check_mesh(request: &Request, told: &Option<MeshTold>) -> Result<(), String> {
+    let interface = match request {
+        Request::MeshUp { interface, .. }
+        | Request::Mesh { interface, .. }
+        | Request::MeshSeen { interface }
+        | Request::MeshDown { interface } => interface,
+        _ => return Ok(()),
+    };
+    let told = told.as_ref().ok_or("this root part was told no mesh")?;
+    if *interface != told.interface {
+        return Err(format!("{}: not the mesh's interface", interface.escape_debug()));
+    }
+    let prefix = told
+        .prefix
+        .ok_or("this root part was told no cluster's range for the mesh")?;
+    match request {
+        Request::MeshUp { address, .. } => match told.own {
+            Some(own) if own != *address => Err(format!("the mesh is up as {own}: {address} is not it")),
+            _ if is_node_address(prefix, *address) => Ok(()),
+            _ => Err(format!(
+                "{address}: not the address of a node of the mesh {prefix}/{}",
+                kith_mesh::MESH_BITS
+            )),
+        },
+        Request::Mesh { peers, addresses, .. } => {
+            let own = told.own.ok_or("the mesh is not up")?;
+            for peer in peers {
+                if peer.key == [0; 32] {
+                    return Err("a peer's key is not a key".into());
+                }
+                for (address, bits) in &peer.allowed {
+                    let ok = match address {
+                        IpAddr::V6(a) => {
+                            *bits == kith_mesh::NODE_BITS
+                                && kith_mesh::in_mesh(prefix, *a)
+                                && !kith_mesh::is_service_address(prefix, *a)
+                                && a.octets()[10..] == [0; 6]
+                                && a.octets()[..10] != own.octets()[..10]
+                        }
+                        IpAddr::V4(_) => false,
+                    };
+                    if !ok {
+                        return Err(format!("{address}/{bits}: not another node's /80 of the mesh"));
+                    }
+                }
+            }
+            match addresses.iter().find(|a| !kith_mesh::is_service_address(prefix, **a)) {
+                Some(a) => Err(format!("{a}: not a service's address of the mesh")),
+                None => Ok(()),
+            }
+        }
+        _ => Ok(()),
     }
 }
 
@@ -326,7 +428,8 @@ pub fn check_create(create: &Create, ground: &Ground, owns: &dyn Fn(&Path) -> bo
 pub struct Book {
     state: Mutex<Option<PathBuf>>,
     devices: Mutex<BTreeSet<PathBuf>>,
-    crossed: [AtomicUsize; 5],
+    mesh: Mutex<Option<MeshTold>>,
+    crossed: [AtomicUsize; 7],
 }
 
 /// What a request is, for counting.
@@ -337,6 +440,10 @@ pub enum Kind {
     Sockets,
     Create,
     Start,
+    /// The mesh's interface, peers and addresses: what changes it (`MeshUp`, `Mesh`, `MeshDown`).
+    Mesh,
+    /// A read of when the peers shook hands (`MeshSeen`): every pass of the mesh's loop.
+    Seen,
 }
 
 impl Book {
@@ -344,7 +451,41 @@ impl Book {
         Book {
             state: Mutex::new(None),
             devices: Mutex::new(BTreeSet::new()),
-            crossed: [const { AtomicUsize::new(0) }; 5],
+            mesh: Mutex::new(None),
+            crossed: [const { AtomicUsize::new(0) }; 7],
+        }
+    }
+
+    /// The mesh's interface, its WireGuard port and where its private key is kept, as the node
+    /// was started with them: told once, and a second telling is not heeded.
+    //
+    // ponytail: told by the serving part, in this process. When the root part is a process of its
+    // own (T-0810) it is given these by its own arguments, which the serving part cannot change.
+    pub fn set_mesh(&self, interface: String, port: u16, key: PathBuf) {
+        let mut told = self.mesh.lock().expect("nothing panics holding the book");
+        told.get_or_insert(MeshTold {
+            interface,
+            port,
+            key,
+            prefix: None,
+            own: None,
+        });
+    }
+
+    /// The cluster's /48 (`kith_mesh::prefix` of its CA): the range every address of the mesh is
+    /// in. The first told is the cluster's; another is refused.
+    //
+    // ponytail: told by the serving part, as above. The root part is to work it out of the CA
+    // itself (T-0810).
+    pub fn set_prefix(&self, prefix: Ipv6Addr) -> Result<(), String> {
+        let mut told = self.mesh.lock().expect("nothing panics holding the book");
+        let told = told.as_mut().ok_or("this root part was told no mesh")?;
+        match told.prefix {
+            Some(had) if had != prefix => Err(format!("the mesh is of the cluster {had}/{}", kith_mesh::MESH_BITS)),
+            _ => {
+                told.prefix = Some(prefix);
+                Ok(())
+            }
         }
     }
 
@@ -389,6 +530,23 @@ pub fn claim(devices: impl IntoIterator<Item = PathBuf>) {
     BOOK.claim(devices);
 }
 
+pub fn set_mesh(interface: String, port: u16, key: PathBuf) {
+    BOOK.set_mesh(interface, port, key);
+}
+
+pub fn set_prefix(prefix: Ipv6Addr) -> Result<(), String> {
+    BOOK.set_prefix(prefix)
+}
+
+/// This process's mesh interface, once it is up: one per node.
+static DEVICE: Mutex<Option<kith_mesh::Device>> = Mutex::new(None);
+
+fn device<T>(then: impl FnOnce(&mut kith_mesh::Device) -> std::io::Result<T>) -> Result<T, String> {
+    let mut held = DEVICE.lock().expect("nothing panics holding the device");
+    let device = held.as_mut().ok_or("the mesh is not up")?;
+    then(device).map_err(|e| e.to_string())
+}
+
 /// What the root part does with the machine, for [`Direct`] to ask after it has checked: here
 /// the code kithd always had, there (in a test) a stand-in.
 pub trait Hands {
@@ -412,6 +570,37 @@ pub trait Hands {
     fn create(&self, create: Create) -> Result<Self::Made, String>;
     /// Written down, then started: it comes back with what refused it, to be deleted.
     fn start(&self, made: Self::Made, id: &str, mark: &str) -> Result<Self::Made, (Self::Made, String)>;
+
+    // The mesh: the node's one WireGuard interface, which is the machine's whatever else these
+    // hands are (so these are what they are by default, and a test says another).
+    /// The interface `interface` up with the key in `key` (made if there is none) on `port`,
+    /// and `address`: its public key.
+    fn mesh_up(&self, interface: &str, key: &Path, port: u16, address: Ipv6Addr) -> Result<kith_mesh::Key, String> {
+        let private = crate::mesh::private_key(key).map_err(|e| e.to_string())?;
+        let mut device = kith_mesh::Device::ensure(interface, &private, port, address).map_err(|e| e.to_string())?;
+        let public = device.public_key().map_err(|e| e.to_string())?;
+        *DEVICE.lock().expect("nothing panics holding the device") = Some(device);
+        Ok(public)
+    }
+    /// The interface with these peers and these further addresses. Both are tried, and what
+    /// failed is said.
+    fn mesh(&self, peers: &[kith_mesh::Peer], addresses: &BTreeSet<Ipv6Addr>) -> Result<(), String> {
+        let addresses =
+            device(|device| device.set_addresses(addresses)).map_err(|e| format!("the services' addresses: {e}"));
+        let peers = device(|device| device.set_peers(peers)).map_err(|e| format!("setting the peers: {e}"));
+        match (addresses, peers) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(a), Ok(())) | (Ok(()), Err(a)) => Err(a),
+            (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+        }
+    }
+    fn mesh_seen(&self) -> Result<Vec<kith_mesh::Seen>, String> {
+        device(|device| device.peers())
+    }
+    fn mesh_down(&self) -> Result<(), String> {
+        let device = DEVICE.lock().expect("nothing panics holding the device").take();
+        device.ok_or("the mesh is not up")?.remove().map_err(|e| e.to_string())
+    }
 }
 
 /// The root part, as the serving part sees it.
@@ -433,7 +622,7 @@ pub struct Direct<'a, H: Hands = Nobody> {
     policy: Option<Policy>,
 }
 
-/// Hands for a Direct that is asked for sockets to listen on and nothing else.
+/// Hands for a Direct that is asked for sockets to listen on and for the mesh, and nothing else.
 pub struct Nobody;
 
 impl Hands for Nobody {
@@ -561,6 +750,13 @@ impl<'a, H: Hands> Direct<'a, H> {
         self
     }
 
+    /// The node's own address on the mesh, once the interface is up with it (and not after).
+    fn own(&self, address: Option<Ipv6Addr>) {
+        if let Some(told) = self.book.mesh.lock().expect("nothing panics holding the book").as_mut() {
+            told.own = address;
+        }
+    }
+
     /// What the root part holds, to check a container against.
     fn ground(&self) -> Ground {
         Ground {
@@ -586,8 +782,12 @@ impl<H: Hands> Root for Direct<'_, H> {
             Request::Bind { .. } => Kind::Bind,
             Request::Pod { .. } => Kind::Pod,
             Request::Sockets { .. } => Kind::Sockets,
+            Request::MeshUp { .. } | Request::Mesh { .. } | Request::MeshDown { .. } => Kind::Mesh,
+            Request::MeshSeen { .. } => Kind::Seen,
         });
         check(&request)?;
+        let told = self.book.mesh.lock().expect("nothing panics holding the book").clone();
+        check_mesh(&request, &told)?;
         match request {
             Request::Bind { address, port, proto } => {
                 let at = SocketAddr::new(address, port);
@@ -615,6 +815,20 @@ impl<H: Hands> Root for Direct<'_, H> {
                     .map(Reply::Pod)
             }
             Request::Sockets { pod, v6, count } => self.hands.sockets(&pod, v6, usize::from(count)).map(Reply::Sockets),
+            // (The mesh was told, or `check_mesh` would have refused.)
+            Request::MeshUp { interface, address } => {
+                let told = told.ok_or("this root part was told no mesh")?;
+                let key = self.hands.mesh_up(&interface, &told.key, told.port, address)?;
+                self.own(Some(address));
+                Ok(Reply::Key(key))
+            }
+            Request::Mesh { peers, addresses, .. } => self.hands.mesh(&peers, &addresses).map(|()| Reply::Done),
+            Request::MeshSeen { .. } => self.hands.mesh_seen().map(Reply::Seen),
+            Request::MeshDown { .. } => {
+                let down = self.hands.mesh_down();
+                self.own(None);
+                down.map(|()| Reply::Done)
+            }
         }
     }
 
@@ -659,6 +873,68 @@ pub fn pod<R: Root>(root: &R, pods: &Mutex<Pods>, ask: Request) -> Result<Given,
         .expect("nothing panics holding the pods")
         .remember(&id, tunnel, &given);
     Ok(given)
+}
+
+/// What the mesh was last told, for [`mesh`]: the peers (by key) and the services' addresses.
+pub type Told = (Vec<kith_mesh::Peer>, BTreeSet<Ipv6Addr>);
+
+/// The mesh's interface as wanted: asked of the root part when it is not what was told last
+/// (`told`, which is kept), and not otherwise, so a mesh that has not changed crosses nothing.
+/// Whether it crossed. A refused or failed one is not taken for told: it is asked again.
+pub fn mesh<R: Root>(
+    root: &R,
+    told: &mut Option<Told>,
+    interface: &str,
+    mut peers: Vec<kith_mesh::Peer>,
+    addresses: BTreeSet<Ipv6Addr>,
+) -> Result<bool, String> {
+    peers.sort_by_key(|peer| peer.key);
+    if told.as_ref().is_some_and(|(had, at)| *had == peers && *at == addresses) {
+        return Ok(false);
+    }
+    let ask = Request::Mesh {
+        interface: interface.into(),
+        peers: peers.clone(),
+        addresses: addresses.clone(),
+    };
+    match root.request(ask)? {
+        Reply::Done => {
+            *told = Some((peers, addresses));
+            Ok(true)
+        }
+        _ => Err("the root part answered a request for the mesh with something else".into()),
+    }
+}
+
+/// The mesh's interface up with the node's `address`: its public key.
+pub fn mesh_key<R: Root>(root: &R, interface: &str, address: Ipv6Addr) -> Result<kith_mesh::Key, String> {
+    match root.request(Request::MeshUp {
+        interface: interface.into(),
+        address,
+    })? {
+        Reply::Key(key) => Ok(key),
+        _ => Err("the root part answered a request for the mesh with something else".into()),
+    }
+}
+
+/// When each peer of the mesh last shook hands.
+pub fn mesh_seen<R: Root>(root: &R, interface: &str) -> Result<Vec<kith_mesh::Seen>, String> {
+    match root.request(Request::MeshSeen {
+        interface: interface.into(),
+    })? {
+        Reply::Seen(seen) => Ok(seen),
+        _ => Err("the root part answered a request for the mesh with something else".into()),
+    }
+}
+
+/// The mesh's interface taken away.
+pub fn mesh_down<R: Root>(root: &R, interface: &str) -> Result<(), String> {
+    match root.request(Request::MeshDown {
+        interface: interface.into(),
+    })? {
+        Reply::Done => Ok(()),
+        _ => Err("the root part answered a request for the mesh with something else".into()),
+    }
 }
 
 /// A stream socket, not yet connected, to be made over into a `TcpSocket`.
@@ -826,6 +1102,26 @@ mod tests {
         fn start(&self, made: String, _: &str, _: &str) -> Result<String, (String, String)> {
             self.said("start");
             Ok(made)
+        }
+
+        fn mesh_up(&self, _: &str, _: &Path, _: u16, _: Ipv6Addr) -> Result<kith_mesh::Key, String> {
+            self.said("mesh_up");
+            Ok([7; 32])
+        }
+
+        fn mesh(&self, _: &[kith_mesh::Peer], _: &BTreeSet<Ipv6Addr>) -> Result<(), String> {
+            self.said("mesh");
+            Ok(())
+        }
+
+        fn mesh_seen(&self) -> Result<Vec<kith_mesh::Seen>, String> {
+            self.said("mesh_seen");
+            Ok(Vec::new())
+        }
+
+        fn mesh_down(&self) -> Result<(), String> {
+            self.said("mesh_down");
+            Ok(())
         }
     }
 
@@ -1460,6 +1756,231 @@ mod tests {
         };
         assert!(pod(&root, &pods, bind).is_err());
         assert_eq!(book.crossed(Kind::Bind), 0);
+    }
+
+    const WG: &str = "kith0";
+
+    /// A book of a node on the mesh of the cluster `seed`, interface `kith0`, with its interface up
+    /// as the node `a`; the mesh's address of a node `name`.
+    fn meshed(seed: &str) -> (Book, Ipv6Addr) {
+        let book = Book::new();
+        book.set_mesh(WG.into(), 51820, PathBuf::from("/nowhere/mesh.key"));
+        let prefix = kith_mesh::prefix(seed.as_bytes());
+        book.set_prefix(prefix).unwrap();
+        (book, prefix)
+    }
+
+    fn up(root: &Direct<Fake>, prefix: Ipv6Addr) -> Result<Reply, String> {
+        let address = kith_mesh::node_address(prefix, "a");
+        root.request(Request::MeshUp {
+            interface: WG.into(),
+            address,
+        })
+    }
+
+    fn peer(key: u8, allowed: Vec<(IpAddr, u8)>) -> kith_mesh::Peer {
+        kith_mesh::Peer {
+            key: [key; 32],
+            endpoint: Some("203.0.113.2:51820".parse().unwrap()),
+            allowed,
+            keepalive: 25,
+        }
+    }
+
+    fn mesh_ask(interface: &str, peers: Vec<kith_mesh::Peer>, addresses: &[Ipv6Addr]) -> Request {
+        Request::Mesh {
+            interface: interface.into(),
+            peers,
+            addresses: addresses.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn a_mesh_request_outside_what_the_root_part_would_make_is_refused() {
+        let (book, prefix) = meshed("a cluster");
+        let root = Direct::with(Fake::default(), &book);
+        let other = kith_mesh::prefix(b"another cluster");
+        let net = |name: &str| (IpAddr::V6(kith_mesh::node_net(prefix, name)), kith_mesh::NODE_BITS);
+        let service = kith_mesh::service_address(prefix, "default", "web");
+        // Nothing is made until the interface is up with an address of the cluster's: not an
+        // interface that is not kith's, not another cluster's address, not a service's or a
+        // node's other address.
+        let said = |interface: &str, address: Ipv6Addr| {
+            root.request(Request::MeshUp {
+                interface: interface.into(),
+                address,
+            })
+            .unwrap_err()
+        };
+        let mine = kith_mesh::node_address(prefix, "a");
+        for interface in ["eth0", "lo", "", "kith0\n", "KITH0", "kith00"] {
+            assert!(
+                said(interface, mine).contains("not the mesh's interface"),
+                "{interface:?}"
+            );
+        }
+        for address in [
+            kith_mesh::node_address(other, "a"),
+            "fe80::1".parse().unwrap(),
+            Ipv6Addr::UNSPECIFIED,
+            service,
+            kith_mesh::node_net(prefix, "a"),
+            "fd00::1".parse().unwrap(),
+        ] {
+            assert!(said(WG, address).contains("not the address of a node"), "{address}");
+        }
+        assert!(
+            root.request(mesh_ask(WG, Vec::new(), &[]))
+                .unwrap_err()
+                .contains("not up"),
+            "a set before an up"
+        );
+        assert!(root.hands.reached().is_empty(), "{:?}", root.hands.reached());
+        // A root part that was told no mesh makes none, and none with no cluster's range.
+        let none = Book::new();
+        let nobody = Direct::with(Fake::default(), &none);
+        assert!(up(&nobody, prefix).unwrap_err().contains("no mesh"));
+        none.set_mesh(WG.into(), 51820, PathBuf::from("/nowhere/mesh.key"));
+        assert!(up(&nobody, prefix).unwrap_err().contains("range"));
+        assert!(nobody.hands.reached().is_empty());
+        // The first cluster told is the one: another is refused.
+        assert!(book.set_prefix(other).is_err());
+        book.set_prefix(prefix).unwrap();
+        // Up: the key comes back, and it is the node's address that is its own from now on.
+        assert!(matches!(up(&root, prefix).unwrap(), Reply::Key(key) if key == [7; 32]));
+        assert_eq!(root.hands.reached(), ["mesh_up"]);
+        let refused = |request: Request| root.request(request).unwrap_err();
+        let bad = [
+            // Not the interface kith made.
+            mesh_ask("eth0", vec![peer(1, vec![net("b")])], &[]),
+            // Allowed addresses outside the cluster's mesh, or the whole of it, or a part of it
+            // that is no node's /80 (a service's, a node's own, one with its address in it).
+            mesh_ask(
+                WG,
+                vec![peer(1, vec![(IpAddr::V6(kith_mesh::node_net(other, "b")), 80)])],
+                &[],
+            ),
+            mesh_ask(
+                WG,
+                vec![peer(1, vec![(IpAddr::V6("fe80::".parse().unwrap()), 80)])],
+                &[],
+            ),
+            mesh_ask(WG, vec![peer(1, vec![("10.0.0.0".parse().unwrap(), 24)])], &[]),
+            mesh_ask(WG, vec![peer(1, vec![(IpAddr::V6(prefix), 48)])], &[]),
+            mesh_ask(WG, vec![peer(1, vec![(IpAddr::V6(prefix), 0)])], &[]),
+            mesh_ask(
+                WG,
+                vec![peer(1, vec![(IpAddr::V6(kith_mesh::node_net(prefix, "b")), 64)])],
+                &[],
+            ),
+            mesh_ask(
+                WG,
+                vec![peer(1, vec![(IpAddr::V6(kith_mesh::node_net(prefix, "b")), 200)])],
+                &[],
+            ),
+            mesh_ask(WG, vec![peer(1, vec![net("a")])], &[]),
+            mesh_ask(WG, vec![peer(1, vec![(IpAddr::V6(mine), 128)])], &[]),
+            mesh_ask(WG, vec![peer(1, vec![(IpAddr::V6(service), 80)])], &[]),
+            mesh_ask(WG, vec![peer(1, vec![(IpAddr::V6(service), 128)])], &[]),
+            // (One bad allowed address among good ones refuses all.)
+            mesh_ask(WG, vec![peer(1, vec![net("b")]), peer(2, vec![net("a")])], &[]),
+            mesh_ask(WG, vec![peer(0, vec![net("b")])], &[]),
+            // Addresses of services only, in the cluster's, and never the node's own.
+            mesh_ask(WG, Vec::new(), &[mine]),
+            mesh_ask(WG, Vec::new(), &[kith_mesh::node_address(prefix, "b")]),
+            mesh_ask(WG, Vec::new(), &[kith_mesh::service_address(other, "default", "web")]),
+            mesh_ask(WG, Vec::new(), &[service, "fe80::1".parse().unwrap()]),
+        ];
+        for request in bad {
+            let why = refused(request.clone());
+            assert!(
+                why.contains("mesh") || why.contains("interface") || why.contains("key"),
+                "{request:?}: {why}"
+            );
+        }
+        assert_eq!(
+            root.hands.reached(),
+            ["mesh_up"],
+            "a refused request reached the machine"
+        );
+        // What is right does: peers' /80s of the cluster (several: a relay's), services' addresses.
+        let good = mesh_ask(
+            WG,
+            vec![peer(1, vec![net("b"), net("c")]), peer(2, Vec::new())],
+            &[service],
+        );
+        assert!(matches!(root.request(good).unwrap(), Reply::Done));
+        assert_eq!(root.hands.reached(), ["mesh_up", "mesh"]);
+        assert!(matches!(
+            root.request(Request::MeshSeen { interface: WG.into() }),
+            Ok(Reply::Seen(_))
+        ));
+        assert!(
+            root.request(Request::MeshSeen {
+                interface: "eth0".into()
+            })
+            .is_err()
+        );
+        assert!(
+            root.request(Request::MeshDown {
+                interface: "eth0".into()
+            })
+            .is_err()
+        );
+        assert!(matches!(
+            root.request(Request::MeshDown { interface: WG.into() }),
+            Ok(Reply::Done)
+        ));
+        assert_eq!(root.hands.reached(), ["mesh_up", "mesh", "mesh_seen", "mesh_down"]);
+        // The wire reads it as it is sent, and no other field.
+        let sent = serde_json::to_vec(&mesh_ask(WG, vec![peer(1, vec![net("b")])], &[service])).unwrap();
+        assert_eq!(
+            decode(&sent).unwrap(),
+            mesh_ask(WG, vec![peer(1, vec![net("b")])], &[service])
+        );
+        assert!(decode(br#"{"MeshSeen":{"interface":"kith0","path":"/x"}}"#).is_err());
+    }
+
+    #[test]
+    fn crossings_of_an_unchanged_mesh_are_none() {
+        let (book, prefix) = meshed("a cluster");
+        let root = Direct::with(Fake::default(), &book);
+        up(&root, prefix).unwrap();
+        let net = |name: &str| (IpAddr::V6(kith_mesh::node_net(prefix, name)), kith_mesh::NODE_BITS);
+        let service = kith_mesh::service_address(prefix, "default", "web");
+        let mut told = None;
+        let mut set = |peers: Vec<kith_mesh::Peer>, addresses: &[Ipv6Addr]| {
+            mesh(&root, &mut told, WG, peers, addresses.iter().copied().collect())
+        };
+        // The first is a crossing; the same every ten seconds after it is none.
+        let b = || vec![peer(1, vec![net("b")])];
+        assert!(set(b(), &[service]).unwrap());
+        for _ in 0..50 {
+            assert!(!set(b(), &[service]).unwrap());
+        }
+        assert_eq!(book.crossed(Kind::Mesh), 2, "the interface up and the first set");
+        // A peer that changed (its endpoint, or one more) or an address is one crossing each.
+        let moved = vec![kith_mesh::Peer {
+            endpoint: None,
+            ..peer(1, vec![net("b")])
+        }];
+        assert!(set(moved.clone(), &[service]).unwrap());
+        assert!(set(moved.clone(), &[]).unwrap());
+        assert!(!set(moved.clone(), &[]).unwrap());
+        assert_eq!(book.crossed(Kind::Mesh), 4);
+        // One refused is not taken for told: asked again next time, and counted.
+        let bad = || vec![peer(1, vec![net("a")])];
+        assert!(set(bad(), &[]).is_err());
+        assert!(set(bad(), &[]).is_err());
+        assert_eq!(book.crossed(Kind::Mesh), 6);
+        assert!(!set(moved, &[]).unwrap(), "what was told last is still what is told");
+        // Reading the handshakes is a crossing of its own kind and changes nothing.
+        root.request(Request::MeshSeen { interface: WG.into() }).unwrap();
+        assert_eq!((book.crossed(Kind::Mesh), book.crossed(Kind::Seen)), (6, 1));
+        assert_eq!(
+            book.crossed(Kind::Pod) + book.crossed(Kind::Create) + book.crossed(Kind::Start),
+            0
+        );
     }
 
     /// `n` connections into the pod `id`, through sockets made ahead, to a real listener.

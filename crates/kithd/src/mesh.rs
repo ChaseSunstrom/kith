@@ -11,7 +11,7 @@
 
 use crate::Shared;
 use kith_api::store::Store;
-use kith_mesh::{Device, Key, Member};
+use kith_mesh::{Key, Member};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv6Addr, SocketAddr};
@@ -90,13 +90,19 @@ pub(crate) fn private_key(path: &std::path::Path) -> std::io::Result<Key> {
 /// CA, which the join `token` names.
 pub fn key_before_joining(options: &Options, token: &str, name: &str) -> Result<String, String> {
     let (_, pinned, _) = crate::pki::token_parts(token)?;
-    let address = kith_mesh::node_address(kith_mesh::prefix(pinned.as_bytes()), name);
-    let up = private_key(&options.key).and_then(|key| {
-        let mut device = Device::ensure(&options.interface, &key, options.port, address)?;
-        device.public_key()
-    });
+    let prefix = kith_mesh::prefix(pinned.as_bytes());
+    let address = kith_mesh::node_address(prefix, name);
+    let up = told_root(options, prefix)
+        .and_then(|()| crate::root_part::mesh_key(&crate::root_part::Direct::new(), &options.interface, address));
     let hint = "--roaming takes the mesh: the kernel's WireGuard and CAP_NET_ADMIN";
     up.map(|key| hex(&key)).map_err(|e| format!("no mesh: {e} ({hint})"))
+}
+
+/// The root part told what the node was started with: the interface, its port and key file, and
+/// the cluster's range.
+fn told_root(options: &Options, prefix: Ipv6Addr) -> Result<(), String> {
+    crate::root_part::set_mesh(options.interface.clone(), options.port, options.key.clone());
+    crate::root_part::set_prefix(prefix)
 }
 
 /// Where the peers a roaming node was told of as it joined are kept: who to call before
@@ -305,17 +311,17 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     let me = cluster.me.name.as_str();
     let prefix = prefix(&cluster.me.ca);
     let address = kith_mesh::node_address(prefix, me);
-    let up = private_key(&options.key).and_then(|key| {
-        let mut device = Device::ensure(&options.interface, &key, options.port, address)?;
-        Ok((device.public_key()?, device))
-    });
-    let (public, mut device) = match up {
-        Ok(up) => up,
+    let root = crate::root_part::Direct::new();
+    let up = told_root(&options, prefix).and_then(|()| crate::root_part::mesh_key(&root, &options.interface, address));
+    let public = match up {
+        Ok(public) => public,
         Err(e) => {
             let hint = "it takes the kernel's WireGuard and the right to set up interfaces, CAP_NET_ADMIN";
             return eprintln!("kithd: no mesh: {e} ({hint})");
         }
     };
+    // What the root part was last asked for the interface: not asked again while it is the same.
+    let mut asked = None;
     eprintln!("kithd: mesh address {address} on {}", options.interface);
     let base = says_of(&public, address, options.port);
     let node = format!("Node/{me}");
@@ -328,7 +334,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
         Arc::new(Notify::new()),
     );
     loop {
-        let peers = device.peers().unwrap_or_else(|e| {
+        let peers = crate::root_part::mesh_seen(&root, &options.interface).unwrap_or_else(|e| {
             eprintln!("kithd: mesh: reading the peers of {}: {e}", options.interface);
             Vec::new()
         });
@@ -367,10 +373,6 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
         {
             member.endpoint = Some(at);
         }
-        // Every node has every Service's address (crate::services listens on them).
-        if let Err(e) = device.set_addresses(&services) {
-            eprintln!("kithd: mesh: the services' addresses on {}: {e}", options.interface);
-        }
         // (Its own Node may not be there yet, right after joining: next time round.)
         if !said && let Err(e) = say(&shared, &node, "mesh", mine).await {
             eprintln!("kithd: mesh: telling the cluster this node's key: {e}");
@@ -384,8 +386,9 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             );
         }
         let peers = kith_mesh::wanted(prefix, me, &members);
-        if let Err(e) = device.set_peers(&peers) {
-            eprintln!("kithd: mesh: setting the peers of {}: {e}", options.interface);
+        // Every node has every Service's address (crate::services listens on them).
+        if let Err(e) = crate::root_part::mesh(&root, &mut asked, &options.interface, peers.clone(), services) {
+            eprintln!("kithd: mesh: setting {}: {e}", options.interface);
         }
         // For `kith node status`.
         let path = |member: &Member| {
@@ -409,7 +412,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     }
     // (What this node said of itself stays: it is back with the same key when kithd
     // starts again, and the others need not forget it for a restart. See `left`.)
-    if let Err(e) = device.remove() {
+    if let Err(e) = crate::root_part::mesh_down(&root, &options.interface) {
         eprintln!("kithd: mesh: removing {}: {e}", options.interface);
     }
 }

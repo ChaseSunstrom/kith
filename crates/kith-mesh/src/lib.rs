@@ -106,8 +106,8 @@ pub struct Member {
     pub seen: Option<SocketAddr>,
 }
 
-/// A peer as the interface should have it.
-#[derive(Debug, Clone, PartialEq)]
+/// A peer as the interface should have it (and as kithd asks its root part for it).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Peer {
     pub key: Key,
     pub endpoint: Option<SocketAddr>,
