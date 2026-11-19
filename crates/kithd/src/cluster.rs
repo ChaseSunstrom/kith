@@ -2176,7 +2176,10 @@ pub(crate) mod pinned_peer {
         // (Not found, as any path it has not; with the feature, the route is there: a node's
         // call does not pass for the admin's.)
         assert_eq!(status == 404, !forge, "{status} {said}");
-        let (status, said) = call_as(&alpha, |client| client.post(format!("https://{address}/v1/nope")).json(&"Mark")).await;
+        let (status, said) = call_as(&alpha, |client| {
+            client.post(format!("https://{address}/v1/nope")).json(&"Mark")
+        })
+        .await;
         assert_eq!(status, 404, "{said}");
     }
 
@@ -2196,7 +2199,11 @@ pub(crate) mod pinned_peer {
         let send = |entry: kith_store::Command| {
             let shared = shared.clone();
             async move {
-                let sent = crate::forge::append(State(shared), axum::Extension(crate::access::Caller::Admin), Json(entry));
+                let sent = crate::forge::append(
+                    State(shared),
+                    axum::Extension(crate::access::Caller::Admin),
+                    Json(entry),
+                );
                 sent.await.map(|Json(said)| said)
             }
         };
