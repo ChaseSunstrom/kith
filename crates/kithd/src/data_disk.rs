@@ -1,6 +1,6 @@
 //! A second disk for a node's data (docs/adr-second-disk.md, sections 1 and 2), the part a file
-//! can show: the 4 KiB plain header that says a disk is a kith data disk, the key drawn for it
-//! from the state's key, and the refusal of a disk that is anyone else's.
+//! can show: the 4 KiB plain header that says a disk is a kith data disk, the disk's own random
+//! key, and the refusal of a disk that is anyone else's.
 //!
 //! Nothing here maps, mounts or writes a disk on its own: `write_header` is the one write, and
 //! the order it comes in (last, after the mapping) is the add's, not this file's. Nothing here
@@ -8,7 +8,7 @@
 // (Nothing calls this yet: the add order and the verbs come in the slices after it.)
 #![allow(dead_code)]
 
-use ring::{digest, hkdf};
+use ring::digest;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -16,8 +16,6 @@ use std::os::unix::fs::FileExt;
 /// The room of the header at the start of the disk; the mapping begins after it (8 sectors).
 pub const ROOM: usize = 4096;
 const FIRST: &str = "kith-disk v1";
-/// What the key is drawn under: a version, so a later draw cannot meet this one's keys.
-const LABEL: &[u8] = b"kith-disk xts v1";
 
 /// A disk's id: 16 random bytes, 32 hex digits in the header.
 pub type Id = [u8; 16];
@@ -150,23 +148,12 @@ pub fn refuse(disk: &impl Dev, root: Option<&str>) -> Result<(), Refused> {
     Ok(())
 }
 
-/// The 64-byte aes-xts-plain64 key of the disk `id` on a node whose state is keyed `state_key`:
-/// HKDF-SHA256 with the id as the salt. Nothing is stored for it. `None` for an empty key.
-pub fn key(state_key: &[u8], id: &Id) -> Option<zeroize::Zeroizing<[u8; 64]>> {
-    struct Xts;
-    impl hkdf::KeyType for Xts {
-        fn len(&self) -> usize {
-            64
-        }
-    }
-    if state_key.is_empty() {
-        return None;
-    }
-    let drawn = hkdf::Salt::new(hkdf::HKDF_SHA256, id).extract(state_key);
-    let mut out = zeroize::Zeroizing::new([0; 64]);
-    let filled = drawn.expand(&[LABEL], Xts).and_then(|okm| okm.fill(&mut out[..]));
-    filled.expect("64 bytes are within what HKDF gives");
-    Some(out)
+/// A new aes-xts-plain64 key for a disk: 64 random bytes, the disk's own (docs/adr-second-disk.md,
+/// section 1). It is derived from nothing, so the state's key and a header's id cannot draw it
+/// again once the copy kept in the state is gone: that is what makes remove an erase. Keeping
+/// it (`disks/<id>/key`, synced) before anything uses it is the add's order, not this function's.
+pub fn new_key() -> zeroize::Zeroizing<[u8; 64]> {
+    zeroize::Zeroizing::new(crate::crypt::random::<64>())
 }
 
 #[cfg(test)]
@@ -351,35 +338,16 @@ mod key {
     use super::support::*;
     use super::*;
 
-    /// The key is 64 bytes of HKDF-SHA256 (id as salt, the label as info), the same as
-    /// RFC 5869 computed by hand from HMAC (and by python for the fixed vector), and it
-    /// differs for another id and for another state key.
+    /// A key is 64 bytes, and two made for one disk differ (it takes no id and no state key, so
+    /// nothing can make one the same twice); neither is zero, and the two XTS halves differ.
     #[test]
-    fn key_is_hkdf_of_the_state_key_and_the_id() {
-        let state: Vec<u8> = (0..32).collect();
-        let got = key(&state, &ID).unwrap();
-        let vector = "97382d653fb725b595ec1e0b200b739e535c07d05e1940eab77502009389d9fe\
-                      0d6dcbe7f2903d5cb92c9fee6ee926a35de6cd29ba7f8f7db73cdc8cb36a1369";
-        assert_eq!(crate::pki::hex(&got[..]), vector);
-
-        // RFC 5869 by hand: PRK = HMAC(salt, ikm); T(n) = HMAC(PRK, T(n-1) | info | n).
-        use ring::hmac;
-        let prk = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &ID), &state);
-        let prk = hmac::Key::new(hmac::HMAC_SHA256, prk.as_ref());
-        let t1 = hmac::sign(&prk, &[LABEL, &[1]].concat());
-        let t2 = hmac::sign(&prk, &[t1.as_ref(), LABEL, &[2]].concat());
-        assert_eq!(&got[..32], t1.as_ref());
-        assert_eq!(&got[32..], t2.as_ref());
-
-        assert_eq!(key(&state, &ID).unwrap()[..], got[..]);
-        let mut other_id = ID;
-        other_id[15] ^= 1;
-        let mut other_state = state.clone();
-        other_state[0] ^= 1;
-        assert_ne!(key(&state, &other_id).unwrap()[..], got[..]);
-        assert_ne!(key(&other_state, &ID).unwrap()[..], got[..]);
-        // The halves differ, so XTS's two keys are not one.
-        assert_ne!(got[..32], got[32..]);
-        assert!(key(&[], &ID).is_none());
+    fn key_is_random_and_64_bytes() {
+        let (a, b) = (new_key(), new_key());
+        assert_eq!(a.len(), 64);
+        assert_ne!(a[..], b[..]);
+        for key in [&a, &b] {
+            assert!(key.iter().any(|&byte| byte != 0));
+            assert_ne!(key[..32], key[32..]);
+        }
     }
 }
