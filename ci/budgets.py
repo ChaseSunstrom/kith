@@ -55,7 +55,9 @@ KITHD_IDLE_RSS = 9 * MB
 # 3.61, not 3.60 (T-0900): the same tree built in another folder differs by one 4 KB page
 # (.text +768 B, .data.rel.ro +552 B on 1c33a26d: 3,773,816 B in the merge gate's folder,
 # 3,777,912 B in the checkout), so a budget set at the gate's size failed every finish on main.
-SIZE_BUDGETS = {"kith": 3 * MB, "kith-remote": int(3.61 * MB), "kithd": int(KITHD_SIZE * MB)}
+# 3.62 (T-0941): kith peer add (T-0764) made it 3,782,008 B in the gate's folder and 3,786,104 B
+# in the checkout, 745 B over 3.61, so every budgets run on main failed again.
+SIZE_BUDGETS = {"kith": 3 * MB, "kith-remote": int(3.62 * MB), "kithd": int(KITHD_SIZE * MB)}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
