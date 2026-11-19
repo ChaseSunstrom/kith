@@ -835,9 +835,9 @@ impl Shared {
                 let resources = self.admitted(resources).await?;
                 Command::Apply { resources, at }
             }
-            Command::Rollback { key, to, at, base } => {
+            Command::Rollback { key, to, at } => {
                 self.restorable(&key, to).await?;
-                Command::Rollback { key, to, at, base }
+                Command::Rollback { key, to, at }
             }
             other => other,
         };
@@ -1737,7 +1737,6 @@ mod tests {
             key: "Node/bound-c".into(),
             to: 1,
             at: 0,
-            base: None,
         };
         let said = to_w
             .post(&url)
@@ -2528,7 +2527,6 @@ mod tests {
                 key: key.into(),
                 to: 1,
                 at,
-                base: None,
             });
         }
         for (n, command) in tried.into_iter().enumerate() {
@@ -2859,8 +2857,7 @@ mod tests {
         assert!(changes_access(&Command::Rollback {
             key: "role/x".into(),
             to: 1,
-            at,
-            base: None,
+            at
         }));
         assert!(changes_access(&Command::Import {
             store: Default::default()
@@ -2914,7 +2911,6 @@ mod tests {
             key: key.into(),
             to: 1,
             at: kith_api::store::now(),
-            base: None,
         };
         let refused = crate::api::refused;
         // Apply on a Share or a Backup is not enough: what it reaches into is asked too.

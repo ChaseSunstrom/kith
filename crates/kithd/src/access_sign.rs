@@ -289,12 +289,7 @@ fn derived(store: &Store, signer: &Caller, method: &str, path: &str, body: &[u8]
                 .iter()
                 .any(|kind| key.starts_with(kind))
             {
-                return Ok(Command::Rollback {
-                    key,
-                    to,
-                    at: 0,
-                    base: None,
-                });
+                return Ok(Command::Rollback { key, to, at: 0 });
             }
             let history = store.history(&key).map_err(|e| e.to_string())?;
             let was = history.iter().find(|was| was.resource.metadata.revision == Some(to));
@@ -1253,7 +1248,6 @@ mod tests {
                 key: "Cluster/home".into(),
                 to: 99,
                 at: 0,
-                base: None,
             },
         ];
         for change in &changes {
@@ -1527,7 +1521,6 @@ mod tests {
             key: "Identity/x".into(),
             to: 1,
             at: 7,
-            base: None,
         });
         writes.push(Command::Import {
             store: Store::default(),
