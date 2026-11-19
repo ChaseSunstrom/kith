@@ -245,7 +245,7 @@ longer true. Options:
   needs it, not by this record.
 
 **Slice T-0956 measures**, before and after, and puts both in its commit; a budget raise without
-the number is refused in review. It is not slice T-0954: that slice's code is called by nothing,
+the number is refused in review. It is not slice T-0954 (T-0966, T-0968): that slice's code is called by nothing,
 and a linker may drop it, so what it adds is not what the feature costs.
 
 ## 6. Build slices
@@ -255,7 +255,7 @@ Each is one task and stands alone: it merges and passes its gates without the ne
 | Task | Slice |
 |---|---|
 | T-0953 | **Kernel.** `CONFIG_HIDRAW=y`, `CONFIG_USB_HID=y` in `os/kernel.config`; `CONFIG_UHID` in the test-only `os/features/uhid-test.config`; the check on the **built `.config`** (section 3), with `# CONFIG_UHID is not set` asserted for a shipped build; the image size and the second kernel's build time measured. |
-| T-0954 | **The client.** `crates/kithd/src/fido2.rs`: CTAPHID framing and the CBOR subset, ECDH, `hmac-secret` with the hand-written CBC, behind a trait of the device so tests use a pipe; tested on NIST's CBC vectors, the x-coordinate derivation and bad frames (short, a wrong channel, an oversize length, a keep-alive storm). **No size measure and no budget raise here:** nothing calls the code yet, and the linker may drop it, so a number taken now is not the number the feature costs. |
+| T-0954 (carved: T-0966 the wire half, T-0968 the rest) | **The client.** `crates/kithd/src/fido2.rs`: CTAPHID framing and the CBOR subset (T-0966), then ECDH (T-0968), `hmac-secret` with the hand-written CBC, behind a trait of the device so tests use a pipe; tested on NIST's CBC vectors, the x-coordinate derivation and bad frames (short, a wrong channel, an oversize length, a keep-alive storm). **No size measure and no budget raise here:** nothing calls the code yet, and the linker may drop it, so a number taken now is not the number the feature costs. |
 | T-0955 | **The stand-in, and the client against it.** The `fido2-test` feature with the uhid authenticator and the four release guards of section 2 (`os/build.sh:98-103`, `ci/vm/tests.sh:22`, `ci/musl.sh`'s case table and grep, a loud startup line). Its VM test is **the client against the stand-in through uhid and hidraw, and nothing more**: a `fido2-test` subcommand of the test build that runs `makeCredential` and `getAssertion` with a known salt on the stand-in and prints the `hmac-secret`, which the test compares with what the seed says it must be; a second stand-in with another seed gives another secret, and a touch withheld times out. It needs no record, no console prompt and no verb. |
 | T-0956 | **The record, the verbs and the state opened by touch.** The `fido2:` lines (two), the console's "touch your key" beside its typed lines (judged after the passphrase, with the same two seconds before an answer, `crypt.rs:726-757`, so a wrong key is answered as every wrong line), `kith node key add` and `remove` with the order of writes above, the audit log; the VM test of enrolling two keys and **opening the state by touching one of two stand-ins** (the other opens it too, a key it was not enrolled with is refused) and of losing one. **kithd's size is measured here, before and after, with the feature called, and the budget raised with the number if it must be** (section 5). |
 

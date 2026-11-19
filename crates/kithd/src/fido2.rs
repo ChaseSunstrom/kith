@@ -30,8 +30,11 @@ pub mod frame {
 
     /// What a key is read and written through: whole reports. `write` gets exactly
     /// [`REPORT`] bytes (the hidraw device adds its report-id byte); `read` gives one
-    /// report and fails with `TimedOut` when none comes in time, which is the device's
-    /// own wait to bound.
+    /// report and fails with `TimedOut` when none comes in time. **The wall-clock bound of
+    /// a [`recv`] is `MAX_SKIPPED` (1024) times the read timeout**, so the hidraw device
+    /// must set a timeout of its own (a second or less), as nothing here has a clock.
+    /// After any `Err` from this module the device may hold half a message: the caller
+    /// reopens it or drains it before the next exchange.
     pub trait Device {
         fn write(&mut self, report: &[u8; REPORT]) -> io::Result<()>;
         fn read(&mut self) -> io::Result<Vec<u8>>;
@@ -89,17 +92,18 @@ pub mod frame {
     /// Read one message of command `want` on channel `cid`. Reports of other channels and
     /// keep-alives are skipped (bounded); an ERROR, another command, a length over
     /// [`MAX_MESSAGE`], a continuation out of order or a new message in the middle of one
-    /// is refused.
+    /// is refused. A continuation of ours before any message began (the tail of an answer
+    /// to an earlier, abandoned request) is skipped like another channel's report.
+    /// At most `MAX_SKIPPED` reports are skipped, so the wall-clock bound is that times
+    /// the device's read timeout (see [`Device`]); after an `Err` the caller reopens or
+    /// drains the device.
     pub fn recv(dev: &mut dyn Device, cid: u32, want: u8) -> Result<Vec<u8>, String> {
         let mut skipped = 0;
         let (len, mut msg) = loop {
             let r = read_report(dev)?;
-            if r[..4] != cid.to_be_bytes() {
+            if r[..4] != cid.to_be_bytes() || r[4] & 0x80 == 0 {
                 skip(&mut skipped)?;
                 continue;
-            }
-            if r[4] & 0x80 == 0 {
-                return Err("a continuation packet with no message begun".into());
             }
             let len = usize::from(u16::from_be_bytes([r[5], r[6]]));
             match r[4] & 0x7f {
@@ -386,8 +390,47 @@ pub mod frame {
                 recv(&mut pipe, 1, CBOR).is_err(),
                 "an initialization packet is not a continuation"
             );
-            pipe.queued.extend([w[1].clone()]);
-            assert!(recv(&mut pipe, 1, CBOR).unwrap_err().contains("no message begun"));
+        }
+
+        #[test]
+        fn a_stray_continuation_of_ours_is_skipped_and_counted() {
+            let mut mine = Pipe::default();
+            send(&mut mine, 1, CBOR, &[7; 100]).unwrap();
+            let mut pipe = Pipe::default();
+            pipe.queued.push_back(report(1, 3, b"tail of an abandoned answer"));
+            pipe.queued.push_back(mine.written[0].to_vec());
+            pipe.queued.push_back(mine.written[1].to_vec());
+            assert_eq!(recv(&mut pipe, 1, CBOR).unwrap(), vec![7; 100]);
+
+            struct Strays;
+            impl Device for Strays {
+                fn write(&mut self, _: &[u8; REPORT]) -> io::Result<()> {
+                    Ok(())
+                }
+                fn read(&mut self) -> io::Result<Vec<u8>> {
+                    Ok(report(1, 0, &[]))
+                }
+            }
+            assert!(recv(&mut Strays, 1, CBOR).unwrap_err().contains("no answer"));
+        }
+
+        #[test]
+        fn a_hard_coded_two_packet_message_is_what_send_makes() {
+            // 100 bytes 0..100 of CBOR on channel ffffffff: 57 in the first packet, 43 in the second.
+            let data: Vec<u8> = (0..100).collect();
+            let mut first = vec![0xff, 0xff, 0xff, 0xff, 0x90, 0x00, 0x64];
+            first.extend(0..57u8);
+            let mut second = vec![0xff, 0xff, 0xff, 0xff, 0x00];
+            second.extend(57..100u8);
+            second.resize(REPORT, 0);
+            let mut pipe = Pipe::default();
+            send(&mut pipe, BROADCAST, CBOR, &data).unwrap();
+            assert_eq!(
+                pipe.written.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+                [first.clone(), second.clone()]
+            );
+            pipe.queued.extend([first, second]);
+            assert_eq!(recv(&mut pipe, BROADCAST, CBOR).unwrap(), data);
         }
 
         #[test]
@@ -521,8 +564,9 @@ pub mod cbor {
         }
     }
 
-    /// The shortest form, with a map's entries in CTAP2's canonical order (the encoded keys,
-    /// shorter first, then bytewise): a key sorts as the key sends it.
+    /// The shortest form, with a map's entries in CTAP2's canonical order: by the key's
+    /// major type, then its encoded length, then bytewise (so 24 sorts before -1). A
+    /// map with a key twice is a caller's bug (checked in a debug build).
     pub fn encode(v: &Value) -> Vec<u8> {
         let mut out = Vec::new();
         put(&mut out, v);
@@ -548,7 +592,8 @@ pub mod cbor {
             Value::Map(m) => {
                 head(out, 5, m.len() as u64);
                 let mut entries: Vec<(Vec<u8>, &Value)> = m.iter().map(|(k, v)| (encode(k), v)).collect();
-                entries.sort_by(|a, b| (a.0.len(), &a.0).cmp(&(b.0.len(), &b.0)));
+                entries.sort_by(|a, b| (a.0[0] >> 5, a.0.len(), &a.0).cmp(&(b.0[0] >> 5, b.0.len(), &b.0)));
+                debug_assert!(entries.windows(2).all(|w| w[0].0 != w[1].0), "a map with a key twice");
                 for (k, v) in entries {
                     out.extend_from_slice(&k);
                     put(out, v);
@@ -560,7 +605,9 @@ pub mod cbor {
 
     /// One item, and nothing after it. At most [`super::frame::MAX_MESSAGE`] bytes, nesting
     /// at most [`MAX_DEPTH`], no duplicate map key; every length is checked against the
-    /// bytes left before anything is allocated.
+    /// bytes left before anything is allocated. It is lenient where the encoder is not: it
+    /// accepts an integer or length in a longer form than the shortest, and a map in any
+    /// order.
     pub fn decode(bytes: &[u8]) -> Result<Value, String> {
         let (v, rest) = decode_prefix(bytes)?;
         if !rest.is_empty() {
@@ -802,6 +849,22 @@ pub mod cbor {
         }
 
         #[test]
+        fn the_encoder_sorts_by_major_type_before_length() {
+            // 24 encodes in two bytes, -1 in one: the major type decides, as CTAP2 says
+            let v = map(vec![(Value::int(-1), u(0)), (u(24), u(0)), (u(1), u(0))]);
+            assert_eq!(encode(&v), [0xa3, 0x01, 0x00, 0x18, 24, 0x00, 0x20, 0x00]);
+        }
+
+        #[test]
+        fn decode_accepts_a_longer_form_and_any_order() {
+            assert_eq!(decode(&[0x18, 0x01]).unwrap(), u(1));
+            let Map(m) = decode(&[0xa2, 0x03, 0x00, 0x01, 0x00]).unwrap() else {
+                panic!()
+            };
+            assert_eq!(m[0].0, u(3));
+        }
+
+        #[test]
         fn get_finds_a_key_and_only_in_a_map() {
             let v = get_info();
             assert_eq!(v.get(&u(6)), Some(&Array(vec![u(1)])));
@@ -845,7 +908,7 @@ pub mod cbor {
         }
 
         #[test]
-        fn a_length_larger_than_the_bytes_left_is_refused_without_allocating_it() {
+        fn a_length_larger_than_the_bytes_left_is_refused() {
             for bytes in [
                 &[0x5a, 0xff, 0xff, 0xff, 0xff, 1][..],                        // 4 GB of bytes
                 &[0x7b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],       // text of 2^64-1
