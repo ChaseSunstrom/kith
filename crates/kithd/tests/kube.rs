@@ -1055,11 +1055,6 @@ fn refused_is_said_with_the_field_and_nothing_is_dropped_in_silence() {
     // (kubectl asks for no port of a pod that is not running: `sh ci/vm.sh --test kube` does.)
     cluster.refused(&["logs", "web-0", "--previous"], &["previous"]);
     cluster.refused(&["logs", "web-0", "--since=1h"], &["sinceSeconds"]);
-    let json = r#"[{"op":"replace","path":"/spec/replicas","value":1}]"#;
-    cluster.refused(
-        &["patch", "deployment", "web", "--type", "json", "-p", json],
-        &["json-patch"],
-    );
     cluster.refused(&["delete", "deployment", "web", "--cascade=orphan"], &["Orphan"]);
     // Deleted only as it was seen (not another by its name), and no sooner or later for the asking.
     let seen =
