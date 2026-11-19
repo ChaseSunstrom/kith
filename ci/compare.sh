@@ -433,8 +433,12 @@ k3s() { # the wait for a lost node, or nothing
         shift
         on "$to" "doas sh -c 'setsid nohup k3s $* >/var/log/k3s.log 2>&1 </dev/null &'" || fail "k3s was not started on machine $to"
     }
+    # (A stress row that asks for more pods than k3s's 110 a node: the same kubelet limit on every
+    # node, and a pod range of /22 from the server, so that each node's pods have addresses.)
+    raised='' cidr=''
+    [ "${KITH_COMPARE_MAX_PODS:-110}" -le 110 ] || { raised="--kubelet-arg=max-pods=$KITH_COMPARE_MAX_PODS"; cidr=--kube-controller-manager-arg=node-cidr-mask-size=22; }
     started=$(date +%s.%N)
-    start 1 server --node-ip 10.9.0.1 --flannel-iface eth1 --token compare --tls-san 127.0.0.1 --write-kubeconfig-mode 644
+    start 1 server --node-ip 10.9.0.1 --flannel-iface eth1 --token compare --tls-san 127.0.0.1 --write-kubeconfig-mode 644 $raised $cidr
     tries=0
     until on 1 'cat /etc/rancher/k3s/k3s.yaml' >"$work/kubeconfig" 2>/dev/null && [ -s "$work/kubeconfig" ]; do
         tries=$((tries + 1))
@@ -452,7 +456,7 @@ EOF
     is_ready='any(c["type"] == "Ready" and c["status"] == "True" for c in (x["status"].get("conditions") or []))'
     API_EVERY=0.1 api wait 900 /api/v1/nodes "any($is_ready for x in j[\"items\"])" >/dev/null || fail "the k3s server's node did not become ready"
     ready=$(echo "$login $(since "$started")" | awk '{ printf "%.1f", $1 + $2 }')
-    for n in 2 3; do start "$n" agent --server https://10.9.0.1:6443 --token compare --node-ip "10.9.0.$n" --flannel-iface eth1; done
+    for n in 2 3; do start "$n" agent --server https://10.9.0.1:6443 --token compare --node-ip "10.9.0.$n" --flannel-iface eth1 $raised; done
     API_EVERY=1 api wait 900 /api/v1/nodes "sum(1 for x in j[\"items\"] if $is_ready) == 3" >/dev/null || fail "three k3s nodes did not become ready"
     # (What k3s starts by itself: its DNS, its ingress and load balancer, its metrics and storage.)
     API_EVERY=1 api wait 900 /api/v1/namespaces/kube-system/pods \
@@ -499,6 +503,13 @@ print(next(x["metadata"]["name"] for x in json.load(open(sys.argv[1]))["items"] 
     done
     applied=$(middle <"$work/applies")
     more=$(workloads k3s "${1:-}")
+    # (A change tried out, some workloads alone, or the stress adapter's row: as kith's, no node is
+    # lost for it, and the row is for no table. k3s has no restart here: its row says so with `-`.)
+    if [ -n "${KITH_COMPARE_ONLY:-}" ]; then
+        echo "k3s tried $more" >>"$raw"
+        note "k3s: $(tail -n 1 "$raw")"
+        return 0
+    fi
     # (What is in use on the disk, less the archive of k3s's images that was copied in.)
     disk=$(on 1 "df -m / | awk 'END { print \$3 }'; doas du -sm /var/lib/rancher/k3s/agent/images | cut -f 1" | tr '\n' ' ' | awk '{ print $1 - $2 }')
 

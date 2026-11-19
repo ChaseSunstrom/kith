@@ -228,3 +228,25 @@ Where the two differ in what they do, the numbers are not of the same thing:
 - k3s is the whole Kubernetes API.
 
 How each row is measured, and what the tables do not say: [How the numbers beside k3s were taken](docs/guide/numbers.md#how-the-numbers-beside-k3s-were-taken).
+
+## Under load
+
+`sh ci/stress.sh` puts containers on the same three machines (or one of them, `--nodes 1`), a size at a time, first as kith OS and then, with `--system k3s`, as k3s. It stops at the first size that fails. Each machine has 2048 MB and 2 CPUs, as above. The table is [ci/stress.txt](ci/stress.txt), row for row; a test holds it to that file.
+
+| containers | nodes | system | max pods a node | ready (s) | memory each (MB) | Services (s) | answers | store | back (s) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100 | 3 | kith | - | 0.55 | 0.50 | 4.08 | yes | ok | 0.01 |
+| 100 | 1 | kith | - | limit | - | - | - | - | - |
+| 100 | 3 | kith | - | 1.07 | 0.57 | 5.13 | yes | ok | 0.03 |
+| 300 | 3 | kith | - | 2.51 | 0.57 | 5.13 | yes | ok | 0.23 |
+| 1000 | 3 | kith | - | 7.88 | 0.61 | 8.57 | yes | ok | 0.04 |
+| 100 | 3 | k3s | 110 | 7.10 | 12.76 | 6.14 | yes | - | - |
+| 100 | 1 | k3s | 110 | limit | - | - | - | - | - |
+| 300 | 3 | k3s | 210 | limit | - | - | - | - | - |
+| 1000 | 3 | k3s | 444 | limit | - | - | - | - | - |
+
+- `limit` in the ready column: that size did not finish. Its row in ci/stress.txt says where it stopped and what the nodes said of themselves; the cells after it are `-`.
+- A k3s row's last column is the most pods a node was let run: 110 (k3s's default) up to 100 containers, and above that the containers' share per node plus 110, with kubelet's max-pods raised and a /22 pod range on the server.
+- k3s has no restart in this run, so its `store` and `back (s)` are `-`.
+- kith stopped at 100 containers on one node, at Services readiness: 0 of 10 Services had their backends after 121 s.
+- k3s stopped at 100 on one node and at 300 on three with "the workloads did not all run on k3s". The row keeps the console lines, not the adapter's error, so the cause is not recorded. At 1000 on three nodes, the API stopped answering after 171 s.

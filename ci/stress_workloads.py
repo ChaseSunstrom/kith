@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""What ci/stress.sh asks of kith, run in place of ci/compare_workloads.py inside ci/compare.sh.
+"""What ci/stress.sh asks of kith, or of k3s, run in place of ci/compare_workloads.py inside ci/compare.sh.
 
-    stress_workloads.py kith          load: STRESS_SIZE replicas, churn, Services; prints JSON
-    stress_workloads.py stop JSON     the first node is stopped as its power button stops it
-    stress_workloads.py after JSON    the first node is back: is the store as it was
+    stress_workloads.py kith|k3s      load: STRESS_SIZE replicas, churn, Services; prints JSON
+    stress_workloads.py stop JSON     the first node is stopped as its power button stops it (kith)
+    stress_workloads.py after JSON    the first node is back: is the store as it was (kith)
     stress_workloads.py header|row    the lines of ci/stress.txt (a row is read from stdin)
 
 STRESS_NODES=1 puts every replica on the first node (ci/compare.sh labels it role=first); the
 other two machines are up and empty. A wait that makes no progress for two minutes, or takes
 longer than a cap that grows with the size, is the size's limit: what it was waiting for, and
-what the nodes say of themselves (a reader on every node: free memory, tasks, open files,
+what the nodes say of themselves (a reader on every node: free memory, tasks, open files and
 cgroups; kithd's last lines from the console), so that a full machine is not taken for a
 limit of kith's. Everything it makes is kept for the restart; the machines go with the script.
+k3s has no restart here: its row has `-` for kithd_mb, store and back_s. A k3s row ends in
+`k3s max_pods=N`, the pods a node was let run (KITH_COMPARE_MAX_PODS; 110 as k3s comes).
 """
 
 import json
@@ -21,7 +23,7 @@ import socket
 import sys
 import time
 
-from compare_workloads import BUSYBOX, NGINX, SERVE, Kith, reading
+from compare_workloads import BUSYBOX, NGINX, SERVE, Kith, Kube, reading
 
 SIZE = int(os.environ.get("STRESS_SIZE", "100"))
 NODES = int(os.environ.get("STRESS_NODES", "3"))
@@ -39,6 +41,95 @@ class Limit(Exception):
     pass
 
 
+class KithStress(Kith):
+    """The calls the stress adapter makes, as kith answers them."""
+
+    def reader(self, name, command):
+        self.apply([self.unit("NodeWorkload", name, BUSYBOX, command)])
+
+    def readers_ready(self, name):
+        return self.status("NodeWorkload", name).get("ready") or 0
+
+    def reader_said(self, node, name):
+        """What the reader `name` on the node last printed (a line or two), or ""."""
+        nodes = self.status("NodeWorkload", name).get("nodes") or {}
+        replica = next((k if v == node else v for k, v in nodes.items() if node in (k, v)), None)
+        log = self.get(f"/v1/logs/NodeWorkload/default/{name}?replica={replica}&tail=1") if replica else None
+        return (log or {}).get("data") or ""
+
+    def inventory(self):
+        found = self.get("/v1/resources") or []
+        return found if isinstance(found, list) else found.get("resources", found.get("items", []))
+
+    def placed(self, name):
+        """The node each replica of a Workload runs on."""
+        return list((self.status("Workload", name).get("nodes") or {}).values())
+
+    def probe(self):
+        return self.call("GET", "/v1/resources/Node/n1")
+
+    def replica_log(self, name):
+        log = self.get(f"/v1/logs/Workload/default/{name}?replica=0&tail=3")
+        return (log or {}).get("data") or ""
+
+
+class KubeStress(Kube):
+    """The same calls, as k3s is asked: a DaemonSet for the readers, Deployments, the pods' nodes."""
+
+    paths = {**Kube.paths, "DaemonSet": "/apis/apps/v1"}
+
+    def reader(self, name, command):
+        spec = {
+            "selector": {"matchLabels": {"app": name}},
+            "template": {
+                "metadata": {"labels": {"app": name}},
+                "spec": {
+                    "terminationGracePeriodSeconds": 0,
+                    "tolerations": [{"operator": "Exists"}],
+                    "containers": [{"name": name, "image": BUSYBOX, "command": command}],
+                },
+            },
+        }
+        self.apply([{"apiVersion": "apps/v1", "kind": "DaemonSet", "metadata": {"name": name}, "spec": spec}])
+
+    def readers_ready(self, name):
+        return self.status("DaemonSet", name).get("numberReady") or 0
+
+    def reader_said(self, node, name):
+        pod = next((p for p in self.pods(name) if p["spec"].get("nodeName") == node), None)
+        if pod is None:
+            return ""
+        status, body = self.call("GET", f"/api/v1/namespaces/default/pods/{pod['metadata']['name']}/log?tailLines=1")
+        return body.decode(errors="replace") if status == 200 else ""
+
+    def inventory(self):
+        """What kith's API lists, from k3s's: each Deployment as a Workload (its ready replicas),
+        each Service with its backends, each Node with its state."""
+        ends = (self.get("/api/v1/namespaces/default/endpoints") or {}).get("items") or []
+        backends = {e["metadata"]["name"]: sum(len(s.get("addresses") or []) for s in e.get("subsets") or []) for e in ends}
+        found = []
+        for d in (self.get(self.path("Deployment")) or {}).get("items") or []:
+            ready = (d.get("status") or {}).get("readyReplicas") or 0
+            found.append({"kind": "Workload", "metadata": d["metadata"], "status": {"ready": ready}})
+        for s in (self.get(self.path("Service")) or {}).get("items") or []:
+            found.append({"kind": "Service", "metadata": s["metadata"], "status": {"backends": backends.get(s["metadata"]["name"], 0)}})
+        for n in (self.get("/api/v1/nodes") or {}).get("items") or []:
+            ready = any(c["type"] == "Ready" and c["status"] == "True" for c in (n.get("status") or {}).get("conditions") or [])
+            found.append({"kind": "Node", "metadata": n["metadata"], "status": {"state": "ready" if ready else "not ready"}})
+        return found
+
+    def placed(self, name):
+        return [p["spec"]["nodeName"] for p in self.pods(name) if p["spec"].get("nodeName")]
+
+    def probe(self):
+        return self.call("GET", "/api/v1/nodes/k1")
+
+    def replica_log(self, name):
+        pods = self.pods(name)
+        status, body = self.call("GET", f"/api/v1/namespaces/default/pods/{pods[0]['metadata']['name']}/log?tailLines=3") if pods else (0, b"")
+        return body.decode(errors="replace") if status == 200 else ""
+
+
 def wait(what, count, target, stall=120, every=0.25):
     """Seconds until count() reaches target; a Limit when it stops rising for `stall` s or takes too long."""
     begun = moved = time.monotonic()
@@ -52,11 +143,6 @@ def wait(what, count, target, stall=120, every=0.25):
         if now - moved > stall or now - begun > cap:
             raise Limit(f"{what}: {have} of {target} after {now - begun:.0f} s")
         time.sleep(every)
-
-
-def listed(api):
-    found = api.get("/v1/resources") or []
-    return found if isinstance(found, list) else found.get("resources", found.get("items", []))
 
 
 def workload(api, name, replicas, **more):
@@ -81,10 +167,7 @@ def used(api):
 
 def say(api, node):
     """What the node's own reader (`limits`) last said, as words, or what is wrong."""
-    nodes = api.status("NodeWorkload", "limits").get("nodes") or {}
-    replica = next((k if v == node else v for k, v in nodes.items() if node in (k, v)), None)
-    log = api.get(f"/v1/logs/NodeWorkload/default/limits?replica={replica}&tail=1") if replica else None
-    found = re.search(r"MemAvailable:\s+(\d+) kB (\d+)/(\d+) (\d+) (\d+)", (log or {}).get("data") or "")
+    found = re.search(r"MemAvailable:\s+(\d+) kB (\d+)/(\d+) (\d+) (\d+)", api.reader_said(node, "limits"))
     if not found:
         return f"{node}: no answer"
     free, running, tasks, files, cgroups = map(int, found.groups())
@@ -106,15 +189,15 @@ def console(n, lines):
 
 def look(api):
     """What the nodes say of themselves, now."""
-    code, why = api.call("GET", "/v1/resources/Node/n1")
+    code, why = api.probe()
     said = [f"api: {code if code else why.decode(errors='replace')[:80]}"] + [say(api, node) for node in api.nodes]
     ooms = sum(len(re.findall(r"Out of memory|oom-kill|Killed process", " ".join(console(n, 400)))) for n in (1, 2, 3))
     return " | ".join(said + [f"oom_kills={ooms}", "kithd: " + " / ".join(console(1, 3))])
 
 
 def load(api, out):
-    api.apply([api.unit("NodeWorkload", "limits", BUSYBOX, ["sh", "-c", LIMITS])])
-    wait("the readers", lambda: api.status("NodeWorkload", "limits").get("ready") or 0, 3)
+    api.reader("limits", ["sh", "-c", LIMITS])
+    wait("the readers", lambda: api.readers_ready("limits"), 3)
     for node in api.nodes:  # (compare.sh's reader prints every 10 s: 30 s of it is four lines)
         wait(f"{node}'s reader", lambda: len(api.read(node, 4)), 4)
     mem0, cpu0 = used(api), cpu(api)
@@ -149,26 +232,25 @@ def load(api, out):
     api.apply([d for name in names for d in (workload(api, name, 3, image=NGINX, command=SERVE, port=8080), api.service(name))])
 
     def served():
-        found = listed(api)
-        by = {(r["kind"], r["metadata"]["name"]): r.get("status") or {} for r in found}
+        by = {(r["kind"], r["metadata"]["name"]): r.get("status") or {} for r in api.inventory()}
         return sum(by.get(("Service", n), {}).get("backends") == 3 and by.get(("Workload", n), {}).get("ready") == 3 for n in names)
 
     try:
         wait("the Services to have their three backends", served, count, every=1)
     except Limit as e:  # (say how the first one that was not served stands)
         stuck = next((n for n in names if api.backends(n) != 3 or api.ready(n) != 3), names[0])
-        log = (api.get(f"/v1/logs/Workload/default/{stuck}?replica=0&tail=3") or {}).get("data") or ""
+        log = api.replica_log(stuck)
         raise Limit(f"{e}; {stuck} has {api.ready(stuck)} of 3 replicas ready and {api.backends(stuck)} backends; its first replica says {log.strip()!r}") from None
     out["services"] = count
     out["svc_s"] = f"{time.monotonic() - begun:.2f}"
-    spread = sum(len(set((api.status("Workload", n).get("nodes") or {}).values())) > 1 for n in names)
+    spread = sum(len(set(api.placed(n))) > 1 for n in names)
     out["spread"] = f"{spread}/{count}"
 
     # Still answering, and what the store holds, to be read back after the restart.
     answered = time.monotonic()
-    nodes = [r for r in listed(api) if r["kind"] == "Node" and (r.get("status") or {}).get("state") == "ready"]
+    nodes = [r for r in api.inventory() if r["kind"] == "Node" and (r.get("status") or {}).get("state") == "ready"]
     out["answers"] = f"{'yes' if len(nodes) == 3 and time.monotonic() - answered < 10 else 'no'}"
-    out["stored"] = len([r for r in listed(api) if r["kind"] in KINDS])
+    out["stored"] = len([r for r in api.inventory() if r["kind"] in KINDS])
 
 
 def timed(api, what, documents, count, target, every=0.25):
@@ -210,7 +292,7 @@ def stop(out):
 def after(api, out):
     begun = time.monotonic()
     try:
-        found = [r for r in listed(api) if r["kind"] in KINDS]
+        found = [r for r in api.inventory() if r["kind"] in KINDS]
         many = api.get("/v1/resources/Workload/default/many") or {}
         replicas = ((many.get("spec") or {}).get("replicas"))
         out["store"] = "ok" if len(found) == out["stored"] and replicas == SIZE else f"{len(found)} of {out['stored']} resources, many has {replicas}"
@@ -223,10 +305,12 @@ def after(api, out):
 
 def row(out):
     mem = out.get("mem_mb", MEMORY)
+    # (A k3s row ends in its mark: the pods a node was let run. A kith row has none.)
+    mark = f" k3s max_pods={out['max_pods']}" if out.get("system") == "k3s" else ""
     if "limit" in out:
         done = " ".join(f"{k}={out[k]}" for k in COLUMNS[3:] if k in out)
-        return f"{out['size']} {out['nodes']} {mem} limit {out['limit']} | {out.get('where', 'nodes not read')}" + (f" | measured: {done}" if done else "")
-    return " ".join(str(out.get(k, "-")) for k in COLUMNS)
+        return f"{out['size']} {out['nodes']} {mem} limit {out['limit']} | {out.get('where', 'nodes not read')}" + (f" | measured: {done}" if done else "") + mark
+    return " ".join(str(out.get(k, "-")) for k in COLUMNS) + mark
 
 
 def main():
@@ -239,10 +323,11 @@ def main():
     if what == "row":
         print(row(json.load(sys.stdin)))
         return
-    api = Kith()
-    out.update(size=SIZE, nodes=NODES, mem_mb=MEMORY)
+    system = "k3s" if what == "k3s" else "kith"
+    api = KubeStress() if system == "k3s" else KithStress()
+    out.update(size=SIZE, nodes=NODES, mem_mb=MEMORY, system=system, max_pods=os.environ.get("KITH_COMPARE_MAX_PODS", "110"))
     try:
-        if what == "kith":
+        if what in ("kith", "k3s"):
             load(api, out)
         elif what == "stop":
             stop(out)
