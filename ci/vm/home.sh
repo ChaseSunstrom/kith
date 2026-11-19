@@ -69,6 +69,9 @@ print(any(r["kind"] == "Node" and r["metadata"]["name"] == "n4" and (r.get("spec
                     [ "$waited" -lt 60 ] || fail "the store does not say n4 roams: $(any GET /v1/resources 2>&1 | head -c 600)"
                     sleep 1
                 done
+                # (n4 reaches none of the voters' own addresses while it is reset, as a roaming node off the
+                # LAN does not: ci/lan_bridge.py drops them; it may call only the house address.)
+                : >"$work/cut"
                 reset=$(now)
                 monitor 4 system_reset
                 waited=0
@@ -77,7 +80,8 @@ print(any(r["kind"] == "Node" and r["metadata"]["name"] == "n4" and (r.get("spec
                     [ "$waited" -lt 240 ] || fail "n4 was reset and no WireGuard handshake from $house answered it: (reset at $reset, holder n$had, then n${now_holder:-?}) $(awk -v since="$reset" '$1 > since' "$work/wg" | tail -n 30) $(cat "$work/wg.err") $(grep -aih 'house\|mesh' "$work/n4.log" | tail -n 6)"
                     sleep 1
                 done
-                echo "vm.sh: n4 was reset: its WireGuard handshake to $house was answered from $house ($reply)" >&2
+                rm -f "$work/cut"
+                echo "vm.sh: n4 was reset, cut off from the voters' own addresses: its WireGuard handshake to $house was answered from $house ($reply)" >&2
             }
 
             steady 120 "the cluster did not take up the house address"

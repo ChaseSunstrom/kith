@@ -184,9 +184,11 @@
         # reaches the node's API through it, and tries its NFS port, or port $inside).
         node() { # N [kithd's further arguments]
             [ -f "$work/n$1.raw" ] || { cp "$base/kith-os.raw" "$work/n$1.raw" && seed "$work/n$1.raw"; }
+            lanport=$((port + 8))
+            [ "$test$1" != home4 ] || lanport=$((port + 9)) # (the bridge's other side)
             timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
-                -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
+                -netdev "socket,id=lan,mcast=230.0.0.1:$lanport,localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
                 -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside${https:+,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:443}$guest${net_restrict-,restrict=on}" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $dumps \
                 -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway${nolink:+ KITH_NO_LINK=1} -- --listen ${listen:-0.0.0.0:7443} --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 8>&- &
@@ -259,6 +261,12 @@ EOF
         # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
         # (home: every joined one serves DNS too; node 4 roams (--roaming, as a laptop joins): it is reset, and dials the house endpoint.)
         [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353'; }
+        # (home: node 4 is on a LAN of its own, joined to the others' by a bridge that, while $work/cut
+        # exists, passes nothing from or to the voters' own addresses: the house address stays reachable.)
+        if [ "$test" = home ]; then
+            python3 -I "$root/ci/lan_bridge.py" $((port + 8)) $((port + 9)) "$work/cut" 2>"$work/bridge.err" &
+            vms="$vms $!"
+        fi
         node 1 "--claim ${first:-}"
         net_restrict=$keep
         tries=0
