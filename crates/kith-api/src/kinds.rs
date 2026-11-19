@@ -299,11 +299,20 @@ spec! {
         pub ingress: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub mesh: Option<NodeMesh>,
+        /// What this node does when no leader answers at its start (its own copy of the store
+        /// says so). `wait` (the default) starts nothing until a write comes back. `run` starts
+        /// what its copy places on it after 30 seconds, Jobs excepted, and says the risks on the
+        /// console and in its status (`alone`: since when, until when). A leader that answers
+        /// catches it up as on any store change.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub alone: Option<Alone>,
     }
 
     pub enum NodeRole { Voter, Worker, Edge }
 
     pub enum Trust { Control, Worker }
+
+    pub enum Alone { Run, Wait }
 
     pub struct NodeMesh {
         /// `never`: this node's traffic goes straight to the other node or not at all,

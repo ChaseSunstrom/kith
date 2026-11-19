@@ -34,7 +34,7 @@
             grep -aqF 'kithd: install: kith OS is on vda' "$work/install-delta.log" || fail "the installer in memory did not install on vda"
             grep -aqF 'kithd: init: restarting' "$work/install-delta.log" || fail "the installer in memory did not restart the machine"
             # shellcheck disable=SC2046
-            vm delta $(drive delta.disk) -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + 5))-:7443" -device virtio-net-pci,netdev=out
+            vm delta $(drive delta.disk) -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + 5))-:7443${net_restrict-,restrict=on}" -device virtio-net-pci,netdev=out
             hears delta 'kithd: init: delta is up'
             hears delta 'kithd: node delta serving other nodes on 0.0.0.0:7443'
             print $((port + 5))
