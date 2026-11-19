@@ -781,7 +781,10 @@ fn refuse_access(store: &Store, step: &mut Step) -> bool {
     let Value::Object(status) = failed(&message, None) else {
         unreachable!("an object")
     };
-    let status: Map<String, Value> = status.into_iter().filter(|(field, _)| field != "observedRevision").collect();
+    let status: Map<String, Value> = status
+        .into_iter()
+        .filter(|(field, _)| field != "observedRevision")
+        .collect();
     let live = store.get(&step.release).and_then(|release| release.status.as_ref());
     let said = live.is_some_and(|live| status.iter().all(|(field, value)| &live[field] == value));
     (step.apply, step.delete) = (Vec::new(), Vec::new());

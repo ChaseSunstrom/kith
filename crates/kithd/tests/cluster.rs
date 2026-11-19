@@ -61,11 +61,33 @@ struct Node {
 impl Node {
     /// Start a kithd named `name` with its state under `test`, plus `args`.
     fn start(test: &str, name: &str, args: &[&str]) -> Node {
-        Node::start_in(None, "127.0.0.1", free_port(), test, name, args)
+        // free_port gives the port back before kithd binds it, and these tests run in parallel
+        // (and beside other builds): another node can take it in between ("Address already in
+        // use", kithd exits 1). A port nobody else holds comes from asking again.
+        let mut last = String::new();
+        for _ in 0..4 {
+            match Node::try_start_in(None, "127.0.0.1", free_port(), test, name, args) {
+                Ok(node) => return node,
+                Err(why) => last = why,
+            }
+        }
+        panic!("{last}")
     }
 
     /// The same, listening on `host:port`, in the network namespace `ns` if there is one.
     fn start_in(ns: Option<&str>, host: &str, port: u16, test: &str, name: &str, args: &[&str]) -> Node {
+        Node::try_start_in(ns, host, port, test, name, args).unwrap_or_else(|why| panic!("{why}"))
+    }
+
+    /// `start_in`, giving the reason when kithd exits before it serves.
+    fn try_start_in(
+        ns: Option<&str>,
+        host: &str,
+        port: u16,
+        test: &str,
+        name: &str,
+        args: &[&str],
+    ) -> Result<Node, String> {
         let built = Command::new(env!("CARGO"))
             .args(["build", "--quiet", "-p", "kith-cli"])
             .status()
@@ -81,16 +103,21 @@ impl Node {
             host: host.to_string(),
         };
         // Fail at once if kithd exited (a socket path it could not bind, say), not after the wait.
+        let mut exited = None;
         wait_for("kithd to serve", || {
             if let Some(status) = node.child.try_wait().unwrap() {
-                panic!(
+                exited = Some(format!(
                     "kithd exited ({status}) before serving {}",
                     node.dir.join("kithd.sock").display()
-                );
+                ));
+                return true;
             }
             node.dir.join("kithd.sock").exists()
         });
-        node
+        match exited {
+            Some(why) => Err(why),
+            None => Ok(node),
+        }
     }
 
     fn spawn(dir: &Path, name: &str, port: u16, args: &[&str]) -> Child {

@@ -953,10 +953,14 @@ impl Shared {
                 .and_then(|signed| signed.relay)
                 .is_some_and(|relay| access_sign::certificate_of(&relay.path).is_some());
             let why = match certificate {
-                true => "refused: the certificate route answers only on the CA node while it leads, and is \
-                         not passed on to the leader; ask the CA node once it leads",
-                false => "refused: a signed request's change that is not passed on as it came (the route is \
-                          not one the leader checks the signature of); send it to the leader directly",
+                true => {
+                    "refused: the certificate route answers only on the CA node while it leads, and is \
+                         not passed on to the leader; ask the CA node once it leads"
+                }
+                false => {
+                    "refused: a signed request's change that is not passed on as it came (the route is \
+                          not one the leader checks the signature of); send it to the leader directly"
+                }
             };
             return Forward::Failed(Error::Invalid(why.into()));
         }
