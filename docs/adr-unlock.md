@@ -672,11 +672,14 @@ The changes, in that order:
   start. Written, read back, opened.
 - **Lock, wipe, forgotten:** every seal line goes, as `tpm:` and `passphrase:` do today.
 
-What no order fixes: **the record is one 4 KiB write**, so a power cut in the middle of one
-may leave it unreadable, and the recovery key's wrapped copy is in it. That is so today; this
-task adds a few writes (a seal, an update, a promotion). Whether a 4 KiB aligned write is whole
-after a power cut depends on the disk (unverified). A second copy of the record would close it,
-but a duress code and an older kithd would then have two copies to keep in step ("Open").
+What this record's order of writes does not fix alone: **the record is a 4 KiB write**, and a
+power cut in the middle of one could leave it unreadable, with the recovery key's wrapped copy in it.
+That was so when this was written; **it is closed since T-0596** (`crypt.rs:96-100`,
+`Record::write`, `crypt.rs:464-493`): the write puts a copy at `AT + ROOM` first and syncs it, then
+the record at `AT` and syncs, and reads it back, and the record carries a `sum:` line, so a cut
+leaves one of the two whole. Whether a 4 KiB aligned write is whole after a power cut depends on
+the disk (unverified), which is why there are two. What stays is that a duress code and an older
+kithd must keep both copies in step ("Open").
 
 ## Steps, in order
 
