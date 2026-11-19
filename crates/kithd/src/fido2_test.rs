@@ -45,7 +45,26 @@ pub mod auth {
         Value::text(s)
     }
 
+    /// One way a getAssertion answer can be wrong.
+    #[derive(Clone, Copy, PartialEq)]
+    #[allow(dead_code)] // (only the client's tests pick a fault; the stand-in never does)
+    pub enum Fault {
+        None,
+        /// ED set, but no extension data after the head.
+        NoExtensions,
+        /// ED set, but the extensions hold no `hmac-secret`.
+        NoHmacSecret,
+        /// `hmac-secret` is text, not the sealed bytes.
+        HmacSecretNotBytes,
+        /// authData for another relying party.
+        WrongRp,
+        /// Extension data present, ED flag clear.
+        NoEdFlag,
+    }
+
     pub struct Key {
+        /// What the next getAssertion answer gets wrong.
+        pub fault: Fault,
         pub seed: u8,
         pub pin: bool,
         pub protocols: Vec<u64>,
@@ -88,6 +107,7 @@ pub mod auth {
     impl Key {
         pub fn new() -> Key {
             Key {
+                fault: Fault::None,
                 seed: 1,
                 pin: false,
                 protocols: vec![1],
@@ -234,13 +254,26 @@ pub mod auth {
                     }
                     let salt = cbc::run(&secret, &[0; 16], enc, false).map_err(|_| 0x02u8)?;
                     let sealed = cbc::run(&secret, &[0; 16], &self.expected(&id, &salt), true).map_err(|_| 0x7fu8)?;
-                    let ext = cbor::encode(&Value::Map(vec![(t("hmac-secret"), Value::Bytes(sealed))]));
+                    let hmac_secret = match self.fault {
+                        Fault::HmacSecretNotBytes => t("sealed"),
+                        _ => Value::Bytes(sealed),
+                    };
+                    let ext = match self.fault {
+                        Fault::NoExtensions => vec![],
+                        Fault::NoHmacSecret => cbor::encode(&Value::Map(vec![(t("credProtect"), u(1))])),
+                        _ => cbor::encode(&Value::Map(vec![(t("hmac-secret"), hmac_secret)])),
+                    };
+                    let flags = match self.fault {
+                        Fault::NoEdFlag => 0x01,
+                        _ => 0x81,
+                    };
+                    let rp = if self.fault == Fault::WrongRp { "elsewhere" } else { rp };
                     Ok(Value::Map(vec![
                         (
                             u(1),
                             Value::Map(vec![(t("id"), Value::Bytes(id)), (t("type"), t("public-key"))]),
                         ),
-                        (u(2), Value::Bytes(Self::auth_data(rp, 0x81, &ext))),
+                        (u(2), Value::Bytes(Self::auth_data(rp, flags, &ext))),
                         (u(3), Value::Bytes(vec![0x30; 70])),
                     ]))
                 }

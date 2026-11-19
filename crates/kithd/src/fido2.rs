@@ -5,6 +5,15 @@
 //!
 //! The device is a trait so a test can use a pipe; the hidraw one comes with the client.
 
+/// Hex text to bytes, for the tests' NIST and RFC vectors.
+#[cfg(test)]
+fn hex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
 /// CTAPHID: 64-byte reports, a message split over an initialization packet and up to 128
 /// continuation packets.
 pub mod frame {
@@ -524,6 +533,11 @@ pub mod cbor {
         Bool(bool),
     }
 
+    /// A map key or a small number, as a CBOR unsigned integer.
+    pub fn uint(n: u64) -> Value {
+        Value::Uint(n)
+    }
+
     impl Value {
         pub fn int(n: i64) -> Value {
             if n >= 0 {
@@ -711,9 +725,7 @@ pub mod cbor {
         fn t(s: &str) -> Value {
             Value::text(s)
         }
-        fn u(n: u64) -> Value {
-            Uint(n)
-        }
+        use super::uint as u;
 
         /// Encodes and decodes to the same value, and every proper prefix is refused.
         fn round_trip(v: &Value) -> Vec<u8> {
@@ -958,6 +970,7 @@ pub mod cbor {
 /// what `hmac-secret` encrypts its salts and its answer with (docs/adr-fido2.md section 1).
 pub mod cbc {
     use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+    use zeroize::{Zeroize, Zeroizing};
 
     pub const BLOCK: usize = 16;
 
@@ -972,10 +985,11 @@ pub mod cbc {
             ));
         }
         let aes = aes::Aes256::new(key.into());
-        let mut chain = *iv;
+        // the running block holds plaintext when decrypting, and the chain value too
+        let mut chain = Zeroizing::new(*iv);
+        let mut b = aes::Block::default();
         let mut out = Vec::with_capacity(data.len());
         for block in data.as_chunks::<BLOCK>().0 {
-            let mut b = aes::Block::default();
             if encrypting {
                 for (i, byte) in b.iter_mut().enumerate() {
                     *byte = block[i] ^ chain[i];
@@ -986,26 +1000,21 @@ pub mod cbc {
             } else {
                 b.copy_from_slice(block);
                 aes.decrypt_block(&mut b);
-                for (byte, c) in b.iter_mut().zip(chain) {
+                for (byte, c) in b.iter_mut().zip(chain.iter()) {
                     *byte ^= c;
                 }
                 chain.copy_from_slice(block);
                 out.extend_from_slice(&b);
             }
         }
+        b[..].zeroize();
         Ok(out)
     }
 
     #[cfg(test)]
     mod tests {
+        use super::super::hex;
         use super::*;
-
-        fn hex(s: &str) -> Vec<u8> {
-            (0..s.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-                .collect()
-        }
 
         fn both(key: &str, iv: &str, plain: &str, cipher: &str) {
             let (key, iv): ([u8; 32], [u8; 16]) = (hex(key).try_into().unwrap(), hex(iv).try_into().unwrap());
@@ -1095,7 +1104,10 @@ pub mod cbc {
 /// key is untrusted bytes: it is checked before ring sees it, and ring checks the point.
 /// Protocol 2 (a 64-byte secret, a random IV) is not here: the ADR requires it before a release.
 pub mod hmac {
-    use super::{cbc, cbor::Value};
+    use super::{
+        cbc,
+        cbor::{Value, uint},
+    };
     use ring::{agreement, digest, hmac as ring_hmac, rand};
     use zeroize::Zeroizing;
 
@@ -1115,10 +1127,6 @@ pub mod hmac {
         let mut out = [0u8; 16];
         out.copy_from_slice(&tag.as_ref()[..16]);
         out
-    }
-
-    fn uint(n: u64) -> Value {
-        Value::Uint(n)
     }
 
     /// A COSE_Key for an ECDH P-256 public key (kty 2, alg -25, crv 1).
@@ -1212,14 +1220,8 @@ pub mod hmac {
 
     #[cfg(test)]
     mod tests {
+        use super::super::hex;
         use super::*;
-
-        fn hex(s: &str) -> Vec<u8> {
-            (0..s.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-                .collect()
-        }
 
         /// The P-256 generator, a point that is on the curve.
         const GX: &str = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
@@ -1278,6 +1280,11 @@ pub mod hmac {
             assert_eq!(s.secret[..], key_secret(&s.key)[..]);
         }
 
+        /// Limit: the request and the reply are checked against this module's own reading of
+        /// CTAP2.1 (and the cipher, derive and HMAC against NIST and RFC vectors), so a
+        /// misreading shared by both sides would pass. A trial with a real key is the
+        /// independent check. No slice of docs/adr-fido2.md section 6 runs one (T-0955's
+        /// stand-in is ours too), so it stays a trial to make by hand before release.
         #[test]
         fn the_request_carries_our_key_the_encrypted_salt_and_its_authentication() {
             let (gx, gy) = (hex(GX), hex(GY));
@@ -1349,7 +1356,7 @@ pub mod hmac {
 /// The assertion's signature is not checked: a key that lies gives a wrong secret, and
 /// the state's key does not unwrap under it.
 pub mod flow {
-    use super::cbor::{self, Value};
+    use super::cbor::{self, Value, uint};
     use super::frame::{self, Device};
     use super::hmac::{self, Session};
     use ring::{digest, rand::SecureRandom, rand::SystemRandom};
@@ -1367,10 +1374,6 @@ pub mod flow {
     const MAX_CREDENTIAL_ID: usize = 1023;
     /// rpIdHash, flags, signature counter.
     const AUTH_DATA_HEAD: usize = 37;
-
-    fn uint(n: u64) -> Value {
-        Value::Uint(n)
-    }
 
     fn call(dev: &mut dyn Device, cid: u32, cmd: u8, params: Option<&Value>) -> Result<Value, String> {
         let mut request = vec![cmd];
@@ -1460,6 +1463,9 @@ pub mod flow {
         rp_id: &str,
         exclude: &[Vec<u8>],
     ) -> Result<Vec<u8>, String> {
+        if let Some(bad) = exclude.iter().find(|id| id.is_empty() || id.len() > MAX_CREDENTIAL_ID) {
+            return Err(format!("an excluded credential id of {} bytes", bad.len()));
+        }
         check_key(dev, cid)?;
         let mut request = vec![
             (uint(1), Value::Bytes(random_32()?.to_vec())),
@@ -1524,7 +1530,7 @@ pub mod flow {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::fido2_test::auth::Key;
+        use crate::fido2_test::auth::{Fault, Key};
 
         const RP: &str = "kith.local";
 
@@ -1637,6 +1643,42 @@ pub mod flow {
                 assert!(get_assertion(&mut key, cid, RP, &vec![1; len], &[0; 32]).is_err());
             }
             assert!(key.seen.is_empty());
+        }
+
+        #[test]
+        fn an_excluded_id_out_of_bounds_is_refused_before_the_key_is_asked() {
+            let mut key = Key::new();
+            let cid = open(&mut key);
+            for len in [0, MAX_CREDENTIAL_ID + 1] {
+                let e = make_credential(&mut key, cid, RP, &[vec![1; 40], vec![1; len]]).unwrap_err();
+                assert!(e.contains("excluded credential id"), "{e}");
+            }
+            assert!(key.seen.is_empty());
+            // the largest id is still sent
+            assert!(make_credential(&mut key, cid, RP, &[vec![1; MAX_CREDENTIAL_ID]]).is_ok());
+        }
+
+        #[test]
+        fn a_wrong_assertion_answer_is_refused_whichever_part_is_wrong() {
+            for (fault, says) in [
+                (Fault::NoExtensions, ""),
+                (Fault::NoHmacSecret, "no hmac-secret"),
+                (Fault::HmacSecretNotBytes, "no hmac-secret"),
+                (Fault::WrongRp, "another relying party"),
+                (Fault::NoEdFlag, "lack"),
+            ] {
+                let mut key = Key::new();
+                let cid = open(&mut key);
+                let id = make_credential(&mut key, cid, RP, &[]).unwrap();
+                key.fault = fault;
+                let e = get_assertion(&mut key, cid, RP, &id, &[7; 32]).unwrap_err();
+                assert!(e.contains(says), "{e}");
+            }
+            // and with no fault the same key answers
+            let mut key = Key::new();
+            let cid = open(&mut key);
+            let id = make_credential(&mut key, cid, RP, &[]).unwrap();
+            assert!(get_assertion(&mut key, cid, RP, &id, &[7; 32]).is_ok());
         }
 
         fn attested(rp: &str, flags: u8, tail: &[u8]) -> Value {
