@@ -77,6 +77,11 @@ const IN_LOCKOUT: u32 = 0x921;
 /// What a wrong authorization not counted against guesses is refused with (the first
 /// session's).
 const BAD_AUTH: u32 = 0x9a2;
+/// What an unseal is refused with when the PCRs are not what the seal's policy asks (the
+/// TPM's policy-check failure, and nothing else): the only refusal that says the seal is of
+/// another system, as against a TPM that is busy, a device that failed, or an answer that
+/// could not be read. Callers compare an error with it to tell the two apart.
+pub const NOT_THIS_SYSTEM: &str = "the TPM does not give the key: this is not the system it was sealed for";
 pub const NOT_THE_PIN: &str =
     "the TPM refuses that PIN: it is not the one this node's key was sealed with (each wrong one is counted)";
 pub const LOCKED_OUT: &str = "the TPM refuses every PIN for now: too many wrong ones were tried";
@@ -298,7 +303,7 @@ impl<T: Read + Write> Tpm<T> {
             // (Asked with a session, a TPM that gives what was asked answers with it.)
             0 if tag == SESSIONS && reply[0..2] != SESSIONS.to_be_bytes() => Err(UNSESSIONED.into()),
             0 => Ok(reply[10..whole].to_vec()),
-            POLICY_FAILED => Err("the TPM does not give the key: this is not the system it was sealed for".into()),
+            POLICY_FAILED => Err(NOT_THIS_SYSTEM.into()),
             AUTH_FAIL => Err(NOT_THE_PIN.into()),
             IN_LOCKOUT => Err(LOCKED_OUT.into()),
             refused => Err(format!("the TPM refuses (its code {refused:#x})")),
@@ -1037,6 +1042,12 @@ pub(crate) mod tests {
         assert_eq!(tpm.unseal(&ahead, name).as_ref(), Ok(&key));
         let refused = tpm.unseal(&old, name).unwrap_err();
         assert!(refused.contains("not the system it was sealed for"), "{refused}");
+        // that refusal (the PCRs are not the seal's) is told from every other failure: a
+        // seal that is cut, a storage key that is not the one it was sealed under
+        assert_eq!(refused, NOT_THIS_SYSTEM);
+        let cut = tpm.unseal(&old[..old.len() / 2], name).unwrap_err();
+        let moved = tpm.unseal(&old, Some(&[7; 34])).unwrap_err();
+        assert!(cut != NOT_THIS_SYSTEM && moved != NOT_THIS_SYSTEM, "{cut} / {moved}");
         // an empty PCR is refused whether read or given
         let empty = tpm.seal_over(&key, name, &[(4, [0; 32])]).unwrap_err();
         assert!(empty.contains("holds nothing"), "{empty}");

@@ -1277,21 +1277,23 @@ fn ahead_sealed<T: std::io::Read + std::io::Write>(
         opened.to_vec()
     });
     // A seal ahead that opens here is this system's, not promoted yet: it stays. One that does
-    // not is for a system that did not come up (the node fell back to this one): the new
-    // signed update's takes its place. (`tpm:` is untouched either way.)
+    // not, because the TPM's PCR policy refuses it, is for a system that did not come up (the
+    // node fell back to this one): the new signed update's takes its place. Any other failure
+    // (a device error, a busy TPM, a seal that is not TPM-shaped) cannot tell whether the seal
+    // still opens: it stays, and the seal ahead waits for the next update or wake. (`tpm:` is
+    // untouched either way.)
     let waiting = if record.pin.is_some() {
         &record.pin_next
     } else {
         &record.next
     };
-    let opens = |tpm: &mut crate::tpm::Tpm<T>, seal: &Vec<u8>| {
-        !seal.is_empty()
-            && tpm
-                .unseal(seal, Some(parent))
-                .is_ok_and(|key| zeroize::Zeroizing::new(key)[..] == now[..])
-    };
-    if waiting.as_ref().is_some_and(|seal| opens(tpm, seal)) {
-        return Err(AHEAD_NOT_NOW.into());
+    if let Some(seal) = waiting.as_ref().filter(|seal| !seal.is_empty()) {
+        match tpm.unseal(seal, Some(parent)).map(zeroize::Zeroizing::new) {
+            Ok(key) if key[..] == now[..] => return Err(AHEAD_NOT_NOW.into()),
+            Ok(_) => {}
+            Err(why) if why == crate::tpm::NOT_THIS_SYSTEM => {}
+            Err(why) => return Err(format!("{AHEAD_NOT_NOW} (the seal that waits was not tried: {why})")),
+        }
     }
     let with = match (&record.pin, &record.tpm) {
         (Some(_), _) => {
@@ -2651,6 +2653,20 @@ mod tests {
         );
         assert_eq!(Record::read(&path), Ok(Some(again.clone())));
         assert_eq!(unsealed(&mut tpm, &again), Ok((key.clone(), false)));
+
+        // A seal waiting that the TPM could not be asked about (here one that is cut, so no
+        // refusal of the PCRs' but another failure) may be this system's: it stays, none is
+        // made now, and nothing is written.
+        let unknown = Record {
+            next: with.next.as_ref().map(|next| next[..next.len() / 2].to_vec()),
+            ..again.clone()
+        };
+        let refused = ahead_sealed(&mut tpm, &unknown, &key, &path, &other).unwrap_err();
+        assert!(
+            refused.starts_with(AHEAD_NOT_NOW) && refused.contains("not tried"),
+            "{refused}"
+        );
+        assert_eq!(Record::read(&path), Ok(Some(again.clone())));
 
         // The next system starts (the PCRs move to what was predicted): the seal ahead opens
         // and the old one no longer does.
