@@ -2158,6 +2158,73 @@ pub(crate) mod pinned_peer {
         assert_eq!((status, asked_now()), (403, 16));
     }
 
+    /// The forge route (a leader that appends what it was not asked for, forge.rs) is in a build
+    /// with the cargo feature `forge` and in no other: a release has no `/v1/forge`, for an
+    /// Identity or a node, and says no more of it than of any path it has not.
+    #[tokio::test]
+    async fn forge_is_in_no_release_build() {
+        let forge = cfg!(feature = "forge");
+        assert_eq!(crate::access::for_identities("/v1/forge"), forge);
+        let ca = pki::Ca::create().unwrap();
+        let alpha = node(&ca, "alpha");
+        let shared = shared_with("forge-route", alpha.clone(), &[at("alpha", "127.0.0.1:1", None)]).await;
+        let address = serving(shared, &alpha).await;
+        let (status, said) = call_as(&alpha, |client| {
+            client.post(format!("https://{address}/v1/forge")).json(&"Mark")
+        })
+        .await;
+        // (Not found, as any path it has not; with the feature, the route is there: a node's
+        // call does not pass for the admin's.)
+        assert_eq!(status == 404, !forge, "{status} {said}");
+        let (status, said) = call_as(&alpha, |client| client.post(format!("https://{address}/v1/nope")).json(&"Mark")).await;
+        assert_eq!(status, 404, "{said}");
+    }
+
+    /// With the feature, the forge route appends what it is given to the log as the leader's own
+    /// write, and says whether applying it here took: a Signed entry no node can check is not.
+    #[cfg(feature = "forge")]
+    #[tokio::test]
+    async fn forge_appends_and_says_what_applying_it_came_to() {
+        use axum::extract::State;
+        let ca = pki::Ca::create().unwrap();
+        let alpha = node(&ca, "alpha");
+        let shared = shared_with("forge-append", alpha.clone(), &[]).await;
+        let id = kith_store::node_id;
+        let alone = kith_store::openraft::BasicNode::new("127.0.0.1:1");
+        let members = std::collections::BTreeMap::from([(id("alpha"), alone)]);
+        shared.raft.initialize(members).await.unwrap();
+        let send = |entry: kith_store::Command| {
+            let shared = shared.clone();
+            async move {
+                let sent = crate::forge::append(State(shared), axum::Extension(crate::access::Caller::Admin), Json(entry));
+                sent.await.map(|Json(said)| said)
+            }
+        };
+        let forged = kith_store::Command::Signed {
+            header: "v1; who=local socket; target=*; expires=1; nonce=00; sig=AA==".into(),
+            method: "POST".into(),
+            path: "/v1/apply".into(),
+            body: String::new(),
+            command: Box::new(kith_store::Command::Mark),
+        };
+        // (A one-voter cluster elects itself: asked until it leads.)
+        let mut said = None;
+        for _ in 0..100 {
+            match send(forged.clone()).await {
+                Ok(answer) => {
+                    said = Some(answer);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let said = said.expect("the node led within ten seconds");
+        assert_eq!(said["applied"], false, "{said}");
+        assert!(said["error"].as_str().unwrap().contains("signed entry"), "{said}");
+        let said = send(kith_store::Command::Mark).await.ok().expect("a leader appends");
+        assert_eq!(said["applied"], true, "{said}");
+    }
+
     /// `/v1/raft/stands` says yes, no or not yet of a name and key, to a node of this cluster only.
     #[tokio::test]
     async fn stands_route_answers_only_a_node_that_stands() {

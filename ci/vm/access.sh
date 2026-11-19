@@ -103,6 +103,128 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each held by al
                 [ "$tries" -lt 60 ] || fail "after the deletion: $(cat "$work/wrong")"
                 sleep 1
             done
+            echo "vm.sh: $said" >&2
+
+            # What a taken leader could append, and no more (T-0848): these nodes run the image of a kithd
+            # built with the feature forge, whose POST /v1/forge puts one entry in the log as it is, with
+            # none of the checks a request gets before it is written. Only what every node does with an
+            # entry when it applies it is between it and the stores: three entries it was not asked for,
+            # once the cluster says signing is required and the admin's key is in it.
+            # The nodes check signed entries once the store is in format 4, which the leader moves it to
+            # when every member reads it.
+            tries=0
+            until grep -aq 'every node checking them' "$work"/n?.log; do
+                tries=$((tries + 1))
+                [ "$tries" -lt 300 ] || fail "the store was not moved to format 4, where every node checks signed entries"
+                sleep 1
+            done
+            # The admin's key (Ed25519), made here; the cluster's id is the print of its CA.
+            adminseed=$(head -c 32 /dev/urandom | xxd -p -c 64)
+            printf '302e020100300506032b657004220420%s' "$adminseed" | xxd -r -p >"$work/admin.der"
+            adminkey=$(openssl pkey -inform DER -in "$work/admin.der" -pubout -outform DER | tail -c 32 | xxd -p -c 64)
+            clusterid=$(openssl x509 -in "$work/ca.pem" -outform DER | sha256sum | cut -d ' ' -f 1)
+            [ -n "$adminkey" ] || fail "no admin key to sign with"
+            [ -n "$clusterid" ] || fail "no cluster id to sign with"
+            # A body of resources, in $work/BODY.json.
+            configmap() { # NAME VALUE
+                printf '[{"apiVersion":"kith.dev/v1","kind":"ConfigMap","metadata":{"name":"%s"},"spec":{"data":{"n":"%s"}}}]' "$1" "$2"
+            }
+            # An entry the admin signed (or not), in $work/NAME.entry; its nonce is the number, in 32 hex digits.
+            expires=$(($(date +%s) + 300))
+            entry() { # NAME NONCE EXPIRES-PLUS SIGNED-BODY [CARRIED-BODY]
+                python3 "$root/ci/vm/forge_entry.py" "$work/admin.der" "$clusterid" "$((expires + $3))" "$(printf '%032x' "$2")" "$work/$4.json" ${5:+"$work/$5.json"} \
+                    >"$work/$1.entry" || fail "the entry $1 was not made"
+            }
+            # The entry appended by whichever node leads (a follower says it does not): its answer, in $work/forged.json.
+            forge() { # NAME
+                for n in 1 2 3; do
+                    api "$n" POST /v1/forge "$work/$1.entry" >"$work/forged.json" 2>/dev/null && return 0
+                done
+                fail "no node appended the entry $1"
+            }
+            applied() { forge "$1"; grep -q '"applied":true' "$work/forged.json" || fail "the entry $1 was not applied: $(cat "$work/forged.json")"; }
+            # Each node's resources of a kind as KIND/NAME=SPEC, until the three say the same.
+            held() { # KIND: in $work/held, one line a resource; fails unless the three nodes agree
+                for n in 1 2 3; do
+                    api "$n" GET "/v1/resources?kind=$1" 2>/dev/null | python3 -c '
+import json, sys
+found = json.load(sys.stdin)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+for r in sorted(found, key=lambda r: r["metadata"]["name"]):
+    print(r["kind"] + "/" + r["metadata"]["name"] + "=" + json.dumps(r["spec"], sort_keys=True))
+' >"$work/held$n" || return 1
+                done
+                cmp -s "$work/held1" "$work/held2" && cmp -s "$work/held1" "$work/held3" && cp "$work/held1" "$work/held"
+            }
+            agreed() { # KIND [REGEX]: the three nodes hold the same of KIND, and REGEX is in it
+                tries=0
+                until held "$1" && { [ -z "${2:-}" ] || grep -q -- "$2" "$work/held"; }; do
+                    tries=$((tries + 1))
+                    [ "$tries" -lt 60 ] || fail "the nodes do not agree on $1 holding $2: $(head -c 300 "$work/held1") | $(head -c 300 "$work/held2") | $(head -c 300 "$work/held3")"
+                    sleep 1
+                done
+            }
+            # Where the cluster's Role may apply a Cluster, then the Cluster of the admin's key (open, the first
+            # key is written unsigned), then the entry the admin signs to turn signing on: required.
+            printf '%s' '[{"apiVersion":"kith.dev/v1","kind":"Role","metadata":{"name":"cluster-admin"},"spec":{"rules":[{"kinds":["*"],"verbs":["get","list","watch","delete","exec"]},{"kinds":["Role","RoleBinding","Cluster"],"verbs":["apply"]}]}}]' >"$work/regrant.json"
+            api 1 POST /v1/apply "$work/regrant.json" >/dev/null || fail "the admin was not allowed to apply a Cluster"
+            printf '[{"apiVersion":"kith.dev/v1","kind":"Cluster","metadata":{"name":"home"},"spec":{"adminKey":"%s"}}]' "$adminkey" >"$work/open.json"
+            api 1 POST /v1/apply "$work/open.json" >/dev/null || fail "the Cluster with the admin's key was not applied"
+            printf '[{"apiVersion":"kith.dev/v1","kind":"Cluster","metadata":{"name":"home"},"spec":{"adminKey":"%s","signing":"required"}}]' "$adminkey" >"$work/required.json"
+            entry required 1 0 required
+            applied required
+            agreed Cluster '"signing": "required"'
+            echo "vm.sh: signing required, by an entry the admin signed" >&2
+            # Two entries the admin signed, written by the leader, and applied on all three nodes.
+            configmap genuine 1 >"$work/first.json"
+            configmap genuine 2 >"$work/second.json"
+            entry first 2 1 first
+            entry second 3 2 second
+            applied first
+            applied second
+            agreed ConfigMap 'ConfigMap/genuine=.*"n": "2"'
+            # The audit log's refusals are held to a number a minute: begin a minute of our own.
+            sleep $((61 - $(date +%s) % 60))
+            # (1) a bare RoleBinding, which no one signed.
+            printf '{"Apply":{"resources":[{"apiVersion":"kith.dev/v1","kind":"RoleBinding","metadata":{"name":"forged-bare"},"spec":{"role":"cluster-admin","subjects":["mallory"]}}],"at":0}}' >"$work/bare.entry"
+            forge bare
+            grep -q '"applied":false' "$work/forged.json" || fail "a bare RoleBinding was applied: $(cat "$work/forged.json")"
+            # (2) a Signed entry whose body was changed: what the admin signed is a ConfigMap, what it carries a RoleBinding.
+            configmap harmless 1 >"$work/harmless.json"
+            printf '[{"apiVersion":"kith.dev/v1","kind":"RoleBinding","metadata":{"name":"forged-changed"},"spec":{"role":"cluster-admin","subjects":["mallory"]}}]' >"$work/changed.json"
+            entry changed 4 3 harmless changed
+            forge changed
+            grep -q '"applied":false' "$work/forged.json" || fail "a signed entry with its body changed was applied: $(cat "$work/forged.json")"
+            # (3) a Signed entry with a replayed nonce: the first of the two ConfigMaps, which the second has since replaced.
+            cp "$work/first.entry" "$work/replayed.entry"
+            forge replayed
+            grep -q '"applied":false' "$work/forged.json" || fail "a signed entry with a nonce taken was applied: $(cat "$work/forged.json")"
+            # Each node refused all three at apply, and wrote it in its audit log.
+            audited() { # N WHO WHAT WHY
+                api "$1" GET '/v1/audit?tail=200' 2>/dev/null | python3 -c '
+import json, sys
+who, what, why = sys.argv[1:4]
+found = json.load(sys.stdin)
+found = found if isinstance(found, list) else found.get("entries", [])
+sys.exit(0 if any(e["verb"] == "signed" and not e["ok"] and e["who"] == who and any(what in w for w in e["what"]) and why in e.get("error", "") for e in found) else 1)
+' "$2" "$3" "$4"
+            }
+            for n in 1 2 3; do
+                tries=0
+                until audited "$n" unsigned forged-bare 'a bare write that changes access is refused' \
+                    && audited "$n" 'local socket' /v1/apply 'over this request' \
+                    && audited "$n" 'local socket' /v1/apply "$(printf '%032x' 2) of local socket was seen already"; do
+                    tries=$((tries + 1))
+                    [ "$tries" -lt 60 ] || fail "n$n did not write all three refusals in its audit log: $(api "$n" GET '/v1/audit?tail=6' 2>&1 | head -c 1500)"
+                    sleep 1
+                done
+            done
+            # And the three hold what the admin signed, and none of what was forged.
+            agreed ConfigMap 'ConfigMap/genuine=.*"n": "2"'
+            ! grep -q 'forged\|harmless' "$work/held" || fail "a forged resource is held: $(cat "$work/held")"
+            agreed RoleBinding
+            ! grep -q 'forged\|mallory' "$work/held" || fail "a forged RoleBinding is held: $(cat "$work/held")"
+            echo "vm.sh: three entries the leader was not asked for, a bare RoleBinding, a signed one with its body changed and one with a replayed nonce, each refused by all three nodes at apply" >&2
             ! grep -al 'Kernel panic\|panicked at' "$work"/n?.log || fail "a node panicked"
-            echo "vm.sh: ok: three nodes; the admin writing through n2 and n3 by a RoleBinding deleted through n1 while n2 was cut off: $said"
+            echo "vm.sh: ok: three nodes; the admin writing through n2 and n3 by a RoleBinding deleted through n1 while n2 was cut off: $said; and a leader that appended a bare RoleBinding, a signed entry with its body changed and one with a replayed nonce: all three nodes refused each at apply, and hold the same"
             exit 0

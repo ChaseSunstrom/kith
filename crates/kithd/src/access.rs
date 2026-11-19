@@ -197,6 +197,10 @@ const FOR_IDENTITIES: [&str; 26] = [
 
 /// Is `path` one an Identity can reach (one of [`FOR_IDENTITIES`], or under one)?
 pub fn for_identities(path: &str) -> bool {
+    // (The forge route of a test build: the admin's, as it checks for itself.)
+    if cfg!(feature = "forge") && path == "/v1/forge" {
+        return true;
+    }
     let open = |route: &&str| {
         let rest = path.strip_prefix(route);
         rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))

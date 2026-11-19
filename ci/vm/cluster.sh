@@ -33,6 +33,8 @@
         # worker: two, on the mesh; quota: one, on the mesh; services: one, with no mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os dumps='' gateway='' https='' guest=''
         seed() { :; }
+        # (access: the nodes run the image tests.sh built with the forge feature.)
+        [ "$test" != access ] || base=$osdir
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
         others=2 more=--mesh project=''
         [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] || others=''

@@ -26,6 +26,8 @@ mod dns;
 mod encrypted;
 mod exits;
 mod files;
+#[cfg(feature = "forge")]
+mod forge;
 mod gpt;
 mod home;
 mod images;

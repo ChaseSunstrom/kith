@@ -25,6 +25,19 @@ if [ "${1:-}" = --tests ]; then
     printf '%s\n' "$built" | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1
     exit 0
 fi
+# KITHD_FEATURES=forge: the test build whose leader can append an entry it was not asked for
+# (crates/kithd/src/forge.rs, ci/vm/access.sh). In a target directory of its own, and only
+# that: the release build below, the one budgets.py weighs and os/build.sh ships, never
+# has the feature, and a build for one does not rebuild the other.
+case "${KITHD_FEATURES:-}" in
+    '') ;;
+    forge)
+        CARGO_TARGET_DIR="$dir/forge" cargo build --release --quiet --target "$target" -p kithd -p kith-cli --features kithd/forge >&2
+        echo "$dir/forge/$target/release"
+        exit 0
+        ;;
+    *) echo "musl.sh: KITHD_FEATURES knows: forge" >&2; exit 1 ;;
+esac
 out="$dir/$target/release"
 # kith with TLS to a node (cargo feature remote) is built first and kept as kith-remote, beside
 # the default kith, which the size budget weighs; the default build after it leaves kith as it was.

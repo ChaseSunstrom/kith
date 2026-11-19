@@ -334,6 +334,18 @@ The VM test for slices 1 to 3 extends `ci/vm.sh --test access` (three nodes, n1 
 
 All four: about +215 KB, to about 11.6 MB.
 
+Slice 4 as built (T-0848): the feature is `forge` in crates/kithd (off in every release and
+default build; `forge_is_in_no_release_build` checks the router has no route). With it, `POST
+/v1/forge` (crates/kithd/src/forge.rs; needs the right to apply a RoleBinding) appends any
+`Command` the caller sends to the log as the leader and says whether applying it succeeded.
+ci/musl.sh builds it only for `KITHD_FEATURES=forge`, into its own target folder, so the
+release binaries are not rebuilt with it; `ci/vm.sh --test access` boots that image
+(target/os-forge). The host crafts the entries (ci/vm/forge_entry.py signs with the admin's
+Ed25519 key, since a signed header is honoured only on the local socket) after setting
+`signing: required` by an admin-signed write: a bare RoleBinding, a Signed entry whose
+carried body differs from the signed one, and a Signed entry with a replayed nonce. n1, n2 and
+n3 each refuse all three at apply, audit each refusal, and `GET /v1/resources` lists agree.
+
 ### Layer 1a as built (T-0743), and where the code said otherwise
 
 kithd checks the header (crates/kithd/src/access_sign.rs: `verify` is the pure check) on

@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test only, and in no release or default build (ci/musl.sh builds it only when KITHD_FEATURES
+# says so, into a folder of its own): `POST /v1/forge` lets a leader append an entry it was not
+# asked for, so the access VM test can show every other node refuses it (forge.rs).
+forge = []
+
 [dependencies]
 # The same as kith-runtime pulls images with.
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
