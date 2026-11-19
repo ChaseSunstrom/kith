@@ -890,8 +890,11 @@ fn pods(owner: &Value, resource: &Resource) -> Vec<Value> {
         if !node.is_null() {
             set(&mut spec, "/nodeName", node.clone());
         }
+        // A replica a delete restarted starts at its restart; the rest at their owner's making.
+        let since = all.iter().filter_map(|unit| unit["restarted"].as_u64()).max();
+        let started = since.map_or(meta["creationTimestamp"].clone(), |at| rfc3339(at).into());
         let mut status = json!({
-            "phase": phase, "startTime": meta["creationTimestamp"],
+            "phase": phase, "startTime": started,
             "conditions": [
                 condition("Initialized", begun, ""), condition("PodScheduled", true, ""),
                 condition("ContainersReady", ready, ""), condition("Ready", ready, ""),
@@ -2556,6 +2559,9 @@ async fn delete(
             "{kind}/{name}: gracePeriodSeconds is taken and changes nothing: what it runs is stopped as kith stops it"
         ));
     }
+    if kind.kind == "Pod" {
+        return delete_pod(call, kind, namespace, name, hints).await;
+    }
     // (Asked first: who may not delete here is not told what is there.)
     call.allowed(kind, namespace, Verb::Delete)?;
     let dry = call.asked.contains_key("dryRun") || options["dryRun"].is_array();
@@ -2626,6 +2632,57 @@ async fn delete(
         format!("Namespace/{name}: {stay} resources in it were not made through this API, and stay: `kith delete` removes them")
     });
     hints.extend(stay);
+    Ok(Written(StatusCode::OK, Some(done), hints).into_response())
+}
+
+/// `kubectl delete pod NAME` restarts that one replica: its node stops it and its Workload starts
+/// it again, with the same name and number and a new start time. Needs the apply right on the
+/// Workload; a pod that is no Workload's replica (a bare pod, a Job's run, a NodeWorkload's copy)
+/// is refused by name. No grace period and no force: what runs is stopped as kith stops it.
+async fn delete_pod(
+    call: &Call,
+    kind: &'static Kind,
+    namespace: Option<&str>,
+    name: &str,
+    hints: Vec<String>,
+) -> Result<Response, No> {
+    let namespace = namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE);
+    let Some(("Workload", owner, replica)) = pod_owner(name) else {
+        let why = format!(
+            "Pod/{name}: only a replica of a Workload is restarted by a delete: kith runs no other pod that is restarted so"
+        );
+        return Err(invalid(why));
+    };
+    // (Asked before the Workload is looked at: who may not restart it is not told what is there.)
+    api::permit(&call.shared, &call.caller, Verb::Apply, |_| {
+        vec![("Workload".to_string(), Some(namespace.to_string()))]
+    })
+    .map_err(refusal)?;
+    let key = format!("Workload/{namespace}/{owner}");
+    let running = {
+        let state = call.shared.store.lock().expect("a handler panicked holding the store");
+        state
+            .store
+            .get(&key)
+            .filter(|held| raw(held).is_some())
+            .is_some_and(|held| {
+                held.status.as_ref().is_some_and(|status| {
+                    status["containers"]
+                        .as_array()
+                        .is_some_and(|units| units.iter().any(|u| u["replica"] == replica))
+                })
+            })
+    };
+    if !running {
+        return Err(not_found(kind, name));
+    }
+    let _ = api::restart_replica(&call.shared, &call.caller, &key, replica, false)
+        .await
+        .map_err(refusal)?;
+    let done = json!({
+        "kind": "Status", "apiVersion": "v1", "status": "Success",
+        "details": { "name": name, "group": kind.group, "kind": kind.plural },
+    });
     Ok(Written(StatusCode::OK, Some(done), hints).into_response())
 }
 
@@ -3775,6 +3832,194 @@ spec: {role: writer, subjects: [carol]}
             let (code, said) = ask("GET", "", &format!("namespaces/default/pods/{pod}/log"), Value::Null).await;
             assert_eq!((code, said.as_str()), (StatusCode::OK, wrote), "{pod}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What `serve` answers a request by `caller`: the status and the body as text.
+    async fn answer_as(
+        shared: Arc<crate::Shared>,
+        caller: Caller,
+        method: &str,
+        group: &str,
+        rest: &str,
+        body: Value,
+    ) -> (StatusCode, String) {
+        let mut request = axum::http::Request::builder().method(method).body(()).unwrap();
+        request.extensions_mut().insert(caller);
+        let (parts, ()) = request.into_parts();
+        match serve(shared, parts, group, rest, Asked::new(), body.to_string().as_bytes()).await {
+            Ok(answer) => {
+                let (code, body) = (answer.status(), answer.into_body());
+                let text = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                (code, String::from_utf8_lossy(&text).into_owned())
+            }
+            Err(no) => (no.code, no.why),
+        }
+    }
+
+    /// A Deployment `x` of two replicas, both running here, and the pods of it by name.
+    async fn two_replicas_of_x(shared: &Arc<crate::Shared>) {
+        let deployment = json!({
+            "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "x" },
+            "spec": { "replicas": 2, "selector": { "matchLabels": { "app": "x" } }, "template": {
+                "metadata": { "labels": { "app": "x" } }, "spec": { "containers": [{ "name": "main", "image": "i" }] },
+            } },
+        });
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "POST",
+            "apps",
+            "namespaces/default/deployments",
+            deployment,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let units = json!({ "containers": [
+            { "name": "main", "replica": 0, "state": "running", "ready": true, "restarts": 0 },
+            { "name": "main", "replica": 1, "state": "running", "ready": true, "restarts": 0 },
+        ] });
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .set_status("Workload/default/x", Some(units))
+            .unwrap();
+    }
+
+    /// `kubectl delete pod x-0` restarts that one replica: its slot is marked for the
+    /// controller to stop and start again, and the other replica and the pods are as they were.
+    /// (The controller's side is `delete_pod_stops_the_replica_and_starts_it_again_ignoring_policy`.)
+    #[tokio::test]
+    async fn delete_pod_restarts_only_that_replica() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-delete-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        two_replicas_of_x(&shared).await;
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{said}");
+        let marked: Vec<(String, u32)> = shared.restarts.lock().unwrap().iter().cloned().collect();
+        assert_eq!(marked, [("Workload/default/x".to_string(), 0)]);
+        let (code, listed) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "GET",
+            "",
+            "namespaces/default/pods",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{listed}");
+        let listed: Value = serde_json::from_str(&listed).unwrap();
+        let mut names: Vec<_> = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pod| pod["metadata"]["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["x-0", "x-1"], "{listed}");
+        // A pod kith runs no Workload replica of is refused by name, and marks nothing.
+        for no in ["bare", "x-j0"] {
+            let (code, said) = answer_as(
+                shared.clone(),
+                Caller::Admin,
+                "DELETE",
+                "",
+                &format!("namespaces/default/pods/{no}"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{no}: {said}");
+            assert!(said.contains(no), "{no}: {said}");
+        }
+        // A Workload that is not there has no such replica.
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-1-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
+        // A replica that is not there is no pod.
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-5",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
+        assert_eq!(shared.restarts.lock().unwrap().len(), 1, "only x-0 is marked");
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a pod of a Workload needs the apply right on that Workload: get alone is
+    /// refused 403 and nothing is marked; apply takes it. Reading the pod stays get's.
+    #[tokio::test]
+    async fn delete_pod_access_needs_apply_on_the_workload() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-delete-access-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let roles = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: readers}\nspec: {rules: [{kinds: [Workload], verbs: [get]}]}\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: writers}\nspec: {rules: [{kinds: [Workload], verbs: [apply]}]}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: ann-reads}\nspec: {role: readers, subjects: [ann]}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: bob-writes}\nspec: {role: writers, subjects: [bob]}\n---\napiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: ann}\nspec: {}\n---\napiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: bob}\nspec: {}\n";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(roles).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        two_replicas_of_x(&shared).await;
+        let ann = Caller::Identity("ann".into());
+        let (code, said) = answer_as(
+            shared.clone(),
+            ann.clone(),
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{said}");
+        assert!(
+            shared.restarts.lock().unwrap().is_empty(),
+            "a refused delete marks nothing"
+        );
+        let (code, said) = answer_as(
+            shared.clone(),
+            ann,
+            "GET",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{said}");
+        let bob = Caller::Identity("bob".into());
+        let (code, said) = answer_as(
+            shared.clone(),
+            bob,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{said}");
+        assert_eq!(shared.restarts.lock().unwrap().len(), 1);
+        drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
