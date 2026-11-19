@@ -88,6 +88,7 @@
 {"u":"guide/numbers.html#the-numbers-drawn","t":"How the numbers beside k3s were taken","h":"The numbers, drawn"},
 {"u":"guide/numbers.html#what-each-row-is","t":"How the numbers beside k3s were taken","h":"What each row is"},
 {"u":"guide/numbers.html#what-it-does-not-say","t":"How the numbers beside k3s were taken","h":"What it does not say"},
+{"u":"guide/numbers.html#the-compose-stack-beside-docker","t":"How the numbers beside k3s were taken","h":"The compose stack beside docker"},
 {"u":"adr-fido2.html","t":"A FIDO2 key as a way into a node's state","h":""},
 {"u":"adr-fido2.html#what-is-checked-and-what-is-not","t":"A FIDO2 key as a way into a node's state","h":"What is checked, and what is not"},
 {"u":"adr-fido2.html#1-the-ctap2-client","t":"A FIDO2 key as a way into a node's state","h":"1. The CTAP2 client"},

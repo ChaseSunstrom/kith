@@ -254,3 +254,19 @@ Where the two differ in what they do, the numbers are not of the same thing:
 - k3s is the whole Kubernetes API.
 
 How each row is measured, and what the tables do not say: [How the numbers beside k3s were taken](docs/guide/numbers.md#how-the-numbers-beside-k3s-were-taken).
+
+## The compose stack beside docker
+
+`KITH_E2E=1 sh ci/vm.sh --test compose` also brings the same eight-service media file
+([ci/compose/media.yml](ci/compose/media.yml)) up under `docker compose up -d` on an Alpine
+machine, and prints both times. One run: kith 2.788 s from `kith apply` to every Workload ready
+(a 512 MB node, ready includes the HTTP probes), docker 0.915 s from `docker compose up -d` to
+all eight containers running (docker 29.9.3, median of three, a 2048 MB machine, no health wait).
+
+kith is slower, by 1.873 s (3.0 times), because the two stop their clocks at different
+moments: kith's at the probes passing, docker's at the containers running; because each
+service is a pod of its own, with its volumes made on the node, where docker starts a
+container; and because the test polls kith's API every 0.2 s. The run does not split
+that 1.873 s among the three. It is one run of kith on a host with other work going on:
+read it as the order of magnitude, not a ratio. How it was taken:
+[the compose stack beside docker](docs/guide/numbers.md#the-compose-stack-beside-docker).
