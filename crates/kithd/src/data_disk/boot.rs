@@ -12,8 +12,10 @@ use super::seed::{self, RealDisk};
 use super::{Dev, Id, Standing, dir_of, hex_id, off_ours, read_entry, read_key, standing};
 use crate::install::Disk;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// How long one disk may take to be read, mapped and mounted.
@@ -49,8 +51,15 @@ pub struct Gone {
 }
 
 /// Read the first 4 KiB of `disk` and, if it is a known disk, `open` it with its key and its
-/// mount point. Nothing is written to the disk here, and `open` is called for a known disk only.
-pub fn judge<D: Dev>(state: &Path, disk: &D, open: impl FnOnce(&Id, &[u8; 64], &Path) -> Result<(), String>) -> What {
+/// mount point. Nothing is written to the disk here, and `open` is called for a known disk only:
+/// one whose `serial` is the one its entry was made for (a copy of a disk's first 4 KiB, or of the
+/// whole disk, on another disk carries the header and not the serial).
+pub fn judge<D: Dev>(
+    state: &Path,
+    disk: &D,
+    serial: &str,
+    open: impl FnOnce(&Id, &[u8; 64], &Path) -> Result<(), String>,
+) -> What {
     let room = match disk.first() {
         Ok(room) => room,
         Err(e) => return What::Unreadable(e.to_string()),
@@ -60,6 +69,9 @@ pub fn judge<D: Dev>(state: &Path, disk: &D, open: impl FnOnce(&Id, &[u8; 64], &
         Standing::Damaged(why) => What::Damaged(why),
         Standing::Ours(id) => {
             let dir = dir_of(state, &id);
+            if read_entry(&dir).is_none_or(|entry| entry.serial != serial) {
+                return What::Failed(id, "its header is this node's, its serial is not the one added".into());
+            }
             let Some(key) = read_key(&dir) else {
                 return What::Failed(id, "its key is not kept whole in the state".into());
             };
@@ -159,6 +171,37 @@ pub fn said() -> Option<Value> {
     SAID.get().cloned()
 }
 
+/// One id is one disk: the first to ask has it, a second disk with the same id is refused.
+fn claim(claimed: &Mutex<HashSet<Id>>, id: &Id) -> Result<(), String> {
+    if claimed.lock().unwrap_or_else(|e| e.into_inner()).insert(*id) {
+        Ok(())
+    } else {
+        Err("another disk has this id".into())
+    }
+}
+
+/// Open one disk (`open`) unless it was `abandoned` (the wait for it ran out), and if it was
+/// abandoned while it was opening, close it again (`undo`): a late answer from a stuck disk must
+/// not leave a mount nothing knows of. An opened disk is `keep`t for [`close`].
+fn open_unless_abandoned(
+    abandoned: &AtomicBool,
+    open: impl FnOnce() -> Result<(), String>,
+    keep: impl FnOnce(),
+    undo: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let let_go = || format!("it did not answer in {} s, let go of", OPEN.as_secs());
+    if abandoned.load(Ordering::SeqCst) {
+        return Err(let_go());
+    }
+    open()?;
+    if abandoned.load(Ordering::SeqCst) {
+        undo().map_err(|e| format!("{}, and not closed: {e}", let_go()))?;
+        return Err(let_go());
+    }
+    keep();
+    Ok(())
+}
+
 /// The disks mounted, as (kernel name, mount point): what [`close`] lets go of.
 static OPEN_NOW: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
 
@@ -190,25 +233,40 @@ pub async fn run(state: PathBuf) {
         .filter(|disk| !disk.removable && off_ours(verity, ours.as_deref(), state_disk.as_deref(), &disk.name))
         .collect();
     let mut tasks = tokio::task::JoinSet::new();
+    // The ids opened so far: one id is one disk, a second disk with it (a copy) is not opened.
+    let claimed = Arc::new(Mutex::new(HashSet::new()));
     for disk in disks {
         let state = state.clone();
+        let claimed = claimed.clone();
         tasks.spawn(async move {
             let shown = disk.to_string();
+            let abandoned = Arc::new(AtomicBool::new(false));
+            let late = abandoned.clone();
             let job = tokio::task::spawn_blocking(move || match RealDisk::new(&disk.name, disk.removable) {
                 None => What::Unreadable("its name is not one".into()),
-                Some(real) => judge(&state, &real, |_, key, at| {
-                    seed::open(&real, at, key)?;
-                    OPEN_NOW
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push((real.name().to_string(), at.to_path_buf()));
-                    Ok(())
+                Some(real) => judge(&state, &real, &disk.serial, |id, key, at| {
+                    claim(&claimed, id)?;
+                    open_unless_abandoned(
+                        &late,
+                        || seed::open(&real, at, key),
+                        || {
+                            OPEN_NOW
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push((real.name().to_string(), at.to_path_buf()));
+                        },
+                        || seed::close(&real, at).map_err(|e| e.to_string()),
+                    )
                 }),
             });
             let what = match tokio::time::timeout(OPEN, job).await {
                 Ok(Ok(what)) => what,
                 Ok(Err(e)) => What::Unreadable(format!("looking at it failed: {e}")),
-                Err(_) => What::Unreadable(format!("it did not answer in {} s", OPEN.as_secs())),
+                Err(_) => {
+                    // (Its thread goes on, stuck: whatever it opens late, it closes again.)
+                    abandoned.store(true, Ordering::SeqCst);
+                    What::Unreadable(format!("it did not answer in {} s", OPEN.as_secs()))
+                }
             };
             Seen { disk: shown, what }
         });
@@ -317,10 +375,70 @@ mod tests {
         let (_dir, disk, state) = rig("boot-known");
         known(&state, &disk);
         let opened = Opened::default();
-        let what = judge(&state, &disk, opening(&opened, Ok(())));
+        let what = judge(&state, &disk, "S1", opening(&opened, Ok(())));
         assert_eq!(what, What::Mounted(ID));
         let at = dir_of(&state, &ID).join("data");
         assert_eq!(*opened.borrow(), vec![([9; 64], at)]);
+    }
+
+    #[test]
+    fn a_second_disk_with_an_id_is_refused() {
+        let claimed = Mutex::new(HashSet::new());
+        assert_eq!(claim(&claimed, &ID), Ok(()));
+        assert_eq!(claim(&claimed, &[7; 16]), Ok(()));
+        assert_eq!(claim(&claimed, &ID), Err("another disk has this id".into()));
+    }
+
+    #[test]
+    fn a_disk_whose_serial_is_not_the_one_added_is_not_opened() {
+        // A copy of a known disk: the header is the same, the disk is another.
+        let (_dir, disk, state) = rig("boot-serial");
+        known(&state, &disk);
+        let opened = Opened::default();
+        for serial in ["S2", ""] {
+            let what = judge(&state, &disk, serial, opening(&opened, Ok(())));
+            assert!(
+                matches!(&what, What::Failed(id, why) if *id == ID && why.contains("serial")),
+                "{what:?}"
+            );
+        }
+        assert!(opened.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_disk_that_is_abandoned_is_not_opened_and_one_opened_late_is_closed_again() {
+        let calls = RefCell::new(Vec::new());
+        let go = |abandoned: &AtomicBool, during: bool, close: Result<(), String>| {
+            calls.borrow_mut().clear();
+            let said = open_unless_abandoned(
+                abandoned,
+                || {
+                    calls.borrow_mut().push("open");
+                    abandoned.store(during, Ordering::SeqCst);
+                    Ok(())
+                },
+                || calls.borrow_mut().push("keep"),
+                || {
+                    calls.borrow_mut().push("undo");
+                    close
+                },
+            );
+            (said, calls.borrow().clone())
+        };
+        let (said, calls) = go(&AtomicBool::new(false), false, Ok(()));
+        assert_eq!((said, calls), (Ok(()), vec!["open", "keep"]));
+        let (said, calls) = go(&AtomicBool::new(true), true, Ok(()));
+        assert!(said.is_err());
+        assert!(calls.is_empty(), "an abandoned disk is not opened: {calls:?}");
+        let (said, calls) = go(&AtomicBool::new(false), true, Ok(()));
+        assert!(said.is_err());
+        assert_eq!(calls, vec!["open", "undo"], "opened late: closed, not kept");
+        let (said, calls) = go(&AtomicBool::new(false), true, Err("busy".into()));
+        assert!(
+            said.is_err_and(|why| why.contains("busy")),
+            "a close that fails is said"
+        );
+        assert_eq!(calls, vec!["open", "undo"]);
     }
 
     #[test]
@@ -343,7 +461,7 @@ mod tests {
             (&pending, &state4),
         ] {
             let before = bytes(disk);
-            assert_eq!(judge(state, disk, opening(&opened, Ok(()))), What::Unknown);
+            assert_eq!(judge(state, disk, "S1", opening(&opened, Ok(()))), What::Unknown);
             assert_eq!(bytes(disk), before, "an unknown disk is read, never written");
         }
         assert!(opened.borrow().is_empty(), "no unknown disk is opened");
@@ -356,7 +474,7 @@ mod tests {
         disk.0.write_all_at(b"X", 20).unwrap();
         let before = bytes(&disk);
         let opened = Opened::default();
-        let what = judge(&state, &disk, opening(&opened, Ok(())));
+        let what = judge(&state, &disk, "S1", opening(&opened, Ok(())));
         assert!(matches!(what, What::Damaged(_)), "{what:?}");
         assert_eq!(bytes(&disk), before);
         assert!(opened.borrow().is_empty());
@@ -370,12 +488,13 @@ mod tests {
         let what = judge(
             &state,
             &disk,
+            "S1",
             opening(&opened, Err("no file system under that key".into())),
         );
         assert_eq!(what, What::Failed(ID, "no file system under that key".into()));
         // A key that is not whole is the state's fault, and said so: the disk is not opened.
         std::fs::write(dir_of(&state, &ID).join("key"), [1; 10]).unwrap();
-        let what = judge(&state, &disk, opening(&opened, Ok(())));
+        let what = judge(&state, &disk, "S1", opening(&opened, Ok(())));
         assert!(
             matches!(&what, What::Failed(id, why) if *id == ID && why.contains("key")),
             "{what:?}"
@@ -389,6 +508,7 @@ mod tests {
         let what = judge(
             Path::new("/nonexistent"),
             &Fake(file, "sdb", false),
+            "S1",
             opening(&Opened::default(), Ok(())),
         );
         assert!(matches!(what, What::Unreadable(_)), "{what:?}");

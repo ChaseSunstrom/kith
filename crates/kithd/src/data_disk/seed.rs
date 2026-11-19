@@ -228,13 +228,24 @@ impl Mapper for Real {
 
 /// The seed written to the start of `to`, synced: `room` bytes are all the mapping has.
 fn copy_seed(seed: &mut impl Read, to: &File, room: u64) -> io::Result<()> {
-    let mut bytes = Vec::new();
-    // (One byte more than the room: a seed that does not fit is told apart from one that fills it.)
-    seed.take(room + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > room {
-        return Err(io::Error::other("the seed file system is bigger than the disk"));
+    // In chunks, not all at once: the seed is 64 MiB and kithd is the machine's first process.
+    // (One byte more than the room is read: a seed that does not fit is told apart from one that
+    // fills it. A seed that does not fit leaves what was written, on a disk whose header is not
+    // written yet.)
+    let mut seed = seed.take(room + 1);
+    let mut chunk = vec![0; 1 << 20];
+    let mut at = 0u64;
+    loop {
+        let got = seed.read(&mut chunk)?;
+        if got == 0 {
+            break;
+        }
+        if at + got as u64 > room {
+            return Err(io::Error::other("the seed file system is bigger than the disk"));
+        }
+        to.write_all_at(&chunk[..got], at)?;
+        at += got as u64;
     }
-    to.write_all_at(&bytes, 0)?;
     to.sync_all()
 }
 

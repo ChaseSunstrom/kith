@@ -1261,6 +1261,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         served.map_err(|e| fail("serving", &e)).and(nodes)
     });
     let _ = std::fs::remove_file(&socket);
+    // (Not a plain drop: that waits for every thread `spawn_blocking` made, and a data disk that
+    // never answers has one stuck in the kernel for good.)
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
     served
 }
 
