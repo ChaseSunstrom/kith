@@ -304,6 +304,12 @@ record, so only T-0956 can open a state by touch and measure the size of what is
   `fido2:` lines it does not know. adr-unlock's rule for passphrase lines is the same; a
   guard is for the slice that writes them (the node refuses an OS slot older than the one that
   wrote them, if `os.rs` has the means).
+- **`remove` does not rotate the state's key.** It takes both `fido2:` lines off the record, but
+  the state's key under them is the same one: an old copy of the config partition (a backup, a
+  disk image, a replaced disk) together with the lost key still opens the state. A key lost is
+  to be treated as that, until the state's key is changed (a rekey, which no verb of this
+  record does). The cluster's lock or forget does drop the lines of the node it reaches
+  (`ways_left`, T-0971), but not a copy of the partition taken before.
 - **Swapping one of two keys**, and more than two keys enrolled at once (the record's room
   allows two lines, section 4).
 - **A hardware token the kernel does not give a hidraw** (a Bluetooth or NFC key): out of scope.
