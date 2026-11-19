@@ -19,6 +19,7 @@ fn node(name: &str, cpu: f64, mem_gi: f64) -> Node {
         trust: None,
         ingress: None,
         mesh: None,
+        alone: None,
     };
     Node {
         name: name.into(),

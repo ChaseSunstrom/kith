@@ -17,7 +17,9 @@ mod netlink;
 pub mod people;
 pub mod pod;
 
-pub use netlink::{Card, Device, Seen, address4, address4_for, addresses6, cards, drop_address4, hold, up};
+pub use netlink::{
+    Card, Device, Seen, address4, address4_for, addresses6, cards, drop_address4, gateway4, hold, public_of, up,
+};
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
@@ -104,8 +106,8 @@ pub struct Member {
     pub seen: Option<SocketAddr>,
 }
 
-/// A peer as the interface should have it.
-#[derive(Debug, Clone, PartialEq)]
+/// A peer as the interface should have it (and as kithd asks its root part for it).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Peer {
     pub key: Key,
     pub endpoint: Option<SocketAddr>,

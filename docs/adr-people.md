@@ -391,8 +391,10 @@ Where the build differs from the text above:
 - An IPv6 overlap is not refused at apply: the mesh /48 and the people /64 come from the CA,
   which kith-api does not hold. kithd refuses an AccessLevel over either in its `refused` status
   instead. An IPv4 overlap with the people ranges or `100.88.0.0/16` is refused at apply.
-- The pods range checked is the default `100.88.0.0/16`. The start-time check of the people
-  ranges against `--pod-range` and the connected networks (condition 4) is not done yet.
+- The pods range checked at apply is the default `100.88.0.0/16`. At start, with `--people`,
+  kithd refuses a `--pod-range` that overlaps `100.89.0.0/16`, and a network of this node
+  (other than `kwg0` and loopback) that overlaps it; as PID 1 the second is only said, as the
+  pods' own clash is, since a refusal there restarts the machine (condition 4).
 - An IPv4 address is 16 bits of the name's SHA-256 inside `100.89.0.0/16`; the IPv6 address is
   the people /64 with the name's SHA-256 bytes 8 to 16 as its interface id. Of the peers that
   share a public key, one is given its addresses: the one already holding an address of ours,
@@ -417,6 +419,111 @@ masquerade (kith OS has CONFIG_NFT_MASQ=y) says so by name, and `--people` does 
 namespace on a host kernel with no masquerade (`unshare -Urn` here) makes the table without its masq
 rules, as kith-mesh's `build_here` does, and says so; the masq rule is covered by kith-mesh's
 expression tests.
+
+## Built: slice D
+
+A phone gets in: `POST /v1/peers` with `{name, node, level, replace}` (`people.rs`, `add`; the route is
+in `FOR_IDENTITIES`, so the caller's own Roles decide). It makes a WireGuard key, applies a
+RemotePeer holding only the public half as the caller, and answers once, with
+`Cache-Control: no-store`, `{name, node, level, publicKey, addresses, config}`. The config is
+`[Interface]` (the private key, the peer's addresses, the level's DNS) and `[Peer]` (the node's
+people public key, the endpoint from `--people-endpoint`, the allowed ranges of the level). The
+refusals: 404 for no such node or level, 409 for a node whose status has no `people` (no
+`--people-endpoint`) or a level or address the plan refuses, 422 for a bad name. Asked again for
+a name that already has a key, it answers 409 "RemotePeer NAME has a key: ask with replace to
+give it a new one" and changes nothing; with `replace: true` (`kith peer add --replace`, or the
+page's "A new key for NAME?" confirm) it makes a new key and the old configuration stops working.
+A node as the caller is not told apart from an Identity.
+
+The key is made by kithd itself, from the system's random source, not as a request to a root
+part: there is no root part yet (T-0334). When there is, the key's making moves there and this
+handler asks for it.
+
+Three guards stand before the key is made. Keys are rationed by one token bucket in the
+`Cluster` (5 a minute, a burst of 5), checked after the refusals that cost nothing (the asker's
+right, the body, a name already taken), so those spend no token; refusals found once the key is
+made (a plan that clashes, a node endpoint or level DNS that will not do) spend one, so a node
+set up wrong uses the burst up. An empty bucket answers 429 with `no-store`. The bucket is per
+kithd process, not shared by the cluster: a request a control node takes is limited by that
+node's own bucket, so the cluster's rate is at most 5 a minute for each node asked; a restart
+starts a full one. A name being added is held in a set until its answer is made: a second add of it
+meanwhile answers 409 "being added", so two concurrent asks cannot both answer 200 with two
+keys. The kernel's answer for the node's public key (`derive`, blocking netlink) runs under
+`spawn_blocking`, so a slow netlink does not hold a runtime thread.
+
+The node's own public key is read by `kith_mesh::public_of`, which asks the kernel for `kwg0`'s
+key through netlink, as the mesh does; no key file is read for it.
+
+The private key is held in `Zeroizing` buffers in the handler: the 32 bytes, the copy moved into
+`spawn_blocking`, its base64, the configuration text and the answer's body, which the response
+owns and wipes when hyper drops it. The 32 bytes are dropped before `applied(...).await`; the
+configuration text lives across it until the answer is built. Copies kithd cannot wipe: the
+netlink attribute and message buffers `kith_mesh::public_of` builds from the key, the stack
+temporaries a dereference of the key leaves, and hyper's and the socket's buffers. The key is in the CLI's or the page's variables while they show it.
+It is not in the store, the history, the audit line or kithd's log: the tests `peers_route*` and
+`peers_config*` look for it in each of them, and in the applied resource.
+
+`kith peer add NAME --node N --level L` prints the configuration and says it is shown once.
+
+The QR code is `crates/kithd/ui/qr.js`: ISO 18004 byte mode, error correction L, versions 1 to
+40, drawn on a `<canvas>` (black on white, a four-module quiet zone) as the page's policy
+allows. It matches `qrencode -8 -l L -m 0` on every length from 1 to 2953 bytes, tried once
+by hand; `ui/test.mjs` holds four of those outputs as fixtures. A configuration past the largest
+version shows its text with "No picture: too long for a QR code".
+
+The page: "Add a peer", on the RemotePeer list for a caller who may apply. A dialog asks the name,
+the node (only those with a `people` status) and the level; the answer opens a second dialog
+with the picture and the text, "Shown this once, and kept nowhere ... whoever has this picture is
+this peer". Closing the dialog wipes it; nothing goes to browser storage, and the test counts
+the key in each toast, question and call. `ci/ui_shots.py` takes the Peer and Qr views at 390
+and 1440, light and dark, through a fetch shim, since the nodes it starts have no `kwg0` (that
+needs root and a kernel WireGuard).
+
+Sizes, `python3 ci/budgets.py` on this lane's build: `kith` 2.96 MB (budget 3.00; `docs/numbers.json`
+had 2.92 before), `kith-remote` 3.59 (3.60), `kithd` 12.66 (13.00; `numbers.json` has 12). Those
+are the figures slice C's text above, 2.93 and 11.35 MB, should have named; the 11.35 was an
+estimate. `kithd.order` was written again (`python3 ci/order.py`), as the new handler's functions
+and slice C's were not in it.
+
+## Built: slice E1
+
+Levels hold on the `--people` node (kithd's `levels.rs`). A pass reads the store (the node's
+RemotePeers, their AccessLevels and Services) and makes what the kernel holds match it:
+
+- The `kith-people` table is written whole, in one batch, from the people and their levels.
+  There is no `ct state established` accept, so a narrowed level is cut by the rewrite alone; a
+  peer taken away also has its connections' marks (`0x6b79_0000 | offset`) deleted from conntrack.
+- Rules 9010 (main table, `suppress_prefixlen 0`), 9012 (unreachable) for both families, and 9011
+  (the peer's /32, the full main table) for each peer of a level with `internet: true`, all `iif
+  kwg0`. exit.rs's 9000-9005 are untouched; its `Rule` gained `suppress`.
+- Order of a pass: the peers leaving come off kwg0 first; then the table, then the rules; then
+  the peers go on; the connections of those that left are flushed last, and only once they are
+  really off the device (a `set_peers` that failed leaves the pass's memory of the device as it
+  was, so the next pass asks again and nothing is flushed meanwhile). Any failed step empties
+  kwg0's peers (fail closed) and says why. A pass is run in `spawn_blocking`, and none runs once
+  the device is being taken away (a lock shared with the teardown). A start that fails takes the
+  old kwg0, its rules and its table away.
+- The rules counted as held are the whole rule (action, lengths, table, suppress): one by kwg0 at
+  9010 to 9012 that differs is not counted, and `people_hold` replaces it.
+- The kernel is read again each pass (table present, rules), so a rule or table removed by hand
+  is put back within 10 s; an unchanged pass writes nothing. `Tend` starts only after `up` has
+  finished its own order (the device, the table, the 9010/9012 base).
+- A peer's AllowedIPs on kwg0 are its own /32 and /128 and nothing else (condition 8 on this
+  side; what the client's shown configuration holds is slice D).
+- `--people-networks A,B` (env `KITH_PEOPLE_NETWORKS`; needs `--people`) names what a level's
+  `networks` may hold: a level's network outside them, or overlapping the mesh /48, the people
+  /64, 100.89.0.0/16, 100.88.0.0/16 or the pods' range (`--pod-range`), is left out with a note (condition 7: narrows, never widens). A Service reached only on UDP
+  is left out (an empty port list means all ports). A level that names an `exit` has no internet
+  until slice E2 ("exit X is not held yet").
+- Two peers with one address or key are both left out, as is an address that is the range's first
+  two or its last (condition 5). A level the store does not
+  have leaves its people out. What was left out, and why, is the Node's `peopleNotes` (up to 16
+  lines of 200 characters; a worker may say only its own).
+
+Not built: a conntrack flush for a peer deleted while kithd was down; the node's own IPv6 links
+in the table's link list (IPv4 only); the kithd resolver's own `may_forward` check that a people
+prefix may be forwarded to (condition 8's other half); a start failure's reason beyond stderr;
+exit levels, the Service listener and per-peer limits (slice E2).
 
 ## Open
 

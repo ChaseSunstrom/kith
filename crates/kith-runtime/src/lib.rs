@@ -22,7 +22,7 @@ pub use container::{
     Awaited, Handle, Mount, NODE_ROOT, ROOTS, Runtime, Undeleted, Unit, exec_shim, plugged, reap_orphans,
     spawn_awaited, started, tune,
 };
-pub use image::{Image, ImageStore, Local, PullPolicy, registry, repository};
+pub use image::{Image, ImageStore, Local, PullPolicy, Unpacking, registry, repository, sha256_hex};
 pub use outside::{Patience, read_capped};
 pub use seccomp::REFUSED;
 

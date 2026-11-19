@@ -25,6 +25,19 @@ if [ "${1:-}" = --tests ]; then
     printf '%s\n' "$built" | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1
     exit 0
 fi
+# KITHD_FEATURES=forge: the test build whose leader can append an entry it was not asked for
+# (crates/kithd/src/forge.rs, ci/vm/access.sh). In a target directory of its own, and only
+# that: the release build below, the one budgets.py weighs and os/build.sh ships, never
+# has the feature, and a build for one does not rebuild the other.
+case "${KITHD_FEATURES:-}" in
+    '') ;;
+    forge)
+        CARGO_TARGET_DIR="$dir/forge" cargo build --release --quiet --target "$target" -p kithd -p kith-cli --features kithd/forge >&2
+        echo "$dir/forge/$target/release"
+        exit 0
+        ;;
+    *) echo "musl.sh: KITHD_FEATURES knows: forge" >&2; exit 1 ;;
+esac
 out="$dir/$target/release"
 # kith with TLS to a node (cargo feature remote) is built first and kept as kith-remote, beside
 # the default kith, which the size budget weighs; the default build after it leaves kith as it was.
@@ -34,6 +47,13 @@ if [ "${KITH_MUSL_REMOTE:-}" = 1 ]; then
     cp "$out/kith" "$out/kith-remote"
 fi
 cargo build --release --quiet --target "$target" -p kithd -p kith-cli >&2
+# Whatever the environment held, this kithd is the one that ships: it has no forge route. (Not
+# "/v1/forge" alone: it is the start of "/v1/forget", which kithd has; the startup line of a
+# forge build is the other thing only that build has.)
+if grep -aqE '/v1/forge([^t]|$)|built with forge: ' "$out/kithd"; then
+    echo "musl.sh: $out/kithd has the forge route in it: a build that ships has none" >&2
+    exit 1
+fi
 # cargo reads a relative CARGO_TARGET_DIR from here; the line printed is absolute (order.py
 # matches it against /proc's maps).
 echo "$out"

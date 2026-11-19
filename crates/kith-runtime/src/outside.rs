@@ -99,9 +99,13 @@ fn human(bytes: usize) -> String {
 }
 
 /// `bytes`' digest, as `sha256:HEX`.
-fn digest_of(bytes: &[u8]) -> String {
+pub(crate) fn digest_of(bytes: &[u8]) -> String {
     format!("sha256:{}", keyless::hex(&keyless::sha256(bytes)))
 }
+
+/// An image as [`Remote::image`] describes it: manifest, its digest, config text, the index's
+/// digest (when there was one), and the manifest's text.
+pub(crate) type Described = (OciImageManifest, String, String, Option<String>, String);
 
 /// The registry an image is pulled from, asked for its metadata by kith's own reads: a manifest,
 /// a config and a referrers index are read with a cap (oci-client reads each whole), within the
@@ -201,6 +205,14 @@ impl Remote {
     /// The manifest `at` names (by digest, or else by tag: `latest` when neither) and its digest.
     /// A digest that is named must be the manifest's.
     pub(crate) async fn manifest(&self, at: &Reference) -> Result<Lookup<(OciManifest, String)>> {
+        Ok(match self.manifest_text(at).await? {
+            Lookup::Found((manifest, digest, _)) => Lookup::Found((manifest, digest)),
+            Lookup::Missing(said) => Lookup::Missing(said),
+        })
+    }
+
+    /// [`manifest`](Self::manifest) with the manifest's bytes (as text), which the digest is of.
+    async fn manifest_text(&self, at: &Reference) -> Result<Lookup<(OciManifest, String, String)>> {
         let name = at.digest().or(at.tag()).unwrap_or("latest");
         let body = match self
             .get(at, &format!("manifests/{name}"), &[], MANIFEST_TYPES, METADATA_LIMIT)
@@ -214,25 +226,28 @@ impl Remote {
             return err(format!("the manifest of {at} is {digest}, not {name}"));
         }
         let manifest: OciManifest = serde_json::from_slice(&body).ctx(format!("reading the manifest of {at}"))?;
-        Ok(Lookup::Found((manifest, digest)))
+        let text = String::from_utf8(body).ctx(format!("the manifest of {at} is not UTF-8"))?;
+        Ok(Lookup::Found((manifest, digest, text)))
     }
 
     /// What `pull_signed` needs of the image `at`: its manifest and that manifest's digest, its
     /// config (as JSON text), and, when `at` is an index, the index's digest (the manifest is
-    /// the entry picked for this platform).
-    pub(crate) async fn image(&self, at: &Reference) -> Result<(OciImageManifest, String, String, Option<String>)> {
-        let (top, top_digest) = match self.manifest(at).await? {
+    /// the entry picked for this platform). The manifest's text, last, is what the digest is of.
+    pub(crate) async fn image(&self, at: &Reference) -> Result<Described> {
+        let (top, top_digest, top_text) = match self.manifest_text(at).await? {
             Lookup::Found(found) => found,
             Lookup::Missing(said) => return err(said),
         };
-        let (manifest, digest, list) = match top {
-            OciManifest::Image(manifest) => (manifest, top_digest, None),
+        let (manifest, digest, list, text) = match top {
+            OciManifest::Image(manifest) => (manifest, top_digest, None, top_text),
             OciManifest::ImageIndex(index) => {
                 let Some(platform) = current_platform_resolver(&index.manifests) else {
                     return err(format!("no entry of {at} is for this platform"));
                 };
-                match self.manifest(&at.clone_with_digest(platform)).await? {
-                    Lookup::Found((OciManifest::Image(manifest), digest)) => (manifest, digest, Some(top_digest)),
+                match self.manifest_text(&at.clone_with_digest(platform)).await? {
+                    Lookup::Found((OciManifest::Image(manifest), digest, text)) => {
+                        (manifest, digest, Some(top_digest), text)
+                    }
                     Lookup::Found(_) => return err(format!("the entry of {at} for this platform is not an image")),
                     Lookup::Missing(said) => return err(said),
                 }
@@ -256,7 +271,7 @@ impl Remote {
             return err(format!("the config of {at} is not {config}"));
         }
         let config = String::from_utf8(body).ctx(format!("the config of {at} is not UTF-8"))?;
-        Ok((manifest, digest, config, list))
+        Ok((manifest, digest, config, list, text))
     }
 
     /// The referrers of `digest` in `at`'s repository of `artifact_type`, as the registry's index

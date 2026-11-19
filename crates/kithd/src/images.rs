@@ -985,6 +985,18 @@ mod tests {
         );
         assert_eq!(again.digest, digest);
         assert_eq!(again.downloaded, 0, "an unchanged Image's layer was downloaded again");
+        // And the root part is not asked to unpack what is here.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let hook = |_: String, _: String, _: Vec<std::fs::File>| -> kith_runtime::Unpacking {
+            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err("nothing to unpack".to_string()) })
+        };
+        own.pull_with(&reference, always, &[], &hook).await.unwrap();
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a cached Image was unpacked again"
+        );
         state.lock().unwrap().delete("Image/default/hello").unwrap();
         for policy in [
             kith_runtime::PullPolicy::IfNotPresent,

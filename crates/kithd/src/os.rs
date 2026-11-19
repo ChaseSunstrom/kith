@@ -344,7 +344,7 @@ pub fn into_slot(
     vouched: impl FnOnce(&[u8]) -> Result<(), String>,
     ahead: bool,
 ) -> Result<Written, String> {
-    let into = if slot == 'a' { 'b' } else { 'a' };
+    let into = other(slot);
     let part = |name: String| crate::init::labelled(&name).ok_or(format!("no partition is labelled {name}"));
     let (root, verity) = (part(format!("root-{into}"))?, part(format!("verity-{into}"))?);
     esp(|esp| {
@@ -363,21 +363,83 @@ pub fn into_slot(
     })?
 }
 
+/// The slot an update is written into, beside `slot` (the one that runs).
+pub fn other(slot: char) -> char {
+    if slot == 'a' { 'b' } else { 'a' }
+}
+
+/// The kernel image on the ESP for `slot`: the newest, counting its tries (`counting`), or
+/// the good one.
+fn image(esp: &Path, slot: char, counting: bool) -> Result<PathBuf, String> {
+    let newest = entries(esp)
+        .into_iter()
+        .filter(|(_, _, its, tries)| *its == slot && tries.is_some() == counting)
+        .max_by_key(|(_, generation, ..)| *generation);
+    newest
+        .map(|(name, ..)| esp.join(name))
+        .ok_or(format!("no kernel image for slot {slot} on the ESP"))
+}
+
+/// The good kernel image of `slot` as it is on the ESP: the image that runs from it.
+pub fn running_image(esp: &Path, slot: char) -> Result<Vec<u8>, String> {
+    let from = image(esp, slot, false)?;
+    std::fs::read(&from).map_err(|e| format!("reading {}: {e}", from.display()))
+}
+
+/// The header of the update that wrote `slot`, kept with its signature and key (`os-release-signed-`
+/// and the slot: the signature and the key's hex, a line each, then the header block).
+pub fn keep_signed(
+    state: &Path,
+    slot: char,
+    signature: Option<&str>,
+    public: Option<&str>,
+    block: &[u8],
+) -> Result<(), String> {
+    let (Some(signature), Some(public)) = (signature, public) else {
+        return Err("the release is not signed: it names no publicKey, or no signature".into());
+    };
+    let mut bytes = format!("{signature}\n{public}\n").into_bytes();
+    bytes.extend_from_slice(block);
+    let file = state.join(format!("os-release-signed-{slot}"));
+    crate::pki::write_whole(&file, &bytes)
+        .map_err(|e| format!("keeping the release's header ({}): {e}", file.display()))
+}
+
+/// What [`keep_signed`] kept for `slot`: the signature, the key, and the header block.
+pub fn kept_signed(state: &Path, slot: char) -> Result<(String, String, Vec<u8>), String> {
+    let file = state.join(format!("os-release-signed-{slot}"));
+    let bytes = std::fs::read(&file).map_err(|e| format!("no release header is kept for slot {slot} ({e})"))?;
+    let text = |line: Option<&[u8]>| line.and_then(|line| std::str::from_utf8(line).ok()).map(str::to_string);
+    let mut parts = bytes.splitn(3, |byte| *byte == b'\n');
+    match (text(parts.next()), text(parts.next()), parts.next()) {
+        (Some(signature), Some(public), Some(block)) => Ok((signature, public, block.to_vec())),
+        _ => Err(format!("the release header kept for slot {slot} is not what was kept")),
+    }
+}
+
+/// The version `block` (a header) names, when its piece for `slot` is the image that `running`
+/// is: the one check that a kept header is the system's own.
+pub fn piece_of(block: &[u8], slot: char, running: &[u8]) -> Result<String, String> {
+    let header = header(block)?;
+    let name = slot.to_string();
+    let promised = header
+        .pieces
+        .iter()
+        .find(|piece| piece.name == name)
+        .map(|piece| piece.sha256.to_ascii_lowercase());
+    match promised {
+        Some(promised) if promised == sha256(running) => Ok(header.version),
+        _ => Err(format!(
+            "the image that runs is not the piece the release names for slot {slot}"
+        )),
+    }
+}
+
 /// The boot files on the ESP for `running` (its image, marked good) and `into` (the one
 /// just written, still counting its tries), where `block` is the header of what was written.
 fn boots(esp: &Path, running: char, into: char, block: &[u8]) -> Result<Boots, String> {
-    let listed = entries(esp);
-    let find = |slot: char, counting: bool| {
-        let newest = listed
-            .iter()
-            .filter(|(_, _, its, tries)| *its == slot && tries.is_some() == counting)
-            .max_by_key(|(_, generation, ..)| *generation);
-        newest
-            .map(|(name, ..)| esp.join(name))
-            .ok_or(format!("no kernel image for slot {slot} on the ESP"))
-    };
     let read = |from: PathBuf| std::fs::read(&from).map_err(|e| format!("reading {}: {e}", from.display()));
-    let (running, new) = (read(find(running, false)?)?, read(find(into, true)?)?);
+    let (running, new) = (running_image(esp, running)?, read(image(esp, into, true)?)?);
     let promised = header(block)?
         .pieces
         .into_iter()
@@ -408,6 +470,35 @@ mod tests {
 
     fn sha(bytes: &[u8]) -> String {
         crate::pki::hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
+    }
+
+    /// The header kept for a slot is read back as it was written, and it vouches for the
+    /// image that runs only as the piece of its own slot: another image, or a slot with no
+    /// header kept, is no.
+    #[test]
+    fn seals_again_the_signed_header_is_kept_per_slot_and_bound_to_its_image() {
+        let dir = std::env::temp_dir().join(format!("kithd-os-signed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let running = b"the kernel image that runs".to_vec();
+        let all = packed(
+            &[("root", b""), ("verity", b""), ("a", b""), ("b", &running)],
+            &"0".repeat(64),
+        );
+        let block = all[..HEADER].to_vec();
+        assert!(kept_signed(&dir, 'b').is_err());
+        keep_signed(&dir, 'b', Some("signature"), Some("public"), &block).unwrap();
+        assert_eq!(
+            kept_signed(&dir, 'b'),
+            Ok(("signature".into(), "public".into(), block.clone()))
+        );
+        assert!(kept_signed(&dir, 'a').is_err());
+        assert!(keep_signed(&dir, 'a', None, Some("public"), &block).is_err());
+        assert_eq!(piece_of(&block, 'b', &running), Ok("9.9".to_string()));
+        assert!(piece_of(&block, 'b', b"another image").is_err());
+        assert!(piece_of(&block, 'a', &running).is_err());
+        assert_eq!((other('a'), other('b')), ('b', 'a'));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An update as os/update.sh packs it.

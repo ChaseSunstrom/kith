@@ -1,6 +1,6 @@
 /* kith's page, drawn as a line map: paper, ink, and one blue line (DESIGN.md, "Direction").
    The page's rail is the stem of the k in the bar, carried down; every part is a stop on it. */
-.paused *, .paused ::before, .paused ::after { animation-play-state: paused !important; }
+.paused *, .paused ::before, .paused ::after { animation-play-state: paused !important; transition: none !important; }
 button.button { font-family: inherit; cursor: pointer; }
 [hidden] { display: none !important; }
 
@@ -160,6 +160,14 @@ h1 { font-size: clamp(44px, 7.4vw, 100px); line-height: 0.98; letter-spacing: -0
 .map .rep:nth-of-type(2) { --k: -0.4s; }
 .map .rep:nth-of-type(3) { --k: -1.2s; }
 .map .wave { fill: var(--accent); stroke: var(--bg); stroke-width: 2; opacity: 0; }
+/* A machine that is lost (the script sets .gone on everything of its): its line is broken, its stop is a dashed red ring, and nothing runs to it. */
+.map .lines path.gone { stroke: var(--dim); stroke-dasharray: 1 9; }
+.map .stopped.gone { stroke: var(--bad); stroke-dasharray: 4 4; }
+.map text.gone { fill: var(--dim); }
+.map .packets circle.gone { opacity: 0; }
+.map .reps.gone path { stroke: var(--dim); }
+.map .reps.gone .rep.on { opacity: 0.5; }
+.map .reps path, .map .rep, .map .stopped, .map text { transition: stroke var(--enter), fill var(--enter), opacity var(--enter); }
 .live figcaption { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; margin: 14px 0 0; padding-top: 10px; border-top: var(--stroke) solid var(--text); font-weight: 400; font-size: var(--note); }
 .live code { font-weight: 700; color: var(--text); }
 @media (max-width: 860px) {
@@ -258,6 +266,19 @@ pre { background: var(--sunken); padding: 20px; line-height: 1.7; font-size: var
 .flow li:nth-child(3) { --n: 2; }
 .flow li:nth-child(4) { --n: 3; }
 
+/* Install: the installer's nine questions as stops, lit one after another, each a link to its place on the install page. */
+.stops { margin-top: 0; }
+.stops li { margin-top: 24px; }
+.stops b a { color: var(--text); text-decoration: none; background: linear-gradient(var(--accent), var(--accent)) no-repeat 0 100% / 0 var(--stroke); padding-bottom: 2px; transition: background-size var(--arrive) var(--ease); }
+.stops b a:hover { background-size: 100% var(--stroke); }
+.stops li:nth-child(5) { --n: 4; }
+.stops li:nth-child(6) { --n: 5; }
+.stops li:nth-child(7) { --n: 6; }
+.stops li:nth-child(8) { --n: 7; }
+.stops li:nth-child(9) { --n: 8; }
+.seen .stops li::before { transition-delay: calc(var(--n, 0) * var(--grow) / 4 + var(--reveal)); }
+@media (min-width: 861px) { .stops ol { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+
 /* A measure is a line run out to a stop; its budget is where the line would end. */
 .bars { display: grid; gap: 14px; padding-top: 18px; }
 .row { display: grid; grid-template-columns: 230px 1fr 150px; align-items: center; gap: 20px; font-size: var(--note); }
@@ -281,10 +302,30 @@ html:not(.js) .track { display: none; } /* a bar is drawn by the script: without
 .versus h3, .where h3 { font-size: var(--head); letter-spacing: -0.02em; margin-bottom: 12px; }
 .versus .panel { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr)); gap: 36px 48px; margin-block: 16px; padding-top: 18px; }
 .versus section { display: grid; gap: 20px; align-content: start; }
-.versus h4 { font-size: var(--small); letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim); border-bottom: 1px solid var(--dim); padding-bottom: 6px; }
-.vs { display: grid; grid-template-columns: 44px 1fr 132px; align-items: center; gap: 6px 14px; font-size: var(--note); }
-.vs p { grid-column: 1 / -1; font-weight: 700; }
-.vs b { text-align: right; white-space: nowrap; }
+.versus .vg { font-size: var(--note); font-weight: 700; color: var(--dim); border-bottom: 1px solid var(--dim); padding-bottom: 6px; margin: 0; }
+.versus section > .fine { margin: -10px 0 0; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 24px; margin: 18px 0 0; font-size: var(--note); }
+.legend span { display: inline-flex; align-items: center; gap: 8px; }
+.legend i { width: 28px; height: 14px; color: var(--accent); background: linear-gradient(currentColor, currentColor) no-repeat center / 100% var(--stroke); position: relative; }
+.legend i::after { content: ""; position: absolute; right: 0; top: 0; width: 14px; height: 14px; box-sizing: border-box; border: var(--stroke) solid currentColor; border-radius: 50%; background: var(--bg); }
+.legend .other i { color: var(--text); }
+/* A bar pair: the figure is printed where its bar ends (the last --r of the lane is kept for it). */
+.vs { display: grid; grid-template-columns: 40px minmax(0, 1fr); align-items: center; gap: 6px 14px; font-size: var(--note); }
+.vs p { grid-column: 1 / -1; font-weight: 700; margin: 0; }
+.lane { --r: 76px; position: relative; }
+.lane .track { margin-right: var(--r); }
+.lane b { position: absolute; top: 50%; left: 0; transform: translateY(-50%); white-space: nowrap; font-weight: 700; transition: left var(--grow) var(--ease); }
+.seen .lane b { left: calc(max(var(--v, 0) * (100% - var(--r)), 14px) + 10px); }
+.lane.other .track i, .lane.other b { transition-delay: var(--step); }
+.vs-table { margin-top: 20px; font-size: var(--note); }
+.vs-table summary { cursor: pointer; font-weight: 700; }
+.vs-table .scroll { overflow-x: auto; margin-top: 12px; }
+.vs-table table { width: 100%; border-collapse: collapse; }
+.vs-table th, .vs-table td { padding: 7px 14px 7px 0; border-bottom: 1px solid var(--hair); text-align: left; vertical-align: top; }
+.vs-table thead th { border-bottom: var(--stroke) solid var(--text); }
+.vs-table th[scope=rowgroup] { padding-top: 16px; font-size: var(--note); font-weight: 700; color: var(--dim); }
+.vs-table td:nth-child(n+3) { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.vs-table th:nth-child(n+3) { text-align: right; }
 .where .row { grid-template-columns: 150px 1fr 210px; }
 @media (max-width: 720px) {
   .where .row { grid-template-columns: 1fr auto; }
@@ -359,6 +400,17 @@ html:not(.js) .track { display: none; } /* a bar is drawn by the script: without
 .part.here::after { animation: ring var(--breath) ease-out infinite; }
 
 footer { max-width: calc(1120px + 2 * var(--gutter)); margin-inline: auto; padding: 20px var(--gutter) 48px calc(var(--gutter) + var(--rail)); font-size: var(--note); display: flex; flex-wrap: wrap; gap: 6px 32px; justify-content: space-between; }
+
+footer nav { display: flex; flex-wrap: wrap; gap: 6px 20px; font-weight: 600; }
+footer nav a { color: var(--text); text-underline-offset: 4px; text-decoration-color: var(--hair); }
+footer nav a:hover { text-decoration-color: var(--accent); }
+footer p { min-width: 0; overflow-wrap: anywhere; }
+
+/* 404.html: the map with one stop that is not there. It loads no script, so nothing there can be paused: its two loops end after three turns. */
+.still .map .halo, .still .mark .ring { animation-iteration-count: 3; }
+.hero.lost { display: block; min-height: 0; padding-block: 56px 72px; }
+.hero.lost .map { max-width: 340px; margin-top: 40px; }
+@media (max-width: 860px) { .hero.lost { padding-block: 32px 56px; } }
 
 /* What is in a part rises once, when the part is first seen; its stop on the rail is always there. */
 .js [data-see] > * { opacity: 0; transform: translateY(14px); transition: opacity var(--reveal) var(--ease), transform var(--reveal) var(--ease); }

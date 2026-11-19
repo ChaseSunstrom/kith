@@ -18,7 +18,7 @@ motion.onclick = () => {
 // What the installer accepts, as it checks it (install.rs, init.rs, policy.rs): said here first.
 const octets = s => { const p = s.split("."); return p.length === 4 && p.every(o => /^(0|[1-9][0-9]{0,2})$/.test(o) && +o <= 255); };
 const ipv6 = s => { try { return /^[0-9a-fA-F:.]{2,45}$/.test(s) && !!new URL(`http://[${s}]`); } catch { return false; } }; // the browser's own parser, as the installer's is a real one
-const KEYS = ["exec-units", "root-containers", "unconfined", "node-network", "vms", "vm-paths", "passthrough", "host-paths", "run", "wipe"];
+const KEYS = ["exec-units", "root-containers", "unconfined", "host-users", "node-network", "vms", "vm-paths", "passthrough", "host-paths", "run", "wipe"];
 const CLASSES = ["gpu", "display", "input", "audio", "usb", "camera", "other"];
 const policyWord = w => w === "hardened" || KEYS.includes(w) || (w.startsWith("no-") && KEYS.includes(w.slice(3)))
   || (w.startsWith("devices=") && (w === "devices=all" || w.slice(8).split("+").filter(Boolean).every(c => CLASSES.includes(c))));

@@ -23,8 +23,14 @@ kith package render packages/web --name shop | kith apply -f -
   then each `-f` file, then each `--set`, merged by key), `release.name`, `release.namespace`,
   `package.name`, `package.version`, `name` (the release's resource name: `shop-web`) and
   `labels`. `toYaml` and `tojson` write a value (`{{ v | toYaml | indent(4) }}`); `required(v,
-  "why")` stops with `why` when there is none. A missing value, a template that never ends or
-  writes over 1 MB is an error. A template reads only its package; `namespace()` is not there.
+  "why")` stops with `why` when there is none. `lookup(kind, namespace, name)` is the spec of a
+  live resource, `{}` when there is none (`(lookup('Secret', release.namespace, 'db').data |
+  default({})).password`): only in the release's own namespace, and only of kinds whoever applied
+  the Release may `get` and, for a package pushed here rather than fetched from the Release's
+  Repository, its pusher may `get` too (the template is the pusher's: it reads no more than they
+  may, as its output makes no more); with `kith package render` nothing is live. The Release is
+  rendered again when a resource it looked up, a Role or binding, or the Identity of its writer
+  or pusher changes; a namespace over 1 MB of specs fails the lookup. A missing value, a template that never ends or writes over 1 MB is an error. A template reads only its package; `namespace()` is not there.
 - Output is checked like any resource (an error shows the rendered line), put in the release's
   namespace unless it names one, and labelled `kith.dev/release` and `kith.dev/package`.
 - `values.schema.json` may use `type`, `properties`, `required`, `additionalProperties`, `items`,
@@ -37,7 +43,7 @@ A cluster installs a package itself: push the package, apply a `Release`.
 ```sh
 kith package push packages/web      # the package, as Package/web-0.1.0 in the store
 kith apply -f release.yaml
-kith get release/shop -n store -o yaml   # status: state, version, resources, notes
+kith get release/shop -n store -o yaml   # status: state, version, resources, notes, pending, history
 ```
 
 ```yaml
@@ -54,6 +60,8 @@ spec:
 | Rendering | The node that leads the store renders and applies again on a change to the Release, the package or shared values, and deletes what is no longer rendered (all of it, with the Release). `kith rollback release/shop --to N` goes back to an earlier Release. |
 | Values | Later over earlier: the package's defaults, the key `values` (YAML) of the ConfigMap `kith-system/kith-values`, the same in the Release's namespace, the Release's `spec.values`. |
 | `version` | One version (`1.2.0`) or a range (`^1.2`, `>=1, <3`); none is any version that is not a pre-release. A Release stays on the newest package that fits; `autoUpgrade: true` follows newer ones. Pushing a version again replaces it. |
+| `status.pending` | What moving a Release that stays to the newest package that fits would do: `{version, apply: [keys new or changed], delete: [keys no longer rendered]}`, or `{version, error}` when that version does not render; null when it follows or is current. It is the difference of the two renders, so a hand edit does not change it. Each pinned Release with a newer fitting package costs one extra render. |
+| `status.history` | The versions installed, `{version, revision, at}` (the Release's revision, unix seconds), newest last, the last ten; a spec edit at the same version adds none, a move back to an older one adds one. A Release installed before this version gets its first entry when kithd is upgraded, so its `at` is that time. |
 | What it owns | What a release installed is annotated `kith.dev/owned-by` with the Release's key and listed in its status; only what is both is deleted when no longer rendered (`kith apply` refuses a resource annotated as a Release's when there is no such Release). |
 | What it refuses | To take over what is there and not its own, to leave its namespace, to make a Node, Package, Release, Source or `kith-values` ConfigMap. This, or a failing template, is `state: error` with the reason in `message`; what was installed stays. |
 | Whose rights | A Release acts with the rights of whoever applied it (or rolled it back), which kithd writes down as `kith.dev/written-by`; what a client says there is not taken. Each render asks for every resource, what it reaches (a Backup's Volume and Secret, a Share's Volume, a CronJob's Jobs) and each deletion as if that writer applied it. |
@@ -94,8 +102,8 @@ spec:
 | Fetched | It has no pusher: the Repository's key is its trust, so whoever may apply a Repository gives the rights of every Release that names it. Only kithd's fetcher sets `kith.dev/repository`: an apply or a Source's file that carries it is refused. |
 | Reaching a registry | `kith` goes through kithd. Plain HTTP only to a registry on the same machine. |
 
-Not yet: `dependencies` are read and nothing more; no hooks, no lookup of cluster objects from a
-template, no registry credentials.
+Not yet: `dependencies` are read and nothing more; no hooks, no `lookup` outside the release's
+namespace or in `.kith` files, no registry credentials.
 
 ### A desktop is a package
 

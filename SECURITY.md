@@ -467,7 +467,7 @@ Only the newest version is fixed. There are no security releases of older ones.
 ## What splitting kithd in two would and would not change
 
 Design in `docs/adr-privilege.md` (T-0334). Built today: the node's own policy and the
-typed request list's seam (`crates/kithd/src/root_part.rs`, listeners only), in one
+typed request list's seam (`crates/kithd/src/root_part.rs`, for listeners, pods and the mesh), in one
 process. There is no second process yet, so everything below is what the split is for,
 not what a node has.
 
@@ -531,7 +531,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   word: `exec` units (`no-exec-units`); containers that would be the node's root, which
   is root in one that keeps the node's users, not root in a pod's range of its own
   (`no-root-containers`); `seccomp` unconfined or with
-  refused calls allowed back (`no-unconfined`); containers on the node's own network
+  refused calls allowed back, `nested` included (`no-unconfined`); containers that keep the
+  node's own users with no range of ids of their own, as a NodeWorkload's do (`no-host-users`);
+  containers on the node's own network
   (`no-node-network`); VMs (`no-vms`), a VM's kernel, firmware or disks as paths on the
   node or another hypervisor than qemu (`no-vm-paths`), PCI devices handed to a VM
   (`no-passthrough`); a Volume of `kith-system`, which is a directory anywhere on the
@@ -542,7 +544,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   what the node itself finds its hardware to be: one whose class, path or further nodes
   the store says otherwise, or one written by hand, is not handed out there (the store
   could call the node's disk a GPU). `hardened` is all of them off, with a GPU the only
-  Device. What a node refuses is not run there and the Workload's status says which word
+  Device; it also stops NodeWorkloads (DaemonSets), whose containers keep the node's users:
+  turn `host-users` back on to run them. (`host-users` holds a container's `host_users`, a
+  NodeWorkload's; a container given a device, or a mount on a file system that cannot be
+  id-mapped, keeps the node's users too, without it.) What a node refuses is not run there and the Workload's status says which word
   refused it; the Node's status says its policy. Every word is on where nothing is said:
   **a node with no policy is as before, and the paragraph above is all there is.** The
   scheduler places a Workload or Job only on nodes whose status says they allow what it
@@ -570,9 +575,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   write `/proc/sys` with file permissions alone; neither is covered by the cut. Untried on
   a cut node: a VM (qemu would be exec'd with the fourteen; `vm-paths` off already leaves
   no VM of use) and a passthrough device (vfio may want `IPC_LOCK` or a memlock limit,
-  which the list does not have); no VM test runs either. A pod on a hardened node can still be root inside
-  a user namespace of its own, with what that gives (above), and a container that keeps the node's
-  users and is not root is still the node's user of its number, with whatever files on
+  which the list does not have); no VM test runs either. On a hardened node a pod with `userNamespaces`
+  (which takes `unconfined`) and a NodeWorkload's container (which takes `host-users`) are not run; a
+  container that keeps the node's users for another reason (a device, or a mount that cannot be
+  id-mapped) and is not root is still the node's user of its number, with whatever files on
   the node that user owns; one that would be of root's group (its image says `1001:0`,
   say) is refused as root is. The policy is no defence against whoever can write the node's config partition
   or kithd's arguments and environment where it is started (`KITH_NODE_POLICY` and the
@@ -635,13 +641,24 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   through the log); the node's own check before start still refuses an unlisted namespace.
   Of the node itself, an exit's pod reaches nothing (only answers to the node's own
   questions of it go back). A running pod keeps its tunnel after its namespace is taken
-  off its Exit's list, until it starts again (the node's check is at start). No NetworkPolicy's egress rules are enforced, for an exit's pod or any other (a
-  policy with them says so in its status). Not tested: a tunnel's link or table taken
+  off its Exit's list, until it starts again (the node's check is at start). Not tested: a tunnel's link or table taken
   away by hand on a running node (the code that makes it again is tested in a network
   namespace, not on kith OS), ICMP through or around a tunnel, kithd killed between
   starting a pod and making its rules (the rules come first; nothing shows the order
   holds under a kill), and names a pod's own resolver library cached before its exit
   changed.
+- **A NetworkPolicy's egress rules hold a pod's packets, on kith OS as root and for pod Workloads
+  and Jobs only.** The pods of the Workloads and Jobs a policy selects, an exit's pod included,
+  pass only what a rule allows, DNS included. Each pod is matched per pod link: its rules are the
+  chain `e-kpN` (`e-kpxN` for an exit's pod) in the node's `inet kith-pods` table, and its source
+  address is checked apart, so a packet from another address on its link is dropped. Exec and VM
+  Workloads are not held, and nothing is written when kithd is not root. A policy with a peer by
+  `namespace` or `selector`, or whose rules are not yet written on a node, says `partial` in its
+  status; `enforced` once they are. kithd writes the rules again when a policy changes. A peer
+  `cidr` that cannot be read is refused when the policy is submitted; a stored one (a log an
+  older version took) fails closed: a deny rule with a cidr that cannot be read denies every
+  address in its direction, and an allow rule with one lets nothing through. Not tested: a policy
+  changing under a running pod; access returning after the policy is deleted.
 - **What a replica writes outside its Volumes is held at the write where the state disk
   keeps project quotas, and counted elsewhere.** Its containers' writable roots and its
   disk scratch share the node's state disk. Where the state disk keeps project quotas (a
@@ -887,9 +904,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     What a worker may write is a list the control node it writes to holds it to,
     against that node's own store: what it says of the replicas the scheduler gave it
     (how many are ready is counted again; a unit's address has to be in the worker's
-    own part of the mesh), `os`, `mesh`, `serves` and `thumbprint` in its own Node's
-    status (not a mesh key another Node says, which would cut both off; a thumbprint
-    in a thumbprint's shape), its own NodeKey once, the Devices
+    own part of the mesh), `os`, `mesh`, `serves`, `thumbprint` and `alone` in its own
+    Node's status (not a mesh key another Node says, which would cut both off; a thumbprint
+    in a thumbprint's shape; `alone` null, or the times it ran alone and its risks), its own NodeKey once, the Devices
     and Seats whose `spec.node` is the worker (under a name that starts with the
     worker's own, with the labels discovery writes and no other, the node and the
     class among them its own), the status of an Image or a Backup of
@@ -945,7 +962,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     was deleted or made a worker meanwhile is still a control node to it. A worker
     that starts again meanwhile runs nothing until a control node answers (what
     was moved off it while it was away is not known to it), as any node that
-    starts with no leader in reach. Its API
+    starts with no leader in reach, unless its Node says `alone: run`
+    ([a node away from its cluster](docs/guide/cluster.md#a-node-away-from-its-cluster)). Its API
     port answers no person, reads included: it has no Identity and no Role to answer
     by (`this node is a worker and answers no one by their rights: ask a control
     node`). What a control node passes on to it for someone (a unit's output, `kith

@@ -11,6 +11,9 @@
 //!                              PASSWORD says, writing nowhere (its root may take no file)
 //!   pod ask HOST PORT [...]    ask each 40 times, and say each different answer's first
 //!                              and last line once, to /dev/stdout opened by that name
+//!   pod once HOST PORT [...]   knock each once (two seconds): say "HOST:PORT answered: FIRST
+//!                              LAST" (then one request's first and last line), "refused" (a
+//!                              reset), or "silent" (nothing back), one line each
 //!   pod seen DIR [SOCKET]      for as long as it runs, say the names in DIR each time they
 //!                              change: those it can open with a `+`, the others with a `-`;
 //!                              and answer whoever connects to SOCKET (a path) with a line
@@ -84,6 +87,22 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
+
+/// The signals ignored when the program began (SigIgn of its status), as its parent left them.
+/// Rust's runtime ignores SIGPIPE before `main`, so `main` reads a later SigIgn with that bit
+/// always set: this is read earlier, from `.init_array`, which the C runtime runs first.
+static INHERITED_SIGIGN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[used]
+#[unsafe(link_section = ".init_array")]
+static READ_SIGIGN: extern "C" fn() = {
+    extern "C" fn read_sigign() {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let found = status.lines().find_map(|l| l.strip_prefix("SigIgn:")).unwrap_or("?");
+        let _ = INHERITED_SIGIGN.set(found.trim().to_string());
+    }
+    read_sigign
+};
 
 /// The byte at `i` of what `pod check` sends: one no lost, doubled or swapped byte keeps in
 /// place (251 is prime, and no buffer's size is a multiple of it).
@@ -616,6 +635,28 @@ fn main() {
                 writeln!(out, "{line}").expect("a line out");
             }
         }
+        // Once each, two seconds at most (knocked): the egress cases, where a denied packet
+        // hangs and asking forty times would take minutes.
+        ["once", pairs @ ..] if !pairs.is_empty() && pairs.len() % 2 == 0 => {
+            let out = std::fs::OpenOptions::new().write(true).open("/dev/stdout");
+            let mut out = out.expect("/dev/stdout, by its name");
+            for pair in pairs.chunks(2) {
+                let resolved = std::net::ToSocketAddrs::to_socket_addrs(&(pair[0], pair[1].parse::<u16>().expect("a port")))
+                    .ok()
+                    .and_then(|mut found| found.next());
+                let said = match resolved {
+                    None => "unresolved".to_string(),
+                    Some(addr) => match knocked(addr) {
+                        "answered" => match asked(pair[0], pair[1]) {
+                            Ok(first_last) => format!("answered: {first_last}"),
+                            Err(e) => format!("answered, then failed: {e}"),
+                        },
+                        state => state.to_string(),
+                    },
+                };
+                writeln!(out, "{}:{} {said}", pair[0], pair[1]).expect("a line out");
+            }
+        }
         // NAME...: the addresses this container's resolver gives each (what /etc/resolv.conf
         // says), on stdout, sorted; what it says when it gives none.
         ["lookup", names @ ..] if !names.is_empty() => {
@@ -765,6 +806,11 @@ fn main() {
             let stat = std::fs::read_to_string("/proc/self/stat").expect("its stat");
             let start = stat.rsplit(") ").next().and_then(|rest| rest.split(' ').nth(19)).unwrap_or("?");
             println!("tick: process {} started at {start}", std::process::id());
+            // The signals it has blocked (SigBlk of its status): kithd's own mask is not its pods'.
+            let status = std::fs::read_to_string("/proc/self/status").expect("its status");
+            let blocked = status.lines().find_map(|l| l.strip_prefix("SigBlk:")).unwrap_or("?").trim();
+            println!("tick: blocked {blocked}");
+            println!("tick: ignored {}", INHERITED_SIGIGN.get().map_or("?", |s| s.as_str()));
             let last: u64 = times.first().map_or(u64::MAX, |n| n.parse().expect("N"));
             for n in 1..=last {
                 println!("tick {n}");

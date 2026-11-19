@@ -351,6 +351,42 @@ def rail(pages, decisions, here):
             '<p class="rail-group">Decisions and reviews</p><ol class="stops">' + "".join(stop(p) for p in decisions) + "</ol>")
 
 
+NUMBERS = "docs/guide/numbers.md"
+DRAWN = '<div class="versus" id="versus" hidden>\n<p class="fine" id="versus-said"></p>\n<div class="panel" id="versus-chart" data-level="h3"></div>\n</div>'
+# The rows docs/chart.js draws (title, unit, [(name, key)]), then the rows it only tabulates: the guide's table is made here, so a
+# reader without scripts has the numbers. self_test keeps this list and chart.js's the same.
+ROWS = [
+    ("Memory in use", "MB", [("On an idle node: the first node, or the server", "control"), ("On an idle node: another node, or an agent", "worker"), ("What each replica of 30 adds", "each")]),
+    ("CPU in use on an idle node", "% of a CPU", [("The first node, or the server", "cpu"), ("Another node, or an agent", "cpu2")]),
+    ("Starting and changing", "s", [("From switching a machine on to a node that is ready (k3s's includes Alpine's boot)", "ready"), ("From apply to a ready container, its image on the node", "apply"), ("One workload of 30 replicas: until all are ready", "scale"), ("20 workloads at once: until all are ready", "burst"), ("A change to a workload of 6 replicas: until all 6 run it", "roll"), ("A container that exits: until it runs again", "crash"), ("A Job that does nothing: until it has succeeded", "job")]),
+    ("A node lost: until its replica is ready on another", "s", [("As each system comes", "lost"), ("Each told to wait about a minute", "lost60")]),
+    ("Requests through a Service to 3 web servers (more is better)", "a second", [("A connection each", "rps"), ("Over connections that are kept", "kept")]),
+    ("How long those requests took", "ms", [("Half took under", "p50"), ("99 in 100 under", "p99")]),
+    ("Not measured alike", "MB", [("On the first node's disk at the end: for kith what its disk file has ever had written, for k3s what df says is in use", "disk")]),
+]
+
+
+def embedded_numbers(n):
+    """docs/numbers.json as the one line a page embeds: a '<' is written \\u003c, so no figure's text can end the script."""
+    return json.dumps(n).replace("<", "\\u003c")
+
+
+def drawn_table(n):
+    """The same numbers as the bars, as a table in the HTML (docs/chart.js makes its own on the front page)."""
+    def say(v):
+        return f"{int(v) if float(v).is_integer() else v:,}"
+    rows = ""
+    for title, unit, keys in ROWS:
+        keys = [(name, key) for name, key in keys if n.get(f"cmp.kith.{key}") is not None and n.get(f"cmp.k3s.{key}") is not None]
+        if keys:
+            rows += f'<tr><th scope="rowgroup" colspan="4">{esc(title)}</th></tr>'
+            rows += "".join(f'<tr><th scope="row">{esc(name)}</th><td>{esc(unit)}</td><td>{say(n["cmp.kith." + key])}</td><td>{say(n["cmp.k3s." + key])}</td></tr>' for name, key in keys)
+    if not rows:
+        return ""
+    return ('<details class="vs-table"><summary>The same numbers as a table</summary><div class="scroll"><table><thead><tr><th scope="col">Row</th><th scope="col">Unit</th>'
+            '<th scope="col">kith</th><th scope="col">k3s</th></tr></thead><tbody>' + rows + "</tbody></table></div></details>")
+
+
 def shell(title, description, up, rail_html, body, foot, source=None):
     return f"""<!doctype html>
 <html lang="en" data-root="{up}">
@@ -363,7 +399,7 @@ def shell(title, description, up, rail_html, body, foot, source=None):
 <link rel="icon" href="{ICON}">
 <link rel="stylesheet" href="{up}site.css">
 <link rel="stylesheet" href="{up}docs.css">
-<script src="{up}docs.js" defer></script>
+{f'<script src="{up}chart.js" defer></script>' + chr(10) if source == NUMBERS else ''}<script src="{up}docs.js" defer></script>
 </head>
 <body>
 <!-- Made by ci/site_docs.py{f' from {source}' if source else ''}: change the markdown, then run it again. -->
@@ -421,7 +457,13 @@ def build():
         near = [("Previous", "prev", allp[n - 1]) if n else None, ("Next", "next", allp[n + 1]) if n + 1 < len(allp) else None]
         links = "".join(f'<a class="{r}" rel="{r}" href="{posixpath.relpath(q.out, posixpath.dirname(p.out))}"><span>{w}</span>{esc(q.label)}</a>' for w, r, q in filter(None, near))
         foot = f'<footer class="tail"><nav aria-label="Previous and next pages">{links}</nav><p class="fine">This page is <a href="{REPO}/blob/main/{p.src}">{p.src}</a>.</p></footer>'
-        body = f'<article>\n{p.doc.body}\n</article>'
+        text = p.doc.body
+        if p.src == NUMBERS:  # the bars are drawn in the browser (docs/chart.js) from the numbers this page embeds
+            nums = json.loads((ROOT / "docs/numbers.json").read_text(encoding="utf-8"))
+            text = text.replace('<h2 id="what-each-row-is">', DRAWN + "\n" + drawn_table(nums) + '\n<h2 id="what-each-row-is">', 1)
+            assert DRAWN in text, f"{NUMBERS} has lost the heading the drawn numbers go before"
+            text += '\n<script id="measured" type="application/json">' + embedded_numbers(nums) + "</script>"
+        body = f'<article>\n{text}\n</article>'
         out[p.out] = shell(p.title, p.doc.summary(), up, rail(pages, notes, p), body, foot, p.src)
     out["docs/guide/index.html"] = shell("The guide", "kith's guide and the decisions behind it, one page for each part.", "../", rail(pages, notes, None), index_body(pages, notes), "")
     search = [{"u": "guide/index.html", "t": "The guide", "h": ""}]
@@ -493,6 +535,46 @@ def used_tokens():
     return sorted(set(re.findall(r"var\((--[\w-]+)", mine)) - have - own)
 
 
+HAND = ["docs/index.html", "docs/install.html", "docs/404.html"]
+LOOK = re.compile(r'(?<![\w-])(?:href|src|srcset)="([^"]*)"')
+IDS = re.compile(r'(?<![\w-])id="([^"]+)"')
+TITLE = re.compile(r"<title>\s*[^<\s][^<]*</title>")
+OG = r'<meta property="%s" content="\s*[^"\s][^"]*"'
+
+
+def hand_problems():
+    """The pages written by hand: each relative link goes to a file of docs/ (and its #anchor to an id there); the two that
+    are shared and found need a title, a description and a type for what shows a link."""
+    found, problems = {}, []
+    for rel in HAND:
+        page = ROOT / rel
+        text = page.read_text(encoding="utf-8")
+        for url in LOOK.findall(text):
+            if url.startswith(("#", "data:", "mailto:")) or SCHEME.match(url) or url.startswith("//"):
+                if url.startswith("#"):
+                    found.setdefault(rel, set()).update([url])
+                continue
+            path, _, anchor = url.partition("#")
+            target = ROOT / "docs" / path
+            if not target.resolve().is_relative_to(ROOT / "docs") or not target.is_file():
+                problems.append(f"{rel}: {url} is not a file of docs/")
+            elif anchor and target.suffix == ".html" and anchor not in IDS.findall(target.read_text(encoding="utf-8")):
+                problems.append(f"{rel}: {url} has no #{anchor} on that page")
+        for url in found.get(rel, ()):
+            if url != "#" and url[1:] not in IDS.findall(text):
+                problems.append(f"{rel}: {url} has no id on the page")
+    for rel in HAND:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        if not TITLE.search(text):
+            problems.append(f"{rel}: no title")
+        for prop in ["og:title", "og:description", "og:type"] if rel.endswith("index.html") else []:
+            if not re.search(OG % prop, text):
+                problems.append(f"{rel}: no {prop}, or it is empty")
+        if rel != "docs/install.html" and not re.search(r'<meta name="description" content="\s*[^"\s]', text):
+            problems.append(f"{rel}: no description")
+    return problems
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--check", action="store_true")
@@ -501,7 +583,8 @@ def main():
     if args.self_test:
         return self_test()
     out, problems = build()
-    stale = [f for f, text in out.items() if not (ROOT / f).is_file() or (ROOT / f).read_text(encoding="utf-8") != text]
+    problems += hand_problems()
+    stale =[f for f, text in out.items() if not (ROOT / f).is_file() or (ROOT / f).read_text(encoding="utf-8") != text]
     # what is ours and no longer made: the pages of docs/guide, and the ADR and review pages of docs/. Never another docs/*.html.
     ours = [*(ROOT / "docs/guide").glob("*.html"), *(ROOT / "docs").glob("adr-*.html"), *(ROOT / "docs").glob("security-review-*.html")]
     stale += [str(f.relative_to(ROOT)) for f in ours if str(f.relative_to(ROOT)) not in out]
@@ -572,6 +655,18 @@ def self_test():
     # a summary skips a paragraph that only introduces what follows
     eq(one("# T\n\nThe parts:\n\n- a\n\nReal one.").summary(), "Real one.")
     eq(one("# T\n\nOnly this:\n").summary(), "Only this:")
+    # docs/chart.js draws the rows ROWS tabulates, in the same order, with the same words
+    js = (ROOT / "docs/chart.js").read_text(encoding="utf-8")
+    assert re.findall(r'^\s*\["([^"]+)", "([^"]+)", \[', js, re.M) == [(t, u) for t, u, _ in ROWS], "docs/chart.js's groups are not site_docs.py's ROWS"
+    assert re.findall(r'\["([^"]+)", "(\w+)"\]', js) == [r for _, _, rows in ROWS for r in rows], "docs/chart.js's rows are not site_docs.py's ROWS"
+    assert embedded_numbers({"a": "</script>"}) == '{"a": "\\u003c/script>"}'
+    table = drawn_table({"cmp.kith.disk": 1234, "cmp.k3s.disk": 2.0})
+    assert "<td>1,234</td><td>2</td>" in table and "<td>" in table and drawn_table({}) == ""
+    # the pages written by hand: the links resolve and the landing page carries its metadata
+    assert hand_problems() == [], hand_problems()
+    assert LOOK.findall('<a href="x.html#a"><source srcset="b.png"><i data-href="no">') == ["x.html#a", "b.png"]
+    assert IDS.findall('<i id="a" data-id="no" aria-id="no">') == ["a"]
+    assert TITLE.search("<title>x</title>") and not TITLE.search("<title> </title>") and not re.search(OG % "og:type", '<meta property="og:type" content="">')
     # the header's mark is checked against its own viewBox: a part outside it is named
     assert mark_whole() == [] and mark_whole(MARK.replace("12 6 40 52", "12 6 20 52")) != []
     print("site_docs self-test: ok")

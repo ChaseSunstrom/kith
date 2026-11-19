@@ -31,7 +31,7 @@
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
         # (rollout, chaos and access: three nodes and nothing more said to kithd; share, pods, kube and
         # worker: two, on the mesh; quota: one, on the mesh; services: one, with no mesh.)
-        others='2 3' more='' inside=2049 lan='' base=$root/target/os out='' dumps='' gateway='' https=''
+        others='2 3' more='' inside=2049 lan='' base=$root/target/os dumps='' gateway='' https='' guest=''
         seed() { :; }
         # (home: on the mesh, so the holder answers a WireGuard handshake to the house address
         # (51820) and the node that roams dials it; and ingress, so it answers TCP 443 there.
@@ -39,6 +39,8 @@
         # learner, and the cluster says four nodes.)
         nodes=three four=''
         [ "$test" != home ] || { more='--mesh --ingress' others='2 3 4' nodes=four four=',[^,? ]+'; }
+        # (access: the nodes run the image tests.sh built with the forge feature.)
+        [ "$test" != access ] || base=$osdir
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
         others=2 more=--mesh project=''
         [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] || others=''
@@ -53,7 +55,7 @@
         # too. So what a pod sends past its tunnel has somewhere to go, and is seen.)
         if [ "$test" = tunnel ]; then
             # (The comma doubled: QEMU's options take one as the next option's start.)
-            others='' inside=8080 out=",restrict=on" gateway=,,10.9.0.9
+            others='' inside=8080 net_restrict=",restrict=on" gateway=,,10.9.0.9
             dumps="-object filter-dump,id=lan-dump,netdev=lan,file=$work/lan.pcap -object filter-dump,id=out-dump,netdev=out,file=$work/out.pcap"
         fi
         # (pods: a state disk keeps 8 MiB free, so a pod filling it is seen in time.)
@@ -61,7 +63,8 @@
         [ "$test" != pods ] || more='--mesh --storage-reserve 8388608 --image-grace 120'
         # (worker: this machine asks what listens on port 80 of a node's own network.)
         [ "$test" != worker ] || inside=80
-        # (services: no --mesh, as kith OS starts a node: its Services answer there too, T-0723.)
+        # (services: no --mesh, as kith OS starts a node: its Services answer there too, T-0723;
+        # then services.sh starts it again with --mesh beside a second node with $nolink, T-0326.)
         [ "$test" != services ] || more=''
         # (policy: no way left to be root with all of the kernel's capabilities, so kithd gives up the rest.
         # QEMU reads a comma in -smbios as the end of a value, so each one here is doubled.)
@@ -170,8 +173,10 @@
         public2=$("$root/target/debug/kith" package keygen "$work/key2")
         handed() { sh "$root/os/update.sh" --handover "$work/$1" "$work/www/next.update" "$public2"; } # KEYFILE
         by=$public more='' allow=''
-        (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
-        web=$!
+        web_up "$work/www" $((port + 9)) || fail "the web server on port $((port + 9)) did not start"
+        # (The nodes' port 80 is this server: only where it runs, as a guest with no listener there cannot start.)
+        # (cmd: each guest connection gets its own socat to that port.)
+        guest=",guestfwd=tcp:10.0.2.100:80-cmd:socat - TCP:127.0.0.1:$((port + 9))"
       fi
 
         # Each node: a card on a network the three share (QEMU passes it over multicast on
@@ -182,8 +187,8 @@
             timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
-                -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside${https:+,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:443}$out" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $dumps \
-                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway -- --listen ${listen:-0.0.0.0:7443} --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
+                -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside${https:+,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:443}$guest${net_restrict-,restrict=on}" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $dumps \
+                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway${nolink:+ KITH_NO_LINK=1} -- --listen ${listen:-0.0.0.0:7443} --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 8>&- &
             vms="$vms $!"
         }
@@ -227,7 +232,7 @@ print(status.get("phase", "-"), updating, versions or "-", status.get("reason", 
         release() {
             cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"OSRelease","metadata":{"name":"$1"},
-  "spec":{"version":"$2","image":"http://10.0.2.2:$((port + 9))/${4:-$1}.update","publicKey":"$by","signature":"$3"$more}},
+  "spec":{"version":"$2","image":"http://10.0.2.100/${4:-$1}.update","publicKey":"$by","signature":"$3"$more}},
  {"apiVersion":"kith.dev/v1","kind":"UpdatePlan","metadata":{"name":"all"},"spec":{"release":"$1"$allow}}]
 EOF
             more='' allow=''
@@ -243,13 +248,19 @@ EOF
         first='' joined=''
         if [ "$test" = poddns ]; then
             first='--dns-upstream 10.9.0.2:5353'
-            joined="--dns 0.0.0.0:5353 --dns-upstream 10.0.2.2:$((port + 9))"
+            joined="--dns 0.0.0.0:5353 --dns-upstream 10.0.2.2:$((port + 9))" # unrestricted: the joined nodes ask this machine's resolver over UDP, which restrict=on drops
             [ "${KITH_POD_NOUPSTREAM:-}" != 1 ] || { first='--dns-upstream 10.9.0.9:5353'; joined='--dns 0.0.0.0:5353 --dns-upstream 10.9.0.9:5353'; }
         fi
+        # (pods: a pod's egress may not reach the node's own subnet (kith's guard refuses it), so
+        # the server its pods ask sits behind the gateway, 10.0.2.2, which restrict=on blocks.
+        # unrestricted: this test's nodes keep their card out open; the value is put back after.)
+        keep=${net_restrict-,restrict=on}
+        [ "$test" != pods ] || net_restrict=''
         # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
         # (home: every joined one serves DNS too; node 4 roams (--roaming, as a laptop joins): it is reset, and dials the house endpoint.)
         [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353'; }
         node 1 "--claim ${first:-}"
+        net_restrict=$keep
         tries=0
         until token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/n1.log" 2>/dev/null) && [ -n "$token" ] \
             && [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 -H 'Content-Type: application/json' -d '{"token":"x","name":"root"}' "https://127.0.0.1:$((port + 1))/v1/claim")" = 403 ]; do
@@ -272,7 +283,12 @@ EOF
             # (home: node 4 roams, as a laptop joins. It listens on [::] as a roaming node does by default
             # (main.rs): the leader reaches it at its mesh address, which is IPv6; 0.0.0.0 has no listener there.)
             [ "$test$n" != home4 ] || { range='--roaming' listen='[::]:7443'; }
+            # (poddns: a joined node asks this machine's resolver over UDP, which restrict=on
+            # drops. unrestricted: only that test's joined nodes keep their card out open; the
+            # value is put back after each, so no other node of it is opened.)
+            case $test in poddns | pods) net_restrict='' ;; esac
             node "$n" "--join 10.9.0.1:7443 --token $join $range ${joined:-}"
+            net_restrict=$keep
         done
         # What a resource's units say: "HOW-MANY-ARE-READY STATE ADDRESS ADDRESS ... and
         # what it says" (`none` for a unit with no address of its own).

@@ -48,7 +48,11 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 pub fn router(shared: Arc<Shared>) -> Router {
-    Router::new()
+    let router = Router::new();
+    // (Test only: a build with the feature `forge`, never a release's.)
+    #[cfg(feature = "forge")]
+    let router = router.route("/v1/forge", post(crate::forge::append));
+    router
         .route("/v1/apply", post(apply))
         .route("/v1/watch", get(watch))
         .route("/v1/resources", get(list))
@@ -56,6 +60,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/history/{*key}", get(history))
         .route("/v1/rollback/{*key}", post(rollback))
         .route("/v1/logs/{*key}", get(logs))
+        .route("/v1/restart/{*key}", post(restart))
         .route("/v1/blobs", axum::routing::put(crate::blobs::put))
         .route("/v1/backups/{namespace}/{name}/restore", post(crate::backups::restore))
         .route("/v1/blobs/{namespace}/{name}", get(crate::blobs::get))
@@ -68,6 +73,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/audit", get(audit))
         .route("/v1/run", post(run::run))
         .route("/v1/tokens", post(crate::cluster::token))
+        .route("/v1/peers", post(crate::people::add))
         .route("/v1/lock", get(crate::crypt::warned))
         .route("/v1/lock/{name}", post(crate::crypt::set))
         .route("/v1/lock/{name}/passphrase", post(crate::crypt::pass))
@@ -206,7 +212,7 @@ fn unconfined(resource: &Resource) -> bool {
             .map(|(template, _)| template),
         _ => None,
     };
-    template.is_some_and(|template| crate::policy::needs(&template, false).contains(&"unconfined"))
+    template.is_some_and(|template| crate::policy::needs(&template, false, false).contains(&"unconfined"))
 }
 
 /// What resources known by kind and namespace alone reach into besides themselves.
@@ -473,7 +479,7 @@ fn veiled(shared: &Shared, caller: &Caller, mut changes: Vec<Change>) -> Vec<Cha
 /// What a new resource may not be (`Resource::submitted`): asked where it is submitted, not when
 /// a log entry is replayed.
 fn submitted(resources: &[Resource]) -> Result<(), ApiError> {
-    let refused = resources.iter().try_for_each(Resource::submitted);
+    let refused = resources.iter().try_for_each(Resource::submitted_by_node);
     refused.map_err(|why| ApiError::Store(Error::Invalid(why)))
 }
 
@@ -852,6 +858,102 @@ pub(crate) async fn output(
 }
 
 #[derive(Deserialize)]
+struct RestartOptions {
+    replica: u32,
+    #[serde(default)]
+    here: bool,
+}
+
+async fn restart(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Path(key): Path<String>,
+    Query(options): Query<RestartOptions>,
+) -> Reply<serde_json::Value> {
+    restart_replica(&shared, &caller, &key, options.replica, options.here).await
+}
+
+/// Restarts replica `replica` of the Workload at `key`: the node it runs on stops it, and the
+/// controller starts it again with its name and number. Asked of the node that runs it; asked of
+/// another, it is passed on there (`here`, which is what a passed-on request says).
+pub(crate) async fn restart_replica(
+    shared: &Arc<Shared>,
+    caller: &Caller,
+    key: &str,
+    replica: u32,
+    here: bool,
+) -> Reply<serde_json::Value> {
+    // Who may apply the Workload may restart its replicas: get alone reads them (see `logs`).
+    permit(shared, caller, Verb::Apply, |_| vec![place_of(key)])?;
+    if !key.starts_with("Workload/") {
+        return Err(ApiError::Refused(format!(
+            "{key}: only a Workload's replicas are restarted"
+        )));
+    }
+    let me = shared
+        .cluster
+        .as_ref()
+        .map(|cluster| cluster.me.name.clone())
+        .unwrap_or_default();
+    let (node, there) = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let resource = state
+            .store
+            .get(key)
+            .ok_or_else(|| ApiError::Store(Error::NotFound(key.to_string())))?;
+        let node = resource
+            .status
+            .as_ref()
+            .and_then(|status| status["nodes"][replica.to_string()].as_str());
+        let node = node.unwrap_or_default().to_string();
+        let there = state
+            .store
+            .get(&format!("Node/{node}"))
+            .and_then(crate::view::Upstream::of);
+        (node, there)
+    };
+    if node == me {
+        shared
+            .restarts
+            .lock()
+            .expect("a handler panicked holding the restarts")
+            .insert((key.to_string(), replica));
+        shared.changed.notify_one();
+        return Ok(Json(
+            serde_json::json!({ "restarting": key, "replica": replica, "node": node }),
+        ));
+    }
+    // (Passed on once: the node it is passed to is the one that runs it, or it is refused.)
+    let cluster = match shared.cluster.as_ref() {
+        Some(cluster) if !here => cluster,
+        _ => {
+            return Err(ApiError::Refused(format!(
+                "{key} replica {replica} does not run on this node"
+            )));
+        }
+    };
+    let there = there
+        .ok_or_else(|| ApiError::Refused(format!("{key} replica {replica} runs on {node}, which is not known")))?;
+    let client = cluster.to(&there).map_err(|e| ApiError::Store(Error::Io(e)))?;
+    let url = reqwest::Url::parse(&format!(
+        "https://{}/v1/restart/{key}?replica={replica}&here=true",
+        there.address
+    ))
+    .map_err(|e| ApiError::Store(Error::Io(e.to_string())))?;
+    let asked = crate::access_sign::pass_on(client.post(url))
+        .header(crate::access::FOR, caller.to_string())
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+    let failed = |e: reqwest::Error| {
+        let e = crate::cluster::why(&e);
+        ApiError::Store(Error::Io(format!("asking node {node} to restart the replica: {e}")))
+    };
+    let answer = asked.and_then(reqwest::Response::error_for_status).map_err(failed)?;
+    answer.json().await.map(Json).map_err(failed)
+}
+
+#[derive(Deserialize)]
 struct AuditOptions {
     tail: Option<u64>,
 }
@@ -1112,6 +1214,14 @@ spec: {size: 1Gi}
             assert!(
                 takes_of(&allowing).contains(&unconfined),
                 "{kind} with an allow-list takes Unconfined"
+            );
+            assert!(
+                takes_of(&of(kind, ", userNamespaces: true")).contains(&unconfined),
+                "{kind} with userNamespaces takes Unconfined: it lets the refused calls back"
+            );
+            assert!(
+                !takes_of(&of(kind, ", userNamespaces: false")).contains(&unconfined),
+                "{kind} with userNamespaces off takes nothing"
             );
             assert!(
                 !takes_of(&of(kind, "")).contains(&unconfined),

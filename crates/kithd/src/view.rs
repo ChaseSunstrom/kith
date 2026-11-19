@@ -420,6 +420,9 @@ struct Follower<'a> {
     saved: Instant,
     /// The copy of the store this node kept until its first view is still to erase.
     kept: bool,
+    /// What the control node last failed to send, as it was said (`follow`): said again once a
+    /// line of its view is taken.
+    said: String,
 }
 
 /// A view that only statuses changed in is written this often: a unit that reports does not
@@ -557,6 +560,15 @@ fn control_nodes(shared: &Shared, me: &str) -> Vec<Upstream> {
 
 const OLDER: &str = "this control node is older than workers: update it";
 
+/// The line said when a view that failed (and was said so, `said`) is taken again: once, and
+/// `said` is cleared, so a failure that comes back is said again.
+fn back(said: &mut String, node: &str, address: &str) -> Option<String> {
+    (!said.is_empty()).then(|| {
+        said.clear();
+        format!("kithd: node {node} ({address}) sends its view again")
+    })
+}
+
 /// Follow the view `upstream` sends until it ends. `Ok`: something of it was taken.
 async fn stream(
     follower: &mut Follower<'_>,
@@ -569,7 +581,12 @@ async fn stream(
     // No other node's certificate is taken at that address: a worker cannot stand in for it.
     let client = cluster.to(upstream)?;
     let asked = client.get(format!("https://{}/v1/view", upstream.address));
-    let mut reply = asked.send().await.map_err(failed)?;
+    // (Its headers within SILENT, or another control node is called: a view that never starts
+    // holds nothing up. The body is not timed here: it is followed for as long as it comes.)
+    let sent = tokio::time::timeout(SILENT, asked.send())
+        .await
+        .map_err(|_| "it sent no reply".to_string())?;
+    let mut reply = sent.map_err(failed)?;
     if reply.status() == StatusCode::NOT_FOUND {
         return Err(OLDER.into());
     }
@@ -598,6 +615,12 @@ async fn stream(
             let line: Vec<u8> = buffer.drain(..=end).collect();
             let sent = serde_json::from_slice(&line).map_err(|e| format!("a line of the view: {e}"))?;
             follower.take(sent).await?;
+            if !heard {
+                // (A view that was said to fail is said to come back once a line of it is taken.)
+                if let Some(line) = back(&mut follower.said, &upstream.name, &upstream.address) {
+                    eprintln!("{line}");
+                }
+            }
             heard = true;
         }
     }
@@ -623,8 +646,9 @@ pub async fn follow(shared: Arc<Shared>, state: PathBuf, ingress: bool, mut stop
         stale: false,
         saved: Instant::now(),
         kept: false,
+        said: String::new(),
     };
-    let (mut turn, mut said) = (0usize, String::new());
+    let mut turn = 0usize;
     while !*stopping.borrow() {
         let mut nodes = control_nodes(&shared, &me);
         if nodes.is_empty() {
@@ -654,9 +678,9 @@ pub async fn follow(shared: Arc<Shared>, state: PathBuf, ingress: bool, mut stop
                 Err(why) => {
                     turn += 1;
                     let why = format!("node {} ({}) sends no view: {why}", upstream.name, upstream.address);
-                    if why != said {
+                    if why != follower.said {
                         eprintln!("kithd: {why}");
-                        said = why;
+                        follower.said = why;
                     }
                 }
             }
@@ -1147,6 +1171,7 @@ spec: { selector: { app: api }, ports: [{ port: 80 }], expose: { host: api.examp
             stale: false,
             saved: Instant::now(),
             kept: false,
+            said: String::new(),
         };
         let mut stopping = shared.stop.subscribe();
         let print = pki::print_of(&a.cert).unwrap();
@@ -1184,6 +1209,58 @@ spec: { selector: { app: api }, ports: [{ port: 80 }], expose: { host: api.examp
         // From here on a change is asked of the control node, and Raft's routes are not served.
         let write = shared.write(Command::Patch { statuses: Vec::new() }).await;
         assert!(write.unwrap_err().to_string().contains("this node is a worker"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A control node that completes the handshake and then never answers the request gives up its
+    /// headers after `SILENT`: the request is not held up past that, and another control node is called.
+    /// (A node that does not even complete the handshake is cut off by the client's 5 s connect timeout.)
+    #[tokio::test(start_paused = true)]
+    async fn a_view_request_that_gets_no_reply_gives_up_after_silent() {
+        let dir = std::env::temp_dir().join(format!("kith-stalled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ca = pki::Ca::create().unwrap();
+        let node = |name: &str| {
+            let (cert, key) = ca.issue(name).unwrap();
+            pki::Identity {
+                name: name.into(),
+                ca: ca.cert.clone(),
+                cert,
+                key,
+            }
+        };
+        let (a, w) = (node("a"), node("w"));
+        let cluster = crate::cluster::Cluster::new(w, None).unwrap();
+        let shared = crate::replica(Some(cluster), &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let first = None;
+        let mut follower = Follower {
+            shared: &shared,
+            state: &dir,
+            first: &first,
+            stale: false,
+            saved: Instant::now(),
+            kept: false,
+            said: String::new(),
+        };
+        let mut stopping = shared.stop.subscribe();
+        // Its certificate is `a`'s; its view is never answered.
+        let silent = axum::Router::new().route("/v1/view", axum::routing::get(std::future::pending::<&'static str>));
+        let port = serve_as(&a, silent).await;
+        let upstream = Upstream {
+            name: "a".into(),
+            address: format!("127.0.0.1:{port}"),
+            certificate: Some(pki::print_of(&a.cert).unwrap()),
+        };
+        let began = tokio::time::Instant::now();
+        let said = stream(&mut follower, &upstream, &mut stopping).await;
+        assert_eq!(said, Err("it sent no reply".to_string()));
+        assert!(
+            began.elapsed() >= SILENT && began.elapsed() < SILENT + std::time::Duration::from_secs(1),
+            "{:?}",
+            began.elapsed()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1232,6 +1309,7 @@ spec: { selector: { app: api }, ports: [{ port: 80 }], expose: { host: api.examp
             stale: false,
             saved: Instant::now(),
             kept: false,
+            said: String::new(),
         };
         let mut stopping = shared.stop.subscribe();
         let print = pki::print_of(&a.cert).unwrap();
@@ -1290,5 +1368,20 @@ spec: { selector: { app: api }, ports: [{ port: 80 }], expose: { host: api.examp
         std::fs::write(path(&dir), r#"{"format":2,"at":1,"resources":[]}"#).unwrap();
         assert!(load(&dir).unwrap_err().contains("newer kithd"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A control node whose view failed (and was said so) is said to send its view again once a
+    /// pass takes it; said once, and not again while it still sends it.
+    #[test]
+    fn alone_a_view_that_comes_back_is_said_once() {
+        let mut said = String::new();
+        assert!(back(&mut said, "n1", "10.9.0.1:7443").is_none());
+        said = "node n1 (10.9.0.1:7443) sends no view: Host is unreachable".into();
+        assert_eq!(
+            back(&mut said, "n1", "10.9.0.1:7443").as_deref(),
+            Some("kithd: node n1 (10.9.0.1:7443) sends its view again")
+        );
+        assert!(said.is_empty());
+        assert!(back(&mut said, "n1", "10.9.0.1:7443").is_none());
     }
 }

@@ -9,17 +9,22 @@
         [ -r "$f" ] && { firmware=$f; break; }
     done
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
+    # (The guests reach nothing outside their forwards, unless KITH_E2E=1 asks for image pulls: then net_restrict is set empty.)
+    [ "${KITH_E2E:-}" != 1 ] || net_restrict=''
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     # (KITH_OS_SPEC=os/examples/all.yaml tries the image of a spec instead of the plain one.)
     # (modules: the 'all' image, whose drivers are modules.)
     [ "$test" != modules ] || KITH_OS_SPEC=os/examples/all.yaml
     osdir=$root/target/os
     [ -z "${KITH_OS_SPEC:-}" ] || osdir=$root/target/os-spec
-    sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC" --out "$osdir"} >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
+    # (access: the image of a kithd built with the feature forge, whose leader can append an entry it
+    # was not asked for (ci/vm/access.sh); in a folder of its own, so the plain image stays plain.)
+    [ "$test" != access ] || { KITHD_FEATURES=forge osdir=$root/target/os-forge; export KITHD_FEATURES; }
+    sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC"} --out "$osdir" >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
     if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
         . "$root/ci/vm/cluster.sh"
     fi
-    if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ] || [ "$test" = blackout ]; then
+    if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ] || [ "$test" = blackout ] || [ "$test" = alone ]; then
         . "$root/ci/vm/machines.sh"
     fi
     # A copy: the node writes its state to the disk, and this test damages its root.
@@ -32,7 +37,7 @@
         : >"$work/log"
         timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none ${once:+-no-reboot} \
             -machine q35 -bios "$firmware" -drive "file=$work/disk.raw,format=raw,if=virtio" \
-            -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:7443" -device virtio-net-pci,netdev=n0 \
+            -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:7443${net_restrict-,restrict=on}" -device virtio-net-pci,netdev=n0 \
             -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=$more" "$@" \
             -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" </dev/null >/dev/null 2>&1 8>&- &
         vm=$!

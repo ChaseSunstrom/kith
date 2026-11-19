@@ -137,12 +137,50 @@ impl Range {
         })
     }
 
+    /// With `--people`: this range may not overlap the people's `100.89.0.0/16` (condition 4).
+    pub fn refuse_people(&self) -> std::result::Result<(), String> {
+        if overlap((self.network, self.bits), PEOPLE) {
+            return Err(format!(
+                "the pods' range {self} overlaps the people's 100.89.0.0/16 (--people): name another with --pod-range"
+            ));
+        }
+        Ok(())
+    }
+
+    /// With `--people`: no network this node has on a link may overlap `100.89.0.0/16`, except on the
+    /// loopback and on kwg0, which holds its own address there.
+    pub fn refuse_people_held(held: &[Held]) -> std::result::Result<(), String> {
+        let clash = held
+            .iter()
+            .filter(|held| held.link != LOOPBACK && held.name != crate::people::DEVICE)
+            .find(|held| overlap((u32::from(held.address), held.bits), PEOPLE));
+        clash.map_or(
+            Ok(()),
+            |Held {
+                 address, bits, name, ..
+             }| {
+                Err(format!(
+                    "this node has {address}/{bits} on {name}, which overlaps the people's 100.89.0.0/16 (--people)"
+                ))
+            },
+        )
+    }
+
+    /// [`Range::refuse_people_held`] for the addresses this machine has now.
+    pub fn refuse_people_in_use() -> std::result::Result<(), String> {
+        let held = held_addresses().map_err(|e| format!("reading this node's addresses: {e}"))?;
+        Self::refuse_people_held(&held)
+    }
+
     /// [`Range::refuse_held`] for the addresses this machine has now (read, not changed).
     pub fn refuse_if_in_use(&self) -> std::result::Result<(), String> {
         let held = held_addresses().map_err(|e| format!("reading this node's addresses: {e}"))?;
         self.refuse_held(&held)
     }
 }
+
+/// The people's range, `100.89.0.0/16` (`--people`).
+const PEOPLE: (u32, u8) = (100 << 24 | 89 << 16, 16);
 
 /// The loopback's index: the first link of a machine.
 const LOOPBACK: u32 = 1;
@@ -400,7 +438,7 @@ pub struct Served {
 /// goes to one of the networks `to` (any, if none) at one of `ports` (any TCP or UDP port, or
 /// no port, if none: a rule with ports fits TCP and UDP only). What answers what came to the
 /// pod passes before any rule; nothing else does, DNS at the node's resolver included.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Egress {
     pub allow: bool,
     pub to: Vec<(IpAddr, u8)>,
@@ -408,7 +446,7 @@ pub struct Egress {
 }
 
 fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
-    crate::address4(1, range.gateway(), 32, None)?;
+    crate::gateway4(1, range.gateway())?;
     let passes = "/proc/sys/net/ipv6/conf/all/forwarding";
     let guard = guard_wanted(guarded, std::fs::read_to_string(passes).ok().as_deref());
     nat(range, guard, masquerade, mesh, pods)?;
@@ -1094,6 +1132,38 @@ mod tests {
         );
     }
 
+    /// docs/adr-people.md, Review 4: with `--people`, neither the pods' range nor a network this
+    /// node is on may overlap the people's 100.89.0.0/16 (kwg0's own address and the loopback aside).
+    #[test]
+    fn the_people_range_is_clear_of_the_pods_and_the_nodes_networks() {
+        for text in ["100.89.0.0/16", "100.64.0.0/10", "100.89.8.0/24", "100.0.0.0/8"] {
+            let said = range(text).unwrap().refuse_people().unwrap_err();
+            assert!(said.contains(text) && said.contains("--pod-range"), "{said}");
+        }
+        for text in ["100.88.0.0/16", "10.77.0.0/16", "100.90.0.0/16", "100.96.0.0/11"] {
+            range(text).unwrap().refuse_people().expect(text);
+        }
+        let on = |address: &str, bits, link, name: &str| Held {
+            address: address.parse().unwrap(),
+            bits,
+            link,
+            name: name.into(),
+        };
+        Range::refuse_people_held(&[
+            on("192.168.1.5", 24, 2, "eth0"),
+            on("100.88.0.1", 32, LOOPBACK, "lo"),
+            on("100.89.0.1", 16, 7, crate::people::DEVICE),
+            on("100.89.5.5", 32, LOOPBACK, "lo"),
+        ])
+        .unwrap();
+        for (address, bits) in [("100.89.3.4", 24), ("100.64.0.9", 10), ("100.89.255.255", 32)] {
+            let said =
+                Range::refuse_people_held(&[on("192.168.1.5", 24, 2, "eth0"), on(address, bits, 3, "tailscale0")])
+                    .unwrap_err();
+            assert!(said.contains(&format!("{address}/{bits} on tailscale0")), "{said}");
+        }
+    }
+
     #[test]
     fn a_node_with_no_address_at_all_refuses_no_range() {
         let ours = range("10.77.0.0/16").unwrap();
@@ -1324,6 +1394,7 @@ mod tests {
         if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
             return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh egress");
         }
+        let _lo = crate::netlink::LO.lock().unwrap_or_else(|e| e.into_inner());
         // The namespace is left as found, a panic too: the other tests take forwarding off as a
         // sign of a node not yet guarded.
         struct Forwarding;
@@ -1400,6 +1471,7 @@ mod tests {
         if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
             return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh pods");
         }
+        let _lo = crate::netlink::LO.lock().unwrap_or_else(|e| e.into_inner());
         up(1).unwrap();
         // (A range that is not the default, and not whole bytes: the masquerade matches its bits.)
         let range = range("198.18.16.0/20").unwrap();

@@ -147,8 +147,21 @@ impl Node {
             })
             .args(args)
             .stdin(Stdio::null())
+            // (To a file the test can read: [`Node::console`].)
+            .stderr(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("kithd.log"))
+                    .unwrap(),
+            )
             .spawn()
             .unwrap()
+    }
+
+    /// What this node has said on its console since it was first started.
+    fn console(&self) -> String {
+        std::fs::read_to_string(self.dir.join("kithd.log")).unwrap_or_default()
     }
 
     fn address(&self) -> String {
@@ -199,6 +212,10 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.stop();
+        // (Its console is in a file, not the terminal: a failing test still shows it.)
+        if std::thread::panicking() {
+            eprintln!("--- console of {} ---\n{}", self.dir.display(), self.console());
+        }
     }
 }
 
@@ -593,19 +610,7 @@ fn forgotten_key_is_on_no_control_nodes_disk() {
     });
 
     // The cluster's code, typed at disk-a: disk-a is wiped and disk-b forgotten.
-    let forget = |body: String| ask_as_node(&nodes[1].address(), &pki(&nodes[1]), "POST", "/v1/forget", Some(&body));
-    let (_, said) = forget(format!("{{\"id\":\"{one}\"}}"));
-    let said: serde_json::Value = serde_json::from_str(&said).unwrap();
-    let nonce = said["nonce"].as_str().unwrap();
-    let bytes: Vec<u8> = (0..nonce.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&nonce[at..at + 2], 16).unwrap())
-        .collect();
-    let signed = code.sign(&[b"kith-forget ", one.as_bytes(), b" ", &bytes].concat());
-    let signature = hex(signed.as_ref());
-    let (status, said) = forget(format!(
-        "{{\"id\":\"{one}\",\"nonce\":\"{nonce}\",\"signature\":\"{signature}\"}}"
-    ));
+    let (status, said) = forget_signed(&nodes[1], &code, &one);
     assert_eq!(status, "200", "{said}");
     // Every control node snapshots the store as it is now.
     for node in &nodes {
@@ -743,6 +748,241 @@ fn the_store_survives_its_leader() {
     wait_for("alpha to be ready again", || {
         states(&alpha) == ["ready", "ready", "ready"]
     });
+}
+
+/// A forget of key `id` typed at `at`, signed with `code` (the cluster's duress code): the nonce
+/// it gives, then the signature over `kith-forget <id> <nonce bytes>`. The answer to the second call.
+fn forget_signed(at: &Node, code: &ring::signature::Ed25519KeyPair, id: &str) -> (String, String) {
+    let pki = at.dir.join("state/pki");
+    let ask = |body: String| ask_as_node(&at.address(), &pki, "POST", "/v1/forget", Some(&body));
+    let (_, said) = ask(format!("{{\"id\":\"{id}\"}}"));
+    let said: serde_json::Value = serde_json::from_str(&said).unwrap();
+    let nonce = said["nonce"].as_str().unwrap();
+    let bytes: Vec<u8> = (0..nonce.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&nonce[at..at + 2], 16).unwrap())
+        .collect();
+    let signed = code.sign(&[b"kith-forget ", id.as_bytes(), b" ", &bytes].concat());
+    let signature: String = signed.as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+    ask(format!(
+        "{{\"id\":\"{id}\",\"nonce\":\"{nonce}\",\"signature\":\"{signature}\"}}"
+    ))
+}
+
+/// The leader's own-write deny list (`own_writes`) says so on the console when it refuses a
+/// control node's write: no node of `nodes` said it. And a control check that it would say it:
+/// `sender` (a control node that does not lead) writes a Namespace as itself to `leader`, which
+/// is refused, and `leader`'s console says so by `sender`'s name.
+fn assert_no_own_write_refused(sender: &Node, leader: &Node, nodes: &[&Node]) {
+    for node in nodes {
+        let said = node.console();
+        assert!(
+            !said.contains("refused a control node's own write"),
+            "{}: {said}",
+            node.dir.display()
+        );
+    }
+    let forged = serde_json::json!({ "Apply": { "at": 0, "resources": [
+        { "apiVersion": "kith.dev/v1", "kind": "Namespace", "metadata": { "name": "forged" }, "spec": {} }
+    ] } });
+    let (_, said) = ask_as_node(
+        &leader.address(),
+        &sender.dir.join("state/pki"),
+        "POST",
+        "/v1/raft/write",
+        Some(&forged.to_string()),
+    );
+    let refused = format!(
+        "refused a control node's own write: {}",
+        sender.dir.file_name().unwrap().to_string_lossy()
+    );
+    let said_by_leader = leader.console();
+    assert!(
+        said_by_leader.contains(&refused),
+        "no `{refused}` after {said}: {said_by_leader}"
+    );
+}
+
+/// What `kithd` writes for the Identity or Admin that asked, made at a node that does not
+/// lead (T-0746): the follower passes each on to the leader as the caller's, never as its own
+/// write, which the leader's deny list would refuse. `kith node lock`, `unlock`, `duress`,
+/// `duress --all` and a forget typed at the follower land at the leader, and neither log says
+/// a control node's own write was refused. (Not behind KITH_E2E: it pulls nothing.)
+#[test]
+fn crypt_writes_at_a_follower() {
+    use ring::signature::KeyPair;
+    let test = "cryptfol";
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("beta to follow alpha", || {
+        beta.kith(&["node", "status"]).1.contains("leader:    alpha") && beta.nodes().len() == 2
+    });
+
+    // beta's own NodeKey, as its disk would give it, and the recovery key shown (what only the node
+    // itself says of its key: as itself, to the leader).
+    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let code = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+    let all = hex(code.public_key().as_ref());
+    let (id, wrapped) = ("a1".repeat(32), "5ea1ed01".repeat(8)); // pragma: allowlist secret
+    let key = |duress: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: NodeKey\nmetadata: {{ name: beta }}\nspec: {{ id: {id}, wrapped: {wrapped}{duress} }}\n"
+        )
+    };
+    std::fs::write(alpha.dir.join("key.yaml"), key("")).unwrap();
+    alpha.ok(&["apply", "-f", "key.yaml"]);
+    let betas = beta.dir.join("state/pki");
+    let seen = r#"{"Status":{"statuses":[["NodeKey/beta",{"recoverySeen":true}]]}}"#;
+    // (A 200 says little: a node that does not lead, or a refused write, answers 200 too. What
+    // counts is the NodeKey showing it, below.)
+    ask_as_node(&alpha.address(), &betas, "POST", "/v1/raft/write", Some(seen));
+
+    // A NodeKey as `node` holds it, if it holds one: beta writes from its own copy (crypt's `set`
+    // and `forget` read the local store), so each step waits for beta to have what the last made.
+    let named_at = |node: &Node, name: &str| -> Option<serde_json::Value> {
+        let (code, said, _) = node.kith(&["get", &format!("NodeKey/{name}"), "-o", "json"]);
+        (code == 0).then(|| serde_json::from_str(&said).ok()).flatten()
+    };
+    let key_at = |node: &Node| named_at(node, "beta");
+    let spec_at = |node: &Node| key_at(node).map(|key| key["spec"].clone());
+    // The spec of beta's NodeKey, as the leader holds it.
+    let held = || spec_at(&alpha).unwrap();
+    let synced = || {
+        wait_for("beta to hold the key the leader does", || {
+            spec_at(&beta) == spec_at(&alpha)
+        })
+    };
+    wait_for("beta's recovery key to show on both nodes", || {
+        [&alpha, &beta]
+            .iter()
+            .all(|node| key_at(node).is_some_and(|key| key["status"]["recoverySeen"] == true))
+    });
+
+    beta.ok(&["node", "lock", "beta"]);
+    assert_eq!(held()["locked"], true);
+    synced();
+    beta.ok(&["node", "unlock", "beta"]);
+    assert!(held().get("locked").is_none(), "{}", held());
+    synced();
+    let shown = beta.ok(&["node", "duress", "beta"]);
+    assert!(shown.contains("A duress code for beta"), "{shown}");
+    assert!(
+        held()["duress"].as_str().is_some_and(|public| public.len() == 64),
+        "{}",
+        held()
+    );
+    synced();
+    beta.ok(&["node", "duress", "beta", "--off"]);
+    assert!(held().get("duress").is_none(), "{}", held());
+    synced();
+
+    // One code for the cluster: written to every NodeKey, and taken away again.
+    let shown = beta.ok(&["node", "duress", "--all"]);
+    assert!(shown.contains("A duress code for the whole cluster"), "{shown}");
+    assert!(
+        held()["duressAll"].as_str().is_some_and(|public| public.len() == 64),
+        "{}",
+        held()
+    );
+    synced();
+    beta.ok(&["node", "duress", "--all", "--off"]);
+    assert!(held().get("duressAll").is_none(), "{}", held());
+    synced();
+
+    // A forget typed at beta (the cluster's code, here one the test holds the key of): the
+    // leader forgets the key, as the admin.
+    // (A second key, `other`: the one typed at is wiped, any other is forgotten.)
+    let other = format!(
+        "---\napiVersion: kith.dev/v1\nkind: NodeKey\nmetadata: {{ name: other }}\nspec: {{ id: {}, wrapped: {}, duressAll: {all} }}\n",
+        "b2".repeat(32),
+        "5ea1ed02".repeat(8) // pragma: allowlist secret
+    );
+    std::fs::write(alpha.dir.join("key.yaml"), key(&format!(", duressAll: {all}")) + &other).unwrap();
+    alpha.ok(&["apply", "-f", "key.yaml"]);
+    synced();
+    wait_for("beta to hold the other key", || named_at(&beta, "other").is_some());
+    assert_eq!(held()["duressAll"], all.as_str());
+    let (status, said) = forget_signed(&beta, &code, &id);
+    assert_eq!(status, "200", "{said}");
+    assert!(held().get("wrapped").is_none() && held()["wiped"] == true, "{}", held());
+    synced();
+
+    // Forgotten, the other key goes when asked to be unlocked: a Delete, at the leader, as the admin.
+    let forgotten = |node: &Node| named_at(node, "other").is_some_and(|key| key["spec"]["forgotten"] == true);
+    wait_for("beta to see the other key forgotten", || forgotten(&beta));
+    assert!(forgotten(&alpha));
+    beta.ok(&["node", "unlock", "other"]);
+    assert!(named_at(&alpha, "other").is_none(), "{:?}", named_at(&alpha, "other"));
+
+    // beta followed alpha throughout: it was a follower that wrote.
+    assert!(beta.kith(&["node", "status"]).1.contains("leader:    alpha"));
+    assert_no_own_write_refused(&beta, &alpha, &[&alpha, &beta]);
+}
+
+/// A CA node that does not lead still admits a node and gives out certificates: the token it
+/// made lets a fourth node join, which the CA node writes to the log (as its own, a Node it
+/// admits) through the leader, and `kith identity cert` makes an Identity as the admin there.
+/// (Not behind KITH_E2E: it pulls nothing.)
+#[test]
+fn join_when_the_ca_node_does_not_lead() {
+    let test = "cafol";
+    let mut alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let join = |name: &str, at: &Node| {
+        let token = at.ok(&["node", "token"]);
+        Node::start(test, name, &["--join", &at.address(), "--token", token.trim()])
+    };
+    let (beta, gamma) = (join("beta", &alpha), join("gamma", &alpha));
+    let status = |node: &Node| node.kith(&["node", "status"]).1;
+    wait_for("three voters", || {
+        [&alpha, &beta, &gamma]
+            .iter()
+            .all(|node| status(node).contains("voters:    alpha, beta, gamma"))
+    });
+
+    // alpha goes: another leads. alpha, back, follows it.
+    alpha.stop();
+    wait_for("another to lead", || {
+        let said = status(&beta);
+        said.contains("leader:    beta") || said.contains("leader:    gamma")
+    });
+    alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &[]);
+    let follows = |alpha: &Node| {
+        let said = status(alpha);
+        said.contains("leader:    beta") || said.contains("leader:    gamma")
+    };
+    wait_for("alpha to follow", || follows(&alpha));
+
+    // The token alpha makes now, taken to alpha: delta joins through a node that does not lead
+    // (checked on both sides of it: if alpha won the lead back, this tests nothing).
+    assert!(follows(&alpha), "alpha leads again before the join: {}", status(&alpha));
+    let delta = join("delta", &alpha);
+    wait_for("delta in every list", || {
+        [&alpha, &beta, &gamma, &delta]
+            .iter()
+            .all(|node| node.nodes().len() == 4)
+    });
+    assert!(follows(&alpha), "alpha led during the join: {}", status(&alpha));
+    // An Identity's certificate is made there too.
+    alpha.ok(&["identity", "cert", "carol", "--out", "."]);
+    assert!(alpha.dir.join("carol.crt").exists());
+    wait_for("carol on the leader's side", || {
+        beta.kith(&["get", "Identity/carol"]).0 == 0 && gamma.kith(&["get", "Identity/carol"]).0 == 0
+    });
+
+    let leader = if status(&alpha).contains("leader:    beta") {
+        &beta
+    } else {
+        &gamma
+    };
+    assert!(follows(&alpha), "alpha led during the certificate: {}", status(&alpha));
+    assert_no_own_write_refused(&alpha, leader, &[&alpha, &beta, &gamma, &delta]);
 }
 
 #[test]

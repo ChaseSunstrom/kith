@@ -26,6 +26,8 @@ mod dns;
 mod encrypted;
 mod exits;
 mod files;
+#[cfg(feature = "forge")]
+mod forge;
 mod gpt;
 mod home;
 mod images;
@@ -35,6 +37,7 @@ mod install;
 mod keeper;
 mod kube;
 mod kubeproto;
+mod levels;
 mod members;
 mod mesh;
 mod modules;
@@ -65,6 +68,7 @@ mod vm;
 mod volume_files;
 mod volumes;
 mod wasm;
+mod websocket;
 mod worker;
 mod workload_identity;
 
@@ -167,14 +171,19 @@ struct Args {
     /// Where other nodes reach this node's people's device, as NAME:PORT or ADDRESS:PORT (with --people)
     #[arg(long, env = "KITH_PEOPLE_ENDPOINT", value_name = "NAME:PORT", requires = "people", value_parser = people_endpoint)]
     people_endpoint: Option<String>,
+    /// The networks a level of the people may reach (with --people): each AccessLevel's `networks`
+    /// are held only where they lie in one of these, so the cluster cannot widen what this node's
+    /// links are open to. None: Services only
+    #[arg(long, env = "KITH_PEOPLE_NETWORKS", value_name = "CIDR,...", requires = "people", value_delimiter = ',', value_parser = levels::network)]
+    people_networks: Vec<(std::net::IpAddr, u8)>,
     /// With --join: this node comes and goes (a laptop). It is reached on the mesh wherever it is,
     /// never votes, and what it runs is not started elsewhere while it is away
     #[arg(long, env = "KITH_ROAMING", requires_all = ["join", "mesh"])]
     roaming: bool,
     /// What the cluster may not have this node do as its root, whoever asks: `hardened`
-    /// (none of it), or words with commas between, `no-` before one to turn it off:
-    /// exec-units, root-containers, unconfined, node-network, vms, vm-paths, passthrough,
-    /// run, wipe; and devices=gpu+input for the classes of Device handed out
+    /// (none of it, and no NodeWorkloads: add host-users to run them), or words with commas between, `no-` before one to turn it off:
+    /// exec-units, root-containers, unconfined, host-users, node-network, vms, vm-paths,
+    /// passthrough, host-paths, run, wipe; and devices=gpu+input for the classes of Device handed out
     #[arg(long, env = "KITH_NODE_POLICY", value_name = "WORDS")]
     node_policy: Option<String>,
     /// Serve HTTPS (port 443, and 80) for Services with `expose`; for edge nodes
@@ -272,6 +281,9 @@ pub struct Shared {
     pub stop: watch::Sender<bool>,
     /// The pods of this node, and their networks.
     pub pods: Mutex<pods::Pods>,
+    /// The replicas a `kubectl delete pod` asked to restart here: (owner key, replica). The
+    /// controller takes them at its next pass; a restart is not kept over a restart of kithd.
+    pub restarts: Mutex<std::collections::BTreeSet<(String, u32)>>,
     /// The tunnels of the Exits this node holds.
     pub exits: Mutex<exits::Exits>,
     /// Dry runs (`/v1/diff`, `apply?dryRun`) at once, from asking admission to the answer:
@@ -346,6 +358,12 @@ fn main() -> ExitCode {
     releases::render_shim();
     // Then, before the runtime and its listeners, the limit of open files they share.
     raise_nofile();
+    // A test build says so, loudly, each time it starts (ci/vm/access.sh looks for the line).
+    #[cfg(feature = "forge")]
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"kithd: built with forge: POST /v1/forge appends unchecked entries; never ship this\n",
+    );
     // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
     if std::process::id() == 1 {
         keeper::keep();
@@ -673,6 +691,7 @@ async fn replica(
         cluster,
         stop: watch::channel(false).0,
         pods: Mutex::default(),
+        restarts: Mutex::default(),
         exits: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
         order: tokio::sync::RwLock::default(),
@@ -803,6 +822,23 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             format_args!("kithd: WARNING: {clash} (going on: pods may not reach, or be reached from, that network)\n"),
         );
     }
+    // --people: neither the pods' range nor a network of this node may overlap 100.89.0.0/16
+    // (docs/adr-people.md, Review 4). The range is a flag, so it refuses; a lease that lands in
+    // the people's range is only said where a refusal would restart the machine (as above).
+    if args.people.is_some() {
+        args.pod_range.refuse_people()?;
+        if let Err(clash) = kith_mesh::pod::Range::refuse_people_in_use() {
+            if !first_process {
+                return Err(clash);
+            }
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!(
+                    "kithd: WARNING: {clash} (going on: people may not reach, or be reached from, that network)\n"
+                ),
+            );
+        }
+    }
     // An encrypted state is opened with a key the cluster holds: nothing below can be
     // done before that, and it takes as long as it takes. A stop that comes meanwhile ends it.
     //
@@ -860,6 +896,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     let state = state
         .canonicalize()
         .map_err(|e| fail("resolving the state directory", &e))?;
+    // The root part's own word for where a mount may be (`root_part::check_create`).
+    root_part::set_state(state.clone());
     // Nobody answered and the state is ours: a socket here is a dead kithd's. Anything else is not ours to remove.
     use std::os::unix::fs::FileTypeExt;
     if std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()) {
@@ -1077,7 +1115,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             );
             let key = async {
                 if let Some(((record, config), opened)) = sealed.zip(opened) {
-                    crypt::keep(shared.clone(), config, record, opened, stopping.clone()).await;
+                    let keys = update::keys(args.release_key.clone(), &state);
+                    crypt::keep(shared.clone(), config, record, opened, keys, stopping.clone()).await;
                 }
             };
             let hardware = devices::run(shared.clone(), stopping.clone(), dmem);
@@ -1119,14 +1158,23 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             }
         };
         // (Its own leftovers too, with no --people: see `people::device`.)
-        let device = people::device(
-            shared.clone(),
-            state.clone(),
-            args.people,
-            args.people_endpoint.clone(),
-            args.mesh_interface.clone(),
-            stopping.clone(),
-        );
+        let device = async {
+            let held = args.people.map(|_| levels::Config {
+                interface: args.mesh_interface.clone(),
+                networks: args.people_networks.clone(),
+                api: args.listen.map_or(7443, |at| at.port()),
+                pods: args.pod_range.network(),
+            });
+            let device = people::device(
+                shared.clone(),
+                state.clone(),
+                args.people,
+                args.people_endpoint.clone(),
+                args.mesh_interface.clone(),
+                stopping.clone(),
+            );
+            tokio::join!(device, levels::run(shared.clone(), held, stopping.clone()));
+        };
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();
         let taken = args.ingress.then_some(taken);
         // (Without a mesh too: a node's Services answer its pods there as well, T-0723.)
@@ -1354,6 +1402,21 @@ mod tests {
         assert!(refused.is_some_and(|why| why.contains("--people")));
         assert!(super::people_refusal(&parse(&["--mesh", "--people"]).unwrap(), true).is_none());
         assert!(super::people_refusal(&parse(&["--mesh"]).unwrap(), false).is_none());
+        // The networks a level may name: CIDRs, comma between, with --people only.
+        let nets = parse(&["--mesh", "--people", "--people-networks=192.168.0.0/16,fd00::/8"]).unwrap();
+        assert_eq!(nets.people_networks.len(), 2);
+        assert!(parse(&["--mesh", "--people"]).unwrap().people_networks.is_empty());
+        for bad in [
+            "--people-networks=0.0.0.0/0",
+            "--people-networks=10.0.0.0",
+            "--people-networks=10.0.0.0/33",
+        ] {
+            assert!(parse(&["--mesh", "--people", bad]).is_err(), "{bad}");
+        }
+        assert!(
+            parse(&["--mesh", "--people-networks=10.0.0.0/8"]).is_err(),
+            "needs --people"
+        );
     }
 
     #[test]

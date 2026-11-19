@@ -54,6 +54,8 @@ pub struct Cluster {
     /// What the voters this node last knew said of a node it has not heard of, by its name and
     /// the print of its key ([`vouched`]).
     vouched: std::sync::Mutex<std::collections::HashMap<(String, String), Kept>>,
+    /// The keys `POST /v1/peers` is making here and has made lately (`people.rs`).
+    pub keys: crate::people::Making,
 }
 
 type Fallible<T> = Result<T, String>;
@@ -82,6 +84,7 @@ impl Cluster {
             joining: tokio::sync::Mutex::new(()),
             pinned: Default::default(),
             vouched: Default::default(),
+            keys: Default::default(),
         })
     }
 
@@ -1130,12 +1133,29 @@ fn applied_what_it_holds(
     m.current_leader.is_some() && m.last_applied.as_ref().is_some_and(applied)
 }
 
+/// A write that changes nothing, put in the log through the leader (a follower sends it on), and
+/// waited for here, giving the index it is at: the leader's log up to it is this node's store, so a
+/// delete committed there is in it. The leader's own read index is not asked of a follower; this
+/// is what stands for it. A leader that refuses this node says so at once, in the error.
+async fn leader_barrier(shared: &Shared) -> Result<u64, kith_api::store::Error> {
+    let unsaid = |e: &dyn std::fmt::Display| kith_api::store::Error::Io(format!("the leader did not confirm: {e}"));
+    let barrier = shared.write_at(Command::Patch { statuses: vec![] });
+    let (_, index) = tokio::time::timeout(WAIT_FOR_STORE, barrier)
+        .await
+        .map_err(|e| unsaid(&e))??;
+    let wait = shared.raft.wait(Some(WAIT_FOR_STORE));
+    let applied = wait.applied_index_at_least(Some(index), "the leader's barrier applied");
+    applied.await.map_err(|e| unsaid(&e))?;
+    Ok(index)
+}
+
 /// [`register`] for the node the cluster started on, at each start, and the only way it is called for it:
 /// it makes its Node only while the store holds no Node at all (the start that made the cluster, or one
 /// that ended before its Node was in), so a node deleted stays deleted across its restart. False: its Node
 /// is gone, or is a joiner's under the name (another certificate), and nothing was written.
 /// It waits first for the store to have applied what the cluster committed (on the leader, Raft's
-/// linearizable read; on any other node, all the log it holds, of the term it is in): until then a
+/// linearizable read; on any other node, all the log it holds, of the term it is in, and then a
+/// barrier write through the leader, applied here): until then a
 /// Node that is there may not show, and one deleted may.
 pub async fn register_first(
     shared: &Shared,
@@ -1157,6 +1177,9 @@ pub async fn register_first(
             wait.metrics(applied_what_it_holds, "everything its log holds applied")
                 .await
                 .map_err(|e| unsaid(&e))?;
+            // The leader may have committed more than this log holds (a delete of its Node among it):
+            // a write through the leader is at an index past all that, and this store has applied it.
+            leader_barrier(shared).await?;
         }
         Err(e) => return Err(unsaid(&e)),
     }
@@ -2135,6 +2158,80 @@ pub(crate) mod pinned_peer {
         assert_eq!((status, asked_now()), (403, 16));
     }
 
+    /// The forge route (a leader that appends what it was not asked for, forge.rs) is in a build
+    /// with the cargo feature `forge` and in no other: a release has no `/v1/forge`, for an
+    /// Identity or a node, and says no more of it than of any path it has not.
+    #[tokio::test]
+    async fn forge_is_in_no_release_build() {
+        let forge = cfg!(feature = "forge");
+        assert_eq!(crate::access::for_identities("/v1/forge"), forge);
+        let ca = pki::Ca::create().unwrap();
+        let alpha = node(&ca, "alpha");
+        let shared = shared_with("forge-route", alpha.clone(), &[at("alpha", "127.0.0.1:1", None)]).await;
+        let address = serving(shared, &alpha).await;
+        let (status, said) = call_as(&alpha, |client| {
+            client.post(format!("https://{address}/v1/forge")).json(&"Mark")
+        })
+        .await;
+        // (Not found, as any path it has not; with the feature, the route is there: a node's
+        // call does not pass for the admin's.)
+        assert_eq!(status == 404, !forge, "{status} {said}");
+        let (status, said) = call_as(&alpha, |client| {
+            client.post(format!("https://{address}/v1/nope")).json(&"Mark")
+        })
+        .await;
+        assert_eq!(status, 404, "{said}");
+    }
+
+    /// With the feature, the forge route appends what it is given to the log as the leader's own
+    /// write, and says whether applying it here took: a Signed entry no node can check is not.
+    #[cfg(feature = "forge")]
+    #[tokio::test]
+    async fn forge_appends_and_says_what_applying_it_came_to() {
+        use axum::extract::State;
+        let ca = pki::Ca::create().unwrap();
+        let alpha = node(&ca, "alpha");
+        let shared = shared_with("forge-append", alpha.clone(), &[]).await;
+        let id = kith_store::node_id;
+        let alone = kith_store::openraft::BasicNode::new("127.0.0.1:1");
+        let members = std::collections::BTreeMap::from([(id("alpha"), alone)]);
+        shared.raft.initialize(members).await.unwrap();
+        let send = |entry: kith_store::Command| {
+            let shared = shared.clone();
+            async move {
+                let sent = crate::forge::append(
+                    State(shared),
+                    axum::Extension(crate::access::Caller::Admin),
+                    Json(entry),
+                );
+                sent.await.map(|Json(said)| said)
+            }
+        };
+        let forged = kith_store::Command::Signed {
+            header: "v1; who=local socket; target=*; expires=1; nonce=00; sig=AA==".into(),
+            method: "POST".into(),
+            path: "/v1/apply".into(),
+            body: String::new(),
+            command: Box::new(kith_store::Command::Mark),
+        };
+        // (A one-voter cluster elects itself: asked until it leads.)
+        let mut said = None;
+        for _ in 0..100 {
+            match send(forged.clone()).await {
+                Ok(answer) => {
+                    said = Some(answer);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let said = said.expect("the node led within ten seconds");
+        assert_eq!(said["applied"], false, "{said}");
+        assert!(said["error"].as_str().unwrap().contains("signed entry"), "{said}");
+        let said = send(kith_store::Command::Mark).await.ok().expect("a leader appends");
+        assert_eq!(said["applied"], true, "{said}");
+    }
+
     /// `/v1/raft/stands` says yes, no or not yet of a name and key, to a node of this cluster only.
     #[tokio::test]
     async fn stands_route_answers_only_a_node_that_stands() {
@@ -2350,6 +2447,22 @@ mod tests {
         assert!(!put(&shared).await.unwrap());
         assert!(shared.store.lock().unwrap().store.get("Node/a").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The barrier a follower asks of the leader before it decides (`register_first`): it comes
+    /// back only once this node has applied the entry the barrier is at, which is past everything
+    /// the leader had committed, and it changes nothing in the store.
+    #[tokio::test]
+    async fn a_barrier_comes_back_once_its_entry_is_applied() {
+        use pinned_peer::{at, node, shared_of};
+        let ca = pki::Ca::create().unwrap();
+        let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
+        let shared = shared_of("barrier-wait", cluster, &[at("b", "127.0.0.1:3", None)]).await;
+        let before = shared.raft.metrics().borrow().last_applied.map_or(0, |l| l.index);
+        let index = leader_barrier(&shared).await.unwrap();
+        let applied = shared.raft.metrics().borrow().last_applied.map_or(0, |l| l.index);
+        assert!(index > before && applied >= index, "{before} {index} {applied}");
+        assert!(shared.store.lock().unwrap().store.get("Node/b").is_some());
     }
 
     #[test]

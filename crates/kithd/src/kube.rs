@@ -26,13 +26,16 @@
 use crate::Shared;
 use crate::access::{Caller, Certificate, Grants};
 use crate::api::{self, ApiError, LogOptions};
+use crate::websocket;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as Route, Query, State};
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
+use hyper::upgrade::OnUpgrade;
+use hyper_util::rt::TokioIo;
 use kith_api::kinds::Verb;
 use kith_api::store::{Action, Error, Store, now, rfc3339};
 use kith_api::{Metadata, Resource};
@@ -40,6 +43,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The annotation a resource made here carries: the object as the client sent it. What
 /// `kubectl apply` works its next change out from is in it, so it is given back whole.
@@ -886,8 +890,11 @@ fn pods(owner: &Value, resource: &Resource) -> Vec<Value> {
         if !node.is_null() {
             set(&mut spec, "/nodeName", node.clone());
         }
+        // A replica a delete restarted starts at its restart; the rest at their owner's making.
+        let since = all.iter().filter_map(|unit| unit["restarted"].as_u64()).max();
+        let started = since.map_or(meta["creationTimestamp"].clone(), |at| rfc3339(at).into());
         let mut status = json!({
-            "phase": phase, "startTime": meta["creationTimestamp"],
+            "phase": phase, "startTime": started,
             "conditions": [
                 condition("Initialized", begun, ""), condition("PodScheduled", true, ""),
                 condition("ContainersReady", ready, ""), condition("Ready", ready, ""),
@@ -2035,6 +2042,20 @@ async fn serve(
             let why = "status is kithd's own: it is written from what runs and is not taken from a client";
             return Err(status(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", why.into()));
         }
+        ("GET" | "POST", Some(name), Some(verb @ ("exec" | "attach"))) if kind.kind == "Pod" => {
+            let upgrade = parts.extensions.get::<OnUpgrade>().cloned();
+            let (method, headers) = (parts.method.as_str(), &parts.headers);
+            pod_stream(
+                &call,
+                verb,
+                namespace.unwrap_or_default(),
+                name,
+                method,
+                headers,
+                upgrade,
+            )
+            .await?
+        }
         (_, Some(_), Some("exec" | "attach" | "portforward")) => {
             let why = "exec, attach and port-forward are not answered here: `kith run` runs a command in a replica";
             return Err(status(StatusCode::NOT_IMPLEMENTED, "NotImplemented", why.into()));
@@ -2538,6 +2559,9 @@ async fn delete(
             "{kind}/{name}: gracePeriodSeconds is taken and changes nothing: what it runs is stopped as kith stops it"
         ));
     }
+    if kind.kind == "Pod" {
+        return delete_pod(call, kind, namespace, name, hints).await;
+    }
     // (Asked first: who may not delete here is not told what is there.)
     call.allowed(kind, namespace, Verb::Delete)?;
     let dry = call.asked.contains_key("dryRun") || options["dryRun"].is_array();
@@ -2608,6 +2632,57 @@ async fn delete(
         format!("Namespace/{name}: {stay} resources in it were not made through this API, and stay: `kith delete` removes them")
     });
     hints.extend(stay);
+    Ok(Written(StatusCode::OK, Some(done), hints).into_response())
+}
+
+/// `kubectl delete pod NAME` restarts that one replica: its node stops it and its Workload starts
+/// it again, with the same name and number and a new start time. Needs the apply right on the
+/// Workload; a pod that is no Workload's replica (a bare pod, a Job's run, a NodeWorkload's copy)
+/// is refused by name. No grace period and no force: what runs is stopped as kith stops it.
+async fn delete_pod(
+    call: &Call,
+    kind: &'static Kind,
+    namespace: Option<&str>,
+    name: &str,
+    hints: Vec<String>,
+) -> Result<Response, No> {
+    let namespace = namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE);
+    let Some(("Workload", owner, replica)) = pod_owner(name) else {
+        let why = format!(
+            "Pod/{name}: only a replica of a Workload is restarted by a delete: kith runs no other pod that is restarted so"
+        );
+        return Err(invalid(why));
+    };
+    // (Asked before the Workload is looked at: who may not restart it is not told what is there.)
+    api::permit(&call.shared, &call.caller, Verb::Apply, |_| {
+        vec![("Workload".to_string(), Some(namespace.to_string()))]
+    })
+    .map_err(refusal)?;
+    let key = format!("Workload/{namespace}/{owner}");
+    let running = {
+        let state = call.shared.store.lock().expect("a handler panicked holding the store");
+        state
+            .store
+            .get(&key)
+            .filter(|held| raw(held).is_some())
+            .is_some_and(|held| {
+                held.status.as_ref().is_some_and(|status| {
+                    status["containers"]
+                        .as_array()
+                        .is_some_and(|units| units.iter().any(|u| u["replica"] == replica))
+                })
+            })
+    };
+    if !running {
+        return Err(not_found(kind, name));
+    }
+    let _ = api::restart_replica(&call.shared, &call.caller, &key, replica, false)
+        .await
+        .map_err(refusal)?;
+    let done = json!({
+        "kind": "Status", "apiVersion": "v1", "status": "Success",
+        "details": { "name": name, "group": kind.group, "kind": kind.plural },
+    });
     Ok(Written(StatusCode::OK, Some(done), hints).into_response())
 }
 
@@ -2880,17 +2955,7 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
         let why = format!("{asked}: a unit's output is kept as it was written, all its runs in one file and not when");
         return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why));
     }
-    // Which replica of what: the name says (a Job's and a Workload's of one name are two).
-    let owner = pod_owner(pod).and_then(|(holder, owner, replica)| {
-        let state = call.shared.store.lock().expect("a handler panicked holding the store");
-        let key = format!("{holder}/{namespace}/{owner}");
-        state
-            .store
-            .get(&key)
-            .is_some_and(|held| raw(held).is_some())
-            .then_some((key, replica))
-    });
-    let (key, replica) = owner.ok_or_else(|| not_found(&KINDS[0], pod))?;
+    let (key, replica) = held_owner(call, namespace, pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
     // What a unit wrote is read by who may read the resource that runs it.
     let holder = key.split('/').next().unwrap_or_default().to_string();
     let place = vec![(holder, Some(namespace.to_string()))];
@@ -2925,9 +2990,287 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
     Ok(([(header::CONTENT_TYPE, "text/plain")], Body::from_stream(chunks)).into_response())
 }
 
+/// The resource that runs `pod` in `namespace` and the replica the pod is, if the store holds
+/// that resource: what the pod's name says, checked against what is there.
+fn held_owner(call: &Call, namespace: &str, pod: &str) -> Option<(String, u32)> {
+    let (holder, owner, replica) = pod_owner(pod)?;
+    let state = call.shared.store.lock().expect("a handler panicked holding the store");
+    let key = format!("{holder}/{namespace}/{owner}");
+    state
+        .store
+        .get(&key)
+        .is_some_and(|held| raw(held).is_some())
+        .then_some((key, replica))
+}
+
+/// The channel protocols kithd answers for exec and attach, in the order it prefers them.
+const CHANNELS: [&str; 2] = ["v5.channel.k8s.io", "v4.channel.k8s.io"];
+
+/// The largest frame a client may send: a frame longer than this is refused before its body is read.
+// ponytail: one frame's bytes held at a time; a stdin larger than this comes as more frames.
+const FRAME_MAX: usize = 1 << 20;
+
+/// `kubectl exec`, `attach` and `cp` (a tar run by exec): the Exec right on the Workload, Job or
+/// NodeWorkload that runs the pod is checked first, and only then is the WebSocket upgrade looked at.
+/// Each decision is written in the audit log, as `kith run`'s is.
+async fn pod_stream(
+    call: &Call,
+    verb: &str,
+    namespace: &str,
+    pod: &str,
+    method: &str,
+    headers: &HeaderMap,
+    upgrade: Option<OnUpgrade>,
+) -> Result<Response, No> {
+    let decided = pod_decision(call, namespace, pod, method, headers, upgrade).await;
+    let outcome = decided.as_ref().map(|_| ()).map_err(|no| no.why.clone());
+    call.shared
+        .audit
+        .record(&call.caller, verb, vec![format!("pod {namespace}/{pod}")], outcome);
+    decided
+}
+
+async fn pod_decision(
+    call: &Call,
+    namespace: &str,
+    pod: &str,
+    method: &str,
+    headers: &HeaderMap,
+    upgrade: Option<OnUpgrade>,
+) -> Result<Response, No> {
+    // (What the pod's name says is enough to ask: a caller without the right is refused whether or not the pod is there.)
+    let (holder, _, _) = pod_owner(pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
+    let place = vec![(holder.to_string(), Some(namespace.to_string()))];
+    api::permit(&call.shared, &call.caller, Verb::Exec, |_| place).map_err(refusal)?;
+    // A NodeWorkload's pod runs on the host, as `kith run` runs there: that takes Exec on `Node`, cluster-wide.
+    if holder == "NodeWorkload" {
+        let node = vec![("Node".to_string(), None)];
+        api::permit(&call.shared, &call.caller, Verb::Exec, |_| node).map_err(refusal)?;
+    }
+    if held_owner(call, namespace, pod).is_none() {
+        return Err(not_found(&KINDS[0], pod));
+    }
+    // kubectl sends no Origin: one is a browser's, and a browser is not let upgrade to a shell.
+    if headers.contains_key(header::ORIGIN) {
+        let why = "an upgrade that carries an Origin is refused: kubectl sends none";
+        return Err(status(StatusCode::FORBIDDEN, "Forbidden", why.into()));
+    }
+    let said = |name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+    };
+    let offered: Vec<&str> = said(header::SEC_WEBSOCKET_PROTOCOL).split(',').map(str::trim).collect();
+    let chosen = CHANNELS.into_iter().find(|channel| offered.contains(channel));
+    let accept = websocket::accept_key(said(header::SEC_WEBSOCKET_KEY));
+    let upgrading = said(header::UPGRADE).eq_ignore_ascii_case("websocket")
+        && said(header::CONNECTION).to_ascii_lowercase().contains("upgrade")
+        && said(header::SEC_WEBSOCKET_VERSION) == "13";
+    let (Some(upgrade), Some(chosen), Some(accept), true) = (upgrade, chosen, accept, upgrading) else {
+        let why = "exec, attach and cp are a WebSocket: a GET that upgrades, with version 13 and a channel protocol kithd answers";
+        return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why.into()));
+    };
+    if method != "GET" {
+        let why = "a WebSocket is asked by GET";
+        return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why.into()));
+    }
+    tokio::spawn(async move {
+        if let Ok(upgraded) = upgrade.await {
+            pod_channels(TokioIo::new(upgraded)).await;
+        }
+    });
+    Ok((
+        StatusCode::SWITCHING_PROTOCOLS,
+        [
+            (header::UPGRADE, "websocket".to_string()),
+            (header::CONNECTION, "Upgrade".to_string()),
+            (header::SEC_WEBSOCKET_ACCEPT, accept),
+            (header::SEC_WEBSOCKET_PROTOCOL, chosen.to_string()),
+        ],
+    )
+        .into_response())
+}
+
+/// What a session says once it is upgraded: the channels are not carried to the replica yet,
+/// so the error channel (3) says so as a Status and the WebSocket is closed. Then the client's
+/// close is read back, for at most five seconds.
+// ponytail: the replica's exec (kith run's hop to its node) is the next slice; until then nothing runs.
+async fn pod_channels<IO: AsyncReadExt + AsyncWriteExt + Unpin>(mut io: IO) {
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        talk(&mut io).await;
+        let _ = io.shutdown().await;
+    })
+    .await;
+}
+
+/// The reply and the reading back of the client's close, which [`pod_channels`] bounds in time.
+async fn talk<IO: AsyncReadExt + AsyncWriteExt + Unpin>(io: &mut IO) {
+    use websocket::Op;
+    let why = json!({
+        "kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure",
+        "reason": "NotImplemented", "code": 501,
+        "message": "exec, attach and cp into a replica are not carried yet: kithd answers the access, not the run",
+    });
+    let mut error = vec![3u8];
+    error.extend_from_slice(why.to_string().as_bytes());
+    let closing = websocket::close_body(1011, "not carried yet");
+    let reply = [
+        websocket::encode(Op::Binary, &error, None),
+        websocket::encode(Op::Close, &closing, None),
+    ]
+    .concat();
+    if io.write_all(&reply).await.is_err() {
+        return;
+    }
+    let mut buf = Vec::new();
+    loop {
+        match websocket::decode(&buf, true, FRAME_MAX) {
+            Ok(Some((frame, used))) => {
+                buf.drain(..used);
+                match frame.op {
+                    Op::Close => return,
+                    Op::Ping => {
+                        let pong = websocket::encode(Op::Pong, &frame.payload, None);
+                        if io.write_all(&pong).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => {
+                let mut chunk = [0u8; 4096];
+                match io.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+    /// The next frame the server sends, read from `client` with what `buf` already holds.
+    async fn frame(client: &mut DuplexStream, buf: &mut Vec<u8>) -> websocket::Frame {
+        loop {
+            match websocket::decode(buf, false, FRAME_MAX) {
+                Ok(Some((frame, used))) => {
+                    buf.drain(..used);
+                    return frame;
+                }
+                Ok(None) => {}
+                Err(_) => panic!("the server sent a malformed frame"),
+            }
+            let mut chunk = [0u8; 4096];
+            let n = client.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "the server ended before its frame");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// A stream whose shutdown never completes, as a peer that stopped answering leaves it.
+    struct StuckShutdown(DuplexStream);
+
+    impl AsyncRead for StuckShutdown {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for StuckShutdown {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// talk answers the client's masked ping with a pong that echoes its payload.
+    #[tokio::test]
+    async fn websocket_talk_answers_a_masked_ping_with_its_pong() {
+        use websocket::Op;
+        let (mut server, mut client) = tokio::io::duplex(1 << 16);
+        let talking = tokio::spawn(async move { talk(&mut server).await });
+        let mut buf = Vec::new();
+        assert_eq!(frame(&mut client, &mut buf).await.op, Op::Binary);
+        assert_eq!(frame(&mut client, &mut buf).await.op, Op::Close);
+        client
+            .write_all(&websocket::encode(Op::Ping, b"hi", Some([1, 2, 3, 4])))
+            .await
+            .unwrap();
+        let pong = frame(&mut client, &mut buf).await;
+        assert_eq!((pong.op, pong.payload.as_slice()), (Op::Pong, &b"hi"[..]));
+        drop(client);
+        talking.await.unwrap();
+    }
+
+    /// talk ends at the client's masked close, and not before: the client stays connected.
+    #[tokio::test]
+    async fn websocket_talk_ends_when_the_client_closes() {
+        use websocket::Op;
+        let (mut server, mut client) = tokio::io::duplex(1 << 16);
+        let talking = tokio::spawn(async move { talk(&mut server).await });
+        let mut buf = Vec::new();
+        assert_eq!(frame(&mut client, &mut buf).await.op, Op::Binary);
+        assert_eq!(frame(&mut client, &mut buf).await.op, Op::Close);
+        let closing = websocket::close_body(1000, "bye");
+        client
+            .write_all(&websocket::encode(Op::Close, &closing, Some([9, 8, 7, 6])))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), talking)
+            .await
+            .expect("talk ends")
+            .unwrap();
+    }
+
+    /// A client that never reads its reply does not hold the session past the five seconds.
+    #[tokio::test(start_paused = true)]
+    async fn websocket_pod_channels_returns_within_the_cap_when_the_client_never_reads() {
+        // A 16-byte buffer cannot take the reply, and the client keeps its end open without reading.
+        let (server, _client) = tokio::io::duplex(16);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), pod_channels(server))
+            .await
+            .expect("pod_channels returned");
+        assert!(started.elapsed() <= Duration::from_secs(6), "{:?}", started.elapsed());
+    }
+
+    /// The shutdown is inside the five seconds too: a shutdown that never completes is given up.
+    #[tokio::test(start_paused = true)]
+    async fn websocket_pod_channels_gives_up_a_shutdown_that_never_completes() {
+        use websocket::Op;
+        let (server, mut client) = tokio::io::duplex(1 << 16);
+        // The client's close is already sent, so talk ends at once and only the shutdown is left.
+        let closing = websocket::close_body(1000, "");
+        client
+            .write_all(&websocket::encode(Op::Close, &closing, Some([1, 1, 1, 1])))
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), pod_channels(StuckShutdown(server)))
+            .await
+            .expect("pod_channels returned");
+        assert!(started.elapsed() <= Duration::from_secs(6), "{:?}", started.elapsed());
+    }
 
     /// A status is kithd's own word for what runs: a client's PUT or PATCH of it is refused
     /// in those words, not with the bare 405 of a path nothing is done to.
@@ -3489,6 +3832,194 @@ spec: {role: writer, subjects: [carol]}
             let (code, said) = ask("GET", "", &format!("namespaces/default/pods/{pod}/log"), Value::Null).await;
             assert_eq!((code, said.as_str()), (StatusCode::OK, wrote), "{pod}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What `serve` answers a request by `caller`: the status and the body as text.
+    async fn answer_as(
+        shared: Arc<crate::Shared>,
+        caller: Caller,
+        method: &str,
+        group: &str,
+        rest: &str,
+        body: Value,
+    ) -> (StatusCode, String) {
+        let mut request = axum::http::Request::builder().method(method).body(()).unwrap();
+        request.extensions_mut().insert(caller);
+        let (parts, ()) = request.into_parts();
+        match serve(shared, parts, group, rest, Asked::new(), body.to_string().as_bytes()).await {
+            Ok(answer) => {
+                let (code, body) = (answer.status(), answer.into_body());
+                let text = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                (code, String::from_utf8_lossy(&text).into_owned())
+            }
+            Err(no) => (no.code, no.why),
+        }
+    }
+
+    /// A Deployment `x` of two replicas, both running here, and the pods of it by name.
+    async fn two_replicas_of_x(shared: &Arc<crate::Shared>) {
+        let deployment = json!({
+            "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "x" },
+            "spec": { "replicas": 2, "selector": { "matchLabels": { "app": "x" } }, "template": {
+                "metadata": { "labels": { "app": "x" } }, "spec": { "containers": [{ "name": "main", "image": "i" }] },
+            } },
+        });
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "POST",
+            "apps",
+            "namespaces/default/deployments",
+            deployment,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let units = json!({ "containers": [
+            { "name": "main", "replica": 0, "state": "running", "ready": true, "restarts": 0 },
+            { "name": "main", "replica": 1, "state": "running", "ready": true, "restarts": 0 },
+        ] });
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .set_status("Workload/default/x", Some(units))
+            .unwrap();
+    }
+
+    /// `kubectl delete pod x-0` restarts that one replica: its slot is marked for the
+    /// controller to stop and start again, and the other replica and the pods are as they were.
+    /// (The controller's side is `delete_pod_stops_the_replica_and_starts_it_again_ignoring_policy`.)
+    #[tokio::test]
+    async fn delete_pod_restarts_only_that_replica() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-delete-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        two_replicas_of_x(&shared).await;
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{said}");
+        let marked: Vec<(String, u32)> = shared.restarts.lock().unwrap().iter().cloned().collect();
+        assert_eq!(marked, [("Workload/default/x".to_string(), 0)]);
+        let (code, listed) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "GET",
+            "",
+            "namespaces/default/pods",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{listed}");
+        let listed: Value = serde_json::from_str(&listed).unwrap();
+        let mut names: Vec<_> = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pod| pod["metadata"]["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["x-0", "x-1"], "{listed}");
+        // A pod kith runs no Workload replica of is refused by name, and marks nothing.
+        for no in ["bare", "x-j0"] {
+            let (code, said) = answer_as(
+                shared.clone(),
+                Caller::Admin,
+                "DELETE",
+                "",
+                &format!("namespaces/default/pods/{no}"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{no}: {said}");
+            assert!(said.contains(no), "{no}: {said}");
+        }
+        // A Workload that is not there has no such replica.
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-1-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
+        // A replica that is not there is no pod.
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-5",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
+        assert_eq!(shared.restarts.lock().unwrap().len(), 1, "only x-0 is marked");
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a pod of a Workload needs the apply right on that Workload: get alone is
+    /// refused 403 and nothing is marked; apply takes it. Reading the pod stays get's.
+    #[tokio::test]
+    async fn delete_pod_access_needs_apply_on_the_workload() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-delete-access-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let roles = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: readers}\nspec: {rules: [{kinds: [Workload], verbs: [get]}]}\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: writers}\nspec: {rules: [{kinds: [Workload], verbs: [apply]}]}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: ann-reads}\nspec: {role: readers, subjects: [ann]}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: bob-writes}\nspec: {role: writers, subjects: [bob]}\n---\napiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: ann}\nspec: {}\n---\napiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: bob}\nspec: {}\n";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(roles).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        two_replicas_of_x(&shared).await;
+        let ann = Caller::Identity("ann".into());
+        let (code, said) = answer_as(
+            shared.clone(),
+            ann.clone(),
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{said}");
+        assert!(
+            shared.restarts.lock().unwrap().is_empty(),
+            "a refused delete marks nothing"
+        );
+        let (code, said) = answer_as(
+            shared.clone(),
+            ann,
+            "GET",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{said}");
+        let bob = Caller::Identity("bob".into());
+        let (code, said) = answer_as(
+            shared.clone(),
+            bob,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{said}");
+        assert_eq!(shared.restarts.lock().unwrap().len(), 1);
+        drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

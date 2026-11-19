@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -137,7 +137,6 @@ pub fn plan(asked: &[Asked], people: Ipv6Addr) -> BTreeMap<String, Said> {
         }
     }
     // Keepers first: a refused peer's held address is kept only where no keeper holds it.
-    // Keepers first: a refused peer's held address is kept only where no keeper holds it.
     lot.sort_by(|a, b| (a.1.is_some(), &a.0.name).cmp(&(b.1.is_some(), &b.0.name)));
 
     let mut said = BTreeMap::new();
@@ -182,7 +181,7 @@ pub fn plan(asked: &[Asked], people: Ipv6Addr) -> BTreeMap<String, Said> {
 
 /// Why an AccessLevel's network lies over the cluster's mesh /48 or its people /64: the first
 /// `min` bits of the two agree. IPv4 networks are not these; the people's IPv4 ranges are kith-api's.
-fn over(net: &str, mesh: Ipv6Addr, people: Ipv6Addr) -> Option<String> {
+pub(crate) fn over(net: &str, mesh: Ipv6Addr, people: Ipv6Addr) -> Option<String> {
     let (address, length) = net.split_once('/')?;
     let IpAddr::V6(address) = address.parse::<IpAddr>().ok()? else {
         return None;
@@ -201,7 +200,7 @@ fn over(net: &str, mesh: Ipv6Addr, people: Ipv6Addr) -> Option<String> {
     }
 }
 
-fn held(resource: &Resource) -> Option<(Ipv4Addr, Ipv6Addr)> {
+pub(crate) fn held(resource: &Resource) -> Option<(Ipv4Addr, Ipv6Addr)> {
     let addresses = resource.status.as_ref()?.get("addresses")?;
     let four = addresses.get("ipv4")?.as_str()?.parse().ok()?;
     let six = addresses.get("ipv6")?.as_str()?.parse().ok()?;
@@ -320,15 +319,41 @@ pub fn up(state: &Path, port: u16, interface: &str, people64: Ipv6Addr) -> std::
 }
 
 /// `up`, with the table made by `table` (the tests make theirs without masquerade: see `table_here`).
-fn up_with(
+pub(crate) fn up_with(
     state: &Path,
     port: u16,
     people64: Ipv6Addr,
     table: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<kith_mesh::Key> {
-    let key = crate::mesh::private_key(&state.join("pki").join("people.key"))?;
-    table()?;
-    Ok(kith_mesh::people::device(&key, port, people64)?.public_key)
+    let made = (|| {
+        let key = crate::mesh::private_key(&state.join("pki").join("people.key"))?;
+        // (The order of docs/adr-people.md: the table with its drops, the rules that send nowhere, the
+        // device with no peers. `levels` adds the levels' chains and the peers, after.)
+        table()?;
+        kith_mesh::exit::people_hold()?;
+        kith_mesh::people::device(&key, port, people64)
+    })();
+    match made {
+        Ok(found) => {
+            crate::levels::DEVICE_UP.store(true, std::sync::atomic::Ordering::Release);
+            Ok(found.public_key)
+        }
+        Err(e) => {
+            // (An old kwg0 would keep last run's peers and rules, with nothing tending them.)
+            take_away();
+            Err(e)
+        }
+    }
+}
+
+/// Take kwg0, its rules and its table away (best effort), once no pass of `levels` is in flight and
+/// none will start: else one would make the table and the rules again.
+pub(crate) fn take_away() {
+    crate::levels::DEVICE_UP.store(false, std::sync::atomic::Ordering::Release);
+    let _tending = crate::levels::TENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = kith_mesh::people::remove() {
+        eprintln!("kithd: people: taking away {}'s people: {e}", kith_mesh::people::DEVICE);
+    }
 }
 
 /// A kernel with no nftables masquerade (CONFIG_NFT_MASQ) refuses the table's post chain: that
@@ -410,12 +435,483 @@ pub async fn device(
             _ = stopping.changed() => break,
         }
     }
-    if let Err(e) = kith_mesh::people::remove() {
-        eprintln!("kithd: people: taking away {}'s people: {e}", kith_mesh::people::DEVICE);
-    }
+    take_away();
     if let Err(e) = crate::mesh::say(&shared, &node, "people", Value::Null).await {
         eprintln!("kithd: people: taking back this node's people: {e}");
     }
+}
+
+// ── A phone gets in (docs/adr-people.md, "How a configuration is shown once") ──────────
+
+/// The body of `POST /v1/peers`: a name, the node that ends the tunnel, and the AccessLevel.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Add {
+    pub name: String,
+    pub node: String,
+    pub level: String,
+    /// Give a name that has a key a new one: the old configuration stops working. Without it a
+    /// name that has a key is refused, so a second tap on a button cannot cut a phone off.
+    #[serde(default)]
+    pub replace: bool,
+}
+
+/// Keys made at once and lately, for `POST /v1/peers` (one of these in the `Cluster`).
+pub struct Making {
+    /// The names a request is making a key for now: two for one name cannot both be let in.
+    names: Mutex<std::collections::BTreeSet<String>>,
+    tokens: Mutex<Bucket>,
+}
+
+impl Default for Making {
+    fn default() -> Self {
+        Making {
+            names: Mutex::default(),
+            tokens: Mutex::new(Bucket::new(std::time::Instant::now())),
+        }
+    }
+}
+
+/// A name held by a request making its key, let go when this is dropped.
+struct Name<'a> {
+    making: &'a Making,
+    name: String,
+}
+
+impl Drop for Name<'_> {
+    fn drop(&mut self) {
+        self.making
+            .names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.name);
+    }
+}
+
+impl Making {
+    fn begin(&self, name: &str) -> Option<Name<'_>> {
+        let new = self
+            .names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string());
+        new.then(|| Name {
+            making: self,
+            name: name.to_string(),
+        })
+    }
+}
+
+/// A token bucket: `BURST` keys at once, one more every `12 s` (5 a minute), a key a token.
+struct Bucket {
+    tokens: f64,
+    at: std::time::Instant,
+}
+
+const BURST: f64 = 5.0;
+const PER_MINUTE: f64 = 5.0;
+
+impl Bucket {
+    fn new(now: std::time::Instant) -> Bucket {
+        Bucket { tokens: BURST, at: now }
+    }
+
+    /// Takes a token at `now` if there is one.
+    fn take(&mut self, now: std::time::Instant) -> bool {
+        let since = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + since * PER_MINUTE / 60.0).min(BURST);
+        self.at = now;
+        let there = self.tokens >= 1.0;
+        if there {
+            self.tokens -= 1.0;
+        }
+        there
+    }
+}
+
+/// `POST /v1/peers`: makes a WireGuard key, applies a RemotePeer holding its public half as the
+/// caller, and answers the peer's configuration once, which holds the private half and is kept
+/// nowhere here. No cache may keep the answer.
+pub async fn add(
+    axum::extract::State(shared): axum::extract::State<Arc<Shared>>,
+    axum::Extension(caller): axum::Extension<crate::access::Caller>,
+    axum::Json(body): axum::Json<Add>,
+) -> axum::response::Response {
+    answer(&shared, &caller, body, kith_mesh::public_of).await
+}
+
+/// The answer's body, which holds a private key: wiped when what holds it lets go, which is
+/// when the server has written it.
+struct Wiped(zeroize::Zeroizing<Vec<u8>>);
+
+impl AsRef<[u8]> for Wiped {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// `add`, with the public half of a private key made by `derive` (the kernel's, but for a test).
+pub(crate) async fn answer(
+    shared: &Arc<Shared>,
+    caller: &crate::access::Caller,
+    body: Add,
+    derive: impl FnOnce(&kith_mesh::Key) -> std::io::Result<kith_mesh::Key> + Send + 'static,
+) -> axum::response::Response {
+    let said = match added(shared, caller, body, derive).await {
+        Ok(said) => {
+            let mut said =
+                axum::response::Response::new(axum::body::Body::from(axum::body::Bytes::from_owner(Wiped(said))));
+            said.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            said
+        }
+        Err(refused) => refused,
+    };
+    crate::cluster::no_store(said)
+}
+
+/// The JSON of the answer, in one buffer made big enough that it never grows (a grown one
+/// leaves its old self, holding the key, behind), and wiped when dropped.
+fn answer_body(
+    name: &str,
+    node: &str,
+    level: &str,
+    public: &str,
+    (four, six): (Ipv4Addr, Ipv6Addr),
+    config: &str,
+) -> zeroize::Zeroizing<Vec<u8>> {
+    #[derive(serde::Serialize)]
+    struct Out<'a> {
+        name: &'a str,
+        node: &'a str,
+        level: &'a str,
+        #[serde(rename = "publicKey")]
+        public: &'a str,
+        addresses: Addresses,
+        config: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct Addresses {
+        ipv4: String,
+        ipv6: String,
+    }
+    // (A character is at most six bytes escaped.)
+    let room = 6 * (name.len() + node.len() + level.len() + public.len() + config.len()) + 256;
+    let mut body = zeroize::Zeroizing::new(Vec::with_capacity(room));
+    let out = Out {
+        name,
+        node,
+        level,
+        public,
+        addresses: Addresses {
+            ipv4: four.to_string(),
+            ipv6: six.to_string(),
+        },
+        config,
+    };
+    serde_json::to_writer(&mut *body, &out).expect("a Vec takes a write, and these are strings");
+    body
+}
+
+#[allow(clippy::result_large_err)] // the refusal is the answer itself, built once and returned
+async fn added(
+    shared: &Arc<Shared>,
+    caller: &crate::access::Caller,
+    body: Add,
+    derive: impl FnOnce(&kith_mesh::Key) -> std::io::Result<kith_mesh::Key> + Send + 'static,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, axum::response::Response> {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use base64::Engine as _;
+    let refuse = |status: StatusCode, why: String| crate::cluster::refuse(status, why).into_response();
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let Some(cluster) = &shared.cluster else {
+        let why = "this kithd is not part of a cluster (start it with --listen)".to_string();
+        return Err(refuse(StatusCode::NOT_FOUND, why));
+    };
+    let kind = |_: &Store| vec![("RemotePeer".to_string(), None)];
+    crate::api::permit(shared, caller, kith_api::kinds::Verb::Apply, kind).map_err(IntoResponse::into_response)?;
+    let people64 = prefix(&cluster.me.ca);
+    // (A name or a level that is no name is refused before anything is looked up or made.)
+    peer_of(None, &body, "").map_err(|why| refuse(StatusCode::UNPROCESSABLE_ENTITY, why))?;
+    // One request at a time makes a key for a name, from before the store is read until the
+    // answer: two for a new name cannot both be let in, and neither reads a name the other
+    // is about to give a key.
+    let Some(_held) = cluster.keys.begin(&body.name) else {
+        let why = format!("RemotePeer {} is being added: ask again when that is done", body.name);
+        return Err(refuse(StatusCode::CONFLICT, why));
+    };
+
+    // What is asked of the store: the node's word of its device, the level, and the other peers.
+    let (people, level, mut asked, existing) = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let store = &state.store;
+        let not_found = |what: &str, name: &str| refuse(StatusCode::NOT_FOUND, format!("no {what} {name}"));
+        let node = store
+            .get(&format!("Node/{}", body.node))
+            .ok_or_else(|| not_found("Node", &body.node))?;
+        let level = store
+            .get(&format!("AccessLevel/{}", body.level))
+            .ok_or_else(|| not_found("AccessLevel", &body.level))?;
+        let people = node.status.as_ref().and_then(|status| status.get("people"));
+        let Some(people) = people.filter(|people| people.is_object()) else {
+            let why = format!(
+                "{} says nothing of a people device: start it with --people and --people-endpoint, and ask again",
+                body.node
+            );
+            return Err(refuse(StatusCode::CONFLICT, why));
+        };
+        if let Some(why) = level.status.as_ref().and_then(|status| status["refused"].as_str()) {
+            return Err(refuse(
+                StatusCode::CONFLICT,
+                format!("AccessLevel {}: {why}", body.level),
+            ));
+        }
+        let spec = serde_json::from_value::<AccessLevelSpec>(level.spec.clone());
+        let spec = spec.map_err(|e| {
+            refuse(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("AccessLevel {}: {e}", body.level),
+            )
+        })?;
+        let mut asked = Vec::new();
+        for peer in store
+            .list(Some("RemotePeer"))
+            .filter(|peer| peer.metadata.name != body.name)
+        {
+            if let Ok(spec) = serde_json::from_value::<RemotePeerSpec>(peer.spec.clone()) {
+                asked.push(Asked {
+                    name: peer.metadata.name.clone(),
+                    key: spec.public_key,
+                    held: held(peer),
+                });
+            }
+        }
+        let existing = store.get(&format!("RemotePeer/{}", body.name)).cloned();
+        (people.clone(), spec, asked, existing)
+    };
+    let has_key = existing
+        .as_ref()
+        .is_some_and(|old| old.spec["publicKey"].as_str().is_some_and(|k| !k.is_empty()));
+    if has_key && !body.replace {
+        let why = format!(
+            "RemotePeer {} has a key: ask with replace to give it a new one",
+            body.name
+        );
+        return Err(refuse(StatusCode::CONFLICT, why));
+    }
+    let token = cluster
+        .keys
+        .tokens
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(std::time::Instant::now());
+    if !token {
+        let why = format!("{PER_MINUTE} keys a minute are made, and that many were: ask again in a few seconds");
+        return Err(refuse(StatusCode::TOO_MANY_REQUESTS, why));
+    }
+
+    // The key is made here, shown once and kept by nothing: only its public half goes on.
+    // (Held in `Zeroizing`: every copy of it, here and in the thread below, is wiped when dropped.)
+    let mut private = zeroize::Zeroizing::new([0u8; 32]);
+    let random = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut *private);
+    random.map_err(|_| {
+        refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no random numbers to make a key from".into(),
+        )
+    })?;
+    private[0] &= 248;
+    private[31] = (private[31] & 127) | 64;
+    // The kernel's netlink blocks: not on the runtime's thread.
+    let sent = zeroize::Zeroizing::new(*private);
+    let derived = tokio::task::spawn_blocking(move || derive(&sent)).await;
+    let public = derived
+        .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("making the public key: {e}")))?
+        .map_err(|e| {
+            let why = format!("making the public key of the new key took the kernel's WireGuard, and root: {e}");
+            refuse(StatusCode::INTERNAL_SERVER_ERROR, why)
+        })?;
+
+    // Its addresses are the ones the leader's plan gives it: refused here, no key is applied.
+    asked.push(Asked {
+        name: body.name.clone(),
+        key: b64.encode(public),
+        held: existing.as_ref().and_then(held),
+    });
+    let pair = match plan(&asked, people64).remove(&body.name) {
+        Some(Said::Given(four, six)) => (four, six),
+        Some(Said::Refused(why, _)) => return Err(refuse(StatusCode::CONFLICT, format!("{}: {why}", body.name))),
+        None => {
+            return Err(refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the plan has no word of the peer".into(),
+            ));
+        }
+    };
+    let text = config(
+        &private,
+        pair,
+        &level,
+        &people,
+        crate::mesh::prefix(&cluster.me.ca),
+        people64,
+    )
+    .map_err(|why| refuse(StatusCode::CONFLICT, format!("{}'s people: {why}", body.node)))?;
+    // (The key itself has done its work: only the text, wiped on drop, holds it across the apply.)
+    drop(private);
+
+    let resource =
+        peer_of(existing, &body, &b64.encode(public)).map_err(|why| refuse(StatusCode::UNPROCESSABLE_ENTITY, why))?;
+    crate::api::applied(shared, caller, vec![resource])
+        .await
+        .map_err(IntoResponse::into_response)?;
+    Ok(answer_body(
+        &body.name,
+        &body.node,
+        &body.level,
+        &b64.encode(public),
+        pair,
+        &text,
+    ))
+}
+
+/// The RemotePeer `body` asks for, with `public` (base64) as its key: the one already there with
+/// its labels kept, or a new one. Validated. An empty `public` is a stand-in key, for the name's check.
+fn peer_of(existing: Option<Resource>, body: &Add, public: &str) -> Result<Resource, String> {
+    use base64::Engine as _;
+    let stand_in = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+    let mut metadata = existing.map_or_else(
+        || kith_api::Metadata {
+            name: body.name.clone(),
+            namespace: None,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            revision: None,
+        },
+        |old| old.metadata,
+    );
+    metadata.revision = None;
+    Resource {
+        api_version: kith_api::API_VERSION.to_string(),
+        kind: "RemotePeer".to_string(),
+        metadata,
+        spec: json!({
+            "node": body.node,
+            "level": body.level,
+            "publicKey": if public.is_empty() { &stand_in } else { public },
+        }),
+        status: None,
+    }
+    .validated()
+}
+
+/// Is this `host:port` a place to send to: an IPv4 address, a bracketed IPv6 one or a DNS name
+/// (letters, digits, `-` and `.`), and a port of 1 to 65535? Nothing else is let into a line of
+/// a configuration, whatever a node says of itself.
+fn reachable(endpoint: &str) -> bool {
+    if endpoint.parse::<std::net::SocketAddr>().is_ok_and(|at| at.port() != 0) {
+        return true;
+    }
+    let Some((host, port)) = endpoint.rsplit_once(':') else {
+        return false;
+    };
+    let name = !host.is_empty()
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+        && !host.starts_with(['-', '.'])
+        && !host.ends_with(['-', '.']);
+    let number = !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit());
+    name && number && port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
+/// A range of a level's `networks`, as the configuration writes it: an address and a length.
+fn range(net: &str) -> Result<String, String> {
+    let wrong = || format!("the level's network {net:?} is not an address and a length");
+    let (address, length) = net.split_once('/').ok_or_else(wrong)?;
+    let address: IpAddr = address.parse().map_err(|_| wrong())?;
+    let most = if address.is_ipv4() { 32 } else { 128 };
+    let digits = !length.is_empty() && length.bytes().all(|byte| byte.is_ascii_digit());
+    match length.parse::<u8>() {
+        Ok(length) if digits && length <= most => Ok(format!("{address}/{length}")),
+        _ => Err(wrong()),
+    }
+}
+
+/// The configuration a phone takes in (WireGuard's own format, docs/adr-people.md): the peer's
+/// addresses and level's resolver, and the node's people device, which it sends everything to for
+/// a level with the internet or an Exit, and otherwise the level's ranges, its Services' /80 and
+/// the node's own people addresses (and the resolver, if none of them is it). `node` is the
+/// node's `people` status; each value of it and of the level is checked and written again, so that
+/// no line of the configuration is another's.
+fn config(
+    private: &kith_mesh::Key,
+    (four, six): (Ipv4Addr, Ipv6Addr),
+    level: &AccessLevelSpec,
+    node: &Value,
+    mesh: Ipv6Addr,
+    people: Ipv6Addr,
+) -> Result<zeroize::Zeroizing<String>, String> {
+    use base64::Engine as _;
+    use std::fmt::Write as _;
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let public = node
+        .get("publicKey")
+        .and_then(Value::as_str)
+        .and_then(|text| b64.decode(text).ok());
+    let public = public
+        .filter(|key| key.len() == 32)
+        .ok_or("its people key is not a WireGuard key")?;
+    let endpoint = node.get("endpoint").and_then(Value::as_str);
+    let endpoint = endpoint.ok_or("it has no --people-endpoint: the phone would have nowhere to send to")?;
+    if !reachable(endpoint) {
+        return Err(format!("its --people-endpoint {endpoint:?} is not host:port"));
+    }
+    let dns = match level.dns.as_deref() {
+        Some(text) => Some(
+            text.parse::<IpAddr>()
+                .map_err(|_| format!("the level's dns {text:?} is not an address"))?,
+        ),
+        None => None,
+    };
+    let mut allowed = level
+        .networks
+        .iter()
+        .map(|net| range(net))
+        .collect::<Result<Vec<_>, _>>()?;
+    if level.internet == Some(true) || level.exit.is_some() {
+        allowed = vec!["0.0.0.0/0".to_string(), "::/0".to_string()];
+    } else {
+        if !level.services.is_empty() {
+            let mut services = kith_mesh::service_address(mesh, "", "").octets();
+            services[10..].fill(0);
+            allowed.push(format!("{}/80", Ipv6Addr::from(services)));
+        }
+        allowed.push(format!("{}/32", Ipv4Addr::from(u32::from(RANGE) | 1)));
+        allowed.push(format!("{}/128", Ipv6Addr::from(u128::from(people) | 1)));
+        if let Some(dns) = dns {
+            let own = format!("{dns}/{}", if dns.is_ipv4() { 32 } else { 128 });
+            if !allowed.contains(&own) {
+                allowed.push(own);
+            }
+        }
+    }
+    let dns = dns.map_or(String::new(), |dns| format!("DNS = {dns}\n"));
+    // The text holds the private key: wiped on drop, in a buffer that is never grown (a grown
+    // one leaves its old self behind), and the key's own base64 in one that is wiped too.
+    let (private, allowed) = (zeroize::Zeroizing::new(b64.encode(private)), allowed.join(", "));
+    let mut text = zeroize::Zeroizing::new(String::with_capacity(1024 + endpoint.len() + dns.len() + allowed.len()));
+    write!(
+        text,
+        "[Interface]\nPrivateKey = {}\nAddress = {four}/32, {six}/128\n{dns}\n[Peer]\nPublicKey = {}\nEndpoint = {endpoint}\nAllowedIPs = {allowed}\nPersistentKeepalive = 25\n",
+        private.as_str(),
+        b64.encode(public),
+    )
+    .expect("a String takes a write");
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -710,6 +1206,7 @@ mod tests {
     /// its public key is said; a second start keeps the key and empties the peers. Without the
     /// flag, the start itself takes all of that away.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn people_device() {
         use base64::Engine as _;
         use std::os::unix::fs::PermissionsExt;
@@ -721,6 +1218,8 @@ mod tests {
         if !alone {
             return eprintln!("skipped: not in a network namespace of its own");
         }
+        // (One at a time with the levels' tests, which share this namespace.)
+        let _kernel = crate::levels::tests::KERNEL.lock().unwrap_or_else(|e| e.into_inner());
         let state = std::env::temp_dir().join(format!("kithd-people-{}", std::process::id()));
         std::fs::create_dir_all(state.join("pki")).unwrap();
         let (port, people64) = (51821, people());
@@ -832,5 +1331,512 @@ mod tests {
         );
         let other = super::no_masquerade(std::io::Error::other("elsewhere"));
         assert_eq!(other.to_string(), "elsewhere");
+    }
+
+    // ── POST /v1/peers (docs/adr-people.md, "How a configuration is shown once") ──────────
+
+    use crate::access::Caller;
+    use axum::http::StatusCode;
+    use base64::Engine as _;
+
+    /// What the kernel would say of a private key, for a test with no root: any fixed map of it.
+    fn derive(key: &kith_mesh::Key) -> std::io::Result<kith_mesh::Key> {
+        Ok(key.map(|byte| byte ^ 0x5a))
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The people key n1 says it has.
+    const NODE_KEY: kith_mesh::Key = [9; 32];
+
+    fn level(spec: Value) -> AccessLevelSpec {
+        serde_json::from_value(spec).unwrap()
+    }
+
+    fn n1_says() -> Value {
+        said(Some(&NODE_KEY), 51821, Some("127.0.0.1:51821"))
+    }
+
+    fn pair() -> (Ipv4Addr, Ipv6Addr) {
+        addresses(people(), 0x0203, 0x5e6f)
+    }
+
+    fn mesh64() -> Ipv6Addr {
+        crate::mesh::prefix("a cluster")
+    }
+
+    /// The value of the line `name = ...` of a configuration.
+    fn line<'a>(config: &'a str, name: &str) -> &'a str {
+        let found = config.lines().find_map(|line| line.strip_prefix(&format!("{name} = ")));
+        found.unwrap_or_else(|| panic!("no {name} line in {config}"))
+    }
+
+    /// The configuration, for a peer of the address pair above and the private key `[1; 32]`.
+    fn config_of(level_spec: Value, node: &Value) -> Result<String, String> {
+        config(&[1; 32], pair(), &level(level_spec), node, mesh64(), people()).map(|text| text.to_string())
+    }
+
+    #[test]
+    fn peers_config_of_a_level_with_internet_sends_everything() {
+        let text = config_of(json!({"internet": true, "dns": "10.1.0.53"}), &n1_says()).unwrap();
+        let (four, six) = pair();
+        let want = format!(
+            "[Interface]\nPrivateKey = {}\nAddress = {four}/32, {six}/128\nDNS = 10.1.0.53\n\n[Peer]\nPublicKey = {}\nEndpoint = 127.0.0.1:51821\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n",
+            b64(&[1; 32]),
+            b64(&NODE_KEY),
+        );
+        assert_eq!(text, want);
+        assert_eq!(four, Ipv4Addr::new(100, 89, 2, 3));
+        // An Exit is the internet too, and a level of neither is not.
+        let exit = config_of(json!({"exit": "home", "dns": "fd00::53"}), &n1_says()).unwrap();
+        assert_eq!(line(&exit, "AllowedIPs"), "0.0.0.0/0, ::/0");
+        assert_eq!(line(&exit, "DNS"), "fd00::53");
+        let none = config_of(json!({"internet": false, "dns": "10.1.0.53"}), &n1_says()).unwrap();
+        assert_ne!(line(&none, "AllowedIPs"), "0.0.0.0/0, ::/0");
+    }
+
+    #[test]
+    fn peers_config_of_a_level_without_it_names_ranges_services_and_the_node() {
+        let spec = json!({"networks": ["192.168.0.0/16", "fd12::/16"], "services": ["web/api"], "dns": "10.1.0.53"});
+        let text = config_of(spec, &n1_says()).unwrap();
+        // (The Services' /80 of the mesh's /48: every Service is in it.)
+        let mut services = mesh64().octets();
+        services[6..10].fill(0xff);
+        services[10..].fill(0);
+        let node6 = Ipv6Addr::from(u128::from(people()) | 1);
+        let want = format!(
+            "192.168.0.0/16, fd12::/16, {}/80, 100.89.0.1/32, {node6}/128, 10.1.0.53/32",
+            Ipv6Addr::from(services)
+        );
+        assert_eq!(line(&text, "AllowedIPs"), want);
+        // No Service named: no /80. The level's resolver is there whatever else is (once).
+        let spec = json!({"networks": ["10.1.0.53/32"], "dns": "10.1.0.53"});
+        let text = config_of(spec, &n1_says()).unwrap();
+        assert_eq!(
+            line(&text, "AllowedIPs"),
+            format!("10.1.0.53/32, 100.89.0.1/32, {node6}/128")
+        );
+        // A level with no resolver gives no DNS line.
+        let text = config_of(json!({"networks": ["10.0.0.0/8"]}), &n1_says()).unwrap();
+        assert!(!text.contains("DNS"), "{text}");
+    }
+
+    #[test]
+    fn peers_config_is_made_of_nothing_a_node_could_smuggle_in() {
+        let said = |people: Value| config_of(json!({"internet": true, "dns": "10.1.0.53"}), &people);
+        for endpoint in [
+            "x.example:51821\nPostUp = reboot",
+            "x.example:51821 ",
+            "x.example",
+            "x.example:0",
+            "x.example:70000",
+            "[::1]:",
+            "a b:1",
+            "",
+        ] {
+            let mut people = n1_says();
+            people["endpoint"] = json!(endpoint);
+            assert!(said(people).is_err(), "{endpoint:?}");
+        }
+        for key in ["short", "", &b64(&[1; 33])] {
+            let mut people = n1_says();
+            people["publicKey"] = json!(key);
+            assert!(said(people).is_err(), "{key:?}");
+        }
+        for dns in ["10.1.0.53\nPostUp = reboot", "not an address", "10.1.0.53/32"] {
+            let spec = json!({"internet": true, "dns": dns});
+            assert!(config_of(spec, &n1_says()).is_err(), "{dns:?}");
+        }
+        let spec = json!({"networks": ["10.0.0.0/8\nPostUp = reboot"], "dns": "10.1.0.53"});
+        assert!(config_of(spec, &n1_says()).is_err());
+        // A host name and a bracketed IPv6 address are an endpoint.
+        for endpoint in ["vpn.example.net:51821", "[fd00::1]:51821", "127.0.0.1:1"] {
+            let mut people = n1_says();
+            people["endpoint"] = json!(endpoint);
+            let text = said(people).unwrap();
+            assert_eq!(line(&text, "Endpoint"), endpoint);
+        }
+        // A node that states none gives none to send to.
+        let mut people = n1_says();
+        people["endpoint"] = Value::Null;
+        assert!(said(people).unwrap_err().contains("people-endpoint"));
+    }
+
+    const LEVELS: &str = "
+apiVersion: kith.dev/v1
+kind: AccessLevel
+metadata: {name: family}
+spec: {internet: true, dns: 10.1.0.53}
+---
+apiVersion: kith.dev/v1
+kind: AccessLevel
+metadata: {name: friends}
+spec: {networks: [192.168.0.0/16], services: ['*'], dns: 10.1.0.53}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: bob}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: peers}
+spec:
+  rules:
+    - {kinds: [RemotePeer], verbs: [apply]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: bob-peers}
+spec: {role: peers, subjects: [bob]}
+";
+
+    /// n1 of a one-node cluster that leads itself, saying `people` of its device, with the
+    /// levels above and an Identity, bob, who may apply RemotePeers.
+    async fn leader(tag: &str, people: Value) -> Arc<Shared> {
+        let ca = crate::pki::Ca::create().unwrap();
+        let me = crate::cluster::pinned_peer::node(&ca, "n1");
+        let up = crate::view::Upstream {
+            name: "n1".into(),
+            address: "127.0.0.1:1".into(),
+            certificate: None,
+        };
+        let cluster = crate::cluster::Cluster::new(me, Some(ca)).unwrap();
+        let shared = crate::cluster::pinned_peer::shared_of(tag, cluster, &[up]).await;
+        {
+            let mut state = shared.store.lock().unwrap();
+            let mut status = state.store.get("Node/n1").unwrap().status.clone().unwrap();
+            status["people"] = people;
+            state.store.set_status("Node/n1", Some(status)).unwrap();
+            for resource in Resource::from_source(LEVELS).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        let id = shared.raft.metrics().borrow().id;
+        let leads = shared.raft.wait(Some(Duration::from_secs(30)));
+        leads.current_leader(id, "leads").await.unwrap();
+        shared
+    }
+
+    /// POST /v1/peers as `caller`: the status, the Cache-Control, and the JSON of the answer.
+    async fn ask(
+        shared: &Arc<Shared>,
+        caller: Caller,
+        name: &str,
+        node: &str,
+        level: &str,
+    ) -> (StatusCode, String, Value) {
+        ask_with(shared, caller, name, node, level, false).await
+    }
+
+    async fn ask_with(
+        shared: &Arc<Shared>,
+        caller: Caller,
+        name: &str,
+        node: &str,
+        level: &str,
+        replace: bool,
+    ) -> (StatusCode, String, Value) {
+        let body = Add {
+            name: name.into(),
+            node: node.into(),
+            level: level.into(),
+            replace,
+        };
+        let answer = super::answer(shared, &caller, body, derive).await;
+        let kept = answer.headers().get(axum::http::header::CACHE_CONTROL);
+        let kept = kept.map(|kept| kept.to_str().unwrap().to_string()).unwrap_or_default();
+        let status = answer.status();
+        let bytes = axum::body::to_bytes(answer.into_body(), 1 << 20).await.unwrap();
+        (status, kept, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn private_of(answer: &Value) -> kith_mesh::Key {
+        let text = line(answer["config"].as_str().unwrap(), "PrivateKey");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(text).unwrap();
+        bytes.try_into().unwrap()
+    }
+
+    fn found_in(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|window| window == needle)
+    }
+
+    /// The private key is in no store, revision, audit line or file under the data directory
+    /// (the raft log, the units' logs, the audit file), in text or as bytes.
+    fn nowhere(shared: &Shared, tag: &str, private: &kith_mesh::Key) {
+        let needles = [b64(private).into_bytes(), hex(private).into_bytes(), private.to_vec()];
+        let mut hay: Vec<Vec<u8>> = Vec::new();
+        {
+            let state = shared.store.lock().unwrap();
+            for resource in state.store.list(None) {
+                hay.push(serde_json::to_vec(resource).unwrap());
+                hay.push(serde_json::to_vec(state.store.history(&resource.key()).unwrap()).unwrap());
+            }
+        }
+        hay.push(serde_json::to_vec(&shared.audit.tail(1000).unwrap()).unwrap());
+        let mut dirs = vec![std::env::temp_dir().join(format!("kithd-pinned-{tag}-{}", std::process::id()))];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                match entry.path() {
+                    path if path.is_dir() => dirs.push(path),
+                    path => hay.extend(std::fs::read(path)),
+                }
+            }
+        }
+        assert!(hay.len() > 3, "the store and the data directory were read");
+        for needle in &needles {
+            assert!(!hay.iter().any(|hay| found_in(hay, needle)), "the private key was kept");
+        }
+    }
+
+    /// The answer is kept by no cache, holds the configuration with the private key once, and
+    /// the RemotePeer stored holds only the public half, which the kernel gives of that key.
+    #[tokio::test]
+    async fn peers_route_answers_once_and_keeps_only_the_public_key() {
+        let shared = leader("peers-route", n1_says()).await;
+        let (status, kept, answer) = ask(&shared, Caller::Admin, "phone", "n1", "family").await;
+        assert_eq!((status, kept.as_str()), (StatusCode::OK, "no-store"), "{answer}");
+        let private = private_of(&answer);
+        assert_ne!(private, [0; 32]);
+        let (name, node, level) = (&answer["name"], &answer["node"], &answer["level"]);
+        assert_eq!((name, node, level), (&json!("phone"), &json!("n1"), &json!("family")));
+        let config = answer["config"].as_str().unwrap();
+        assert_eq!(line(config, "PublicKey"), b64(&NODE_KEY));
+
+        let public = b64(&derive(&private).unwrap());
+        assert_eq!(answer["publicKey"], json!(public));
+        assert_ne!(public, b64(&private));
+        {
+            let state = shared.store.lock().unwrap();
+            let stored = state.store.get("RemotePeer/phone").expect("the RemotePeer is applied");
+            assert_eq!(
+                stored.spec,
+                json!({"node": "n1", "level": "family", "publicKey": public})
+            );
+            // The addresses it was told are the ones the leader's plan gives it.
+            let (four, six) = (
+                answer["addresses"]["ipv4"].as_str(),
+                answer["addresses"]["ipv6"].as_str(),
+            );
+            let (offset, iid) = drawn("phone");
+            let (want4, want6) = addresses(prefix(&shared.cluster.as_ref().unwrap().me.ca), offset, iid);
+            assert_eq!(
+                (four, six),
+                (Some(want4.to_string().as_str()), Some(want6.to_string().as_str()))
+            );
+            assert!(line(config, "Address").starts_with(&format!("{want4}/32, {want6}/128")));
+        }
+        // Applied as the caller: the audit line says who and what, and no key.
+        let audit = shared.audit.tail(50).unwrap();
+        let line = audit
+            .iter()
+            .find(|line| line["what"].to_string().contains("RemotePeer/phone"));
+        assert_eq!(line.expect("an audit line")["verb"], json!("apply"));
+        nowhere(&shared, "peers-route", &private);
+    }
+
+    /// An Identity with no right to apply RemotePeers gets a 403 (kept by no cache) and nothing
+    /// is made; one with the right is let in, and its name is on what it made.
+    #[tokio::test]
+    async fn peers_route_refuses_an_identity_that_may_not_apply_remote_peers() {
+        let shared = leader("peers-route-403", n1_says()).await;
+        let (status, kept, answer) = ask(&shared, Caller::Identity("carol".into()), "phone", "n1", "family").await;
+        assert_eq!((status, kept.as_str()), (StatusCode::FORBIDDEN, "no-store"), "{answer}");
+        assert!(answer["error"].as_str().unwrap().contains("carol"), "{answer}");
+        assert!(!answer.to_string().contains("PrivateKey"));
+        assert!(shared.store.lock().unwrap().store.get("RemotePeer/phone").is_none());
+        let (status, _, answer) = ask(&shared, Caller::Identity("bob".into()), "phone", "n1", "family").await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert!(shared.store.lock().unwrap().store.get("RemotePeer/phone").is_some());
+    }
+
+    /// Asked again for a name that has a key, nothing is made and the answer says to ask with
+    /// `replace`; with it, a new key replaces the old one: the RemotePeer holds the new public
+    /// key only, and the old configuration's key is no longer anywhere.
+    #[tokio::test]
+    async fn peers_route_asked_again_replaces_the_key() {
+        let shared = leader("peers-route-again", n1_says()).await;
+        let (_, _, first) = ask(&shared, Caller::Admin, "phone", "n1", "family").await;
+        let kept = shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .get("RemotePeer/phone")
+            .unwrap()
+            .clone();
+        let (status, no_store, refused) = ask(&shared, Caller::Admin, "phone", "n1", "friends").await;
+        assert_eq!(
+            (status, no_store.as_str()),
+            (StatusCode::CONFLICT, "no-store"),
+            "{refused}"
+        );
+        let why = refused["error"].as_str().unwrap();
+        assert_eq!(why, "RemotePeer phone has a key: ask with replace to give it a new one");
+        assert!(refused.get("config").is_none());
+        {
+            let state = shared.store.lock().unwrap();
+            assert_eq!(
+                state.store.get("RemotePeer/phone").unwrap().spec,
+                kept.spec,
+                "nothing was changed"
+            );
+        }
+        let (status, _, second) = ask_with(&shared, Caller::Admin, "phone", "n1", "friends", true).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let (old, new) = (private_of(&first), private_of(&second));
+        assert_ne!(old, new);
+        assert_eq!(first["addresses"], second["addresses"], "a name keeps its addresses");
+        {
+            let state = shared.store.lock().unwrap();
+            assert_eq!(state.store.list(Some("RemotePeer")).count(), 1);
+            let stored = state.store.get("RemotePeer/phone").unwrap();
+            assert_eq!(stored.spec["publicKey"], json!(b64(&derive(&new).unwrap())));
+            assert_eq!(stored.spec["level"], json!("friends"));
+        }
+        // (The first key is in the history as a public key only: its private half is nowhere.)
+        nowhere(&shared, "peers-route-again", &old);
+        nowhere(&shared, "peers-route-again", &new);
+    }
+
+    /// Keys come at 5 a minute, with a burst of 5: the sixth is a 429 that no cache keeps, and
+    /// makes nothing. (The bucket's own arithmetic is `peers_bucket_*`.)
+    #[tokio::test]
+    async fn peers_route_makes_five_keys_in_a_burst_and_then_says_429() {
+        let shared = leader("peers-route-429", n1_says()).await;
+        for at in 0..5 {
+            let (status, _, answer) = ask(&shared, Caller::Admin, &format!("phone-{at}"), "n1", "family").await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+        }
+        let (status, kept, answer) = ask(&shared, Caller::Admin, "phone-5", "n1", "family").await;
+        assert_eq!(
+            (status, kept.as_str()),
+            (StatusCode::TOO_MANY_REQUESTS, "no-store"),
+            "{answer}"
+        );
+        assert!(answer.get("config").is_none());
+        assert!(shared.store.lock().unwrap().store.get("RemotePeer/phone-5").is_none());
+        // (A request that is refused before a key is made takes none of the bucket.)
+        let (status, ..) = ask(&shared, Caller::Admin, "phone-0", "n1", "family").await;
+        assert_eq!(status, StatusCode::CONFLICT, "has a key, and asked for no replace");
+    }
+
+    #[test]
+    fn peers_bucket_refills_five_a_minute_up_to_five() {
+        let start = std::time::Instant::now();
+        let mut bucket = Bucket::new(start);
+        assert!((0..5).all(|_| bucket.take(start)), "a burst of five");
+        assert!(!bucket.take(start), "and the sixth waits");
+        assert!(
+            !bucket.take(start + Duration::from_secs(11)),
+            "one comes every 12 seconds"
+        );
+        assert!(bucket.take(start + Duration::from_secs(12)));
+        assert!(!bucket.take(start + Duration::from_secs(12)));
+        // Left alone an hour it holds five, not sixty.
+        let later = start + Duration::from_secs(3600);
+        assert!((0..5).all(|_| bucket.take(later)));
+        assert!(!bucket.take(later));
+    }
+
+    /// A name is made for by one request at a time: another for it is refused until the first
+    /// is done (its guard dropped), whatever the first did.
+    #[test]
+    fn peers_names_in_flight_are_made_for_one_at_a_time() {
+        let making = Making::default();
+        let first = making.begin("phone").expect("the first is let in");
+        assert!(making.begin("phone").is_none());
+        assert!(making.begin("tablet").is_some(), "another name is not held up");
+        drop(first);
+        assert!(making.begin("phone").is_some());
+    }
+
+    /// The answer's body is wiped when whoever holds it lets go; its text is what was asked.
+    #[test]
+    fn peers_answer_body_is_the_json_and_is_wiped_by_its_owner() {
+        let text = config(
+            &[7; 32],
+            pair(),
+            &level(json!({"internet": true})),
+            &n1_says(),
+            mesh64(),
+            people(),
+        )
+        .unwrap();
+        let body = answer_body("phone", "n1", "family", "AAAA", pair(), &text);
+        let said: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(said["config"].as_str().unwrap(), text.as_str());
+        assert_eq!(said["publicKey"], json!("AAAA"));
+        // Handed on as the response's body, whose owner (`Wiped`) wipes it as it is dropped.
+        let wiped = axum::body::Bytes::from_owner(Wiped(body));
+        assert_eq!(serde_json::from_slice::<Value>(&wiped).unwrap(), said);
+    }
+
+    /// A node with no people status (no `--people`, or no device), or none that is a key, gives
+    /// no configuration and nothing is applied: the answer says why.
+    #[tokio::test]
+    async fn peers_config_refused_for_a_node_with_no_people() {
+        let shared = leader("peers-config-none", Value::Null).await;
+        let (status, kept, answer) = ask(&shared, Caller::Admin, "phone", "n1", "family").await;
+        assert_eq!((status, kept.as_str()), (StatusCode::CONFLICT, "no-store"), "{answer}");
+        let why = answer["error"].as_str().unwrap();
+        assert!(why.contains("n1") && why.contains("--people"), "{why}");
+        assert!(answer.get("config").is_none());
+        assert!(shared.store.lock().unwrap().store.get("RemotePeer/phone").is_none());
+        // A node or a level that is not there is not found.
+        let (status, ..) = ask(&shared, Caller::Admin, "phone", "n9", "family").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, ..) = ask(&shared, Caller::Admin, "phone", "n1", "gone").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // A name that is not a name is refused, whoever asks.
+        let (status, ..) = ask(&shared, Caller::Admin, "Not A Name", "n1", "family").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A peer the leader would refuse (its address is another peer's) gets no configuration: the
+    /// answer says what the status would, and no key is made into the store.
+    #[tokio::test]
+    async fn peers_config_refused_for_a_peer_the_leader_would_refuse() {
+        let shared = leader("peers-config-refused", n1_says()).await;
+        {
+            let mut state = shared.store.lock().unwrap();
+            apply_peer(&mut state.store, "squatter", KEY);
+            let (offset, iid) = drawn("phone");
+            let (four, six) = addresses(prefix(&shared.cluster.as_ref().unwrap().me.ca), offset, iid);
+            let held = json!({"addresses": {"ipv4": four.to_string(), "ipv6": six.to_string()}});
+            state.store.set_status("RemotePeer/squatter", Some(held)).unwrap();
+        }
+        let (status, kept, answer) = ask(&shared, Caller::Admin, "phone", "n1", "family").await;
+        assert_eq!((status, kept.as_str()), (StatusCode::CONFLICT, "no-store"), "{answer}");
+        let why = answer["error"].as_str().unwrap();
+        assert!(why.contains("squatter") && why.contains("name it otherwise"), "{why}");
+        assert!(answer.get("config").is_none());
+        assert!(shared.store.lock().unwrap().store.get("RemotePeer/phone").is_none());
+    }
+
+    /// The kernel's own public key (RFC 7748, 6.1: Alice's), through a link made for the one
+    /// call and taken away again: in a network namespace of its own, as `people_device` is.
+    #[test]
+    fn peers_route_real_kernel_gives_the_public_key() {
+        if std::env::var_os("KITH_E2E").is_none() {
+            return eprintln!("skipped: set KITH_E2E=1 under unshare -Urn");
+        }
+        let unhex = |text: &str| -> kith_mesh::Key {
+            let byte = |at: usize| u8::from_str_radix(&text[2 * at..2 * at + 2], 16).unwrap();
+            std::array::from_fn(byte)
+        };
+        let private = unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let public = unhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        assert_eq!(kith_mesh::public_of(&private).unwrap(), public);
+        // (Twice: the link of the first is gone.)
+        assert_eq!(kith_mesh::public_of(&private).unwrap(), public);
+        let links = std::fs::read_to_string("/proc/net/dev").unwrap();
+        assert!(!links.contains("wgk"), "{links}");
     }
 }

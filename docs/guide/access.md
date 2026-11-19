@@ -60,6 +60,8 @@ RoleBindings (it could give itself every right anyway).
 - `get` covers a resource, its history and its output (`/v1/logs`); `apply` covers rollback, and
   push to or pull from a registry through kithd (which calls whatever registry is named).
 - Kinds in no namespace (Node, Role, KindDefinition…) need a rule without `namespaces`.
+- A template with `seccomp` unconfined or allowing calls, or a container with `userNamespaces`
+  (which lets the refused calls back), also needs the right to apply `Unconfined` (in no namespace).
 - The certificate stands while the Identity's `publicKey` is its key: `kith identity cert` again
   ends the old one, `kith delete identity/alice` all access.
 - Grant with care: `apply` on Role, RoleBinding or Identity grants oneself anything, and whoever may apply a Workload runs programs on your nodes. A Release or a Source acts with the rights of whoever applied
@@ -135,19 +137,25 @@ turn each off, there and nowhere else:
 
 ```sh
 kithd --node-policy hardened              # none of it, and a GPU the only Device handed out
+                                          # (also no NodeWorkloads: add host-users to run them)
 kithd --node-policy hardened,node-network # the same, but containers that are no pod
 kithd --node-policy no-exec-units,no-run  # everything but exec units and `kith run`
 ```
 
 The words: `exec-units`; `root-containers` (off: no container is root without an id range of its
 own, as a pod's on kith OS); `unconfined` (a `seccomp` that is unconfined or allows refused
-calls back); `node-network` (containers that are no pod); `vms`; `vm-paths` (a VM's kernel,
+calls back, which `userNamespaces` does); `host-users` (containers with `host_users`, a
+NodeWorkload's: the node's own users; off, no NodeWorkload runs); `node-network` (containers that are no pod); `vms`; `vm-paths` (a VM's kernel,
 firmware or disks as node paths, or a hypervisor other than qemu; `vms` alone runs none of use); `passthrough`; `host-paths` (a Volume in `kith-system` at any path on the node);
 `run` (`kith run`); `wipe` (the cluster erasing this node's key or setting duress codes);
 `devices=gpu+input` (the Device classes a DeviceClaim hands out: `all`, or none after the `=`;
 with classes named, only Devices the node listed itself). `no-` before a word turns it off; they
 are read left to right. On kith OS they go at the end of what the config partition says (` --
 --node-policy hardened`); elsewhere `KITH_NODE_POLICY` does too.
+
+`hardened` also stops NodeWorkloads (DaemonSets): turn `host-users` back on to run them. A
+container given a Device, or a mount on a file system that cannot be id-mapped, keeps the node's
+users too, whatever `host-users` says.
 
 What a node refuses is not run there, and the Workload says why. The scheduler reads each Node's
 `status.policy` (`kith get node/NAME -o yaml`): a Workload or Job asking for what a node refuses

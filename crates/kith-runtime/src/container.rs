@@ -1,4 +1,41 @@
 //! Running one container from an [`Image`].
+//!
+//! # Clone
+//!
+//! libcontainer 0.7 starts a container's intermediate process (`youki:[1:INTER]`) with a raw
+//! `clone3` (`process/fork.rs`), which skips the handlers a C library's `fork` runs to put its
+//! allocator and locks right. Called from a process with other threads, the clone's child starts
+//! with whatever lock another thread held at that instant, and waits for it forever: the create
+//! never returns, and a create after it that takes the same lock waits too. Seen on 2026-11-19
+//! as `create_error_names_what_failed_beneath` holding `cargo test --workspace`, and with
+//! `create_from_many_threads` (8 threads, 48 creates), which made 13 of its 48 before its
+//! watchdog on the unfixed code (and passed a run in three).
+//!
+//! The evidence is the stuck process itself: asleep at no CPU, one voluntary context switch,
+//! its `/proc/PID/status` showing no capabilities (`CapEff` 0), so it had not yet entered its
+//! user namespace. The rootless id-mapping exchange with the parent happens after that (in
+//! `setup_userns`), so it is not what it waited on; before it the process only reads the spec,
+//! makes its cgroup manager and logs, which take the allocator's lock. (Its stack and
+//! `wchan` are not readable by the parent: a rootless process is not dumpable, and `wchan` is
+//! hidden on a hardened kernel.)
+//!
+//! kithd is exposed the same way: its serving part calls `root.create` from async tasks
+//! (`controller.rs`), which is `root_part.rs`'s `Runtime::create` in kithd's own process (the
+//! root part is not a second one), on a tokio worker among the others. So [`Runtime::create`]
+//! makes the container in a child of `fork` (`kith_dm_sys::fork_start`), which has one thread and
+//! the allocator put right by `fork`, and reads the result from the state libcontainer saved.
+//! The container's init process is then a child of that child, and of this process (a child
+//! subreaper, see [`Runtime::new`]) once it has ended, so [`Handle::wait`] is as before. The
+//! helper is registered as awaited ([`spawn_awaited`]) while it is forked, so that
+//! [`reap_orphans`] leaves it to the create.
+// ponytail: `fork` puts right the allocator's lock only. The child does take locks of tracing's
+// (a subscriber is made and set, and its first events register their call sites), of the
+// environment and of stderr, and another thread of this process may hold one at the fork. A
+// create makes its subscriber before the fork under `FORKING`, which keeps kith's own off the
+// registry's write lock then; any other holder leaves the child waiting, and the parent's
+// deadline (`HELPER_DEADLINE`) kills it and fails the create, which sweeps what it half made. A
+// request-per-process re-exec would have none of it, at the price of sending the image and unit
+// across.
 
 use crate::{Context, Image, ImageStore, Result, devfilter, err};
 use caps::CapSet;
@@ -793,7 +830,46 @@ impl Runtime {
                 .as_init(&bundle)
                 .with_systemd(false)
                 .with_detach(true);
-            let container = logged_build(&bundle.join("init.log"), refused, || builder.build()).ctx(&what)?;
+            // In a child of `fork`, with one thread: see the module doc's "Clone".
+            let log = bundle.join("init.log");
+            let said = {
+                // (The subscriber is made, and the helper forked, with no other create's
+                // subscriber half made: see [`FORKING`]. A reader's panic cannot spoil it.)
+                let forking = FORKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let dispatch = init_dispatch(&log)?;
+                // Registered as awaited while it is forked: `reap_orphans` would otherwise
+                // collect the helper first, and this would never learn how it ended.
+                let (forked, _awaited) = spawn_awaited(
+                    || {
+                        kith_dm_sys::fork_start(|| {
+                            let built = logged_build(dispatch, &log, refused, || builder.build());
+                            // First byte: 0 made, 1 failed, 2 failed for the kernel's refusal of the overlay.
+                            let mut said = vec![match (&built, refused.load(Ordering::Relaxed)) {
+                                (Ok(_), _) => 0,
+                                (Err(_), false) => 1,
+                                (Err(_), true) => 2,
+                            }];
+                            said.extend(built.err().map(|e| e.to_string()).unwrap_or_default().into_bytes());
+                            said
+                        })
+                    },
+                    |forked| u32::try_from(forked.pid()).ok(),
+                )
+                .ctx(&what)?;
+                drop(forking);
+                // A helper that hangs (a lock of this process held at the fork that it takes)
+                // is killed at the deadline; the error then sweeps what it half made.
+                forked.collect(HELPER_DEADLINE).ctx(&what)?
+            };
+            match said.split_first() {
+                Some((0, _)) => {}
+                Some((refusal, text)) => {
+                    refused.store(*refusal == 2, Ordering::Relaxed);
+                    return err(format!("{what}: {}", String::from_utf8_lossy(text)));
+                }
+                None => return err(format!("{what}: the process making it ended before it said how")),
+            }
+            let container = Container::load(state.clone()).ctx(&what)?;
             match container.pid() {
                 Some(pid) => Ok((container, pid)),
                 None => err(format!("{what}: no process was created")),
@@ -923,11 +999,11 @@ impl Runtime {
     }
 }
 
-/// Held while libcontainer creates or starts a container: it reaches the notify socket by
-/// changing the process's working directory and back, so two at once on different threads would
-/// bind or connect in each other's directory ("failed to bind notify socket").
-// ponytail: one lock for every create and start; a create takes milliseconds, so it holds while
-// pods start one at a time.
+/// Held while libcontainer starts a container: it reaches the notify socket by changing the
+/// process's working directory and back, so two at once on different threads would connect in
+/// each other's directory. (A create does the same in a child of its own: see the module doc.)
+// ponytail: one lock for every start; a start takes milliseconds, so it holds while pods start
+// one at a time.
 static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The children someone waits for besides the handles' (see [`spawn_awaited`]).
@@ -1666,18 +1742,17 @@ const LOG_KEPT: usize = 64 << 10;
 /// for a failure says what they were beside it. libcontainer's parent sees only the top error's
 /// text ("failed to prepare rootfs"); the cause is logged by the child, which inherits this
 /// subscriber through its fork. `refused` is set when the whole log says the kernel refused the
-/// overlay root ([`refuses_overlay`]).
+/// overlay root ([`refuses_overlay`]). `dispatch` is [`init_dispatch`] of the same `log`, made
+/// beforehand: making one takes tracing's registry lock, which `create_once` must not have
+/// another thread hold when it forks.
 fn logged_build<T, E: std::fmt::Display>(
+    dispatch: tracing::Dispatch,
     log: &Path,
     refused: &AtomicBool,
     build: impl FnOnce() -> std::result::Result<T, E>,
 ) -> Result<T> {
-    let file = File::create(log).ctx("its init log")?;
-    let dispatch = tracing::Dispatch::new(InitLog(Mutex::new(file)));
-    let built = {
-        let _cwd = CWD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        tracing::dispatcher::with_default(&dispatch, build)
-    };
+    // (No lock on the working directory: `create_once` runs this in a child of its own.)
+    let built = tracing::dispatcher::with_default(&dispatch, build);
     drop(dispatch);
     let logged = fs::read(log).unwrap_or_default();
     let _ = fs::remove_file(log);
@@ -1694,6 +1769,24 @@ fn logged_build<T, E: std::fmt::Display>(
         }
     }
 }
+
+/// The subscriber [`logged_build`] runs under, writing to a new file at `log`.
+fn init_dispatch(log: &Path) -> Result<tracing::Dispatch> {
+    let file = File::create(log).ctx("its init log")?;
+    Ok(tracing::Dispatch::new(InitLog(Mutex::new(file))))
+}
+
+/// Held by a create from making its subscriber (which takes tracing's registry lock for
+/// writing) until its helper is forked, so no other create's making of one is half done at a
+/// fork: the helper would inherit that lock held, and wait for it forever.
+// ponytail: this keeps kith's own subscribers apart; another crate's, or a first event of a
+// call site on another thread, may still hold a lock of tracing's at a fork. The helper's
+// deadline ends that wait.
+static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How long a create waits for its helper (the process that makes the container) before it
+/// kills it. A create takes milliseconds to seconds; this only bounds a helper that hangs.
+const HELPER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Writes the error-level events it is given, one line each, until the file holds [`LOG_KEPT`].
 struct InitLog(Mutex<File>);
@@ -3073,6 +3166,141 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Creates from many threads of one process (as kithd's are, from its tokio workers) all return:
+    /// libcontainer clones its intermediate process with a raw `clone3`, which a thread of this
+    /// process may have caught holding a lock, and that child then waits for it forever. Each create
+    /// fails the same way (the rootfs is a file), so the test needs no image: only that every one
+    /// of them says so within the watchdog.
+    #[test]
+    fn create_from_many_threads() {
+        const THREADS: usize = 8;
+        const EACH: usize = 6;
+        let root = std::env::temp_dir().join(format!("kith-create-threads-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = std::sync::Arc::new(Runtime::new(root.join("runtime")).unwrap());
+        let rootfs = root.join("rootfs-is-a-file");
+        fs::write(&rootfs, "").unwrap();
+        let image = std::sync::Arc::new(Image {
+            rootfs,
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        });
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for thread in 0..THREADS {
+            let (runtime, image, sender, root) = (runtime.clone(), image.clone(), sender.clone(), root.clone());
+            std::thread::spawn(move || {
+                for n in 0..EACH {
+                    // the pid keeps two runs of this test (two lanes) off one cgroup
+                    let id = format!("many-{}-{thread}-{n}", std::process::id());
+                    let (out, err) = (
+                        File::create(root.join(format!("{id}.out"))).unwrap(),
+                        File::create(root.join(format!("{id}.err"))).unwrap(),
+                    );
+                    let said = runtime
+                        .create(&id, &image, &Unit::default(), out, err)
+                        .err()
+                        .map(|e| e.to_string());
+                    let _ = sender.send(said);
+                }
+            });
+        }
+        drop(sender);
+        let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut said = Vec::new();
+        while said.len() < THREADS * EACH {
+            let left = watchdog.saturating_duration_since(std::time::Instant::now());
+            match receiver.recv_timeout(left) {
+                Ok(one) => said.push(one),
+                Err(e) => panic!(
+                    "only {} of {} creates returned within 120 s ({e}): one is stuck",
+                    said.len(),
+                    THREADS * EACH
+                ),
+            }
+        }
+        // (A runner's cgroup may take no pids limit: every create fails before the rootfs.)
+        if let Some(line) = said.iter().flatten().find_map(|said| cgroup_skip(said)) {
+            let _ = fs::remove_dir_all(&root);
+            return report_skip(&line);
+        }
+        for said in &said {
+            let said = said.as_deref().expect("a rootfs that is a file makes no container");
+            assert!(said.contains("failed to prepare rootfs"), "{said}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A container made from a thread that blocks SIGINT, SIGTERM and SIGCHLD (as kithd's tokio
+    /// threads do, from the keeper's mask) runs its process with nothing blocked: libcontainer
+    /// resets no mask, and a pod that has SIGTERM blocked never hears `kith stop`; nor does it
+    /// ignore SIGPIPE, which Rust's runtime sets in this process. (Read from the init process's
+    /// own status, which the program keeps when it execs.)
+    #[test]
+    fn container_starts_with_no_signal_blocked() {
+        let root = std::env::temp_dir().join(format!("kith-sigblk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        let rootfs = root.join("rootfs");
+        for dir in ["dev", "etc", "proc", "run", "sys", "tmp", "bin"] {
+            fs::create_dir_all(rootfs.join(dir)).unwrap();
+        }
+        fs::copy("/bin/true", rootfs.join("bin/true")).unwrap();
+        let image = Image {
+            rootfs,
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let (out, err) = (
+            File::create(root.join("out")).unwrap(),
+            File::create(root.join("err")).unwrap(),
+        );
+        let made = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    // (This thread's mask only.)
+                    use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+                    let mut set = SigSet::empty();
+                    for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGCHLD] {
+                        set.add(signal);
+                    }
+                    pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&set), None).unwrap();
+                    runtime.create("sigblk", &image, &Unit::default(), out, err)
+                })
+                .join()
+                .unwrap()
+        });
+        let handle = match made {
+            Err(e) if cgroup_skip(&e.to_string()).is_some() => {
+                let _ = fs::remove_dir_all(&root);
+                return report_skip(&cgroup_skip(&e.to_string()).unwrap());
+            }
+            made => made.unwrap(),
+        };
+        let status = fs::read_to_string(format!("/proc/{}/status", handle.pid())).unwrap();
+        let blocked = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigBlk:"))
+            .map(str::trim);
+        let ignored = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigIgn:"))
+            .map(|hex| u64::from_str_radix(hex.trim(), 16).unwrap());
+        handle.discard(&root.join("runtime/state/sigblk"));
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            blocked,
+            Some("0000000000000000"),
+            "the container's process blocks signals"
+        );
+        // (Rust's runtime ignores SIGPIPE in this process, and an ignored signal survives the exec:
+        // bit 13, 0x1000.)
+        assert_eq!(
+            ignored.map(|ignored| ignored & 0x1000),
+            Some(0),
+            "the container's process ignores SIGPIPE: {ignored:x?}"
+        );
+    }
+
     /// Only the overlay's EPERM is the kernel refusing the overlay root: the other failures of a
     /// create, and EPERM of another mount, are not, and stay errors.
     #[test]
@@ -3094,7 +3322,7 @@ mod tests {
     fn create_error_sees_an_overlay_refusal_past_a_long_first_event() {
         let log = std::env::temp_dir().join(format!("kith-init-log-long-{}", std::process::id()));
         let refused = AtomicBool::new(false);
-        let built = logged_build(&log, &refused, || {
+        let built = logged_build(init_dispatch(&log).unwrap(), &log, &refused, || {
             tracing::error!("{}", "a long first event ".repeat(200));
             tracing::error!("failed to mount {}: Nix(EPERM)", r#"Mount { typ: Some("overlay") }"#);
             Err::<(), _>("failed to prepare rootfs")

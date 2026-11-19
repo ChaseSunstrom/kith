@@ -43,6 +43,17 @@ for r in found:
             before=$(IFS='|'; for unit in $units_of; do IFS=' '; set -- $unit; process "$@"; done)
             [ "$(printf '%s\n' "$before" | grep -c 'tick: process')" = 3 ] || fail "each unit did not say once which process it is: $before"
             ticks=$(ticked Workload ticker tick)
+            # No pod's process starts with a signal blocked: kithd began with the keeper's mask
+            # (SIGINT, SIGTERM and SIGCHLD, 0x14002), and a container made from one of its threads
+            # kept it. (The exec unit, a plain child, is std's and had none.) Nor with SIGPIPE
+            # ignored (bit 13, 0x1000 of SigIgn): kithd's Rust runtime ignores it, and it stays so.
+            for unit in 'Workload ticker tick' 'Job long'; do
+                # shellcheck disable=SC2086 # (a unit is KIND NAME UNIT words)
+                [ "$(said $unit | grep -o 'tick: blocked [0-9a-f]*')" = 'tick: blocked 0000000000000000' ] || fail "the process of $unit did not start with no signal blocked: $(said $unit | grep -o 'tick: blocked [0-9a-f]*')"
+                # shellcheck disable=SC2086 # (a unit is KIND NAME UNIT words)
+                ignored=$(said $unit | grep -o 'tick: ignored [0-9a-f]*' | cut -d ' ' -f 3)
+                [ -n "$ignored" ] && [ $((0x$ignored & 0x1000)) = 0 ] || fail "the process of $unit started with SIGPIPE ignored: SigIgn '$ignored'"
+            done
             # kithd killed (SIGKILL) by an exec unit of a Job: the first process starts it again.
             booted=$(grep -ac 'Kernel command line' "$work/n1.log")
             cat >"$work/apply.json" <<EOF
