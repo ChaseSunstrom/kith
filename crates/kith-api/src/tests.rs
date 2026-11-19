@@ -2306,3 +2306,16 @@ fn changes_go_on_when_a_store_is_replaced_whole() {
     assert!(brought.changes("DNSZone") > before.changes("DNSZone"));
     assert!(brought.get("Node/alpha").is_some());
 }
+
+#[test]
+fn a_node_says_its_lan_address_before_its_mesh_one() {
+    let mut node = one(ALPHA);
+    let said = |node: &Resource| node.node_addresses().map(str::to_string).collect::<Vec<_>>();
+    assert!(said(&node).is_empty());
+    node.status = Some(json!({ "address": "10.9.0.2:7443" }));
+    assert_eq!(said(&node), ["10.9.0.2:7443"]);
+    // Moved onto the mesh by the leader: both, the LAN one first (and it is the LAN address).
+    node.status = Some(json!({ "address": "[fd00::2]:7443", "lan": "10.9.0.2:7443" }));
+    assert_eq!(said(&node), ["10.9.0.2:7443", "[fd00::2]:7443"]);
+    assert_eq!(node.lan_address().map(|ip| ip.to_string()).as_deref(), Some("10.9.0.2"));
+}

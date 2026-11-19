@@ -201,7 +201,7 @@ fn members(
             .ok()
             .filter(|port| *port != 0)?;
         // (Its LAN address when the leader has moved `address` onto the mesh: WireGuard is not called through itself.)
-        let at = status["lan"].as_str().or_else(|| status["address"].as_str());
+        let at = node.node_addresses().next();
         let at = at.and_then(|at| at.parse::<SocketAddr>().ok());
         let since = *known.entry(key).or_insert(now);
         let fresh = shook_lately(shook, &key);

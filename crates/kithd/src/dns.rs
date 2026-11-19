@@ -137,7 +137,7 @@ fn zones_made_of(store: &Store) -> Vec<(String, Value, Option<Value>)> {
         .map(|r| {
             let status = r.status.as_ref().map(|s| {
                 if r.kind == "Node" {
-                    json!([s["address"], s["serves"], s["state"]])
+                    json!([s["address"], s["lan"], s["serves"], s["state"]])
                 } else if r.kind == "Workload" {
                     let units = s["containers"].as_array().into_iter().flatten();
                     let units: Vec<Value> = units
@@ -169,7 +169,8 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
     // such name" here, and never sent to the internet to ask.
     let mut own = vec![soa("kith"), soa("cluster.local")];
     for node in store.list(Some("Node")) {
-        let address = node.status.as_ref().and_then(|status| status["address"].as_str());
+        // (`<node>.node.kith` stays its LAN address, not the mesh one the leader may have moved it to.)
+        let address = node.node_addresses().next();
         if let Some(address) = address.and_then(|address| address.parse::<SocketAddr>().ok()) {
             let data = match address.ip() {
                 IpAddr::V4(ip) => Rdata::A(ip),

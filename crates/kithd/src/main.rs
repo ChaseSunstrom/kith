@@ -1076,7 +1076,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 eprintln!("kithd: --admit-deleted-nodes: a deleted node's certificate is still taken here");
                 cluster::ADMIT_DELETED.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            let listener = cluster::listen(tcp, pki::server_config(&cluster.me)?).map_err(|e| fail("listening", &e))?;
+            let mesh_me = kith_mesh::node_address(mesh::prefix(&cluster.me.ca), &cluster.me.name);
+            let listener = cluster::listen_on(tcp, pki::server_config(&cluster.me)?, Some(mesh_me))
+                .map_err(|e| fail("listening", &e))?;
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();
             let served = axum::serve(listener, app).with_graceful_shutdown(async move { drop(stop.changed().await) });
