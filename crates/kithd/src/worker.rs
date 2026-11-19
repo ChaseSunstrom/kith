@@ -3,8 +3,9 @@
 //! A node sends its writes to the node that leads (`/v1/raft/write`), which gives them to
 //! Raft as they come. From a worker each one is held to the list here first, against the
 //! store of the control node that was asked: what a node says about itself, and nothing
-//! of anyone else's (docs/adr-workers.md, "Writes"). A control node's writes are not
-//! looked at: one that is taken is the cluster taken.
+//! of anyone else's (docs/adr-workers.md, "Writes"). A control node's own writes (no caller
+//! named) are held to the list in `own_writes.rs` instead, which reuses these checks for
+//! the kinds a control node holds and refuses the rest.
 
 use kith_api::Resource;
 use kith_api::store::Store;
@@ -181,6 +182,21 @@ fn serving_shape(key: &str, serves: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Refused where the mesh key `fields` say is another node's: two nodes that say one key are both
+/// left out of the mesh, so saying another's cuts it off. (A Node's own patch, by a worker or a
+/// control node alike: `own_writes` calls it too.)
+pub(crate) fn mesh_key_elsewhere(store: &Store, node: &str, key: &str, fields: &Fields) -> Result<(), String> {
+    let said = fields.get("mesh").and_then(|mesh| mesh["key"].as_str());
+    let theirs = |other: &Resource| {
+        let has = other.status.as_ref().and_then(|status| status["mesh"]["key"].as_str());
+        other.metadata.name != node && has.is_some() && has == said
+    };
+    match store.list(Some("Node")).find(|other| theirs(other)) {
+        Some(other) => Err(refused(key, format!("the mesh key is node {}'s", other.metadata.name))),
+        None => Ok(()),
+    }
+}
+
 /// What a node says of its people's device (`status.people`): null, or the device's public key
 /// (32 bytes, base64), its port and its endpoint (a string or null), and nothing else.
 fn people_shape(key: &str, people: &Value) -> Result<(), String> {
@@ -222,7 +238,7 @@ fn people_shape(key: &str, people: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), String> {
+pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), String> {
     let node = who.name;
     let Some(live) = store.get(key) else {
         // (A key that is gone is skipped by the store: nothing to refuse.)
@@ -289,16 +305,7 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
                     ));
                 }
             }
-            // Two nodes that say one key are both left out of the mesh: saying another's cuts it off.
-            let said = fields.get("mesh").and_then(|mesh| mesh["key"].as_str());
-            let theirs = |other: &Resource| {
-                let has = other.status.as_ref().and_then(|status| status["mesh"]["key"].as_str());
-                other.metadata.name != node && has.is_some() && has == said
-            };
-            match store.list(Some("Node")).find(|other| theirs(other)) {
-                Some(other) => Err(refused(key, format!("the mesh key is node {}'s", other.metadata.name))),
-                None => Ok(()),
-            }
+            mesh_key_elsewhere(store, node, key, fields)
         }
         "Blob" => {
             only(key, fields, &["nodes"])?;
@@ -364,7 +371,7 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
     }
 }
 
-fn status(store: &Store, who: &Worker, key: &str, said: Option<&Value>) -> Result<(), String> {
+pub(crate) fn status(store: &Store, who: &Worker, key: &str, said: Option<&Value>) -> Result<(), String> {
     let Some(live) = store.get(key) else { return Ok(()) };
     let fields = match said {
         Some(Value::Object(fields)) => fields.clone(),
@@ -396,7 +403,7 @@ fn status(store: &Store, who: &Worker, key: &str, said: Option<&Value>) -> Resul
 
 /// What is taken of what the worker says of the units of `key`: `Err` when none of it is
 /// its to say, and the units of replicas the scheduler gave another node are left out.
-fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>) -> Result<Option<Value>, String> {
+pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>) -> Result<Option<Value>, String> {
     let (Some(live), Some(said)) = (store.get(key), said) else {
         // (Gone: skipped by the store. Nothing said: its own units are taken out.)
         return Ok(None);
@@ -442,8 +449,18 @@ fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>) -> Result
     };
     let units = said.remove("containers");
     let units: Vec<Value> = units.as_ref().and_then(Value::as_array).cloned().unwrap_or_default();
-    const UNIT: [&str; 9] = [
-        "name", "replica", "state", "ready", "restarts", "revision", "exitCode", "message", "address",
+    // (`hostUsers`: whether a container keeps the node's users, which the node says of its own unit.)
+    const UNIT: [&str; 10] = [
+        "name",
+        "replica",
+        "state",
+        "ready",
+        "restarts",
+        "revision",
+        "exitCode",
+        "message",
+        "address",
+        "hostUsers",
     ];
     for unit in &units {
         match unit.as_object() {
@@ -473,7 +490,7 @@ fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>) -> Result
     Ok(Some(said.into()))
 }
 
-fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), String> {
+pub(crate) fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), String> {
     let (key, node) = (resource.key(), who.name);
     let live = store.get(&key);
     let spec = resource.spec.as_object().cloned().unwrap_or_default();
@@ -558,7 +575,7 @@ fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), Str
     }
 }
 
-fn delete(store: &Store, who: &Worker, key: &str) -> Result<(), String> {
+pub(crate) fn delete(store: &Store, who: &Worker, key: &str) -> Result<(), String> {
     let Some(live) = store.get(key) else { return Ok(()) };
     let discovered = live.metadata.labels.get(DISCOVERED).is_some_and(|made| made == "true");
     let made_here = live.metadata.annotations.get(MADE_ON).is_some_and(|on| on == who.name);
@@ -608,7 +625,10 @@ pub fn checked(store: &Store, who: &Worker, command: Command) -> Result<Command,
         Command::Delete { key } => delete(store, who, &key).map(|()| Command::Delete { key }),
         Command::Rollback { key, .. } => Err(refused(key, "a rollback is asked of a control node")),
         Command::Import { .. } => Err(refused("a whole store", "only a control node brings one in")),
-        Command::Mark => Err(refused("the store's format", "only the leader changes it")),
+        Command::Mark | Command::MarkSigned | Command::MarkChecked => {
+            Err(refused("the store's format", "only the leader changes it"))
+        }
+        Command::Signed { .. } => Err(refused("a signed entry", "no worker writes one")),
     }
 }
 
@@ -1139,6 +1159,15 @@ spec: { volume: there, every: 1d }
         // A unit that says which node runs it, or anything else a unit does not say today.
         let elsewhere = json!({ "containers": [unit(0, json!({ "node": "a" }))] });
         assert!(try_as(&store, "w", report_of("w", "Workload/default/web", elsewhere)).is_err());
+    }
+
+    /// Whether a unit keeps the node's users (`hostUsers`, where kithd is root) is the node's to say.
+    #[test]
+    fn a_unit_says_whether_it_keeps_the_nodes_users() {
+        let store = store();
+        let said = json!({ "containers": [unit(0, json!({ "hostUsers": false }))] });
+        let taken = reported(try_as(&store, "w", report_of("w", "Workload/default/web", said)).unwrap()).unwrap();
+        assert_eq!(taken["containers"], json!([unit(0, json!({ "hostUsers": false }))]));
     }
 
     #[test]

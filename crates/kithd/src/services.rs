@@ -6,7 +6,9 @@
 //! 127.0.0.1 only); one on another node through that node's kithd, which listens on its
 //! mesh address for exactly this and connects to the replica there. Two nodes keep the
 //! connections between them for a while and pass on one client's after another on each
-//! ([`carry`]): a new connection to a Service is then no new one between the nodes.
+//! ([`carry`]): a new connection to a Service is then no new one between the nodes. A node that
+//! says it takes links (`status.mesh.link`) is reached on one link, a stream for each client
+//! ([`Proxy::linked`]).
 //
 // The kernel passes a connection made on the node's own network to a replica here with
 // no NetworkPolicy straight to it ([`connect`]); kithd then never sees it.
@@ -19,19 +21,22 @@
 // redirected segment through a worker): 74k kept requests a second where this has 81k.
 
 mod connect;
-// (Not wired yet: the trial in `tests` runs through it; T-0326's next step asks it of the nodes.)
-#[allow(dead_code)]
+// (One link to each node that takes them, opened by `Proxy::linked`; its receiving end is `receive`.)
 mod link;
+mod receive;
 
 use crate::Shared;
 use crate::ingress::{Idle, Limits, Place};
 use futures_util::FutureExt;
 use kith_api::Resource;
-use kith_api::kinds::{NetworkPolicySpec, Peer, PolicyAction, PortRef, Protocol, ServiceSpec, WorkloadSpec};
+use kith_api::kinds::{
+    NetworkPolicySpec, Peer, PolicyAction, PolicyRule, PortRef, Protocol, ServiceSpec, WorkloadSpec,
+};
 use kith_api::store::Store;
+use kith_mesh::pod::Egress;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -302,6 +307,71 @@ pub fn admits(store: &Store, workload: &str, node: Option<&str>, from: IpAddr, p
     !chosen
 }
 
+/// What a pod of `workload` may reach: the egress rules of the NetworkPolicies for it, in the
+/// order the store lists them and each is written; `None` when none has an egress rule (the
+/// pod is not held). `prefix`: the mesh's, where there is one: a peer by `node` is that node's
+/// address on it (nothing without a mesh). The peers of a rule are the networks it fits: a
+/// `cidr` is one, `node` and `cidr` together are the node's address if it is within the
+/// cidr, and neither is everything (both families). One that cannot be told apart by
+/// `namespace` or `selector` fits nothing in an allow (as for ingress) and, but for what its
+/// `node` or `cidr` say, everything in a deny. A rule whose peers hold no network is left out
+/// (it would fit anything). Nothing is let through that no rule allows: the node's resolver
+/// too (DNS to the gateway), so a policy that holds a pod must name it.
+pub fn egress_of(store: &Store, workload: &str, prefix: Option<Ipv6Addr>) -> Option<Vec<Egress>> {
+    let target = store.get(workload)?;
+    let specs: Vec<NetworkPolicySpec> = policies(store, target).filter(|spec| !spec.egress.is_empty()).collect();
+    if specs.is_empty() {
+        return None;
+    }
+    let rules = specs.iter().flat_map(|spec| &spec.egress);
+    Some(rules.filter_map(|rule| egress_rule(rule, prefix)).collect())
+}
+
+/// The mesh's prefix where this node is in a cluster: the one `egress_of` is asked with, by
+/// every caller (so the rules a pod is made with are the ones it is kept in step with).
+pub fn mesh_prefix(shared: &Shared) -> Option<Ipv6Addr> {
+    shared
+        .cluster
+        .as_ref()
+        .map(|cluster| crate::mesh::prefix(&cluster.me.ca))
+}
+
+/// `10.0.0.0/8` as an address and its length; `None` for one that cannot be read, or whose
+/// length is over its family's size (as `within_cidr` holds nothing for it).
+fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
+    let (address, length) = cidr.split_once('/')?;
+    let address: IpAddr = address.parse().ok()?;
+    let size = if address.is_ipv4() { 32 } else { 128 };
+    Some((address, length.parse::<u8>().ok().filter(|length| *length <= size)?))
+}
+
+fn egress_rule(rule: &PolicyRule, prefix: Option<Ipv6Addr>) -> Option<Egress> {
+    let allow = rule.action == PolicyAction::Allow;
+    let mut to = Vec::new();
+    for peer in &rule.peers {
+        if allow && !told_apart(peer) {
+            continue;
+        }
+        match (&peer.node, &peer.cidr) {
+            // (A node's address is a network of one, if the cidr has it.)
+            (Some(name), cidr) => {
+                let Some(prefix) = prefix else { continue };
+                let address = IpAddr::from(kith_mesh::node_address(prefix, name));
+                if cidr.as_deref().is_none_or(|cidr| within_cidr(cidr, address)) {
+                    to.push((address, 128));
+                }
+            }
+            (None, Some(cidr)) => to.extend(parse_cidr(cidr)),
+            (None, None) => to.extend([(Ipv4Addr::UNSPECIFIED.into(), 0), (Ipv6Addr::UNSPECIFIED.into(), 0)]),
+        }
+    }
+    (rule.peers.is_empty() || !to.is_empty()).then(|| Egress {
+        allow,
+        to,
+        ports: rule.ports.clone(),
+    })
+}
+
 /// The NetworkPolicies for `target`: of its namespace, with a selector its labels fit.
 fn policies<'a>(store: &'a Store, target: &'a Resource) -> impl Iterator<Item = NetworkPolicySpec> + 'a {
     store.list(Some("NetworkPolicy")).filter_map(move |policy| {
@@ -312,8 +382,8 @@ fn policies<'a>(store: &'a Store, target: &'a Resource) -> impl Iterator<Item = 
 }
 
 /// What a NetworkPolicy's status is to be told, if it is not already.
-fn policy_unsaid(policy: &Resource) -> Option<serde_json::Map<String, Value>> {
-    let report = policy_report(policy);
+fn policy_unsaid(policy: &Resource, unsent: bool) -> Option<serde_json::Map<String, Value>> {
+    let report = policy_report(policy, unsent);
     if policy.status.as_ref() == Some(&report) {
         return None;
     }
@@ -323,18 +393,24 @@ fn policy_unsaid(policy: &Resource) -> Option<serde_json::Map<String, Value>> {
     Some(fields)
 }
 
-/// What a NetworkPolicy's status says: whether all of it is enforced.
-fn policy_report(policy: &Resource) -> Value {
+/// What a NetworkPolicy's status says: whether all of it is enforced. `unsent`: this node's
+/// pods' tables could not be made again for a change of rules (`Pods::unsent`): a policy with
+/// egress rules is then not enforced for them yet.
+fn policy_report(policy: &Resource, unsent: bool) -> Value {
+    // (`policies` skips one that cannot be read: the pods it was meant for are not held by it.)
     let Ok(spec) = serde_json::from_value::<NetworkPolicySpec>(policy.spec.clone()) else {
-        return json!({ "state": "error", "message": "cannot read this NetworkPolicy" });
+        return json!({ "state": "error", "message": "cannot read this NetworkPolicy: it holds no pod" });
     };
     let mut gaps = Vec::new();
-    if !spec.egress.is_empty() {
-        gaps.push("egress rules are not enforced yet");
+    if unsent && !spec.egress.is_empty() {
+        gaps.push("egress not enforced yet: this node could not write its pods' rules (tried again)");
     }
+    // (Egress is enforced for a Workload's pods, by `egress_of`'s rules: a pod it holds
+    // reaches only what they allow, its DNS included.)
     if spec
         .ingress
         .iter()
+        .chain(&spec.egress)
         .flat_map(|rule| &rule.peers)
         .any(|peer| !told_apart(peer))
     {
@@ -386,6 +462,17 @@ struct Proxy {
     /// The connections to each other node's kithd that no client's is on now, and since when.
     /// (As the kernel's, on no thread's runtime: the next client's may be on another.)
     kept: Mutex<BTreeMap<String, Vec<(std::net::TcpStream, Instant)>>>,
+    /// What a link from another node may hold ([`receive`]).
+    links: receive::Bounds,
+    /// The one link this node keeps to each other node that takes links, dialled by the first
+    /// client that needs it ([`Proxy::link_to`]); one that is down is dialled again. With
+    /// when a stream was last open on it, as far as [`Proxy::forget`] has looked.
+    // ponytail: one link, so one task (a core) frames and writes everything to a node; a second
+    // link per node when a profile of a busy one shows that core full.
+    linked: Mutex<BTreeMap<String, (link::Link, Instant)>>,
+    /// Where every other node is dialled, in the tests (a node's mesh address is not on the machine).
+    #[cfg(test)]
+    dial_to: Option<SocketAddr>,
 }
 
 /// What [`Proxy::reach`] reached.
@@ -393,6 +480,9 @@ enum Reached {
     /// A connection that is this client's alone: to a replica here, or through a node of
     /// before, which keeps none.
     Whole(TcpStream),
+    /// A stream on the link to a node that takes links ([`link`]): this client's alone, and
+    /// the node has the replica.
+    Linked(link::Stream),
     /// One to that node's kithd, which has the replica: kept after, if it ends well.
     Kept(String, Relay),
     /// That node was sent the client's first bytes with the asking and gave no answer in
@@ -423,17 +513,26 @@ impl Proxy {
                 .and_then(|node| node.status.as_ref());
             status.and_then(|status| {
                 let port = u16::try_from(status["mesh"]["port"].as_u64()?).ok()?;
-                Some((port, status["mesh"]["kept"] == true))
+                Some((port, status["mesh"]["kept"] == true, status["mesh"]["link"] == true))
             })
         };
-        let (relay, keeps) = relay.ok_or_else(|| std::io::Error::other(format!("node {node} is not on the mesh")))?;
+        let (relay, keeps, links) =
+            relay.ok_or_else(|| std::io::Error::other(format!("node {node} is not on the mesh")))?;
         let there = SocketAddr::new(kith_mesh::node_address(self.prefix, node).into(), relay);
         let replica = replica.map(|replica| format!(" {replica}")).unwrap_or_default();
+        if links {
+            let line = format!("{port} {workload}{replica}\n");
+            // (None: the node would not take the link, or this one holds as many streams as the
+            // node takes; the connection kept to it is used instead, as it says it keeps them.)
+            if let Some(reached) = self.linked(node, there, &line, early).await? {
+                return Ok(reached);
+            }
+        }
         if !keeps {
             // A node of before: a connection for this client alone, as it knows them. It
             // says so (one byte) when it has the replica; if it hangs up instead (a
             // policy, a replica just gone), the next backend is tried.
-            let mut stream = within(TcpStream::connect(there)).await?;
+            let mut stream = within(self.dial(there)).await?;
             stream
                 .write_all(format!("{port} {workload}{replica}\n").as_bytes())
                 .await?;
@@ -446,7 +545,7 @@ impl Proxy {
         loop {
             let (was_kept, mut relay) = match before.take() {
                 Some(relay) => (true, relay),
-                None => (false, Relay::new(within(TcpStream::connect(there)).await?)),
+                None => (false, Relay::new(within(self.dial(there)).await?)),
             };
             let asked = ask(&mut relay, &line, early).await;
             if was_kept && asked.is_err() {
@@ -466,6 +565,94 @@ impl Proxy {
                 },
             }
         }
+    }
+
+    async fn dial(&self, there: SocketAddr) -> std::io::Result<TcpStream> {
+        #[cfg(test)]
+        let there = self.dial_to.unwrap_or(there);
+        TcpStream::connect(there).await
+    }
+
+    /// A stream on the link to `node`, which takes links, asked for the replica `line` names
+    /// with `early` (what the client has said so far) behind it, in one frame: the node says
+    /// `+` when it has it, and resets the stream when it has not. A link that is down is
+    /// dialled again, once: with the client's bytes on the link that went down they may be
+    /// with a replica ([`Reached::Lost`]), and with none said the same asking is made on the new one.
+    /// A node that gives no answer in time has the link taken down (it is as good as gone), so
+    /// that the next client dials a new one rather than waiting as long. None, with nothing
+    /// sent: the node took no link, or this one holds the streams the node takes at most.
+    async fn linked(
+        &self,
+        node: &str,
+        there: SocketAddr,
+        line: &str,
+        early: &[u8],
+    ) -> std::io::Result<Option<Reached>> {
+        let asking = [line.as_bytes(), early].concat();
+        for attempt in 0..2 {
+            let Some(link) = self.link_to(node, there).await? else {
+                return Ok(None);
+            };
+            // (The node resets what is past its cap, which reads as its no: the kept way is for those.)
+            if link.streams() >= receive::STREAMS {
+                return Ok(None);
+            }
+            let Ok(mut stream) = link.open() else { continue };
+            if stream.tx.write(&asking).await.is_err() {
+                continue;
+            }
+            let e = match within(stream.rx.read()).await {
+                Ok(Some(said)) if said == b"+" => return Ok(Some(Reached::Linked(stream))),
+                Ok(_) => return Err(std::io::Error::other("that node does not pass it on")),
+                Err(e) => e,
+            };
+            // (A reset with the link up is the node's no: before its `+` it resets for nothing else.)
+            if !link.is_down() && e.kind() == std::io::ErrorKind::ConnectionReset {
+                return Err(e);
+            }
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                link.close();
+            }
+            match unanswered(e, link.is_down() && attempt == 0, !early.is_empty()) {
+                Unanswered::Lost => return Ok(Some(Reached::Lost)),
+                Unanswered::Next(e) => return Err(e),
+                Unanswered::Again => {}
+            }
+        }
+        Err(std::io::Error::other("the link is down"))
+    }
+
+    /// The link to `node`: the one there is, or a new one (`link` said first, as a node
+    /// that takes links wants it, and answers `+` to) that takes its place. None when the
+    /// node says no (`-`) or hangs up instead, before anything of a client's was sent.
+    async fn link_to(&self, node: &str, there: SocketAddr) -> std::io::Result<Option<link::Link>> {
+        let live = |links: &BTreeMap<String, (link::Link, Instant)>| {
+            links
+                .get(node)
+                .filter(|(link, _)| !link.is_down())
+                .map(|(link, _)| link.clone())
+        };
+        let hit = live(&self.linked.lock().expect("nothing panics holding the links"));
+        if let Some(link) = hit {
+            return Ok(Some(link));
+        }
+        let mut relay = Relay::new(within(self.dial(there)).await?);
+        within(relay.to.write_all(b"link\n")).await?;
+        match within(relay.from.read_u8()).await {
+            Ok(b'+') => {}
+            // (Silent: a node that is slow or gone, and the kept way would wait as long.)
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(e),
+            _ => return Ok(None),
+        }
+        let (link, _) = link::link(relay, true);
+        let mut links = self.linked.lock().expect("nothing panics holding the links");
+        // (Another client dialled meanwhile: one link to a node, so ours goes.)
+        if let Some(other) = live(&links) {
+            link.close();
+            return Ok(Some(other));
+        }
+        links.insert(node.to_string(), (link.clone(), Instant::now()));
+        Ok(Some(link))
     }
 
     /// A connection to `node`'s kithd from before, if one is kept and not for too long.
@@ -510,6 +697,17 @@ impl Proxy {
             kept.retain(|(_, since)| since.elapsed() < KEPT);
             !kept.is_empty()
         });
+        // (A link that is down is dialled again by the next client that needs it. One with no
+        // stream open for as long as a connection is kept is closed, as the node closes it.)
+        let mut links = self.linked.lock().expect("nothing panics holding the links");
+        links.retain(|_, (link, since)| {
+            if link.streams() > 0 {
+                *since = Instant::now();
+            } else if since.elapsed() > KEPT {
+                link.close();
+            }
+            !link.is_down()
+        });
     }
 
     /// Someone connected to a Service: pass the connection to its next backend that
@@ -549,6 +747,13 @@ impl Proxy {
                     }
                     return;
                 }
+                Ok(Reached::Linked(stream)) => {
+                    // (What the client said went with the asking.)
+                    drop(early);
+                    let _ = client.set_nodelay(true);
+                    stream.join(Idle::new(client, IDLE, None)).await;
+                    return;
+                }
                 Ok(Reached::Lost) => return,
                 Err(_) => {}
             }
@@ -572,25 +777,35 @@ impl Proxy {
         let IpAddr::V6(caller) = from.peer_addr().ok()?.ip() else {
             return None;
         };
-        let find = |port, workload: String, replica| async move {
-            let asked_for = {
-                let table = self.table.lock().expect("nothing panics holding the table");
-                let mut backends = table.values().flatten();
-                let asked = (self.me(), port, workload.as_str(), replica);
-                backends.any(|(node, port, of, which)| (node.as_str(), *port, of.as_str(), *which) == asked)
-            };
-            if !asked_for || !self.admits(&workload, caller, port) {
-                return None;
-            }
-            self.local(&workload, replica, port).await.ok()
+        // (Each asking, of a connection or of a stream of a link, is found for by itself.)
+        let find = move |port, workload, replica| self.find(caller, port, workload, replica);
+        let link = move |io, relaying, caller: IpAddr| receive::serve(io, relaying, caller, self.links, find);
+        admit_or_link(&self.relaying, &self.spares, caller.into(), from, find, link).await
+    }
+
+    /// The replica `caller` asks for, if this node's table asks for it and the Workload's
+    /// NetworkPolicies let `caller` in: a connection to it.
+    async fn find(&self, caller: Ipv6Addr, port: u16, workload: String, replica: Option<u32>) -> Option<TcpStream> {
+        let asked_for = {
+            let table = self.table.lock().expect("nothing panics holding the table");
+            let mut backends = table.values().flatten();
+            let asked = (self.me(), port, workload.as_str(), replica);
+            backends.any(|(node, port, of, which)| (node.as_str(), *port, of.as_str(), *which) == asked)
         };
-        admit(&self.relaying, &self.spares, caller.into(), from, find).await
+        if !asked_for || !self.admits(&workload, caller, port) {
+            return None;
+        }
+        self.local(&workload, replica, port).await.ok()
     }
 
     /// A replica on this machine, wherever it listens: on the machine's own loopback, or
     /// in its pod.
     async fn local(&self, workload: &str, replica: Option<u32>, port: u16) -> std::io::Result<TcpStream> {
-        let pod = replica.map(|replica| crate::controller::pod_of(workload, replica));
+        let pod = replica.map(|replica| {
+            let pod = crate::controller::pod_of(workload, replica);
+            let pods = self.shared.pods.lock().expect("nothing panics holding the pods");
+            pods.live_id(&pod).to_string()
+        });
         let pod = pod.as_deref().map(|pod| (&*self.shared, pod));
         within(crate::pods::connect(pod, port)).await
     }
@@ -675,10 +890,17 @@ async fn ask(relay: &mut Relay, line: &str, early: &[u8]) -> std::io::Result<boo
 /// as they are, or it is hung up on. Over the limit (no place for it at this asking) nothing
 /// is looked for: each kept asking is said no to in the same way, and a node of before is
 /// hung up on. Each asking looks for a place again ([`Hold::room`]).
-async fn taken<F, Fut>(from: TcpStream, mut hold: Hold<'_>, find: F) -> Option<()>
+///
+/// A first line of `link` alone makes the connection a link between the two kithds
+/// instead: what `link` does with it ([`receive::serve`]), which holds the place the
+/// connection has for as long as the link lasts. Its streams each ask for a replica by
+/// themselves and take places of their own.
+async fn taken<F, Fut, L, LFut>(from: TcpStream, mut hold: Hold<'_>, find: F, link: L) -> Option<()>
 where
     F: Fn(u16, String, Option<u32>) -> Fut,
     Fut: Future<Output = Option<TcpStream>>,
+    L: FnOnce(Relay, Limits, IpAddr) -> LFut,
+    LFut: Future<Output = Option<()>>,
 {
     let mut relay = Relay::new(from);
     let mut wait = CONNECT;
@@ -694,6 +916,16 @@ where
             .await
             .ok()?;
         let line = std::str::from_utf8(&line).ok()?.strip_suffix('\n')?;
+        if line == "link" && wait == CONNECT {
+            // (A node with no place to relay for gets no link: it is told `-` and hung up on. A
+            // link is begun with `+`, which the node that asks for it waits for before it sends.)
+            if !hold.room() {
+                let _ = relay.to.write_all(b"-").await;
+                return None;
+            }
+            relay.to.write_all(b"+").await.ok()?;
+            return link(relay, hold.relaying.clone(), hold.caller).await;
+        }
         let mut words = line.split(' ').peekable();
         let kept = words.next_if_eq(&"kept").is_some();
         let (port, workload) = (words.next()?.parse::<u16>().ok()?, words.next()?);
@@ -791,10 +1023,31 @@ fn over_limit(caller: IpAddr) {
 /// [`taken`] for a connection from node `caller`, with a place for relaying if one is free,
 /// else a spare ([`SPARE`]) to say no with. Past the spares, the connection is dropped at once:
 /// nothing is read from it, and no answer is given.
+#[cfg(test)]
 async fn admit<F, Fut>(relaying: &Limits, spares: &Limits, caller: IpAddr, from: TcpStream, find: F) -> Option<()>
 where
     F: Fn(u16, String, Option<u32>) -> Fut,
     Fut: Future<Output = Option<TcpStream>>,
+{
+    // (A node with no links: one that says `link` is hung up on, as a line it does not know.)
+    let link = |_, _, _| async { None };
+    admit_or_link(relaying, spares, caller, from, find, link).await
+}
+
+/// [`admit`] for a node that takes links too ([`taken`]).
+async fn admit_or_link<F, Fut, L, LFut>(
+    relaying: &Limits,
+    spares: &Limits,
+    caller: IpAddr,
+    from: TcpStream,
+    find: F,
+    link: L,
+) -> Option<()>
+where
+    F: Fn(u16, String, Option<u32>) -> Fut,
+    Fut: Future<Output = Option<TcpStream>>,
+    L: FnOnce(Relay, Limits, IpAddr) -> LFut,
+    LFut: Future<Output = Option<()>>,
 {
     let place = relaying.take(caller);
     let spare = match place.is_some() {
@@ -813,6 +1066,7 @@ where
             spare,
         },
         find,
+        link,
     )
     .await
 }
@@ -922,6 +1176,10 @@ pub async fn run(
         relaying: Limits::new(RELAYING, RELAYING_PER_NODE).per_node(),
         spares: Limits::new(SPARE, SPARE_PER_NODE).per_node(),
         kept: Mutex::default(),
+        links: receive::BOUNDS,
+        linked: Mutex::default(),
+        #[cfg(test)]
+        dial_to: None,
     });
     let me = kith_mesh::node_address(prefix, proxy.me());
     // (False again if the ingress gives up: then the ports are ours after all.)
@@ -979,6 +1237,9 @@ pub async fn run(
     let mut unbound = BTreeSet::new();
     let relay = port.map(|port| (me, port));
     loop {
+        // (Asked before the store's lock: never both at once. The rules themselves are kept in
+        // step by `pods::keep_held`, which needs no cluster.)
+        let unsent = shared.pods.lock().expect("nothing panics holding the pods").unsent();
         let (mut wanted, reports, plans) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let table = table(&state.store, prefix);
@@ -1004,7 +1265,7 @@ pub async fn run(
             };
             let mut reports: Vec<_> = addresses(&state.store, prefix).into_iter().filter_map(stale).collect();
             for policy in state.store.list(Some("NetworkPolicy")) {
-                reports.extend(policy_unsaid(policy).map(|fields| (policy.key(), fields)));
+                reports.extend(policy_unsaid(policy, unsent).map(|fields| (policy.key(), fields)));
             }
             let plans = match kernel {
                 Kernel::Has(..) => kernel_plan(&state.store, &table, proxy.me()),
@@ -1354,7 +1615,8 @@ fn where_asked(shared: &Shared, plans: &[Plan]) -> BTreeMap<Backend, Vec<Ipv6Add
     let pods = shared.pods.lock().expect("nothing panics holding the pods");
     let at = |(_, _, workload, replica): &Backend| {
         let pod = replica.map_or_else(Vec::new, |replica| {
-            pods.addresses(&crate::controller::pod_of(workload, replica))
+            let pod = crate::controller::pod_of(workload, replica);
+            pods.addresses(pods.live_id(&pod))
         });
         reachable(*replica, pod)
     };
@@ -1572,7 +1834,7 @@ spec:
         let key = "NetworkPolicy/default/p";
         // What the leader does: write what is not said yet, merged into the status as a Patch does.
         let settle = |store: &mut Store| -> Option<Value> {
-            let fields = policy_unsaid(store.get(key).unwrap())?;
+            let fields = policy_unsaid(store.get(key).unwrap(), false)?;
             let mut status = match store.get(key).unwrap().status.clone() {
                 Some(Value::Object(status)) => status,
                 _ => serde_json::Map::new(),
@@ -1631,7 +1893,7 @@ spec:
         assert!(!admits(&store, web, Some("b"), "fd01::1".parse().unwrap(), 9000));
         // Not for other workloads.
         assert!(asks(&store, other, "c", 1));
-        let report = policy_report(store.get("NetworkPolicy/default/web").unwrap());
+        let report = policy_report(store.get("NetworkPolicy/default/web").unwrap(), false);
         assert_eq!(report, json!({ "state": "enforced", "message": null }));
 
         // Peers by label cannot be told apart yet: allowing them lets nobody in, denying
@@ -1643,7 +1905,7 @@ spec:
             &policy("web", "[{ action: allow, peers: [{ selector: { app: other } }] }]"),
         );
         assert!(!asks(&labels, web, "a", 8080));
-        let report = policy_report(labels.get("NetworkPolicy/default/web").unwrap());
+        let report = policy_report(labels.get("NetworkPolicy/default/web").unwrap(), false);
         assert_eq!(report["state"], "partial");
         let rules = "[{ action: deny, peers: [{ namespace: other }] }, { action: allow }]";
         let mut denied = Store::default();
@@ -1656,6 +1918,132 @@ spec:
         assert!(within_cidr("0.0.0.0/0", "11.0.0.1".parse().unwrap()));
         assert!(!within_cidr("0.0.0.0/0", from) && !within_cidr("10.0.0.0/40", "10.0.0.1".parse().unwrap()));
         assert!(!within_cidr("nonsense", from));
+    }
+
+    /// What a pod of a Workload may reach is its policies' egress rules, in the order they are
+    /// stored and written: a peer by node is the node's address on the mesh, by cidr the
+    /// network, and one that cannot be told apart matches nothing in an allow and everything in
+    /// a deny. A Workload with no egress rule in any policy is not held; the status says enforced.
+    #[test]
+    fn egress_rules_of_a_workload_come_from_its_policies() {
+        use kith_mesh::pod::Egress;
+        let mut store = Store::default();
+        let apply = |store: &mut Store, source: &str| {
+            for resource in Resource::from_source(source).unwrap() {
+                store.apply(resource.unwrap()).unwrap();
+            }
+        };
+        let (web, other) = ("Workload/default/web", "Workload/default/other");
+        let prefix = kith_mesh::prefix(b"test");
+        apply(&mut store, HOME);
+        assert_eq!(egress_of(&store, web, Some(prefix)), None, "no policy");
+        let policy = |name: &str, selector: &str, rules: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: {{ name: {name} }}\n\
+                 spec:\n  selector: {selector}\n  ingress: [{{ action: allow }}]\n  egress: {rules}\n"
+            )
+        };
+        let rules = "[{ action: deny, peers: [{ cidr: '10.1.0.0/16' }], ports: [22] }, \
+                     { action: allow, peers: [{ node: b }, { cidr: '10.0.0.0/8' }, { selector: { app: x } }], ports: [443, 80] }, \
+                     { action: allow, peers: [{ node: b, cidr: 'fd00::/8' }] }, { action: deny }]";
+        apply(&mut store, &policy("p", "{ app: web }", rules));
+        let b = IpAddr::from(kith_mesh::node_address(prefix, "b"));
+        let got = egress_of(&store, web, Some(prefix)).unwrap();
+        let net = |cidr: &str| {
+            let (address, bits) = cidr.split_once('/').unwrap();
+            (address.parse().unwrap(), bits.parse().unwrap())
+        };
+        assert_eq!(
+            got,
+            vec![
+                Egress {
+                    allow: false,
+                    to: vec![net("10.1.0.0/16")],
+                    ports: vec![22]
+                },
+                // (The peer by selector holds nothing in an allow; the other two are the rule's.)
+                Egress {
+                    allow: true,
+                    to: vec![(b, 128), net("10.0.0.0/8")],
+                    ports: vec![443, 80]
+                },
+                // (The node's address is within fd00::/8 only if the mesh's prefix is: it is.)
+                Egress {
+                    allow: true,
+                    to: vec![(b, 128)],
+                    ports: vec![]
+                },
+                Egress {
+                    allow: false,
+                    to: vec![],
+                    ports: vec![]
+                },
+            ]
+        );
+        // With no mesh a node has no address: its peer holds nothing.
+        let alone = egress_of(&store, web, None).unwrap();
+        assert_eq!(alone[1].to, vec![net("10.0.0.0/8")]);
+        assert_eq!(
+            alone.len(),
+            3,
+            "a rule whose peers hold nothing is no rule: it would be any"
+        );
+        // Others are not held, nor is a Workload whose policies have ingress rules only.
+        assert_eq!(egress_of(&store, other, Some(prefix)), None);
+        let mut ingress = Store::default();
+        apply(&mut ingress, HOME);
+        let only = "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: { name: i }\n\
+                    spec:\n  selector: { app: web }\n  ingress: [{ action: allow }]\n";
+        apply(&mut ingress, only);
+        assert_eq!(egress_of(&ingress, web, Some(prefix)), None);
+        // A deny of peers that cannot be told apart keeps everybody out, in both families.
+        let mut denied = Store::default();
+        apply(&mut denied, HOME);
+        apply(
+            &mut denied,
+            &policy("d", "{ app: web }", "[{ action: deny, peers: [{ namespace: x }] }]"),
+        );
+        let all = egress_of(&denied, web, Some(prefix)).unwrap();
+        assert_eq!(all[0].to, vec![net("0.0.0.0/0"), net("::/0")]);
+        // The status says egress is enforced.
+        let report = policy_report(store.get("NetworkPolicy/default/p").unwrap(), false);
+        assert_eq!(report["state"], "partial", "(the selector peer)");
+        assert!(
+            !report["message"]
+                .as_str()
+                .unwrap()
+                .contains("egress rules are not enforced")
+        );
+        let report = policy_report(denied.get("NetworkPolicy/default/d").unwrap(), false);
+        assert!(report["message"].as_str().unwrap().contains("cannot be told apart"));
+        let mut plain = Store::default();
+        apply(&mut plain, HOME);
+        apply(
+            &mut plain,
+            &policy(
+                "e",
+                "{ app: web }",
+                "[{ action: allow, peers: [{ cidr: '10.0.0.0/8' }] }]",
+            ),
+        );
+        let report = policy_report(plain.get("NetworkPolicy/default/e").unwrap(), false);
+        assert_eq!(report, json!({ "state": "enforced", "message": null }));
+        // While this node's pods' tables could not be made again for it, egress is not enforced:
+        // the status says so (a policy with no egress rule is not held back by it).
+        let report = policy_report(plain.get("NetworkPolicy/default/e").unwrap(), true);
+        assert_eq!(report["state"], "partial");
+        assert!(report["message"].as_str().unwrap().contains("egress not enforced yet"));
+        let report = policy_report(ingress.get("NetworkPolicy/default/i").unwrap(), true);
+        assert_eq!(report, json!({ "state": "enforced", "message": null }));
+        // A policy that cannot be read holds no pod (`policies` skips it): the status is not enforced.
+        // (The store refuses one, so this is one it holds from another version of the spec.)
+        let spec = json!({ "selector": { "app": "web" }, "egress": "nonsense" });
+        let written = json!({
+            "apiVersion": "kith.dev/v1", "kind": "NetworkPolicy", "metadata": { "name": "x" }, "spec": spec,
+        });
+        let report = policy_report(&serde_json::from_value(written).unwrap(), false);
+        assert_eq!(report["state"], "error");
+        assert!(report["message"].as_str().unwrap().contains("holds no pod"));
     }
 
     #[tokio::test]
@@ -1731,7 +2119,7 @@ spec:
 
     /// A replica: it answers what each connection says (all of it, to its end) with `a:`
     /// before it, then hangs up. Where it listens, and how many connections it has had.
-    async fn replica() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    pub(super) async fn replica() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::AsyncReadExt;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (at, had) = (
@@ -1808,6 +2196,156 @@ spec:
             heard
         };
         tokio::join!(carry(held, relay, Duration::from_secs(60)), asking)
+    }
+
+    /// A client's connection to [`Proxy::take`] from loopback, as an IPv4-mapped V6 address:
+    /// (the client's end, the one held). Not `[::1]`: where loopback has no IPv6 that bind
+    /// fails, and the whole workspace gate with it. The mapped address is still a V6 caller to
+    /// `take`, and `Limits` canonicalizes it to the V4 key. (Needs `net.ipv6.bindv6only=0`, the
+    /// kernel's default, so `[::]` takes V4 connections.)
+    pub(super) async fn pair_from_ipv6() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("[::]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ours = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))
+            .await
+            .unwrap();
+        (ours, listener.accept().await.unwrap().0)
+    }
+
+    /// Applies the resources of `source` to `shared`'s store.
+    pub(super) fn apply(shared: &Shared, source: &str) {
+        let mut state = shared.store.lock().unwrap();
+        for resource in Resource::from_source(source).unwrap() {
+            state.store.apply(resource.unwrap()).unwrap();
+        }
+    }
+
+    const WEB: &str = "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: web, labels: { app: web } }
+spec:
+  template:
+    containers: [{ name: main, image: example.org/web, ports: [{ name: http, port: 8080 }] }]
+";
+
+    /// A node `a` whose store has the Workload `web` in it, and nothing else.
+    pub(super) async fn state_with_web(tag: &str) -> Arc<Shared> {
+        let ca = crate::pki::Ca::create().unwrap();
+        let shared =
+            crate::cluster::pinned_peer::shared_with(tag, crate::cluster::pinned_peer::node(&ca, "a"), &[]).await;
+        apply(&shared, WEB);
+        shared
+    }
+
+    /// A Proxy as [`run`] makes one on `shared`, its table one backend: this node's Workload `of`
+    /// on `port`, and `replica` of it where it is a pod's.
+    pub(super) fn proxy_of(shared: Arc<Shared>, port: u16, of: &str, replica: Option<u32>) -> Proxy {
+        let cluster = shared.cluster.as_ref().expect("a cluster");
+        let backend = (shared.members.me().to_string(), port, of.to_string(), replica);
+        Proxy {
+            prefix: crate::mesh::prefix(&cluster.me.ca),
+            table: Mutex::new(BTreeMap::from([((Ipv6Addr::LOCALHOST, 80), vec![backend])])),
+            turns: Turns::default(),
+            serving: Limits::new(SERVING, SERVING),
+            relaying: Limits::new(RELAYING, RELAYING_PER_NODE).per_node(),
+            spares: Limits::new(SPARE, SPARE_PER_NODE).per_node(),
+            kept: Mutex::default(),
+            links: receive::BOUNDS,
+            linked: Mutex::default(),
+            dial_to: None,
+            shared,
+        }
+    }
+
+    /// Says `says` to `proxy`'s take over loopback: what take passed on, and what the client heard.
+    async fn take_says(proxy: &Proxy, says: &str) -> (Option<()>, Vec<u8>) {
+        let (mut client, held) = pair_from_ipv6().await;
+        let asking = async {
+            client.write_all(says.as_bytes()).await.unwrap();
+            // Said all: a replica it reaches answers once the client's side ends.
+            client.shutdown().await.unwrap();
+            let mut heard = Vec::new();
+            client.read_to_end(&mut heard).await.unwrap();
+            heard
+        };
+        // A take that never closes must fail the test, not hang it.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(proxy.take(held), asking)
+        })
+        .await
+        .expect("take ends")
+    }
+
+    /// What the table asks for over loopback (this node's `web` on `port`, no replica) reaches the
+    /// replica, which answers `a:`; the place it holds is held while the connection lasts and
+    /// given back when it ends.
+    #[tokio::test]
+    async fn take_passes_on_what_the_table_asks_for_to_the_replica() {
+        let (replica, replicas) = replica().await;
+        let port = replica.port();
+        let mut proxy = proxy_of(state_with_web("take-asked").await, port, "Workload/default/web", None);
+        // One place, so that a second one can be seen to be held.
+        proxy.relaying = Limits::new(1, 1).per_node();
+        let caller = IpAddr::V6(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+        let (mut client, held) = pair_from_ipv6().await;
+        let asking = async {
+            client
+                .write_all(format!("{port} Workload/default/web\n").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(client.read_u8().await.unwrap(), b'+');
+            assert!(proxy.relaying.take(caller).is_none(), "held while the connection lasts");
+            client.write_all(b"q").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut heard = String::new();
+            client.read_to_string(&mut heard).await.unwrap();
+            heard
+        };
+        let (passed, heard) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(proxy.take(held), asking)
+        })
+        .await
+        .expect("take ends");
+        assert_eq!((passed, heard.as_str()), (Some(()), "a:q"));
+        assert!(proxy.relaying.take(caller).is_some(), "given back when it ends");
+        assert_eq!(replicas.load(Ordering::Relaxed), 1);
+    }
+
+    /// What the table does not ask for is closed with no byte, and no replica is connected: the
+    /// same Workload on the same port, but a replica the table has none of.
+    #[tokio::test]
+    async fn take_closes_what_the_table_does_not_ask_for_with_no_byte() {
+        let (replica, replicas) = replica().await;
+        let port = replica.port();
+        let proxy = proxy_of(state_with_web("take-unasked").await, port, "Workload/default/web", None);
+        let said = take_says(&proxy, &format!("{port} Workload/default/web 0\n")).await;
+        assert_eq!(said, (None, Vec::new()));
+        assert_eq!(replicas.load(Ordering::Relaxed), 0);
+    }
+
+    /// A NetworkPolicy that does not let loopback in closes what the table asks for the same way:
+    /// no byte, and no replica is connected. The same policy naming the caller's own address
+    /// lets it through, so it is the cidr that refuses, not a policy that never matches.
+    #[tokio::test]
+    async fn take_closes_what_a_network_policy_refuses_with_no_byte() {
+        let policy = |cidr: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: {{ name: web }}\n\
+                 spec:\n  selector: {{ app: web }}\n  ingress: [{{ action: allow, peers: [{{ cidr: '{cidr}' }}] }}]\n"
+            )
+        };
+        for (cidr, passes) in [("fd00::/64", false), ("::ffff:127.0.0.1/128", true)] {
+            let (replica, replicas) = replica().await;
+            let port = replica.port();
+            let shared = state_with_web(if passes { "take-let-in" } else { "take-refused" }).await;
+            apply(&shared, &policy(cidr));
+            let proxy = proxy_of(shared, port, "Workload/default/web", None);
+            let (passed, heard) = take_says(&proxy, &format!("{port} Workload/default/web\n")).await;
+            assert_eq!(passed.is_some(), passes, "{cidr}");
+            assert_eq!(heard.is_empty(), !passes, "{cidr}: no byte when refused");
+            assert_eq!(replicas.load(Ordering::Relaxed), usize::from(passes), "{cidr}");
+        }
     }
 
     /// One connection between two nodes passes on one client's connection after another,
@@ -2097,9 +2635,10 @@ spec:
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = dripping.accept().await {
                 tokio::spawn(async move {
-                    // Five bytes over two seconds, then (its client's end heard) its own.
-                    for _ in 0..5 {
-                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    // Twelve bytes a quarter second apart (three seconds), then (its client's end
+                    // heard) its own.
+                    for _ in 0..12 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
                         stream.write_all(b".").await.unwrap();
                     }
                     let _ = stream.read_to_end(&mut Vec::new()).await;
@@ -2111,13 +2650,13 @@ spec:
         assert!(ask(&mut relay, "kept 8080 web\n", b"").await.unwrap());
         let (mut client, held) = pair().await;
         let hearing = async {
-            let mut heard = [0; 5];
+            let mut heard = [0; 12];
             client.read_exact(&mut heard).await.unwrap();
             client.shutdown().await.unwrap();
             client.read_to_end(&mut Vec::new()).await.unwrap()
         };
         let begun = std::time::Instant::now();
-        let (carried, more) = tokio::join!(carry(held, &mut relay, Duration::from_secs(1)), hearing);
+        let (carried, more) = tokio::join!(carry(held, &mut relay, Duration::from_secs(2)), hearing);
         carried.unwrap();
         assert!(more == 0 && begun.elapsed() >= Duration::from_secs(2));
 
@@ -2129,9 +2668,9 @@ spec:
         let (mut client, held) = pair().await;
         client.shutdown().await.unwrap();
         let begun = std::time::Instant::now();
-        let cut = carry(held, &mut relay, Duration::from_secs(1)).await;
+        let cut = carry(held, &mut relay, Duration::from_secs(2)).await;
         assert_eq!(cut.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
-        assert!(begun.elapsed() >= Duration::from_secs(1) && begun.elapsed() < Duration::from_secs(3));
+        assert!(begun.elapsed() >= Duration::from_secs(2) && begun.elapsed() < Duration::from_secs(10));
     }
 
     /// A replica that speaks first and ends first: its bytes and its end reach the client,
@@ -2598,6 +3137,324 @@ spec:
             frames * 2 >= writes * 3,
             "fewer than 1.5 frames to a write: {frames} in {writes}"
         );
+    }
+
+    // ---- T-0326, slice B: the sending end of a link ----
+
+    /// Another node's kithd that takes links as well as connections ([`other_node`] takes only
+    /// connections): every replica but the Workload `shut` is the one at `replica`. Where it
+    /// listens, and how many connections it has had.
+    async fn linking_node(replica: SocketAddr, places: usize) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (at, had) = (
+            listener.local_addr().unwrap(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let count = had.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let (relaying, spares) = (Limits::new(places, places), Limits::new(1, 1));
+                    let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+                    let find = move |_: u16, workload: String, _: Option<u32>| async move {
+                        match workload.as_str() {
+                            "shut" => None,
+                            _ => TcpStream::connect(replica).await.ok(),
+                        }
+                    };
+                    let link = |io, relaying, caller| receive::serve(io, relaying, caller, receive::BOUNDS, &find);
+                    admit_or_link(&relaying, &spares, local, stream, &find, link).await
+                });
+            }
+        });
+        (at, had)
+    }
+
+    /// A node that takes each link (`link\n`, answered `+`), reads `reads` bytes more of it and
+    /// hangs up; or, with none, reads what it is sent and says nothing, as a peer that is half-open
+    /// does. Where it listens, and how many connections it has had.
+    async fn hanging_node(reads: Option<usize>) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (at, had) = (
+            listener.local_addr().unwrap(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let count = had.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let _ = stream.read_exact(&mut [0; 5]).await;
+                    let _ = stream.write_all(b"+").await;
+                    match reads {
+                        Some(reads) => drop(stream.read_exact(&mut vec![0; reads]).await),
+                        None => while stream.read(&mut [0; 4096]).await.is_ok_and(|read| read > 0) {},
+                    }
+                });
+            }
+        });
+        (at, had)
+    }
+
+    const AT_B: &str = "Workload/default/web";
+
+    /// A Proxy of node `a` that knows Node `b` as saying `mesh`, and dials it at `at`.
+    async fn proxy_to_b(tag: &str, mesh: Value, at: SocketAddr) -> Proxy {
+        let shared = state_with_web(tag).await;
+        {
+            let mut state = shared.store.lock().unwrap();
+            let node = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: b }\nspec: {}\n";
+            state
+                .store
+                .apply(Resource::from_source(node).unwrap().remove(0).unwrap())
+                .unwrap();
+            state.store.set_status("Node/b", Some(json!({ "mesh": mesh }))).unwrap();
+        }
+        let mut proxy = proxy_of(shared, 8080, AT_B, None);
+        proxy.dial_to = Some(at);
+        proxy
+    }
+
+    /// The link `proxy` has to Node b.
+    fn link_of(proxy: &Proxy) -> link::Link {
+        proxy.linked.lock().unwrap().get("b").unwrap().0.clone()
+    }
+
+    fn on_b(workload: &str) -> Backend {
+        ("b".into(), 8080, workload.into(), None)
+    }
+
+    /// A client that says `says` through `stream`: what it hears.
+    async fn say_on(stream: link::Stream, says: &str) -> String {
+        use tokio::io::AsyncReadExt;
+        let (mut client, held) = pair().await;
+        let asking = async {
+            client.write_all(says.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut heard = String::new();
+            client.read_to_string(&mut heard).await.unwrap();
+            heard
+        };
+        let (_, heard) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(stream.join(held), asking)
+        })
+        .await
+        .expect("the stream ends");
+        heard
+    }
+
+    /// A node that says it takes links is reached by a stream on one link, however many clients
+    /// there are, with what a client said first going with the opening; one that says `kept`
+    /// only is reached on a kept connection, and a node of before on a connection of its own.
+    #[tokio::test]
+    async fn reach_uses_a_stream_of_the_link_where_the_node_takes_links_and_the_old_paths_where_not() {
+        let (replica, replicas) = replica().await;
+        let (node, connections) = linking_node(replica, 8).await;
+        let proxy = proxy_to_b("reach-link", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        for turn in 0..3 {
+            let Ok(Reached::Linked(stream)) = proxy.reach(&on_b(AT_B), b"").await else {
+                panic!("not a stream of a link");
+            };
+            assert_eq!(say_on(stream, &format!("q{turn}")).await, format!("a:q{turn}"));
+        }
+        let Ok(Reached::Linked(stream)) = proxy.reach(&on_b(AT_B), b"first, ").await else {
+            panic!("not a stream of a link");
+        };
+        assert_eq!(say_on(stream, "more").await, "a:first, more");
+        // What the node has no replica for is said no to on its stream; the link carries on.
+        assert!(proxy.reach(&on_b("shut"), b"for nobody").await.is_err());
+        assert!(matches!(proxy.reach(&on_b(AT_B), b"").await, Ok(Reached::Linked(_))));
+        assert_eq!(connections.load(Ordering::Relaxed), 1, "one connection to the node");
+        assert_eq!(replicas.load(Ordering::Relaxed), 5);
+        assert!(proxy.kept.lock().unwrap().is_empty());
+
+        // Only `kept`: a kept connection, and no link.
+        let (node, connections, _) = other_node(replica).await;
+        let proxy = proxy_to_b("reach-kept", json!({ "port": 1, "kept": true }), node).await;
+        assert!(matches!(proxy.reach(&on_b(AT_B), b"").await, Ok(Reached::Kept(..))));
+        assert!(proxy.linked.lock().unwrap().is_empty());
+        // A node of before says neither: a connection of its own.
+        let proxy = proxy_to_b("reach-whole", json!({ "port": 1 }), node).await;
+        assert!(matches!(proxy.reach(&on_b(AT_B), b"").await, Ok(Reached::Whole(_))));
+        assert!(proxy.linked.lock().unwrap().is_empty());
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
+    }
+
+    /// A link that went down while no client used it is dialled again, once, before the next
+    /// client is asked for: the client does not notice.
+    #[tokio::test]
+    async fn a_link_that_went_down_idle_is_redialled_for_the_next_client() {
+        let (node, connections) = linking_node(replica().await.0, 8).await;
+        let proxy = proxy_to_b("link-redial", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        let Ok(Reached::Linked(stream)) = proxy.reach(&on_b(AT_B), b"").await else {
+            panic!("not a stream of a link");
+        };
+        assert_eq!(say_on(stream, "one").await, "a:one");
+        link_of(&proxy).close();
+        let Ok(Reached::Linked(stream)) = proxy.reach(&on_b(AT_B), b"spoken").await else {
+            panic!("not a stream of a link");
+        };
+        assert_eq!(say_on(stream, " and two").await, "a:spoken and two");
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
+        assert!(!link_of(&proxy).is_down());
+    }
+
+    /// A link that goes down with a client's bytes on it ends that client's connection as a
+    /// kept connection's does ([`Reached::Lost`]: they may be with a replica, and go to no other); with
+    /// nothing said it is dialled for once more, and then the next backend is tried.
+    #[tokio::test]
+    async fn a_link_that_dies_ends_its_streams_as_lost_and_is_dialled_once_more_for_a_client_that_said_nothing() {
+        let line = format!("8080 {AT_B}\n");
+        // (After the node's `+`: the opening, and the data frame with the asking.)
+        let (node, connections) = hanging_node(Some(7 + 7 + line.len() + 6)).await;
+        let proxy = proxy_to_b("link-lost", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        assert!(matches!(proxy.reach(&on_b(AT_B), b"spoken").await, Ok(Reached::Lost)));
+        assert_eq!(
+            connections.load(Ordering::Relaxed),
+            1,
+            "what was said is asked for nowhere else"
+        );
+
+        let (node, connections) = hanging_node(Some(7 + 7 + line.len())).await;
+        let proxy = proxy_to_b("link-twice", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        assert!(proxy.reach(&on_b(AT_B), b"").await.is_err());
+        assert_eq!(connections.load(Ordering::Relaxed), 2, "dialled once more, not again");
+    }
+
+    /// A stream open when its link goes down ends, and the client's connection with it.
+    #[tokio::test]
+    async fn a_stream_open_on_a_link_that_goes_down_closes_its_client() {
+        use tokio::io::AsyncReadExt;
+        let (node, _) = linking_node(replica().await.0, 8).await;
+        let proxy = proxy_to_b("link-open", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        let Ok(Reached::Linked(stream)) = proxy.reach(&on_b(AT_B), b"").await else {
+            panic!("not a stream of a link");
+        };
+        let (mut client, held) = pair().await;
+        let joined = tokio::spawn(stream.join(held));
+        link_of(&proxy).close();
+        tokio::time::timeout(Duration::from_secs(10), joined)
+            .await
+            .expect("the stream ends")
+            .unwrap();
+        let mut heard = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut heard)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "the client's connection is closed"
+        );
+    }
+
+    /// The node holds as many streams of a link as [`receive::STREAMS`] and resets the rest: the
+    /// clients past that many reach it on a kept connection, and all of them reach the replica.
+    #[tokio::test]
+    async fn clients_past_the_streams_a_link_holds_take_the_kept_path() {
+        let (replica, replicas) = replica().await;
+        let (node, connections) = linking_node(replica, receive::STREAMS + 8).await;
+        let proxy = proxy_to_b("link-cap", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        let (mut held, mut kept) = (Vec::new(), Vec::new());
+        for _ in 0..receive::STREAMS + 4 {
+            match proxy.reach(&on_b(AT_B), b"").await {
+                Ok(Reached::Linked(stream)) => held.push(stream),
+                Ok(Reached::Kept(_, relay)) => kept.push(relay),
+                _ => panic!("a client did not reach the replica"),
+            }
+        }
+        assert_eq!((held.len(), kept.len()), (receive::STREAMS, 4));
+        assert_eq!(say_on(held.pop().unwrap(), "linked").await, "a:linked");
+        for relay in &mut kept {
+            let (carried, heard) = through(relay, "kept").await;
+            assert!(carried.is_ok());
+            assert_eq!(heard, "a:kept");
+        }
+        assert_eq!(replicas.load(Ordering::Relaxed), receive::STREAMS + 4);
+        assert_eq!(
+            connections.load(Ordering::Relaxed),
+            1 + 4,
+            "the link, and a connection to each"
+        );
+    }
+
+    /// A node that takes the link and answers nothing on a stream is not waited for by each
+    /// client: the first one's wait ends the link, and the next client dials a new one.
+    #[tokio::test]
+    async fn a_node_that_answers_nothing_on_a_stream_loses_its_link() {
+        let (node, connections) = hanging_node(None).await;
+        let proxy = proxy_to_b("link-silent", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        assert!(proxy.reach(&on_b(AT_B), b"").await.is_err());
+        assert!(link_of(&proxy).is_down());
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+        assert!(proxy.reach(&on_b(AT_B), b"").await.is_err());
+        assert_eq!(connections.load(Ordering::Relaxed), 2, "the next client dialled again");
+    }
+
+    /// The node answers `link\n` with `+` or `-`: a no (or a hang-up, as a node of before does)
+    /// before any stream is opened sends the client the kept way, with nothing lost.
+    #[tokio::test]
+    async fn a_node_that_does_not_take_the_link_is_reached_on_a_kept_connection() {
+        let (replica, _) = replica().await;
+        // No place to relay in: the link is said no to, and so is the kept connection.
+        let (node, connections) = linking_node(replica, 0).await;
+        let proxy = proxy_to_b("link-no", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        assert!(proxy.reach(&on_b(AT_B), b"spoken").await.is_err());
+        assert!(proxy.linked.lock().unwrap().is_empty());
+        assert_eq!(connections.load(Ordering::Relaxed), 2, "the link's, and the kept one's");
+
+        // A hang-up before any answer: the kept way is tried (and is hung up on as well here).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (node, connections) = (
+            listener.local_addr().unwrap(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let count = connections.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::Relaxed);
+                drop(stream);
+            }
+        });
+        let proxy = proxy_to_b("link-hung-up", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        // (Not Lost: nothing was sent on the link.)
+        assert!(proxy.reach(&on_b(AT_B), b"").await.is_err());
+        assert!(proxy.linked.lock().unwrap().is_empty());
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
+    }
+
+    /// A link with no open stream for longer than a kept connection lasts is closed by
+    /// [`Proxy::forget`] (the node closes one that is empty), and one with a stream open is not.
+    #[tokio::test]
+    async fn a_link_no_stream_has_used_for_long_is_closed() {
+        let (node, connections) = linking_node(replica().await.0, 8).await;
+        let proxy = proxy_to_b("link-idle", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        let Ok(Reached::Linked(open)) = proxy.reach(&on_b(AT_B), b"").await else {
+            panic!("not a stream of a link");
+        };
+        let long_ago = |proxy: &Proxy| {
+            let ago = Instant::now().checked_sub(KEPT + Duration::from_secs(1)).unwrap();
+            proxy.linked.lock().unwrap().get_mut("b").unwrap().1 = ago;
+        };
+        long_ago(&proxy);
+        proxy.forget();
+        assert!(!link_of(&proxy).is_down(), "a stream is open on it");
+        let Ok(Reached::Linked(over)) = proxy.reach(&on_b(AT_B), b"").await else {
+            panic!("not a stream of a link");
+        };
+        assert_eq!(say_on(over, "two").await, "a:two");
+        drop(open);
+        for _ in 0..100 {
+            if link_of(&proxy).streams() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(link_of(&proxy).streams(), 0);
+        long_ago(&proxy);
+        let link = link_of(&proxy);
+        proxy.forget();
+        assert!(link.is_down() && proxy.linked.lock().unwrap().is_empty());
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
     }
 }
 

@@ -44,7 +44,7 @@ sh ci/vm.sh --test image   # boot a copy of it under UEFI in QEMU and check it
 
 | Part | What it is |
 | --- | --- |
-| kernel | 6.18, 13 MB, from kernel.org's source at a pinned version and checksum (`os/kernel.config`): no modules, no initramfs; NVMe, SATA, USB and SD storage, the common wired cards, virtio, WireGuard, dm-verity, dm-crypt, KVM. The first build takes ten minutes or so |
+| kernel | 6.18, 13 MB, from kernel.org's source at a pinned version and checksum (`os/kernel.config`): no modules, no initramfs; NVMe, SATA, USB and SD storage, the common wired cards, virtio, WireGuard, dm-verity, dm-crypt, KVM, the IOMMU drivers (Intel and AMD). The first build takes ten minutes or so |
 | root | a read-only squashfs of about 6 MB: kithd as `/sbin/init`, `kith`, curl's CA bundle. No shell, no libc, no package manager |
 | verity | the root's dm-verity hash is on the command line inside the one EFI file the firmware starts (systemd's stub, the kernel, the command line), so a changed root is refused block by block |
 | disk | GPT: `esp` (systemd-boot, `kith-1-a.efi`), `root-a` and `verity-a`, `root-b` and `verity-b` (empty: an update goes there), `state` (ext4), the only partition a running node writes |
@@ -82,6 +82,21 @@ update is 43 MB against 34 and the ESP's two kernels 36 of its 64 MB; the root i
 Built and started under UEFI in QEMU, the kernel brings amdgpu up (`amdgpu: Topology: Add CPU
 node`) and kithd serves; on a 780M itself it has not run yet.
 
+`vfio`, to prepare the kernel for handing a PCI card (a GPU, a USB controller) to a virtual
+machine: the IOMMU switched on (Intel's, with interrupt remapping) and `vfio-pci` built in
+(`os/examples/vfio.yaml`). That is all it does: binding a card to `vfio-pci`, and `vms` on kith
+OS (there is no qemu in the image), come later. Every kith OS kernel, spec or not, has the
+IOMMU drivers pinned in `os/kernel.config` (x86's default config already had them), Intel's
+off by default as before: nothing on an installed node's command line can turn it on, so the
+spec does. Measured: the plain kernel is byte for byte the one it was, 13,489,152 bytes, the
+update 34,288,640 and the raw image the same 282 MiB, under its 300 MB budget; the `vfio`
+spec's kernel is 13,558,784 bytes (+68 KiB, 69,632 bytes), its update 34,427,904. Booted in
+QEMU with a virtual Intel IOMMU (`-machine q35,kernel-irqchip=split -device
+intel-iommu,intremap=on`), the plain kernel reads the IOMMU's table and leaves it off, and the
+`vfio` one says `DMAR: Intel(R) Virtualization Technology for Directed I/O`, `DMAR-IR: Enabled
+IRQ remapping in x2apic mode` and `VFIO - User Level meta-driver version: 0.3`. Passing a real
+card through has not been tried: that is on hardware.
+
 A node can say which features it wants itself. kithd matches its PCI cards (`lspci -n` ids) against
 the `# pci:` lines of `os/features/` and lists the features that match as `wants` in its Node status.
 `kith node features` prints them as a spec, which builds that node's image:
@@ -94,6 +109,45 @@ sh os/build.sh --spec n1.yaml --out target/os-n1
 A node with no card a feature matches prints `features: []`; a node that runs no kith OS has no
 `wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
 card the catalogue does not list yet) is chosen by hand, as above.
+
+#### The `all` feature: drivers as signed modules
+
+```sh
+KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
+KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
+sh ci/vm.sh --test modules   # the same image: drivers load at start, on a device added, and a bad signature is refused
+```
+
+For a node whose hardware is not known when the image is built, `features: [all]` turns on
+kernel modules (`os/features/all.config`): GPUs (amdgpu, i915, xe, nouveau), sound (HDA and its
+codecs, USB audio, Sound Open Firmware), Wi-Fi (iwlwifi, ath9k to ath12k, mt76, rtw88, rtw89)
+and the network cards the plain kernel lacks. `firmware: [all]` is all of linux-firmware; a list
+of paths there (`amdgpu/*`) is those files, and in both cases the files each module names
+(`modinfo -F firmware`) are there too.
+
+- **Signed, per kernel build.** The kernel makes a key of its own at the start of each kernel build (a tree cut short and gone on from has its old key removed first), signs
+  every module with it as `modules_install` writes them, and builds the public half in;
+  `CONFIG_MODULE_SIG_FORCE` refuses any other module. `build.sh` then deletes the key: the build
+  fails if a `signing_key` or a `.pem` is left in the kernel's tree or in the root, and a
+  failed build deletes it too. It checks one module's signature against the kernel's own key.
+  So the modules of one build load only into that build's kernel, and the kernel of an `all`
+  image is not the same bytes from one kernel build to the next (the plain one is). The
+  kernel and its modules are cached by the hash of their config, so the key is made when
+  they are built, not at each image build.
+- **In the root, not the ESP.** `/lib/modules/VER` (with `modules.dep`, `modules.alias`,
+  `modules.builtin` and `modules.builtin.modinfo`, so a loader knows what is built in) and
+  `/lib/firmware` (with the links linux-firmware lists in `WHENCE`: a driver asks for
+  `iwlwifi-cc-a0-77.ucode`, the file is `intel/iwlwifi/`) are in the squashfs under dm-verity,
+  block by block like the rest. The ESP stays 64 MB; the root slots grow with the root, so a
+  node installed from a plain image has slots too small to be updated to this one.
+- **Sizes** (the plain image is 295,715,328 bytes, as before, and its kernel the same bytes):
+  kernel 13 MB; modules 77 MB (170 of them) and firmware 1,992 MB, both before compression; the
+  root 931 MB squashfs; the raw disk image 2,576 MB (954 MB as qcow2); the update file 966 MB.
+  `build.sh --check` allows the `all` image 4 GB, not the plain 300 MB. The installer's memory
+  disk carries the payload and not the modules.
+- **Not in it yet.** The NVIDIA open modules: a later slice, built out of tree against this
+  kernel and signed with the same throwaway key in the same build. A spec naming both `all` and
+  `gpu-amd-phoenix` is refused (the same driver, built in there).
 
 A cluster runs plain and GPU nodes side by side: sign each image's update as its own
 `OSRelease` and roll each with its own `UpdatePlan`, the GPU one with a `selector` on a label
@@ -150,7 +204,7 @@ cargo test -p kith-store format        # this build reads a state written in for
 ```
 
 A node's copy of the cluster's resources is two files in its state, `raft/log.redb` and
-`raft/snapshot.json`, each saying its format, 1 or 2 (a file from before the number is 1).
+`raft/snapshot.json`, each saying its format, 1, 2 or 3 (a file from before the number is 1).
 Format 2 keeps when each resource was first made, apart from its history (which is trimmed): it
 says which of two Services naming one host was there first. A state stays in format 1 until the
 cluster's leader marks the store with one entry in the log, once every other node that keeps the
@@ -166,13 +220,17 @@ files. So:
    when each resource was first made`, and there is no going back short of that backup. A
    cluster of one node has nobody to wait for: it marks its store as soon as the new kithd
    starts.
+4. Format 3 comes the same way, once every node's kithd says it reads format 3: the leader
+   says `the store keeps from now on the nonces of signed entries`. It is format 2 with a book
+   of the nonces of signed writes in the log, kept so that each is run once; a kithd that
+   reads format 3 refuses every such write for now, and none is written yet.
 
 What there was at the mark counts as made at the time of its oldest revision still kept: a
 Service edited more than a hundred times before may count as newer than one that names its host.
 Where that matters, keep the host with its Namespace's `hosts` before updating.
 
-- A kithd reads every format up to its own: `crates/kith-store/fixtures/format-1` and `format-2`
-  are a state as each format writes it. A build that changes what is written takes the next
+- A kithd reads every format up to its own: `crates/kith-store/fixtures/format-1`, `format-2` and
+  `format-3` are a state as each format writes it. A build that changes what is written takes the next
   number, adds a fixture and keeps the old ones.
 - A kithd refuses a newer format and leaves the files as they were. Going back to an older
   release is sure only while the state is in a format that release reads.

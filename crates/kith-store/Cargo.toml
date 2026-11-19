@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-kith-api.workspace = true
+kith-api = { workspace = true, features = ["signing"] }
 serde.workspace = true
 serde_json.workspace = true
 openraft = { version = "0.9", default-features = false, features = ["serde", "storage-v2"] }

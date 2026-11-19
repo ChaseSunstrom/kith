@@ -45,6 +45,9 @@
 #                               disk never has another's, and what it does with no control node in reach
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
 #                               in turn losing power, then all at once; what was acknowledged is on all three
+#   sh ci/vm.sh --test home     three nodes with a house address in the Cluster: one MAC answers for it
+#                               and DNS answers from it; the holder reset, and the next stopped: another
+#                               announces it within 10 s and two are never heard at once
 #   sh ci/vm.sh --test access   three nodes: a write let through by a node that had not heard its
 #                               RoleBinding was deleted is refused where the log is kept
 #   sh ci/vm.sh --test policy   two nodes whose policy turns off exec units, VM paths and /v1/run: kithd
@@ -85,6 +88,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    (refused), a good one (it restarts into its other slot, marks it
                    good, and is the same node), then one whose root is broken (three
                    tries, and it is back on the slot that worked); same needs
+  --test modules   instead: the 'all' image (its drivers are modules, signed with the key of its
+                   build): kithd loads the driver of an HDA controller at start, and of a USB
+                   audio device the monitor adds later, in the same boot; the same spec built
+                   with one byte of snd-usb-audio changed is refused on one console line; same
+                   needs as image, and the image is built twice
   --test rollout   instead: three nodes on a network of their own, claimed and joined
                    over TLS, their image built with a release key; a first release by
                    another key (refused), one with another file's signature (refused), a signed
@@ -235,6 +243,16 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    writes each time, a cut-off node acknowledges none, every write
                    that was acknowledged is on all three nodes at the end, and the
                    three hold the same; needs what --test rollout needs
+  --test home      instead: three nodes as for rollout, a house address (10.9.0.100/24)
+                   in the Cluster, and a machine on their network (ci/lan_probe.py)
+                   that asks who has it four times a second. Expected: one card
+                   answers and announces it, the Cluster's status.home says whose
+                   it is (and the next holder's after a reset), DNS asked of it answers from it, with
+                   the holder reset by the hypervisor and then (after it is back)
+                   the next one stopped, another announces it within 10 s (the
+                   seconds are printed), and two cards are never heard answering at
+                   once, not when the stopped one goes on again; needs socat and
+                   python3 as --test chaos does
   --test access    instead: three nodes as for rollout, and the cluster's admin
                    writing through n2 and n3 by a RoleBinding that is deleted through
                    n1, once while n2 is cut off from the others. Expected: no write
@@ -288,7 +306,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | access | policy | tunnel | outlive | alone) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | alone) ;; *) echo "vm.sh: --test knows: init, image, update, modules, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -316,11 +334,14 @@ fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
-vms='' web=''
+vms='' web='' found=''
 # (What a test left running goes with it; its consoles' logs are kept where KITH_VM_LOGS
 # names a directory, for a failure that does not come again. Stopped, it ends there: a trap on
 # TERM alone would clean up and then go on running the test.)
-trap 'kill $vms $web 2>/dev/null || true; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; rm -rf "$work"' EXIT
+# A write a control node makes as itself that the leader refused (raft.rs `write`, own_writes.rs)
+# is a call site no suite expects: the run fails whatever the suite said, and names the lines.
+refusals() { grep -ahs "refused a control node.s own write" "$work"/log "$work"/*.log | head -n 3; }
+trap 'kill $vms $web 2>/dev/null || true; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
 trap 'exit 1' INT TERM
 said() { grep -aq "$1" "$work/log" 2>/dev/null; }
 fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }

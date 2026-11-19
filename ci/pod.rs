@@ -581,6 +581,27 @@ fn main() {
                 let _ = stream.write_all(said.as_bytes());
             }
         }
+        // HOST PORT SECONDS: asks it ten times a second for that long and says how many
+        // answers came, how many failed (the first, with why) and what the rest said: a
+        // rolling update's check that something always answered.
+        ["hammer", host, port, seconds] => {
+            let until = std::time::Instant::now() + Duration::from_secs(seconds.parse().expect("seconds"));
+            let (mut asked_n, mut failed, mut heard) = (0, Vec::new(), std::collections::BTreeSet::new());
+            while std::time::Instant::now() < until {
+                asked_n += 1;
+                match asked(host, port) {
+                    Ok(said) if said.starts_with("HTTP/1.0 200") => drop(heard.insert(said)),
+                    Ok(said) => failed.push(format!("said {said:?}")),
+                    Err(e) => failed.push(e.to_string()),
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            println!(
+                "hammer: {asked_n} asked, {} failed ({}), heard {heard:?}",
+                failed.len(),
+                failed.first().map_or("none", String::as_str)
+            );
+        }
         ["ask", pairs @ ..] if !pairs.is_empty() && pairs.len() % 2 == 0 => {
             let mut heard = std::collections::BTreeSet::new();
             for pair in pairs.chunks(2) {
@@ -679,7 +700,9 @@ fn main() {
             // mknod(2): std makes no device nodes.
             let made = syscall(133, [name.as_ptr() as u64, mode, device, 0, 0]);
             let read = std::fs::File::open(path).and_then(|mut node| node.read(&mut [0; 512]));
-            println!("node: made {made}, read {read:?}");
+            let status = std::fs::read_to_string("/proc/self/status").expect("a /proc to read itself in");
+            let eff = status.lines().find_map(|line| line.strip_prefix("CapEff:")).map_or("?", str::trim);
+            println!("node: made {made}, read {read:?}, caps eff {eff}");
         }
         [how @ ("ids" | "stays"), paths @ ..] => {
             use std::os::unix::fs::MetadataExt;

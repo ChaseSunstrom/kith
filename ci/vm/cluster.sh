@@ -10,6 +10,7 @@
         helms=$(printf '%s' "${KITH_HELM:-$(command -v helm || true)}" | tr ':' ' ')
         [ "$test" != kube ] || [ -x "$kubectl" ] || skip "no kubectl (KITH_KUBECTL names one; sh ci/kube.sh --vm fetches one)"
         [ "$test" != quota ] || command -v socat >/dev/null 2>&1 || skip "no socat to restart a node with"
+        [ "$test" != home ] || command -v socat >/dev/null 2>&1 || skip "no socat to reset and stop a node with"
         if [ "$test" = pods ]; then
             command -v socat >/dev/null 2>&1 || skip "no socat to plug a keyboard in with"
         fi
@@ -239,6 +240,8 @@ EOF
             joined="--dns 0.0.0.0:5353 --dns-upstream 10.0.2.2:$((port + 9))"
             [ "${KITH_POD_NOUPSTREAM:-}" != 1 ] || { first='--dns-upstream 10.9.0.9:5353'; joined='--dns 0.0.0.0:5353 --dns-upstream 10.9.0.9:5353'; }
         fi
+        # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
+        [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353'; }
         node 1 "--claim ${first:-}"
         tries=0
         until token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/n1.log" 2>/dev/null) && [ -n "$token" ] \
@@ -357,6 +360,9 @@ EOF
 
         if [ "$test" = chaos ]; then
             . "$root/ci/vm/chaos.sh"
+        fi
+        if [ "$test" = home ]; then
+            . "$root/ci/vm/home.sh"
         fi
 
         # Before any release, each node says it takes releases from its image's keys (each

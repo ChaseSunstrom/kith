@@ -31,10 +31,19 @@ directory is refused.
   deletes its logs.
 - **Probes.** `readiness` decides whether a replica counts as ready. A `liveness` probe that fails
   `failureThreshold` times in a row (3) restarts the container. `tcp` and `http` probes go to
-  `localhost` every `intervalSeconds` (10), and once a second until the first success.
+  `localhost` every `intervalSeconds` (10), and once a second until the first success. A liveness
+  probe's `startSeconds` (0, none) is how long a container may take to pass its first check: after
+  it, a failure counts like any other. (Kubernetes' `initialDelaySeconds` on a liveness probe is
+  imported as `startSeconds`; on a readiness probe it is said and left out.)
 - **Updates.** A changed Workload (or a changed `ConfigMap` or `Secret` value in a unit's `env`) is
   replaced one replica at a time, the next once the others are ready: an update that does not come
   up stops at its first replica and the status says where. `strategy: recreate` replaces all at once.
+  A rolling update surges: the replacement starts beside the old replica, and the old one stops
+  only after the new one is ready (and its Service address has moved, 3 seconds), so a
+  `replicas: 1` Workload behind a Service is never without a ready replica. A replica that holds
+  one of something (a volume, a claimed device, the node's network, or a second copy's worth of
+  CPU or memory the node does not have) stops first instead, and the status says why
+  ([Rolling updates](cluster.md#rolling-updates): a replacement that does not come up, a kithd restarted in the middle).
 - **Shutdown.** On SIGTERM kithd stops what it started, answering requests for 3 seconds at most.
   A second signal ends it at once and its next start stops what was left.
 
@@ -98,8 +107,9 @@ must be allowed to apply a Job.
 
 - `exec` probes are accepted and do nothing (the status says so). A container's `ports` only name
   them for probes and Services; nothing is opened or mapped.
-- A replica is stopped before its replacement starts, so `replicas: 1` is down for a moment during
-  an update. `blueGreen` is treated as rolling.
+- A replica that holds a volume, a device or the node's network is stopped before its replacement
+  starts, so `replicas: 1` of one is down for a moment during an update. `blueGreen` is treated as
+  rolling. A readiness probe's `initialDelaySeconds` is not kept: kith asks at once.
 - Pulls are anonymous; layers must be gzip or plain tar.
 - [`dist/kithd.service`](../../dist/kithd.service) is a systemd user unit; `sh ci/systemd.sh` runs
   it under your user's systemd and checks its cgroups and its stop. A root service on a distro is
@@ -203,8 +213,9 @@ spec:
   - Only someone with rights over the whole cluster can apply a `Cluster`. Every node must run a
     build that reads rules: an older one runs an image as before.
   - At most 32 rules, 16 keys each. A rule by mistake stops new containers under it from starting
-    (the refusal names it); take it out of the `Cluster` to go back. `spec.images` is all kithd
-    reads of a `Cluster` today; `kith lint`, `diff` and `apply` say so of its other fields.
+    (the refusal names it); take it out of the `Cluster` to go back. `spec.images` and `spec.home`
+    (the [house address](cluster.md#one-address-for-the-house)) are all kithd reads of a `Cluster` today;
+    `kith lint`, `diff` and `apply` say so of its other fields.
 - **What it still reaches.** The node's network, the kernel through every call the filter lets by,
   and the devices it claims (a GPU's render node is a wide door into a kernel driver). Untrusted
   programs belong in a VM ([Virtual machines](hardware.md#virtual-machines)), which is what a

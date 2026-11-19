@@ -32,7 +32,7 @@
         "kind",
         "metadata"
       ],
-      "description": "Cluster-wide settings: the keys that sign images, the admin's key and whether callers must sign (the other fields are kept and not acted on)",
+      "description": "Cluster-wide settings: the keys that sign images, the admin's key and whether callers must sign, and the house address (the other fields are kept and not acted on)",
       "title": "Cluster",
       "$schema": "https://json-schema.org/draft/2020-12/schema"
     },
@@ -1639,6 +1639,17 @@
             }
           ],
           "description": "Whether a caller one node passes on to another, and a write at a node's local\nsocket, must be signed: `open` (left out: unsigned is taken, as before) or\n`required` (unsigned at the local socket is the node itself, which reads). Changed\nonly by a write the admin signed."
+        },
+        "home": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HomeSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The house's one address on its LAN: whichever control node leads holds it, and\nanswers DNS at it, so a router can name it once (DHCP option 6) and forward to it."
         }
       }
     },
@@ -2431,6 +2442,26 @@
         "proof"
       ],
       "description": "A release key handing over to others (`sh os/update.sh --handover`)."
+    },
+    "HomeSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "address": {
+          "type": "string",
+          "description": "The address with its prefix length, as the LAN has it (`192.168.1.250/24`): an IPv4\naddress no other machine there has, in the network of a card of the node that holds it."
+        },
+        "endpoint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "How the outside reaches the house: a name, or an address, with a port\n(`house.example.org:51820`). Kept and not acted on: the router forwards to `address`."
+        }
+      },
+      "required": [
+        "address"
+      ]
     },
     "HttpProbe": {
       "type": "object",
@@ -3367,6 +3398,15 @@
           ],
           "format": "uint32",
           "minimum": 0
+        },
+        "startSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "A liveness probe's start deadline: the container is restarted if it has not passed once\nthis long after it started (until then a failure does not count). Kubernetes'\n`initialDelaySeconds` becomes this."
         }
       },
       "description": "Exactly one of `http`, `tcp` or `exec`."
