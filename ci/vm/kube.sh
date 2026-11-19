@@ -58,11 +58,11 @@ EOF
             k get ingress shop 2>&1 | grep -q shop.example.com || fail "the Ingress does not say its host: $(k get ingress 2>&1)"
             must 'kubectl logs of a running pod' k logs shop-0
             must 'kubectl describe of a running pod' k describe pod shop-0
-            # The ways into a running pod are not here, and say so.
-            if timeout 60 env HOME="$work/home" KUBECONFIG="$work/kubeconfig" "$kubectl" port-forward shop-0 "$((port + 10)):80" >"$work/said" 2>&1; then
-                fail "kubectl port-forward was answered"
+            # The way into a running pod that is not here yet (kubectl exec) says so; port-forward is, and is tried by its tests.
+            if timeout 60 env HOME="$work/home" KUBECONFIG="$work/kubeconfig" "$kubectl" exec shop-0 -- true >"$work/said" 2>&1; then
+                fail "kubectl exec was answered"
             fi
-            grep -q 'not answered here' "$work/said" || fail "kubectl port-forward was not refused in words: $(cat "$work/said")"
+            grep -Eq 'not answered here|not carried yet' "$work/said" || fail "kubectl exec was not refused in words: $(cat "$work/said")"
 
             # A Job, and a CronJob's Job made by the clock: each hears the three of the shop,
             # what they were told, and the db, which has started once.

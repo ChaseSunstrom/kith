@@ -1488,6 +1488,7 @@ dependencies = [
  "kith-store",
  "kith-yaml",
  "log",
+ "miniz_oxide",
  "nix 0.29.0",
  "oci-client",
  "rcgen",
