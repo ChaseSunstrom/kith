@@ -2427,7 +2427,8 @@ async fn write(
         return Err(invalid(why.into()));
     };
     // A Pod made is what its restartPolicy says, before anything is asked of the caller or the store.
-    let kind = if kind.kind == "Pod" && how == How::Create {
+    // (Helm 4 sends a test hook's Pod as a server-side apply.)
+    let kind = if kind.kind == "Pod" && matches!(how, How::Create | How::Apply) {
         bare(&body)
     } else {
         kind
@@ -2469,6 +2470,10 @@ async fn write(
         if there {
             call.allowed(kind, namespace, Verb::Get)?;
         }
+        if there && kind.kind == "Pod" && how == How::Apply {
+            let why = format!("Pod/{name}: a Pod that is there is not changed: delete it and send it again");
+            return Err(invalid(why));
+        }
     }
     let exists = || {
         status(
@@ -2493,7 +2498,10 @@ async fn write(
         // A Pod shares its name space with the Job and the Workload it might have been, and with the
         // pods of what owns one. (ponytail: read and written under two calls for the other kind's key,
         // so a Job and an Always Pod of one name made at once may both be made; a same-kind one cannot.)
-        if kind.kind == "Pod" && how == How::Create && taken(&state.store, namespace, &name) {
+        if kind.kind == "Pod"
+            && (how == How::Create || (how == How::Apply && !there))
+            && taken(&state.store, namespace, &name)
+        {
             return Err(exists());
         }
         // What is there and was not made here, or not as this kind, is not written over.
@@ -2620,8 +2628,18 @@ async fn delete(
             "{kind}/{name}: gracePeriodSeconds is taken and changes nothing: what it runs is stopped as kith stops it"
         ));
     }
+    // A Pod that is a bare one is deleted as what it is held as, by that holder's own right; any
+    // other Pod name is a replica's, and a delete restarts it.
+    let mut kind = kind;
     if kind.kind == "Pod" {
-        return delete_pod(call, kind, namespace, name, hints).await;
+        let held = {
+            let state = call.shared.store.lock().expect("a handler panicked holding the store");
+            held_bare(&state.store, namespace, name)
+        };
+        match held {
+            Some(row) => kind = row,
+            None => return delete_pod(call, kind, namespace, name, hints).await,
+        }
     }
     // (Asked first: who may not delete here is not told what is there.)
     call.allowed(kind, namespace, Verb::Delete)?;
@@ -2696,10 +2714,28 @@ async fn delete(
     Ok(Written(StatusCode::OK, Some(done), hints).into_response())
 }
 
-/// `kubectl delete pod NAME` restarts that one replica: its node stops it and its Workload starts
-/// it again, with the same name and number and a new start time. Needs the apply right on the
-/// Workload; a pod that is no Workload's replica (a bare pod, a Job's run, a NodeWorkload's copy)
-/// is refused by name. No grace period and no force: what runs is stopped as kith stops it.
+/// The row a Pod named exactly `name` is held as when it is a bare one: the Job or the Workload of
+/// that name that carries the `kith.dev/pod` mark and is read back as a Pod. The mark alone tells it
+/// from a replica of an owner (`web-0` of Workload `web`), which [`delete_pod`] restarts.
+fn held_bare(store: &Store, namespace: Option<&str>, name: &str) -> Option<&'static Kind> {
+    BARE.iter().find(|row| {
+        let Some(held) = store.get(&key(row, namespace, name)) else {
+            return false;
+        };
+        let marked = held
+            .metadata
+            .annotations
+            .get("kith.dev/pod")
+            .is_some_and(|mark| mark == "true");
+        marked && served(held).is_some_and(|(of, _)| std::ptr::eq(of, *row))
+    })
+}
+
+/// `kubectl delete pod NAME` on a name that is no bare Pod (see [`held_bare`], which `delete` asks
+/// first) restarts that one replica: its node stops it and its Workload starts it again, with the
+/// same name and number and a new start time. Needs the apply right on the Workload; a pod that is
+/// no Workload's replica is refused by name when it is a Job's run or a NodeWorkload's copy, and is
+/// not found when it is nothing. No grace period and no force: what runs is stopped as kith stops it.
 async fn delete_pod(
     call: &Call,
     kind: &'static Kind,
@@ -2708,7 +2744,17 @@ async fn delete_pod(
     hints: Vec<String>,
 ) -> Result<Response, No> {
     let namespace = namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE);
-    let Some(("Workload", owner, replica)) = pod_owner(name) else {
+    let owned = pod_owner(name);
+    let Some(("Workload", owner, replica)) = owned else {
+        // (A name no Job's run or NodeWorkload's copy has is no pod, as it is not in Kubernetes: Helm
+        // deletes the test pod of an earlier run before it makes one, and wants NotFound of what is not there.)
+        let held = |holder: &str, owner: &str| {
+            let state = call.shared.store.lock().expect("a handler panicked holding the store");
+            state.store.get(&format!("{holder}/{namespace}/{owner}")).is_some()
+        };
+        if !owned.is_some_and(|(holder, owner, _)| held(holder, owner)) {
+            return Err(not_found(kind, name));
+        }
         let why = format!(
             "Pod/{name}: only a replica of a Workload is restarted by a delete: kith runs no other pod that is restarted so"
         );
@@ -4212,7 +4258,7 @@ spec: {role: writer, subjects: [carol]}
             .collect();
         names.sort();
         assert_eq!(names, ["x-0", "x-1"], "{listed}");
-        // A pod kith runs no Workload replica of is refused by name, and marks nothing.
+        // A name that is no pod is not found (Helm deletes what it made before, and wants this), and marks nothing.
         for no in ["bare", "x-j0"] {
             let (code, said) = answer_as(
                 shared.clone(),
@@ -4223,7 +4269,7 @@ spec: {role: writer, subjects: [carol]}
                 Value::Null,
             )
             .await;
-            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{no}: {said}");
+            assert_eq!(code, StatusCode::NOT_FOUND, "{no}: {said}");
             assert!(said.contains(no), "{no}: {said}");
         }
         // A Workload that is not there has no such replica.
@@ -4304,6 +4350,123 @@ spec: {role: writer, subjects: [carol]}
         .await;
         assert_eq!(code, StatusCode::OK, "{said}");
         assert_eq!(shared.restarts.lock().unwrap().len(), 1);
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn delete_pod_named(shared: &Arc<crate::Shared>, caller: Caller, name: &str) -> (StatusCode, String) {
+        answer_as(
+            shared.clone(),
+            caller,
+            "DELETE",
+            "",
+            &format!("namespaces/default/pods/{name}"),
+            Value::Null,
+        )
+        .await
+    }
+
+    /// A marked bare Pod is deleted as the Job or the Workload it is held as, and is then no pod; one
+    /// named like a replica (`web-0`, with no Workload `web`) is deleted too and not 404; the pod
+    /// of an owner is still restarted, not deleted; and a delete is a delete (nothing is restarted).
+    #[tokio::test]
+    async fn bare_pod_delete_removes_the_marked_pod_and_still_restarts_an_owners_replica() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-delete-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        two_replicas_of_x(&shared).await;
+        for (name, policy, held) in [
+            ("once", Some("Never"), "Job"),
+            ("always", None, "Workload"),
+            ("web-0", None, "Workload"),
+        ] {
+            let (code, said) = send_pod(&shared, Caller::Admin, a_pod(name, policy)).await;
+            assert_eq!(code, StatusCode::CREATED, "{name}: {said}");
+            let (code, said) = delete_pod_named(&shared, Caller::Admin, name).await;
+            assert_eq!(code, StatusCode::OK, "{name}: {said}");
+            let said: Value = serde_json::from_str(&said).unwrap();
+            assert_eq!(said["details"]["name"], name, "{said}");
+            assert!(
+                shared
+                    .store
+                    .lock()
+                    .unwrap()
+                    .store
+                    .get(&format!("{held}/default/{name}"))
+                    .is_none(),
+                "{name}"
+            );
+            let (code, said) = pods_of(&shared, &format!("namespaces/default/pods/{name}")).await;
+            assert_eq!(code, StatusCode::NOT_FOUND, "{name}: {said}");
+            let (code, _) = delete_pod_named(&shared, Caller::Admin, name).await;
+            assert_ne!(code, StatusCode::OK, "{name} is deleted once");
+        }
+        assert!(
+            shared.restarts.lock().unwrap().is_empty(),
+            "a delete of a bare pod restarts nothing"
+        );
+        // A run of a Job that is there is a pod that is not restarted by a delete: refused by name; one of a Job that is not is no pod.
+        let (code, said) = send_pod(&shared, Caller::Admin, a_pod("job", Some("Never"))).await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let (code, said) = delete_pod_named(&shared, Caller::Admin, "job-j0").await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{said}");
+        let (code, said) = delete_pod_named(&shared, Caller::Admin, "gone-j0").await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
+        // The owner's replica next to them is restarted, and its Workload stays.
+        let (code, said) = delete_pod_named(&shared, Caller::Admin, "x-0").await;
+        assert_eq!(code, StatusCode::OK, "{said}");
+        let marked: Vec<(String, u32)> = shared.restarts.lock().unwrap().iter().cloned().collect();
+        assert_eq!(marked, [("Workload/default/x".to_string(), 0)]);
+        assert!(shared.store.lock().unwrap().store.get("Workload/default/x").is_some());
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a bare pod needs the delete right on what it is held as: get alone is 403 and the
+    /// pod stays; apply alone is 403 too (a delete is not an apply); delete takes it.
+    #[tokio::test]
+    async fn bare_pod_delete_needs_the_delete_right_on_its_holder() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-delete-access-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let mut roles = String::new();
+        for (who, verb) in [("ann", "get"), ("bob", "apply"), ("cat", "delete")] {
+            roles += &format!(
+                "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{name: {who}}}\nspec: {{}}\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: {{name: {who}-role}}\nspec: {{rules: [{{kinds: [Job, Workload], verbs: [{verb}]}}]}}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{name: {who}-binding}}\nspec: {{role: {who}-role, subjects: [{who}]}}\n---\n"
+            );
+        }
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(&roles).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        for (name, policy, held) in [("once", Some("Never"), "Job"), ("always", None, "Workload")] {
+            let (code, said) = send_pod(&shared, Caller::Admin, a_pod(name, policy)).await;
+            assert_eq!(code, StatusCode::CREATED, "{name}: {said}");
+            for who in ["ann", "bob"] {
+                let (code, said) = delete_pod_named(&shared, Caller::Identity(who.into()), name).await;
+                assert_eq!(code, StatusCode::FORBIDDEN, "{who} {name}: {said}");
+                assert!(
+                    shared
+                        .store
+                        .lock()
+                        .unwrap()
+                        .store
+                        .get(&format!("{held}/default/{name}"))
+                        .is_some()
+                );
+            }
+            let (code, said) = delete_pod_named(&shared, Caller::Identity("cat".into()), name).await;
+            assert_eq!(code, StatusCode::OK, "{name}: {said}");
+            assert!(
+                shared
+                    .store
+                    .lock()
+                    .unwrap()
+                    .store
+                    .get(&format!("{held}/default/{name}"))
+                    .is_none()
+            );
+        }
         drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -564,6 +564,26 @@ fn readme_shows_the_install_pin_and_the_review_says_m2_is_fixed() {
     );
 }
 
+/// `kubectl run` and `helm test` make a bare Pod and `kubectl delete pod` deletes it: the guide
+/// says so, and no longer lists `kubectl run` among what is not answered.
+#[test]
+fn the_guide_says_a_bare_pod_is_run_and_deleted() {
+    for said in [
+        "`run NAME --image=IMAGE`",
+        "A bare pod is deleted, not restarted",
+        "`test` (a chart's test hook is a bare Pod",
+    ] {
+        assert!(
+            README.contains(said),
+            "docs/guide/kubernetes.md no longer says {said:?}"
+        );
+    }
+    assert!(
+        !README.contains("`kubectl run` (a pod alone)"),
+        "kubectl run is still among what is not answered"
+    );
+}
+
 /// The installer's page (docs/install.html) carries the three answer files kithd's own unit test parses
 /// (`the_install_page_examples`), and the front page and the guide lead to it.
 #[test]
