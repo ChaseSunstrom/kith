@@ -2,10 +2,11 @@
 //! can show: the 4 KiB plain header that says a disk is a kith data disk, the disk's own random
 //! key, and the refusal of a disk that is anyone else's.
 //!
-//! Nothing here maps, mounts or writes a disk on its own: `write_header` is the one write, and
-//! the order it comes in (last, after the mapping) is the add's, not this file's. Nothing here
-//! reads more than a disk's first 4 KiB.
-// (Nothing calls this yet: the add order and the verbs come in the slices after it.)
+//! Nothing here maps, mounts or writes a disk on its own: `write_header` is the one write, it
+//! needs the [`Clear`] that [`refuse`] gives for that disk, and the order it comes in (last,
+//! after the mapping) is the add's, not this file's. Nothing here reads more than a disk's
+//! first 4 KiB.
+// (Nothing calls this yet: T-0969, the add order, is the slice that calls it and removes this.)
 #![allow(dead_code)]
 
 use ring::digest;
@@ -31,14 +32,18 @@ fn text(id: &Id) -> String {
     format!("{body}sum: {}\n", crate::pki::hex(sum.as_ref()))
 }
 
-/// Write the header for `id` over the first 4 KiB of `file` (the rest of the room zero) and
-/// sync it.
-pub fn write_header(file: &File, id: &Id) -> io::Result<()> {
+/// The 4 KiB of the header of `id`: its text, the rest of the room zero.
+fn room_of(id: &Id) -> [u8; ROOM] {
     let mut room = [0u8; ROOM];
     let text = text(id);
     room[..text.len()].copy_from_slice(text.as_bytes());
-    file.write_all_at(&room, 0)?;
-    file.sync_all()
+    room
+}
+
+/// Write the header for `id` over the first 4 KiB of the disk `refuse` cleared, and sync it.
+/// A disk that was not cleared has no `Clear`, so it cannot be written to here.
+pub fn write_header(clear: &Clear<impl Dev>, id: &Id) -> io::Result<()> {
+    clear.0.write_first(&room_of(id))
 }
 
 /// The id of the header at the start of `file`, or why there is none. Strict: the header is
@@ -91,10 +96,31 @@ pub trait Dev {
     fn removable(&self) -> bool;
     /// Its first 4 KiB, no more; an error when it has fewer.
     fn first(&self) -> io::Result<[u8; ROOM]>;
+    /// Write `room` over its first 4 KiB and sync it. Only [`write_header`] calls it.
+    fn write_first(&self, room: &[u8; ROOM]) -> io::Result<()>;
 }
 
+/// The kernel name of the whole disk the system runs from (`sda`, `nvme0n1`, `vda`), never one
+/// of its partitions (`sda2`, `nvme0n1p2`) or a mapping (`dm-0`): `refuse` compares it with a
+/// disk's name, so a partition's name would match no disk and offer the root. The caller
+/// resolves a partition to its parent disk (as `init::booted` does) before it makes one; an
+/// empty name or one with a `/` is none, and `refuse` with no `Root` refuses every disk.
+#[derive(Debug, PartialEq)]
+pub struct Root(String);
+
+impl Root {
+    pub fn new(name: &str) -> Option<Root> {
+        (!name.is_empty() && !name.contains('/')).then(|| Root(name.to_string()))
+    }
+}
+
+/// A disk `refuse` looked at and found takeable: the one witness `write_header` takes.
+#[derive(Debug)]
+pub struct Clear<'a, D: Dev>(&'a D);
+
 /// Why a disk is not taken. `Root` and `Removable` are final; `Signature` and `NotEmpty` are
-/// the two a `--wipe` may pass, and `Unreadable` is a disk that cannot be looked at.
+/// the two a `--wipe` may pass ([`Refused::wipeable`]), and `Unreadable` is a disk that cannot
+/// be looked at.
 #[derive(Debug, PartialEq)]
 pub enum Refused {
     Root,
@@ -102,6 +128,13 @@ pub enum Refused {
     Signature(&'static str),
     NotEmpty,
     Unreadable(String),
+}
+
+impl Refused {
+    /// Whether a `--wipe` may go on past this: only what the disk holds, never which disk it is.
+    pub fn wipeable(&self) -> bool {
+        matches!(self, Refused::Signature(_) | Refused::NotEmpty)
+    }
 }
 
 impl std::fmt::Display for Refused {
@@ -127,12 +160,18 @@ const SIGNATURES: [(usize, &[u8], &str); 5] = [
     (1080, &[0x53, 0xef], "an ext4 file system"),
 ];
 
-/// Whether `disk` may be made a data disk. `root` is the name of the disk the system runs
-/// from, `None` when that cannot be told: then every disk is refused (it fails closed, as the
-/// state's own fence does, `init::on_ours`). A removable disk and the root disk first, since
-/// no `--wipe` passes them; then what its first 4 KiB say.
-pub fn refuse(disk: &impl Dev, root: Option<&str>) -> Result<(), Refused> {
-    if root.is_none_or(|root| root == disk.name()) {
+/// Whether `disk` may be made a data disk, and if so the [`Clear`] to write its header with.
+/// `root` is the disk the system runs from, `None` when that cannot be told: then every disk
+/// is refused (it fails closed, as the state's own fence does, `init::on_ours`), and so is one
+/// that names itself nothing. The root disk and a removable disk come first, since no
+/// `--wipe` passes them; then what its first 4 KiB say.
+///
+/// **What passes as empty:** only the first 4 KiB are read (the ADR's rule), so a signature
+/// further in passes: an md 1.2 or a bcachefs superblock (at 4 KiB), a btrfs one (at 64 KiB),
+/// ZFS labels, or a GPT whose only copy is the backup at the disk's end. The overwrite of the
+/// whole mapping at `add` (ADR section 1), not this check, is what destroys them.
+pub fn refuse<'a, D: Dev>(disk: &'a D, root: Option<&Root>) -> Result<Clear<'a, D>, Refused> {
+    if disk.name().is_empty() || root.is_none_or(|root| root.0 == disk.name()) {
         return Err(Refused::Root);
     }
     if disk.removable() {
@@ -145,7 +184,7 @@ pub fn refuse(disk: &impl Dev, root: Option<&str>) -> Result<(), Refused> {
     if room.iter().any(|&byte| byte != 0) {
         return Err(Refused::NotEmpty);
     }
-    Ok(())
+    Ok(Clear(disk))
 }
 
 /// A new aes-xts-plain64 key for a disk: 64 random bytes, the disk's own (docs/adr-second-disk.md,
@@ -175,6 +214,33 @@ mod support {
             let mut room = [0; ROOM];
             self.0.read_exact_at(&mut room, 0).map(|()| room)
         }
+        fn write_first(&self, room: &[u8; ROOM]) -> io::Result<()> {
+            self.0.write_all_at(room, 0)?;
+            self.0.sync_all()
+        }
+    }
+
+    /// The header of `id` put on `file` as it is, with no check: for the tests of the reading.
+    pub fn put(file: &File, id: &Id) {
+        file.write_all_at(&room_of(id), 0).unwrap();
+    }
+
+    /// `refuse`'s verdict without the witness, to compare.
+    pub fn check(disk: &Fake, root: Option<&Root>) -> Result<(), Refused> {
+        refuse(disk, root).map(|_| ())
+    }
+
+    pub fn root(name: &str) -> Root {
+        Root::new(name).unwrap()
+    }
+
+    /// A directory of its own in the temp dir, removed when it goes out of scope.
+    pub struct Dir(PathBuf);
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     pub fn fake(tag: &str, len: u64, writes: &[(u64, &[u8])]) -> Fake {
@@ -186,16 +252,17 @@ mod support {
     }
 
     /// A directory of its own in the temp dir, and a disk file of `len` bytes in it.
-    pub fn disk_file(tag: &str, len: u64) -> (PathBuf, File) {
+    pub fn disk_file(tag: &str, len: u64) -> (Dir, File) {
         let dir = std::env::temp_dir().join(format!("kith-data-disk-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let dir = Dir(dir);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(dir.join("disk"))
+            .open(dir.0.join("disk"))
             .unwrap();
         file.set_len(len).unwrap();
         (dir, file)
@@ -217,7 +284,7 @@ mod header {
     fn header_reads_back_its_id() {
         let (_dir, file) = disk_file("header-back", 1 << 20);
         assert!(read_header(&file).unwrap_err().contains("no kith-disk header"));
-        write_header(&file, &ID).unwrap();
+        put(&file, &ID);
         assert_eq!(read_header(&file), Ok(ID));
         let mut room = [0u8; ROOM];
         file.read_exact_at(&mut room, 0).unwrap();
@@ -229,7 +296,7 @@ mod header {
         // A random id differs from the next, and reads back too.
         let (a, b) = (new_id(), new_id());
         assert_ne!(a, b);
-        write_header(&file, &a).unwrap();
+        put(&file, &a);
         assert_eq!(read_header(&file), Ok(a));
         let (_dir, short) = disk_file("header-short", 100);
         assert!(read_header(&short).unwrap_err().contains("4 KiB"));
@@ -241,7 +308,7 @@ mod header {
     #[test]
     fn header_fails_on_a_flipped_byte() {
         let (_dir, file) = disk_file("header-flip", 1 << 20);
-        write_header(&file, &ID).unwrap();
+        put(&file, &ID);
         for at in 0..ROOM as u64 {
             let mut byte = [0u8];
             file.read_exact_at(&mut byte, at).unwrap();
@@ -277,15 +344,12 @@ mod refuse {
     /// whatever they hold.
     #[test]
     fn refuse_a_signature_the_root_and_a_removable_disk() {
-        let root = Some("sda");
-        assert_eq!(refuse(&fake("refuse-empty", 1 << 20, &[]), root), Ok(()));
-        assert_eq!(
-            refuse(
-                &fake("refuse-late", 1 << 20, &[(4096, b"LUKS\xba\xbe"), (1 << 19, b"x")]),
-                root
-            ),
-            Ok(())
-        );
+        let sda = root("sda");
+        let root = Some(&sda);
+        assert_eq!(check(&fake("refuse-empty", 1 << 20, &[]), root), Ok(()));
+        // What passes as empty: a signature past the first 4 KiB (md 1.2 at 4096, btrfs at 64 KiB).
+        let late: &[(u64, &[u8])] = &[(4096, b"LUKS\xba\xbe"), (65600, b"_BHRfS_M"), (1 << 19, b"x")];
+        assert_eq!(check(&fake("refuse-late", 1 << 20, late), root), Ok(()));
         type Writes<'a> = &'a [(u64, &'a [u8])];
         let cases: [(&str, Writes, Refused); 8] = [
             ("luks", &[(0, b"LUKS\xba\xbe")], Refused::Signature("a LUKS header")),
@@ -310,26 +374,53 @@ mod refuse {
             ("middle", &[(2000, b"data")], Refused::NotEmpty),
         ];
         for (tag, writes, want) in cases {
-            assert_eq!(refuse(&fake(tag, 1 << 20, writes), root), Err(want), "{tag}");
+            assert_eq!(check(&fake(tag, 1 << 20, writes), root), Err(want), "{tag}");
         }
-        // A disk with a header written by write_header is refused as a kith disk.
+        // A disk with a header written through its witness is refused as a kith disk.
         let made = fake("refuse-made", 1 << 20, &[]);
-        write_header(&made.0, &ID).unwrap();
-        assert_eq!(refuse(&made, root), Err(Refused::Signature("a kith-disk header")));
+        write_header(&refuse(&made, root).unwrap(), &ID).unwrap();
+        assert_eq!(read_header(&made.0), Ok(ID));
+        assert_eq!(check(&made, root), Err(Refused::Signature("a kith-disk header")));
 
         let empty = |name, removable| Fake(disk_file("refuse-name", 1 << 20).1, name, removable);
-        assert_eq!(refuse(&empty("sda", false), root), Err(Refused::Root));
-        assert_eq!(refuse(&empty("sdb", false), None), Err(Refused::Root));
-        assert_eq!(refuse(&empty("sdb", true), root), Err(Refused::Removable));
+        assert_eq!(check(&empty("sda", false), root), Err(Refused::Root));
+        assert_eq!(check(&empty("sdb", false), None), Err(Refused::Root));
+        assert_eq!(check(&empty("sdb", true), root), Err(Refused::Removable));
         // The root disk that is also removable, and holds a signature: Root first, never wiped.
         assert_eq!(
-            refuse(&Fake(made.0.try_clone().unwrap(), "sda", true), root),
+            check(&Fake(made.0.try_clone().unwrap(), "sda", true), root),
             Err(Refused::Root)
         );
         // A disk shorter than the room cannot be looked at, so it is not taken.
         let short = fake("refuse-short", 100, &[]);
-        assert!(matches!(refuse(&short, root), Err(Refused::Unreadable(_))));
+        assert!(matches!(check(&short, root), Err(Refused::Unreadable(_))));
         assert!(Refused::NotEmpty.to_string().contains("4 KiB"));
+    }
+
+    /// A root that is no disk name fails closed: `Some("")` makes no `Root`, so the check gets
+    /// none and refuses every disk (before, an empty string matched no disk and offered the
+    /// root); a disk that names itself nothing is refused too.
+    #[test]
+    fn refuse_fails_closed_on_an_empty_or_path_root() {
+        assert_eq!(Root::new(""), None);
+        assert_eq!(Root::new("/dev/sda"), None);
+        assert!(Root::new("sda").is_some());
+        let disk = fake("refuse-closed", 1 << 20, &[]);
+        assert_eq!(check(&disk, Root::new("").as_ref()), Err(Refused::Root));
+        assert_eq!(
+            check(&Fake(disk.0.try_clone().unwrap(), "", false), Some(&root("sda"))),
+            Err(Refused::Root)
+        );
+        assert_eq!(check(&disk, Some(&root("sda"))), Ok(()));
+    }
+
+    /// A `--wipe` may pass what a disk holds and nothing else: the root, a removable disk and
+    /// one that cannot be read are not wipeable.
+    #[test]
+    fn refuse_wipeable_is_only_what_the_disk_holds() {
+        assert!(Refused::Signature("a GPT").wipeable() && Refused::NotEmpty.wipeable());
+        assert!(!Refused::Root.wipeable() && !Refused::Removable.wipeable());
+        assert!(!Refused::Unreadable("x".into()).wipeable());
     }
 }
 
