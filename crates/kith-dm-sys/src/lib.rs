@@ -608,6 +608,10 @@ pub struct Forked {
 /// so the clone is safe. Whatever `f` makes with `clone` that outlives the child is the
 /// nearest child subreaper's afterwards.
 ///
+/// The child runs with no signal blocked, whatever the forking thread blocks, and with SIGPIPE
+/// as the default again, not the ignored one Rust's runtime sets: both outlive the `clone` and
+/// the exec of a container's process.
+///
 /// `fork` puts right only the allocator's locks. Any other lock of this process that a thread
 /// holds at the fork (tracing's registry, the environment's, stderr's, a `Mutex` of the
 /// program's own) is held for good in the child, which then waits for it: the caller keeps
@@ -634,6 +638,18 @@ pub fn fork_start(f: impl FnOnce() -> Vec<u8>) -> Result<Forked> {
         return Err(Error::last_os_error());
     }
     if child == 0 {
+        // A child starts with the mask of the thread that forked it, and a container's process
+        // (made from this child, and exec'd) keeps it: a pod with SIGTERM blocked never hears
+        // `kith stop`. kithd's threads hold the keeper's block (SIGINT, SIGTERM, SIGCHLD).
+        // Likewise Rust's runtime ignores SIGPIPE, and that stays ignored through clone and exec.
+        // SAFETY: sigemptyset fills a set this child owns; pthread_sigmask sets its one thread's
+        // mask; signal sets this one process's disposition (both are async-signal-safe).
+        unsafe {
+            let mut none = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut none);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
         let mut bytes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_default();
         bytes.truncate(FORKED_MOST);
         // (A short write is the parent's empty or cut answer.)
@@ -909,6 +925,65 @@ mod tests {
             .unwrap()
             .collect(Duration::from_secs(30));
         assert_eq!(got.unwrap(), b"said it");
+    }
+
+    /// Puts back the signal mask this thread had, when dropped.
+    struct Unblock(libc::sigset_t);
+
+    impl Drop for Unblock {
+        fn drop(&mut self) {
+            // SAFETY: sets the mask of this thread only.
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut()) };
+        }
+    }
+
+    /// Blocks SIGINT, SIGTERM and SIGCHLD on the calling thread, as the keeper's mask does
+    /// (bit N-1 of SigBlk is signal N); the mask comes back when the guard drops.
+    fn block_the_keepers_signals() -> Unblock {
+        // SAFETY: sigset_t is plain data; sigemptyset and sigaddset fill it, and
+        // pthread_sigmask changes only this thread's mask.
+        unsafe {
+            let (mut set, mut old) = (std::mem::zeroed::<libc::sigset_t>(), std::mem::zeroed());
+            libc::sigemptyset(&mut set);
+            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGCHLD] {
+                libc::sigaddset(&mut set, signal);
+            }
+            assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old), 0);
+            Unblock(old)
+        }
+    }
+
+    /// What a forked child's status says on `field` (`SigBlk`, `SigIgn`), with the mask blocked.
+    fn forked_status(field: &'static str) -> Vec<u8> {
+        let _children = children();
+        let _blocked = block_the_keepers_signals();
+        fork_start(move || {
+            let key = format!("{field}:\t").into_bytes();
+            std::fs::read("/proc/thread-self/status")
+                .unwrap_or_default()
+                .split(|&b| b == b'\n')
+                .find_map(|line| line.strip_prefix(key.as_slice()))
+                .unwrap_or(b"unread")
+                .to_vec()
+        })
+        .unwrap()
+        .collect(Duration::from_secs(30))
+        .unwrap()
+    }
+
+    /// A container's process inherits the mask of the thread that forks it, and kithd's tokio
+    /// threads keep the keeper's block: the child starts with nothing blocked.
+    #[test]
+    fn forked_child_has_no_signal_blocked() {
+        assert_eq!(forked_status("SigBlk"), b"0000000000000000");
+    }
+
+    /// Rust's runtime ignores SIGPIPE in this process, an ignored signal stays ignored across
+    /// clone and exec, and a pod's process would not hear it: bit 13 (0x1000) of SigIgn is clear.
+    #[test]
+    fn forked_child_does_not_ignore_sigpipe() {
+        let ignored = u64::from_str_radix(std::str::from_utf8(&forked_status("SigIgn")).unwrap(), 16).unwrap();
+        assert_eq!(ignored & (1 << (libc::SIGPIPE - 1)), 0, "SigIgn {ignored:#x}");
     }
 
     #[test]
