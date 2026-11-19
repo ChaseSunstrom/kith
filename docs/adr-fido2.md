@@ -90,10 +90,10 @@ and answers the client's CTAPHID frames. Candidates, checked:
 
 **The choice: write it in this tree**, as a module of kithd behind a cargo feature, `fido2-test`.
 It is the shape `forge` already has: a test-only build of kithd, made in a target directory of its own
-by `ci/musl.sh` with `KITHD_FEATURES=fido2-test` (`ci/musl.sh:28-39` handles
-`forge` so), whose shipped binary is checked to hold none of it (`ci/musl.sh:50-53`: the shipped
-kithd is grepped for the forge route; the same grep gets a string only the stand-in has). The
-feature is declared like `forge = []` (`crates/kithd/Cargo.toml:12`). Because the feature is off in
+by `ci/musl.sh` with `KITHD_FEATURES=fido2-test` (the `case` on `KITHD_FEATURES` in `ci/musl.sh`
+handles `forge` so), whose shipped binary is checked to hold none of it (the shipped
+kithd is grepped for the forge route; a second grep looks for the strings only the stand-in has).
+The feature is declared like `forge = []` (the `[features]` table of `crates/kithd/Cargo.toml`). Because the feature is off in
 release, **the stand-in adds nothing to kithd's size**, which section 5 needs.
 
 How it works: it opens `/dev/uhid`, sends `UHID_CREATE2` with a report descriptor of usage page
@@ -116,18 +116,19 @@ as the TPM, `docs/adr-unlock.md`'s Unverified items).
 four guards, and `fido2-test` gets each one; T-0955 extends each of them, and the slice is not
 done until all four are:
 
-1. **The build output.** `os/build.sh:98-103` refuses an `--out` that is not `target/os-forge`
-   for a forge build; the same rule is extended so a `fido2-test` build goes only to its own
-   folder (`target/os-fido2`) and a shipped image is never made from it.
-2. **The test runner.** `ci/vm/tests.sh:22` sets `KITHD_FEATURES=forge` and
+1. **The build output.** The feature rule in `os/build.sh` refuses an `--out` that is not
+   `target/os-forge` for a forge build; the same rule is extended so a `fido2-test` build goes
+   only to its own folder (`target/os-fido2`) and a shipped image is never made from it.
+2. **The test runner.** `ci/vm/tests.sh` sets `KITHD_FEATURES=forge` and
    `osdir=$root/target/os-forge` for the access test alone; the stand-in's test sets
    `KITHD_FEATURES=fido2-test` and `osdir=$root/target/os-fido2` the same way, and no other test
    gets either.
-3. **The musl build.** `ci/musl.sh`'s case table (`ci/musl.sh:28-39`) knows `forge` only, and
-   its release-path grep (`ci/musl.sh:50-53`) looks for the forge route in the shipped kithd;
-   both gain `fido2-test` and a string only the stand-in has.
-4. **A loud startup line.** `crates/kithd/src/main.rs:365` prints a line when the forge is on;
-   a `fido2-test` kithd prints one too, at the start, naming that it will answer as a key.
+3. **The musl build.** `ci/musl.sh`'s case on `KITHD_FEATURES` knew `forge` only, and
+   its release-path grep looks for the forge route in the shipped kithd;
+   both gain `fido2-test` and the strings only the stand-in has (its startup line, the start of
+   each line the VM run prints, the touch file).
+4. **A loud startup line.** `main` in `crates/kithd/src/main.rs` prints a line when the forge is
+   on; a `fido2-test` kithd prints one too, at the start, naming that it makes keys.
 
 `ci/budgets.py:439` already strips `KITHD_FEATURES` from its build, so the size measure never
 sees the stand-in.
@@ -266,7 +267,7 @@ Each is one task and stands alone: it merges and passes its gates without the ne
 |---|---|
 | T-0953 | **Kernel.** `CONFIG_HIDRAW=y`, `CONFIG_USB_HID=y` in `os/kernel.config`; `CONFIG_UHID` in the test-only `os/features/uhid-test.config`; the check on the **built `.config`** (section 3), with `# CONFIG_UHID is not set` asserted for a shipped build; the image size and the second kernel's build time measured. |
 | T-0954 (carved: T-0966 the wire half, T-0968 the rest) | **The client.** `crates/kithd/src/fido2.rs`: CTAPHID framing and the CBOR subset (T-0966), then ECDH (T-0968), `hmac-secret` with the hand-written CBC, behind a trait of the device so tests use a pipe; tested on NIST's CBC vectors, the x-coordinate derivation and bad frames (short, a wrong channel, an oversize length, a keep-alive storm). **No size measure and no budget raise here:** nothing calls the code yet, and the linker may drop it, so a number taken now is not the number the feature costs. |
-| T-0955 | **The stand-in, and the client against it.** The `fido2-test` feature with the uhid authenticator and the four release guards of section 2 (`os/build.sh:98-103`, `ci/vm/tests.sh:22`, `ci/musl.sh`'s case table and grep, a loud startup line). Its VM test is **the client against the stand-in through uhid and hidraw, and nothing more**: a `fido2-test` subcommand of the test build that runs `makeCredential` and `getAssertion` with a known salt on the stand-in and prints the `hmac-secret`, which the test compares with what the seed says it must be; a second stand-in with another seed gives another secret, and a touch withheld times out. It needs no record, no console prompt and no verb. |
+| T-0955 | **The stand-in, and the client against it.** The `fido2-test` feature with the uhid authenticator and the four release guards of section 2 (`os/build.sh`'s feature rule, `ci/vm/tests.sh`, `ci/musl.sh`'s case table and grep, a loud startup line). Its VM test (`ci/vm/fido2.sh`, T-0973) is **the client against the stand-in through uhid and hidraw, and nothing more**: a `fido2-test` word on the kernel's command line, read by the test build alone, that runs `makeCredential` and `getAssertion` with a known salt on the stand-in and prints the `hmac-secret`, which the test compares with what the seed says it must be; a second stand-in with another seed gives another secret, and a touch withheld times out. It needs no record, no console prompt and no verb. |
 | T-0956 | **The record, the verbs and the state opened by touch.** The `fido2:` lines (two), the console's "touch your key" beside its typed lines (judged after the passphrase, with the same two seconds before an answer, `crypt.rs:726-757`, so a wrong key is answered as every wrong line), `kith node key add` and `remove` with the order of writes above, the audit log; the VM test of enrolling two keys and **opening the state by touching one of two stand-ins** (the other opens it too, a key it was not enrolled with is refused) and of losing one. **kithd's size is measured here, before and after, with the feature called, and the budget raised with the number if it must be** (section 5). |
 
 The order is 1, 2, 3, 4; slices 1 and 2 are independent of each other. Only T-0956 needs the

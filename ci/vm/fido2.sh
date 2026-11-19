@@ -15,8 +15,7 @@
 # seed 3 has its touch withheld first (the client gives up, no credential is made) and then given
 # (its secret is what its seed says). A disk file only: the machine's disk is a copy of the image.
 # It never touches a real key or disk.
-    command -v python3 >/dev/null 2>&1 || skip "no python3 to compute the secrets with"
-    [ "$time" -gt 120 ] || time=120
+    [ "$time" -gt 180 ] || time=180
     cp "$osdir/kith-os.raw" "$work/disk.raw"
     more='fido2-test' once=1
     boot
@@ -31,6 +30,7 @@ open(sys.argv[2], "w").write(re.sub(r"\[ *[0-9]+\.[0-9]{6}\][^\n]*\n", "", text)
     said_clean() { grep -aq -- "$1" "$work/clean"; }
     said 'built with fido2-test: ' || fail "the fido2-test kithd did not say, at its start, that it is one"
     ! said_clean 'kithd: fido2-test: FAIL' || fail "the client or the stand-in failed in the VM"
+    ! said_clean 'kithd: init: started again' || fail "kithd was started again (it died and the keeper restarted it)"
     said_clean 'kithd: fido2-test: done' || fail "the fido2-test run did not reach its end"
     said_clean 'kithd: init: powering off' || fail "kithd did not power the machine off when it was done"
     ! said 'Kernel panic' || fail "the kernel panicked"
@@ -60,7 +60,11 @@ print(hmac.new(random, bytes(range(32)), hashlib.sha256).hexdigest())' "$1" "$2"
     log=$(cat "$work/clean")
     gave=$(printf '%s\n' "$log" | grep -an 'kithd: fido2-test: key 3: touch withheld: gave up' | head -n 1 | cut -d: -f1)
     made=$(printf '%s\n' "$log" | grep -an 'kithd: fido2-test: key 3: credential ' | head -n 1 | cut -d: -f1)
+    # The key must have been alive and waiting (UPNEEDED) before the client gave up: a dead key times out too.
+    told=$(printf '%s\n' "$log" | grep -an 'kithd: fido2-test: the key sends UPNEEDED' | head -n 1 | cut -d: -f1)
     [ -n "$gave" ] || fail "key 3: its touch was withheld and the client did not give up"
+    [ -n "$told" ] || fail "key 3: the key never sent UPNEEDED"
+    [ "$told" -lt "$gave" ] || fail "key 3: the client gave up with no UPNEEDED from the key before (a dead key, not a waiting one)"
     [ -n "$made" ] || fail "key 3: no credential was made once the touch was given"
     [ "$gave" -lt "$made" ] || fail "key 3: a credential was made before the touch (line $made, gave up at $gave)"
     echo "vm.sh: ok: the client, through uhid and hidraw, got the hmac-secret each seed says it must be (key 1 ${secret1%"${secret1#????????}"}..., key 2 ${secret2%"${secret2#????????}"}...), the two differ, and a withheld touch timed out where a given one was answered"

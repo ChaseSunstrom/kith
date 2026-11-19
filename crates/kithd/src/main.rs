@@ -374,13 +374,9 @@ fn main() -> ExitCode {
         &mut std::io::stderr(),
         b"kithd: built with forge: POST /v1/forge appends unchecked entries; never ship this\n",
     );
-    // The same for the software security key (the VM test, T-0955, looks for the line); started as
-    // `kithd fido2-authenticator` it then answers on /dev/uhid and never returns.
+    // The same for the software security key (the VM test, T-0973, looks for the line).
     #[cfg(feature = "fido2-test")]
-    {
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), fido2_test::STARTUP_LINE);
-        fido2_test::shim();
-    }
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), fido2_test::STARTUP_LINE);
     // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
     if std::process::id() == 1 {
         keeper::keep();

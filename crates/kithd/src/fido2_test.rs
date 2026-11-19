@@ -15,7 +15,7 @@
 
 /// The text only a build with this feature has, for the release guard of `ci/musl.sh` to look
 /// for in a shipped kithd (it greps the same words).
-pub const STARTUP_LINE: &[u8] = b"kithd: built with fido2-test: `kithd fido2-authenticator` answers as a security key on /dev/uhid; never ship this\n";
+pub const STARTUP_LINE: &[u8] = b"kithd: built with fido2-test: `fido2-test` among the kernel's words makes security keys on /dev/uhid; never ship this\n";
 
 /// The authenticator's side of CTAPHID, getInfo, clientPIN, makeCredential and getAssertion
 /// with `hmac-secret`, answering through the framing the client uses.
@@ -83,6 +83,8 @@ pub mod auth {
         incoming: Option<(u32, u8, usize, Vec<u8>)>,
         /// A request waiting for its touch: the channel and the request.
         pending: Option<(u32, Vec<u8>)>,
+        /// Said once, on the first keep-alive, that the key waits for a touch (the VM test reads it).
+        told: bool,
         out: VecDeque<Vec<u8>>,
     }
 
@@ -120,6 +122,7 @@ pub mod auth {
                 agreement: None,
                 incoming: None,
                 pending: None,
+                told: false,
                 out: VecDeque::new(),
             }
         }
@@ -317,6 +320,10 @@ pub mod auth {
         }
 
         fn keepalive(&mut self, cid: u32) {
+            // A key that waits says so once, so a test of a withheld touch can tell it from a dead one.
+            if !std::mem::replace(&mut self.told, true) {
+                eprintln!("kithd: fido2-test: the key sends UPNEEDED: it waits for a touch");
+            }
             self.send(cid, frame::KEEPALIVE, &[UPNEEDED]);
         }
 
@@ -1011,50 +1018,23 @@ fn vm_run() -> Result<(), String> {
         let mut dev = plug(seed, false)?;
         enrol(seed, &mut dev, long, false)?;
     }
-    // Seed 3, its touch withheld: both calls must end in "no answer" within the bound.
+    // Seed 3, its touch withheld: INIT must be answered (so the key is alive), and only
+    // makeCredential, which waits for the touch, ends in "no answer" within the bound.
     let mut dev = plug(3, true)?;
     let _ = std::fs::remove_file(TOUCH);
-    match enrol(3, &mut dev, Duration::from_secs(5), false) {
+    dev.arm(long);
+    let cid = crate::fido2::frame::init(&mut dev, *b"kith-vm\0")
+        .map_err(|e| format!("key 3: INIT: {e}"))?
+        .cid;
+    dev.arm(Duration::from_secs(5));
+    match crate::fido2::flow::make_credential(&mut dev, cid, RP, &[]) {
         Err(e) if e.contains("no answer") || e.contains("timed out") => {
             eprintln!("kithd: fido2-test: key 3: touch withheld: gave up: {e}");
         }
         Err(e) => return Err(format!("key 3 with no touch: another error: {e}")),
-        Ok(()) => return Err("key 3 answered with no touch".into()),
+        Ok(_) => return Err("key 3 answered with no touch".into()),
     }
     // ... and given (a new INIT drops the request that still waits).
     enrol(3, &mut dev, long, true)?;
     Ok(())
-}
-
-/// `kithd fido2-authenticator [--seed N] [--touch FILE]`: the stand-in as a process of its own,
-/// started by the VM test. Without `--touch` it answers at once; with it, an operation waits for
-/// the file to exist. Never returns when it is asked for.
-#[cfg(feature = "fido2-test")]
-pub fn shim() {
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("fido2-authenticator") {
-        return;
-    }
-    let mut key = auth::Key::new();
-    while let Some(a) = args.next() {
-        match (a.as_str(), args.next()) {
-            ("--seed", Some(n)) if n.parse::<u8>().is_ok() => key.seed = n.parse().unwrap_or(1),
-            ("--touch", Some(p)) => key.touch = Some(p.into()),
-            _ => {
-                eprintln!("usage: kithd fido2-authenticator [--seed 0-255] [--touch FILE]");
-                std::process::exit(2);
-            }
-        }
-    }
-    eprintln!(
-        "kithd: fido2-authenticator: a security key (seed {}, {}) on {}",
-        key.seed,
-        key.touch
-            .as_ref()
-            .map_or("touched at once".into(), |p| format!("touch file {}", p.display())),
-        uhid::PATH
-    );
-    let e = uhid::run(&mut key, "kith FIDO2 test key");
-    eprintln!("kithd: fido2-authenticator: ended: {e:?}");
-    std::process::exit(1);
 }

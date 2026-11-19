@@ -4,6 +4,8 @@
 # variables and functions; not a script to run alone.
     command -v socat >/dev/null 2>&1 || skip "no socat to press keys with"
     command -v openssl >/dev/null 2>&1 || skip "no openssl to call the node with"
+    # (fido2 computes the secrets it expects with python3: asked before the image is built, so it can't skip after.)
+    [ "$test" != fido2 ] || command -v python3 >/dev/null 2>&1 || skip "no python3 to compute the secrets with"
     firmware=''
     for f in /usr/share/edk2-ovmf/x64/OVMF.4m.fd /usr/share/edk2/x64/OVMF.4m.fd /usr/share/OVMF/OVMF.fd /usr/share/ovmf/OVMF.fd; do
         [ -r "$f" ] && { firmware=$f; break; }

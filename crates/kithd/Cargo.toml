@@ -11,8 +11,8 @@ license.workspace = true
 # asked for, so the access VM test can show every other node refuses it (forge.rs).
 forge = []
 # Test only, in no release (ci/musl.sh builds it into a folder of its own, os/build.sh lets only
-# that folder take it): `kithd fido2-authenticator` answers as a security key on /dev/uhid, so the
-# fido2 VM test can run the client against it (fido2_test.rs).
+# that folder take it): a kithd started with `fido2-test` among the kernel's words makes security
+# keys on /dev/uhid and runs the client against them, for the fido2 VM test (fido2_test.rs).
 fido2-test = []
 
 [dependencies]
