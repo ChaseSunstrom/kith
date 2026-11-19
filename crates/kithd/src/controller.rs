@@ -2887,6 +2887,17 @@ fn running_said(note: Option<&str>, replaced: Option<String>) -> Option<String> 
         .reduce(|said, more| format!("{said}; {more}"))
 }
 
+/// A refusal of a node's root container, said with the policy that allows it: the runtime says what
+/// the container would be; here whose word refused it.
+fn node_root_refusal(said: String) -> String {
+    match said.contains(kith_runtime::NODE_ROOT) {
+        true => format!(
+            "this node's policy refuses containers that are the node's root (rootContainers is off: `--node-policy root-containers` where the node's kithd is started allows them): {said}"
+        ),
+        false => said,
+    }
+}
+
 /// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
 async fn start(
     shared: &Shared,
@@ -3105,14 +3116,7 @@ async fn start(
                 .await
                 .map_err(|e| e.to_string())?;
             let created = runtime.create(id, &image, &unit, log("out")?, log("err")?);
-            // The runtime says what the container would be; here whose word refused it.
-            let whose = |e: kith_runtime::Error| match e.to_string().contains(kith_runtime::NODE_ROOT) {
-                true => format!(
-                    "this node's policy refuses containers that are the node's root (rootContainers is off: `--node-policy root-containers` where the node's kithd is started allows them): {e}"
-                ),
-                false => e.to_string(),
-            };
-            created.map_err(whose)
+            created.map_err(|e| node_root_refusal(e.to_string()))
         }
         Run::Exec(e) => {
             unit.command = e.command.clone();
@@ -3260,6 +3264,21 @@ mod tests {
         assert_eq!(running_said(Some(note), None), Some(note.to_string()));
         assert_eq!(running_said(None, Some(replaced.clone())), Some(replaced));
         assert_eq!(running_said(None, None), None);
+    }
+
+    /// A refusal the runtime made of a node's root container is said with the policy that allows
+    /// it, around the runtime's own text; any other refusal comes back as it was.
+    #[test]
+    fn node_root_refusal_names_the_policy() {
+        let root = format!("this container {}: its user is root's", kith_runtime::NODE_ROOT);
+        let said = node_root_refusal(root.clone());
+        assert!(said.contains("rootContainers is off"), "{said}");
+        assert!(said.contains("--node-policy root-containers"), "{said}");
+        assert!(said.ends_with(&root), "{said}");
+        assert_eq!(
+            node_root_refusal("an unrelated failure".to_string()),
+            "an unrelated failure"
+        );
     }
 
     /// A public key's text, as `signedBy` takes it: Ed25519, each `n` another.
