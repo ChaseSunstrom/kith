@@ -9,7 +9,7 @@
 //!
 //! The `unsafe` of the workspace is here: the ioctl, bpf and mount calls themselves (and
 //! taking the file descriptors they answer with), and the forks of a child that holds a
-//! user namespace while it is made and of one that makes a container (see [`forked`]). Each request is put together as bytes, so there is no
+//! user namespace while it is made and of one that makes a container (see [`fork_start`]). Each request is put together as bytes, so there is no
 //! struct whose layout has to match the kernel's.
 
 use std::fs::File;
@@ -587,13 +587,19 @@ pub fn user_namespace(from: u32, count: u32) -> Result<OwnedFd> {
     users
 }
 
-/// The most bytes [`forked`] brings back (a pipe holds 64 KiB, and the child has written
-/// before the parent reads).
+/// The most bytes [`fork_start`]'s child brings back (a pipe holds 64 KiB, so its blocking write
+/// of this much never waits for the parent, which reads after the child has ended).
 pub const FORKED_MOST: usize = 32 * 1024;
 
-/// Runs `f` in a child made by `fork(2)` and returns the first [`FORKED_MOST`] bytes it
-/// gives, once the child is gone and collected. Empty where the child ended without
-/// giving any (it panicked, or was killed).
+/// A child made by [`fork_start`], not yet collected.
+pub struct Forked {
+    pid: i32,
+    read: File,
+}
+
+/// Runs `f` in a child made by `fork(2)`; [`Forked::collect`] waits for it and brings back the
+/// first [`FORKED_MOST`] bytes it gave. Split in two so that a caller can say who the child is
+/// (to a reaper that would otherwise collect it) while it is made.
 ///
 /// For a call that clones a process itself with a raw `clone3`, as libcontainer does: from a
 /// process with other threads, the clone's child starts with whatever lock a thread held at
@@ -602,20 +608,27 @@ pub const FORKED_MOST: usize = 32 * 1024;
 /// so the clone is safe. Whatever `f` makes with `clone` that outlives the child is the
 /// nearest child subreaper's afterwards.
 ///
-/// The pipe is read after the child has ended, never to its end: a process `f` cloned holds
-/// the pipe's write end until it execs, which is not before it is told to.
-pub fn forked(f: impl FnOnce() -> Vec<u8>) -> Result<Vec<u8>> {
-    use std::io::{Read, Write};
+/// `fork` puts right only the allocator's locks. Any other lock of this process that a thread
+/// holds at the fork (tracing's registry, the environment's, stderr's, a `Mutex` of the
+/// program's own) is held for good in the child, which then waits for it: the caller keeps
+/// those off the child's path, or holds them across the call, and `collect` gives it a deadline.
+pub fn fork_start(f: impl FnOnce() -> Vec<u8>) -> Result<Forked> {
+    use std::io::Write;
     let mut ends = [0; 2];
     // SAFETY: pipe2 writes two descriptors into `ends`.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(Error::last_os_error());
     }
     // SAFETY: both are open, and this is their only owner.
-    let (mut read, mut write) = unsafe { (File::from_raw_fd(ends[0]), File::from_raw_fd(ends[1])) };
+    let (read, mut write) = unsafe { (File::from_raw_fd(ends[0]), File::from_raw_fd(ends[1])) };
+    // (Only the read end is nonblocking, for `collect`: a process `f` cloned holds the write
+    // end until it execs, so the pipe is never read to its end.)
+    // SAFETY: fcntl on a descriptor this process owns.
+    if unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
+        return Err(Error::last_os_error());
+    }
     // SAFETY: the child runs `f` and `_exit`s; it returns nowhere, and runs no destructor of
-    // what this process holds. (Another thread's lock that `fork` does not put right, such as
-    // a `Mutex` of the program's own, is not the child's to take: `f` must not.)
+    // what this process holds. (`f` takes no lock another thread may hold: see above.)
     let child = unsafe { libc::fork() };
     if child < 0 {
         return Err(Error::last_os_error());
@@ -623,27 +636,59 @@ pub fn forked(f: impl FnOnce() -> Vec<u8>) -> Result<Vec<u8>> {
     if child == 0 {
         let mut bytes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_default();
         bytes.truncate(FORKED_MOST);
-        // (A short write is the parent's empty or cut answer: the pipe has room for all.)
+        // (A short write is the parent's empty or cut answer.)
         let _ = write.write_all(&bytes);
         // SAFETY: ends this process at once, with no handler or destructor.
         unsafe { libc::_exit(0) }
     }
-    drop(write);
-    loop {
-        // SAFETY: waitpid on this process's own child, with no status wanted.
-        let said = unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
-        if said == child {
-            break;
-        }
-        let e = Error::last_os_error();
-        if said < 0 && e.kind() != std::io::ErrorKind::Interrupted {
-            return Err(e);
-        }
+    Ok(Forked { pid: child, read })
+}
+
+impl Forked {
+    /// The child's process number.
+    pub fn pid(&self) -> i32 {
+        self.pid
     }
-    let mut got = Vec::new();
-    // (Nonblocking: where nothing is left, or the child wrote none, it says so and stops.)
-    let _ = (&mut read).take(FORKED_MOST as u64).read_to_end(&mut got);
-    Ok(got)
+
+    /// Waits for the child, and returns what it gave: empty where it ended without giving any
+    /// (it panicked, or was killed). A child that has not ended within `deadline` is killed and
+    /// collected, and the error says it did not end.
+    pub fn collect(self, deadline: std::time::Duration) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let until = std::time::Instant::now() + deadline;
+        loop {
+            // SAFETY: waitpid on this process's own child, with no status wanted.
+            let said = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if said == self.pid {
+                break;
+            }
+            if said < 0 {
+                let e = Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            } else if std::time::Instant::now() >= until {
+                // SAFETY: kill and waitpid on this process's own child.
+                unsafe {
+                    libc::kill(self.pid, libc::SIGKILL);
+                    libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+                }
+                return Err(Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "the forked helper did not end within {} s and was killed",
+                        deadline.as_secs_f32()
+                    ),
+                ));
+            }
+            // ponytail: a poll every 10 ms; a create takes tens, so the cost is the wait's own.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut got = Vec::new();
+        // (Nonblocking: where nothing is left, or the child wrote none, it says so and stops.)
+        let _ = (&self.read).take(FORKED_MOST as u64).read_to_end(&mut got);
+        Ok(got)
+    }
 }
 
 /// What a mount made by [`mount_mapped`] is besides mapped: read-only, without setuid,
@@ -848,6 +893,47 @@ pub fn relro_ranges(headers: impl Iterator<Item = (u32, usize, usize)> + Clone, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn forked_brings_back_what_the_child_gave() {
+        let got = fork_start(|| b"said it".to_vec())
+            .unwrap()
+            .collect(Duration::from_secs(30));
+        assert_eq!(got.unwrap(), b"said it");
+    }
+
+    #[test]
+    fn forked_cuts_an_answer_over_the_most() {
+        let got = fork_start(|| vec![7; FORKED_MOST + 100])
+            .unwrap()
+            .collect(Duration::from_secs(30));
+        assert_eq!(got.unwrap(), vec![7; FORKED_MOST]);
+    }
+
+    #[test]
+    fn forked_gives_nothing_where_the_child_panicked() {
+        let got = fork_start(|| panic!("no answer"))
+            .unwrap()
+            .collect(Duration::from_secs(30));
+        assert!(got.unwrap().is_empty());
+    }
+
+    /// A child that does not end is killed and collected at the deadline, and says so.
+    #[test]
+    fn forked_kills_a_child_that_outlasts_the_deadline() {
+        let forked = fork_start(|| {
+            std::thread::sleep(Duration::from_secs(300));
+            Vec::new()
+        })
+        .unwrap();
+        let pid = forked.pid();
+        let said = forked.collect(Duration::from_millis(200)).unwrap_err();
+        assert!(said.to_string().contains("did not end"), "{said}");
+        // Collected: there is no child of that number left to wait for.
+        // SAFETY: waitpid on a number that is no child of this process, with no status wanted.
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+    }
 
     #[test]
     fn fb_var_screeninfo_is_160_bytes_with_the_channels_offsets_at_32_44_56() {

@@ -22,14 +22,20 @@
 //! kithd is exposed the same way: its serving part calls `root.create` from async tasks
 //! (`controller.rs`), which is `root_part.rs`'s `Runtime::create` in kithd's own process (the
 //! root part is not a second one), on a tokio worker among the others. So [`Runtime::create`]
-//! makes the container in a child of `fork` (`kith_dm_sys::forked`), which has one thread and
+//! makes the container in a child of `fork` (`kith_dm_sys::fork_start`), which has one thread and
 //! the allocator put right by `fork`, and reads the result from the state libcontainer saved.
 //! The container's init process is then a child of that child, and of this process (a child
-//! subreaper, see [`Runtime::new`]) once it has ended, so [`Handle::wait`] is as before.
-// ponytail: `fork` does not put right a lock of this program's own (a `Mutex` static, the
-// tracing callsite registry) that another thread holds at that instant; the child takes few
-// of those, and none of its own. A request-per-process re-exec would, at the price of sending
-// the image and unit across.
+//! subreaper, see [`Runtime::new`]) once it has ended, so [`Handle::wait`] is as before. The
+//! helper is registered as awaited ([`spawn_awaited`]) while it is forked, so that
+//! [`reap_orphans`] leaves it to the create.
+// ponytail: `fork` puts right the allocator's lock only. The child does take locks of tracing's
+// (a subscriber is made and set, and its first events register their call sites), of the
+// environment and of stderr, and another thread of this process may hold one at the fork. A
+// create makes its subscriber before the fork under `FORKING`, which keeps kith's own off the
+// registry's write lock then; any other holder leaves the child waiting, and the parent's
+// deadline (`HELPER_DEADLINE`) kills it and fails the create, which sweeps what it half made. A
+// request-per-process re-exec would have none of it, at the price of sending the image and unit
+// across.
 
 use crate::{Context, Image, ImageStore, Result, devfilter, err};
 use caps::CapSet;
@@ -826,18 +832,35 @@ impl Runtime {
                 .with_detach(true);
             // In a child of `fork`, with one thread: see the module doc's "Clone".
             let log = bundle.join("init.log");
-            let said = kith_dm_sys::forked(|| {
-                let built = logged_build(&log, refused, || builder.build());
-                // First byte: 0 made, 1 failed, 2 failed for the kernel's refusal of the overlay.
-                let mut said = vec![match (&built, refused.load(Ordering::Relaxed)) {
-                    (Ok(_), _) => 0,
-                    (Err(_), false) => 1,
-                    (Err(_), true) => 2,
-                }];
-                said.extend(built.err().map(|e| e.to_string()).unwrap_or_default().into_bytes());
-                said
-            })
-            .ctx(&what)?;
+            let said = {
+                // (The subscriber is made, and the helper forked, with no other create's
+                // subscriber half made: see [`FORKING`]. A reader's panic cannot spoil it.)
+                let forking = FORKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let dispatch = init_dispatch(&log)?;
+                // Registered as awaited while it is forked: `reap_orphans` would otherwise
+                // collect the helper first, and this would never learn how it ended.
+                let (forked, _awaited) = spawn_awaited(
+                    || {
+                        kith_dm_sys::fork_start(|| {
+                            let built = logged_build(dispatch, &log, refused, || builder.build());
+                            // First byte: 0 made, 1 failed, 2 failed for the kernel's refusal of the overlay.
+                            let mut said = vec![match (&built, refused.load(Ordering::Relaxed)) {
+                                (Ok(_), _) => 0,
+                                (Err(_), false) => 1,
+                                (Err(_), true) => 2,
+                            }];
+                            said.extend(built.err().map(|e| e.to_string()).unwrap_or_default().into_bytes());
+                            said
+                        })
+                    },
+                    |forked| u32::try_from(forked.pid()).ok(),
+                )
+                .ctx(&what)?;
+                drop(forking);
+                // A helper that hangs (a lock of this process held at the fork that it takes)
+                // is killed at the deadline; the error then sweeps what it half made.
+                forked.collect(HELPER_DEADLINE).ctx(&what)?
+            };
             match said.split_first() {
                 Some((0, _)) => {}
                 Some((refusal, text)) => {
@@ -1719,14 +1742,15 @@ const LOG_KEPT: usize = 64 << 10;
 /// for a failure says what they were beside it. libcontainer's parent sees only the top error's
 /// text ("failed to prepare rootfs"); the cause is logged by the child, which inherits this
 /// subscriber through its fork. `refused` is set when the whole log says the kernel refused the
-/// overlay root ([`refuses_overlay`]).
+/// overlay root ([`refuses_overlay`]). `dispatch` is [`init_dispatch`] of the same `log`, made
+/// beforehand: making one takes tracing's registry lock, which `create_once` must not have
+/// another thread hold when it forks.
 fn logged_build<T, E: std::fmt::Display>(
+    dispatch: tracing::Dispatch,
     log: &Path,
     refused: &AtomicBool,
     build: impl FnOnce() -> std::result::Result<T, E>,
 ) -> Result<T> {
-    let file = File::create(log).ctx("its init log")?;
-    let dispatch = tracing::Dispatch::new(InitLog(Mutex::new(file)));
     // (No lock on the working directory: `create_once` runs this in a child of its own.)
     let built = tracing::dispatcher::with_default(&dispatch, build);
     drop(dispatch);
@@ -1745,6 +1769,24 @@ fn logged_build<T, E: std::fmt::Display>(
         }
     }
 }
+
+/// The subscriber [`logged_build`] runs under, writing to a new file at `log`.
+fn init_dispatch(log: &Path) -> Result<tracing::Dispatch> {
+    let file = File::create(log).ctx("its init log")?;
+    Ok(tracing::Dispatch::new(InitLog(Mutex::new(file))))
+}
+
+/// Held by a create from making its subscriber (which takes tracing's registry lock for
+/// writing) until its helper is forked, so no other create's making of one is half done at a
+/// fork: the helper would inherit that lock held, and wait for it forever.
+// ponytail: this keeps kith's own subscribers apart; another crate's, or a first event of a
+// call site on another thread, may still hold a lock of tracing's at a fork. The helper's
+// deadline ends that wait.
+static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How long a create waits for its helper (the process that makes the container) before it
+/// kills it. A create takes milliseconds to seconds; this only bounds a helper that hangs.
+const HELPER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Writes the error-level events it is given, one line each, until the file holds [`LOG_KEPT`].
 struct InitLog(Mutex<File>);
@@ -3209,7 +3251,7 @@ mod tests {
     fn create_error_sees_an_overlay_refusal_past_a_long_first_event() {
         let log = std::env::temp_dir().join(format!("kith-init-log-long-{}", std::process::id()));
         let refused = AtomicBool::new(false);
-        let built = logged_build(&log, &refused, || {
+        let built = logged_build(init_dispatch(&log).unwrap(), &log, &refused, || {
             tracing::error!("{}", "a long first event ".repeat(200));
             tracing::error!("failed to mount {}: Nix(EPERM)", r#"Mount { typ: Some("overlay") }"#);
             Err::<(), _>("failed to prepare rootfs")
