@@ -949,6 +949,7 @@ spec: { volume: there, every: 1d }
             key: "Workload/default/web".into(),
             to: 1,
             at: 0,
+            base: None,
         };
         assert!(try_as(&store, "w", rollback).is_err());
         assert!(

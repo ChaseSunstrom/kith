@@ -85,6 +85,7 @@ fn commands_replay_to_the_same_store() {
             key: "ConfigMap/default/a".into(),
             to: 1,
             at: 300,
+            base: None,
         },
         Command::Status {
             statuses: vec![
@@ -147,6 +148,60 @@ fn commands_replay_to_the_same_store() {
         },
     );
     assert!(imported.is_ok() && store == Store::default());
+}
+
+/// A rollback that names the revision of the head it was decided on goes back only if the head
+/// is still at it: a write that landed since is not written over, and nothing is changed.
+#[test]
+fn rollback_with_a_base() {
+    let mut store = Store::default();
+    let apply = |value: &str, at| Command::Apply {
+        resources: vec![config("a", value)],
+        at,
+    };
+    let key = "ConfigMap/default/a";
+    let back = |to, base| Command::Rollback {
+        key: key.into(),
+        to,
+        at: 300,
+        base,
+    };
+    run(&mut store, apply("1", 100)).unwrap();
+    run(&mut store, apply("2", 200)).unwrap();
+    // The head is at 2; a writer landed 3 after an undo read it at 2.
+    run(&mut store, apply("3", 250)).unwrap();
+    let before = store.clone();
+    let refused = run(&mut store, back(1, Some(2)));
+    assert!(matches!(refused, Err(Error::Conflict(_))), "{refused:?}");
+    assert_eq!(store, before, "a refused rollback changes nothing");
+    // The head as it was read goes back, as one with no base always did.
+    let Ok(Done::Changes(changes)) = run(&mut store, back(1, Some(3))) else {
+        panic!("a rollback of an unmoved head")
+    };
+    assert_eq!(changes[0].after.metadata.revision, Some(4));
+    assert_eq!(
+        store.get(key).unwrap().spec,
+        store.history(key).unwrap()[0].resource.spec
+    );
+    run(&mut store, back(2, None)).unwrap();
+    assert_eq!(store.get(key).unwrap().metadata.revision, Some(5));
+}
+
+/// A Rollback entry in the log from before it had a base still reads, runs as it did, and is
+/// written the way it was (so a build from before reads what this one writes of it).
+#[test]
+fn rollback_entry_without_a_base() {
+    let old = r#"{"Rollback":{"key":"ConfigMap/default/a","to":1,"at":300}}"#;
+    let command: Command = serde_json::from_str(old).unwrap();
+    assert!(matches!(command, Command::Rollback { base: None, .. }), "{command:?}");
+    assert_eq!(serde_json::to_string(&command).unwrap(), old);
+    let mut store = Store::default();
+    for (value, at) in [("1", 100), ("2", 200)] {
+        let resources = vec![config("a", value)];
+        run(&mut store, Command::Apply { resources, at }).unwrap();
+    }
+    assert!(matches!(run(&mut store, command), Ok(Done::Changes(_))));
+    assert_eq!(store.get("ConfigMap/default/a").unwrap().metadata.revision, Some(3));
 }
 
 #[test]
@@ -248,6 +303,7 @@ fn fixture_entries() -> Vec<openraft::Entry<TypeConfig>> {
             key: a(),
             to: 1,
             at: 300,
+            base: None,
         }),
         EntryPayload::Normal(Command::Patch {
             statuses: vec![(a(), serde_json::Map::from_iter([("x".to_string(), true.into())]))],

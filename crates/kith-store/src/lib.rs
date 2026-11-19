@@ -131,10 +131,15 @@ pub enum Command {
     Delete {
         key: String,
     },
+    /// Go back to revision `to`. With a `base`, only if the head is still at that revision (the
+    /// one the asker read): a write that landed since is refused as a conflict, not written over.
+    /// Left out of an entry when there is none, so an entry reads the same to a build before it.
     Rollback {
         key: String,
         to: u64,
         at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<u64>,
     },
     /// What controllers report. A key that is gone is skipped.
     Status {
@@ -209,7 +214,14 @@ pub fn run(store: &mut Store, command: Command) -> Reply {
             changes.map(Done::Changes)
         }
         Command::Delete { key } => store.delete(&key).map(|gone| Done::Deleted(Box::new(gone))),
-        Command::Rollback { key, to, at } => {
+        Command::Rollback { key, to, at, base } => {
+            // (The same comparison an Apply's revision gets: a resource with none is at 0.)
+            let head = store.get(&key).and_then(|head| head.metadata.revision).unwrap_or(0);
+            if let Some(base) = base.filter(|base| *base != head) {
+                return Err(Error::Conflict(format!(
+                    "{key} is at revision {head}, but this rollback was decided on revision {base}; read it again"
+                )));
+            }
             store.at(Some(at));
             let change = store.rollback(&key, to);
             store.at(None);

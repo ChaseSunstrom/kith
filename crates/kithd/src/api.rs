@@ -719,17 +719,19 @@ async fn rollback(
     Path(key): Path<String>,
     Query(options): Query<RollbackOptions>,
 ) -> Reply<Change> {
-    rolled_back(&shared, &caller, key, options.to).await.map(Json)
+    rolled_back(&shared, &caller, key, options.to, None).await.map(Json)
 }
 
 /// Going back to revision `to` of `key`, with every check the route makes: what applying that
 /// revision takes, a NodeKey not rolled back, who acts for a writer, a Node's control staying.
-/// (The Kubernetes API's `kubectl rollout undo` goes through here as well.)
+/// (The Kubernetes API's `kubectl rollout undo` goes through here as well, with the `base` it
+/// read the head at: the store refuses with a conflict if the head moved before the entry ran.)
 pub(crate) async fn rolled_back(
     shared: &Arc<Shared>,
     caller: &Caller,
     key: String,
     to: u64,
+    base: Option<u64>,
 ) -> Result<Change, ApiError> {
     allowed(shared, caller, |store| back_takes(store, &key, to))?;
     let at = kith_api::store::now();
@@ -769,7 +771,15 @@ pub(crate) async fn rolled_back(
         })?;
     }
     let what = vec![format!("{key} to revision {to}")];
-    match change(shared, caller, "rollback", what, Command::Rollback { key, to, at }).await? {
+    match change(
+        shared,
+        caller,
+        "rollback",
+        what,
+        Command::Rollback { key, to, at, base },
+    )
+    .await?
+    {
         Done::Changes(mut changes) if changes.len() == 1 => Ok(changes.remove(0)),
         _ => Err(odd()),
     }
@@ -1185,6 +1195,7 @@ spec: {size: 1Gi}
             key: key.into(),
             to,
             at: 0,
+            base: None,
         };
         let said = refused(&state.store, &carol, &command(provisioned)).unwrap();
         assert!(said.contains("may not apply Volume in namespace default"), "{said}");
