@@ -965,13 +965,16 @@ pub mod cbc {
     /// of blocks, and not nothing: this is not a padding scheme, and a refused length is
     /// the caller's mistake, not something to round.
     pub fn run(key: &[u8; 32], iv: &[u8; BLOCK], data: &[u8], encrypting: bool) -> Result<Vec<u8>, String> {
-        if data.is_empty() || data.len() % BLOCK != 0 {
-            return Err(format!("{} bytes of CBC data: whole blocks of {BLOCK} expected", data.len()));
+        if data.is_empty() || !data.len().is_multiple_of(BLOCK) {
+            return Err(format!(
+                "{} bytes of CBC data: whole blocks of {BLOCK} expected",
+                data.len()
+            ));
         }
         let aes = aes::Aes256::new(key.into());
         let mut chain = *iv;
         let mut out = Vec::with_capacity(data.len());
-        for block in data.chunks_exact(BLOCK) {
+        for block in data.as_chunks::<BLOCK>().0 {
             let mut b = aes::Block::default();
             if encrypting {
                 for (i, byte) in b.iter_mut().enumerate() {
@@ -1034,11 +1037,36 @@ pub mod cbc {
         fn aesavs_cbc_gfsbox_256_zero_key_and_iv_both_ways() {
             let zero = "0".repeat(64);
             let iv = "0".repeat(32);
-            both(&zero, &iv, "014730f80ac625fe84f026c60bfd547d", "5c9d844ed46f9885085e5d6a4f94c7d7");
-            both(&zero, &iv, "0b24af36193ce4665f2825d7b4749c98", "a9ff75bd7cf6613d3731c77c3b6d0c04");
-            both(&zero, &iv, "761c1fe41a18acf20d241650611d90f1", "623a52fcea5d443e48d9181ab32c7421");
-            both(&zero, &iv, "8a560769d605868ad80d819bdba03771", "38f2c7ae10612415d27ca190d27da8b4");
-            both(&zero, &iv, "91fbef2d15a97816060bee1feaa49afe", "1bc704f1bce135ceb810341b216d7abe");
+            both(
+                &zero,
+                &iv,
+                "014730f80ac625fe84f026c60bfd547d",
+                "5c9d844ed46f9885085e5d6a4f94c7d7",
+            );
+            both(
+                &zero,
+                &iv,
+                "0b24af36193ce4665f2825d7b4749c98",
+                "a9ff75bd7cf6613d3731c77c3b6d0c04",
+            );
+            both(
+                &zero,
+                &iv,
+                "761c1fe41a18acf20d241650611d90f1",
+                "623a52fcea5d443e48d9181ab32c7421",
+            );
+            both(
+                &zero,
+                &iv,
+                "8a560769d605868ad80d819bdba03771",
+                "38f2c7ae10612415d27ca190d27da8b4",
+            );
+            both(
+                &zero,
+                &iv,
+                "91fbef2d15a97816060bee1feaa49afe",
+                "1bc704f1bce135ceb810341b216d7abe",
+            );
         }
 
         #[test]
@@ -1139,7 +1167,9 @@ pub mod hmac {
             let rng = rand::SystemRandom::new();
             let mine = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng)
                 .map_err(|_| "no random bytes for the key agreement")?;
-            let public = mine.compute_public_key().map_err(|_| "no public key for the key agreement")?;
+            let public = mine
+                .compute_public_key()
+                .map_err(|_| "no public key for the key agreement")?;
             let public = public.as_ref();
             if public.len() != 65 {
                 return Err("an agreement key of an unexpected size".into());
@@ -1196,13 +1226,13 @@ pub mod hmac {
         const GY: &str = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
 
         /// What a key does with our public key: its own agreement key, then the secret.
-        fn key_side(ours: &Value) -> (Value, impl FnOnce() -> Zeroizing<[u8; 32]>) {
+        fn key_side() -> (Value, impl FnOnce(&Value) -> Zeroizing<[u8; 32]>) {
             let rng = rand::SystemRandom::new();
             let k = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng).unwrap();
             let p = k.compute_public_key().unwrap();
             let theirs = cose(&p.as_ref()[1..33], &p.as_ref()[33..]);
-            let ours = point(ours).unwrap();
-            (theirs, move || {
+            (theirs, move |ours: &Value| {
+                let ours = point(ours).unwrap();
                 agreement::agree_ephemeral(
                     k,
                     &agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, &ours[..]),
@@ -1243,9 +1273,9 @@ pub mod hmac {
             let p = point(&s.key).unwrap();
             assert_eq!(p[0], 4);
             // a key with an agreement key of its own: both ends derive one secret
-            let (theirs, key_secret) = key_side(&s.key);
+            let (theirs, key_secret) = key_side();
             let s = Session::agree(&theirs).unwrap();
-            assert_eq!(s.secret[..], key_secret()[..]);
+            assert_eq!(s.secret[..], key_secret(&s.key)[..]);
         }
 
         #[test]
@@ -1260,7 +1290,10 @@ pub mod hmac {
             assert_eq!(enc.len(), 32);
             assert_ne!(enc[..], salt[..], "the salt does not travel plain");
             assert_eq!(cbc::run(&s.secret, &[0; 16], enc, false).unwrap(), salt);
-            assert_eq!(req.get(&uint(3)), Some(&Value::Bytes(mac16(&s.secret[..], enc).to_vec())));
+            assert_eq!(
+                req.get(&uint(3)),
+                Some(&Value::Bytes(mac16(&s.secret[..], enc).to_vec()))
+            );
             assert_eq!(req.get(&uint(1)), Some(&s.key));
             // the answer is the secret, encrypted the same way, and comes back as it was
             let secret = [0x77u8; 32];
@@ -1401,7 +1434,10 @@ pub mod flow {
     fn credential_id(answer: &Value, rp_id: &str) -> Result<Vec<u8>, String> {
         let rest = auth_data(answer, rp_id, UP | AT | ED)?;
         let short = || "the attested credential data is cut short".to_string();
-        let (id_len, rest) = rest.get(16..).and_then(|r| r.split_first_chunk::<2>()).ok_or_else(short)?;
+        let (id_len, rest) = rest
+            .get(16..)
+            .and_then(|r| r.split_first_chunk::<2>())
+            .ok_or_else(short)?;
         let id_len = usize::from(u16::from_be_bytes(*id_len));
         if id_len == 0 || id_len > MAX_CREDENTIAL_ID {
             return Err(format!("a credential id of {id_len} bytes"));
@@ -1418,7 +1454,12 @@ pub mod flow {
     /// Enrol: a credential for `rp_id` with `hmac-secret`, one touch, and its id. A key
     /// that has one of `exclude` answers CREDENTIAL_EXCLUDED, and one with a PIN set
     /// answers PIN_REQUIRED.
-    pub fn make_credential(dev: &mut dyn Device, cid: u32, rp_id: &str, exclude: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    pub fn make_credential(
+        dev: &mut dyn Device,
+        cid: u32,
+        rp_id: &str,
+        exclude: &[Vec<u8>],
+    ) -> Result<Vec<u8>, String> {
         check_key(dev, cid)?;
         let mut request = vec![
             (uint(1), Value::Bytes(random_32()?.to_vec())),
@@ -1437,7 +1478,10 @@ pub mod flow {
                     (Value::text("type"), Value::text("public-key")),
                 ])]),
             ),
-            (uint(6), Value::Map(vec![(Value::text("hmac-secret"), Value::Bool(true))])),
+            (
+                uint(6),
+                Value::Map(vec![(Value::text("hmac-secret"), Value::Bool(true))]),
+            ),
             (uint(7), Value::Map(vec![(Value::text("rk"), Value::Bool(false))])),
         ];
         if !exclude.is_empty() {
@@ -1505,7 +1549,10 @@ pub mod flow {
             assert_eq!(other[..], key.expected(&id, &[0x43; 32])[..]);
             // the salt never crossed in the clear
             for (_, req) in &key.seen {
-                assert!(!format!("{req:?}").contains("66, 66, 66, 66"), "salt bytes in a request");
+                assert!(
+                    !format!("{req:?}").contains("66, 66, 66, 66"),
+                    "salt bytes in a request"
+                );
             }
         }
 
@@ -1515,7 +1562,7 @@ pub mod flow {
             b.seed = 2;
             let (ca, cb) = (open(&mut a), open(&mut b));
             let ida = make_credential(&mut a, ca, RP, &[]).unwrap();
-            let idb = make_credential(&mut b, cb, RP, &[ida.clone()]).unwrap();
+            let idb = make_credential(&mut b, cb, RP, std::slice::from_ref(&ida)).unwrap();
             let salt = [9u8; 32];
             let sa = get_assertion(&mut a, ca, RP, &ida, &salt).unwrap();
             let sb = get_assertion(&mut b, cb, RP, &idb, &salt).unwrap();
@@ -1549,7 +1596,11 @@ pub mod flow {
             let mut key = Key::new();
             key.extensions = vec!["credProtect"];
             let cid = open(&mut key);
-            assert!(make_credential(&mut key, cid, RP, &[]).unwrap_err().contains("hmac-secret"));
+            assert!(
+                make_credential(&mut key, cid, RP, &[])
+                    .unwrap_err()
+                    .contains("hmac-secret")
+            );
             let mut key = Key::new();
             key.protocols = vec![2];
             let cid = open(&mut key);
@@ -1560,7 +1611,10 @@ pub mod flow {
             );
             assert!(get_assertion(&mut key, cid, RP, &[1; 40], &[0; 32]).is_err());
             assert!(key.creds.is_empty());
-            assert!(key.seen.iter().all(|(cmd, _)| *cmd == GET_INFO), "only getInfo was asked");
+            assert!(
+                key.seen.iter().all(|(cmd, _)| *cmd == GET_INFO),
+                "only getInfo was asked"
+            );
         }
 
         #[test]
@@ -1568,7 +1622,11 @@ pub mod flow {
             let mut key = Key::new();
             key.grant_hmac = false;
             let cid = open(&mut key);
-            assert!(make_credential(&mut key, cid, RP, &[]).unwrap_err().contains("without hmac-secret"));
+            assert!(
+                make_credential(&mut key, cid, RP, &[])
+                    .unwrap_err()
+                    .contains("without hmac-secret")
+            );
         }
 
         #[test]
@@ -1594,7 +1652,10 @@ pub mod flow {
             let mut t = vec![0u8; 16];
             t.extend_from_slice(&[0, 3, 7, 8, 9]);
             t.push(0x01); // the public key: 1
-            t.extend_from_slice(&cbor::encode(&Value::Map(vec![(Value::text("hmac-secret"), Value::Bool(true))])));
+            t.extend_from_slice(&cbor::encode(&Value::Map(vec![(
+                Value::text("hmac-secret"),
+                Value::Bool(true),
+            )])));
             t
         }
 
@@ -1603,23 +1664,42 @@ pub mod flow {
             let tail = good_tail();
             assert_eq!(credential_id(&attested(RP, 0xc1, &tail), RP).unwrap(), [7, 8, 9]);
             for cut in 0..tail.len() {
-                assert!(credential_id(&attested(RP, 0xc1, &tail[..cut]), RP).is_err(), "cut {cut}");
+                assert!(
+                    credential_id(&attested(RP, 0xc1, &tail[..cut]), RP).is_err(),
+                    "cut {cut}"
+                );
             }
             let mut more = tail.clone();
             more.push(0);
             assert!(credential_id(&attested(RP, 0xc1, &more), RP).is_err(), "trailing bytes");
-            assert!(credential_id(&attested("elsewhere", 0xc1, &tail), RP).unwrap_err().contains("another relying party"));
+            assert!(
+                credential_id(&attested("elsewhere", 0xc1, &tail), RP)
+                    .unwrap_err()
+                    .contains("another relying party")
+            );
             for flags in [0x00, 0x41, 0x81, 0xc0, 0xc0 | 0x04] {
                 if flags & 0xc1 != 0xc1 {
-                    assert!(credential_id(&attested(RP, flags, &tail), RP).unwrap_err().contains("lack"));
+                    assert!(
+                        credential_id(&attested(RP, flags, &tail), RP)
+                            .unwrap_err()
+                            .contains("lack")
+                    );
                 }
             }
             let mut zero_id = tail.clone();
             zero_id[17] = 0;
-            assert!(credential_id(&attested(RP, 0xc1, &zero_id), RP).unwrap_err().contains("credential id"));
+            assert!(
+                credential_id(&attested(RP, 0xc1, &zero_id), RP)
+                    .unwrap_err()
+                    .contains("credential id")
+            );
             let mut huge = tail;
             huge[16..18].copy_from_slice(&1024u16.to_be_bytes());
-            assert!(credential_id(&attested(RP, 0xc1, &huge), RP).unwrap_err().contains("1024"));
+            assert!(
+                credential_id(&attested(RP, 0xc1, &huge), RP)
+                    .unwrap_err()
+                    .contains("1024")
+            );
             assert!(credential_id(&Value::Map(vec![]), RP).is_err());
             assert!(credential_id(&attested(RP, 0xc1, &[]), RP).is_err());
         }
@@ -1693,7 +1773,10 @@ mod script {
 
         /// What the key's hmac-secret is for `salt` under credential `id`.
         pub fn expected(&self, id: &[u8], salt: &[u8]) -> [u8; 32] {
-            let tag = ring_hmac::sign(&ring_hmac::Key::new(ring_hmac::HMAC_SHA256, self.cred_random(id).as_ref()), salt);
+            let tag = ring_hmac::sign(
+                &ring_hmac::Key::new(ring_hmac::HMAC_SHA256, self.cred_random(id).as_ref()),
+                salt,
+            );
             tag.as_ref().try_into().unwrap()
         }
 
@@ -1733,7 +1816,8 @@ mod script {
                     if p.get(&u(1)) != Some(&u(1)) || p.get(&u(2)) != Some(&u(2)) {
                         return Err(0x02);
                     }
-                    let k = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rand::SystemRandom::new()).unwrap();
+                    let k = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rand::SystemRandom::new())
+                        .unwrap();
                     let public = k.compute_public_key().unwrap();
                     let public = public.as_ref();
                     self.agreement = Some(k);
@@ -1753,7 +1837,10 @@ mod script {
                     tail.extend_from_slice(&(id.len() as u16).to_be_bytes());
                     tail.extend_from_slice(&id);
                     tail.extend_from_slice(&cbor::encode(&hmac::cose(&[1; 32], &[2; 32])));
-                    tail.extend_from_slice(&cbor::encode(&Value::Map(vec![(t("hmac-secret"), Value::Bool(self.grant_hmac))])));
+                    tail.extend_from_slice(&cbor::encode(&Value::Map(vec![(
+                        t("hmac-secret"),
+                        Value::Bool(self.grant_hmac),
+                    )])));
                     Ok(Value::Map(vec![
                         (u(1), t("none")),
                         (u(2), Value::Bytes(Self::auth_data(rp, 0xc1, &tail))),
@@ -1764,7 +1851,10 @@ mod script {
                     let Value::Text(rp) = p.get(&u(1)).ok_or(0x14u8)? else {
                         return Err(0x14);
                     };
-                    let id = Self::ids(p.get(&u(3))).into_iter().find(|id| self.creds.contains(id)).ok_or(0x2eu8)?;
+                    let id = Self::ids(p.get(&u(3)))
+                        .into_iter()
+                        .find(|id| self.creds.contains(id))
+                        .ok_or(0x2eu8)?;
                     let ext = p.get(&u(4)).and_then(|e| e.get(&t("hmac-secret"))).ok_or(0x14u8)?;
                     let (Some(cose), Some(Value::Bytes(enc)), Some(Value::Bytes(auth))) =
                         (ext.get(&u(1)), ext.get(&u(2)), ext.get(&u(3)))
@@ -1786,7 +1876,10 @@ mod script {
                     let sealed = cbc::run(&secret, &[0; 16], &self.expected(&id, &salt), true).unwrap();
                     let ext = cbor::encode(&Value::Map(vec![(t("hmac-secret"), Value::Bytes(sealed))]));
                     Ok(Value::Map(vec![
-                        (u(1), Value::Map(vec![(t("id"), Value::Bytes(id)), (t("type"), t("public-key"))])),
+                        (
+                            u(1),
+                            Value::Map(vec![(t("id"), Value::Bytes(id)), (t("type"), t("public-key"))]),
+                        ),
                         (u(2), Value::Bytes(Self::auth_data(rp, 0x81, &ext))),
                         (u(3), Value::Bytes(vec![0x30; 70])),
                     ]))
@@ -1804,7 +1897,11 @@ mod script {
                     (frame::INIT, a)
                 }
                 frame::CBOR => {
-                    let p = if data.len() > 1 { cbor::decode(&data[1..]).unwrap() } else { Value::Map(vec![]) };
+                    let p = if data.len() > 1 {
+                        cbor::decode(&data[1..]).unwrap()
+                    } else {
+                        Value::Map(vec![])
+                    };
                     self.seen.push((data[0], p.clone()));
                     match self.ctap(data[0], &p) {
                         Ok(v) => (frame::CBOR, [&[0][..], &cbor::encode(&v)].concat()),
