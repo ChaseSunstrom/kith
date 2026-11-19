@@ -382,6 +382,21 @@ impl Resource {
             .map_or(Ok(()), |ns| one_label("namespace", ns))
     }
 
+    /// `submitted`, and a NetworkPolicy's peer cidrs can be read (`NetworkPolicySpec::submitted`).
+    /// Asked by kithd where it takes a resource (apply, plan, access sign), not by the CLI: kith
+    /// speaks to a node's kithd, which asks it, and a local store enforces no policy; the CLI
+    /// binaries (kith-remote's size is held to a budget) do not link the cidr parser for it.
+    pub fn submitted_by_node(&self) -> Result<(), String> {
+        self.submitted()?;
+        if self.kind == "NetworkPolicy" {
+            // (A spec that cannot be read is `validated`'s to say, not this.)
+            if let Ok(spec) = serde_json::from_value::<kinds::NetworkPolicySpec>(self.spec.clone()) {
+                spec.submitted().map_err(|msg| format!("spec.{msg}"))?;
+            }
+        }
+        Ok(())
+    }
+
     /// What can be checked of a resource whose kind is not kith's own without the
     /// `KindDefinition` (the store has that, and checks the rest: see `Store::plan`).
     fn custom(self) -> Result<Resource, String> {

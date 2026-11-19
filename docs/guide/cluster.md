@@ -224,7 +224,13 @@ Service that selects its Workload.
 
 A `NetworkPolicy` decides who may connect to the Workloads it selects through a Service: the
 first ingress rule that fits wins, none means refused. A connection to a node's own address
-bypasses the ingress rules. Its egress rules, which decide where a pod may connect, are below.
+bypasses the ingress rules. A `cidr` must be an address and a length within its family
+(`10.0.0.0/8`, `fd00::/8`; not IPv4 written as IPv6, and IPv6 only on ingress, where a caller
+comes from a mesh address), or the policy is refused when it is submitted. One already stored
+(a log replays what an older version took) whose `cidr` cannot be read fails closed: in a deny
+it keeps everything out, in an allow it lets nothing in, and the status says `partial`. A deny
+of a `node` on a node with no cluster has no node address to keep out and is left out. Its
+egress rules, which decide where a pod may connect, are below.
 
 - **Egress (kith OS as root; pod Workloads and Jobs only):** a `NetworkPolicy`'s egress rules
   hold the pods of the Workloads and Jobs it selects, an exit's pod included. A pod reaches only

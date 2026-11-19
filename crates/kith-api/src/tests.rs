@@ -753,6 +753,24 @@ fn replay_takes_a_dotted_service_an_older_binary_logged() {
     assert!(store.get("Service/db.prod/db-0").is_some());
 }
 
+/// Replay takes a NetworkPolicy an older binary logged with a cidr that cannot be read: refused
+/// when submitted (`submitted`), not in `validated`, or the policy would vanish on replay and
+/// the pods it holds would be open. (The enforcer keeps everybody out for it.)
+#[test]
+fn network_policy_cidr_replay_takes_one_an_older_binary_logged() {
+    let logged = Resource {
+        api_version: API_VERSION.into(),
+        kind: "NetworkPolicy".into(),
+        metadata: serde_json::from_value(json!({ "name": "old" })).unwrap(),
+        spec: json!({ "ingress": [{ "action": "deny", "peers": [{ "cidr": "nonsense" }] }, { "action": "allow" }] }),
+        status: None,
+    };
+    assert!(logged.submitted_by_node().is_err(), "a new one is refused");
+    let mut store = Store::default();
+    store.apply_all(vec![logged]).unwrap();
+    assert!(store.get("NetworkPolicy/default/old").is_some());
+}
+
 /// A headless Service has no address to send a host to: it is refused with `expose` at apply,
 /// and not served without its host (its name answers its replicas, and nothing else).
 #[test]
