@@ -316,6 +316,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --selftest-kill  instead: start this script with a stand-in for QEMU, kill its shell from
                    outside (SIGKILL, then SIGTERM) and expect no QEMU left and the VM lock
                    free; needs no QEMU, KVM or kernel
+  --selftest-web   instead: web_up serves a directory on a port and returns once it answers; with
+                   another process holding the port, it returns 1 with that server's own error;
+                   needs python3 and curl, no QEMU, KVM or kernel
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -330,6 +333,7 @@ while [ $# -gt 0 ]; do
     --help | -h) usage; exit 0 ;;
     --selftest-kill) selftest='kill'; shift ;;
     --selftest-said) selftest='said'; shift ;;
+    --selftest-web) selftest='web'; shift ;;
     --kernel | --initrd | --disk | --append | --time | --test)
         [ $# -ge 2 ] || { echo "vm.sh: $1 needs a value" >&2; exit 2; }
         case $1 in
@@ -431,6 +435,61 @@ if [ "$selftest" = kill ]; then
     rm -rf "$st"
     [ "$bad" = 0 ] || exit 1
     echo "vm.sh: selftest ok: killed from outside (SIGKILL, SIGTERM), no QEMU left and the lock free"
+    exit 0
+fi
+
+# web_up DIR PORT: a web server of DIR on 127.0.0.1 PORT, waited for until its log says it is serving
+# and it answers; sets web to its pid and returns 0, or returns 1 with the server's own error. Its
+# stderr goes to a file, never /dev/null: a port another process holds kills the server at the bind,
+# and only that error says why the guests hear nothing. Bounded by time tries of a second; the log
+# line guards against another process answering on the port (only our server prints it, after bind).
+web_up() {
+    (cd "$1" && exec python3 -u -m http.server --bind 127.0.0.1 "$2") >"$work/web-$2.log" 2>"$work/web-$2.err" &
+    web=$!
+    web_tries=0
+    until grep -aq 'Serving HTTP' "$work/web-$2.log" && curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$2/"; do
+        kill -0 "$web" 2>/dev/null || { echo "vm.sh: the web server on port $2 is not running: $(cat "$work/web-$2.err")" >&2; return 1; }
+        web_tries=$((web_tries + 1))
+        [ "$web_tries" -lt "$time" ] || { echo "vm.sh: the web server on port $2 did not answer: $(cat "$work/web-$2.err")" >&2; return 1; }
+        sleep 1
+    done
+}
+
+# --selftest-web: web_up serves a directory and returns once it answers. With another process holding
+# the port, its own server dies at the bind: web_up must return 1 and say that server's error, not
+# call the port served by the other process. Needs python3 and curl; no QEMU, KVM or kernel.
+if [ "$selftest" = web ]; then
+    st=$(mktemp -d)
+    work=$st time=20
+    mkdir "$st/www"
+    : >"$st/www/index.html"
+    free=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    bad=0
+    if web_up "$st/www" "$free"; then
+        curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$free/index.html" || { echo "vm.sh: selftest: FAIL: the server web_up started does not serve its directory" >&2; bad=1; }
+    else
+        echo "vm.sh: selftest: FAIL: web_up did not start a server on a free port" >&2; bad=1
+    fi
+    kill "$web" 2>/dev/null || true
+    wait "$web" 2>/dev/null || true
+    (cd "$st/www" && exec python3 -m http.server --bind 127.0.0.1 "$free") >"$st/holder.log" 2>"$st/holder.err" &
+    holder=$!
+    n=0
+    until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$free/"; do
+        n=$((n + 1)); [ "$n" -lt 100 ] || { echo "vm.sh: selftest: FAIL: the holder of the port never answered" >&2; kill "$holder"; exit 1; }
+        sleep 0.1
+    done
+    if web_up "$st/www" "$free" 2>"$st/held.err"; then
+        echo "vm.sh: selftest: FAIL: web_up called a port another process holds served" >&2; bad=1
+        kill "$web" 2>/dev/null || true
+    else
+        grep -aq 'Errno' "$st/held.err" || { echo "vm.sh: selftest: FAIL: the server's own error is not said: $(cat "$st/held.err")" >&2; bad=1; }
+    fi
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    rm -rf "$st"
+    [ "$bad" = 0 ] || exit 1
+    echo "vm.sh: selftest ok: web_up serves a port it is given, and says the server's own error when another process holds it"
     exit 0
 fi
 
