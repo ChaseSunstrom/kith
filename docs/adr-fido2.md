@@ -1,6 +1,9 @@
 # A FIDO2 key as a way into a node's state
 
-Status: design (T-0863); built so far, and called by nothing: the client's wire half (T-0966:
+Status: design (T-0863); built so far: the console's "touch your key" (T-0974: `crypt.rs`'s
+`console` tries the keys plugged in on `/dev/hidraw*`, `fido2.rs`'s `hidraw`, after what is typed,
+a key not enrolled answered as a wrong line is, and no key looked for after a duress code); the
+rest of it called by nothing yet: the client's wire half (T-0966:
 CTAPHID framing, the CBOR subset) and its second half (T-0968: AES-256-CBC, ECDH, `hmac-secret`,
 `makeCredential` and `getAssertion`), all tested on a scripted key and never yet on a real one;
 and the software key of section 2's test build (T-0970: `crates/kithd/src/fido2_test.rs`, the

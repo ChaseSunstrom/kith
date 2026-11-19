@@ -189,6 +189,8 @@ pub mod frame {
 
     pub const CREDENTIAL_EXCLUDED: &str = "CREDENTIAL_EXCLUDED";
     pub const PIN_REQUIRED: &str = "PIN_REQUIRED";
+    /// What a key says of a credential it does not hold (no touch asked).
+    pub const NO_CREDENTIALS: &str = "NO_CREDENTIALS";
 
     /// The CTAP2 status codes a console has to tell apart, as ` (NAME)` after the number.
     fn status_name(status: u8) -> String {
@@ -199,7 +201,7 @@ pub mod frame {
             0x19 => CREDENTIAL_EXCLUDED,
             0x26 => "UNSUPPORTED_ALGORITHM",
             0x27 => "OPERATION_DENIED",
-            0x2e => "NO_CREDENTIALS",
+            0x2e => NO_CREDENTIALS,
             0x2f => "USER_ACTION_TIMEOUT",
             0x31 => "PIN_INVALID",
             0x32 => "PIN_BLOCKED",
@@ -1362,6 +1364,8 @@ pub mod flow {
     use ring::{digest, rand::SecureRandom, rand::SystemRandom};
     use zeroize::Zeroizing;
 
+    /// The relying party every kith credential is made for (docs/adr-fido2.md section 4).
+    pub const RP_ID: &str = "kith.local";
     const MAKE_CREDENTIAL: u8 = 0x01;
     const GET_ASSERTION: u8 = 0x02;
     const GET_INFO: u8 = 0x04;
@@ -1744,6 +1748,101 @@ pub mod flow {
             );
             assert!(credential_id(&Value::Map(vec![]), RP).is_err());
             assert!(credential_id(&attested(RP, 0xc1, &[]), RP).is_err());
+        }
+    }
+}
+
+/// A security key on `/dev/hidraw*`, plain file I/O (docs/adr-fido2.md section 1): the
+/// devices whose report descriptor opens with the FIDO usage page, each handed out once
+/// while it stays plugged in.
+pub mod hidraw {
+    use super::frame::{Device, REPORT};
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::collections::HashSet;
+    use std::fs::File;
+    use std::io::{self, Read, Write};
+    use std::os::fd::AsFd;
+    use std::path::Path;
+
+    /// How long a read waits for a report: a key waiting for a touch sends a keep-alive
+    /// every 100 ms, so this is the bound on a key that says nothing (see [`Device`]).
+    const READ_WAIT: u16 = 1000;
+    /// A FIDO device's report descriptor begins `Usage Page (0xF1D0)`.
+    const FIDO_PAGE: [u8; 3] = [0x06, 0xd0, 0xf1];
+
+    pub struct Hid(File);
+
+    impl Device for Hid {
+        fn write(&mut self, report: &[u8; REPORT]) -> io::Result<()> {
+            // (hidraw wants the report id first: 0 for a device that has none.)
+            let mut out = [0u8; REPORT + 1];
+            out[1..].copy_from_slice(report);
+            self.0.write_all(&out)
+        }
+
+        fn read(&mut self) -> io::Result<Vec<u8>> {
+            let mut ready = [PollFd::new(self.0.as_fd(), PollFlags::POLLIN)];
+            if poll(&mut ready, PollTimeout::from(READ_WAIT)).map_err(io::Error::from)? == 0 {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let mut report = [0u8; REPORT];
+            let got = self.0.read(&mut report)?;
+            Ok(report[..got].to_vec())
+        }
+    }
+
+    /// The keys in `class` (`/sys/class/hidraw`) not in `tried`, opened from `dev` (`/dev`),
+    /// and `tried` as it is now: the names still plugged in. A missing `class` is no keys.
+    pub fn plugged_in(class: &Path, dev: &Path, tried: &mut HashSet<String>) -> Vec<Hid> {
+        let names: HashSet<String> = std::fs::read_dir(class)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                let descriptor = std::fs::read(class.join(name).join("device/report_descriptor"));
+                descriptor.is_ok_and(|descriptor| descriptor.starts_with(&FIDO_PAGE))
+            })
+            .collect();
+        tried.retain(|name| names.contains(name));
+        let mut new: Vec<_> = names.into_iter().filter(|name| !tried.contains(name)).collect();
+        new.sort();
+        let mut keys = Vec::new();
+        for name in new {
+            tried.insert(name.clone());
+            if let Ok(file) = File::options().read(true).write(true).open(dev.join(&name)) {
+                keys.push(Hid(file));
+            }
+        }
+        keys
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_fido_device_is_handed_out_once_and_again_when_plugged_in_again() {
+            let root = std::env::temp_dir().join(format!("kith-hidraw-{}", std::process::id()));
+            let (class, dev) = (root.join("class"), root.join("dev"));
+            let _ = std::fs::remove_dir_all(&root);
+            let mut tried = HashSet::new();
+            assert!(plugged_in(&class, &dev, &mut tried).is_empty(), "no class: no keys");
+            std::fs::create_dir_all(&dev).unwrap();
+            let add = |name: &str, descriptor: &[u8]| {
+                std::fs::create_dir_all(class.join(name).join("device")).unwrap();
+                std::fs::write(class.join(name).join("device/report_descriptor"), descriptor).unwrap();
+                std::fs::write(dev.join(name), b"").unwrap();
+            };
+            add("hidraw0", &[0x05, 0x01, 0x09, 0x06]); // a keyboard
+            add("hidraw1", &[0x06, 0xd0, 0xf1, 0x09, 0x01]);
+            assert_eq!(plugged_in(&class, &dev, &mut tried).len(), 1);
+            assert!(plugged_in(&class, &dev, &mut tried).is_empty(), "handed out once");
+            std::fs::remove_dir_all(class.join("hidraw1")).unwrap();
+            assert!(plugged_in(&class, &dev, &mut tried).is_empty());
+            add("hidraw1", &[0x06, 0xd0, 0xf1]);
+            assert_eq!(plugged_in(&class, &dev, &mut tried).len(), 1, "plugged in again");
+            std::fs::remove_dir_all(&root).unwrap();
         }
     }
 }
