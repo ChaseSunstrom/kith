@@ -436,9 +436,9 @@ pub async fn run(
         rt
     });
     let swept = runtime.and_then(|rt| {
-        let adopted = rt.adopt();
-        // What a kithd before this one made, and this one takes back, is made here too.
-        crate::root_part::made(adopted.keys().cloned());
+        // What a kithd before this one made, and this one takes back, is made here too: one the
+        // root part does not take is left to the sweep below.
+        let adopted = Direct::today(&shared.pods, Some(&rt)).adopt();
         let kept = adopted.keys().cloned().collect();
         rt.cleanup_but(&kept).map(|old| (rt, old, adopted))
     });
@@ -861,7 +861,11 @@ fn unit_id(prefix: &str, replica: u32, b: bool, unit: &str) -> Result<String, St
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
     match ok {
-        true => Ok(format!("{prefix}{replica}{}_{unit}", if b { "b" } else { "" })),
+        // (And one the root part takes for a name: it is asked of a unit by its id alone.)
+        true => {
+            let id = format!("{prefix}{replica}{}_{unit}", if b { "b" } else { "" });
+            crate::root_part::label("unit id", &id).map(|()| id)
+        }
         false => Err(format!("unit name `{unit}`: use letters, digits, `-` and `.`")),
     }
 }
@@ -2826,7 +2830,7 @@ impl Controller {
         let mut killed = true;
         for (id, slot) in &mut units {
             (slot.message, slot.replaced) = (Some(why.to_string()), true);
-            if let Some(Err(e)) = slot.handle.as_mut().map(Handle::kill) {
+            if let Some(Err(e)) = slot.handle.as_mut().map(|handle| Direct::units().kill(handle, id)) {
                 eprintln!("kithd: {id}: {e}");
                 killed = false;
             }
@@ -3335,14 +3339,8 @@ async fn start(
         }
         Run::Exec(e) => {
             unit.command = e.command.clone();
-            let made = runtime
-                .exec(id, &unit, log("out")?, log("err")?)
-                .map_err(|e| e.to_string());
-            // (An exec unit is not made through `Create`: the root part is told it was made.)
-            if made.is_ok() {
-                crate::root_part::made([id.to_string()]);
-            }
-            made
+            // (Through the root part, which takes it for made here: Kill and Delete name it.)
+            root.exec(id, &unit, log("out")?, log("err")?)
         }
     };
     let handle = created?;
@@ -4257,8 +4255,16 @@ mod tests {
         let prefix = id_prefix("Workload", "default", "web.v2");
         assert_eq!(unit_id(&prefix, 1, false, "app").unwrap(), "w_default_web.v2_1_app");
         assert_eq!(id_prefix("Job", "default", "web.v2"), "j_default_web.v2_");
-        for bad in ["", "a/b", "..\\x", "a_b", "a b"] {
-            assert!(unit_id(&prefix, 0, false, bad).is_err(), "{bad:?}");
+        // (`a..b` is no name to the root part, which would never be asked to kill what it holds
+        // under it: so no unit of that name is made at all.)
+        for bad in ["", "a/b", "..\\x", "a_b", "a b", "a..b", "a..."] {
+            let id = unit_id(&prefix, 0, false, bad);
+            assert!(id.is_err(), "{bad:?}");
+        }
+        // And whatever is made is a name to the root part.
+        for ok in ["app", "a.b", "a-b", "9"] {
+            let id = unit_id(&prefix, 3, true, ok).unwrap();
+            assert!(crate::root_part::label("unit id", &id).is_ok(), "{id}");
         }
         // What runs first is run until it ends well, whatever the others are; a Job's never again.
         use RestartPolicy::{Always, Never, OnFailure};

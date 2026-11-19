@@ -11,7 +11,12 @@
 //! names a unit by the id this part made at Create, and is refused one it did not; `Plug` a
 //! device no claim granted; `Usage`: what a pod of its units holds of the state disk). The
 //! handle itself is this process's, as for Create and Start, so these are [`Root`] methods
-//! that take it, and a [`Request`] for one has nothing to act on until the root part is a process.
+//! that take it (and the handle must be the unit's, [`Hands::is`]), and a [`Request`] for one has
+//! nothing to act on until the root part is a process. An exec unit ([`Root::exec`]) and one
+//! taken back from an earlier run ([`Root::adopt`]) are made here as a created one is.
+//!
+//! A claim is of the node's devices, not of a unit's, as it is for `Create`: any unit made here
+//! may be given a device any claim granted, and a `Plug` or `Unplug` is no finer than that.
 //!
 //! A request is refused for what it is, never for who asked ([`check`], [`check_create`]): a
 //! mount outside the state directory, a device no claim of this node's granted, a network
@@ -29,7 +34,7 @@ use crate::policy::Policy;
 use kith_runtime::{Handle, Image, ImageStore, Mount, Runtime, Unit};
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::OwnedFd;
@@ -126,9 +131,13 @@ pub enum Request {
     /// The device node `device` (one a claim granted, of the kind that comes and goes) given to
     /// the unit `id` as it runs, and taken from it again.
     Plug { id: String, device: PathBuf },
+    /// The device node `device` taken from the unit `id`. It needs no claim (what is no longer
+    /// claimed is what is taken away), only a unit made here and a node of the same kind as a
+    /// `Plug`'s.
     Unplug { id: String, device: PathBuf },
-    /// What the pod `pod` (the replica directory of units made here) holds of the state disk, if
-    /// it is held to a limit as it writes. The path is derived here, from the state directory.
+    /// What the pod `pod` (the pod of a unit made here, as its id has it: a second generation's
+    /// ends in `b`) holds of the state disk, if it is held to a limit as it writes. The path is
+    /// derived here, from the state directory.
     Usage { pod: String },
 }
 
@@ -172,7 +181,7 @@ pub fn decode(bytes: &[u8]) -> Result<Request, String> {
 
 /// A name that is safe to put in a file's name and a line of a file: letters, digits, `.`,
 /// `-` and `_`, not starting with `-` or `.`, no `..`, at most a file name's length.
-fn label(what: &str, text: &str) -> Result<(), String> {
+pub(crate) fn label(what: &str, text: &str) -> Result<(), String> {
     let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
     let whole = !text.is_empty() && text.len() <= 255 && !text.starts_with(['-', '.']) && !text.contains("..");
     match whole && text.chars().all(plain) {
@@ -258,13 +267,6 @@ pub fn check(request: &Request) -> Result<(), String> {
             }
         }
     }
-}
-
-/// The replica directory a unit `id` is one of (`check_mount` derives it the same way): its pod,
-/// of a rolling update's other generation (`b`) the same.
-fn replica_of(id: &str) -> &str {
-    let pod = id.rsplit_once('_').map_or(id, |(pod, _)| pod);
-    pod.strip_suffix('b').unwrap_or(pod)
 }
 
 fn digest(text: &str) -> Result<(), String> {
@@ -586,12 +588,13 @@ impl Book {
         }
     }
 
-    /// The units `ids` taken as made here: ones a run before this one made and this takes back
-    /// (`Runtime::adopt`), and exec units, which the runtime makes and `Create` is not for.
-    /// A name that is no name is not taken.
-    pub fn made(&self, ids: impl IntoIterator<Item = String>) {
-        let mut units = self.units.lock().expect("nothing panics holding the book");
-        units.extend(ids.into_iter().filter(|id| label("unit id", id).is_ok()));
+    /// The unit `id` taken as made here: one made through [`Root::create`] or [`Root::exec`], or a
+    /// run before this one's that this takes back ([`Root::adopt`]). A name that is no name is
+    /// refused, and not taken.
+    pub fn made(&self, id: String) -> Result<(), String> {
+        label("unit id", &id)?;
+        self.units.lock().expect("nothing panics holding the book").insert(id);
+        Ok(())
     }
 
     /// A unit that is gone is not one made here any more.
@@ -620,9 +623,11 @@ impl Book {
                     .then_some(())
                     .ok_or_else(|| format!("{}: no claim of this node's granted this device", device.display()))
             }
+            // (The unit's pod as it is: a second generation's (`b`) is its own, as `storage_pod`
+            // has it.)
             Request::Usage { pod } => units
                 .iter()
-                .any(|id| replica_of(id) == pod)
+                .any(|id| id.rsplit_once('_').is_some_and(|(of, _)| of == pod))
                 .then_some(())
                 .ok_or_else(|| format!("no unit made here is one of the pod `{pod}`")),
             _ => Ok(()),
@@ -725,18 +730,17 @@ pub fn set_prefix(prefix: Ipv6Addr) -> Result<(), String> {
     BOOK.set_prefix(prefix)
 }
 
-/// The units `ids` as made here (see [`Book::made`]).
-pub fn made(ids: impl IntoIterator<Item = String>) {
-    BOOK.made(ids);
-}
-
 /// What the pod `pod` holds of the state disk, as the root part of this node says; `None` when
 /// it is held to no limit as it writes, or when the root part refused (no unit made here is of
-/// that pod): the caller counts it the long way.
+/// that pod, which is said): the caller counts it the long way.
 pub fn usage(pod: &str) -> Option<(u64, u64, u64)> {
     match Direct::new().request(Request::Usage { pod: pod.into() }) {
         Ok(Reply::Usage(usage)) => usage,
-        _ => None,
+        Ok(_) => None,
+        Err(why) => {
+            eprintln!("kithd: usage of {pod}: {why}");
+            None
+        }
     }
 }
 
@@ -770,6 +774,13 @@ pub trait Hands {
     /// Whether `path` is the network namespace of a pod this root part made.
     fn owns_netns(&self, path: &Path) -> bool;
     fn create(&self, create: Create) -> Result<Self::Made, String>;
+    /// An exec unit: a command of the node's own, in a cgroup but no container.
+    fn exec(&self, id: &str, unit: &Unit, out: File, err: File) -> Result<Self::Made, String>;
+    /// The units a run before this one left, and these hands take back, by id with the mark each
+    /// was started as.
+    fn adopt(&self) -> BTreeMap<String, (Self::Made, String)>;
+    /// Whether `made` is the unit `id` (the cgroup of one is named by its id).
+    fn is(&self, made: &Self::Made, id: &str) -> bool;
     /// Written down, then started: it comes back with what refused it, to be deleted.
     fn start(&self, made: Self::Made, id: &str, mark: &str) -> Result<Self::Made, (Self::Made, String)>;
     fn kill(&self, made: &mut Self::Made) -> Result<(), String>;
@@ -826,6 +837,12 @@ pub trait Root {
     }
     /// Create the container if [`check_create`] allows it.
     fn create(&self, create: Create) -> Result<Self::Made, String>;
+    /// An exec unit `id` of `unit`, made unless `id` is no name: it is a unit made here, as a
+    /// created one is.
+    fn exec(&self, id: &str, unit: &Unit, out: File, err: File) -> Result<Self::Made, String>;
+    /// The units of a run before this one that are taken back, as made here: one whose id is no
+    /// name is left out (and said), so what the runtime keeps is only what is asked of.
+    fn adopt(&self) -> BTreeMap<String, (Self::Made, String)>;
     /// Start what [`Root::create`] made; `mark` is what it is started as (`Runtime::record`).
     fn start(&self, made: Self::Made, id: &str, mark: &str) -> Result<Self::Made, (Self::Made, String)>;
     // The units made here, asked of by the id [`Root::create`] was given (and `made`): the
@@ -884,6 +901,15 @@ impl Hands for Nobody {
     fn create(&self, _: Create) -> Result<(), String> {
         Err("this root part makes no containers".into())
     }
+    fn exec(&self, _: &str, _: &Unit, _: File, _: File) -> Result<(), String> {
+        Err("this root part runs no units".into())
+    }
+    fn adopt(&self) -> BTreeMap<String, ((), String)> {
+        BTreeMap::new()
+    }
+    fn is(&self, _: &(), _: &str) -> bool {
+        true
+    }
     fn start(&self, made: (), _: &str, _: &str) -> Result<(), ((), String)> {
         Err((made, "this root part starts no containers".into()))
     }
@@ -941,11 +967,8 @@ impl Hands for Today<'_> {
     }
 
     fn owns_netns(&self, path: &Path) -> bool {
-        self.pods.is_some_and(|pods| {
-            pods.lock()
-                .expect("nothing panics holding the pods")
-                .owns_netns(path)
-        })
+        self.pods
+            .is_some_and(|pods| pods.lock().expect("nothing panics holding the pods").owns_netns(path))
     }
 
     fn create(&self, create: Create) -> Result<Handle, String> {
@@ -958,6 +981,20 @@ impl Hands for Today<'_> {
             err,
         } = create;
         runtime.create(id, image, unit, out, err).map_err(|e| e.to_string())
+    }
+
+    fn exec(&self, id: &str, unit: &Unit, out: File, err: File) -> Result<Handle, String> {
+        let runtime = self.runtime.ok_or("this root part has no runtime")?;
+        runtime.exec(id, unit, out, err).map_err(|e| e.to_string())
+    }
+
+    fn adopt(&self) -> BTreeMap<String, (Handle, String)> {
+        self.runtime.map(Runtime::adopt).unwrap_or_default()
+    }
+
+    fn is(&self, made: &Handle, id: &str) -> bool {
+        // (`{cgroup_parent}/kith-{id}`, whichever way the runtime made it: created, exec, adopted.)
+        made.cgroup.file_name().and_then(|name| name.to_str()) == Some(&format!("kith-{id}"))
     }
 
     fn start(&self, mut made: Handle, id: &str, mark: &str) -> Result<Handle, (Handle, String)> {
@@ -1127,8 +1164,29 @@ impl<H: Hands> Root for Direct<'_, H> {
         check_create(&create, &self.ground(), &|path| self.hands.owns_netns(path))?;
         let id = create.id.to_string();
         let made = self.hands.create(create)?;
-        self.book.made([id]);
+        // (`check_create` refused an id that is no name.)
+        let _ = self.book.made(id);
         Ok(made)
+    }
+
+    fn exec(&self, id: &str, unit: &Unit, out: File, err: File) -> Result<H::Made, String> {
+        self.book.count(Kind::Create);
+        label("unit id", id)?;
+        let made = self.hands.exec(id, unit, out, err)?;
+        self.book.made(id.into())?;
+        Ok(made)
+    }
+
+    fn adopt(&self) -> BTreeMap<String, (H::Made, String)> {
+        let mut taken = self.hands.adopt();
+        taken.retain(|id, _| match self.book.made(id.clone()) {
+            Ok(()) => true,
+            Err(why) => {
+                eprintln!("kithd: {why}: not taken back");
+                false
+            }
+        });
+        taken
     }
 
     fn start(&self, made: H::Made, id: &str, mark: &str) -> Result<H::Made, (H::Made, String)> {
@@ -1144,11 +1202,15 @@ impl<H: Hands> Root for Direct<'_, H> {
 
     fn kill(&self, made: &mut H::Made, id: &str) -> Result<(), String> {
         self.unit(Kind::Kill, Request::Kill { id: id.into() })?;
+        self.bound(made, id)?;
         self.hands.kill(made)
     }
 
     fn delete(&self, made: H::Made, id: &str) -> Result<(), (Option<H::Made>, String)> {
-        if let Err(why) = self.unit(Kind::Delete, Request::Delete { id: id.into() }) {
+        let refused = self
+            .unit(Kind::Delete, Request::Delete { id: id.into() })
+            .and_then(|()| self.bound(&made, id));
+        if let Err(why) = refused {
             return Err((Some(made), why));
         }
         let done = self.hands.delete(made);
@@ -1174,6 +1236,7 @@ impl<H: Hands> Root for Direct<'_, H> {
                 cpu_millis,
             },
         )?;
+        self.bound(made, id)?;
         Ok(self.hands.tune(made, guaranteed, cpu_millis))
     }
 
@@ -1185,6 +1248,7 @@ impl<H: Hands> Root for Direct<'_, H> {
                 device: device.into(),
             },
         )?;
+        self.bound(made, id)?;
         self.hands.plug(made, device)
     }
 
@@ -1196,6 +1260,7 @@ impl<H: Hands> Root for Direct<'_, H> {
                 device: device.into(),
             },
         )?;
+        self.bound(made, id)?;
         self.hands.unplug(made, device)
     }
 }
@@ -1207,6 +1272,15 @@ impl<H: Hands> Direct<'_, H> {
         self.book.count(kind);
         check(&request)?;
         self.book.known(&request)
+    }
+
+    /// That the handle is the unit `id`: what is asked of by one unit's id is not done to
+    /// another unit's handle (and the first forgotten, left running and out of reach).
+    fn bound(&self, made: &H::Made, id: &str) -> Result<(), String> {
+        match self.hands.is(made, id) {
+            true => Ok(()),
+            false => Err(format!("this handle is not the unit `{id}`")),
+        }
     }
 
     /// A request of the Images family: the store is exactly `<state>/runtime` (the state
@@ -1534,6 +1608,8 @@ mod tests {
         calls: Mutex<Vec<&'static str>>,
         /// The calls that fail, by name (`mesh_up`, `mesh_down`).
         failing: Mutex<Vec<&'static str>>,
+        /// The units a run before this one left, for `adopt`.
+        left: Mutex<Vec<&'static str>>,
         /// How many of the mesh's calls are inside one at once, and the most there were.
         inside: AtomicUsize,
         most: AtomicUsize,
@@ -1552,6 +1628,10 @@ mod tests {
             if fails {
                 failing.push(what);
             }
+        }
+
+        fn adopting<const N: usize>(&self, ids: [&'static str; N]) {
+            *self.left.lock().unwrap() = ids.to_vec();
         }
 
         /// A mesh call that takes a while, and says whether it is to fail.
@@ -1615,6 +1695,22 @@ mod tests {
         fn start(&self, made: String, _: &str, _: &str) -> Result<String, (String, String)> {
             self.said("start");
             Ok(made)
+        }
+
+        fn exec(&self, id: &str, _: &Unit, _: File, _: File) -> Result<String, String> {
+            self.said("exec");
+            Ok(id.into())
+        }
+
+        fn adopt(&self) -> BTreeMap<String, (String, String)> {
+            let left = self.left.lock().unwrap();
+            left.iter()
+                .map(|id| (id.to_string(), (id.to_string(), "mark".into())))
+                .collect()
+        }
+
+        fn is(&self, made: &String, id: &str) -> bool {
+            made == id
         }
 
         fn kill(&self, _: &mut String) -> Result<(), String> {
@@ -2378,7 +2474,11 @@ mod tests {
         let named = |why: String| assert!(why.contains("made here"), "{why}");
         named(root.kill(&mut held, unknown).unwrap_err());
         let (back, why) = root.delete(held.clone(), unknown).unwrap_err();
-        assert_eq!(back.as_deref(), Some("handle"), "a refused delete gives the handle back");
+        assert_eq!(
+            back.as_deref(),
+            Some("handle"),
+            "a refused delete gives the handle back"
+        );
         named(why);
         named(root.tune(&held, unknown, None, None).unwrap_err());
         named(root.plug(&held, unknown, device).unwrap_err());
@@ -2386,25 +2486,39 @@ mod tests {
         named(root.request(Request::Usage { pod: "w_a_b_0".into() }).unwrap_err());
         assert!(root.hands.reached().is_empty(), "{:?}", root.hands.reached());
         // (Counted, refused or not: one of each.)
-        for kind in [Kind::Kill, Kind::Delete, Kind::Tune, Kind::Plug, Kind::Unplug, Kind::Usage] {
+        for kind in [
+            Kind::Kill,
+            Kind::Delete,
+            Kind::Tune,
+            Kind::Plug,
+            Kind::Unplug,
+            Kind::Usage,
+        ] {
             assert_eq!(book.crossed(kind), 1, "{kind:?}");
         }
         // A name that is no name never gets as far as a lookup.
         let why = root.kill(&mut held, "../w").unwrap_err();
         assert!(why.contains("not a name"), "{why}");
-        // The unit that was made is asked of, and the pod it is a unit of: one of its next
-        // generation (`b`) is the same replica directory.
+        // The unit that was made is asked of, and the pod it is a unit of, as it is: the next
+        // generation's (`b`) is its own pod (the storage pod of its slot), not its replica's.
         let mut made = made_one(&root, "w_a_b_0_c");
         made_one(&root, "w_a_b_1b_c");
         assert!(root.kill(&mut made, "w_a_b_0_c").is_ok());
-        assert!(root.tune(&made, "w_a_b_0_c", Some(1 << 20), Some(500)).unwrap().is_empty());
+        assert!(
+            root.tune(&made, "w_a_b_0_c", Some(1 << 20), Some(500))
+                .unwrap()
+                .is_empty()
+        );
         assert!(root.plug(&made, "w_a_b_0_c", device).is_ok());
         assert!(root.unplug(&made, "w_a_b_0_c", device).is_ok());
-        assert!(matches!(
-            root.request(Request::Usage { pod: "w_a_b_1".into() }),
-            Ok(Reply::Usage(None))
-        ));
-        assert!(root.request(Request::Usage { pod: "w_a_b_2".into() }).is_err());
+        for pod in ["w_a_b_0", "w_a_b_1b"] {
+            let reply = root.request(Request::Usage { pod: pod.into() });
+            assert!(matches!(reply, Ok(Reply::Usage(None))), "{pod}: {reply:?}");
+        }
+        // (`w_a_b_1` has no unit of its own: only its next generation's is here.)
+        for pod in ["w_a_b_1", "w_a_b_2", "w_a_b_0b"] {
+            assert!(root.request(Request::Usage { pod: pod.into() }).is_err(), "{pod}");
+        }
         assert_eq!(
             root.hands.reached(),
             ["create", "create", "kill", "tune", "plug", "unplug"]
@@ -2418,17 +2532,66 @@ mod tests {
         root.hands.fail("delete", false);
         assert!(root.delete(made.clone(), "w_a_b_0_c").is_ok());
         named(root.kill(&mut made, "w_a_b_0_c").unwrap_err());
-        // A unit given to the book by name (adopted from an earlier run, an exec unit) is made too,
-        // if its name is one.
-        book.made(["w_a_b_5_c".to_string(), "../x".to_string()]);
-        assert!(root.kill(&mut made, "w_a_b_5_c").is_ok());
-        assert!(root.kill(&mut made, "../x").is_err());
+    }
+
+    #[test]
+    fn a_handle_is_the_unit_it_is_asked_of_by() {
+        let (book, _) = book("bound");
+        book.claim([PathBuf::from(INPUT)]);
+        let root = Direct::with(Fake::default(), &book).under(policy(""));
+        let (mut a, b) = (made_one(&root, "w_a_b_0_c"), made_one(&root, "w_a_b_1_c"));
+        let (device, not) = (Path::new(INPUT), |why: String| {
+            assert!(why.contains("not the unit"), "{why}")
+        });
+        // The handle of one with the id of another is refused, whatever else holds.
+        not(root.kill(&mut a, "w_a_b_1_c").unwrap_err());
+        not(root.tune(&a, "w_a_b_1_c", None, None).unwrap_err());
+        not(root.plug(&a, "w_a_b_1_c", device).unwrap_err());
+        not(root.unplug(&a, "w_a_b_1_c", device).unwrap_err());
+        let (back, why) = root.delete(a.clone(), "w_a_b_1_c").unwrap_err();
+        assert_eq!(back, Some(a.clone()), "a refused delete gives the handle back");
+        not(why);
+        assert_eq!(root.hands.reached(), ["create", "create"]);
+        // Neither was deleted or forgotten: each is still asked of by its own.
+        assert!(root.delete(b, "w_a_b_1_c").is_ok());
+        assert!(root.delete(a, "w_a_b_0_c").is_ok());
+    }
+
+    #[test]
+    fn exec_and_adopted_units_are_made_here() {
+        let (book, _) = book("exec");
+        let root = Direct::with(Fake::default(), &book).under(policy(""));
+        // An exec unit is made through the root part: it is asked of afterwards, as a created one is.
+        let mut made = root.exec("w_a_b_0_c", &plain(), null(), null()).unwrap();
+        assert!(root.kill(&mut made, "w_a_b_0_c").is_ok());
+        assert_eq!(root.hands.reached(), ["exec", "kill"]);
+        // A name that `unit_id` would have to refuse is refused before anything runs.
+        for id in ["a..b", "../x", "-x", ""] {
+            let why = root.exec(id, &plain(), null(), null()).unwrap_err();
+            assert!(why.contains("not a name"), "{why}");
+        }
+        assert_eq!(root.hands.reached(), ["exec", "kill"]);
+        // What a run before this one made, and this takes back, is made here; what is no name is
+        // not taken back (the runtime's sweep removes what is not kept).
+        root.hands.adopting(["w_a_b_5_c", "a..b"]);
+        let taken = root.adopt();
+        assert_eq!(taken.keys().collect::<Vec<_>>(), ["w_a_b_5_c"]);
+        let mut five = taken["w_a_b_5_c"].0.clone();
+        assert!(root.kill(&mut five, "w_a_b_5_c").is_ok());
+        assert!(root.kill(&mut five, "a..b").is_err());
+        // A delete forgets it, as for a created one.
+        assert!(root.delete(five.clone(), "w_a_b_5_c").is_ok());
+        assert!(root.kill(&mut five, "w_a_b_5_c").is_err());
     }
 
     #[test]
     fn a_device_nobody_claimed_is_not_plugged() {
         let (book, _) = book("plug");
-        book.claim([PathBuf::from(INPUT), PathBuf::from("/dev/dri/renderD128"), PathBuf::from("/dev/input/../sda")]);
+        book.claim([
+            PathBuf::from(INPUT),
+            PathBuf::from("/dev/dri/renderD128"),
+            PathBuf::from("/dev/input/../sda"),
+        ]);
         let root = Direct::with(Fake::default(), &book).under(policy(""));
         let made = made_one(&root, "w_a_b_0_c");
         let plug = |device: &str| root.plug(&made, "w_a_b_0_c", Path::new(device));
@@ -2463,7 +2626,11 @@ mod tests {
         assert!(tune(None, None).is_ok());
         assert!(tune(Some(MOST_GUARANTEED), Some(MOST_CPU_MILLIS)).is_ok());
         assert!(tune(Some(MOST_GUARANTEED + 1), None).unwrap_err().contains("bytes"));
-        assert!(tune(None, Some(MOST_CPU_MILLIS + 1)).unwrap_err().contains("thousandths"));
+        assert!(
+            tune(None, Some(MOST_CPU_MILLIS + 1))
+                .unwrap_err()
+                .contains("thousandths")
+        );
         assert!(tune(Some(u64::MAX), Some(u64::MAX)).is_err());
         assert_eq!(root.hands.reached(), ["create", "tune", "tune"]);
     }
@@ -2496,7 +2663,7 @@ mod tests {
         // Asked as a request, a unit's verb has no handle to act on: it says so.
         let (book, _) = book("wire-units");
         let root = Direct::with(Fake::default(), &book);
-        book.made(["w_a_b_0_c".to_string()]);
+        book.made("w_a_b_0_c".into()).unwrap();
         let why = root.request(Request::Kill { id: "w_a_b_0_c".into() }).unwrap_err();
         assert!(why.contains("handle"), "{why}");
     }

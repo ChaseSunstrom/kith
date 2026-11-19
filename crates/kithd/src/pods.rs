@@ -1663,6 +1663,14 @@ mod tests {
             Err((made, "not asked".into()))
         }
 
+        fn exec(&self, _: &str, _: &kith_runtime::Unit, _: std::fs::File, _: std::fs::File) -> Result<(), String> {
+            Err("not asked".into())
+        }
+
+        fn adopt(&self) -> std::collections::BTreeMap<String, ((), String)> {
+            Default::default()
+        }
+
         fn kill(&self, _: &mut (), _: &str) -> Result<(), String> {
             Err("not asked".into())
         }
