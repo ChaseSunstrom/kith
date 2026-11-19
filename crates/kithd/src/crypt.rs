@@ -1550,6 +1550,9 @@ pub async fn set(
                 return deleted.map(|_| said).map_err(|e| e.to_string());
             }
             "wipe" => {}
+            // (Taking a code away gives nobody power: a leaked one is revoked before the unlock.
+            // The write below is held to `stays_forgotten` as any is.)
+            "no-duress" if held.spec["forgotten"] == true && !wiped => {}
             _ if held.spec["forgotten"] == true => {
                 return Err(format!(
                     "the cluster has forgotten {name}'s key (a duress code was typed): `kith node unlock {name}` has it held again"
@@ -3050,6 +3053,104 @@ mod tests {
         // A record that names no duress code takes that code for a wrong key.
         let none = Record { duress: None, ..record };
         assert!(matches!(judged(&none, &duress, None), Typed::Wrong));
+    }
+
+    /// `do=ACTION` on `NodeKey/n` as an admin: the status and what it said.
+    async fn locked(shared: &Arc<Shared>, action: &str) -> (StatusCode, String) {
+        let asked = Query(BTreeMap::from([("do".to_string(), action.to_string())]));
+        let answer = set(
+            State(shared.clone()),
+            Extension(Caller::Admin),
+            Named("n".into()),
+            asked,
+        )
+        .await;
+        let status = answer.status();
+        let body = axum::body::to_bytes(answer.into_body(), 1 << 16).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// A cluster holding `NodeKey/n` with this spec, as a node's key is kept.
+    async fn holding(tag: &str, spec: Value) -> Arc<Shared> {
+        let dir = std::env::temp_dir().join(format!("kithd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .apply(node_key("n", spec, json!({})))
+            .unwrap();
+        shared
+    }
+
+    fn spec_of(shared: &Arc<Shared>) -> Value {
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .get("NodeKey/n")
+            .unwrap()
+            .spec
+            .clone()
+    }
+
+    /// A leaked per-node duress code is revoked while the key is forgotten (T-0879): that
+    /// takes the node's own code and nothing else, and the key stays forgotten; the other
+    /// actions on a forgotten key are refused as before, and a wiped key has no code to take.
+    #[tokio::test]
+    async fn no_duress_on_a_forgotten_key() {
+        let forgotten = json!({ "id": "aa", "forgotten": true, "duress": "d1", "duressAll": "d2" });
+        let shared = holding("no-duress-forgotten", forgotten.clone()).await;
+        let (status, said) = locked(&shared, "no-duress").await;
+        assert_eq!(status, StatusCode::OK, "{said}");
+        assert_eq!(
+            spec_of(&shared),
+            json!({ "id": "aa", "forgotten": true, "duressAll": "d2" })
+        );
+        // Every other action but unlock and wipe is refused, and changes nothing.
+        let after = spec_of(&shared);
+        for action in ["lock", "seal", "unseal", "duress", "bogus"] {
+            let (status, said) = locked(&shared, action).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{action}: {said}");
+            assert!(
+                said.contains("`kith node unlock n` has it held again"),
+                "{action}: {said}"
+            );
+        }
+        assert_eq!(spec_of(&shared), after);
+        // Wiped: no code is there to take, and it is refused as a wiped key is.
+        let wiped = holding("no-duress-wiped", json!({ "id": "aa", "wiped": true, "duress": "d1" })).await;
+        let (status, said) = locked(&wiped, "no-duress").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{said}");
+        assert!(said.contains("was wiped"), "{said}");
+        assert_eq!(spec_of(&wiped)["duress"], "d1");
+        // A key not forgotten takes it as it did.
+        let held = holding("no-duress-held", json!({ "id": "aa", "wrapped": "00", "duress": "d1" })).await;
+        assert_eq!(locked(&held, "no-duress").await.0, StatusCode::OK);
+        assert!(spec_of(&held).get("duress").is_none());
+    }
+
+    /// After that, the code once typed at the node (`/v1/forget`) forgets nothing more, and
+    /// the cluster's code still does.
+    #[tokio::test]
+    async fn a_revoked_duress_code_forgets_nothing() {
+        let (_, own, own_public) = code();
+        let (_, all, all_public) = code();
+        let spec = json!({ "id": "aa", "forgotten": true, "duress": own_public, "duressAll": all_public });
+        let shared = holding("revoked-duress", spec).await;
+        let nonce = [5; 32];
+        let typed = |pair: &ring::signature::Ed25519KeyPair| {
+            let signature = pair.sign(&forget_text("aa", &nonce));
+            let state = shared.store.lock().unwrap();
+            forgetting(&state.store, "aa", &nonce, signature.as_ref())
+        };
+        assert_eq!(typed(&own).len(), 1);
+        assert_eq!(locked(&shared, "no-duress").await.0, StatusCode::OK);
+        assert!(typed(&own).is_empty());
+        assert_eq!(typed(&all).len(), 1);
     }
 
     #[test]
