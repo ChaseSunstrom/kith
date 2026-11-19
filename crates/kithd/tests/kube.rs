@@ -741,6 +741,10 @@ fn workflows_kubectl_delete_pod_restarts_that_replica() {
     let pods = || cluster.ok(&["get", "pods", "-l", "app=web", "-o", "name"]);
     eventually("the two replicas are pods", 30, || pods() == "pod/web-0\npod/web-1\n");
     let started = |name: &str| cluster.got(&["pod", name])["status"]["startTime"].clone();
+    // (A pod is listed before it has started: under load its start time comes later.)
+    eventually("both replicas started", 30, || {
+        !started("web-0").is_null() && !started("web-1").is_null()
+    });
     let (first, second) = (started("web-0"), started("web-1"));
     // A start time is whole seconds: wait past one, so the restart is a new one.
     std::thread::sleep(Duration::from_millis(1100));
