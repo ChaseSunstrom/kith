@@ -26,11 +26,11 @@ kith package render packages/web --name shop | kith apply -f -
   "why")` stops with `why` when there is none. `lookup(kind, namespace, name)` is the spec of a
   live resource, `{}` when there is none (`(lookup('Secret', release.namespace, 'db').data |
   default({})).password`): only in the release's own namespace, and only of kinds whoever applied
-  the Release may `get`; with `kith package render` nothing is live. The Release is rendered again
-  when a resource it looked up, or a Role or binding of its writer, changes; a namespace over 1
-  MB of specs fails the lookup. What `lookup` reads is decided by the Release's writer alone, not
-  by whoever pushed the package (as with Helm, a package is trusted with what its installer may
-  read). A missing value, a template that never ends or writes over 1 MB is an error. A template reads only its package; `namespace()` is not there.
+  the Release may `get` and, for a package pushed here rather than fetched from the Release's
+  Repository, its pusher may `get` too (the template is the pusher's: it reads no more than they
+  may, as its output makes no more); with `kith package render` nothing is live. The Release is
+  rendered again when a resource it looked up, a Role or binding, or the Identity of its writer
+  or pusher changes; a namespace over 1 MB of specs fails the lookup. A missing value, a template that never ends or writes over 1 MB is an error. A template reads only its package; `namespace()` is not there.
 - Output is checked like any resource (an error shows the rendered line), put in the release's
   namespace unless it names one, and labelled `kith.dev/release` and `kith.dev/package`.
 - `values.schema.json` may use `type`, `properties`, `required`, `additionalProperties`, `items`,

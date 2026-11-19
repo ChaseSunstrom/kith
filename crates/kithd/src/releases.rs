@@ -13,9 +13,9 @@
 // A render is remembered by the revisions of what went in, so every Release is looked at
 // on every change to the store but rendered once. `lookup(kind, namespace, name)` in a
 // template reads the live spec (an empty map when there is none) of a resource in the
-// release's own namespace that its writer may `get`: the render has no store, so it is
-// handed a snapshot (at most 1 MB), and is made again when a resource it looked up
-// changes. Other namespaces and the `.kith` language see no `lookup`.
+// release's own namespace that its writer, and a pushed Package's pusher, may `get`: the
+// render has no store, so it is handed a snapshot (at most 1 MB), and is made again when a
+// resource it looked up changes. Other namespaces and the `.kith` language see no `lookup`.
 
 use crate::Shared;
 use kith_api::Resource;
@@ -158,7 +158,7 @@ struct Inputs {
     /// What a render looked up (`lookup` in a template), as it was when the render began: it
     /// stands until one of these changes ([`fresh`]). Empty until [`pending`] makes the job.
     looked: BTreeMap<String, Stamp>,
-    /// The rights `lookup` read by, as one number ([`crate::controllers::rights`]); none for a
+    /// The rights `lookup` read by, as one number ([`lookup_rights`]); none for a
     /// package that looks nothing up.
     rights: Option<u64>,
 }
@@ -177,9 +177,10 @@ fn fresh(store: &Store, release: &Resource, had: &Inputs, now: &Inputs) -> bool 
     };
     alike == *now
         && had.looked.iter().all(looked)
-        && had
-            .rights
-            .is_none_or(|rights| rights == crate::controllers::rights(store, release))
+        && had.rights.is_none_or(|rights| {
+            let package = store.get(&now.package.0);
+            package.is_some_and(|package| rights == lookup_rights(store, release, package))
+        })
 }
 
 /// What a finished render stands on: of the stamps its job was made with, those of what it
@@ -489,13 +490,18 @@ async fn apart(job: &Job) -> Result<Output, String> {
 const LIVE_LIMIT: usize = 1 << 20;
 
 /// What `lookup` is to see for `release`: the specs of the resources in its namespace that
-/// whoever applied it may read (a template is no way round a right), and the stamp of each,
-/// taken together with them. Nothing for a package that does not say `lookup` anywhere.
+/// whoever applied it may read (a template is no way round a right) and, unless `package` is
+/// one its Repository supplied ([`fetched`]), that its pusher may read too: the template is
+/// the pusher's, and its output is held to both ([`plan`]), so with the writer's rights alone
+/// it could read through them (a Secret rendered into a ConfigMap the pusher may read). A
+/// pusher nobody wrote down, or one kithd does not act as, may read nothing. With the stamp
+/// of each, taken together with them. Nothing for a package that does not say `lookup` anywhere.
 // ponytail: a scan of the store per render that looks things up; an index by namespace if
 // that is ever dear.
 fn live(
     store: &Store,
     release: &Resource,
+    package: &Resource,
     files: &BTreeMap<String, String>,
 ) -> (kith_packages::Live, BTreeMap<String, Stamp>, Option<u64>) {
     use crate::access::{Caller, Grants};
@@ -506,13 +512,24 @@ fn live(
     if !files.values().any(|text| text.contains("lookup")) {
         return (live, stamps, None);
     }
-    let writer = release
-        .metadata
-        .annotations
-        .get(WRITER)
-        .and_then(|writer| Caller::named(writer));
-    let caller = writer.filter(|caller| same_writer(store, release, caller).is_ok());
-    let (grants, home) = (caller.map(|caller| Grants::of(&caller, store)), namespace(release));
+    // Whoever applied `owner` (the Release, or the Package), as it was when they did.
+    let grants = |owner: &Resource| {
+        let writer = owner.metadata.annotations.get(WRITER);
+        let caller = writer.and_then(|writer| Caller::named(writer));
+        let caller = caller.filter(|caller| same_writer(store, owner, caller).is_ok());
+        caller.map(|caller| Grants::of(&caller, store))
+    };
+    // (None for a fetched Package: no pusher to ask.)
+    let (writer, pusher) = (
+        grants(release),
+        (!fetched(store, release, package)).then(|| grants(package)),
+    );
+    let home = namespace(release);
+    let get = |grants: &Option<Grants>, kind: &str| {
+        grants
+            .as_ref()
+            .is_some_and(|grants| grants.may(&Verb::Get, kind, Some(&home)))
+    };
     let mut size = 0;
     for resource in store.list(None) {
         if resource.metadata.namespace.as_deref() != Some(home.as_str()) {
@@ -524,9 +541,8 @@ fn live(
         stamps.insert(key.clone(), stamp(store, resource));
         // (Past the cap nothing more is copied: the snapshot is refused below.)
         if size <= LIVE_LIMIT
-            && grants
-                .as_ref()
-                .is_some_and(|grants| grants.may(&Verb::Get, &resource.kind, Some(&home)))
+            && get(&writer, &resource.kind)
+            && pusher.as_ref().is_none_or(|pusher| get(pusher, &resource.kind))
         {
             size += resource.spec.to_string().len();
             live.specs.insert(key, resource.spec.clone());
@@ -539,7 +555,30 @@ fn live(
             LIVE_LIMIT >> 20
         ));
     }
-    (live, stamps, Some(crate::controllers::rights(store, release)))
+    (live, stamps, Some(lookup_rights(store, release, package)))
+}
+
+/// What `lookup` reads by, as one number: the rights of the Release's writer
+/// ([`crate::controllers::rights`]) and, for a Package its Repository did not supply, of its
+/// pusher too, so a pusher narrowed, gone or made again renders it again.
+fn lookup_rights(store: &Store, release: &Resource, package: &Resource) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    crate::controllers::rights(store, release).hash(&mut hasher);
+    if !fetched(store, release, package) {
+        crate::controllers::rights(store, package).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Is `package` the one the Repository `release` names supplied, as its origin says
+/// ([`origin`])? That Repository's key (or, with none, its address) is its trust, and it has
+/// no pusher. Any other, annotated or not, is its pusher's.
+fn fetched(store: &Store, release: &Resource, package: &Resource) -> bool {
+    let origin = release.spec["package"]["repo"]
+        .as_str()
+        .and_then(|repo| origin(store, repo));
+    origin.is_some() && package.metadata.annotations.get(REPOSITORY) == origin.as_ref()
 }
 
 /// The Releases whose render is missing or out of date.
@@ -563,7 +602,7 @@ fn pending(store: &Store, renders: &Renders) -> Vec<(String, Inputs, Job)> {
             .flatten()
             .map(|(path, text)| (path.clone(), text.as_str().unwrap_or_default().to_string()))
             .collect();
-        let (live, stamps, rights) = live(store, release, &files);
+        let (live, stamps, rights) = live(store, release, package, &files);
         let job = Job {
             files,
             layers,
@@ -707,13 +746,7 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
             // the Release's writer. One the Repository the Release names supplied has none: that
             // Repository's key (or, with none, its address) is its trust. Any other, annotated
             // or not, is asked of its writer, and refused when none is written down.
-            let origin = release.spec["package"]["repo"]
-                .as_str()
-                .and_then(|repo| origin(store, repo));
-            let fetched = |package: &Resource| {
-                origin.is_some() && package.metadata.annotations.get(REPOSITORY) == origin.as_ref()
-            };
-            if let Some(package) = package.filter(|package| !fetched(package)) {
+            if let Some(package) = package.filter(|package| !fetched(store, release, package)) {
                 writer_may(store, package, &output.resources, &done.delete)?;
             }
             Ok((output, done))
@@ -2075,6 +2108,86 @@ mod tests {
         apply(&mut store, &role("apply, delete, get"));
         settle(&mut store, &mut renders);
         assert_eq!(peer(&store), "a");
+    }
+
+    /// What the render of the Release `mine` is handed for `lookup`: the keys.
+    fn handed(store: &Store) -> Vec<String> {
+        let jobs = pending(store, &Renders::new());
+        jobs.into_iter()
+            .flat_map(|(_, _, job)| job.live.specs.into_keys())
+            .collect()
+    }
+
+    /// `lookup` in a Package someone pushed reads no more than that pusher may get, besides
+    /// the Release's writer: the template is the pusher's, so the writer's rights alone would
+    /// let it read through them (a Secret rendered into a ConfigMap the pusher may read). A
+    /// pusher without get on Secret is handed no Secret though the writer may read it, and a
+    /// ConfigMap both may get is still handed over (T-0922).
+    #[test]
+    fn lookup_pusher_a_pushed_package_is_handed_only_what_both_may_get() {
+        const TOKEN: &str = "apiVersion: kith.dev/v1\nkind: Secret\nmetadata: { name: token, namespace: shop }\n\
+                             spec: { data: { k: hidden } }\n";
+        let mut store = Store::default();
+        bob(&mut store, "ConfigMap");
+        apply(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: shop }\n\
+             spec: { rules: [{ kinds: [ConfigMap], verbs: [apply, delete, get], namespaces: [shop] }] }\n",
+        );
+        apply(&mut store, TOKEN);
+        apply(&mut store, &UPSTREAM.replace("{addr}", "a"));
+        store
+            .apply(pushed_by_bob(package("1.0.0", &[("peek.yaml", PEEKS)]), 0))
+            .unwrap();
+        // The local socket applied the Release: it may get both.
+        apply(&mut store, RELEASE);
+        assert_eq!(handed(&store), ["ConfigMap/shop/upstream"]);
+        // Rendered so, it stands; with bob's Identity gone it is rendered again (what it read
+        // by is the pusher's as well as the writer's).
+        let mut renders = Renders::new();
+        settle(&mut store, &mut renders);
+        assert_eq!(said(&store).0, json!("installed"), "{}", said(&store).1);
+        assert!(pending(&store, &renders).is_empty());
+        store.delete("Identity/bob").unwrap();
+        assert_eq!(pending(&store, &renders).len(), 1);
+        // Made again under the name with another key: not the bob who pushed it, nothing.
+        bob_is(&mut store, 1);
+        assert_eq!(handed(&store), Vec::<String>::new());
+        // Pushed again through the local socket: both are handed over.
+        store.apply(package("1.0.0", &[("peek.yaml", PEEKS)])).unwrap();
+        let all = [
+            "ConfigMap/shop/mine-maps-peek",
+            "ConfigMap/shop/upstream",
+            "Release/shop/mine",
+            "Secret/shop/token",
+        ];
+        assert_eq!(handed(&store), all);
+    }
+
+    /// A Package fetched from the Repository its Release names has no pusher: its `lookup`
+    /// reads by the writer's rights alone, as its output is checked. One not fetched with
+    /// nobody written down as its pusher is handed nothing (T-0922).
+    #[test]
+    fn lookup_pusher_a_fetched_package_reads_by_the_writer_and_one_with_no_pusher_by_nobody() {
+        const HUB: &str = "apiVersion: kith.dev/v1\nkind: Repository\nmetadata: { name: hub }\n\
+                           spec: { url: 'oci://127.0.0.1:1/kith' }\n";
+        let mut store = Store::default();
+        apply(&mut store, HUB);
+        apply(&mut store, &UPSTREAM.replace("{addr}", "a"));
+        let mut fetched = package("1.0.0", &[("peek.yaml", PEEKS)]);
+        fetched.metadata.annotations.remove(WRITER);
+        let hubs = origin(&store, "hub").unwrap();
+        fetched.metadata.annotations.insert(REPOSITORY.into(), hubs);
+        store.apply(fetched).unwrap();
+        apply(&mut store, &RELEASE.replace("name: maps }", "name: maps, repo: hub }"));
+        assert_eq!(handed(&store), ["ConfigMap/shop/upstream", "Release/shop/mine"]);
+
+        // Pushed here with nobody written down, for a Release that names no Repository.
+        let mut unknown = package("1.0.0", &[("peek.yaml", PEEKS)]);
+        unknown.metadata.annotations.remove(WRITER);
+        store.apply(unknown).unwrap();
+        apply(&mut store, RELEASE);
+        assert_eq!(handed(&store), Vec::<String>::new());
     }
 
     /// A job with what `lookup` sees goes to the render child as JSON on its stdin and its
