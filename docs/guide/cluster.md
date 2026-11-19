@@ -81,11 +81,19 @@ the plan allowed 0.3 ms).
   handshakes. The private key stays in `<state>/pki`.
 - Raft and the node API ride the mesh for LAN-joined nodes too. A node with `--mesh` listens on
   every address (`[::]:7443`, when `bindv6only` is 0 and `--listen` is not given), says so
-  (`status.mesh.api`), and once the leader has shaken hands with it the leader records its
-  address as the mesh one (derived from the CA and the name, never the node's own claim); the
-  LAN address it joined at stays in `status.lan`, where the tunnel's endpoint and ingress DNS
-  still read it. A node left out of this (no `--mesh`, or listening on one address) stays at its
-  LAN address, and nothing moves until every node has a mesh key.
+  (`status.mesh.api`), and once the leader has a handshake with it from the last three minutes
+  the leader records its address as the mesh one (derived from the CA and the name, never the
+  node's own claim); the LAN address it joined at stays in `status.lan`, where the tunnel's
+  endpoint and ingress DNS still read it. It only answers IPv4, loopback and its own mesh
+  address on that socket, not another IPv6 address of the machine. A node left out of this (no
+  `--mesh`, or listening on one address) stays at its LAN address, and so does a worker; a node
+  with no mesh key does not hold the others back, but the leader stays on the LAN while a control
+  node has none.
+- The move is reversible: when a moved node stops saying it serves the API on the mesh (it
+  restarted without `--mesh`, or with a `--listen` of its own), or the leader's handshake with it
+  is more than six minutes old (or missing, once the leader has been looking for six minutes),
+  the leader puts the LAN address back in `status.address` and drops `status.lan`. It is
+  moved again only on a fresh handshake.
 - A peer silent for three minutes is reached through a node with the `edge` role until it
   answers again. The edge machine must forward (`net.ipv6.conf.all.forwarding=1`; kithd warns
   but leaves it alone) and sees what it passes on.

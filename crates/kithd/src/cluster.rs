@@ -291,6 +291,13 @@ pub fn may_answer(local: SocketAddr, mesh: Ipv6Addr) -> bool {
     }
 }
 
+/// Whether a connection is hung up on at once: the address it called (asked of the socket, not
+/// the peer) is one [`may_answer`] refuses, or is not known, which is a no too. Never when
+/// `mesh` is `None`: the socket is bound to one address.
+fn hung_up_on(called: std::io::Result<SocketAddr>, mesh: Option<Ipv6Addr>) -> bool {
+    mesh.is_some_and(|mesh| !called.is_ok_and(|to| may_answer(to, mesh)))
+}
+
 #[cfg(test)]
 pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::Result<TlsListener> {
     listen_on(tcp, config, None)
@@ -321,8 +328,7 @@ pub fn listen_on(
                 continue;
             };
             // (Asked of the socket, not the peer: which of this machine's addresses it called.)
-            let to = stream.local_addr();
-            if mesh.is_some_and(|mesh| to.is_ok_and(|to| !may_answer(to, mesh))) {
+            if hung_up_on(stream.local_addr(), mesh) {
                 continue;
             }
             // An address that holds its share already is hung up on: it waits for itself.
@@ -2420,6 +2426,14 @@ mod tests {
         );
         assert!(!may_answer(to("2001:db8::7"), mesh), "a global IPv6 address");
         assert!(!may_answer(to("fe80::1"), mesh), "a link-local address");
+        assert!(hung_up_on(Ok(to("2001:db8::7")), Some(mesh)));
+        assert!(!hung_up_on(Ok(to("10.9.0.1")), Some(mesh)));
+        assert!(!hung_up_on(Ok(to("2001:db8::7")), None), "a socket of one address");
+        let unknown = Err(std::io::Error::other("no local address"));
+        assert!(
+            hung_up_on(unknown, Some(mesh)),
+            "not knowing which address it called is a no"
+        );
     }
     use std::task::Poll;
 

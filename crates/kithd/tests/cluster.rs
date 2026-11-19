@@ -3346,14 +3346,21 @@ fn roaming_node_is_sent_the_store_over_the_mesh() {
 /// beside), and the store goes on coming to it, now over the mesh.
 #[test]
 fn mesh_address_of_a_lan_joined_node() {
+    // (Straight to stderr: the test harness keeps what eprintln! says of a test that passes.)
+    let skip = |why: &str| {
+        use std::io::Write;
+        drop(writeln!(
+            std::io::stderr(),
+            "SKIP mesh_address_of_a_lan_joined_node: {why}"
+        ));
+    };
     if std::env::var_os("KITH_E2E").is_none() {
-        eprintln!("skipped: set KITH_E2E=1");
-        return;
+        return skip("set KITH_E2E=1");
     }
     if std::env::var_os("KITH_IN_NAMESPACE").is_none() {
         let unshare = |args: &[&str]| Command::new("unshare").arg("-Urn").args(args).status();
         if !unshare(&["true"]).is_ok_and(|status| status.success()) {
-            return eprintln!("skipped: no unprivileged user namespaces here (unshare -Urn)");
+            return skip("no unprivileged user namespaces here (unshare -Urn)");
         }
         let me = std::env::current_exe().unwrap();
         // (10.9.0.1 is the LAN here: the root part will not call a peer at a loopback address.)
