@@ -206,7 +206,8 @@ A Service with `headless: true` (`clusterIP: None` in Kubernetes) has no address
 name answers the addresses of its ready replicas, and it cannot be `expose`d. Each ready replica
 is also named `NAME-N.SERVICE.NAMESPACE.svc.cluster.local` (a StatefulSet's pod names) under every
 Service that selects its Workload. With no ready replica the name still exists: it answers NODATA
-(no records), not NXDOMAIN. A Workload whose longest replica name `NAME-N` passes 63 characters (a
+(no records), not NXDOMAIN. A Service's name exists exactly, so a wildcard `DNSRecord` no longer
+answers it (it answers NODATA for a type the Service has no address for). A Workload whose longest replica name `NAME-N` passes 63 characters (a
 DNS label) is refused when applied, by name.
 
 - Relaying runs on up to four threads of its own and DNS on one more, so a busy Service holds up

@@ -1547,7 +1547,7 @@ spec: { selector: { app: web }, ports: [{ port: 80 }] }
     /// minimum); a Service that is not there is still NXDOMAIN.
     #[test]
     fn a_headless_service_with_no_replica_answers_nodata() {
-        let store = store(
+        let mut store = store(
             "
 apiVersion: kith.dev/v1
 kind: Workload
@@ -1575,6 +1575,14 @@ spec: { headless: true, selector: { app: db }, ports: [{ port: 80 }] }
         }
         let missing = zones.lookup(client, "nope.prod.svc.cluster.local", 28).unwrap();
         assert_eq!(missing.rcode, 3);
+        // With no mesh prefix a Service has no address of its own either, and still exists.
+        let (bare, _) = zones_of(&store, None);
+        let found = bare.lookup(client, "db.prod.kith", 28).unwrap();
+        assert_eq!((found.rcode, found.answers.len(), found.authority.len()), (0, 0, 1));
+        // Deleted, the name is missing again.
+        store.delete("Service/prod/db").unwrap();
+        let (gone, _) = zones_of(&store, Some(kith_mesh::prefix(b"test")));
+        assert_eq!(gone.lookup(client, "db.prod.kith", 28).unwrap().rcode, 3);
     }
 
     #[test]

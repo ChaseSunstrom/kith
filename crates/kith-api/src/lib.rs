@@ -366,8 +366,10 @@ impl Resource {
 
     /// What a new resource must meet beyond `validated`: a Service's and a Namespace's name, and a
     /// namespace, are one DNS label (a dot makes another Service's or replica's name). Asked where
-    /// a resource is submitted (kithd's apply and plan, the CLI's apply), not in `validated`: replay
-    /// validates every logged resource too, and a log written before this rule holds dotted ones.
+    /// a resource is submitted (kithd's apply, plan and signed apply, the Kubernetes API's writes, and
+    /// the CLI's `apply`), not in `validated`: replay validates every logged resource too, and a log
+    /// written before this rule holds dotted ones. Not asked of what kithd applies itself (a Release's
+    /// rendered Workload, a cron or controller's): those are not checked.
     pub fn submitted(&self) -> Result<(), String> {
         let one_label = |what: &str, name: &str| match name.contains('.') {
             true => Err(format!("{what} names are one DNS label: no `.` in `{name}`")),
