@@ -45,6 +45,12 @@ impl Cluster {
 
     /// A kithd of its own with its Identities, which need no kubectl: `curl` asks it directly.
     fn boot(test: &str) -> Cluster {
+        Cluster::boot_with(test, false)
+    }
+
+    /// `host`: a port-forward to a pod this node has not made reaches the host's loopback (`KITHD_PORTFORWARD_HOST`, a
+    /// debug build's): the tests here have no network to make a pod with, and one that sets it is the only one to need it.
+    fn boot_with(test: &str, host: bool) -> Cluster {
         let kubectl = std::env::var("KITH_KUBECTL").unwrap_or("kubectl".into());
         let built = Command::new(env!("CARGO"))
             .args(["build", "--quiet", "-p", "kith-cli"])
@@ -74,8 +80,9 @@ impl Cluster {
             .current_dir(&dir)
             .args(["--state", "state", "--socket", "kithd.sock", "--name", "alpha"])
             .args(["--listen", &format!("127.0.0.1:{port}"), "--registry-port", "0"])
-            // (A silent port-forward stream ends after this long: a debug build of kithd reads it, so a test need not wait minutes.)
-            .env("KITHD_PORTFORWARD_IDLE_MS", "3000")
+            // (A silent port-forward stream, and a session with none, end after this long: a debug build of kithd reads it, so a test need not wait minutes.)
+            .env("KITHD_PORTFORWARD_IDLE_MS", "10000")
+            .envs(host.then_some(("KITHD_PORTFORWARD_HOST", "1")))
             .stdin(Stdio::null())
             .spawn()
             .unwrap();
@@ -1531,7 +1538,11 @@ const FORWARD: [&str; 5] = [
 
 /// A cluster with a Deployment `web` in `team`, and bob who may get it and carol who may also run in it.
 fn with_team(test: &str) -> Cluster {
-    let cluster = Cluster::boot(test);
+    with_team_as(test, false)
+}
+
+fn with_team_as(test: &str, host: bool) -> Cluster {
+    let cluster = Cluster::boot_with(test, host);
     cluster.kith(&["identity", "cert", "bob", "--out", "."]);
     cluster.kith(&["identity", "cert", "carol", "--out", "."]);
     let roles = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: reader }\nspec:\n  rules:\n    - kinds: [Workload, Job]\n      verbs: [get, list, watch]\n      namespaces: [team]\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: runner }\nspec:\n  rules:\n    - kinds: [Workload, Job]\n      verbs: [get, list, exec]\n      namespaces: [team]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob-reader }\nspec:\n  role: reader\n  subjects: [bob]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: carol-runner }\nspec:\n  role: runner\n  subjects: [carol]\n";
@@ -1650,10 +1661,17 @@ fn access_port_forward_sessions_are_bounded_per_caller() {
     });
 }
 
+/// One test at a time runs `with_running`'s unit: its systemd name (`w_team_tool_0_main`) is the same in every cluster
+/// here, and a kithd that sets it up kills the one another test's kithd runs (exit 137, restarts, a pod that is Pending).
+fn alone() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// `with_team`, and a Workload `tool` of one exec unit that runs on this host, shown to kubectl as a Deployment
 /// (the images of the others are empty, so their pods are never Running, and kubectl asks no port of a pod that is not).
-fn with_running(test: &str) -> Cluster {
-    let cluster = with_team(test);
+fn with_running(test: &str, host: bool) -> Cluster {
+    let cluster = with_team_as(test, host);
     let sent = r#"{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"tool","namespace":"team"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"tool"}},"template":{"metadata":{"labels":{"app":"tool"}},"spec":{"containers":[{"name":"main","image":"busybox:1.36"}]}}}}"#;
     let tool = format!("apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: tool\n  namespace: team\n  annotations:\n    {}: '{sent}'\nspec:\n  replicas: 1\n  template:\n    exec:\n      - name: main\n        command: [sleep, '3600']\n", "kube.kith.dev/sent");
     cluster.write("tool.yaml", &tool);
@@ -1674,8 +1692,8 @@ impl Drop for Forward {
     }
 }
 
-/// kubectl forwards a port of this host (a pod that is not made reaches the host's loopback) as carol, who may run in
-/// `team`: the local port, once kubectl says it listens.
+/// kubectl forwards a port of this host (with `host`, a pod that is not made reaches the host's loopback) as carol, who
+/// may run in `team`: the local port, once kubectl says it listens.
 fn forward(cluster: &Cluster, remote: u16) -> (Forward, u16) {
     let local = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let carol = cluster.as_("carol");
@@ -1724,7 +1742,8 @@ fn workflows_kubectl_port_forward_carries_bytes_both_ways() {
     if !has_kubectl() {
         return;
     }
-    let cluster = with_running("kube-forward-bytes");
+    let _alone = alone();
+    let cluster = with_running("kube-forward-bytes", true);
     let (_forward, local) = forward(&cluster, echo());
     let mut stream = near(local);
     stream.write_all(b"hello").unwrap();
@@ -1741,21 +1760,22 @@ fn workflows_kubectl_port_forward_carries_bytes_both_ways() {
     assert!(back == payload, "a megabyte comes back as it went");
 }
 
-/// A connection that moves no byte ends after the idle time (3 s here), and a session carries 16 connections: the
+/// A connection that moves no byte ends after the idle time (10 s here), and a session carries 16 connections: the
 /// 17th is refused at once, not left to idle out.
 #[test]
 fn workflows_kubectl_port_forward_ends_a_silent_stream_and_bounds_its_streams() {
     if !has_kubectl() {
         return;
     }
-    let cluster = with_running("kube-forward-bound-streams");
+    let _alone = alone();
+    let cluster = with_running("kube-forward-bound-streams", true);
     let (_forward, local) = forward(&cluster, echo());
     let mut silent = near(local);
     let began = Instant::now();
     let mut one = [0u8; 1];
     assert_eq!(silent.read(&mut one).unwrap_or(0), 0, "ended, not answered");
     let took = began.elapsed();
-    assert!(took >= Duration::from_secs(2) && took < Duration::from_secs(15), "a silent stream ended after {took:?}");
+    assert!(took >= Duration::from_secs(8) && took < Duration::from_secs(40), "a silent stream ended after {took:?}");
 
     let mut held: Vec<TcpStream> = (0..16).map(|_| near(local)).collect();
     for stream in &mut held {
@@ -1765,6 +1785,79 @@ fn workflows_kubectl_port_forward_ends_a_silent_stream_and_bounds_its_streams() 
     let mut over = near(local);
     let _ = over.write_all(b"y");
     assert_eq!(over.read(&mut one).unwrap_or(0), 0, "the 17th connection is refused, not echoed");
+}
+
+/// A pod this node has not made (here, one that runs on the host) has no network to reach: the connection is refused and
+/// what listens on the host's loopback is not reached, as it is where `KITHD_PORTFORWARD_HOST` is set.
+#[test]
+fn workflows_kubectl_port_forward_does_not_reach_the_host_through_a_pod_that_is_not_made() {
+    if !has_kubectl() {
+        return;
+    }
+    let _alone = alone();
+    let cluster = with_running("kube-forward-not-made", false);
+    let (_forward, local) = forward(&cluster, echo());
+    let mut stream = near(local);
+    let _ = stream.write_all(b"hello");
+    let mut back = [0u8; 5];
+    assert_eq!(stream.read(&mut back).unwrap_or(0), 0, "nothing is echoed: the host's loopback is not reached");
+}
+
+/// A session that takes no connection and hears nothing ends after the idle time (10 s here). (Not kubectl's: it pings
+/// every 10 s, and a ping is a frame heard.)
+#[test]
+fn access_port_forward_ends_a_session_that_hears_nothing() {
+    let cluster = with_team("kube-forward-idle-session");
+    let pod = "/api/v1/namespaces/team/pods/web-0/portforward";
+    let mut asked = format!("GET {pod} HTTP/1.1\r\nHost: kith\r\n");
+    asked.extend(FORWARD.iter().map(|header| format!("{header}\r\n")));
+    asked.push_str("\r\n");
+    let mut client = Command::new("stdbuf");
+    client
+        .args(["-o0", "openssl", "s_client", "-quiet", "-CAfile", "ca.crt", "-cert", "carol.crt", "-key", "carol.key"])
+        .args(["-servername", "kith", "-connect", &format!("127.0.0.1:{}", cluster.port)])
+        .current_dir(&cluster.dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut client = client.spawn().expect("openssl runs");
+    client.stdin.as_mut().unwrap().write_all(asked.as_bytes()).unwrap();
+    let mut line = String::new();
+    BufRead::read_line(&mut BufReader::new(client.stdout.as_mut().unwrap()), &mut line).unwrap();
+    assert!(line.contains("101"), "{line}");
+    // (Its stdin stays open: the connection ends from kithd's side or not at all.)
+    let began = Instant::now();
+    while client.try_wait().unwrap().is_none() {
+        if began.elapsed() > Duration::from_secs(60) {
+            client.kill().unwrap();
+            panic!("an idle session did not end");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(began.elapsed() >= Duration::from_secs(5), "ended after {:?}, before the idle time", began.elapsed());
+}
+
+/// The Exec right is asked again for each connection: a session whose caller lost it is upgraded still, and the
+/// connection it takes next is refused.
+#[test]
+fn workflows_kubectl_port_forward_asks_the_right_again_for_each_connection() {
+    if !has_kubectl() {
+        return;
+    }
+    let _alone = alone();
+    let cluster = with_running("kube-forward-recheck", true);
+    let (_forward, local) = forward(&cluster, echo());
+    let mut first = near(local);
+    first.write_all(b"hello").unwrap();
+    let mut back = [0u8; 5];
+    first.read_exact(&mut back).unwrap();
+    assert_eq!(&back, b"hello");
+    // carol's binding now names bob: her session is upgraded still, and a connection it takes next is refused.
+    cluster.write("revoked.yaml", "apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: carol-runner }\nspec:\n  role: runner\n  subjects: [bob]\n");
+    cluster.kith(&["apply", "-f", "revoked.yaml"]);
+    let mut second = near(local);
+    let _ = second.write_all(b"hello");
+    assert_eq!(second.read(&mut back).unwrap_or(0), 0, "a connection of a session whose right is gone is refused");
 }
 
 /// A StatefulSet of several replicas has a claim and a Volume of each replica's own, named

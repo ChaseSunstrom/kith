@@ -101,6 +101,7 @@ impl Drop for Held {
 struct Owner {
     key: String,
     replica: u32,
+    caller: Caller,
     who: String,
 }
 
@@ -156,7 +157,7 @@ fn decide(
         return Err(status(StatusCode::TOO_MANY_REQUESTS, "TooManyRequests", why));
     };
     let shared = call.shared.clone();
-    let owner = Owner { key, replica, who };
+    let owner = Owner { key, replica, caller: call.caller.clone(), who };
     tokio::spawn(async move {
         if let Ok(upgraded) = upgrade.await {
             session(shared, owner, TokioIo::new(upgraded), held).await;
@@ -180,16 +181,10 @@ fn wire(frame: Vec<u8>) -> Vec<u8> {
 
 /// One WebSocket, until the client closes it, it breaks the protocol or kithd stops.
 async fn session(shared: Arc<Shared>, owner: Owner, io: TokioIo<Upgraded>, _held: Held) {
-    let (mut read, mut write) = tokio::io::split(io);
-    let (out, mut queue) = mpsc::channel::<Vec<u8>>(QUEUE);
-    let writer = tokio::spawn(async move {
-        while let Some(bytes) = queue.recv().await {
-            if write.write_all(&bytes).await.is_err() {
-                return;
-            }
-        }
-        let _ = write.shutdown().await;
-    });
+    let (mut read, write) = tokio::io::split(io);
+    let (out, queue) = mpsc::channel::<Vec<u8>>(QUEUE);
+    let gone = out.clone();
+    let mut writer = tokio::spawn(drain(queue, write, idle()));
     let mut stop = shared.stop.subscribe();
     let mut at = Session {
         shared,
@@ -203,16 +198,28 @@ async fn session(shared: Arc<Shared>, owner: Owner, io: TokioIo<Upgraded>, _held
     let (code, why) = tokio::select! {
         ended = at.run(&mut read) => ended,
         _ = stop.wait_for(|stopped| *stopped) => (1001, "kithd is stopping".to_string()),
+        _ = gone.closed() => (1011, "the client reads nothing".to_string()),
     };
     // (Every connection ends before the queue's last sender does; the close is the last frame.)
     at.tasks.shutdown().await;
     let close = websocket::encode(Op::Close, &websocket::close_body(code, &why), None);
-    let _ = at.out.send(close).await;
-    drop(at);
-    // (A client that reads nothing is let hold this for five seconds.)
-    if tokio::time::timeout(Duration::from_secs(5), writer).await.is_err() {
-        // the writer is dropped with the connection
+    // (A client that reads nothing is let hold the close and the writer for five seconds each, and no longer.)
+    let _ = tokio::time::timeout(Duration::from_secs(5), at.out.send(close)).await;
+    drop((at, gone));
+    if tokio::time::timeout(Duration::from_secs(5), &mut writer).await.is_err() {
+        writer.abort();
     }
+}
+
+/// Writes what is queued for the client until the queue ends, or a write takes `wait`: a client that reads nothing is let
+/// hold one frame that long, then the queue closes and every sender sees it.
+async fn drain(mut queue: mpsc::Receiver<Vec<u8>>, mut write: impl AsyncWrite + Unpin, wait: Duration) {
+    while let Some(bytes) = queue.recv().await {
+        if !matches!(tokio::time::timeout(wait, write.write_all(&bytes)).await, Ok(Ok(()))) {
+            return;
+        }
+    }
+    let _ = write.shutdown().await;
 }
 
 /// The connections of a session: a request is the error stream and the data stream of one.
@@ -276,6 +283,8 @@ impl Session {
                 }
             }
             tokio::select! {
+                // A session with no connection that hears nothing for the idle time ends (a connection ends by its own).
+                _ = tokio::time::sleep(idle()), if self.tasks.is_empty() => return (1000, "idle".into()),
                 read = read.read(&mut chunk) => match read {
                     Ok(0) | Err(_) => return (1000, String::new()),
                     Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -340,6 +349,11 @@ impl Session {
             return self.say(self.reply.reset(id, spdy::PROTOCOL)).await;
         }
         self.last = id;
+        // The right is asked again for each connection: a session that is upgraded does not outlast it being taken away.
+        if kind == "data" && may_exec(&self.shared, &self.owner.caller, &self.owner.key).is_err() {
+            self.requests.remove(request);
+            return self.say(self.reply.reset(id, spdy::REFUSED)).await;
+        }
         let full = self.requests.len() >= STREAMS_MAX;
         match (kind, self.requests.get_mut(request)) {
             ("error", None) if full => self.say(self.reply.reset(id, spdy::REFUSED)).await,
@@ -379,7 +393,7 @@ async fn connection(
     out: mpsc::Sender<Vec<u8>>,
 ) -> String {
     let spdy = Writer::new();
-    let send = |id: u32, fin: bool, bytes: &[u8]| out.send(wire(spdy.data(id, fin, bytes)));
+    let send = |id: u32, fin: bool, bytes: &[u8]| put(&out, wire(spdy.data(id, fin, bytes)), idle());
     let said = match reach(&shared, &owner, port).await {
         Err(why) => Some(why),
         Ok(pod) => {
@@ -397,9 +411,7 @@ async fn connection(
                     if n == 0 {
                         return Ok(());
                     }
-                    if send(data, false, &chunk[..n]).await.is_err() {
-                        return Err(std::io::Error::other("the client is gone"));
-                    }
+                    send(data, false, &chunk[..n]).await?;
                 }
             };
             // The client's end of its bytes is no end of the connection: the pod may still answer. The pod's is.
@@ -418,12 +430,25 @@ async fn connection(
             ended.err().filter(|e| e.kind() != std::io::ErrorKind::TimedOut).map(|e| e.to_string())
         }
     };
+    // (Each is given up on after the idle time, and a client that took none of them is not asked the next.)
     if let Some(why) = said {
-        let _ = send(error, false, why.as_bytes()).await;
+        if send(error, false, why.as_bytes()).await.is_err() {
+            return request;
+        }
     }
-    let _ = send(data, true, &[]).await;
-    let _ = send(error, true, &[]).await;
+    if send(data, true, &[]).await.is_ok() {
+        let _ = send(error, true, &[]).await;
+    }
     request
+}
+
+/// A frame for the client, given up on after `wait`: a client that reads nothing keeps no connection here.
+async fn put(out: &mpsc::Sender<Vec<u8>>, frame: Vec<u8>, wait: Duration) -> std::io::Result<()> {
+    match tokio::time::timeout(wait, out.send(frame)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(std::io::Error::other("the client is gone")),
+        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+    }
 }
 
 /// Where the replica `replica` of `key` runs: `None` is this node, else the node and where to reach it.
@@ -444,14 +469,23 @@ fn place(shared: &Shared, key: &str, replica: u32) -> Result<Option<(String, Ups
     Ok(Some((node.to_string(), there)))
 }
 
-/// A connection to `port` of the pod that is the replica, on this node: its own address and no other. A byte
-/// that moves renews its idle time (`idle`).
+/// A connection to `port` of the pod that is the replica, on this node: through the pod's own namespace and no other
+/// way (a pod not made yet is refused, not answered by the host's loopback). A byte that moves renews its idle time
+/// (`idle`). A debug build with `KITHD_PORTFORWARD_HOST` set reaches the loopback instead, for a test that has no
+/// network to make a pod with.
 async fn pod(shared: &Shared, key: &str, replica: u32, port: u16) -> Result<Idle<TcpStream>, String> {
     let live = {
         let pods = shared.pods.lock().expect("nothing panics holding the pods");
         pods.live_id(&crate::controller::pod_of(key, replica)).to_string()
     };
-    let stream = tokio::time::timeout(HOP, crate::pods::connect(Some((shared, &live)), port)).await;
+    let host = cfg!(debug_assertions) && std::env::var_os("KITHD_PORTFORWARD_HOST").is_some();
+    let connecting = async {
+        match host {
+            true => crate::pods::connect(Some((shared, &live)), port).await,
+            false => crate::pods::connect_made(&shared.pods, &live, port).await,
+        }
+    };
+    let stream = tokio::time::timeout(HOP, connecting).await;
     let stream = stream.map_err(|_| format!("port {port} did not answer in {} s", HOP.as_secs()))?;
     let stream = stream.map_err(|e| format!("port {port} of the pod: {e}"))?;
     Ok(Idle::new(stream, idle(), None))
@@ -485,7 +519,7 @@ async fn reach(shared: &Shared, owner: &Owner, port: u16) -> Result<Box<dyn Io>,
         return Err(format!("node {node} said {code}: {}", said.chars().take(512).collect::<String>()));
     }
     match reply.upgrade().await {
-        Ok(far) => Ok(Box::new(far)),
+        Ok(far) => Ok(Box::new(Idle::new(far, idle(), None))),
         Err(_) => Err(format!("node {node} did not give the tunnel")),
     }
 }
@@ -498,6 +532,17 @@ struct Spec {
     port: u16,
     /// Who asked the first node.
     caller: String,
+}
+
+/// The Exec right of `who` on what owns `key`, a Workload's or a Job's replica and nothing else: the key is parsed,
+/// never trusted as a path.
+fn may_exec(shared: &Shared, who: &Caller, key: &str) -> Result<(), Response> {
+    let mut parts = key.splitn(3, '/');
+    let (Some(kind @ ("Workload" | "Job")), Some(namespace)) = (parts.next(), parts.next()) else {
+        return Err(say(StatusCode::BAD_REQUEST, format!("{key:?} is no Workload or Job")));
+    };
+    let held = vec![(kind.to_string(), Some(namespace.to_string()))];
+    crate::api::permit(shared, who, Verb::Exec, |_| held).map_err(|refused| refused.into_response())
 }
 
 fn say(code: StatusCode, why: impl std::fmt::Display) -> Response {
@@ -537,14 +582,8 @@ pub(crate) async fn hop(
         return say(StatusCode::FORBIDDEN, why);
     }
     let who = crate::access::passed(&shared, from, who);
-    // A Workload's or a Job's replica, and nothing else: the key is parsed, never trusted as a path.
-    let mut parts = spec.key.splitn(3, '/');
-    let (Some(kind @ ("Workload" | "Job")), Some(namespace)) = (parts.next(), parts.next()) else {
-        return say(StatusCode::BAD_REQUEST, format!("{:?} is no Workload or Job", spec.key));
-    };
-    let held = vec![(kind.to_string(), Some(namespace.to_string()))];
-    if let Err(refused) = crate::api::permit(&shared, &who, Verb::Exec, |_| held) {
-        return refused.into_response();
+    if let Err(refused) = may_exec(&shared, &who, &spec.key) {
+        return refused;
     }
     match place(&shared, &spec.key, spec.replica) {
         Ok(None) => {}
@@ -558,7 +597,8 @@ pub(crate) async fn hop(
     let mut stop = shared.stop.subscribe();
     tokio::spawn(async move {
         if let Ok(upgraded) = upgrade.await {
-            let mut near = TokioIo::new(upgraded);
+            // (Idle: a node that reads nothing is no more let hold the pod's bytes than a client is.)
+            let mut near = Idle::new(TokioIo::new(upgraded), idle(), None);
             tokio::select! {
                 _ = tokio::io::copy_bidirectional(&mut near, &mut pod) => {}
                 _ = stop.wait_for(|stopped| *stopped) => {}
@@ -583,5 +623,28 @@ mod tests {
         assert!(Held::take("test-other").is_some(), "another caller's own");
         drop(held);
         assert!(Held::take("test-caller").is_some());
+    }
+
+    #[tokio::test]
+    async fn portforward_a_client_that_reads_nothing_frees_every_sender_and_its_queue_closes() {
+        // (A pipe of 8 bytes nobody reads: the writer is stuck in its first frame.)
+        let (client, _unread) = tokio::io::duplex(8);
+        let (out, queue) = mpsc::channel(1);
+        let writer = tokio::spawn(drain(queue, client, Duration::from_millis(100)));
+        out.send(vec![0; 64]).await.unwrap();
+        out.send(vec![0; 64]).await.unwrap();
+        // The third waits for room, until the writer gives up and the queue closes: an error, not a wait for ever.
+        let third = put(&out, vec![1], Duration::from_secs(30)).await.unwrap_err();
+        assert_ne!(third.kind(), std::io::ErrorKind::TimedOut, "{third}");
+        tokio::time::timeout(Duration::from_secs(5), out.closed()).await.expect("the queue is closed");
+        tokio::time::timeout(Duration::from_secs(5), writer).await.expect("the writer ended").unwrap();
+    }
+
+    #[tokio::test]
+    async fn portforward_a_frame_that_finds_no_room_is_given_up_after_the_wait() {
+        let (out, _queue) = mpsc::channel(1);
+        out.send(vec![0]).await.unwrap();
+        let said = put(&out, vec![1], Duration::from_millis(50)).await.unwrap_err();
+        assert_eq!(said.kind(), std::io::ErrorKind::TimedOut);
     }
 }
