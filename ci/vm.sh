@@ -313,8 +313,8 @@ append="console=ttyS0 panic=-1"
 while [ $# -gt 0 ]; do
     case $1 in
     --help | -h) usage; exit 0 ;;
-    --selftest-kill) selftest=kill; shift ;;
-    --selftest-said) selftest=said; shift ;;
+    --selftest-kill) selftest='kill'; shift ;;
+    --selftest-said) selftest='said'; shift ;;
     --kernel | --initrd | --disk | --append | --time | --test)
         [ $# -ge 2 ] || { echo "vm.sh: $1 needs a value" >&2; exit 2; }
         case $1 in
