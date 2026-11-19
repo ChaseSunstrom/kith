@@ -1428,6 +1428,7 @@ dependencies = [
  "rustls",
  "rustls-webpki",
  "seccompiler",
+ "serde",
  "serde_json",
  "tar",
  "tokio",

@@ -132,6 +132,7 @@
 {"u":"adr-privilege.html#what-needs-root-today-by-who-asks","t":"kithd in two parts: what reads the network holds no root","h":"What needs root today, by who asks"},
 {"u":"adr-privilege.html#layouts-considered","t":"kithd in two parts: what reads the network holds no root","h":"Layouts considered"},
 {"u":"adr-privilege.html#the-two-parts","t":"kithd in two parts: what reads the network holds no root","h":"The two parts"},
+{"u":"adr-privilege.html#the-transport","t":"kithd in two parts: what reads the network holds no root","h":"The transport"},
 {"u":"adr-privilege.html#the-requests","t":"kithd in two parts: what reads the network holds no root","h":"The requests"},
 {"u":"adr-privilege.html#hot-paths-what-crosses-how-often","t":"kithd in two parts: what reads the network holds no root","h":"Hot paths: what crosses, how often"},
 {"u":"adr-privilege.html#the-nodes-own-policy","t":"kithd in two parts: what reads the network holds no root","h":"The node's own policy"},

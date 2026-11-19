@@ -18,11 +18,12 @@ What is built, where the code is the word where this record differs:
   it is, never for who asks; `Bind` refuses kithd's own ports 7443, 5000, 51820 and
   multicast addresses), and the `Root` trait with its in-process `Direct`.
 - **`Bind`** is used by `share.rs`'s NFS listener (`share.rs:397`).
-- There is no socket and no second process yet.
+- There is a socket since T-0810 (`root_part/socket.rs`, `--split`, off by default) and still no
+  second process: the root part is a thread of kithd that answers on it.
 
 The carve of the rest, one task each: T-0808 pods and Services behind `Root`, with a
 counter of crossings; T-0809 mesh (done: `MeshUp`, `Mesh`, `MeshSeen` and `MeshDown`, in process, each checked and counted), then images, units, volumes and node; T-0810 the socket
-pair transport, `--split` off by default; T-0811 confinement of the serving part, tied
+pair transport (done: see "The transport"), `--split` off by default; T-0811 confinement of the serving part, tied
 lifetimes of the two parts, and the VM test of privilege; T-0812 the before and after
 runs, the budgets, and `--split` on by default.
 
@@ -192,6 +193,48 @@ process has them as root's).
 
 A node kithd runs on as a user (agent mode) has no root and no split, as today. A kithd
 run as root on another OS takes the split by the same flag.
+
+## The transport
+
+Built by T-0810, behind `--split` (or `KITH_SPLIT`), which is off by default; T-0812 flips it.
+With it on, kithd makes a `SOCK_SEQPACKET` socket pair (`root_part::split`) and a thread, "root-part",
+serves one end with the node's `Direct` (`root_part::serve_split`); `Direct::new` and `today` ask
+the other end (a `Socket`, which is a `Root`), so a request that needs no handle crosses it, and
+every check and every count is the root part's, once (a `Book` is shared, so there is no second
+count). The controller's own `Create`, `Start`, `Kill` and the rest of a unit's verbs stay local until
+T-0811 moves the unit's handle to the other process. Nothing is confined yet: no uid or
+capability drop, no `no_new_privs`, no filter, no tied lives (T-0811).
+
+- **Wrappers.** `kith-dm-sys` is the one crate with the unsafe code: `socketpair`, `send_fds`
+  and `recv_fds` (`SCM_RIGHTS`; `MSG_NOSIGNAL`; descriptors arrive close-on-exec; a message or a
+  control part cut short, or more than `MOST_FDS` = 253 descriptors, is an error and never a
+  partial answer), and, for T-0811, `no_new_privs`, `setresuid`, `capget` and `capset`. kithd
+  has no libc and no unsafe code.
+- **Wire.** One message is one JSON text of at most `MAX_REQUEST`, `{seq, call}` one way and
+  `{seq, kept, said}` back, with the descriptors beside it: a `Create` and an `Exec` bring the
+  unit's output and error (exactly two), an `Unpack` its layers (regular files only: a pipe would
+  be read for ever), a `Bind` or `Sockets` gets its sockets back. A file beside anything else is
+  refused whole. A unit the root part made is held by it under its id, and the caller's handle
+  (`Held`) is the id; a handle is checked against the id it is used with before anything is sent.
+- **A slow or hostile peer is bounded** by one reader thread that decodes each message and puts it
+  in a queue of 16 (`Limits::queue`); a request that finds the queue full is told so at once, by its
+  `seq`, and never waits; a request that waited more than 30 s (`wait`) in it is refused unread; a
+  reply that the peer does not take in 10 s (`reply`) closes the socket; and 8 messages in a row that
+  are no request (`bad`) close it too (a good one resets the count). The one worker does the
+  requests one at a time.
+- **The caller** has one call in flight (a lock), and a deadline for it, 30 s (ten times that for
+  an `Unpack`): a call that gives up says so, and an answer that comes late is read past by the
+  next call (its `seq` is not that call's, and its descriptors are closed). A request over
+  `MAX_REQUEST` is refused before it is sent. A `Delete` that is not answered keeps the handle,
+  since it may not have been done.
+
+**Not done, said here**: a single worker serializes the requests, and a long one (an unpack) holds the
+rest behind it, up to their deadline (T-0812 measures it before it is changed); a caller waiting for the
+lock has no deadline of its own; more than 253 layers cannot be sent in one `Unpack` though the
+limit on layers is 256; a caller that gives up after a `Create` leaves the unit held by the root
+part, to be taken by `Adopt` or deleted; a layer that is a FIFO is refused; the serving thread is
+not started again if the peer ends (the root part is a thread of kithd until T-0811 makes it a
+process, so the two end together).
 
 ## The requests
 
