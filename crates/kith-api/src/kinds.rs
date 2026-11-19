@@ -1597,26 +1597,41 @@ impl Spec for ClusterSpec {
     }
 }
 
-/// A peer's `cidr` is an address and a length within its family (`10.0.0.0/8`, `fd00::/8`): a
-/// deny whose cidr could not be read would keep nothing out. (Read as kithd's `parse_cidr` does.)
-impl Spec for NetworkPolicySpec {
-    fn check(&self) -> Result<(), String> {
+/// `10.0.0.0/8` as an address and its length; `None` for one that cannot be read: not ADDR/LEN, a
+/// length over its family's size, or an IPv4 address written as IPv6 (`::ffff:10.0.0.0/104`: a
+/// pod's IPv4 packets never meet an IPv6 match, so it would hold nothing).
+pub fn parse_cidr(cidr: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (address, length) = cidr.split_once('/')?;
+    let address: std::net::IpAddr = address.parse().ok()?;
+    let size = if address.is_ipv4() { 32 } else { 128 };
+    if matches!(address, std::net::IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some()) {
+        return None;
+    }
+    Some((address, length.parse::<u8>().ok().filter(|length| *length <= size)?))
+}
+
+impl NetworkPolicySpec {
+    /// What a new policy must meet beyond its shape (`Resource::submitted`, not `check`: replay
+    /// takes one an older binary logged, and one that vanished would leave its pods open): a
+    /// peer's `cidr` is one `parse_cidr` reads, and on ingress an IPv6 one (a caller comes from
+    /// the mesh's IPv6 addresses, so an IPv4 cidr names none). A deny whose cidr kept nothing out
+    /// would be a hole; the enforcer keeps everything out for a stored one.
+    pub fn submitted(&self) -> Result<(), String> {
         for (side, rules) in [("ingress", &self.ingress), ("egress", &self.egress)] {
             for (i, rule) in rules.iter().enumerate() {
                 for (j, peer) in rule.peers.iter().enumerate() {
                     let Some(cidr) = &peer.cidr else { continue };
-                    let read = cidr.split_once('/').and_then(|(address, length)| {
-                        let size = if address.parse::<std::net::IpAddr>().ok()?.is_ipv4() {
-                            32
-                        } else {
-                            128
-                        };
-                        length.parse::<u8>().ok().filter(|length| *length <= size)
-                    });
-                    if read.is_none() {
-                        return Err(format!(
-                            "{side}[{i}].peers[{j}].cidr: `{cidr}` is not ADDR/LEN (`10.0.0.0/8`, `fd00::/8`, a length within its family)"
-                        ));
+                    let at = format!("{side}[{i}].peers[{j}].cidr: `{cidr}`");
+                    match parse_cidr(cidr) {
+                        None => {
+                            return Err(format!(
+                                "{at} is not ADDR/LEN (`fd00::/8`, `10.0.0.0/8`, a length within its family, not IPv4 written as IPv6)"
+                            ));
+                        }
+                        Some((address, _)) if side == "ingress" && address.is_ipv4() => {
+                            return Err(format!("{at} is IPv4: a caller comes from an IPv6 mesh address"));
+                        }
+                        Some(_) => {}
                     }
                 }
             }
@@ -1627,6 +1642,7 @@ impl Spec for NetworkPolicySpec {
 
 no_checks!(
     BlobSpec,
+    NetworkPolicySpec,
     VolumeClaimSpec,
     ConfigMapSpec,
     SecretSpec,
@@ -2931,8 +2947,16 @@ mod access_tests {
     /// A deny whose cidr cannot be read would hold nothing back, so a policy is refused for one.
     #[test]
     fn network_policy_cidr_is_an_address_and_a_length_in_its_family() {
-        let ingress = |cidr: &str| format!("{{ ingress: [{{ action: deny, peers: [{{ cidr: '{cidr}' }}] }}] }}");
-        let egress = |cidr: &str| format!("{{ egress: [{{ action: allow, peers: [{{ cidr: '{cidr}' }}] }}] }}");
+        // Refused when submitted, not parsed: replay parses what an older binary logged.
+        let submit = |side: &str, action: &str, cidr: &str| {
+            let spec = format!("{{ {side}: [{{ action: {action}, peers: [{{ cidr: '{cidr}' }}] }}] }}");
+            let text = format!("apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: {{ name: p }}\nspec: {spec}\n");
+            let docs = Resource::from_source(&text).unwrap();
+            docs.into_iter().next().unwrap().unwrap().submitted()
+        };
+        for cidr in ["fd00::/8", "::/0", "fd00::1/128"] {
+            submit("ingress", "deny", cidr).unwrap_or_else(|e| panic!("{cidr}: {e}"));
+        }
         for cidr in [
             "10.0.0.0/8",
             "fd00::/8",
@@ -2941,10 +2965,12 @@ mod access_tests {
             "10.0.0.1/32",
             "fd00::1/128",
         ] {
-            read("NetworkPolicy", &ingress(cidr)).unwrap_or_else(|e| panic!("{cidr}: {e}"));
-            read("NetworkPolicy", &egress(cidr)).unwrap_or_else(|e| panic!("{cidr}: {e}"));
+            submit("egress", "allow", cidr).unwrap_or_else(|e| panic!("{cidr}: {e}"));
+            submit("egress", "deny", cidr).unwrap_or_else(|e| panic!("{cidr}: {e}"));
         }
-        for cidr in [
+        // Not an address and a length within its family, or an IPv4 address as IPv6 (a pod's
+        // IPv4 packets never meet it).
+        let bad = [
             "nonsense",
             "10.0.0.0/40",
             "10.0.0.1",
@@ -2952,11 +2978,28 @@ mod access_tests {
             "10.0.0.0/",
             "/8",
             "10.0.0.0/-1",
-        ] {
-            let refused = read("NetworkPolicy", &ingress(cidr)).unwrap_err();
-            assert!(refused.contains("ingress[0].peers[0].cidr"), "{cidr}: {refused}");
-            let refused = read("NetworkPolicy", &egress(cidr)).unwrap_err();
-            assert!(refused.contains("egress[0].peers[0].cidr"), "{cidr}: {refused}");
+        ];
+        for cidr in bad.into_iter().chain(["::ffff:10.0.0.0/104", "::ffff:0:0/96"]) {
+            for (side, action) in [
+                ("ingress", "deny"),
+                ("ingress", "allow"),
+                ("egress", "deny"),
+                ("egress", "allow"),
+            ] {
+                let refused = submit(side, action, cidr).unwrap_err();
+                assert!(
+                    refused.contains(&format!("{side}[0].peers[0].cidr")),
+                    "{cidr}: {refused}"
+                );
+            }
+        }
+        // Callers of an ingress rule come from the mesh's IPv6 addresses: an IPv4 cidr names none.
+        for cidr in ["10.0.0.0/8", "0.0.0.0/0"] {
+            let refused = submit("ingress", "deny", cidr).unwrap_err();
+            assert!(
+                refused.contains("ingress[0].peers[0].cidr") && refused.contains("IPv6"),
+                "{refused}"
+            );
         }
     }
 

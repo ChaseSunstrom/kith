@@ -363,7 +363,8 @@ impl Resource {
     }
 
     /// What a new resource must meet beyond `validated`: a Service's and a Namespace's name, and a
-    /// namespace, are one DNS label (a dot makes another Service's or replica's name). Asked where
+    /// namespace, are one DNS label (a dot makes another Service's or replica's name), and a
+    /// NetworkPolicy's peer cidrs can be read (`NetworkPolicySpec::submitted`). Asked where
     /// a resource is submitted (kithd's apply and plan, the CLI's apply), not in `validated`: replay
     /// validates every logged resource too, and a log written before this rule holds dotted ones.
     pub fn submitted(&self) -> Result<(), String> {
@@ -373,6 +374,12 @@ impl Resource {
         };
         if matches!(self.kind.as_str(), "Service" | "Namespace") {
             one_label(&self.kind, &self.metadata.name)?;
+        }
+        if self.kind == "NetworkPolicy" {
+            // (A spec that cannot be read is `validated`'s to say, not this.)
+            if let Ok(spec) = serde_json::from_value::<kinds::NetworkPolicySpec>(self.spec.clone()) {
+                spec.submitted().map_err(|msg| format!("spec.{msg}"))?;
+            }
         }
         self.metadata
             .namespace
