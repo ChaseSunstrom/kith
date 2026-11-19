@@ -92,16 +92,21 @@ pub fn key_before_joining(options: &Options, token: &str, name: &str) -> Result<
     let (_, pinned, _) = crate::pki::token_parts(token)?;
     let prefix = kith_mesh::prefix(pinned.as_bytes());
     let address = kith_mesh::node_address(prefix, name);
-    let up = told_root(options, prefix)
+    let up = told_root(options, name, prefix)
         .and_then(|()| crate::root_part::mesh_key(&crate::root_part::Direct::new(), &options.interface, address));
     let hint = "--roaming takes the mesh: the kernel's WireGuard and CAP_NET_ADMIN";
     up.map(|key| hex(&key)).map_err(|e| format!("no mesh: {e} ({hint})"))
 }
 
-/// The root part told what the node was started with: the interface, its port and key file, and
-/// the cluster's range.
-fn told_root(options: &Options, prefix: Ipv6Addr) -> Result<(), String> {
-    crate::root_part::set_mesh(options.interface.clone(), options.port, options.key.clone());
+/// The root part told what the node was started with: the interface, its port and key file, the
+/// node's name, and the cluster's range.
+fn told_root(options: &Options, name: &str, prefix: Ipv6Addr) -> Result<(), String> {
+    crate::root_part::set_mesh(
+        options.interface.clone(),
+        options.port,
+        options.key.clone(),
+        name.to_string(),
+    )?;
     crate::root_part::set_prefix(prefix)
 }
 
@@ -312,7 +317,8 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     let prefix = prefix(&cluster.me.ca);
     let address = kith_mesh::node_address(prefix, me);
     let root = crate::root_part::Direct::new();
-    let up = told_root(&options, prefix).and_then(|()| crate::root_part::mesh_key(&root, &options.interface, address));
+    let up =
+        told_root(&options, me, prefix).and_then(|()| crate::root_part::mesh_key(&root, &options.interface, address));
     let public = match up {
         Ok(public) => public,
         Err(e) => {
