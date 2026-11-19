@@ -20,6 +20,7 @@ mod controller;
 mod controllers;
 mod cron;
 mod crypt;
+mod data_disk;
 mod devices;
 mod dhcp;
 mod dns;
