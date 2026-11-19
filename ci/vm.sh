@@ -1,5 +1,5 @@
 #!/bin/sh
-# shellcheck disable=SC1091,SC2034 # (names the driver and its parts share)
+# shellcheck disable=SC1091,SC2034,SC2016,SC2089,SC2090 # (names the driver and its parts share; $reap is a script kept in a variable)
 # Boot a kernel in QEMU and print what it said: by default the host's kernel with the
 # static kithd as init (so, the kernel and kithd, nothing else). The image,
 # installer, update and cluster tests reuse it with their own kernel, initramfs and disk image.
@@ -150,7 +150,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    a pod of a user who is not root finds their Service
                    by its short name and its Kubernetes one, hears all three through
                    it, reaches this machine from behind its node's address, and
-                   writes to /dev/stdout by name; a pod that is root is kept from a
+                   writes to /dev/stdout by name; a NetworkPolicy's egress rule holds
+                   the pods of one app to this machine's address and one port (and
+                   port 80 of no other address): another port, or a pod's address on
+                   port 80, is silent, while an unfenced pod on the same node is
+                   answered by that pod and refused by the port nothing listens on;
+                   a pod that is root is kept from a
                    device it was not given (its node's disk); a container that asks for user
                    namespaces starts a sandbox in it (this machine's bwrap), one that
                    does not is refused, one that is root is not started; a USB keyboard
@@ -212,7 +217,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    the one on PATH) asking the first as the cluster's admin: the
                    manifests of ci/kube applied, rolled out and running, a
                    StatefulSet's claim given a volume that outlives its
-                   pod, a Job and a CronJob's Job reading all of it through their
+                   pod, a StatefulSet of three with a claim and a volume for each
+                   replica across the nodes, a Job and a CronJob's Job reading all of it through their
                    Services, kubectl create, expose, scale, set image, rollout
                    restart, wait and logs, helm install, upgrade and uninstall
                    with --wait, and nothing left when all is deleted. Skipped
@@ -274,6 +280,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    of a namespace the Exit does not list is refused; and in what
                    the node's two cards carried, no packet of the pod's but the
                    tunnel's own. Needs what --test pods needs, and ip and wg
+  --selftest-kill  instead: start this script with a stand-in for QEMU, kill its shell from
+                   outside (SIGKILL, then SIGTERM) and expect no QEMU left and the VM lock
+                   free; needs no QEMU, KVM or kernel
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -281,11 +290,12 @@ compiler when there is no musl-gcc: ci/musl.sh) and needs cpio and zstd.
 EOF
 }
 
-kernel='' initrd='' disk='' time=60 test=''
+kernel='' initrd='' disk='' time=60 test='' selftest=''
 append="console=ttyS0 panic=-1"
 while [ $# -gt 0 ]; do
     case $1 in
     --help | -h) usage; exit 0 ;;
+    --selftest-kill) selftest=1; shift ;;
     --kernel | --initrd | --disk | --append | --time | --test)
         [ $# -ge 2 ] || { echo "vm.sh: $1 needs a value" >&2; exit 2; }
         case $1 in
@@ -311,8 +321,54 @@ if [ -n "$disk" ]; then
 fi
 
 skip() { echo "skipped: $1"; exit 0; }
+
+# --selftest-kill: this script, with a stand-in for QEMU (a sleep that writes its pid), killed from
+# outside by SIGKILL (no trap runs) and by SIGTERM: nothing of it may be left, and its lock must be
+# free. Needs no QEMU, no KVM and no kernel. Stops only the pid the stand-in wrote, if it survives.
+if [ -n "$selftest" ]; then
+    st=$(mktemp -d)
+    mkdir "$st/bin"
+    printf '#!/bin/sh\necho $$ >"%s/pid"\nexec sleep 300\n' "$st" >"$st/bin/qemu-system-x86_64"
+    chmod +x "$st/bin/qemu-system-x86_64"
+    : >"$st/kernel"; : >"$st/initrd"
+    bad=0 alive=''
+    for sig in KILL TERM; do
+        rm -f "$st/pid"
+        KITH_VM_STUB=1 KITH_VM_LOCK="$st/lock" PATH="$st/bin:$PATH" \
+            sh "$0" --kernel "$st/kernel" --initrd "$st/initrd" --time 300 >/dev/null 2>&1 8>&- &
+        shell=$!
+        n=0
+        until [ -s "$st/pid" ]; do
+            n=$((n + 1)); [ "$n" -lt 100 ] || { echo "vm.sh: selftest: the stand-in never started" >&2; kill -9 "$shell"; exit 1; }
+            sleep 0.1
+        done
+        qemu=$(cat "$st/pid")
+        kill -"$sig" "$shell"
+        n=0
+        while kill -0 "$qemu" 2>/dev/null && [ "$n" -lt 50 ]; do n=$((n + 1)); sleep 0.1; done
+        if kill -0 "$qemu" 2>/dev/null; then
+            echo "vm.sh: selftest: FAIL: after SIG$sig to the shell its QEMU ($qemu) still runs" >&2
+            bad=1 alive=1
+        fi
+        # (up to 5 s for the lock: the shell's own exit frees it; a QEMU that kept the descriptor never does)
+        if command -v flock >/dev/null 2>&1 && ! flock -w 5 "$st/lock" true; then
+            echo "vm.sh: selftest: FAIL: after SIG$sig to the shell its lock is still held" >&2
+            bad=1
+        fi
+        kill -9 "$shell" 2>/dev/null || true # (only if it ignored the signal; reaped here)
+        wait "$shell" 2>/dev/null || true
+        [ -z "$alive" ] || kill -9 "$qemu" 2>/dev/null || true # (its own pid, as it survived)
+        alive=''
+    done
+    rm -rf "$st"
+    [ "$bad" = 0 ] || exit 1
+    echo "vm.sh: selftest ok: killed from outside (SIGKILL, SIGTERM), no QEMU left and the lock free"
+    exit 0
+fi
+
+# (KITH_VM_STUB is for that selftest: a stand-in QEMU on PATH, no KVM needed.)
 command -v qemu-system-x86_64 >/dev/null 2>&1 || skip "no qemu-system-x86_64"
-if ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; then skip "no usable /dev/kvm"; fi
+if [ -z "${KITH_VM_STUB:-}" ] && { ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; }; then skip "no usable /dev/kvm"; fi
 
 # One VM test at a time for a user on a machine: two at once starve each other into waits
 # that run out, which reads as a failure. KITH_VM_LOCK names another file; empty, no wait.
@@ -331,7 +387,15 @@ vms='' web='' found=''
 # A write a control node makes as itself that the leader refused (raft.rs `write`, own_writes.rs)
 # is a call site no suite expects: the run fails whatever the suite said, and names the lines.
 refusals() { grep -ahs "refused a control node.s own write" "$work"/log "$work"/*.log | head -n 3; }
-trap 'kill $vms $web 2>/dev/null || true; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
+# Everything this run starts carries KITH_VM_RUN in its environment, and $reap ends what carries it
+# (TERM, then KILL for what is left a second later): the QEMU itself, which a `kill` of its `timeout`
+# wrapper does not reach when the shell is gone, and no process by name. The EXIT trap runs it; so does a
+# watcher of its own (own session, no lock descriptor) for the shell killed with SIGKILL, which runs no trap.
+KITH_VM_RUN=$$.$(date +%s%N); export KITH_VM_RUN
+reap='for sig in TERM KILL; do pids=; for f in $(grep -lzx "KITH_VM_RUN=$1" /proc/[0-9]*/environ 2>/dev/null); do p=${f#/proc/}; pids="$pids ${p%/environ}"; done; [ -z "$pids" ] || { kill -$sig $pids 2>/dev/null; sleep 1; }; done; true'
+setsid=''; ! command -v setsid >/dev/null 2>&1 || setsid=setsid
+env -u KITH_VM_RUN $setsid sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 1; done; exec sh -c "$2" sh "$3"' sh $$ "$reap" "$KITH_VM_RUN" </dev/null >/dev/null 2>&1 8>&- &
+trap 'kill $vms $web 2>/dev/null || true; env -u KITH_VM_RUN sh -c "$reap" sh "$KITH_VM_RUN"; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
 trap 'exit 1' INT TERM
 said() { grep -aq "$1" "$work/log" 2>/dev/null; }
 fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
@@ -373,7 +437,7 @@ if [ "$test" = init ]; then
         shift 2
         rm -f "$work/log" "$work/keys"
         timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
-            -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" "$@" </dev/null >/dev/null 2>&1 &
+            -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" "$@" </dev/null >/dev/null 2>&1 8>&- &
         vm=$!
         until said 'kithd: serving '; do
             kill -0 "$vm" 2>/dev/null || fail "the VM ended before kithd served"
@@ -401,7 +465,10 @@ fi
 
 # panic=-1 reboots at once, -no-reboot turns that into QEMU exiting: a kithd that
 # stops (as init, it must not) ends the run; the timeout ends one that does not.
-timeout "$time" qemu-system-x86_64 "$@" </dev/null >"$work/log" 2>&1 || true
+# (In the background and waited for: a signal's trap waits for a command in the foreground.)
+timeout "$time" qemu-system-x86_64 "$@" </dev/null >"$work/log" 2>&1 8>&- &
+vms=$!
+wait "$vms" || true
 cat "$work/log"
 if grep -qi kithd "$work/log"; then
     echo "vm.sh: ok: kithd spoke"

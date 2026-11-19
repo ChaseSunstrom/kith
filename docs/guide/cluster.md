@@ -222,15 +222,26 @@ Service that selects its Workload.
   once and relays everything.
 
 A `NetworkPolicy` decides who may connect to the Workloads it selects through a Service: the
-first ingress rule that fits wins, none means refused. Peers are a `node` or a `cidr`; peers by
-`namespace` or `selector` cannot be told apart yet (allow lets nobody in, deny keeps everyone
-out) and egress is not enforced; the status says `partial` and why, or `enforced`. A connection
-to a node's own address bypasses it. A `cidr` must be an address and a length within its
-family (`10.0.0.0/8`, `fd00::/8`; not IPv4 written as IPv6, and IPv6 only on ingress, where a
-caller comes from a mesh address), or the policy is refused when it is submitted. One already
-stored (a log replays what an older version took) whose `cidr` cannot be read fails closed: in a
-deny it keeps everything out, in an allow it lets nothing in, and the status says `partial`. A deny of a `node` on a node with no cluster has no node address to keep
-out and is left out.
+first ingress rule that fits wins, none means refused. A connection to a node's own address
+bypasses the ingress rules. A `cidr` must be an address and a length within its family
+(`10.0.0.0/8`, `fd00::/8`; not IPv4 written as IPv6, and IPv6 only on ingress, where a caller
+comes from a mesh address), or the policy is refused when it is submitted. One already stored
+(a log replays what an older version took) whose `cidr` cannot be read fails closed: in a deny
+it keeps everything out, in an allow it lets nothing in, and the status says `partial`. A deny
+of a `node` on a node with no cluster has no node address to keep out and is left out. Its
+egress rules, which decide where a pod may connect, are below.
+
+- **Egress (kith OS as root; pod Workloads and Jobs only):** a `NetworkPolicy`'s egress rules
+  hold the pods of the Workloads and Jobs it selects, an exit's pod included. A pod reaches only
+  what a rule allows, its DNS included, so a policy that holds a pod names the resolver it
+  needs; answers to a connection that came in still pass. kithd writes the rules again when a
+  policy changes. Each pod is matched per pod link: its rules are the chain `e-kpN` (`e-kpxN`
+  for an exit's pod), and its source address is checked apart, so a packet from another
+  address on its link is dropped. Exec and VM Workloads are not held, and nothing is written
+  when kithd is not root. Peers are a `node` or a `cidr`; peers by `namespace` or `selector`
+  cannot be told apart yet (an allow rule fits nobody, a deny rule everybody), and the status
+  says `partial` and why until every rule is written on the node, then `enforced`. Not tested:
+  a policy changing under a running pod; access returning after the policy is deleted.
 
 ### Rolling updates
 

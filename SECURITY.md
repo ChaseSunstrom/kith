@@ -635,13 +635,21 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   through the log); the node's own check before start still refuses an unlisted namespace.
   Of the node itself, an exit's pod reaches nothing (only answers to the node's own
   questions of it go back). A running pod keeps its tunnel after its namespace is taken
-  off its Exit's list, until it starts again (the node's check is at start). No NetworkPolicy's egress rules are enforced, for an exit's pod or any other (a
-  policy with them says so in its status). Not tested: a tunnel's link or table taken
+  off its Exit's list, until it starts again (the node's check is at start). Not tested: a tunnel's link or table taken
   away by hand on a running node (the code that makes it again is tested in a network
   namespace, not on kith OS), ICMP through or around a tunnel, kithd killed between
   starting a pod and making its rules (the rules come first; nothing shows the order
   holds under a kill), and names a pod's own resolver library cached before its exit
   changed.
+- **A NetworkPolicy's egress rules hold a pod's packets, on kith OS as root and for pod Workloads
+  and Jobs only.** The pods of the Workloads and Jobs a policy selects, an exit's pod included,
+  pass only what a rule allows, DNS included. Each pod is matched per pod link: its rules are the
+  chain `e-kpN` (`e-kpxN` for an exit's pod) in the node's `inet kith-pods` table, and its source
+  address is checked apart, so a packet from another address on its link is dropped. Exec and VM
+  Workloads are not held, and nothing is written when kithd is not root. A policy with a peer by
+  `namespace` or `selector`, or whose rules are not yet written on a node, says `partial` in its
+  status; `enforced` once they are. kithd writes the rules again when a policy changes. Not
+  tested: a policy changing under a running pod; access returning after the policy is deleted.
 - **What a replica writes outside its Volumes is held at the write where the state disk
   keeps project quotas, and counted elsewhere.** Its containers' writable roots and its
   disk scratch share the node's state disk. Where the state disk keeps project quotas (a
@@ -845,8 +853,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     a write the admin signed; the first key is written unsigned (trust on first use), and
     `open`, the default, takes everything as before. What it does not close: a taken
     control node still writes into the log as itself (its own writes are held to a list
-    in layer 2), and one that leads still appends what it likes until every node checks
-    what the leader appends (layer 3, T-0742). Nonces are kept in memory: a node that starts
+    in layer 2), and one that leads still appends what it likes, but for what changes
+    access: under `required` at store format 4 every node refuses, at apply, a bare Role,
+    RoleBinding, Identity, KindDefinition or Cluster write and any import, so a taken leader
+    cannot grant itself rights (layer 3, slices 2 and 3, T-0783, T-0825). Still open: its
+    bare writes of any other spec, until every node also checks a node's own writes, ACME,
+    the scheduler and cron (slice 5) and a Release's, a Source's, the registry's, an
+    update's and wasm's (slice 6, T-0850). Nonces are kept in memory: a node that starts
     again, or a new leader, takes once more a request it took in the ten minutes before, if a
     node that saw it pass sends it again (layer 3 keeps them in the store). One Cluster that
     says `required` makes every node require a signature, and every Cluster's `adminKey`
@@ -889,7 +902,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     worker's own, with the labels discovery writes and no other, the node and the
     class among them its own), the status of an Image or a Backup of
     a Volume that is on it, a Blob it made, its own name among a Blob's holders, and
-    when it synced as a Volume's replica. Everything else is refused and written to
+    when it synced as a Volume's replica, the notes of a Job placed on it, and the delete of
+    a Volume that is on it whose data it was told to wipe (its claim gone, not retained, not
+    encrypted, and no unit placed on it mounts it). Everything else is refused and written to
     the audit log under the worker's name: a template, a Secret, a Role, a Node's
     spec (its own `trust` too), another node's status or Device, a report in another
     node's name. So a change asked of a worker's own API is refused as well (`ask a
@@ -1449,7 +1464,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   own and the cluster's. One that was off when the cluster's code was used still has
   its record: either code typed at it later erases it, and the cluster says wiped.
   `kith node duress --all --off` and a new `--all` reach a forgotten key too, so a
-  revoked cluster code wipes no node, and the forgotten key stays forgotten.
+  revoked cluster code wipes no node, and the forgotten key stays forgotten. So does
+  `kith node duress NAME --off`: a node's own code that leaked is revoked there without
+  an unlock, and the key stays forgotten (lock, seal and a new code are still refused
+  on it until `kith node unlock`).
   `kith node unlock` deletes a forgotten key: the node has neither code afterwards,
   until they are made anew.
   **A new recovery key (`kith node recovery`) is written before it is shown**: an

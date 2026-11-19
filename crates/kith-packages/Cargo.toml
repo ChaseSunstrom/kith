@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# `lookup` in a template sees live resources (`Live`, `render_live`): kithd renders Releases
+# with it. The `kith` that renders by hand takes none (`default-features = false`): it has no
+# store to look in, and kith-remote's size is held.
+default = ["live"]
+live = []
+
 [dependencies]
 kith-yaml.workspace = true
 kith-api.workspace = true

@@ -65,6 +65,7 @@ mod vm;
 mod volume_files;
 mod volumes;
 mod wasm;
+mod websocket;
 mod worker;
 mod workload_identity;
 
@@ -108,7 +109,7 @@ struct Args {
     /// Serve the API to other nodes on this address (TLS); the first start makes this node a cluster of one
     #[arg(long, env = "KITH_LISTEN", value_name = "ADDR:PORT")]
     listen: Option<std::net::SocketAddr>,
-    /// Join the cluster of the node at this address (needs --token; listens on 0.0.0.0:7443 unless --listen says otherwise)
+    /// Join the cluster of the node at this address (needs --token; listens on 0.0.0.0:7443, or [::]:7443 for a roaming or mesh-joined node, unless --listen says otherwise)
     #[arg(long, env = "KITH_JOIN", value_name = "ADDR:PORT", requires = "token")]
     join: Option<String>,
     /// A join token, from `kith node token` on a node of that cluster
@@ -1077,7 +1078,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             );
             let key = async {
                 if let Some(((record, config), opened)) = sealed.zip(opened) {
-                    crypt::keep(shared.clone(), config, record, opened, stopping.clone()).await;
+                    let keys = update::keys(args.release_key.clone(), &state);
+                    crypt::keep(shared.clone(), config, record, opened, keys, stopping.clone()).await;
                 }
             };
             let hardware = devices::run(shared.clone(), stopping.clone(), dmem);
@@ -1405,6 +1407,16 @@ mod tests {
         assert!(unreachable_listen(any, true, true).is_none());
         assert!(unreachable_listen(some, false, true).is_none());
         assert!(unreachable_listen(any, false, false).is_none());
+    }
+
+    /// The `--join` help names both addresses the node may listen on: 0.0.0.0 for a LAN node, and
+    /// [::] for a roaming or mesh-joined one (see `listen` in `membership`).
+    #[test]
+    fn join_help_names_both_binds() {
+        let cmd = Args::command();
+        let join = cmd.get_arguments().find(|arg| arg.get_id() == "join").expect("--join");
+        let help = join.get_help().expect("--join has help").to_string();
+        assert!(help.contains("0.0.0.0:7443") && help.contains("[::]:7443"), "{help}");
     }
 
     #[test]

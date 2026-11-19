@@ -838,12 +838,7 @@ async fn issue(
         let state = shared.store.lock().expect("a handler panicked holding the store");
         state.store.get(&key_of).cloned()
     };
-    let mut identity = identity.unwrap_or_else(|| {
-        let new = serde_json::json!({
-            "apiVersion": kith_api::API_VERSION, "kind": "Identity", "metadata": { "name": name }, "spec": {},
-        });
-        serde_json::from_value(new).expect("an Identity with a valid name")
-    });
+    let mut identity = identity.unwrap_or_else(|| crate::access_sign::new_identity(name));
     identity.spec["publicKey"] = public.into();
     let resources = std::iter::once(identity).chain(more).collect();
     // (As the admin's, not this node's own: a control node that is not the leader passes it on,
@@ -1135,12 +1130,29 @@ fn applied_what_it_holds(
     m.current_leader.is_some() && m.last_applied.as_ref().is_some_and(applied)
 }
 
+/// A write that changes nothing, put in the log through the leader (a follower sends it on), and
+/// waited for here, giving the index it is at: the leader's log up to it is this node's store, so a
+/// delete committed there is in it. The leader's own read index is not asked of a follower; this
+/// is what stands for it. A leader that refuses this node says so at once, in the error.
+async fn leader_barrier(shared: &Shared) -> Result<u64, kith_api::store::Error> {
+    let unsaid = |e: &dyn std::fmt::Display| kith_api::store::Error::Io(format!("the leader did not confirm: {e}"));
+    let barrier = shared.write_at(Command::Patch { statuses: vec![] });
+    let (_, index) = tokio::time::timeout(WAIT_FOR_STORE, barrier)
+        .await
+        .map_err(|e| unsaid(&e))??;
+    let wait = shared.raft.wait(Some(WAIT_FOR_STORE));
+    let applied = wait.applied_index_at_least(Some(index), "the leader's barrier applied");
+    applied.await.map_err(|e| unsaid(&e))?;
+    Ok(index)
+}
+
 /// [`register`] for the node the cluster started on, at each start, and the only way it is called for it:
 /// it makes its Node only while the store holds no Node at all (the start that made the cluster, or one
 /// that ended before its Node was in), so a node deleted stays deleted across its restart. False: its Node
 /// is gone, or is a joiner's under the name (another certificate), and nothing was written.
 /// It waits first for the store to have applied what the cluster committed (on the leader, Raft's
-/// linearizable read; on any other node, all the log it holds, of the term it is in): until then a
+/// linearizable read; on any other node, all the log it holds, of the term it is in, and then a
+/// barrier write through the leader, applied here): until then a
 /// Node that is there may not show, and one deleted may.
 pub async fn register_first(
     shared: &Shared,
@@ -1162,6 +1174,9 @@ pub async fn register_first(
             wait.metrics(applied_what_it_holds, "everything its log holds applied")
                 .await
                 .map_err(|e| unsaid(&e))?;
+            // The leader may have committed more than this log holds (a delete of its Node among it):
+            // a write through the leader is at an index past all that, and this store has applied it.
+            leader_barrier(shared).await?;
         }
         Err(e) => return Err(unsaid(&e)),
     }
@@ -2355,6 +2370,22 @@ mod tests {
         assert!(!put(&shared).await.unwrap());
         assert!(shared.store.lock().unwrap().store.get("Node/a").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The barrier a follower asks of the leader before it decides (`register_first`): it comes
+    /// back only once this node has applied the entry the barrier is at, which is past everything
+    /// the leader had committed, and it changes nothing in the store.
+    #[tokio::test]
+    async fn a_barrier_comes_back_once_its_entry_is_applied() {
+        use pinned_peer::{at, node, shared_of};
+        let ca = pki::Ca::create().unwrap();
+        let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
+        let shared = shared_of("barrier-wait", cluster, &[at("b", "127.0.0.1:3", None)]).await;
+        let before = shared.raft.metrics().borrow().last_applied.map_or(0, |l| l.index);
+        let index = leader_barrier(&shared).await.unwrap();
+        let applied = shared.raft.metrics().borrow().last_applied.map_or(0, |l| l.index);
+        assert!(index > before && applied >= index, "{before} {index} {applied}");
+        assert!(shared.store.lock().unwrap().store.get("Node/b").is_some());
     }
 
     #[test]

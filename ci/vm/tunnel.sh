@@ -37,7 +37,7 @@ EOF
             timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 256 -smp 1 -display none -no-reboot \
                 -kernel "$base/vmlinuz" -initrd "$work/provider.cpio" -append "console=ttyS0 panic=-1 rdinit=/bin/pod -- init /script" \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:09" \
-                -serial "file:$work/n9.log" -monitor "unix:$work/keys9,server,nowait" </dev/null >/dev/null 2>&1 &
+                -serial "file:$work/n9.log" -monitor "unix:$work/keys9,server,nowait" </dev/null >/dev/null 2>&1 8>&- &
             vms="$vms $!"
             waited=0
             until grep -aq 'init: ready' "$work/n9.log" 2>/dev/null; do

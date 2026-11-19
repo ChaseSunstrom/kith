@@ -860,7 +860,7 @@ impl Shared {
                 .checking();
             let relay = access_sign::current().and_then(|signed| Some((signed.header, signed.relay?)));
             match relay {
-                Some((header, relay)) if checking && relay.carries(&command) => Command::Signed {
+                Some((header, relay)) if checking && relay.signs(&command) => Command::Signed {
                     header,
                     method: relay.method,
                     path: relay.path,
@@ -947,8 +947,21 @@ impl Shared {
         // Patch, is this node's own: `relayed`.)
         let barrier = matches!(command, Command::Patch { statuses } if statuses.is_empty());
         if access_sign::current().is_some() && !barrier {
-            let why = "refused: a signed request's change that is not passed on as it came (the route is \
-                       not one the leader checks the signature of); send it to the leader directly";
+            // (The certificate route is signed but never passed on: the CA node writes the Identity
+            // with the key it made, and answers only while it leads.)
+            let certificate = access_sign::current()
+                .and_then(|signed| signed.relay)
+                .is_some_and(|relay| access_sign::certificate_of(&relay.path).is_some());
+            let why = match certificate {
+                true => {
+                    "refused: the certificate route answers only on the CA node while it leads, and is \
+                         not passed on to the leader; ask the CA node once it leads"
+                }
+                false => {
+                    "refused: a signed request's change that is not passed on as it came (the route is \
+                          not one the leader checks the signature of); send it to the leader directly"
+                }
+            };
             return Forward::Failed(Error::Invalid(why.into()));
         }
         let mut call = access_sign::pass_on(client.post(format!("https://{at}/v1/raft/write")));
@@ -971,13 +984,15 @@ impl Shared {
                 Forward::Wait(wait, format!("the leader at {at} asked to wait {} s", wait.as_secs()))
             }
             Ok(reply) => {
-                if let Ok(Some((reply, index))) = reply.json::<Option<(Reply, u64)>>().await {
+                let status = reply.status();
+                let said = reply.text().await.unwrap_or_default();
+                let answer = answered(status, &said, at);
+                if let Forward::Done(_, index) = &answer {
                     // What a client writes through this node, it can read from this node.
                     let caught_up = self.raft.wait(Some(PATIENCE));
-                    let _ = caught_up.applied_index_at_least(Some(index), "own write").await;
-                    return Forward::Done(reply, index);
+                    let _ = caught_up.applied_index_at_least(Some(*index), "own write").await;
                 }
-                Forward::Again(None)
+                answer
             }
             // Never reached it (or refused it, which is the same to the change): nothing
             // happened, and asking again is safe.
@@ -1049,7 +1064,11 @@ impl Shared {
 }
 
 /// Whether `command` can change who may do what: it is put in the log alone ([`Shared::turn`]).
-fn changes_access(command: &Command) -> bool {
+/// An Apply, Delete or Rollback of an access kind, any Import, and a Signed entry's command.
+/// A `Patch`, `Status` or `Report` only sets a status, never a spec, and what access reads is
+/// spec; the few status fields it reads of a Node (address, ca, view) are the node's own, held
+/// by layer 2 (`own_writes`). So those are not access writes.
+pub(crate) fn changes_access(command: &Command) -> bool {
     let access = |kind: &str| {
         // (A KindDefinition says whether a kind is namespaced: which rule matches it. A
         // Cluster holds the admin's key, asked of in the same turn: `access_sign::guard`.)
@@ -1080,6 +1099,20 @@ enum Forward {
     Again(Option<String>),
     /// Refused for now (a worker that wrote too much): ask again after this long.
     Wait(Duration, String),
+}
+
+/// What a leader's answer (not a 429) to a forwarded write is: its reply and index; a refusal
+/// of this node itself (401, 403: asking again gets the same, and the leader's words say why) at
+/// once; and for anything else (`null`: not the leader any more; a 5xx) ask again.
+fn answered(status: reqwest::StatusCode, said: &str, at: &str) -> Forward {
+    if matches!(status.as_u16(), 401 | 403) {
+        let said: String = said.chars().take(300).collect();
+        return Forward::Failed(Error::Invalid(format!("the leader at {at} refused ({status}): {said}")));
+    }
+    match serde_json::from_str::<Option<(Reply, u64)>>(said) {
+        Ok(Some((reply, index))) => Forward::Done(reply, index),
+        _ => Forward::Again(None),
+    }
 }
 
 /// The change was not taken in time; `refused` is why the last leader called was not reached.
@@ -1432,6 +1465,39 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leader's refusal of this node (401, 403) ends a forwarded write at once with the leader's
+    /// words; a 5xx or a `null` is asked again; a reply and an index are the answer.
+    #[test]
+    fn a_leaders_refusal_is_not_asked_again() {
+        use reqwest::StatusCode as S;
+        for status in [S::UNAUTHORIZED, S::FORBIDDEN] {
+            match answered(status, "evicted: join again", "10.0.0.1:1") {
+                Forward::Failed(Error::Invalid(why)) => {
+                    assert!(
+                        why.contains("evicted: join again") && why.contains(status.as_str()),
+                        "{why}"
+                    )
+                }
+                _ => panic!("{status} is not refused at once"),
+            }
+        }
+        for (status, said) in [
+            (S::SERVICE_UNAVAILABLE, "overloaded"),
+            (S::OK, "null"),
+            (S::BAD_GATEWAY, ""),
+        ] {
+            assert!(
+                matches!(answered(status, said, "a"), Forward::Again(None)),
+                "{status} {said}"
+            );
+        }
+        let said = serde_json::to_string(&Some((Reply::Err(Error::NotFound("x".into())), 7u64))).unwrap();
+        assert!(matches!(
+            answered(S::OK, &said, "a"),
+            Forward::Done(Err(Error::NotFound(_)), 7)
+        ));
+    }
 
     /// A worker is held to one barrier a second, and the map keeps no name whose second is over
     /// (a deleted worker's, or one of many names that came and went).
@@ -2804,6 +2870,22 @@ mod tests {
             key: "ConfigMap/default/own".into()
         }));
         assert!(!changes_access(&Command::Status { statuses: vec![] }));
+        // A Patch sets fields of a status, never a spec: it cannot reach what access reads of a
+        // Role, RoleBinding, Identity, KindDefinition or Cluster, even when it names one.
+        let fields = serde_json::Map::from_iter([("signing".to_string(), serde_json::json!("open"))]);
+        let mut cluster = map("x");
+        cluster.kind = "Cluster".into();
+        cluster.metadata.namespace = None;
+        cluster.spec = serde_json::json!({"adminKey": "11".repeat(32), "signing": "required"});
+        let key = cluster.key();
+        let patch = Command::Patch {
+            statuses: vec![(key.clone(), fields.clone()), ("Role/x".into(), fields)],
+        };
+        assert!(!changes_access(&patch));
+        let mut store = kith_api::store::Store::default();
+        store.apply(cluster).unwrap();
+        kith_store::run(&mut store, patch).unwrap();
+        assert_eq!(store.get(&key).unwrap().spec["signing"], "required");
     }
 
     /// What the leader asks again of a rollback, a delete and anything else: the kind's own
