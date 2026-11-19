@@ -127,7 +127,14 @@ lost, and the same name is not tried again, so rotate under a new name to try ag
 know:
 
 - One node rotates at a time in a cluster, and only with a peer reached; a node with none is
-  refused (it would have nothing to prove the new key with).
+  refused (it would have nothing to prove the new key with). Nodes asked together go in order of
+  name, the lowest first, each when the one before has said `rotated` or `failed` (a node that is
+  down is not waited for).
+- Every peer that is reached has to take the new key. One on an older kithd, which does not, makes
+  the rotation revert after two minutes: update the cluster's kithd first. A peer that says a
+  `next` and never finishes holds the others back for two minutes, no longer.
+- `failed` and `rotated` live in memory: a kithd that restarts forgets that a rotation was given up
+  (a known limit).
 - Traffic between the node and its peers pauses from the switch until their next handshake, up to
   half a minute. Rotate a node when that is fine; the others are not touched.
 - A node that stops half way starts on the old key (the file is it), and rotates again at once if

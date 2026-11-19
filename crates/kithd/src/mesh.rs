@@ -72,7 +72,8 @@ pub(crate) fn read_key(path: &std::path::Path) -> std::io::Result<Key> {
 }
 
 /// `key` written to `path`: whole or not at all (half a key file would be no key for good), for
-/// its owner alone, and in the directory when this returns (so a power cut keeps it).
+/// its owner alone, and in the directory when this returns (so a power cut keeps it; a directory
+/// that will not sync is said, and is no failure: the file is the key by then).
 pub(crate) fn write_key(path: &std::path::Path, key: &Key) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -86,7 +87,16 @@ pub(crate) fn write_key(path: &std::path::Path, key: &Key) -> std::io::Result<()
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
-    std::fs::File::open(dir)?.sync_all()
+    // The file is the key now, whatever the sync says: an error here must not read as "not written"
+    // (the node would go back to the old key while the file holds the new). Tried twice, then said.
+    let synced = || std::fs::File::open(dir)?.sync_all();
+    if let Err(e) = synced().or_else(|_| synced()) {
+        eprintln!(
+            "kithd: mesh: {} is written, but its directory is not synced: {e}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn random_key() -> std::io::Result<Key> {
@@ -335,7 +345,7 @@ fn resolving(cache: &Arc<std::sync::Mutex<Lookup>>, endpoint: &str, wake: &Arc<N
 }
 
 /// A name for a rotation that is one: some text, not long, with nothing in it a log line would break on.
-fn rotate_name(id: &str) -> bool {
+pub(crate) fn rotate_name(id: &str) -> bool {
     (1..=64).contains(&id.chars().count()) && !id.chars().any(char::is_control)
 }
 
@@ -428,6 +438,17 @@ fn fresh(nexts: BTreeMap<String, Key>, seen: &mut BTreeMap<String, Instant>, now
         .into_iter()
         .filter(|(name, _)| now.saturating_duration_since(seen[name]) < ROTATE_WAIT)
         .collect()
+}
+
+/// Whether a node named before `me` that `reached` has a rotation asked and not done or given up:
+/// two that make their new keys together have none to call each other by, so the lower goes first.
+fn asks_before(store: &Store, me: &str, reached: impl Fn(&str) -> bool) -> bool {
+    store.list(Some("Node")).any(|node| {
+        let name = node.metadata.name.as_str();
+        let asked = node.spec["mesh"]["rotate"].as_str().filter(|id| rotate_name(id));
+        let said = |field: &str| node.status.as_ref().and_then(|status| status["mesh"][field].as_str());
+        name < me && reached(name) && asked.is_some_and(|id| said("rotated") != Some(id) && said("failed") != Some(id))
+    })
 }
 
 /// The peers with the keys they are to take: each member that has a `next` has it as a peer
@@ -573,12 +594,15 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
             let services = crate::services::addresses(&state.store, prefix);
             let home = home_endpoint(&state.store, me, &members, &shook);
-            let turns = (spec.filter(|id| rotated.as_ref() != Some(id)), took, nexts);
+            let reached = |name: &str| members.iter().any(|m| m.name == name && shook_lately(&shook, &m.key));
+            let earlier = asks_before(&state.store, me, reached);
+            let turns = (spec.filter(|id| rotated.as_ref() != Some(id)), took, nexts, earlier);
             (members, mine, said, edge, services.into_values().collect(), home, turns)
         };
-        let (asking, took, nexts) = turns;
-        // The key replacement goes a step on (the next pass, at once, says it).
-        let waiting = !nexts.is_empty();
+        let (asking, took, nexts, earlier) = turns;
+        // The key replacement goes a step on (the next pass, at once, says it). It waits for a node
+        // that has its own to make (the lower name first) and one that is under way.
+        let waiting = !nexts.is_empty() || earlier;
         let shook_by_name: BTreeMap<String, Duration> = members
             .iter()
             .filter(|member| member.name != me)
@@ -1223,6 +1247,37 @@ mod tests {
             .collect();
         assert_eq!(names, BTreeSet::from(["mesh.key".to_string(), "mesh.next".to_string()]));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Nodes asked to rotate at once go one at a time, the lowest name first: a node waits while
+    /// an earlier one that is reached still has its rotation to do (not done, not given up).
+    #[test]
+    fn the_lowest_named_node_rotates_first() {
+        let mut store = Store::default();
+        for name in ["a", "b", "c"] {
+            let source = format!(
+                "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{ mesh: {{ rotate: r1 }} }}\n"
+            );
+            let resource = kith_api::Resource::from_source(&source).unwrap().remove(0);
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let all = |_: &str| true;
+        assert!(!asks_before(&store, "a", all));
+        assert!(asks_before(&store, "b", all));
+        assert!(asks_before(&store, "c", all));
+        // An earlier node that is not reached (down) is not waited for.
+        assert!(!asks_before(&store, "b", |name: &str| name != "a"));
+        assert!(asks_before(&store, "c", |name: &str| name != "a"));
+        // Done or given up: the next goes.
+        store
+            .set_status("Node/a", Some(json!({ "mesh": { "rotated": "r1" } })))
+            .unwrap();
+        assert!(!asks_before(&store, "b", all));
+        assert!(asks_before(&store, "c", all));
+        store
+            .set_status("Node/b", Some(json!({ "mesh": { "failed": "r1" } })))
+            .unwrap();
+        assert!(!asks_before(&store, "c", all));
     }
 
     /// A key is exactly 64 lower-case hex digits: one text per key, so that comparing the texts

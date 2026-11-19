@@ -194,6 +194,26 @@ pub(crate) fn mesh_key_elsewhere(store: &Store, node: &str, key: &str, fields: &
             return Err(refused(key, format!("mesh.{field} is a key: 64 lower-case hex digits")));
         }
     }
+    // (And what it says of a rotation is small: the name asked, and the new keys it holds.)
+    let mesh = fields.get("mesh");
+    for field in ["rotated", "failed"] {
+        let value = mesh.map(|mesh| &mesh[field]).filter(|value| !value.is_null());
+        if value.is_some_and(|value| !value.as_str().is_some_and(crate::mesh::rotate_name)) {
+            return Err(refused(key, format!("mesh.{field} is a short name")));
+        }
+    }
+    let takes = mesh.map(|mesh| &mesh["takes"]).filter(|takes| !takes.is_null());
+    let keys = |takes: &Value| {
+        let list = takes.as_array()?;
+        (list.len() <= 64
+            && list
+                .iter()
+                .all(|key| key.as_str().is_some_and(|k| crate::mesh::key_of(k).is_some())))
+        .then_some(())
+    };
+    if takes.is_some_and(|takes| keys(takes).is_none()) {
+        return Err(refused(key, "mesh.takes is up to 64 keys"));
+    }
     let said = |field: &str| text(field).and_then(crate::mesh::key_of);
     let has = |other: &Resource, field: &str| {
         other
