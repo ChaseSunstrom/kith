@@ -1,6 +1,9 @@
 # A FIDO2 key as a way into a node's state
 
-Status: design, nothing built (T-0863). This record settles what [adr-unlock.md](adr-unlock.md)
+Status: design (T-0863); built so far, and called by nothing: the client's wire half (T-0966:
+CTAPHID framing, the CBOR subset) and its second half (T-0968: AES-256-CBC, ECDH, `hmac-secret`,
+`makeCredential` and `getAssertion`), all tested on a scripted key and never yet on a real one.
+This record settles what [adr-unlock.md](adr-unlock.md)
 left as "FIDO2: deferred", item by item, so that the build can be cut into slices that each
 stand alone. Where the code differs from a line here, the code is the word. A decision here
 that a build finds wrong is changed here, in the same commit.

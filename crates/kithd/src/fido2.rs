@@ -5,6 +5,15 @@
 //!
 //! The device is a trait so a test can use a pipe; the hidraw one comes with the client.
 
+/// Hex text to bytes, for the tests' NIST and RFC vectors.
+#[cfg(test)]
+fn hex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
 /// CTAPHID: 64-byte reports, a message split over an initialization packet and up to 128
 /// continuation packets.
 pub mod frame {
@@ -174,8 +183,31 @@ pub mod frame {
         match answer.split_first() {
             None => Err("an empty CBOR answer".into()),
             Some((0, body)) => Ok(body.to_vec()),
-            Some((status, _)) => Err(format!("the key answered status {status:#04x}")),
+            Some((status, _)) => Err(format!("the key answered status {status:#04x}{}", status_name(*status))),
         }
+    }
+
+    pub const CREDENTIAL_EXCLUDED: &str = "CREDENTIAL_EXCLUDED";
+    pub const PIN_REQUIRED: &str = "PIN_REQUIRED";
+
+    /// The CTAP2 status codes a console has to tell apart, as ` (NAME)` after the number.
+    fn status_name(status: u8) -> String {
+        let name = match status {
+            0x01 => "INVALID_COMMAND",
+            0x02 => "INVALID_PARAMETER",
+            0x03 => "INVALID_LENGTH",
+            0x19 => CREDENTIAL_EXCLUDED,
+            0x26 => "UNSUPPORTED_ALGORITHM",
+            0x27 => "OPERATION_DENIED",
+            0x2e => "NO_CREDENTIALS",
+            0x2f => "USER_ACTION_TIMEOUT",
+            0x31 => "PIN_INVALID",
+            0x32 => "PIN_BLOCKED",
+            0x35 => "PIN_NOT_SET",
+            0x36 => PIN_REQUIRED,
+            _ => return String::new(),
+        };
+        format!(" ({name})")
     }
 
     #[cfg(test)]
@@ -501,6 +533,11 @@ pub mod cbor {
         Bool(bool),
     }
 
+    /// A map key or a small number, as a CBOR unsigned integer.
+    pub fn uint(n: u64) -> Value {
+        Value::Uint(n)
+    }
+
     impl Value {
         pub fn int(n: i64) -> Value {
             if n >= 0 {
@@ -586,6 +623,16 @@ pub mod cbor {
     /// accepts an integer or length in a longer form than the shortest, and a map in any
     /// order.
     pub fn decode(bytes: &[u8]) -> Result<Value, String> {
+        let (v, rest) = decode_prefix(bytes)?;
+        if !rest.is_empty() {
+            return Err(format!("{} bytes after the CBOR item", rest.len()));
+        }
+        Ok(v)
+    }
+
+    /// The first item of `bytes` and what follows it (an authenticator's data holds a key
+    /// and a map one after the other). The same bounds as [`decode`].
+    pub fn decode_prefix(bytes: &[u8]) -> Result<(Value, &[u8]), String> {
         if bytes.len() > super::frame::MAX_MESSAGE {
             return Err(format!(
                 "{} bytes of CBOR: at most {}",
@@ -595,10 +642,7 @@ pub mod cbor {
         }
         let mut rest = bytes;
         let v = item(&mut rest, 0)?;
-        if !rest.is_empty() {
-            return Err(format!("{} bytes after the CBOR item", rest.len()));
-        }
-        Ok(v)
+        Ok((v, rest))
     }
 
     fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
@@ -681,9 +725,7 @@ pub mod cbor {
         fn t(s: &str) -> Value {
             Value::text(s)
         }
-        fn u(n: u64) -> Value {
-            Uint(n)
-        }
+        use super::uint as u;
 
         /// Encodes and decodes to the same value, and every proper prefix is refused.
         fn round_trip(v: &Value) -> Vec<u8> {
@@ -920,6 +962,1051 @@ pub mod cbor {
             let mut bytes = vec![0x59, 0x1e, 0x00]; // 7680 bytes of bytes
             bytes.resize(3 + 7680, 0);
             assert!(decode(&bytes).unwrap_err().contains("at most"));
+        }
+    }
+}
+
+/// AES-256-CBC with no padding, over the `aes` block cipher kithd already links (tpm.rs):
+/// what `hmac-secret` encrypts its salts and its answer with (docs/adr-fido2.md section 1).
+pub mod cbc {
+    use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+    use zeroize::{Zeroize, Zeroizing};
+
+    pub const BLOCK: usize = 16;
+
+    /// `data` encrypted or decrypted under `key` and `iv`. Its length must be a whole number
+    /// of blocks, and not nothing: this is not a padding scheme, and a refused length is
+    /// the caller's mistake, not something to round.
+    pub fn run(key: &[u8; 32], iv: &[u8; BLOCK], data: &[u8], encrypting: bool) -> Result<Vec<u8>, String> {
+        if data.is_empty() || !data.len().is_multiple_of(BLOCK) {
+            return Err(format!(
+                "{} bytes of CBC data: whole blocks of {BLOCK} expected",
+                data.len()
+            ));
+        }
+        let aes = aes::Aes256::new(key.into());
+        // the running block holds plaintext when decrypting, and the chain value too
+        let mut chain = Zeroizing::new(*iv);
+        let mut b = aes::Block::default();
+        let mut out = Vec::with_capacity(data.len());
+        for block in data.as_chunks::<BLOCK>().0 {
+            if encrypting {
+                for (i, byte) in b.iter_mut().enumerate() {
+                    *byte = block[i] ^ chain[i];
+                }
+                aes.encrypt_block(&mut b);
+                chain.copy_from_slice(&b);
+                out.extend_from_slice(&b);
+            } else {
+                b.copy_from_slice(block);
+                aes.decrypt_block(&mut b);
+                for (byte, c) in b.iter_mut().zip(chain.iter()) {
+                    *byte ^= c;
+                }
+                chain.copy_from_slice(block);
+                out.extend_from_slice(&b);
+            }
+        }
+        b[..].zeroize();
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::hex;
+        use super::*;
+
+        fn both(key: &str, iv: &str, plain: &str, cipher: &str) {
+            let (key, iv): ([u8; 32], [u8; 16]) = (hex(key).try_into().unwrap(), hex(iv).try_into().unwrap());
+            assert_eq!(run(&key, &iv, &hex(plain), true).unwrap(), hex(cipher), "encrypting");
+            assert_eq!(run(&key, &iv, &hex(cipher), false).unwrap(), hex(plain), "decrypting");
+        }
+
+        /// NIST SP 800-38A, F.2.5 (CBC-AES256.Encrypt) and F.2.6 (CBC-AES256.Decrypt): four
+        /// chained blocks under a chosen IV.
+        #[test]
+        fn sp_800_38a_cbc_aes256_both_ways() {
+            both(
+                "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4",
+                "000102030405060708090a0b0c0d0e0f",
+                "6bc1bee22e409f96e93d7e117393172a\
+                 ae2d8a571e03ac9c9eb76fac45af8e51\
+                 30c81c46a35ce411e5fbc1191a0a52ef\
+                 f69f2445df4f9b17ad2b417be66c3710",
+                "f58c4c04d6e5f1ba779eabfb5f7bfbd6\
+                 9cfc4e967edb808d679f777bc6702c7d\
+                 39f23369a9d9bacfa530e26304231461\
+                 b2eb05e2c39be9fcda6c19078c6a9d1b",
+            );
+        }
+
+        /// NIST AESAVS, CBC GFSbox known answers for a 256-bit key: a zero key and a zero
+        /// IV, which is what `hmac-secret` uses.
+        #[test]
+        fn aesavs_cbc_gfsbox_256_zero_key_and_iv_both_ways() {
+            let zero = "0".repeat(64);
+            let iv = "0".repeat(32);
+            both(
+                &zero,
+                &iv,
+                "014730f80ac625fe84f026c60bfd547d",
+                "5c9d844ed46f9885085e5d6a4f94c7d7",
+            );
+            both(
+                &zero,
+                &iv,
+                "0b24af36193ce4665f2825d7b4749c98",
+                "a9ff75bd7cf6613d3731c77c3b6d0c04",
+            );
+            both(
+                &zero,
+                &iv,
+                "761c1fe41a18acf20d241650611d90f1",
+                "623a52fcea5d443e48d9181ab32c7421",
+            );
+            both(
+                &zero,
+                &iv,
+                "8a560769d605868ad80d819bdba03771",
+                "38f2c7ae10612415d27ca190d27da8b4",
+            );
+            both(
+                &zero,
+                &iv,
+                "91fbef2d15a97816060bee1feaa49afe",
+                "1bc704f1bce135ceb810341b216d7abe",
+            );
+        }
+
+        #[test]
+        fn a_length_that_is_not_whole_blocks_is_refused_either_way() {
+            for len in [0, 1, 15, 17, 33] {
+                for encrypting in [true, false] {
+                    assert!(run(&[0; 32], &[0; 16], &vec![0; len], encrypting).is_err(), "len {len}");
+                }
+            }
+        }
+
+        #[test]
+        fn a_changed_iv_or_key_changes_the_answer_and_never_decrypts_back() {
+            let data = [7u8; 32];
+            let c = run(&[1; 32], &[2; 16], &data, true).unwrap();
+            assert_ne!(c, run(&[1; 32], &[3; 16], &data, true).unwrap());
+            assert_ne!(c, run(&[9; 32], &[2; 16], &data, true).unwrap());
+            assert_ne!(run(&[1; 32], &[3; 16], &c, false).unwrap(), data);
+        }
+    }
+}
+
+/// PIN protocol 1 for `hmac-secret` (docs/adr-fido2.md section 1): an ECDH P-256 agreement
+/// with the key's agreement key, the shared secret as SHA-256 of the x coordinate, a zero IV,
+/// and the first 16 bytes of an HMAC-SHA-256 as the salt's authentication. The key's agreement
+/// key is untrusted bytes: it is checked before ring sees it, and ring checks the point.
+/// Protocol 2 (a 64-byte secret, a random IV) is not here: the ADR requires it before a release.
+pub mod hmac {
+    use super::{
+        cbc,
+        cbor::{Value, uint},
+    };
+    use ring::{agreement, digest, hmac as ring_hmac, rand};
+    use zeroize::Zeroizing;
+
+    /// A salt, and so the secret it gives, is 32 bytes (one salt of the two `hmac-secret` takes).
+    pub const SALT: usize = 32;
+
+    /// The protocol 1 key from the x coordinate of the ECDH point.
+    pub fn derive(x: &[u8]) -> Zeroizing<[u8; 32]> {
+        let mut key = Zeroizing::new([0u8; 32]);
+        key.copy_from_slice(digest::digest(&digest::SHA256, x).as_ref());
+        key
+    }
+
+    /// The first 16 bytes of the HMAC-SHA-256 of `data`.
+    pub fn mac16(key: &[u8], data: &[u8]) -> [u8; 16] {
+        let tag = ring_hmac::sign(&ring_hmac::Key::new(ring_hmac::HMAC_SHA256, key), data);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&tag.as_ref()[..16]);
+        out
+    }
+
+    /// A COSE_Key for an ECDH P-256 public key (kty 2, alg -25, crv 1).
+    pub(super) fn cose(x: &[u8], y: &[u8]) -> Value {
+        Value::Map(vec![
+            (uint(1), uint(2)),
+            (uint(3), Value::int(-25)),
+            (Value::int(-1), uint(1)),
+            (Value::int(-2), Value::Bytes(x.to_vec())),
+            (Value::int(-3), Value::Bytes(y.to_vec())),
+        ])
+    }
+
+    /// The uncompressed point (0x04, x, y) of a COSE key that is P-256 and nothing else.
+    pub(super) fn point(key: &Value) -> Result<[u8; 65], String> {
+        if key.get(&uint(1)) != Some(&uint(2)) {
+            return Err("the key's agreement key is not an EC2 key".into());
+        }
+        if key.get(&Value::int(-1)) != Some(&uint(1)) {
+            return Err("the key's agreement key is not on P-256".into());
+        }
+        if key.get(&uint(3)).is_some_and(|alg| *alg != Value::int(-25)) {
+            return Err("the key's agreement key is not for ECDH-ES (-25)".into());
+        }
+        let mut out = [0u8; 65];
+        out[0] = 4;
+        for (n, at) in [(-2, 1), (-3, 33)] {
+            match key.get(&Value::int(n)) {
+                Some(Value::Bytes(b)) if b.len() == 32 => out[at..at + 32].copy_from_slice(b),
+                _ => return Err("the key's agreement key has no 32-byte coordinate".into()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// An agreement made with a key's agreement key: the shared secret, and our public key
+    /// to send with it. The private half is gone once the secret is derived.
+    pub struct Session {
+        secret: Zeroizing<[u8; 32]>,
+        key: Value,
+    }
+
+    impl Session {
+        pub fn agree(peer: &Value) -> Result<Session, String> {
+            let peer = point(peer)?;
+            let rng = rand::SystemRandom::new();
+            let mine = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng)
+                .map_err(|_| "no random bytes for the key agreement")?;
+            let public = mine
+                .compute_public_key()
+                .map_err(|_| "no public key for the key agreement")?;
+            let public = public.as_ref();
+            if public.len() != 65 {
+                return Err("an agreement key of an unexpected size".into());
+            }
+            let secret = agreement::agree_ephemeral(
+                mine,
+                &agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, &peer[..]),
+                derive,
+            )
+            .map_err(|_| "the key's agreement key is not a point on P-256")?;
+            Ok(Session {
+                secret,
+                key: cose(&public[1..33], &public[33..]),
+            })
+        }
+
+        /// The `hmac-secret` input of getAssertion for `salt`: our key (1), the salt
+        /// encrypted (2) and its authentication (3).
+        pub fn request(&self, salt: &[u8; SALT]) -> Result<Value, String> {
+            let enc = cbc::run(&self.secret, &[0; cbc::BLOCK], salt, true)?;
+            let auth = mac16(&self.secret[..], &enc);
+            Ok(Value::Map(vec![
+                (uint(1), self.key.clone()),
+                (uint(2), Value::Bytes(enc)),
+                (uint(3), Value::Bytes(auth.to_vec())),
+            ]))
+        }
+
+        /// The secret out of the encrypted answer in the assertion's extensions.
+        pub fn reply(&self, enc: &[u8]) -> Result<Zeroizing<[u8; SALT]>, String> {
+            if enc.len() != SALT {
+                return Err(format!("an hmac-secret answer of {} bytes: {SALT} expected", enc.len()));
+            }
+            let plain = Zeroizing::new(cbc::run(&self.secret, &[0; cbc::BLOCK], enc, false)?);
+            let mut out = Zeroizing::new([0u8; SALT]);
+            out.copy_from_slice(&plain);
+            Ok(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::hex;
+        use super::*;
+
+        /// The P-256 generator, a point that is on the curve.
+        const GX: &str = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
+        const GY: &str = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+
+        /// What a key does with our public key: its own agreement key, then the secret.
+        fn key_side() -> (Value, impl FnOnce(&Value) -> Zeroizing<[u8; 32]>) {
+            let rng = rand::SystemRandom::new();
+            let k = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng).unwrap();
+            let p = k.compute_public_key().unwrap();
+            let theirs = cose(&p.as_ref()[1..33], &p.as_ref()[33..]);
+            (theirs, move |ours: &Value| {
+                let ours = point(ours).unwrap();
+                agreement::agree_ephemeral(
+                    k,
+                    &agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, &ours[..]),
+                    derive,
+                )
+                .unwrap()
+            })
+        }
+
+        #[test]
+        fn the_shared_secret_is_sha256_of_the_x_coordinate() {
+            // sha256sum of the bytes 00 01 .. 1f
+            let x: Vec<u8> = (0..32).collect();
+            assert_eq!(
+                derive(&x)[..],
+                hex("630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd")[..]
+            );
+        }
+
+        /// RFC 4231, test cases 1 and 2 (HMAC-SHA-256), cut to the 16 bytes protocol 1 keeps.
+        #[test]
+        fn the_salt_authentication_is_the_first_16_bytes_of_hmac_sha256() {
+            assert_eq!(
+                mac16(&[0x0b; 20], b"Hi There"),
+                hex("b0344c61d8db38535ca8afceaf0bf12b")[..]
+            );
+            assert_eq!(
+                mac16(b"Jefe", b"what do ya want for nothing?"),
+                hex("5bdcc146bf60754e6a042426089575c7")[..]
+            );
+        }
+
+        #[test]
+        fn both_sides_of_the_agreement_reach_the_same_secret() {
+            let (gx, gy) = (hex(GX), hex(GY));
+            // the generator is a good peer; its agreement works and gives our key to send
+            let s = Session::agree(&cose(&gx, &gy)).unwrap();
+            let p = point(&s.key).unwrap();
+            assert_eq!(p[0], 4);
+            // a key with an agreement key of its own: both ends derive one secret
+            let (theirs, key_secret) = key_side();
+            let s = Session::agree(&theirs).unwrap();
+            assert_eq!(s.secret[..], key_secret(&s.key)[..]);
+        }
+
+        /// Limit: the request and the reply are checked against this module's own reading of
+        /// CTAP2.1 (and the cipher, derive and HMAC against NIST and RFC vectors), so a
+        /// misreading shared by both sides would pass. A trial with a real key is the
+        /// independent check. No slice of docs/adr-fido2.md section 6 runs one (T-0955's
+        /// stand-in is ours too), so it stays a trial to make by hand before release.
+        #[test]
+        fn the_request_carries_our_key_the_encrypted_salt_and_its_authentication() {
+            let (gx, gy) = (hex(GX), hex(GY));
+            let s = Session::agree(&cose(&gx, &gy)).unwrap();
+            let salt = [0x5a; SALT];
+            let req = s.request(&salt).unwrap();
+            let Some(Value::Bytes(enc)) = req.get(&uint(2)) else {
+                panic!("no salt")
+            };
+            assert_eq!(enc.len(), 32);
+            assert_ne!(enc[..], salt[..], "the salt does not travel plain");
+            assert_eq!(cbc::run(&s.secret, &[0; 16], enc, false).unwrap(), salt);
+            assert_eq!(
+                req.get(&uint(3)),
+                Some(&Value::Bytes(mac16(&s.secret[..], enc).to_vec()))
+            );
+            assert_eq!(req.get(&uint(1)), Some(&s.key));
+            // the answer is the secret, encrypted the same way, and comes back as it was
+            let secret = [0x77u8; 32];
+            let sealed = cbc::run(&s.secret, &[0; 16], &secret, true).unwrap();
+            assert_eq!(s.reply(&sealed).unwrap()[..], secret[..]);
+        }
+
+        #[test]
+        fn an_answer_of_the_wrong_size_is_refused() {
+            let s = Session::agree(&cose(&hex(GX), &hex(GY))).unwrap();
+            for len in [0, 15, 16, 31, 33, 48, 64] {
+                assert!(s.reply(&vec![1; len]).unwrap_err().contains("32 expected"), "len {len}");
+            }
+        }
+
+        #[test]
+        fn an_agreement_key_that_is_not_p256_or_not_a_point_is_refused() {
+            let (gx, gy) = (hex(GX), hex(GY));
+            let good = cose(&gx, &gy);
+            assert!(Session::agree(&good).is_ok());
+            let with = |n: i64, v: Value| {
+                let Value::Map(m) = cose(&gx, &gy) else { panic!() };
+                Value::Map(
+                    m.into_iter()
+                        .map(|(k, old)| if k == Value::int(n) { (k, v.clone()) } else { (k, old) })
+                        .collect(),
+                )
+            };
+            let mut off_curve = gy.clone();
+            off_curve[31] ^= 1;
+            for (bad, why) in [
+                (with(1, uint(1)), "EC2"),
+                (with(-1, uint(2)), "P-256"),
+                (with(3, Value::int(-7)), "ECDH-ES"),
+                (with(-2, Value::Bytes(gx[..31].to_vec())), "coordinate"),
+                (with(-3, Value::Bytes([gy.clone(), vec![0]].concat())), "coordinate"),
+                (with(-3, Value::text("y")), "coordinate"),
+                (with(-2, Value::Bytes(vec![0; 32])), "point"),
+                (with(-3, Value::Bytes(off_curve)), "point"),
+                (Value::Map(vec![]), "EC2"),
+                (uint(1), "EC2"),
+            ] {
+                assert!(Session::agree(&bad).err().unwrap().contains(why), "{bad:?}");
+            }
+        }
+    }
+}
+
+/// The two CTAP2 calls the console needs, over a [`frame::Device`] with a channel from
+/// [`frame::init`]: `makeCredential` with `hmac-secret` to enrol a key, and `getAssertion`
+/// with a salt to get its 32-byte secret (docs/adr-fido2.md sections 1, 4 and 6). A key that
+/// refuses answers with its status named (`CREDENTIAL_EXCLUDED`, `PIN_REQUIRED`, ...).
+/// The assertion's signature is not checked: a key that lies gives a wrong secret, and
+/// the state's key does not unwrap under it.
+pub mod flow {
+    use super::cbor::{self, Value, uint};
+    use super::frame::{self, Device};
+    use super::hmac::{self, Session};
+    use ring::{digest, rand::SecureRandom, rand::SystemRandom};
+    use zeroize::Zeroizing;
+
+    const MAKE_CREDENTIAL: u8 = 0x01;
+    const GET_ASSERTION: u8 = 0x02;
+    const GET_INFO: u8 = 0x04;
+    const CLIENT_PIN: u8 = 0x06;
+    /// authData flags: user present, attested credential data, extension data.
+    const UP: u8 = 0x01;
+    const AT: u8 = 0x40;
+    const ED: u8 = 0x80;
+    /// CTAP2's limit on a credential id.
+    const MAX_CREDENTIAL_ID: usize = 1023;
+    /// rpIdHash, flags, signature counter.
+    const AUTH_DATA_HEAD: usize = 37;
+
+    fn call(dev: &mut dyn Device, cid: u32, cmd: u8, params: Option<&Value>) -> Result<Value, String> {
+        let mut request = vec![cmd];
+        if let Some(p) = params {
+            request.extend(cbor::encode(p));
+        }
+        cbor::decode(&frame::cbor_request(dev, cid, &request)?)
+    }
+
+    fn random_32() -> Result<[u8; 32], String> {
+        let mut out = [0u8; 32];
+        SystemRandom::new().fill(&mut out).map_err(|_| "no random bytes")?;
+        Ok(out)
+    }
+
+    fn descriptor(id: &[u8]) -> Value {
+        Value::Map(vec![
+            (Value::text("id"), Value::Bytes(id.to_vec())),
+            (Value::text("type"), Value::text("public-key")),
+        ])
+    }
+
+    /// The key must have `hmac-secret` and PIN protocol 1: this client speaks nothing else.
+    pub fn check_key(dev: &mut dyn Device, cid: u32) -> Result<(), String> {
+        let info = call(dev, cid, GET_INFO, None)?;
+        match info.get(&uint(2)) {
+            Some(Value::Array(ext)) if ext.contains(&Value::text("hmac-secret")) => {}
+            _ => return Err("the key does not list the hmac-secret extension".into()),
+        }
+        match info.get(&uint(6)) {
+            Some(Value::Array(p)) if p.contains(&uint(1)) => Ok(()),
+            _ => Err("the key does not list pinUvAuthProtocols 1: protocol 2 alone is not supported yet".into()),
+        }
+    }
+
+    fn key_agreement(dev: &mut dyn Device, cid: u32) -> Result<Session, String> {
+        let request = Value::Map(vec![(uint(1), uint(1)), (uint(2), uint(2))]); // protocol 1, getKeyAgreement
+        let answer = call(dev, cid, CLIENT_PIN, Some(&request))?;
+        Session::agree(answer.get(&uint(1)).ok_or("the key sent no agreement key")?)
+    }
+
+    /// authData after its head, once its relying party hash and the `need`ed flags check out.
+    fn auth_data<'a>(answer: &'a Value, rp_id: &str, need: u8) -> Result<&'a [u8], String> {
+        let Some(Value::Bytes(auth)) = answer.get(&uint(2)) else {
+            return Err("the key's answer has no authenticator data".into());
+        };
+        if auth.len() < AUTH_DATA_HEAD {
+            return Err(format!("authenticator data of {} bytes is cut short", auth.len()));
+        }
+        if auth[..32] != *digest::digest(&digest::SHA256, rp_id.as_bytes()).as_ref() {
+            return Err("the key's answer is for another relying party".into());
+        }
+        if auth[32] & need != need {
+            return Err(format!("the key's flags {:#04x} lack {need:#04x}", auth[32]));
+        }
+        Ok(&auth[AUTH_DATA_HEAD..])
+    }
+
+    /// The credential id in the attested data of a makeCredential answer, once its
+    /// extensions say `hmac-secret` was made.
+    fn credential_id(answer: &Value, rp_id: &str) -> Result<Vec<u8>, String> {
+        let rest = auth_data(answer, rp_id, UP | AT | ED)?;
+        let short = || "the attested credential data is cut short".to_string();
+        let (id_len, rest) = rest
+            .get(16..)
+            .and_then(|r| r.split_first_chunk::<2>())
+            .ok_or_else(short)?;
+        let id_len = usize::from(u16::from_be_bytes(*id_len));
+        if id_len == 0 || id_len > MAX_CREDENTIAL_ID {
+            return Err(format!("a credential id of {id_len} bytes"));
+        }
+        let (id, rest) = rest.split_at_checked(id_len).ok_or_else(short)?;
+        let (_public_key, rest) = cbor::decode_prefix(rest)?;
+        let extensions = cbor::decode(rest)?;
+        if extensions.get(&Value::text("hmac-secret")) != Some(&Value::Bool(true)) {
+            return Err("the key made the credential without hmac-secret".into());
+        }
+        Ok(id.to_vec())
+    }
+
+    /// Enrol: a credential for `rp_id` with `hmac-secret`, one touch, and its id. A key
+    /// that has one of `exclude` answers CREDENTIAL_EXCLUDED, and one with a PIN set
+    /// answers PIN_REQUIRED.
+    pub fn make_credential(
+        dev: &mut dyn Device,
+        cid: u32,
+        rp_id: &str,
+        exclude: &[Vec<u8>],
+    ) -> Result<Vec<u8>, String> {
+        if let Some(bad) = exclude.iter().find(|id| id.is_empty() || id.len() > MAX_CREDENTIAL_ID) {
+            return Err(format!("an excluded credential id of {} bytes", bad.len()));
+        }
+        check_key(dev, cid)?;
+        let mut request = vec![
+            (uint(1), Value::Bytes(random_32()?.to_vec())),
+            (uint(2), Value::Map(vec![(Value::text("id"), Value::text(rp_id))])),
+            (
+                uint(3),
+                Value::Map(vec![
+                    (Value::text("id"), Value::Bytes(b"kith".to_vec())),
+                    (Value::text("name"), Value::text("kith")),
+                ]),
+            ),
+            (
+                uint(4),
+                Value::Array(vec![Value::Map(vec![
+                    (Value::text("alg"), Value::int(-7)),
+                    (Value::text("type"), Value::text("public-key")),
+                ])]),
+            ),
+            (
+                uint(6),
+                Value::Map(vec![(Value::text("hmac-secret"), Value::Bool(true))]),
+            ),
+            (uint(7), Value::Map(vec![(Value::text("rk"), Value::Bool(false))])),
+        ];
+        if !exclude.is_empty() {
+            request.push((uint(5), Value::Array(exclude.iter().map(|id| descriptor(id)).collect())));
+        }
+        credential_id(&call(dev, cid, MAKE_CREDENTIAL, Some(&Value::Map(request)))?, rp_id)
+    }
+
+    /// The key's `hmac-secret` for `salt` under `credential`: one touch.
+    pub fn get_assertion(
+        dev: &mut dyn Device,
+        cid: u32,
+        rp_id: &str,
+        credential: &[u8],
+        salt: &[u8; hmac::SALT],
+    ) -> Result<Zeroizing<[u8; hmac::SALT]>, String> {
+        if credential.is_empty() || credential.len() > MAX_CREDENTIAL_ID {
+            return Err(format!("a credential id of {} bytes", credential.len()));
+        }
+        check_key(dev, cid)?;
+        let session = key_agreement(dev, cid)?;
+        let request = Value::Map(vec![
+            (uint(1), Value::text(rp_id)),
+            (uint(2), Value::Bytes(random_32()?.to_vec())),
+            (uint(3), Value::Array(vec![descriptor(credential)])),
+            (
+                uint(4),
+                Value::Map(vec![(Value::text("hmac-secret"), session.request(salt)?)]),
+            ),
+            (uint(5), Value::Map(vec![(Value::text("up"), Value::Bool(true))])),
+        ]);
+        let answer = call(dev, cid, GET_ASSERTION, Some(&request))?;
+        let extensions = cbor::decode(auth_data(&answer, rp_id, UP | ED)?)?;
+        match extensions.get(&Value::text("hmac-secret")) {
+            Some(Value::Bytes(sealed)) => session.reply(sealed),
+            _ => Err("the key's assertion has no hmac-secret".into()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::script::{Fault, Key};
+        use super::*;
+
+        const RP: &str = "kith.local";
+
+        fn open(key: &mut Key) -> u32 {
+            frame::init(key, *b"01234567").unwrap().cid
+        }
+
+        #[test]
+        fn make_credential_then_get_assertion_gives_the_32_byte_secret() {
+            let mut key = Key::new();
+            let cid = open(&mut key);
+            let id = make_credential(&mut key, cid, RP, &[]).unwrap();
+            assert_eq!(id, key.creds[0]);
+            let salt = [0x42u8; 32];
+            let secret = get_assertion(&mut key, cid, RP, &id, &salt).unwrap();
+            assert_eq!(secret.len(), 32);
+            assert_eq!(secret[..], key.expected(&id, &salt)[..], "what the key's own seed says");
+            // the same salt again is the same secret, another salt another
+            assert_eq!(get_assertion(&mut key, cid, RP, &id, &salt).unwrap()[..], secret[..]);
+            let other = get_assertion(&mut key, cid, RP, &id, &[0x43; 32]).unwrap();
+            assert_ne!(other[..], secret[..]);
+            assert_eq!(other[..], key.expected(&id, &[0x43; 32])[..]);
+            // the salt never crossed in the clear
+            for (_, req) in &key.seen {
+                assert!(
+                    !format!("{req:?}").contains("66, 66, 66, 66"),
+                    "salt bytes in a request"
+                );
+            }
+        }
+
+        #[test]
+        fn a_second_key_has_another_secret_and_the_same_key_is_excluded() {
+            let (mut a, mut b) = (Key::new(), Key::new());
+            b.seed = 2;
+            let (ca, cb) = (open(&mut a), open(&mut b));
+            let ida = make_credential(&mut a, ca, RP, &[]).unwrap();
+            let idb = make_credential(&mut b, cb, RP, std::slice::from_ref(&ida)).unwrap();
+            let salt = [9u8; 32];
+            let sa = get_assertion(&mut a, ca, RP, &ida, &salt).unwrap();
+            let sb = get_assertion(&mut b, cb, RP, &idb, &salt).unwrap();
+            assert_ne!(sa[..], sb[..]);
+            // the first key again, with its own credential excluded: the key says so by name
+            let e = make_credential(&mut a, ca, RP, &[ida]).unwrap_err();
+            assert!(e.contains(frame::CREDENTIAL_EXCLUDED), "{e}");
+            assert_eq!(a.creds.len(), 1, "and made nothing");
+        }
+
+        #[test]
+        fn a_key_with_a_pin_set_says_pin_required_by_name() {
+            let mut key = Key::new();
+            key.pin = true;
+            let cid = open(&mut key);
+            let e = make_credential(&mut key, cid, RP, &[]).unwrap_err();
+            assert!(e.contains(frame::PIN_REQUIRED), "{e}");
+            assert!(key.creds.is_empty());
+        }
+
+        #[test]
+        fn a_credential_the_key_does_not_have_is_named() {
+            let mut key = Key::new();
+            let cid = open(&mut key);
+            let e = get_assertion(&mut key, cid, RP, &[1; 40], &[0; 32]).unwrap_err();
+            assert!(e.contains("NO_CREDENTIALS"), "{e}");
+        }
+
+        #[test]
+        fn a_key_without_hmac_secret_or_protocol_1_is_refused_before_anything_is_made() {
+            let mut key = Key::new();
+            key.extensions = vec!["credProtect"];
+            let cid = open(&mut key);
+            assert!(
+                make_credential(&mut key, cid, RP, &[])
+                    .unwrap_err()
+                    .contains("hmac-secret")
+            );
+            let mut key = Key::new();
+            key.protocols = vec![2];
+            let cid = open(&mut key);
+            assert!(
+                make_credential(&mut key, cid, RP, &[])
+                    .unwrap_err()
+                    .contains("pinUvAuthProtocols")
+            );
+            assert!(get_assertion(&mut key, cid, RP, &[1; 40], &[0; 32]).is_err());
+            assert!(key.creds.is_empty());
+            assert!(
+                key.seen.iter().all(|(cmd, _)| *cmd == GET_INFO),
+                "only getInfo was asked"
+            );
+        }
+
+        #[test]
+        fn a_credential_made_without_hmac_secret_is_refused() {
+            let mut key = Key::new();
+            key.grant_hmac = false;
+            let cid = open(&mut key);
+            assert!(
+                make_credential(&mut key, cid, RP, &[])
+                    .unwrap_err()
+                    .contains("without hmac-secret")
+            );
+        }
+
+        #[test]
+        fn a_credential_id_out_of_bounds_is_refused_before_the_key_is_asked() {
+            let mut key = Key::new();
+            let cid = open(&mut key);
+            for len in [0, MAX_CREDENTIAL_ID + 1] {
+                assert!(get_assertion(&mut key, cid, RP, &vec![1; len], &[0; 32]).is_err());
+            }
+            assert!(key.seen.is_empty());
+        }
+
+        #[test]
+        fn an_excluded_id_out_of_bounds_is_refused_before_the_key_is_asked() {
+            let mut key = Key::new();
+            let cid = open(&mut key);
+            for len in [0, MAX_CREDENTIAL_ID + 1] {
+                let e = make_credential(&mut key, cid, RP, &[vec![1; 40], vec![1; len]]).unwrap_err();
+                assert!(e.contains("excluded credential id"), "{e}");
+            }
+            assert!(key.seen.is_empty());
+            // the largest id is still sent
+            assert!(make_credential(&mut key, cid, RP, &[vec![1; MAX_CREDENTIAL_ID]]).is_ok());
+        }
+
+        #[test]
+        fn a_wrong_assertion_answer_is_refused_whichever_part_is_wrong() {
+            for (fault, says) in [
+                (Fault::NoExtensions, ""),
+                (Fault::NoHmacSecret, "no hmac-secret"),
+                (Fault::HmacSecretNotBytes, "no hmac-secret"),
+                (Fault::WrongRp, "another relying party"),
+                (Fault::NoEdFlag, "lack"),
+            ] {
+                let mut key = Key::new();
+                let cid = open(&mut key);
+                let id = make_credential(&mut key, cid, RP, &[]).unwrap();
+                key.fault = fault;
+                let e = get_assertion(&mut key, cid, RP, &id, &[7; 32]).unwrap_err();
+                assert!(e.contains(says), "{e}");
+            }
+            // and with no fault the same key answers
+            let mut key = Key::new();
+            let cid = open(&mut key);
+            let id = make_credential(&mut key, cid, RP, &[]).unwrap();
+            assert!(get_assertion(&mut key, cid, RP, &id, &[7; 32]).is_ok());
+        }
+
+        fn attested(rp: &str, flags: u8, tail: &[u8]) -> Value {
+            let mut auth = digest::digest(&digest::SHA256, rp.as_bytes()).as_ref().to_vec();
+            auth.push(flags);
+            auth.extend_from_slice(&[0; 4]);
+            auth.extend_from_slice(tail);
+            Value::Map(vec![(uint(2), Value::Bytes(auth))])
+        }
+
+        /// aaguid, a credential id of 3, a one-item key, `{"hmac-secret": true}`.
+        fn good_tail() -> Vec<u8> {
+            let mut t = vec![0u8; 16];
+            t.extend_from_slice(&[0, 3, 7, 8, 9]);
+            t.push(0x01); // the public key: 1
+            t.extend_from_slice(&cbor::encode(&Value::Map(vec![(
+                Value::text("hmac-secret"),
+                Value::Bool(true),
+            )])));
+            t
+        }
+
+        #[test]
+        fn attested_data_is_read_whole_and_every_cut_of_it_is_refused() {
+            let tail = good_tail();
+            assert_eq!(credential_id(&attested(RP, 0xc1, &tail), RP).unwrap(), [7, 8, 9]);
+            for cut in 0..tail.len() {
+                assert!(
+                    credential_id(&attested(RP, 0xc1, &tail[..cut]), RP).is_err(),
+                    "cut {cut}"
+                );
+            }
+            let mut more = tail.clone();
+            more.push(0);
+            assert!(credential_id(&attested(RP, 0xc1, &more), RP).is_err(), "trailing bytes");
+            assert!(
+                credential_id(&attested("elsewhere", 0xc1, &tail), RP)
+                    .unwrap_err()
+                    .contains("another relying party")
+            );
+            for flags in [0x00, 0x41, 0x81, 0xc0, 0xc0 | 0x04] {
+                if flags & 0xc1 != 0xc1 {
+                    assert!(
+                        credential_id(&attested(RP, flags, &tail), RP)
+                            .unwrap_err()
+                            .contains("lack")
+                    );
+                }
+            }
+            let mut zero_id = tail.clone();
+            zero_id[17] = 0;
+            assert!(
+                credential_id(&attested(RP, 0xc1, &zero_id), RP)
+                    .unwrap_err()
+                    .contains("credential id")
+            );
+            let mut huge = tail;
+            huge[16..18].copy_from_slice(&1024u16.to_be_bytes());
+            assert!(
+                credential_id(&attested(RP, 0xc1, &huge), RP)
+                    .unwrap_err()
+                    .contains("1024")
+            );
+            assert!(credential_id(&Value::Map(vec![]), RP).is_err());
+            assert!(credential_id(&attested(RP, 0xc1, &[]), RP).is_err());
+        }
+    }
+}
+
+/// A scripted key for the tests: the authenticator's side of CTAPHID, getInfo, clientPIN,
+/// makeCredential and getAssertion with `hmac-secret`, answering through the same framing
+/// the client uses. Its secrets come from a seed, so a test can say what they must be.
+#[cfg(test)]
+mod script {
+    use super::cbor::{self, Value};
+    use super::frame::{self, Device, REPORT};
+    use super::{cbc, hmac};
+    use ring::{agreement, digest, hmac as ring_hmac, rand};
+    use std::{collections::VecDeque, io};
+
+    use super::cbor::uint as u;
+    fn t(s: &str) -> Value {
+        Value::text(s)
+    }
+
+    /// One way a getAssertion answer can be wrong.
+    #[derive(Clone, Copy, PartialEq)]
+    pub enum Fault {
+        None,
+        /// ED set, but no extension data after the head.
+        NoExtensions,
+        /// ED set, but the extensions hold no `hmac-secret`.
+        NoHmacSecret,
+        /// `hmac-secret` is text, not the sealed bytes.
+        HmacSecretNotBytes,
+        /// authData for another relying party.
+        WrongRp,
+        /// Extension data present, ED flag clear.
+        NoEdFlag,
+    }
+
+    pub struct Key {
+        /// What the next getAssertion answer gets wrong.
+        pub fault: Fault,
+        pub seed: u8,
+        pub pin: bool,
+        pub protocols: Vec<u64>,
+        pub extensions: Vec<&'static str>,
+        /// What a made credential's extensions say about hmac-secret.
+        pub grant_hmac: bool,
+        pub creds: Vec<Vec<u8>>,
+        /// Every CTAP2 request received: its command byte and its map.
+        pub seen: Vec<(u8, Value)>,
+        agreement: Option<agreement::EphemeralPrivateKey>,
+        incoming: Option<(u32, u8, usize, Vec<u8>)>,
+        out: VecDeque<Vec<u8>>,
+    }
+
+    /// Where the key's answers are framed to.
+    struct Sink<'a>(&'a mut VecDeque<Vec<u8>>);
+    impl Device for Sink<'_> {
+        fn write(&mut self, r: &[u8; REPORT]) -> io::Result<()> {
+            self.0.push_back(r.to_vec());
+            Ok(())
+        }
+        fn read(&mut self) -> io::Result<Vec<u8>> {
+            unreachable!()
+        }
+    }
+
+    impl Key {
+        pub fn new() -> Key {
+            Key {
+                fault: Fault::None,
+                seed: 1,
+                pin: false,
+                protocols: vec![1],
+                extensions: vec!["hmac-secret"],
+                grant_hmac: true,
+                creds: vec![],
+                seen: vec![],
+                agreement: None,
+                incoming: None,
+                out: VecDeque::new(),
+            }
+        }
+
+        fn cred_random(&self, id: &[u8]) -> ring_hmac::Tag {
+            ring_hmac::sign(&ring_hmac::Key::new(ring_hmac::HMAC_SHA256, &[self.seed; 32]), id)
+        }
+
+        /// What the key's hmac-secret is for `salt` under credential `id`.
+        pub fn expected(&self, id: &[u8], salt: &[u8]) -> [u8; 32] {
+            let tag = ring_hmac::sign(
+                &ring_hmac::Key::new(ring_hmac::HMAC_SHA256, self.cred_random(id).as_ref()),
+                salt,
+            );
+            tag.as_ref().try_into().unwrap()
+        }
+
+        fn auth_data(rp: &str, flags: u8, tail: &[u8]) -> Vec<u8> {
+            let mut a = digest::digest(&digest::SHA256, rp.as_bytes()).as_ref().to_vec();
+            a.push(flags);
+            a.extend_from_slice(&[0, 0, 0, 1]);
+            a.extend_from_slice(tail);
+            a
+        }
+
+        fn text_at<'a>(v: &'a Value, key: u64, inner: &str) -> Result<&'a str, u8> {
+            match v.get(&u(key)).and_then(|m| m.get(&t(inner))) {
+                Some(Value::Text(s)) => Ok(s),
+                _ => Err(0x14), // MISSING_PARAMETER
+            }
+        }
+
+        fn ids(v: Option<&Value>) -> Vec<Vec<u8>> {
+            let Some(Value::Array(a)) = v else { return vec![] };
+            a.iter()
+                .filter_map(|d| match d.get(&t("id")) {
+                    Some(Value::Bytes(b)) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn ctap(&mut self, cmd: u8, p: &Value) -> Result<Value, u8> {
+            match cmd {
+                0x04 => Ok(Value::Map(vec![
+                    (u(1), Value::Array(vec![t("FIDO_2_0")])),
+                    (u(2), Value::Array(self.extensions.iter().map(|e| t(e)).collect())),
+                    (u(6), Value::Array(self.protocols.iter().map(|n| u(*n)).collect())),
+                ])),
+                0x06 => {
+                    if p.get(&u(1)) != Some(&u(1)) || p.get(&u(2)) != Some(&u(2)) {
+                        return Err(0x02);
+                    }
+                    let k = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rand::SystemRandom::new())
+                        .unwrap();
+                    let public = k.compute_public_key().unwrap();
+                    let public = public.as_ref();
+                    self.agreement = Some(k);
+                    Ok(Value::Map(vec![(u(1), hmac::cose(&public[1..33], &public[33..]))]))
+                }
+                0x01 => {
+                    let rp = Self::text_at(p, 2, "id")?;
+                    if self.pin {
+                        return Err(0x36);
+                    }
+                    if Self::ids(p.get(&u(5))).iter().any(|id| self.creds.contains(id)) {
+                        return Err(0x19);
+                    }
+                    let id = vec![self.creds.len() as u8 + 1; 40];
+                    self.creds.push(id.clone());
+                    let mut tail = vec![0xaa; 16];
+                    tail.extend_from_slice(&(id.len() as u16).to_be_bytes());
+                    tail.extend_from_slice(&id);
+                    tail.extend_from_slice(&cbor::encode(&hmac::cose(&[1; 32], &[2; 32])));
+                    tail.extend_from_slice(&cbor::encode(&Value::Map(vec![(
+                        t("hmac-secret"),
+                        Value::Bool(self.grant_hmac),
+                    )])));
+                    Ok(Value::Map(vec![
+                        (u(1), t("none")),
+                        (u(2), Value::Bytes(Self::auth_data(rp, 0xc1, &tail))),
+                        (u(3), Value::Map(vec![])),
+                    ]))
+                }
+                0x02 => {
+                    let Value::Text(rp) = p.get(&u(1)).ok_or(0x14u8)? else {
+                        return Err(0x14);
+                    };
+                    let id = Self::ids(p.get(&u(3)))
+                        .into_iter()
+                        .find(|id| self.creds.contains(id))
+                        .ok_or(0x2eu8)?;
+                    let ext = p.get(&u(4)).and_then(|e| e.get(&t("hmac-secret"))).ok_or(0x14u8)?;
+                    let (Some(cose), Some(Value::Bytes(enc)), Some(Value::Bytes(auth))) =
+                        (ext.get(&u(1)), ext.get(&u(2)), ext.get(&u(3)))
+                    else {
+                        return Err(0x14);
+                    };
+                    let peer = hmac::point(cose).map_err(|_| 0x02u8)?;
+                    let k = self.agreement.take().ok_or(0x21u8)?; // PROCESSING
+                    let secret = agreement::agree_ephemeral(
+                        k,
+                        &agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, &peer[..]),
+                        hmac::derive,
+                    )
+                    .map_err(|_| 0x02u8)?;
+                    if hmac::mac16(&secret[..], enc) != auth[..] {
+                        return Err(0x33); // PIN_AUTH_INVALID
+                    }
+                    let salt = cbc::run(&secret, &[0; 16], enc, false).map_err(|_| 0x02u8)?;
+                    let sealed = cbc::run(&secret, &[0; 16], &self.expected(&id, &salt), true).unwrap();
+                    let hmac_secret = match self.fault {
+                        Fault::HmacSecretNotBytes => t("sealed"),
+                        _ => Value::Bytes(sealed),
+                    };
+                    let ext = match self.fault {
+                        Fault::NoExtensions => vec![],
+                        Fault::NoHmacSecret => cbor::encode(&Value::Map(vec![(t("credProtect"), u(1))])),
+                        _ => cbor::encode(&Value::Map(vec![(t("hmac-secret"), hmac_secret)])),
+                    };
+                    let flags = match self.fault {
+                        Fault::NoEdFlag => 0x01,
+                        _ => 0x81,
+                    };
+                    let rp = if self.fault == Fault::WrongRp { "elsewhere" } else { rp };
+                    Ok(Value::Map(vec![
+                        (
+                            u(1),
+                            Value::Map(vec![(t("id"), Value::Bytes(id)), (t("type"), t("public-key"))]),
+                        ),
+                        (u(2), Value::Bytes(Self::auth_data(rp, flags, &ext))),
+                        (u(3), Value::Bytes(vec![0x30; 70])),
+                    ]))
+                }
+                _ => Err(0x01),
+            }
+        }
+
+        fn answer(&mut self, cid: u32, cmd: u8, data: Vec<u8>) {
+            let (cmd, body) = match cmd {
+                frame::INIT => {
+                    let mut a = data[..8].to_vec();
+                    a.extend_from_slice(&0x0a0b_0c0du32.to_be_bytes());
+                    a.extend_from_slice(&[2, 5, 1, 0, 0x04]);
+                    (frame::INIT, a)
+                }
+                frame::CBOR => {
+                    let p = if data.len() > 1 {
+                        cbor::decode(&data[1..]).unwrap()
+                    } else {
+                        Value::Map(vec![])
+                    };
+                    self.seen.push((data[0], p.clone()));
+                    match self.ctap(data[0], &p) {
+                        Ok(v) => (frame::CBOR, [&[0][..], &cbor::encode(&v)].concat()),
+                        Err(status) => (frame::CBOR, vec![status]),
+                    }
+                }
+                _ => (frame::ERROR, vec![1]),
+            };
+            frame::send(&mut Sink(&mut self.out), cid, cmd, &body).unwrap();
+        }
+    }
+
+    impl Device for Key {
+        fn write(&mut self, r: &[u8; REPORT]) -> io::Result<()> {
+            let cid = u32::from_be_bytes([r[0], r[1], r[2], r[3]]);
+            if r[4] & 0x80 != 0 {
+                let len = usize::from(u16::from_be_bytes([r[5], r[6]]));
+                self.incoming = Some((cid, r[4] & 0x7f, len, r[7..7 + len.min(REPORT - 7)].to_vec()));
+            } else if let Some(m) = &mut self.incoming {
+                let want = (m.2 - m.3.len()).min(REPORT - 5);
+                m.3.extend_from_slice(&r[5..5 + want]);
+            }
+            if self.incoming.as_ref().is_some_and(|m| m.3.len() >= m.2) {
+                let (cid, cmd, _, data) = self.incoming.take().unwrap();
+                self.answer(cid, cmd, data);
+            }
+            Ok(())
+        }
+
+        fn read(&mut self) -> io::Result<Vec<u8>> {
+            self.out
+                .pop_front()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "the key has nothing to say"))
         }
     }
 }
