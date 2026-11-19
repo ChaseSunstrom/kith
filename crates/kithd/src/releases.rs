@@ -265,8 +265,9 @@ pub fn fits(asked: Option<&str>, version: &str) -> bool {
 
 /// The Package a release is on: of those that fit what it asks for (and came from the
 /// Repository it names, if it names one), the one it has installed, or the newest when
-/// it has none or follows the newest (`autoUpgrade`). `1.0.0-rc1` is older than `1.0.0`.
-fn package<'a>(store: &'a Store, release: &Resource, spec: &ReleaseSpec) -> Result<&'a Resource, String> {
+/// it has none or `follow`s the newest (`autoUpgrade`; an upgrade's preview follows too).
+/// `1.0.0-rc1` is older than `1.0.0`.
+fn package<'a>(store: &'a Store, release: &Resource, spec: &ReleaseSpec, follow: bool) -> Result<&'a Resource, String> {
     let (name, asked) = (&spec.package.name, spec.package.version.as_deref());
     let version = |package: &Resource| package.spec["version"].as_str().unwrap_or_default().to_string();
     let from = spec
@@ -280,7 +281,7 @@ fn package<'a>(store: &'a Store, release: &Resource, spec: &ReleaseSpec) -> Resu
             && fits(asked, &version(package))
     };
     let installed = release.status.as_ref().and_then(|status| status["version"].as_str());
-    let kept = installed.filter(|_| spec.auto_upgrade != Some(true));
+    let kept = installed.filter(|_| !follow);
     let kept = kept.and_then(|installed| store.get(&format!("Package/{name}-{installed}")));
     let newest = || {
         let packages = store.list(Some("Package")).filter(fitting);
@@ -320,10 +321,14 @@ fn shared_values(store: &Store, key: &str) -> Result<(Stamp, Option<Value>), Str
 
 /// What the Release `release` is to be rendered from, now: the package and the values
 /// over its defaults. (Nothing big is copied here: this runs for every Release on
-/// every change to the store.)
-fn inputs<'a>(store: &'a Store, release: &Resource) -> Result<(Inputs, &'a Resource, Vec<Value>), String> {
+/// every change to the store.) With `preview`, the newest fitting Package, as if it followed.
+fn inputs<'a>(
+    store: &'a Store,
+    release: &Resource,
+    preview: bool,
+) -> Result<(Inputs, &'a Resource, Vec<Value>), String> {
     let spec: ReleaseSpec = serde_json::from_value(release.spec.clone()).map_err(|e| e.to_string())?;
-    let package = package(store, release, &spec)?;
+    let package = package(store, release, &spec, preview || spec.auto_upgrade == Some(true))?;
     let (cluster, everywhere) = shared_values(store, "ConfigMap/kith-system/kith-values")?;
     let (local, here) = shared_values(store, &format!("ConfigMap/{}/{SHARED}", namespace(release)))?;
     let inputs = Inputs {
@@ -581,12 +586,42 @@ fn fetched(store: &Store, release: &Resource, package: &Resource) -> bool {
     origin.is_some() && package.metadata.annotations.get(REPOSITORY) == origin.as_ref()
 }
 
+/// What an upgrade of `release` is rendered from: it does not follow, has something
+/// installed, and a newer Package fits. None for any other.
+fn newer<'a>(store: &'a Store, release: &Resource) -> Option<(Inputs, &'a Resource, Vec<Value>)> {
+    let installed = release.status.as_ref()?["version"].as_str()?;
+    if release.spec["autoUpgrade"] == true {
+        return None;
+    }
+    let found = inputs(store, release, true).ok()?;
+    (found.1.spec["version"] != installed).then_some(found)
+}
+
+/// Drop the renders of what is gone, and the upgrade of each Release that has none to preview.
+fn prune(store: &Store, renders: &mut Renders, upgrades: &mut Renders) {
+    renders.retain(|key, _| store.get(key).is_some());
+    upgrades.retain(|key, _| store.get(key).is_some_and(|release| newer(store, release).is_some()));
+}
+
 /// The Releases whose render is missing or out of date.
 fn pending(store: &Store, renders: &Renders) -> Vec<(String, Inputs, Job)> {
+    jobs(store, renders, false)
+}
+
+/// The Releases whose upgrade has no render, or one out of date ([`newer`]).
+fn upgrading(store: &Store, upgrades: &Renders) -> Vec<(String, Inputs, Job)> {
+    jobs(store, upgrades, true)
+}
+
+fn jobs(store: &Store, renders: &Renders, upgrade: bool) -> Vec<(String, Inputs, Job)> {
     let mut jobs = Vec::new();
     for release in store.list(Some("Release")) {
         // (One that cannot be started says why in `plan`.)
-        let Ok((inputs, package, layers)) = inputs(store, release) else {
+        let Some((inputs, package, layers)) = (if upgrade {
+            newer(store, release)
+        } else {
+            inputs(store, release, false).ok()
+        }) else {
             continue;
         };
         let key = release.key();
@@ -672,6 +707,63 @@ pub fn recorded(owner: &Resource) -> BTreeSet<&str> {
     listed.into_iter().flatten().filter_map(Value::as_str).collect()
 }
 
+/// Are `live` and `wanted` the same, as far as applying one over the other would change it?
+fn same(live: &Resource, wanted: &Resource) -> bool {
+    (&live.spec, &live.metadata.labels, &live.metadata.annotations)
+        == (&wanted.spec, &wanted.metadata.labels, &wanted.metadata.annotations)
+}
+
+/// What moving `release` to the Package its upgrade is rendered from would change, by what
+/// `installed` and that render make: the keys to apply (new or changed) and to delete. Taken
+/// from the two renders, not the store, so a hand edit or another Release's churn does not
+/// move it. Null when there is no newer Package; None when its render is not made yet.
+fn upgrade_of<'a>(store: &Store, release: &Resource, installed: &'a Output, upgrades: &'a Renders) -> Option<Value> {
+    let Some((now, package, _)) = newer(store, release) else {
+        return Some(Value::Null);
+    };
+    let (had, rendered) = upgrades.get(&release.key())?;
+    if !fresh(store, release, had, &now) {
+        return None;
+    }
+    let version = &package.spec["version"];
+    Some(match rendered {
+        Err(error) => json!({ "version": version, "error": error }),
+        Ok(upgraded) => {
+            let keyed = |output: &'a Output| -> BTreeMap<String, &'a Resource> {
+                output.resources.iter().map(|r| (r.key(), r)).collect()
+            };
+            let (had, next) = (keyed(installed), keyed(upgraded));
+            let apply: Vec<&String> = next
+                .iter()
+                .filter(|(key, wanted)| !had.get(*key).is_some_and(|live| same(live, wanted)))
+                .map(|(key, _)| key)
+                .collect();
+            let delete: Vec<&String> = had.keys().filter(|key| !next.contains_key(*key)).collect();
+            json!({ "version": version, "apply": apply, "delete": delete })
+        }
+    })
+}
+
+/// How many installed versions a Release's status remembers.
+const HISTORY: usize = 10;
+
+/// The Release's `history` with `version` added, when it is not the one last installed: a
+/// spec edit at one version adds nothing, a move back to an older one adds an entry. None
+/// when there is nothing to add.
+fn history_of(release: &Resource, version: &str, now: u64) -> Option<Value> {
+    let mut seen: Vec<Value> = release
+        .status
+        .as_ref()
+        .and_then(|status| status["history"].as_array().cloned())
+        .unwrap_or_default();
+    if seen.last().is_some_and(|last| last["version"] == version) {
+        return None;
+    }
+    seen.push(json!({ "version": version, "revision": release.metadata.revision, "at": now }));
+    seen.drain(..seen.len().saturating_sub(HISTORY));
+    Some(Value::Array(seen))
+}
+
 /// Compare `resources` with the store for the owner `key`. Nothing of someone else's
 /// is taken over: one resource that is there already and not `key`'s refuses them all.
 pub fn reconcile(
@@ -703,15 +795,7 @@ pub fn reconcile(
     for resource in resources {
         done.kept.insert(resource.key());
         let live = store.get(&resource.key());
-        let same = live.is_some_and(|live| {
-            (&live.spec, &live.metadata.labels, &live.metadata.annotations)
-                == (
-                    &resource.spec,
-                    &resource.metadata.labels,
-                    &resource.metadata.annotations,
-                )
-        });
-        if !same {
+        if !live.is_some_and(|live| same(live, resource)) {
             done.apply.push(resource.clone());
             done.differ.extend(live.map(Resource::key));
         }
@@ -724,12 +808,13 @@ pub fn reconcile(
     Ok(done)
 }
 
-/// What the store needs done for its Releases, given the renders there are.
-fn plan(store: &Store, renders: &Renders) -> Plan {
+/// What the store needs done for its Releases, given the renders there are and the upgrades
+/// previewed; `now` (unix seconds) is when a version newly installed is written down.
+fn plan(store: &Store, renders: &Renders, upgrades: &Renders, now: u64) -> Plan {
     let mut plan = Plan::default();
     for release in store.list(Some("Release")) {
         let key = release.key();
-        let (output, package) = match inputs(store, release) {
+        let (output, package) = match inputs(store, release, false) {
             Err(e) => (Err(e), None),
             Ok((now, package, _)) => match renders.get(&key) {
                 Some((had, output)) if fresh(store, release, had, &now) => (output.clone(), Some(package)),
@@ -765,10 +850,18 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
                 let following = release.spec["autoUpgrade"] == true && release.spec["package"]["repo"].is_string();
                 let unlooked = following.then(|| supplied(store, release).err()).flatten();
                 let message = unlooked.map(|why| format!("no newer Package is looked for: {why}"));
-                json!({
+                let mut status = json!({
                     "state": "installed", "message": message, "version": output.version,
                     "resources": done.kept, "notes": output.notes, "observedRevision": release.metadata.revision,
-                })
+                });
+                // (Left out when not known yet or unchanged: the status is written when a field differs.)
+                if let Some(pending) = upgrade_of(store, release, &output, upgrades) {
+                    status["pending"] = pending;
+                }
+                if let Some(history) = history_of(release, &output.version, now) {
+                    status["history"] = history;
+                }
+                status
             }
             // (What was installed before stays as it is.)
             Err(e) => failed(&e, release.metadata.revision),
@@ -876,15 +969,15 @@ fn failed(why: &str, revision: Option<u64>) -> Value {
 
 /// Install the Releases, as long as this node leads the store, until told to stop.
 pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
-    let mut renders = Renders::new();
+    let (mut renders, mut upgrades) = (Renders::new(), Renders::new());
     let mut generation = shared.generation.subscribe();
     loop {
         let metrics = shared.raft.metrics().borrow().clone();
         if metrics.current_leader == Some(metrics.id) {
-            let jobs = {
+            let (jobs, previews) = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
-                renders.retain(|key, _| state.store.get(key).is_some());
-                pending(&state.store, &renders)
+                prune(&state.store, &mut renders, &mut upgrades);
+                (pending(&state.store, &renders), upgrading(&state.store, &upgrades))
             };
             // (Each in a kithd of its own, one at a time: a package is someone else's code, and
             // what it grows to, a panic or a stack it overflows ends only that one.)
@@ -892,9 +985,13 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 let rendered = apart(&job).await;
                 renders.insert(key, learned(inputs, rendered));
             }
+            for (key, inputs, job) in previews {
+                let rendered = apart(&job).await;
+                upgrades.insert(key, learned(inputs, rendered));
+            }
             let plan = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
-                plan(&state.store, &renders)
+                plan(&state.store, &renders, &upgrades, kith_api::store::now())
             };
             carry_out(&shared, plan.steps, plan.orphans).await;
         }
@@ -1068,11 +1165,20 @@ mod tests {
 
     /// Render what is pending and carry the plan out, until there is nothing to do.
     fn settle(store: &mut Store, renders: &mut Renders) -> usize {
+        settle_at(store, renders, &mut Renders::new(), 1000)
+    }
+
+    /// `settle`, with the upgrades kept between calls and the clock at `now`.
+    fn settle_at(store: &mut Store, renders: &mut Renders, upgrades: &mut Renders, now: u64) -> usize {
         for turn in 0..10 {
+            prune(store, renders, upgrades);
             for (key, inputs, job) in pending(store, renders) {
                 renders.insert(key, learned(inputs, render(&job)));
             }
-            let plan = plan(store, renders);
+            for (key, inputs, job) in upgrading(store, upgrades) {
+                upgrades.insert(key, learned(inputs, render(&job)));
+            }
+            let plan = plan(store, renders, upgrades, now);
             if plan == Plan::default() {
                 return turn;
             }
@@ -1463,6 +1569,155 @@ mod tests {
     }
 
     /// The Identity bob, who may apply and delete `kinds` (a YAML list's insides) in shop.
+    const SELF: &str = "Release/shop/mine";
+
+    fn status_of(store: &Store) -> Value {
+        store.get(SELF).unwrap().status.clone().unwrap()
+    }
+
+    /// A Release that is not following says in `status.pending` which resources moving to the
+    /// newest fitting Package would apply and delete, from the two renders alone.
+    #[test]
+    fn a_release_says_what_an_upgrade_would_change() {
+        let (mut store, mut renders, mut upgrades) = (Store::default(), Renders::new(), Renders::new());
+        let old =
+            "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }}-old }\nspec: { data: { a: b } }\n";
+        let new = old.replace("-old", "-new");
+        let changed = MAP.replace("colour: {{", "colour: v2-{{");
+        let pinned = RELEASE.replace("autoUpgrade: true", "autoUpgrade: false");
+        let pending = |store: &Store| status_of(store)["pending"].clone();
+
+        store
+            .apply(package("1.0.0", &[("map.yaml", MAP), ("old.yaml", old)]))
+            .unwrap();
+        apply(&mut store, &pinned);
+        settle_at(&mut store, &mut renders, &mut upgrades, 10);
+        assert_eq!(pending(&store), Value::Null);
+        assert!(upgrades.is_empty());
+
+        // 1.5.0 changes `mine-maps`, adds `-new`, drops `-old`, and leaves `-extra` be.
+        store
+            .apply(package("1.5.0", &[("map.yaml", &changed), ("new.yaml", &new)]))
+            .unwrap();
+        settle_at(&mut store, &mut renders, &mut upgrades, 20);
+        let expected = json!({
+            "version": "1.5.0",
+            "apply": ["ConfigMap/shop/mine-maps", "ConfigMap/shop/mine-maps-new"],
+            "delete": ["ConfigMap/shop/mine-maps-old"],
+        });
+        assert_eq!(pending(&store), expected);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
+        assert_eq!(settle_at(&mut store, &mut renders, &mut upgrades, 30), 0);
+
+        // A hand edit to a live resource is not what an upgrade changes.
+        let mut live = store.get("ConfigMap/shop/mine-maps").unwrap().clone();
+        live.spec["data"]["colour"] = json!("blue");
+        store.apply(live).unwrap();
+        settle_at(&mut store, &mut renders, &mut upgrades, 40);
+        assert_eq!(pending(&store), expected);
+
+        // Following, it goes there and has nothing pending; so has one that is current.
+        apply(&mut store, RELEASE);
+        settle_at(&mut store, &mut renders, &mut upgrades, 50);
+        assert_eq!(
+            (status_of(&store)["version"].clone(), pending(&store)),
+            (json!("1.5.0"), Value::Null)
+        );
+        assert!(upgrades.is_empty());
+        apply(&mut store, &pinned);
+        settle_at(&mut store, &mut renders, &mut upgrades, 60);
+        assert_eq!(pending(&store), Value::Null);
+        assert_eq!(settle_at(&mut store, &mut renders, &mut upgrades, 61), 0);
+
+        // A newer one whose render fails says so, and nothing else.
+        store.apply(package("1.6.0", &[("map.yaml", "{% if %}")])).unwrap();
+        settle_at(&mut store, &mut renders, &mut upgrades, 70);
+        let failed = pending(&store);
+        let mut fields: Vec<&String> = failed.as_object().unwrap().keys().collect();
+        fields.sort();
+        assert_eq!(
+            (fields, &failed["version"]),
+            (vec![&"error".to_string(), &"version".to_string()], &json!("1.6.0"))
+        );
+        assert!(!failed["error"].as_str().unwrap().is_empty());
+        assert_eq!(settle_at(&mut store, &mut renders, &mut upgrades, 80), 0);
+    }
+
+    /// `status.history` has one entry per version installed (newest last, the last ten), so
+    /// writing it never makes another turn.
+    #[test]
+    fn a_release_keeps_a_history_without_a_write_loop() {
+        let (mut store, mut renders, mut upgrades) = (Store::default(), Renders::new(), Renders::new());
+        let revision = |store: &Store| store.get(SELF).unwrap().metadata.revision;
+        let history = |store: &Store| status_of(store)["history"].clone();
+        let mut at = 100;
+        let mut settled = |store: &mut Store| {
+            at += 100;
+            settle_at(store, &mut renders, &mut upgrades, at);
+            assert_eq!(settle_at(store, &mut renders, &mut upgrades, at + 1), 0);
+            at
+        };
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, RELEASE);
+        let first = revision(&store);
+        let at1 = settled(&mut store);
+        assert_eq!(
+            history(&store),
+            json!([{ "version": "1.0.0", "revision": first, "at": at1 }])
+        );
+
+        store.apply(package("2.0.0", &[("map.yaml", MAP)])).unwrap();
+        let at2 = settled(&mut store);
+        let both = json!([
+            { "version": "1.0.0", "revision": first, "at": at1 },
+            { "version": "2.0.0", "revision": first, "at": at2 },
+        ]);
+        assert_eq!(history(&store), both);
+
+        // A spec edit at the same version adds nothing.
+        apply(&mut store, &RELEASE.replace("extra: true", "extra: false"));
+        assert_ne!(revision(&store), first);
+        settled(&mut store);
+        assert_eq!(history(&store), both);
+
+        // A move back to an older version is another entry.
+        let back = RELEASE.replace("autoUpgrade: true", "autoUpgrade: false");
+        apply(
+            &mut store,
+            &back.replace("name: maps }", "name: maps, version: 1.0.0 }"),
+        );
+        let at3 = settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
+        let entries = history(&store);
+        assert_eq!(
+            entries.as_array().unwrap()[2],
+            json!({ "version": "1.0.0", "revision": revision(&store), "at": at3 })
+        );
+        assert_eq!(entries.as_array().unwrap().len(), 3);
+
+        // Eleven more installs keep the last ten.
+        apply(&mut store, RELEASE);
+        for minor in 3..=13 {
+            store
+                .apply(package(&format!("{minor}.0.0"), &[("map.yaml", MAP)]))
+                .unwrap();
+            settled(&mut store);
+        }
+        let entries = history(&store);
+        let versions: Vec<&str> = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            [
+                "4.0.0", "5.0.0", "6.0.0", "7.0.0", "8.0.0", "9.0.0", "10.0.0", "11.0.0", "12.0.0", "13.0.0"
+            ]
+        );
+    }
+
     fn bob(store: &mut Store, kinds: &str) {
         apply(
             store,

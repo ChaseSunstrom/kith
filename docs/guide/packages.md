@@ -43,7 +43,7 @@ A cluster installs a package itself: push the package, apply a `Release`.
 ```sh
 kith package push packages/web      # the package, as Package/web-0.1.0 in the store
 kith apply -f release.yaml
-kith get release/shop -n store -o yaml   # status: state, version, resources, notes
+kith get release/shop -n store -o yaml   # status: state, version, resources, notes, pending, history
 ```
 
 ```yaml
@@ -59,7 +59,7 @@ spec:
 |---|---|
 | Rendering | The node that leads the store renders and applies again on a change to the Release, the package or shared values, and deletes what is no longer rendered (all of it, with the Release). `kith rollback release/shop --to N` goes back to an earlier Release. |
 | Values | Later over earlier: the package's defaults, the key `values` (YAML) of the ConfigMap `kith-system/kith-values`, the same in the Release's namespace, the Release's `spec.values`. |
-| `version` | One version (`1.2.0`) or a range (`^1.2`, `>=1, <3`); none is any version that is not a pre-release. A Release stays on the newest package that fits; `autoUpgrade: true` follows newer ones. Pushing a version again replaces it. |
+| `version` | One version (`1.2.0`) or a range (`^1.2`, `>=1, <3`); none is any version that is not a pre-release. A Release stays on the newest package that fits; `autoUpgrade: true` follows newer ones. Pushing a version again replaces it. A Release that stays while a newer package fits says in `status.pending` what moving to it would do: `{version, apply: [keys new or changed], delete: [keys no longer rendered]}`, or `{version, error}` when that version does not render (null when it follows or is current). It is the difference of the two renders, so a hand edit does not change it. `status.history` lists the versions installed, `{version, revision, at}` (the Release's revision, unix seconds), newest last, the last ten; a spec edit at the same version adds none, a move back to an older one adds one. |
 | What it owns | What a release installed is annotated `kith.dev/owned-by` with the Release's key and listed in its status; only what is both is deleted when no longer rendered (`kith apply` refuses a resource annotated as a Release's when there is no such Release). |
 | What it refuses | To take over what is there and not its own, to leave its namespace, to make a Node, Package, Release, Source or `kith-values` ConfigMap. This, or a failing template, is `state: error` with the reason in `message`; what was installed stays. |
 | Whose rights | A Release acts with the rights of whoever applied it (or rolled it back), which kithd writes down as `kith.dev/written-by`; what a client says there is not taken. Each render asks for every resource, what it reaches (a Backup's Volume and Secret, a Share's Volume, a CronJob's Jobs) and each deletion as if that writer applied it. |
