@@ -16,8 +16,8 @@ needs a registry).
     python3 ci/order.py --check   how many of the file's names the built kithd still has, and
                                   has together where its code starts: exit 1 under 95 in 100
                                   of the names, or four fifths of those together
-    python3 ci/order.py --stale   trace and write nothing: exit 1 when more than a few
-                                  functions that ran are not in the file (code written since
+    python3 ci/order.py --stale   trace twice and write nothing: exit 1 when more than a few
+                                  functions that ran, in the worse trace, are not in the file (code written since
                                   that runs at start or idle: write the file again)
     python3 ci/order.py --self-test   what a name keeps through an ordinary change
 
@@ -270,9 +270,18 @@ def unnamed(ran, names):
     return [pattern for pattern in ran if pattern not in names]
 
 
+def stalest(orders, names):
+    """The most unnamed patterns any one of the traces `orders` ran (the first, on a tie)."""
+    return max((unnamed(ran, names) for ran in orders), key=len)
+
+
 def self_test():
     """What a name keeps through an ordinary change, and what it does not."""
     assert unnamed(["a", "b", "c"], ["c", "a"]) == ["b"] and unnamed([], ["a"]) == []
+    # The count wanders between runs (5 at one, 11 at the next): the gate reads the larger.
+    five, eleven = [f"n{i}" for i in range(5)], [f"n{i}" for i in range(11)]
+    assert len(stalest([["x"] + five, ["x"] + eleven], ["x"])) == 11
+    assert len(stalest([["x"] + eleven, ["x"] + five], ["x"])) == 11 and stalest([["x"]], ["x"]) == []
     # A crate's hash, an impl's number in its module, and the number the compiler gives a copy.
     was = "_RNvMs0_NtCshUCiHv8I5f8_5alloc5allocNtB5_6Global18alloc_impl_runtime.7057"
     now = "_RNvMs1_NtCs1gUZZmupoa8_5alloc5allocNtB5_6Global18alloc_impl_runtime.4840"
@@ -315,16 +324,23 @@ def main():
         # (An empty file orders nothing; one with names that are gone, less; and a link that
         # did not take the order leaves them all over.)
         sys.exit(0 if names and len(found) >= 0.95 * len(names) and together >= 0.8 * len(found) else 1)
-    # (Each pattern once, where the first function it names ran.)
-    order = list(dict.fromkeys(loose(name) for name in traced(kithd, known)))
-    order = [pattern for pattern in order if re.fullmatch(PATTERN, pattern)]
-    missing = [what for what, part in MUST.items() if not any(part in pattern for pattern in order)]
-    if missing:
-        sys.exit(f"the traced kithd ran no function of {', '.join(missing)}: nothing written")
+    def trace():
+        # (Each pattern once, where the first function it names ran.)
+        order = list(dict.fromkeys(loose(name) for name in traced(kithd, known)))
+        order = [pattern for pattern in order if re.fullmatch(PATTERN, pattern)]
+        missing = [what for what, part in MUST.items() if not any(part in pattern for pattern in order)]
+        if missing:
+            sys.exit(f"the traced kithd ran no function of {', '.join(missing)}: nothing written")
+        return order
+
+    order = trace()
     if args.stale:
         with open(ORDER) as file:
-            new = unnamed(order, file.read().split())
-        print(f"{len(new)} of the {len(order)} functions that ran are not in kithd.order (at most {STALE}): {' '.join(new[:8])}")
+            names = file.read().split()
+        # The count wanders between runs (8 or under at one, 11 to 14 at the next): judge the larger of two.
+        orders = [order, trace()]
+        new = stalest(orders, names)
+        print(f"{' and '.join(str(len(unnamed(ran, names))) for ran in orders)} of the {len(order)} functions that ran are not in kithd.order, the larger judged (at most {STALE}): {' '.join(new[:8])}")
         sys.exit(0 if len(new) <= STALE else "kithd.order is stale: write it again (python3 ci/order.py) and build")
     with open(ORDER, "w") as file:
         file.write("".join(name + "\n" for name in order))
