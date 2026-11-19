@@ -16,7 +16,7 @@ type Strings = BTreeMap<String, String>;
 
 /// What a Workload may have of replicas (`kith-api` refuses more): and of a StatefulSet's
 /// claims, which would otherwise be as many as a number in a manifest says.
-const MAX_REPLICAS: u32 = 1000;
+const MAX_REPLICAS: u32 = 1000; // (the note in `workload` says the number)
 
 /// Every document of a source as JSON; a document that cannot be read is an error.
 pub fn documents(name: &str, src: &str) -> Result<Vec<Value>, String> {
@@ -873,9 +873,9 @@ fn probe(cx: &mut Cx, container: &mut Map, key: &str, at: &str) -> Option<Value>
 
 /// What a volume of a pod is.
 enum Vol {
-    Claim(String),
-    /// A StatefulSet's claim template: each replica's claim is this name and `-ORDINAL`.
-    Each(String),
+    /// A claim; `true`: a StatefulSet's claim template, each replica's claim this name and
+    /// `-ORDINAL`.
+    Claim(String, bool),
     /// A ConfigMap's or (`secret`) a Secret's keys as files.
     Files {
         secret: bool,
@@ -1072,15 +1072,9 @@ fn container(cx: &mut Cx, mut c: Map, at: &str, list: &str, vols: &Volumes, of_p
                     "not translated: its volume is not a PersistentVolumeClaim, a ConfigMap, a Secret or an emptyDir";
                 cx.note(&mp, why)
             }
-            (Some(Vol::Claim(claim)), Some(path)) => mounts.push(obj([
+            (Some(Vol::Claim(claim, each)), Some(path)) => mounts.push(obj([
                 ("volume", Some(json!(claim))),
-                ("path", Some(json!(path))),
-                ("readOnly", some(read_only)),
-                ("subPath", some(part)),
-            ])),
-            (Some(Vol::Each(claim)), Some(path)) => mounts.push(obj([
-                ("volume", Some(json!(claim))),
-                ("perReplica", Some(json!(true))),
+                ("perReplica", each.then(|| json!(true))),
                 ("path", Some(json!(path))),
                 ("readOnly", some(read_only)),
                 ("subPath", some(part)),
@@ -1178,7 +1172,10 @@ fn pod(cx: &mut Cx, mut tpl: Map, at: &str, claims: &Strings, has_priority: bool
     let mut s = cx.map(&mut tpl, "spec", at);
     cx.rest(tpl, at);
 
-    let mut vols: Volumes = claims.iter().map(|(k, v)| (k.clone(), Vol::Each(v.clone()))).collect();
+    let mut vols: Volumes = claims
+        .iter()
+        .map(|(k, v)| (k.clone(), Vol::Claim(v.clone(), true)))
+        .collect();
     for mut v in cx.maps(&mut s, "volumes", &sp) {
         let Some(name) = cx.text(&mut v, "name", &sp) else {
             cx.note(&join(&sp, "volumes"), "has a volume without a name: not translated");
@@ -1193,7 +1190,7 @@ fn pod(cx: &mut Cx, mut tpl: Map, at: &str, claims: &Strings, has_priority: bool
         let cp = join(&vp, "persistentVolumeClaim");
         let claim_name = cx.text(&mut claim, "claimName", &cp);
         cx.rest(claim, &cp);
-        let mut vol = claim_name.map_or(Vol::Other, Vol::Claim);
+        let mut vol = claim_name.map_or(Vol::Other, |c| Vol::Claim(c, false));
         for (key, named) in [("configMap", "name"), ("secret", "secretName")] {
             vol = files(cx, &mut v, key, named, &vp).unwrap_or(vol);
         }
@@ -1403,10 +1400,7 @@ fn workload(cx: &mut Cx, root: &mut Map, mut meta: Metadata, kind: &str, out: Ou
                 let base = format!("{template}-{}", meta.name);
                 let wanted = replicas.unwrap_or(1);
                 if wanted > MAX_REPLICAS {
-                    cx.note(
-                        "spec.replicas",
-                        &format!("claims are made for the first {MAX_REPLICAS} replicas only"),
-                    );
+                    cx.note("spec.replicas", "claims are made for the first 1000 replicas only");
                 }
                 for ordinal in 0..wanted.min(MAX_REPLICAS) {
                     let mut each = claim.clone();
