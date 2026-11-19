@@ -196,11 +196,28 @@ EOF
                 stock='nginx as it is shipped (mirror.gcr.io/library/nginx:1.27-alpine) rolled out by kubectl create deployment and by helm install --wait, and answered through its Service'
             fi
 
+            # A StatefulSet of three with a claim template: a claim and a volume for each replica,
+            # across the two nodes, each replica on the node of its own volume (also when it
+            # starts again), and a claim deleted takes nothing from a replica that is running.
+            must 'kubectl apply of the StatefulSet of three' k apply -f "$root/ci/kube/ring.yaml"
+            must 'the StatefulSet of three did not roll out' k rollout status statefulset/ring --timeout=240s
+            for n in 0 1 2; do
+                [ "$(k get pvc "data-ring-$n" -o 'jsonpath={.status.phase}' 2>&1)" = Bound ] || fail "the claim data-ring-$n is not bound: $(k get pvc 2>&1)"
+            done
+            ring_nodes() { for n in 0 1 2; do k get pod "ring-$n" -o 'jsonpath={.spec.nodeName}' 2>&1; echo; done; }
+            ringed=$(ring_nodes)
+            [ "$(echo "$ringed" | sort -u | wc -l)" -ge 2 ] || fail "the three replicas are all on one node, not across the two: $ringed"
+            must 'kubectl rollout restart of the StatefulSet of three' k rollout restart statefulset/ring
+            must 'the StatefulSet of three did not roll out again' k rollout status statefulset/ring --timeout=240s
+            [ "$(ring_nodes)" = "$ringed" ] || fail "a replica came back on another node than its volume's: before $ringed, after $(ring_nodes)"
+            must 'kubectl delete of one replica'"'"'s claim' k delete pvc data-ring-1
+            [ "$(k get pod ring-1 -o 'jsonpath={.status.phase}' 2>&1)" = Running ] || fail "the replica whose claim was deleted stopped: $(k get pods 2>&1)"
+
             # Deleted, nothing of it is left: not the volume made for the claim either.
             must 'kubectl delete of the manifests' k delete -f "$root/ci/kube"
             must 'kubectl delete of what was made by hand' k delete deployment,service made
             must 'kubectl delete of the Jobs made by hand' k delete job again ask-made
-            must 'kubectl delete of the claim' k delete pvc data-db-0
+            must 'kubectl delete of the claims' k delete pvc data-db-0 data-ring-0 data-ring-2
             left() {
                 k get all,pvc,configmaps,secrets,ingress -o name 2>&1
                 any GET /v1/resources 2>/dev/null | python3 -c '
@@ -221,5 +238,5 @@ for r in found:
             done
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes, and kubectl and helm as they are shipped asking the first: manifests written for Kubernetes applied (a Deployment of three told things by a ConfigMap and a Secret, its Service and Ingress, a StatefulSet whose claim got a volume made for it), rolled out and running; a Job and a CronJob's Job, made by the clock, heard all of them through their Services (kubectl wait, kubectl logs); after kubectl rollout restart the StatefulSet's new pod had the file the old one wrote; a pod as a chart writes one had a ConfigMap's files (changed in it when the ConfigMap was, with no restart) and one of them alone (subPath), a Secret's file from memory with the mode it asked, two directories of its own (one in memory), what it was told by envFrom and by its own fields, no capability as a user who is not root, and found what its initContainer left; root without two capabilities had the others; told runAsNonRoot an image that names no user did not start and said why; a Deployment made, exposed, scaled and given another image by hand rolled out each time; port-forward was refused in words; helm install, upgrade and uninstall with --wait came back when the chart was ready ($n of helm); deleted, nothing was left; $stock" >&2
+            echo "vm.sh: ok: two nodes, and kubectl and helm as they are shipped asking the first: manifests written for Kubernetes applied (a Deployment of three told things by a ConfigMap and a Secret, its Service and Ingress, a StatefulSet whose claim got a volume made for it, and one of three with a claim and a volume for each replica across the two nodes, each back on its own volume's node after a restart), rolled out and running; a Job and a CronJob's Job, made by the clock, heard all of them through their Services (kubectl wait, kubectl logs); after kubectl rollout restart the StatefulSet's new pod had the file the old one wrote; a pod as a chart writes one had a ConfigMap's files (changed in it when the ConfigMap was, with no restart) and one of them alone (subPath), a Secret's file from memory with the mode it asked, two directories of its own (one in memory), what it was told by envFrom and by its own fields, no capability as a user who is not root, and found what its initContainer left; root without two capabilities had the others; told runAsNonRoot an image that names no user did not start and said why; a Deployment made, exposed, scaled and given another image by hand rolled out each time; port-forward was refused in words; helm install, upgrade and uninstall with --wait came back when the chart was ready ($n of helm); deleted, nothing was left; $stock" >&2
             exit 0

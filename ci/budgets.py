@@ -49,7 +49,10 @@ KITHD_IDLE_RSS = 9 * MB
 # webpki are most of its extra size. Its own line, so the default kith links no TLS and keeps 3 MB.
 # Measured 3.55 MB: ring's provider links every suite whichever are asked for; a provider of the
 # one P-256 suite (a direct webpki dependency) is the way under 3.5 if the line is to come down.
-SIZE_BUDGETS = {"kith": 3 * MB, "kith-remote": int(3.60 * MB), "kithd": KITHD_SIZE * MB}
+# 3.61, not 3.60 (T-0900): the same tree built in another folder differs by one 4 KB page
+# (.text +768 B, .data.rel.ro +552 B on 1c33a26d: 3,773,816 B in the merge gate's folder,
+# 3,777,912 B in the checkout), so a budget set at the gate's size failed every finish on main.
+SIZE_BUDGETS = {"kith": 3 * MB, "kith-remote": int(3.61 * MB), "kithd": KITHD_SIZE * MB}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 

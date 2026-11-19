@@ -838,12 +838,7 @@ async fn issue(
         let state = shared.store.lock().expect("a handler panicked holding the store");
         state.store.get(&key_of).cloned()
     };
-    let mut identity = identity.unwrap_or_else(|| {
-        let new = serde_json::json!({
-            "apiVersion": kith_api::API_VERSION, "kind": "Identity", "metadata": { "name": name }, "spec": {},
-        });
-        serde_json::from_value(new).expect("an Identity with a valid name")
-    });
+    let mut identity = identity.unwrap_or_else(|| crate::access_sign::new_identity(name));
     identity.spec["publicKey"] = public.into();
     let resources = std::iter::once(identity).chain(more).collect();
     // (As the admin's, not this node's own: a control node that is not the leader passes it on,

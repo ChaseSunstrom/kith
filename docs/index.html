@@ -6,6 +6,11 @@
 <meta name="color-scheme" content="dark light">
 <title>kith: all of your machines, one cluster</title>
 <meta name="description" content="kith is a tiny, immutable operating system and one small daemon that joins your machines into a cluster and keeps them matching the YAML you apply.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="kith">
+<meta property="og:title" content="kith: all of your machines, one cluster">
+<meta property="og:description" content="kith is a tiny, immutable operating system and one small daemon that joins your machines into a cluster and keeps them matching the YAML you apply.">
+<meta name="twitter:card" content="summary">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="site.css">
 </head>
@@ -29,6 +34,7 @@
     <a href="#numbers">Numbers</a>
     <a href="#kinds">Kinds</a>
     <a href="#security">Security</a>
+    <a href="#install">Install</a>
   </nav>
   <button class="button quiet" id="motion" type="button" aria-pressed="false" hidden>Pause</button>
   <a class="button quiet" href="guide/index.html">Guide</a>
@@ -49,33 +55,33 @@
     <p class="fine">Version <span data-n="version">1.0.0</span>. No release is tagged yet: it is built from source.</p>
   </div>
   <figure class="live" id="live">
-    <svg class="map" viewBox="0 0 340 350" role="img" aria-label="The kith mark as a live map: a hub, a line to each of four machines, packets running along the lines, and the replicas of one workload as stops beside each machine.">
+    <svg class="map" viewBox="0 0 340 350" role="img" aria-label="The kith mark as a live map: a hub, a line to each of four machines, packets running along the lines, and the replicas of one workload as stops beside each machine. Now and then one machine is lost, and its replicas start on the others.">
       <circle class="halo" cx="96" cy="170" r="16"/>
       <circle class="halo late" cx="96" cy="170" r="16"/>
       <g class="lines">
-        <path id="m-desktop" d="M96 170 96 40"/><path id="m-laptop" d="M96 170 96 300"/><path id="m-server" d="M96 170 226 40"/><path id="m-old" d="M96 170 226 300"/>
+        <path id="m-desktop" data-node="desktop" d="M96 170 96 40"/><path id="m-laptop" data-node="laptop" d="M96 170 96 300"/><path id="m-server" data-node="server" d="M96 170 226 40"/><path id="m-old" data-node="old" d="M96 170 226 300"/>
       </g>
       <g class="packets">
-        <circle r="5"><animateMotion dur="2.2s" repeatCount="indefinite"><mpath href="#m-desktop"/></animateMotion></circle>
-        <circle r="5"><animateMotion dur="2.6s" begin="-0.9s" repeatCount="indefinite" keyPoints="1;0" keyTimes="0;1"><mpath href="#m-laptop"/></animateMotion></circle>
-        <circle r="5"><animateMotion dur="2s" begin="-0.4s" repeatCount="indefinite"><mpath href="#m-server"/></animateMotion></circle>
-        <circle r="5"><animateMotion dur="2.4s" begin="-1.3s" repeatCount="indefinite" keyPoints="1;0" keyTimes="0;1"><mpath href="#m-old"/></animateMotion></circle>
-        <circle r="5"><animateMotion dur="3.1s" begin="-2.2s" repeatCount="indefinite" keyPoints="1;0" keyTimes="0;1"><mpath href="#m-desktop"/></animateMotion></circle>
-        <circle r="5"><animateMotion dur="2.9s" begin="-0.2s" repeatCount="indefinite"><mpath href="#m-old"/></animateMotion></circle>
+        <circle r="5" data-node="desktop"><animateMotion dur="2.2s" repeatCount="indefinite"><mpath href="#m-desktop"/></animateMotion></circle>
+        <circle r="5" data-node="laptop"><animateMotion dur="2.6s" begin="-0.9s" repeatCount="indefinite" keyPoints="1;0" keyTimes="0;1"><mpath href="#m-laptop"/></animateMotion></circle>
+        <circle r="5" data-node="server"><animateMotion dur="2s" begin="-0.4s" repeatCount="indefinite"><mpath href="#m-server"/></animateMotion></circle>
+        <circle r="5" data-node="old"><animateMotion dur="2.4s" begin="-1.3s" repeatCount="indefinite" keyPoints="1;0" keyTimes="0;1"><mpath href="#m-old"/></animateMotion></circle>
+        <circle r="5" data-node="desktop"><animateMotion dur="3.1s" begin="-2.2s" repeatCount="indefinite" keyPoints="1;0" keyTimes="0;1"><mpath href="#m-desktop"/></animateMotion></circle>
+        <circle r="5" data-node="old"><animateMotion dur="2.9s" begin="-0.2s" repeatCount="indefinite"><mpath href="#m-old"/></animateMotion></circle>
       </g>
       <g class="reps" data-node="desktop"><path d="M96 40 22 40"/><circle class="rep on" cx="68" cy="40" r="8"/><circle class="rep on" cx="44" cy="40" r="8"/><circle class="rep" cx="22" cy="40" r="8"/></g>
       <g class="reps" data-node="laptop"><path d="M96 300 22 300"/><circle class="rep on" cx="68" cy="300" r="8"/><circle class="rep" cx="44" cy="300" r="8"/><circle class="rep" cx="22" cy="300" r="8"/></g>
       <g class="reps" data-node="server"><path d="M226 40 300 40"/><circle class="rep on" cx="254" cy="40" r="8"/><circle class="rep on" cx="278" cy="40" r="8"/><circle class="rep" cx="300" cy="40" r="8"/></g>
       <g class="reps" data-node="old"><path d="M226 300 300 300"/><circle class="rep on" cx="254" cy="300" r="8"/><circle class="rep on" cx="278" cy="300" r="8"/><circle class="rep" cx="300" cy="300" r="8"/></g>
-      <circle class="stopped" cx="96" cy="40" r="12"/><circle class="stopped" cx="96" cy="300" r="12"/><circle class="stopped" cx="226" cy="40" r="12"/><circle class="stopped" cx="226" cy="300" r="12"/>
+      <circle class="stopped" data-node="desktop" cx="96" cy="40" r="12"/><circle class="stopped" data-node="laptop" cx="96" cy="300" r="12"/><circle class="stopped" data-node="server" cx="226" cy="40" r="12"/><circle class="stopped" data-node="old" cx="226" cy="300" r="12"/>
       <circle class="hub" cx="96" cy="170" r="17"/>
       <circle class="wave" r="7" cx="-20" cy="-20"/>
-      <text x="96" y="14">desktop</text>
-      <text x="96" y="338">laptop</text>
-      <text x="226" y="14">server</text>
-      <text x="226" y="338">the old PC</text>
+      <text data-node="desktop" x="96" y="14">desktop</text>
+      <text data-node="laptop" x="96" y="338">laptop</text>
+      <text data-node="server" x="226" y="14">server</text>
+      <text data-node="old" x="226" y="338">the old PC</text>
     </svg>
-    <figcaption><code id="live-cmd">$ kith apply -f hello.yaml</code><span class="dim" id="live-said">hello: 7 of 7 replicas ready, on 4 machines</span></figcaption>
+    <figcaption><code id="live-cmd">$ kith apply -f hello.yaml</code><span class="dim" id="live-said">hello: 7 of 7 replicas ready, on 4 machines</span><span class="dim">Shown faster than life: a lost machine's replicas start elsewhere only after <code>--lost-after</code>, five minutes unless you say otherwise.</span></figcaption>
   </figure>
 </section>
 
@@ -379,12 +385,44 @@
     <a class="button quiet" href="https://github.com/ChaseSunstrom/kith/blob/main/PLAN.md">The design</a>
   </p>
 </section>
+
+<section id="install" class="part" data-see>
+  <div class="head">
+    <p class="no"><b>10</b> Install</p>
+    <h2>Answer once. It installs without asking.</h2>
+    <p>The kith OS installer asks at the machine's console: which disk, what name, what address, which cluster. Answer on <a href="install.html">the install page</a> instead, and it writes <code>kith-install.yaml</code> for the stick, in your browser. The machine then asks nothing.</p>
+  </div>
+  <figure class="panel flow stops" id="stops">
+    <figcaption>What the installer would ask <span class="dim">one stop for each, in the order the install page asks</span></figcaption>
+    <ol>
+      <li><b><a href="install.html#stick">The stick</a></b> Write the installer to a USB stick. Everything on it is lost.</li>
+      <li><b><a href="install.html#disk">The disk</a></b> Which one is erased: the machine's only disk, or one by its name or its serial.</li>
+      <li><b><a href="install.html#name">The name</a></b> What the machine is called. Left empty, it names itself from its network card's address.</li>
+      <li><b><a href="install.html#network">The network</a></b> Ask the network, or give it a fixed address, a way out and a DNS server.</li>
+      <li><b><a href="install.html#cluster">The cluster</a></b> Start one, or join one with the address of a node and a token.</li>
+      <li><b><a href="install.html#encryption">Encryption</a></b> Whether its state is locked. If it is, a recovery key is shown once.</li>
+      <li><b><a href="install.html#policy">What it accepts</a></b> The release key it takes updates from, and what the cluster may have it do.</li>
+      <li><b><a href="install.html#writing">Writing</a></b> The file goes on the stick, or is fetched from a URL by its digest.</li>
+      <li><b><a href="install.html#recovery">The key</a></b> Written down when it appears on the console: it is shown that once.</li>
+    </ol>
+  </figure>
+  <p class="acts">
+    <a class="button" href="install.html">Write your answers</a>
+    <a class="button quiet" href="guide/os.html#installing-on-a-machine">The install guide</a>
+  </p>
+</section>
 <i class="end" aria-hidden="true"></i>
 
 </main>
 
 <footer>
   <p><b>kith</b> <span class="dim">is written in Rust, under the Apache-2.0 licence.</span></p>
+  <nav aria-label="Elsewhere">
+    <a href="guide/index.html">Guide</a>
+    <a href="install.html">Install</a>
+    <a href="https://github.com/ChaseSunstrom/kith/blob/main/SECURITY.md">Security</a>
+    <a href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+  </nav>
   <p class="dim">Numbers measured on <span data-n="measured">2026-11-17</span> by <code>ci/site_numbers.py</code>. This page loads nothing from anywhere else.</p>
 </footer>
 

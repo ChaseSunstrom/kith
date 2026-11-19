@@ -41,6 +41,45 @@ pub struct Dir {
 pub struct Held {
     pub node: Option<String>,
     pub volumes: BTreeMap<String, Dir>,
+    /// What a mount that is `perReplica` adds, for each replica that has one: its own claims'
+    /// Volumes (each by the claim's name, `data-0`), or why it has none. Kept apart: a replica
+    /// whose claim has no Volume waits, and the others go on.
+    pub each: BTreeMap<u32, Result<Own, String>>,
+}
+
+/// The Volumes a replica's own claims come to: the node they are on (none: all shared), and the
+/// directory of each by name.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Own {
+    pub node: Option<String>,
+    pub dirs: BTreeMap<String, Dir>,
+}
+
+impl Held {
+    /// What replica `n` mounts and where: its own Volumes with the rest, and the node that goes
+    /// with them, or why it has none.
+    pub fn of_replica(&self, n: u32) -> Result<Held, String> {
+        // (Only replica `n`'s entry is copied, not every replica's.)
+        let mut held = Held {
+            node: self.node.clone(),
+            volumes: self.volumes.clone(),
+            each: BTreeMap::new(),
+        };
+        match self.each.get(&n) {
+            None => Ok(held),
+            Some(Err(why)) => Err(why.clone()),
+            Some(Ok(own)) => {
+                if let (Some(one), Some(other)) = (&held.node, &own.node)
+                    && one != other
+                {
+                    return Err(format!("its volumes are on different nodes: {one}, {other}"));
+                }
+                held.node = held.node.or_else(|| own.node.clone());
+                held.volumes.extend(own.dirs.clone());
+                Ok(held)
+            }
+        }
+    }
 }
 
 /// The answer for every workload that mounts something (its key), and the status each
@@ -389,39 +428,54 @@ pub fn wipe(state: &Path, dir: &Dir) -> Result<(), String> {
 }
 
 /// The names of the volumes a workload's containers mount.
-fn mount_names(owner: &Resource) -> BTreeSet<String> {
+/// (Those a mount that is `perReplica` names are the second: the claims' common name.)
+fn mount_names(owner: &Resource) -> (BTreeSet<String>, BTreeSet<String>) {
     let containers = owner.spec["template"]["containers"].as_array().into_iter().flatten();
     let mounts = containers
         .filter_map(|container| container["volumeMounts"].as_array())
         .flatten();
-    mounts
-        .filter_map(|mount| Some(mount["volume"].as_str()?.to_string()))
-        .collect()
+    let named = mounts.filter_map(|mount| Some((mount["volume"].as_str()?.to_string(), mount["perReplica"] == true)));
+    let (each, plain): (Vec<_>, Vec<_>) = named.partition(|(_, each)| *each);
+    let names = |list: Vec<(String, bool)>| list.into_iter().map(|(name, _)| name).collect();
+    (names(plain), names(each))
+}
+
+/// The Volume the name `name` comes to in `namespace` (a Volume of the name before a
+/// VolumeClaim of it), or why it comes to none.
+fn volume_of<'a>(
+    namespace: &str,
+    name: &str,
+    vols: &'a BTreeMap<String, Vol>,
+    bound: &BTreeMap<String, Result<String, String>>,
+) -> Result<&'a Vol, String> {
+    let volume = if vols.contains_key(&format!("Volume/{namespace}/{name}")) {
+        name.to_string()
+    } else {
+        match bound.get(&format!("VolumeClaim/{namespace}/{name}")) {
+            Some(Ok(volume)) => volume.clone(),
+            Some(Err(why)) => return Err(format!("VolumeClaim {name}: {why}")),
+            None => return Err(format!("there is no Volume or VolumeClaim {name}")),
+        }
+    };
+    let vol = &vols[&format!("Volume/{namespace}/{volume}")];
+    match &vol.refused {
+        Some(why) => Err(format!("Volume {volume}: {why}")),
+        None => Ok(vol),
+    }
 }
 
 /// The Volumes `names` come to in `namespace`, and the one node they are on, or why they are not.
+/// `each`: the common names of the claims of each of `count` replicas (`name-0`, `name-1`...).
 fn held(
     namespace: &str,
-    names: BTreeSet<String>,
+    (names, each): (BTreeSet<String>, BTreeSet<String>),
+    count: u32,
     vols: &BTreeMap<String, Vol>,
     bound: &BTreeMap<String, Result<String, String>>,
 ) -> Result<Held, String> {
     let (mut volumes, mut nodes) = (BTreeMap::new(), BTreeSet::new());
     for name in names {
-        // A Volume of the name is mounted before a VolumeClaim of it.
-        let volume = if vols.contains_key(&format!("Volume/{namespace}/{name}")) {
-            name.clone()
-        } else {
-            match bound.get(&format!("VolumeClaim/{namespace}/{name}")) {
-                Some(Ok(volume)) => volume.clone(),
-                Some(Err(why)) => return Err(format!("VolumeClaim {name}: {why}")),
-                None => return Err(format!("there is no Volume or VolumeClaim {name}")),
-            }
-        };
-        let vol = &vols[&format!("Volume/{namespace}/{volume}")];
-        if let Some(why) = &vol.refused {
-            return Err(format!("Volume {volume}: {why}"));
-        }
+        let vol = volume_of(namespace, &name, vols, bound)?;
         // (A shared one is served to whichever node the workload is on.)
         if !vol.shared {
             nodes.insert(vol.dir.node.clone());
@@ -432,9 +486,31 @@ fn held(
         let nodes: Vec<String> = nodes.into_iter().collect();
         return Err(format!("its volumes are on different nodes: {}", nodes.join(", ")));
     }
+    // A replica with a claim of its own with no Volume waits alone: the others go on.
+    let mut own: BTreeMap<u32, Result<Own, String>> = BTreeMap::new();
+    if !each.is_empty() {
+        for replica in 0..count {
+            let found = each.iter().try_fold(Own::default(), |mut own, base| {
+                let name = format!("{base}-{replica}");
+                let vol = volume_of(namespace, &name, vols, bound)?;
+                if !vol.shared {
+                    match &own.node {
+                        Some(other) if *other != vol.dir.node => {
+                            return Err(format!("its volumes are on different nodes: {other}, {}", vol.dir.node));
+                        }
+                        _ => own.node = Some(vol.dir.node.clone()),
+                    }
+                }
+                own.dirs.insert(name, vol.dir.clone());
+                Ok(own)
+            });
+            own.insert(replica, found);
+        }
+    }
     Ok(Held {
         node: nodes.into_iter().next(),
         volumes,
+        each: own,
     })
 }
 
@@ -493,9 +569,10 @@ pub fn resolve(store: &Store) -> Volumes {
     // (A Job that is over holds nothing.)
     for owner in owners.filter(|owner| crate::sched::wants(owner).is_some()) {
         let names = mount_names(owner);
-        if !names.is_empty() {
+        if !(names.0.is_empty() && names.1.is_empty()) {
             let key = owner.key();
-            let outcome = held(parts(&key).0, names, &vols, &bound);
+            let count = crate::sched::wants(owner).map_or(0, |(count, ..)| count);
+            let outcome = held(parts(&key).0, names, count, &vols, &bound);
             found.owners.insert(key, outcome);
         }
     }
@@ -538,8 +615,19 @@ pub fn mounts(store: &Store, me: &str) -> BTreeMap<String, BTreeMap<String, Dir>
             .ok()
             .filter(|held| held.node.as_deref().is_none_or(|node| node == me))?;
         let namespace = parts(&key).0;
-        let settled = held.volumes.iter().all(|(name, dir)| recorded(namespace, name, dir));
-        settled.then_some((key, held.volumes))
+        let settled = |dirs: &BTreeMap<String, Dir>| dirs.iter().all(|(name, dir)| recorded(namespace, name, dir));
+        if !settled(&held.volumes) {
+            return None;
+        }
+        // A replica's own Volumes: those of a replica that is to be on this node, and settled.
+        // (One that is not goes without: it is not started here, never on an empty directory.)
+        let mut all = held.volumes;
+        for own in held.each.into_values().filter_map(Result::ok) {
+            if own.node.as_deref().is_none_or(|node| node == me) && settled(&own.dirs) {
+                all.extend(own.dirs);
+            }
+        }
+        Some((key, all))
     });
     mine.collect()
 }
@@ -729,6 +817,72 @@ spec: { node: a, path: tiny, size: 1Gi }
 
     fn status(store: &Store, key: &str) -> Value {
         store.get(key).unwrap().status.clone().unwrap_or(json!({}))
+    }
+
+    /// A Workload of three replicas whose mount of `data` is `perReplica`, and `fast` is plain.
+    fn replicated_set(volumes: &[(&str, &str)]) -> String {
+        let spec = "{ replicas: 3, template: { containers: [{ name: run, image: img, volumeMounts: [\
+             { volume: data, perReplica: true, path: /d }, { volume: fast, path: /f }] }] } }";
+        let made = volumes
+            .iter()
+            .map(|(name, node)| res("Volume", "default", name, &format!("{{ node: {node}, path: {name} }}")));
+        [made.collect::<String>(), res("Workload", "default", "db", spec)].concat()
+    }
+
+    #[test]
+    fn per_replica_mounts_pin_each_replica_to_the_node_of_its_own_volume() {
+        let all_on_a = store(&replicated_set(&[("data-0", "a"), ("data-1", "a"), ("data-2", "a")]));
+        let held = resolve(&all_on_a).owners["Workload/default/db"].clone().unwrap();
+        // (The plain mount's node is the workload's: all replicas are on it.)
+        assert_eq!(held.node.as_deref(), Some("a"));
+        assert_eq!(held.each.len(), 3);
+        assert_eq!(
+            held.clone().of_replica(2).unwrap().volumes.keys().collect::<Vec<_>>(),
+            ["data-2", "fast"]
+        );
+        // With no plain mount, each goes where its own is.
+        let spec = "{ replicas: 3, template: { containers: [{ name: run, image: img, volumeMounts: [\
+             { volume: data, perReplica: true, path: /d }] }] } }";
+        let store = store(
+            &[
+                res("Volume", "default", "data-0", "{ node: a, path: d0 }"),
+                res("Volume", "default", "data-1", "{ node: b, path: d1 }"),
+                res("Volume", "default", "data-2", "{ node: a, path: d2 }"),
+                res("Workload", "default", "db", spec),
+            ]
+            .concat(),
+        );
+        let held = resolve(&store).owners["Workload/default/db"].clone().unwrap();
+        assert_eq!(held.node, None);
+        let node = |n: u32| held.clone().of_replica(n).unwrap().node;
+        assert_eq!(
+            [node(0), node(1), node(2)],
+            [Some("a".into()), Some("b".into()), Some("a".into())]
+        );
+        // Each node is given the Volumes of the replicas that are to be on it, no others.
+        let on = |me: &str| -> Vec<String> { mounts(&store, me)["Workload/default/db"].keys().cloned().collect() };
+        assert_eq!(on("a"), ["data-0", "data-2"]);
+        assert_eq!(on("b"), ["data-1"]);
+    }
+
+    #[test]
+    fn per_replica_mount_of_a_volume_missing_or_elsewhere_waits_that_replica_alone() {
+        // data-2 is not there at all; the plain `fast` is on a, data-1 on b.
+        let store = store(&replicated_set(&[("data-0", "a"), ("data-1", "b")]));
+        let held = resolve(&store).owners["Workload/default/db"].clone().unwrap();
+        assert!(held.clone().of_replica(0).is_ok());
+        assert_eq!(
+            held.clone().of_replica(1),
+            Err("its volumes are on different nodes: a, b".into())
+        );
+        assert_eq!(
+            held.clone().of_replica(2),
+            Err("there is no Volume or VolumeClaim data-2".into())
+        );
+        // None of the one that waits is given to a node: never started on an empty directory.
+        let given = mounts(&store, "a")["Workload/default/db"].clone();
+        assert_eq!(given.keys().collect::<Vec<_>>(), ["data-0", "fast"]);
+        assert!(mounts(&store, "b").is_empty());
     }
 
     #[test]
