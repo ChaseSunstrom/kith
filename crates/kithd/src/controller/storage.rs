@@ -442,8 +442,9 @@ fn sweep_until(replica: &Path, halted: &dyn Fn() -> bool) {
 /// counted; else its `roots` are walked, and the processes of its `cgroups` for the files they
 /// keep open after deleting them, each within `SPELL`. It removes nothing: a scratch set aside
 /// is the sweep's (`sweep`, a job of its own), so a huge one holds no pod's count.
-pub fn measure(mut pod: Pod, roots: &[PathBuf], cgroups: &[PathBuf], state: &Path, stop: &AtomicBool) -> Pod {
-    let usage = pod.held.then(|| Projects::usage(state, &pod.id)).flatten();
+pub fn measure(mut pod: Pod, roots: &[PathBuf], cgroups: &[PathBuf], stop: &AtomicBool) -> Pod {
+    // (Asked of the root part, which reads the project's numbers of the state disk it holds.)
+    let usage = pod.held.then(|| crate::root_part::usage(&pod.id)).flatten();
     pod.held = usage.is_some();
     if let Some((bytes, files, most)) = usage {
         (pod.bytes, pod.files, pod.most) = (bytes, files, most);
@@ -1728,7 +1729,7 @@ pub(crate) mod tests {
             std::fs::write(d.join("f"), vec![1u8; 1 << 20]).unwrap();
         }
         let stop = AtomicBool::new(false);
-        let counted = measure(pod("p", None, 0), std::slice::from_ref(&live), &[], &state, &stop);
+        let counted = measure(pod("p", None, 0), std::slice::from_ref(&live), &[], &stop);
         assert!(
             counted.finished && counted.bytes >= 1 << 20 && counted.bytes < 2 << 20,
             "{}",

@@ -17,7 +17,7 @@ mod prune;
 pub mod storage;
 
 use crate::Shared;
-use crate::root_part::Root;
+use crate::root_part::{Direct, Root};
 use futures_util::FutureExt;
 use kith_api::Resource;
 use kith_api::kinds::{
@@ -437,6 +437,8 @@ pub async fn run(
     });
     let swept = runtime.and_then(|rt| {
         let adopted = rt.adopt();
+        // What a kithd before this one made, and this one takes back, is made here too.
+        crate::root_part::made(adopted.keys().cloned());
         let kept = adopted.keys().cloned().collect();
         rt.cleanup_but(&kept).map(|old| (rt, old, adopted))
     });
@@ -622,20 +624,25 @@ async fn stop(id: &str, slot: &mut Slot) {
         return;
     };
     slot.tried = Some(Instant::now());
-    let deleted = delete(handle).await;
+    let deleted = delete(id, handle).await;
     stopped(id, slot, deleted);
 }
 
-/// `handle.delete()` on a thread of its own: a delete kills the unit and then waits, asleep
-/// between tries, for its cgroup to empty, and on kithd's thread the API, the proxy and DNS
-/// would wait with it. Where the node has no thread to give, it runs here after all.
-async fn delete(handle: Handle) -> Result<(), kith_runtime::Undeleted> {
+/// What a delete gives back when the unit is still there: its handle, if it has one, and why.
+type Undeleted = (Option<Handle>, String);
+
+/// The unit `id` deleted by the root part, on a thread of its own: a delete kills the unit and
+/// then waits, asleep between tries, for its cgroup to empty, and on kithd's thread the API, the
+/// proxy and DNS would wait with it. Where the node has no thread to give, it runs here after all.
+#[allow(clippy::result_large_err)] // the handle that comes back is the answer itself, moved once
+async fn delete(id: &str, handle: Handle) -> Result<(), Undeleted> {
     let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(handle)));
     let (theirs, (done, said)) = (cell.clone(), tokio::sync::oneshot::channel());
+    let name = id.to_string();
     let spawned = std::thread::Builder::new().name("stop".into()).spawn(move || {
         let handle = theirs.lock().expect("nothing panics holding it").take();
         if let Some(handle) = handle {
-            let _ = done.send(handle.delete());
+            let _ = done.send(Direct::units().delete(handle, &name));
         }
     });
     if spawned.is_ok()
@@ -644,13 +651,14 @@ async fn delete(handle: Handle) -> Result<(), kith_runtime::Undeleted> {
         return deleted;
     }
     let handle = cell.lock().expect("nothing panics holding it").take();
-    handle
-        .expect("the stop's thread took the handle and answered nothing: it panicked")
-        .delete()
+    Direct::units().delete(
+        handle.expect("the stop's thread took the handle and answered nothing: it panicked"),
+        id,
+    )
 }
 
 /// What a stop leaves in its slot once the delete was tried with `deleted`.
-fn stopped(id: &str, slot: &mut Slot, deleted: Result<(), kith_runtime::Undeleted>) {
+fn stopped(id: &str, slot: &mut Slot, deleted: Result<(), Undeleted>) {
     match deleted {
         Ok(()) => {
             // Gone: the "stopping" message of an earlier pass is over.
@@ -658,24 +666,21 @@ fn stopped(id: &str, slot: &mut Slot, deleted: Result<(), kith_runtime::Undelete
                 slot.message = None;
             }
         }
-        Err(undeleted) => {
-            slot.handle = undeleted.handle.map(|handle| *handle);
+        Err((handle, error)) => {
+            slot.handle = handle;
             if slot.handle.is_some() {
                 slot.probes = None;
                 if slot.state == "running" {
                     slot.state = "stopping";
                 }
-                let message = format!(
-                    "stopping: {}; its devices and name are held until it is gone",
-                    undeleted.error
-                );
+                let message = format!("stopping: {error}; its devices and name are held until it is gone");
                 // Said once, not on every pass while it stays stuck.
                 if slot.message.as_ref() != Some(&message) {
-                    eprintln!("kithd: {id}: {}", undeleted.error);
+                    eprintln!("kithd: {id}: {error}");
                 }
                 slot.message = Some(message);
             } else {
-                eprintln!("kithd: {id}: {}", undeleted.error);
+                eprintln!("kithd: {id}: {error}");
                 // (Its processes are gone: only the cleanup failed, and nothing is held.)
                 if slot.message.as_deref().is_some_and(|m| m.starts_with("stopping: ")) {
                     slot.message = None;
@@ -1724,16 +1729,16 @@ impl Controller {
                 }
                 // One that is not gone is asked again after STOP_RETRY, not forgotten running; its
                 // slot, if wanted, waits for it (see `taken_back`).
-                match delete(handle).await {
+                match delete(&id, handle).await {
                     Ok(()) => drop(self.stuck.remove(&id)),
-                    Err(e) => {
+                    Err((left, error)) => {
                         if !self.stuck.contains_key(&id) {
-                            eprintln!("kithd: {id}: {}", e.error);
+                            eprintln!("kithd: {id}: {error}");
                         }
-                        match e.handle {
+                        match left {
                             Some(handle) => {
                                 self.stuck.insert(id.clone(), Instant::now());
-                                self.adopted.insert(id, (*handle, was));
+                                self.adopted.insert(id, (handle, was));
                             }
                             None => drop(self.stuck.remove(&id)),
                         }
@@ -1899,7 +1904,7 @@ impl Controller {
                 .cloned()
                 .collect();
             for path in gone {
-                match handle.unplug(&path) {
+                match Direct::units().unplug(handle, id, &path) {
                     // (The slot keeps the node until what came is plugged below: whether a unit
                     // takes devices as it runs is asked of what it started with.)
                     Ok(()) => drop(changed.insert(id.clone())),
@@ -1939,7 +1944,7 @@ impl Controller {
                 slot.message = Some(why);
                 continue;
             }
-            match added.iter().try_for_each(|path| handle.plug(path)) {
+            match added.iter().try_for_each(|path| Direct::units().plug(handle, id, path)) {
                 Ok(()) => {
                     if !added.is_empty() || changed.contains(id) {
                         eprintln!("kithd: {id}: its input devices changed, and it has them as it runs");
@@ -2069,7 +2074,7 @@ impl Controller {
                     // Killed here, noticed as an exit below or next pass, restarted like any other exit.
                     // A kill that failed is tried again next pass: the probes stay.
                     slot.message = Some("the liveness probe failed".into());
-                    match handle.kill() {
+                    match Direct::units().kill(handle, id) {
                         Ok(()) => slot.probes = None,
                         Err(e) => eprintln!("kithd: {id}: {e}"),
                     }
@@ -2236,8 +2241,13 @@ impl Controller {
                 own
             };
             if slot.tuned != Some((guaranteed, cpu)) {
-                for refused in kith_runtime::tune(&handle.cgroup, guaranteed, cpu) {
-                    eprintln!("kithd: {id}: its seat's arrangement is not all in place: {refused}");
+                match Direct::units().tune(handle, id, guaranteed, cpu) {
+                    Ok(refused) => {
+                        for refused in refused {
+                            eprintln!("kithd: {id}: its seat's arrangement is not all in place: {refused}");
+                        }
+                    }
+                    Err(e) => eprintln!("kithd: {id}: its seat's arrangement is not put in place: {e}"),
                 }
                 slot.tuned = Some((guaranteed, cpu));
             }
@@ -2670,7 +2680,7 @@ impl Controller {
         self.count = Job::start("storage", &shared.changed, move || {
             let pods: Vec<storage::Pod> = pods
                 .into_iter()
-                .map(|(pod, roots, cgroups)| storage::measure(pod, &roots, &cgroups, &state, &stop))
+                .map(|(pod, roots, cgroups)| storage::measure(pod, &roots, &cgroups, &stop))
                 .collect();
             let disk = nix::sys::statvfs::statvfs(&state).ok();
             let free = disk.map_or(free, |d| d.blocks_available() * d.fragment_size());
@@ -3325,9 +3335,14 @@ async fn start(
         }
         Run::Exec(e) => {
             unit.command = e.command.clone();
-            runtime
+            let made = runtime
                 .exec(id, &unit, log("out")?, log("err")?)
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string());
+            // (An exec unit is not made through `Create`: the root part is told it was made.)
+            if made.is_ok() {
+                crate::root_part::made([id.to_string()]);
+            }
+            made
         }
     };
     let handle = created?;
@@ -3342,7 +3357,7 @@ async fn start(
             // (Deleted here, not on a thread: this start is given up when kithd ends, and a
             // delete nobody waits for any more would be cut short by the exit.)
             slot.tried = Some(Instant::now());
-            stopped(id, slot, handle.delete());
+            stopped(id, slot, root.delete(handle, id));
             Err(e)
         }
     }

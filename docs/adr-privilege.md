@@ -246,7 +246,7 @@ process is not in this task (said as open below).
 | A container started | in process | at most 3 requests: `Pod` (the first container of a pod only), `Create`, `Start`; `Unpack` once per image |
 | A change of the Service table | BPF attach in process | one `ServiceTable`; one `Bind` per new port under 1024 |
 | The mesh every 10 s | netlink when something changed | compared in the serving part; one `Mesh` only when something changed |
-| Storage accounting | reads in process | one `Usage` per period for all units |
+| Storage accounting | reads in process | one `Usage` per pod per period (built: T-0844) |
 
 Sockets made ahead cost kernel memory while idle: 16 unconnected TCP sockets a pod.
 Measured in step 4; if it shows in the idle budget the count becomes 4 until a pod has
