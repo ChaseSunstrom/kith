@@ -457,7 +457,7 @@ mod tests {
             let other = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
             let store = &mut shared.store.lock().unwrap().store;
             store.apply(other).unwrap();
-            let mesh = serde_json::json!({ "mesh": { "key": "QUFB", "port": 51820 } });
+            let mesh = serde_json::json!({ "mesh": { "key": "ab".repeat(32), "port": 51820 } });
             store.set_status("Node/mesh-o", Some(mesh)).unwrap();
         }
         let own = |key: &str| Command::Patch {
@@ -469,8 +469,11 @@ mod tests {
                     .clone(),
             )],
         };
-        assert!(checked(&shared, "mesh-c", own("QUFB")).is_err());
-        assert!(checked(&shared, "mesh-c", own("TkVX")).is_ok());
+        // (The same key in capitals, or any text that is no key, is refused too.)
+        for refused in ["ab".repeat(32), "AB".repeat(32), "ab".repeat(31), "zz".repeat(32)] {
+            assert!(checked(&shared, "mesh-c", own(&refused)).is_err(), "{refused}");
+        }
+        assert!(checked(&shared, "mesh-c", own(&"5a".repeat(32))).is_ok());
     }
 
     /// The key a node is to take next (T-1017) may be neither another node's key nor its next one:
@@ -484,22 +487,24 @@ mod tests {
             let other = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
             let store = &mut shared.store.lock().unwrap().store;
             store.apply(other).unwrap();
-            let mesh = serde_json::json!({ "mesh": { "key": "QUFB", "next": "Qk5O", "port": 51820 } });
+            let mesh =
+                serde_json::json!({ "mesh": { "key": "ab".repeat(32), "next": "cd".repeat(32), "port": 51820 } });
             store.set_status("Node/next-o", Some(mesh)).unwrap();
         }
         let own = |next: &str| Command::Patch {
             statuses: vec![(
                 "Node/next-c".to_string(),
-                serde_json::json!({ "mesh": { "key": "TkVX", "next": next, "port": 51820 } })
+                serde_json::json!({ "mesh": { "key": "43".repeat(32), "next": next, "port": 51820 } })
                     .as_object()
                     .unwrap()
                     .clone(),
             )],
         };
-        for refused in ["QUFB", "Qk5O"] {
-            assert!(checked(&shared, "next-c", own(refused)).is_err(), "{refused}");
+        // (Another node's key in capitals is that key still, to what reads it: refused too.)
+        for refused in ["ab".repeat(32), "cd".repeat(32), "AB".repeat(32), "Cd".repeat(32)] {
+            assert!(checked(&shared, "next-c", own(&refused)).is_err(), "{refused}");
         }
-        assert!(checked(&shared, "next-c", own("Wlpa")).is_ok());
+        assert!(checked(&shared, "next-c", own(&"5a".repeat(32))).is_ok());
     }
 
     /// The join a control node that holds the CA makes (`cluster.rs` `join` and `register`), not

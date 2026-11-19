@@ -48,10 +48,15 @@ fn says_of(public: &[u8], address: Ipv6Addr, port: u16) -> Value {
     says
 }
 
+/// A key from its text: exactly 64 lower-case hex digits (what `hex` writes), so one key has one
+/// text and two texts are the same key when they are the same text.
 pub(crate) fn key_of(hex: &str) -> Option<Key> {
-    let byte = |at: usize| u8::from_str_radix(hex.get(2 * at..2 * at + 2)?, 16).ok();
-    let bytes: Vec<u8> = (0..32).map_while(byte).collect();
-    bytes.try_into().ok().filter(|_| hex.len() == 64)
+    let digit = |c: u8| matches!(c, b'0'..=b'9' | b'a'..=b'f');
+    if hex.len() != 64 || !hex.bytes().all(digit) {
+        return None;
+    }
+    let byte = |at: usize| u8::from_str_radix(&hex[2 * at..2 * at + 2], 16).ok();
+    (0..32).map_while(byte).collect::<Vec<u8>>().try_into().ok()
 }
 
 /// The cluster's /48, the same on every node of it.
@@ -410,6 +415,21 @@ fn nexts(store: &Store, me: &str, own: &Key) -> BTreeMap<String, Key> {
         .collect()
 }
 
+/// `nexts` without those said for `ROTATE_WAIT` or longer: a node that says a `next` and never
+/// commits it (its own wait gives up by then) is not one this node waits for for ever. `seen`:
+/// when each was first said, kept while it is said. (A node that takes its `next` back and says
+/// one again has the wait start over: that costs this node a wait of its own, once.)
+fn fresh(nexts: BTreeMap<String, Key>, seen: &mut BTreeMap<String, Instant>, now: Instant) -> BTreeMap<String, Key> {
+    seen.retain(|name, _| nexts.contains_key(name));
+    for name in nexts.keys() {
+        seen.entry(name.clone()).or_insert(now);
+    }
+    nexts
+        .into_iter()
+        .filter(|(name, _)| now.saturating_duration_since(seen[name]) < ROTATE_WAIT)
+        .collect()
+}
+
 /// The peers with the keys they are to take: each member that has a `next` has it as a peer
 /// too, which answers its handshakes and has no addresses (so what it sends is not taken as
 /// anyone's) until it has shaken hands: then it is the member's peer, and the old key is not.
@@ -471,6 +491,8 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     let mut base = says_of(&public, address, options.port);
     // A key's replacement under way, the rotation that was last given up, and the last one that was done.
     let (mut rotation, mut failed, mut done): (Option<Rotation>, Option<String>, Option<String>) = (None, None, None);
+    // When each other node first said the `next` it says now.
+    let mut said_next: BTreeMap<String, Instant> = BTreeMap::new();
     let node = format!("Node/{me}");
     let first = told(&first_peers(&options.key));
     let mut known = BTreeMap::new();
@@ -503,7 +525,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             let rotated = done
                 .clone()
                 .or_else(|| own?.status.as_ref()?["mesh"]["rotated"].as_str().map(str::to_string));
-            let nexts = nexts(&state.store, me, &public);
+            let nexts = fresh(nexts(&state.store, me, &public), &mut said_next, now);
             let took: BTreeSet<String> = match &rotation {
                 None => BTreeSet::new(),
                 Some(rotation) => {
@@ -1201,5 +1223,43 @@ mod tests {
             .collect();
         assert_eq!(names, BTreeSet::from(["mesh.key".to_string(), "mesh.next".to_string()]));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A key is exactly 64 lower-case hex digits: one text per key, so that comparing the texts
+    /// of two keys is comparing the keys.
+    #[test]
+    fn a_key_is_64_lower_case_hex_digits_and_nothing_else() {
+        let good = "ab".repeat(32);
+        assert_eq!(key_of(&good), Some([0xab; 32]));
+        assert_eq!(key_of(&good.to_uppercase()), None);
+        assert_eq!(key_of(&format!("aB{}", &good[2..])), None);
+        assert_eq!(key_of(&good[..63]), None);
+        assert_eq!(key_of(&format!("{good}a")), None);
+        assert_eq!(key_of(&format!("{good} ")), None);
+        // (`from_str_radix` takes a sign.)
+        assert_eq!(key_of(&format!("+a{}", &good[2..])), None);
+        assert_eq!(key_of(&format!("{}zz", &good[..62])), None);
+        assert_eq!(key_of(&hex(&[0x5c; 32])), Some([0x5c; 32]));
+    }
+
+    /// A peer's `next` that has not been taken in `ROTATE_WAIT` stops holding this node's
+    /// rotation back (its own rotation gave up by then); a `next` said again after it was taken
+    /// back starts the wait over.
+    #[test]
+    fn a_next_key_that_never_commits_stops_holding_others_back() {
+        let start = Instant::now();
+        let said = BTreeMap::from([("a".to_string(), [10; 32])]);
+        let mut seen = BTreeMap::new();
+        assert_eq!(fresh(said.clone(), &mut seen, start), said);
+        assert_eq!(
+            fresh(said.clone(), &mut seen, start + ROTATE_WAIT - Duration::from_secs(1)),
+            said
+        );
+        let late = start + ROTATE_WAIT;
+        assert!(fresh(said.clone(), &mut seen, late).is_empty());
+        assert!(fresh(said.clone(), &mut seen, late + Duration::from_secs(500)).is_empty());
+        // Taken back (not said for a pass), then said: a new wait.
+        assert!(fresh(BTreeMap::new(), &mut seen, late + Duration::from_secs(501)).is_empty());
+        assert_eq!(fresh(said.clone(), &mut seen, late + Duration::from_secs(502)), said);
     }
 }
