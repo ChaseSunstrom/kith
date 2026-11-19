@@ -72,7 +72,7 @@ Not answered, each refused in words:
 | What it is not, and is not meant to become | kith is not a conformant Kubernetes (the conformance tests are not run and would not pass). It takes no CNI, CSI or device plugin (a pod's network, a volume and a device are kith's own), serves no aggregated API, and never starts, fetches or packages Kubernetes: what needs the real thing needs a real cluster |
 | In a pod: `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, `privileged`, added capabilities | kith gives no Workload these, by any API |
 | In a pod: a `projected` or `downwardAPI` volume, a mode for one item of a volume, an initContainer with a `restartPolicy` (a sidecar) | What a chart commonly says is carried, as [kith's own fields](workloads.md#what-a-container-is-given): volumes from a ConfigMap, a Secret or an `emptyDir`, `subPath` of any of them, `envFrom`, `fieldRef`, `initContainers`, `runAsNonRoot`, dropped capabilities, and `limits.ephemeral-storage` with a disk `emptyDir`'s `sizeLimit` as `resources.storage` (either under 64Ki raised to it) |
-| A StatefulSet with a claim template and more than one replica; a CronJob in a time zone other than UTC; `kubectl rollout undo` | use `kith rollback` |
+| A CronJob in a time zone other than UTC; `kubectl rollout undo` | use `kith rollback` |
 | `kubectl delete pod` (a pod is its owner's replica), `--cascade=orphan`, `kubectl logs --previous`, `--since`, `--timestamps` | a unit's output is kept as it was written, not when |
 
 What it costs: it is in the one kithd there is and added 0.38 MB to it, and the JSON patch 0.01 MB
@@ -95,7 +95,7 @@ it.
 
 | Kubernetes | kith |
 |---|---|
-| Deployment, StatefulSet | Workload with `pod: true` (a StatefulSet's `volumeClaimTemplates` each become a VolumeClaim `<template>-<name>-0`; with more than one replica that is refused) |
+| Deployment, StatefulSet | Workload with `pod: true` (a StatefulSet's `volumeClaimTemplates` each become a VolumeClaim for each replica, `<template>-<name>-<ordinal>`, and its mount is `perReplica`: [each replica its own](storage.md#a-claim-for-each-replica). Scaling down keeps the claims and their data, as Kubernetes does, and scaling up again finds them) |
 | DaemonSet, Service | NodeWorkload, Service |
 | Ingress | `expose: {host, via: edge, paths}` on the Service behind each host (the one behind `/`, else the first named) |
 | ConfigMap, Secret | ConfigMap, Secret (`data` decoded from base64: the output holds the plain text) |

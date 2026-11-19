@@ -1,0 +1,38 @@
+# A StatefulSet of three with a claim template: each replica has a claim and a volume of its
+# own (data-ring-0, data-ring-1, data-ring-2), on whichever node the volume was made, and goes
+# back to that node when it starts again.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ring
+spec:
+  serviceName: ring
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ring
+  template:
+    metadata:
+      labels:
+        app: ring
+    spec:
+      containers:
+        - name: ring
+          image: kith.test/pod:1
+          command: ["/bin/pod", "serve", "/data/started"]
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            tcpSocket:
+              port: 80
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 64Mi

@@ -894,7 +894,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     worker's own, with the labels discovery writes and no other, the node and the
     class among them its own), the status of an Image or a Backup of
     a Volume that is on it, a Blob it made, its own name among a Blob's holders, and
-    when it synced as a Volume's replica. Everything else is refused and written to
+    when it synced as a Volume's replica, the notes of a Job placed on it, and the delete of
+    a Volume that is on it whose data it was told to wipe (its claim gone, not retained, not
+    encrypted, and no unit placed on it mounts it). Everything else is refused and written to
     the audit log under the worker's name: a template, a Secret, a Role, a Node's
     spec (its own `trust` too), another node's status or Device, a report in another
     node's name. So a change asked of a worker's own API is refused as well (`ask a
