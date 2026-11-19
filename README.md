@@ -100,7 +100,7 @@ is still there when it starts again.
 | Make several machines one cluster | [More than one node](docs/guide/cluster.md#more-than-one-node) |
 | Give what runs a name, inside and outside | [DNS](docs/guide/cluster.md#dns); a host of its own with a certificate: [More than one node](docs/guide/cluster.md#more-than-one-node) |
 | Say a thing once: names, functions and imports instead of YAML repeated | [kith's own language](docs/guide/api.md#kiths-own-language) |
-| Install an app with its settings, and upgrade it | [Packages](docs/guide/packages.md#packages) |
+| Install an app with its settings, and upgrade it (a Job annotated `kith.dev/hook` runs before or after: `pre-install`, `post-install`, `pre-upgrade`, `post-upgrade`; delete hooks are not built) | [Packages](docs/guide/packages.md#packages) |
 | Keep a cluster in step with a git repository | [Sources (GitOps)](docs/guide/packages.md#sources-gitops) |
 | Use kubectl, Helm and the manifests you have, unchanged | [kubectl and Helm, as they are](docs/guide/kubernetes.md#kubectl-and-helm-as-they-are) |
 | Turn manifests or a chart into kith's own files | [Importing from Kubernetes and Helm](docs/guide/kubernetes.md#importing-from-kubernetes-and-helm) |
@@ -115,6 +115,22 @@ is still there when it starts again.
 | Make a machine nothing but a node, and keep it updated | [kith OS](docs/guide/os.md#kith-os-kithd-as-the-machines-first-process) |
 | Know what it costs beside Kubernetes | [Beside k3s](#beside-k3s), and [how it was measured](docs/guide/numbers.md#how-the-numbers-beside-k3s-were-taken) |
 | Find your way in the code and test it | [Layout](docs/guide/development.md#layout), [Development](docs/guide/development.md#development) |
+
+## Coming from docker compose
+
+```sh
+kith import compose docker-compose.yml --node n1 -n media > stack.yaml   # review it, then: kith apply -f stack.yaml
+```
+
+This is a translation, once; kith does not run compose. Each service becomes a Workload
+(a pod of its own, as in compose), its `ports` a Service of the compose name, and each host
+directory or named volume a Volume on the node `--node` names. Exit status 1 means something
+is in the report on stderr: the resources are still printed.
+
+kith refuses by path and name what it cannot carry: `cap_add` (kith only drops capabilities),
+`sysctls`, `devices` (a DeviceClaim hands hardware in), `privileged`, `env_file` (write the
+variables under `environment`), `build`, `security_opt` and `tmpfs`; the guide lists the rest.
+The whole table is [From a docker-compose file](docs/guide/kubernetes.md#from-a-docker-compose-file).
 
 ## How it works
 
@@ -238,3 +254,28 @@ Where the two differ in what they do, the numbers are not of the same thing:
 - k3s is the whole Kubernetes API.
 
 How each row is measured, and what the tables do not say: [How the numbers beside k3s were taken](docs/guide/numbers.md#how-the-numbers-beside-k3s-were-taken).
+
+## Under load
+
+`sh ci/stress.sh` puts containers on the same three machines (or one of them, `--nodes 1`), a size at a time, first as kith OS and then, with `--system k3s`, as k3s. It stops at the first size that fails. Each machine has 2048 MB and 2 CPUs, as above. The table is [ci/stress.txt](ci/stress.txt), row for row; a test holds it to that file.
+
+| containers | nodes | system | max pods a node | ready (s) | memory each (MB) | Services (s) | answers | store | back (s) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100 | 3 | kith | - | 0.55 | 0.50 | 4.08 | yes | ok | 0.01 |
+| 100 | 1 | kith | - | limit | - | - | - | - | - |
+| 100 | 3 | kith | - | 1.07 | 0.57 | 5.13 | yes | ok | 0.03 |
+| 300 | 3 | kith | - | 2.51 | 0.57 | 5.13 | yes | ok | 0.23 |
+| 1000 | 3 | kith | - | 7.88 | 0.61 | 8.57 | yes | ok | 0.04 |
+| 100 | 3 | k3s | 110 | 7.10 | 12.76 | 6.14 | yes | - | - |
+| 1000 | 3 | k3s | 444 | limit | - | - | - | - | - |
+| 100 | 1 | k3s | 110 | limit | - | - | - | - | - |
+| 300 | 3 | k3s | 210 | limit | - | - | - | - | - |
+
+- `limit` in the ready column: that size did not finish. Its row in ci/stress.txt says where it stopped and what the nodes said of themselves; the cells after it are `-`.
+- A k3s row's last column is the most pods a node was let run: 110 (k3s's default) up to 100 containers, and above that the containers' share per node plus 110, with kubelet's max-pods raised and a /22 pod range on the server.
+- k3s has no restart in this run, so its `store` and `back (s)` are `-`.
+- kith stopped at 100 containers on one node, at Services readiness: 0 of 10 Services had their backends after 121 s.
+- k3s stopped at 100 on one node: k1 ran 107 pods on 2 vCPUs, the kernel logged soft lockups (a CPU stuck for 22 s and for 51 s), and k1's memory reader gave no reading. The row shows the node's own counts instead (179 MB free, 104 of 107 pods running), and no node had an OOM kill. The cause is inferred from those lines and counts, not from a kubelet trace.
+- k3s stopped at 300 on three nodes: the API handshake timed out after 198 s and no node answered, with nothing logged on any of them. The cause is not established; the row does not say whether the API or the hosts were saturated.
+- k3s at 1000 on three nodes: the API stopped answering after 171 s.
+- Two earlier k3s rows at 100 on one node and 300 on three had no cause. The adapter raised an uncaught error reading the memory reader and the row kept only the console lines. That was a bug in ci/stress_workloads.py, fixed and tested; the rows above are the reruns.
