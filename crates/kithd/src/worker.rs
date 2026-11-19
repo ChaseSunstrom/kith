@@ -269,7 +269,16 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
             only(
                 key,
                 fields,
-                &["os", "mesh", "serves", "policy", "thumbprint", "people", "peopleNotes", "alone"],
+                &[
+                    "os",
+                    "mesh",
+                    "serves",
+                    "policy",
+                    "thumbprint",
+                    "people",
+                    "peopleNotes",
+                    "alone",
+                ],
             )?;
             if let Some(people) = fields.get("people") {
                 people_shape(key, people)?;
