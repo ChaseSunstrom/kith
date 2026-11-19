@@ -1783,6 +1783,30 @@ fn access_an_upgrade_that_carries_an_origin_is_refused() {
     assert!(refused, "the refused upgrade is in the audit log: {audit}");
 }
 
+/// The one route between nodes for a pod is `/v1/pod-hop`: the exec route that was there before is no route (404) to a
+/// node (here this node's own certificate), and an Identity is refused (403) at both, for the hop is the cluster's nodes'.
+#[test]
+fn access_one_hop_route_for_a_pod_and_no_identity_uses_it() {
+    let cluster = with_team("kube-one-hop");
+    for who in ["bob", "carol"] {
+        for path in ["/v1/exec-hop", "/v1/pod-hop"] {
+            assert_eq!(cluster.reply(who, "POST", path, &[], None), "403", "{who} {path}");
+        }
+    }
+    let node = "state/pki/node";
+    assert_eq!(
+        cluster.reply(node, "POST", "/v1/exec-hop", &[], None),
+        "404",
+        "the deleted route"
+    );
+    // (Found, and asked for what it needs: the upgrade it names.)
+    assert_eq!(
+        cluster.reply(node, "POST", "/v1/pod-hop", &[], None),
+        "400",
+        "the one route"
+    );
+}
+
 /// What kubectl port-forward asks for: a WebSocket that speaks SPDY/3.1 (the plain upgrade it falls back to is a POST).
 const FORWARD: [&str; 5] = [
     "Connection: Upgrade",

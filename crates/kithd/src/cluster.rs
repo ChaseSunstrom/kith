@@ -602,7 +602,7 @@ async fn standing(State(shared): State<Arc<Shared>>, Query(asked): Query<Standin
 }
 
 /// What a worker (`spec.trust`) is refused among the nodes' routes: the second hop of
-/// `kith run`, the hop of `kubectl port-forward` and Raft's own messages, which only one that votes or leads sends.
+/// `kith run`, the one hop for a pod (`kubectl exec`, `cp` and `port-forward`) and Raft's own messages, which only one that votes or leads sends.
 const CONTROL_ONLY: [&str; 5] = [
     "/v1/raft/append",
     "/v1/raft/vote",
@@ -724,8 +724,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
     // (The second hop of `kith run`: the caller was checked on the first node.)
     let hop = Router::new()
         .route("/v1/run-hop", post(api::run::hop))
-        .route("/v1/exec-hop", post(crate::pod_exec::hop))
-        .route(POD_HOP, post(crate::kube::portforward::hop))
+        .route(POD_HOP, post(crate::pod_exec::hop))
         .route("/v1/raft/stands", get(standing))
         .route("/v1/view", get(crate::view::serve))
         .route("/v1/blob-copy/{name}", get(crate::blobs::copy))

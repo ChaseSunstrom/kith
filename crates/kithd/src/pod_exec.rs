@@ -7,9 +7,12 @@
 //! ```text
 //! kubectl --WebSocket--> node A (checks Exec on the pod's owner)
 //!                          \-- replica here:  enters the container, speaks the channels
-//!                          \-- replica there: POST /v1/exec-hop --> node B (checks it again in
+//!                          \-- replica there: POST /v1/pod-hop --> node B (checks it again in
 //!                                             its own store, enters, speaks the channels)
 //! ```
+//! `/v1/pod-hop` is the one route between nodes for a pod: `kubectl port-forward` (kube/portforward.rs) asks
+//! it for a byte stream to a port instead ([`Spec::Connect`]). It has one gate ([`hop`]) and one sender
+//! ([`send`]); what the gate lets through is run by what the body asks.
 //! Node A passes the client's bytes on without reading them (the WebSocket is the client's, to
 //! node B, which is the one that answers it). A failure after the upgrade is a Status on channel
 //! 3 and a close: a client that was refused an upgrade would fall back to another protocol.
@@ -24,7 +27,7 @@
 use crate::Shared;
 use crate::access::Caller;
 use crate::api::permit;
-use crate::cluster::{Peer, refuse};
+use crate::cluster::{POD_HOP, Peer, refuse};
 use crate::pki::Subject;
 use crate::view::Upstream;
 use crate::websocket::{self, Op};
@@ -49,7 +52,7 @@ use tokio::sync::{Mutex, watch};
 // ponytail: one frame's bytes held at a time; a stdin larger than this comes as more frames.
 pub(crate) const FRAME_MAX: usize = 1 << 20;
 
-const PROTOCOL: &str = "kith-exec";
+const PROTOCOL: &str = "kith-pod-hop";
 /// How long the node that runs the replica has to answer the hop.
 const HOP: Duration = Duration::from_secs(15);
 /// How long a session may take to say how it ended and read the client's close back.
@@ -110,10 +113,10 @@ pub struct Ask {
 
 /// An answer that is no: the Status's code and reason, and what it says.
 #[derive(Debug)]
-struct Failed {
+pub(crate) struct Failed {
     code: u16,
     reason: &'static str,
-    message: String,
+    pub(crate) message: String,
 }
 
 impl Failed {
@@ -296,18 +299,19 @@ async fn prepare(
         return Ok(Run::Here(enter(placed.id, ask.command.clone()).await?, ask.stdin));
     };
     // The replica is on another node: its session is that node's, and this one passes the bytes.
-    relay(shared, who, namespace, pod, ask, &placed.node, there)
+    send(shared, who, namespace, pod, Spec::Exec(ask), &placed.node, there)
         .await
         .map(Run::There)
 }
 
-/// Asks the node that runs the replica to run `ask` in it: its end of the WebSocket's bytes.
-async fn relay(
-    shared: &Arc<Shared>,
+/// The one sender of the hop: asks the node that runs the replica to do `spec` for `who`, and gives the
+/// connection it upgrades to (the client's WebSocket for an exec, a byte stream for a connect).
+pub(crate) async fn send(
+    shared: &Shared,
     who: &Caller,
     namespace: &str,
     pod: &str,
-    ask: Ask,
+    spec: Spec,
     node: &str,
     there: &Upstream,
 ) -> Result<reqwest::Upgraded, Failed> {
@@ -318,11 +322,11 @@ async fn relay(
         namespace: namespace.into(),
         pod: pod.into(),
         caller: who.to_string(),
-        ask,
+        spec,
     };
     let down = |why: String| Failed::new(502, "InternalError", format!("node {node} {why}"));
     let client = cluster.to(there).map_err(|e| Failed::new(502, "InternalError", e))?;
-    let send = crate::access_sign::pass_on(client.post(format!("https://{}/v1/exec-hop", there.address)))
+    let send = crate::access_sign::pass_on(client.post(format!("https://{}{POD_HOP}", there.address)))
         .header(header::CONNECTION, "upgrade")
         .header(header::UPGRADE, PROTOCOL)
         .json(&hop)
@@ -346,19 +350,28 @@ async fn relay(
     }
 }
 
-/// What node A asks node B: the pod, the caller, and what to run.
+/// What node A asks node B: the pod, the caller, and what to do for it.
 #[derive(Serialize, Deserialize)]
 struct Hop {
     namespace: String,
     pod: String,
     /// Who asked node A.
     caller: String,
-    ask: Ask,
+    spec: Spec,
 }
 
-/// `POST /v1/exec-hop`: the node that runs the replica, asked by the node the client reached
+/// What node B does for the pod: runs a command in it (the client's WebSocket is then node B's to answer), or
+/// connects to a port of it and passes the bytes.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Spec {
+    Exec(Ask),
+    Connect { port: u16 },
+}
+
+/// `POST /v1/pod-hop`: the node that runs the replica, asked by the node the client reached
 /// (members only). It checks, in its own store, that the caller named may exec on what runs the
-/// pod, enters the container, and answers the client's WebSocket on the connection it is given.
+/// pod (a connection to a port of it takes the same right), then does what the body asks on the connection it is given.
 pub async fn hop(
     State(shared): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
@@ -375,7 +388,7 @@ pub async fn hop(
         .headers()
         .get(crate::access_sign::SIGNED)
         .map(|header| header.to_str().unwrap_or_default().to_string());
-    let path = request.uri().path_and_query().map_or("/v1/exec-hop", |p| p.as_str());
+    let path = request.uri().path_and_query().map_or(POD_HOP, |p| p.as_str());
     let path = path.to_string();
     let upgrade = hyper::upgrade::on(&mut request);
     let body = match to_bytes(request.into_body(), 64 << 10).await {
@@ -401,16 +414,20 @@ pub async fn hop(
     };
     let held = crate::access_sign::hop(&shared, from.as_str(), signed.as_deref(), &asked, Some(&who), false);
     let who = crate::access::passed(&shared, from, who);
+    let verb = match hop.spec {
+        Spec::Exec(_) => "exec",
+        Spec::Connect { .. } => "portforward",
+    };
     let audit = |outcome| {
         let what = vec![format!("pod {}/{}", hop.namespace, hop.pod)];
-        shared.audit.record(&who, "exec", what, outcome);
+        shared.audit.record(&who, verb, what, outcome);
     };
     if let Err(why) = held {
         audit(Err(why.clone()));
         return say(StatusCode::FORBIDDEN, why);
     }
     // (What the pod's name says is enough to ask: a caller without the right is refused whether or not the pod is there.)
-    let Some((holder, ..)) = crate::kube::pod_owner(&hop.pod) else {
+    let Some((holder, owner, replica)) = crate::kube::pod_owner(&hop.pod) else {
         let why = format!("pod {}/{} is not found", hop.namespace, hop.pod);
         audit(Err(why.clone()));
         return say(StatusCode::NOT_FOUND, why);
@@ -420,38 +437,58 @@ pub async fn hop(
         audit(Err("refused".into()));
         return refused.into_response();
     }
-    let placed = match place(&shared, &hop.namespace, &hop.pod, hop.ask.container.as_deref()) {
-        Ok(placed) => placed,
-        Err(failed) => {
-            audit(Err(failed.message.clone()));
-            return say(
-                StatusCode::from_u16(failed.code).unwrap_or(StatusCode::BAD_REQUEST),
-                failed.message,
-            );
+    // (Past the gate: what is asked is done here, or refused with a status that says why.)
+    let done = match hop.spec {
+        Spec::Exec(ask) => exec_here(&shared, &hop.namespace, &hop.pod, &hop.caller, ask, upgrade).await,
+        // (A NodeWorkload's unit runs on the host: there is no pod to connect to.)
+        Spec::Connect { .. } if holder == "NodeWorkload" => {
+            let why = "port-forward does not reach a NodeWorkload's unit, which runs on the host";
+            Err((StatusCode::NOT_IMPLEMENTED, why.to_string()))
+        }
+        Spec::Connect { port: 0 } => Err((StatusCode::BAD_REQUEST, "port 0 is no port".to_string())),
+        Spec::Connect { port } => {
+            let key = format!("{holder}/{}/{owner}", hop.namespace);
+            crate::kube::portforward::tunnel(&shared, &key, replica, port, upgrade).await
         }
     };
+    if let Err((status, why)) = done {
+        audit(Err(why.clone()));
+        return say(status, why);
+    }
+    audit(Ok(()));
+    let mut reply = Response::new(Body::empty());
+    *reply.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    let headers = reply.headers_mut();
+    headers.insert(header::CONNECTION, "upgrade".parse().expect("a header value"));
+    headers.insert(header::UPGRADE, PROTOCOL.parse().expect("a header value"));
+    reply
+}
+
+/// An exec the gate let through, run here: the container is entered and the client's connection (once it is
+/// upgraded) is given to `pump`. The replica is on this node, or the hop is refused.
+async fn exec_here(
+    shared: &Arc<Shared>,
+    namespace: &str,
+    pod: &str,
+    caller: &str,
+    ask: Ask,
+    upgrade: hyper::upgrade::OnUpgrade,
+) -> Result<(), (StatusCode, String)> {
+    let no = |failed: Failed, code| (code, failed.message);
+    let placed = place(shared, namespace, pod, ask.container.as_deref()).map_err(|failed| {
+        let code = StatusCode::from_u16(failed.code).unwrap_or(StatusCode::BAD_REQUEST);
+        no(failed, code)
+    })?;
     // (Passed on once: the node it is passed to is the one that runs it, or it is refused.)
     if placed.there.is_some() {
-        let why = format!("pod {}/{} does not run on this node", hop.namespace, hop.pod);
-        audit(Err(why.clone()));
-        return say(StatusCode::CONFLICT, why);
+        let why = format!("pod {namespace}/{pod} does not run on this node");
+        return Err((StatusCode::CONFLICT, why));
     }
-    let slot = match take(&hop.caller) {
-        Ok(slot) => slot,
-        Err(failed) => {
-            audit(Err(failed.message.clone()));
-            return say(StatusCode::TOO_MANY_REQUESTS, failed.message);
-        }
-    };
-    let run = match enter(placed.id, hop.ask.command.clone()).await {
-        Ok(run) => run,
-        Err(failed) => {
-            audit(Err(failed.message.clone()));
-            return say(StatusCode::UNPROCESSABLE_ENTITY, failed.message);
-        }
-    };
-    audit(Ok(()));
-    let (stop, stdin) = (shared.stop.subscribe(), hop.ask.stdin);
+    let slot = take(caller).map_err(|failed| no(failed, StatusCode::TOO_MANY_REQUESTS))?;
+    let run = enter(placed.id, ask.command)
+        .await
+        .map_err(|failed| no(failed, StatusCode::UNPROCESSABLE_ENTITY))?;
+    let (stop, stdin) = (shared.stop.subscribe(), ask.stdin);
     tokio::spawn(async move {
         let _slot = slot;
         match upgrade.await {
@@ -463,12 +500,7 @@ pub async fn hop(
             Err(_) => run.kill(),
         }
     });
-    let mut reply = Response::new(Body::empty());
-    *reply.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    let headers = reply.headers_mut();
-    headers.insert(header::CONNECTION, "upgrade".parse().expect("a header value"));
-    headers.insert(header::UPGRADE, PROTOCOL.parse().expect("a header value"));
-    reply
+    Ok(())
 }
 
 /// The Status on channel 3 and the close that follows it, as one write.
@@ -833,13 +865,21 @@ spec: {role: execer, subjects: [alice]}
 ";
 
     /// What the node the hop is sent to answers when it is asked as node a: the status and what it says.
-    async fn ask_hop(client: &reqwest::Client, port: u16, caller: &str, pod: &str) -> (u16, String) {
-        let body = json!({
-            "namespace": "default", "pod": pod, "caller": caller,
-            "ask": {"command": ["true"], "container": null, "stdin": false},
-        });
+    async fn ask_hop(client: &reqwest::Client, port: u16, caller: &str, pod: &str, spec: &Value) -> (u16, String) {
+        ask_at(client, port, POD_HOP, caller, pod, spec).await
+    }
+
+    async fn ask_at(
+        client: &reqwest::Client,
+        port: u16,
+        path: &str,
+        caller: &str,
+        pod: &str,
+        spec: &Value,
+    ) -> (u16, String) {
+        let body = json!({"namespace": "default", "pod": pod, "caller": caller, "spec": spec});
         let reply = client
-            .post(format!("https://127.0.0.1:{port}/v1/exec-hop"))
+            .post(format!("https://127.0.0.1:{port}{path}"))
             .header(header::CONNECTION, "upgrade")
             .header(header::UPGRADE, PROTOCOL)
             .json(&body)
@@ -851,11 +891,20 @@ spec: {role: execer, subjects: [alice]}
         (status, said["error"].as_str().unwrap_or_default().to_string())
     }
 
+    /// The two things a node is asked to do for a pod, as the hop's body says them.
+    fn specs() -> [Value; 2] {
+        [
+            json!({"exec": {"command": ["true"], "container": null, "stdin": false}}),
+            json!({"connect": {"port": 80}}),
+        ]
+    }
+
     /// The node the replica runs on asks its own store whether the caller a node names may exec,
-    /// and answers for what it finds there; nothing is entered for a caller it refuses.
+    /// and answers for what it finds there, for an exec and for a connection to a port alike (one route, one
+    /// gate); nothing is entered or connected for a caller it refuses.
     #[tokio::test]
     async fn hop_checks_the_named_caller_and_the_pod_on_the_node_it_arrives_at() {
-        let world = crate::api::run::tests::World::new("exec-hop").await;
+        let world = crate::api::run::tests::World::new("pod-hop").await;
         let alice = world.user("alice");
         world.user("bob");
         for shared in [&world.a, &world.b] {
@@ -865,50 +914,101 @@ spec: {role: execer, subjects: [alice]}
             }
             // web runs on b, far and the host's agent elsewhere.
             for (key, node) in [("Workload/default/web", "b"), ("Workload/default/far", "a")] {
-                state
-                    .store
-                    .set_status(key, Some(json!({"nodes": {"0": node}})))
-                    .unwrap();
+                let unit = json!({"replica": 0, "node": node, "state": "running"});
+                let status = json!({"nodes": {"0": node}, "containers": [unit]});
+                state.store.set_status(key, Some(status)).unwrap();
             }
         }
         let a = world.a.cluster.as_ref().unwrap().client.clone();
-        let ask = |caller: &'static str, pod: &'static str| ask_hop(&a, world.b_port, caller, pod);
+        for spec in specs() {
+            let ask = |caller: &'static str, pod: &'static str| ask_hop(&a, world.b_port, caller, pod, &spec);
 
-        let (status, why) = ask("bob", "web-0").await;
-        assert_eq!(status, 403, "{why}");
-        assert!(why.contains("bob via node a may not exec Workload"), "{why}");
-        // Refused for what it is, whatever the pod: a caller without the right learns nothing of it.
-        assert_eq!(ask("bob", "ghost-0").await.0, 403);
-        assert_eq!(ask("mallory", "web-0").await.0, 403);
-        // Not a caller a hop is for.
-        for caller in ["node a", "alice via node b", ""] {
-            assert_eq!(ask(caller, "web-0").await.0, 400, "{caller:?}");
+            let (status, why) = ask("bob", "web-0").await;
+            assert_eq!(status, 403, "{spec}: {why}");
+            assert!(why.contains("bob via node a may not exec Workload"), "{why}");
+            // Refused for what it is, whatever the pod: a caller without the right learns nothing of it.
+            assert_eq!(ask("bob", "ghost-0").await.0, 403, "{spec}");
+            assert_eq!(ask("mallory", "web-0").await.0, 403, "{spec}");
+            // Not a caller a hop is for.
+            for caller in ["node a", "alice via node b", ""] {
+                assert_eq!(ask(caller, "web-0").await.0, 400, "{spec} {caller:?}");
+            }
+            // A pod that runs on another node is not reached from here, and no pod is not found.
+            assert_eq!(ask("alice", "far-0").await.0, 409, "{spec}");
+            assert_eq!(ask("alice", "ghost-0").await.0, 404, "{spec}");
+            assert_eq!(ask("alice", "ghost").await.0, 404, "{spec}");
+            // A NodeWorkload's pod is the host's, not a container's.
+            assert_eq!(ask("alice", "agent-n0").await.0, 501, "{spec}");
+            // An Identity is no node: the hop is not its way past node a.
+            assert_eq!(ask_hop(&alice, world.b_port, "alice", "web-0", &spec).await.0, 403);
         }
-        // Who may exec: the hop goes on to enter the container, which this node did not make.
-        let (status, why) = ask("alice", "web-0").await;
+        // Who may exec: the hop goes on to enter the container, which this node did not make, or to
+        // connect to a pod that has no network here.
+        let [exec, connect] = specs();
+        let (status, why) = ask_hop(&a, world.b_port, "alice", "web-0", &exec).await;
         assert_eq!(status, 422, "{why}");
         assert!(why.contains("not a unit made here"), "{why}");
-        // A pod that runs on another node is not entered from here, and no pod is not found.
-        assert_eq!(ask("alice", "far-0").await.0, 409);
-        assert_eq!(ask("alice", "ghost-0").await.0, 404);
-        assert_eq!(ask("alice", "ghost").await.0, 404);
-        // A NodeWorkload's pod is the host's, not a container's.
-        assert_eq!(ask("alice", "agent-n0").await.0, 501);
-        // An Identity is no node: the hop is not its way past node a.
-        assert_eq!(ask_hop(&alice, world.b_port, "alice", "web-0").await.0, 403);
+        let (status, why) = ask_hop(&a, world.b_port, "alice", "web-0", &connect).await;
+        assert_eq!(status, 502, "{why}");
+        // Neither a spec that names nothing nor one that names both is a hop.
+        for spec in [
+            json!({}),
+            json!({"exec": {"command": ["true"]}, "connect": {"port": 80}}),
+            json!({"connect": {"port": 0}}),
+        ] {
+            let (status, why) = ask_hop(&a, world.b_port, "alice", "web-0", &spec).await;
+            assert_eq!(status, 400, "{spec}: {why}");
+        }
 
-        let entries = world.b.audit.tail(20).unwrap();
-        let bob = entries
-            .iter()
-            .find(|e| e["who"] == "bob via node a")
-            .expect("bob's refusal is written down");
-        assert_eq!((&bob["verb"], &bob["ok"]), (&json!("exec"), &json!(false)));
+        let entries = world.b.audit.tail(60).unwrap();
+        let verbs = |who: &str| {
+            let refused = entries.iter().filter(|e| e["who"] == who && e["ok"] == false);
+            refused
+                .map(|e| e["verb"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        let bob = verbs("bob via node a");
         assert!(
-            entries
-                .iter()
-                .any(|e| e["who"] == "alice via node a" && e["ok"] == false),
-            "{entries:?}"
+            bob.contains(&"exec".to_string()) && bob.contains(&"portforward".to_string()),
+            "{bob:?}"
         );
+        assert!(!verbs("alice via node a").is_empty(), "{entries:?}");
+    }
+
+    /// The two routes this one replaced are gone: a node that asks for either is told there is no such route,
+    /// and a worker is refused this one as it was refused port-forward's.
+    #[tokio::test]
+    async fn hop_is_one_route_and_the_old_exec_route_is_gone() {
+        let world = crate::api::run::tests::World::new("pod-hop-one").await;
+        world.user("alice");
+        for shared in [&world.a, &world.b] {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(HOP_STORE).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        let a = world.a.cluster.as_ref().unwrap().client.clone();
+        let [exec, connect] = specs();
+        for (path, spec) in [("/v1/exec-hop", &exec), ("/v1/exec-hop", &connect)] {
+            assert_eq!(
+                ask_at(&a, world.b_port, path, "alice", "web-0", spec).await.0,
+                404,
+                "{path}"
+            );
+        }
+        assert_ne!(ask_at(&a, world.b_port, POD_HOP, "alice", "web-0", &exec).await.0, 404);
+        // b's store says a is a worker: a worker's hop is refused for either, whoever it names.
+        let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: a}\nspec: {trust: worker}\n";
+        let node = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
+        world.b.store.lock().unwrap().store.apply(node).unwrap();
+        for spec in [&exec, &connect] {
+            let (status, why) = ask_hop(&a, world.b_port, "alice", "web-0", spec).await;
+            assert_eq!(status, 403, "{why}");
+            assert!(
+                why.contains("node a is a worker: only a control node sends this"),
+                "{why}"
+            );
+        }
     }
 
     /// The shutdown is inside the five seconds too: a shutdown that never completes is given up.

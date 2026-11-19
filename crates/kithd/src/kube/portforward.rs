@@ -8,9 +8,10 @@
 //! what goes wrong is said as text on the error stream; when the data stream ends both are FINed, which
 //! is what makes kubectl close the local connection.
 //!
-//! The bytes go to the node that runs the replica over `POD_HOP`, a byte tunnel between nodes that is
-//! asked for the replica and a port, never an address: that node connects to the pod's own address
-//! (`pods::connect`) and checks the right again for the caller the first node names, as `run-hop` does.
+//! The bytes go to the node that runs the replica over `POD_HOP`, the one hop route for a pod (pod_exec.rs):
+//! it is asked for the pod and a port (`Spec::Connect`), never an address, and that node connects to the pod's
+//! own address (`pods::connect`) after the same gate `exec` has: the caller the first node names and signs, and the
+//! Exec right in its own store.
 //!
 //! Bounds: a caller has [`SESSIONS_MAX`] sessions at a node (counted at the upgrade, not by streams), a
 //! session [`STREAMS_MAX`] connections, and a connection that moves no byte for [`idle`] ends.
@@ -18,20 +19,17 @@
 use super::{Call, No, pod_access, status};
 use crate::Shared;
 use crate::access::Caller;
-use crate::cluster::{POD_HOP, Peer, refuse};
+use crate::cluster::refuse;
 use crate::ingress::Idle;
-use crate::pki::Subject;
+use crate::pod_exec::Spec;
 use crate::spdy::{self, Frame, Reader, Writer};
 use crate::view::Upstream;
 use crate::websocket::{self, Op};
-use axum::body::{Body, to_bytes};
-use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use hyper::upgrade::{OnUpgrade, Upgraded};
 use hyper_util::rt::TokioIo;
 use kith_api::kinds::Verb;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,7 +40,6 @@ use tokio::task::{AbortHandle, JoinSet};
 
 /// The WebSocket subprotocol kubectl asks for, and the one between nodes.
 const PROTOCOL: &str = "SPDY/3.1+portforward.k8s.io";
-const HOP_PROTOCOL: &str = "kith-portforward";
 /// Sessions one caller holds at a node, and the connections one session carries at once.
 const SESSIONS_MAX: usize = 8;
 const STREAMS_MAX: usize = 16;
@@ -105,9 +102,10 @@ impl Drop for Held {
 #[derive(Clone)]
 struct Owner {
     key: String,
+    namespace: String,
+    pod: String,
     replica: u32,
     caller: Caller,
-    who: String,
 }
 
 /// `GET .../pods/NAME/portforward`: the right on what runs the pod, then the upgrade. Each decision is in the audit log.
@@ -172,9 +170,10 @@ fn decide(
     let shared = call.shared.clone();
     let owner = Owner {
         key,
+        namespace: namespace.to_string(),
+        pod: pod.to_string(),
         replica,
         caller: call.caller.clone(),
-        who,
     };
     tokio::spawn(async move {
         if let Ok(upgraded) = upgrade.await {
@@ -538,50 +537,11 @@ async fn reach(shared: &Shared, owner: &Owner, port: u16) -> Result<Box<dyn Io>,
     let Some((node, there)) = place(shared, &owner.key, owner.replica)? else {
         return Ok(Box::new(pod(shared, &owner.key, owner.replica, port).await?));
     };
-    let cluster = shared.cluster.as_ref().ok_or("this kithd is not part of a cluster")?;
-    let client = cluster.to(&there)?;
-    let spec = Spec {
-        key: owner.key.clone(),
-        replica: owner.replica,
-        port,
-        caller: owner.who.clone(),
-    };
-    let send = crate::access_sign::pass_on(client.post(format!("https://{}{POD_HOP}", there.address)))
-        .header(header::CONNECTION, "upgrade")
-        .header(header::UPGRADE, HOP_PROTOCOL)
-        .json(&spec)
-        .send();
-    let reply = match tokio::time::timeout(HOP, send).await {
-        Ok(Ok(reply)) => reply,
-        Ok(Err(e)) => return Err(format!("node {node} did not answer: {}", crate::cluster::why(&e))),
-        Err(_) => return Err(format!("node {node} did not answer in time")),
-    };
-    if reply.status() != StatusCode::SWITCHING_PROTOCOLS {
-        let code = reply.status();
-        let said = reply.text().await.unwrap_or_default();
-        let said = serde_json::from_str::<serde_json::Value>(&said)
-            .ok()
-            .and_then(|said| said["error"].as_str().map(str::to_string))
-            .unwrap_or(said);
-        return Err(format!(
-            "node {node} said {code}: {}",
-            said.chars().take(512).collect::<String>()
-        ));
-    }
-    match reply.upgrade().await {
-        Ok(far) => Ok(Box::new(Idle::new(far, idle(), None))),
-        Err(_) => Err(format!("node {node} did not give the tunnel")),
-    }
-}
-
-/// What the first node asks the node that runs the replica.
-#[derive(Serialize, Deserialize)]
-struct Spec {
-    key: String,
-    replica: u32,
-    port: u16,
-    /// Who asked the first node.
-    caller: String,
+    let spec = Spec::Connect { port };
+    let far = crate::pod_exec::send(shared, &owner.caller, &owner.namespace, &owner.pod, spec, &node, &there)
+        .await
+        .map_err(|failed| failed.message)?;
+    Ok(Box::new(Idle::new(far, idle(), None)))
 }
 
 /// The Exec right of `who` on what owns `key`, a Workload's or a Job's replica and nothing else: the key is parsed,
@@ -599,62 +559,23 @@ fn say(code: StatusCode, why: impl std::fmt::Display) -> Response {
     refuse(code, why).into_response()
 }
 
-/// `POST /v1/pod-hop`: the node the replica runs on, asked by the first node (members only). It takes the
-/// caller's name, not what the caller may do: the right is checked here, in this node's own store.
-pub(crate) async fn hop(
-    State(shared): State<Arc<Shared>>,
-    ConnectInfo(peer): ConnectInfo<Peer>,
-    mut request: Request,
-) -> Response {
-    let Some(Subject::Node(from, ..)) = peer.subject else {
-        return say(StatusCode::FORBIDDEN, "this is for the cluster's nodes");
-    };
-    if request.headers().get(header::UPGRADE).is_none_or(|v| v != HOP_PROTOCOL) {
-        return say(StatusCode::BAD_REQUEST, format!("ask with `Upgrade: {HOP_PROTOCOL}`"));
-    }
-    let signed = request.headers().get(crate::access_sign::SIGNED);
-    let signed = signed.map(|header| header.to_str().unwrap_or_default().to_string());
-    let path = request
-        .uri()
-        .path_and_query()
-        .map_or(POD_HOP, |path| path.as_str())
-        .to_string();
-    let upgrade = hyper::upgrade::on(&mut request);
-    let body = match to_bytes(request.into_body(), 4 << 10).await {
-        Ok(body) => body,
-        Err(e) => return say(StatusCode::PAYLOAD_TOO_LARGE, e),
-    };
-    let spec: Spec = match serde_json::from_slice(&body) {
-        Ok(spec) => spec,
-        Err(e) => return say(StatusCode::BAD_REQUEST, e),
-    };
-    let Some(who) = Caller::named(&spec.caller) else {
-        return say(
-            StatusCode::BAD_REQUEST,
-            format!("caller: {:?} is no caller a node passes on", spec.caller),
-        );
-    };
-    let asked = crate::access_sign::Asked {
-        method: "POST",
-        path: &path,
-        body: &body,
-    };
-    if let Err(why) = crate::access_sign::hop(&shared, from.as_str(), signed.as_deref(), &asked, Some(&who), false) {
-        return say(StatusCode::FORBIDDEN, why);
-    }
-    let who = crate::access::passed(&shared, from, who);
-    if let Err(refused) = may_exec(&shared, &who, &spec.key) {
-        return refused;
-    }
-    match place(&shared, &spec.key, spec.replica) {
+/// The far end of a `Spec::Connect` hop (`pod_exec::hop` has checked the caller and the right): connects to `port` of
+/// the replica, which has to run on this node, and passes the bytes of the upgraded connection both ways.
+pub(crate) async fn tunnel(
+    shared: &Arc<Shared>,
+    key: &str,
+    replica: u32,
+    port: u16,
+    upgrade: OnUpgrade,
+) -> Result<(), (StatusCode, String)> {
+    match place(shared, key, replica) {
         Ok(None) => {}
-        Ok(Some(_)) => return say(StatusCode::CONFLICT, "that replica does not run on this node"),
-        Err(why) => return say(StatusCode::NOT_FOUND, why),
+        Ok(Some(_)) => return Err((StatusCode::CONFLICT, "that replica does not run on this node".into())),
+        Err(why) => return Err((StatusCode::NOT_FOUND, why)),
     }
-    let mut pod = match pod(&shared, &spec.key, spec.replica, spec.port).await {
-        Ok(pod) => pod,
-        Err(why) => return say(StatusCode::BAD_GATEWAY, why),
-    };
+    let mut pod = pod(shared, key, replica, port)
+        .await
+        .map_err(|why| (StatusCode::BAD_GATEWAY, why))?;
     let mut stop = shared.stop.subscribe();
     tokio::spawn(async move {
         if let Ok(upgraded) = upgrade.await {
@@ -666,15 +587,7 @@ pub(crate) async fn hop(
             }
         }
     });
-    let mut reply = Response::new(Body::empty());
-    *reply.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    reply
-        .headers_mut()
-        .insert(header::CONNECTION, "upgrade".parse().expect("a header value"));
-    reply
-        .headers_mut()
-        .insert(header::UPGRADE, HOP_PROTOCOL.parse().expect("a header value"));
-    reply
+    Ok(())
 }
 
 #[cfg(test)]
