@@ -95,10 +95,18 @@ root=$(cd "$here/.." && pwd)
 # (Absolute: systemd-repart ignores a relative CopyBlocks= path and leaves the partition empty.)
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
-# KITHD_FEATURES (ci/musl.sh) builds a kithd with test-only routes: only into the folder
+# KITHD_FEATURES (ci/musl.sh) builds a kithd with test-only code: only into the folder
 # ci/vm.sh gives that image, so one left in the environment never makes an image that ships.
-if [ -n "${KITHD_FEATURES:-}" ] && [ "$out" != "$root/target/os-forge" ]; then
-    echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): only for --out target/os-forge, not $out (unset it)" >&2
+# (forge: a route a leader appends an unchecked entry by; fido2-test: a software security key
+# on /dev/uhid, docs/adr-fido2.md section 2.)
+case "${KITHD_FEATURES:-}" in
+    '') ;;
+    forge) want=$root/target/os-forge ;;
+    fido2-test) want=$root/target/os-fido2 ;;
+    *) echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): it knows forge and fido2-test (unset it)" >&2; exit 2 ;;
+esac
+if [ -n "${KITHD_FEATURES:-}" ] && [ "$out" != "$want" ]; then
+    echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): only for --out ${want#"$root"/}, not $out (unset it)" >&2
     exit 2
 fi
 cache=${KITH_OS_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/kith-os}
@@ -192,6 +200,10 @@ if [ -n "$spec" ]; then
         case $f in *[!a-z0-9-]*) die "--spec: '$f' is not a feature's name" ;; esac
         [ -r "$root/os/features/$f.config" ] ||
             die "--spec: no feature '$f' (os/features has: $(cd "$root/os/features" && ls | sed 's/\.config$//' | tr '\n' ' '))"
+        # (uhid-test puts /dev/uhid in the kernel: only for the image of the fido2 test, which
+        # has the software key that opens it, and which ships nowhere.)
+        [ "$f" != uhid-test ] || [ "$out" = "$root/target/os-fido2" ] ||
+            die "--spec: the feature uhid-test (CONFIG_UHID) is for --out target/os-fido2 only, not $out"
         { echo "# --spec: $f"; cat "$root/os/features/$f.config"; } >>"$kconfig"
         globs="$globs
 $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
@@ -325,6 +337,22 @@ if ! [ -r "$kernel" ]; then
     # (The tree is 2.6 GB; the kernel is what is kept.)
     find "$tree" -delete
     mv "$cache/kernel-$key/vmlinuz.part" "$kernel"
+fi
+# What the kernel was built with, not what was asked of it: the merge fragments never show an
+# option that is off, and a defconfig may give one on of its own. A key and an HID device
+# node for it in every build; /dev/uhid (which lets root make an input device out of nothing)
+# in none that ships: that build must say '# CONFIG_UHID is not set', so a missing line (an
+# option the tree does not know) fails too. Only the uhid-test spec has CONFIG_UHID=y.
+built=$cache/kernel-$key/config
+[ -r "$built" ] || die "no .config kept for the kernel ($built)"
+for want_on in CONFIG_HIDRAW=y CONFIG_USB_HID=y; do
+    grep -qxF "$want_on" "$built" || die "the kernel's .config has no $want_on"
+done
+if [ -n "$spec" ] && spec_list features | grep -qx uhid-test; then
+    grep -qxF 'CONFIG_UHID=y' "$built" || die "the uhid-test kernel's .config has no CONFIG_UHID=y"
+else
+    grep -qxF '# CONFIG_UHID is not set' "$built" ||
+        die "a shipped kernel's .config must say '# CONFIG_UHID is not set' (only --spec with the feature uhid-test has /dev/uhid): $(grep 'CONFIG_UHID' "$built" || echo 'no CONFIG_UHID line')"
 fi
 if [ -n "$modules" ]; then
     # What the modules ask for, from linux-firmware: the whole of it for `all`, and the files

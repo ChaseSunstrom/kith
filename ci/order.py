@@ -75,7 +75,9 @@ class Registers(ctypes.Structure):
 
 def built():
     """The kithd ci/musl.sh builds, and the linker's map of it."""
-    made = subprocess.run(["sh", os.path.join(ROOT, "ci/musl.sh")], check=True, stdout=subprocess.PIPE, text=True)
+    # (Without KITHD_FEATURES: a test build of kithd is in another folder, and not the one weighed.)
+    made = subprocess.run(["sh", os.path.join(ROOT, "ci/musl.sh")], check=True, stdout=subprocess.PIPE, text=True,
+                          env={k: v for k, v in os.environ.items() if k != "KITHD_FEATURES"})
     release = made.stdout.strip()
     # (Wherever under it cargo keeps what a build script writes: that has moved before.)
     maps = glob.glob(os.path.join(release, "**/kithd.map"), recursive=True)

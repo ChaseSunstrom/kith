@@ -2,7 +2,10 @@
 
 Status: design (T-0863); built so far, and called by nothing: the client's wire half (T-0966:
 CTAPHID framing, the CBOR subset) and its second half (T-0968: AES-256-CBC, ECDH, `hmac-secret`,
-`makeCredential` and `getAssertion`), all tested on a scripted key and never yet on a real one.
+`makeCredential` and `getAssertion`), all tested on a scripted key and never yet on a real one;
+and the software key of section 2's test build (T-0970: `crates/kithd/src/fido2_test.rs`, the
+cargo feature `fido2-test`, with its four release guards in `os/build.sh`, `ci/vm/tests.sh` and
+`ci/musl.sh`; its VM test is not yet built).
 This record settles what [adr-unlock.md](adr-unlock.md)
 left as "FIDO2: deferred", item by item, so that the build can be cut into slices that each
 stand alone. Where the code differs from a line here, the code is the word. A decision here
