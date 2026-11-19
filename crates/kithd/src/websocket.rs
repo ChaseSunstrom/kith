@@ -3,7 +3,9 @@
 //! every length before any of its body is read, and the encoder. No extension (RSV bits stay 0).
 //! A client's message may come as several frames (kubectl's gorilla client splits its writes over
 //! a 4 KiB buffer): the decoder hands each one over as it is, a continuation (opcode 0) as
-//! [`Op::Continue`], and what reads them keeps what the first one said. kithd sends each message whole.
+//! [`Op::Continue`], and what reads them keeps what the first one said. Where the messages are one
+//! stream of bytes (`decode_with`: kubectl port-forward's SPDY) a continuation comes back as `Binary`.
+//! kithd sends each message whole.
 
 use base64::Engine;
 
@@ -55,6 +57,19 @@ pub(crate) fn accept_key(client_key: &str) -> Option<String> {
 /// bytes it took. `from_client` is set when kithd is the server: client frames must be masked and
 /// server frames must not be. A declared length over `max` is refused as soon as the header shows it.
 pub(crate) fn decode(buf: &[u8], from_client: bool, max: usize) -> Result<Option<(Frame, usize)>, FrameError> {
+    decode_with(buf, from_client, max, false)
+}
+
+/// [`decode`], where `stream` says the messages are one stream of bytes (port-forward's SPDY):
+/// a message may then come in pieces, and a continuation frame (opcode 0) or one that is not the last
+/// comes back as a `Binary` frame, its payload the next bytes of the stream. kubectl's gorilla client splits
+/// its writes over a 4 KiB buffer, so it sends these. Each piece is still bounded by `max`.
+pub(crate) fn decode_with(
+    buf: &[u8],
+    from_client: bool,
+    max: usize,
+    stream: bool,
+) -> Result<Option<(Frame, usize)>, FrameError> {
     if buf.len() < 2 {
         return Ok(None);
     }
@@ -63,7 +78,11 @@ pub(crate) fn decode(buf: &[u8], from_client: bool, max: usize) -> Result<Option
         return Err(FrameError::Malformed("a reserved bit is set"));
     }
     let fin = b0 & 0x80 != 0;
+    if !fin && stream && !matches!(b0 & 0x0f, 0 | 2) {
+        return Err(FrameError::Malformed("a fragmented frame"));
+    }
     let op = match b0 & 0x0f {
+        0 if stream => Op::Binary,
         0 => Op::Continue,
         1 => Op::Text,
         2 => Op::Binary,
@@ -286,6 +305,30 @@ mod tests {
             decode(&head, true, 1024),
             Err(FrameError::TooLong { len: 65535, max: 1024 })
         );
+    }
+
+    #[test]
+    fn websocket_a_stream_takes_the_pieces_of_a_message_and_a_message_still_does_not() {
+        // A binary frame without FIN, then a continuation that ends it: two pieces of one stream.
+        let mut first = encode(Op::Binary, b"ab", Some(KEY));
+        first[0] &= 0x7f;
+        let mut last = encode(Op::Binary, b"cd", Some(KEY));
+        last[0] &= 0xf0;
+        for (wire, bytes) in [(&first, b"ab"), (&last, b"cd")] {
+            let (frame, used) = decode_with(wire, true, MAX, true).unwrap().unwrap();
+            assert_eq!(
+                (frame.op, frame.payload.as_slice(), used),
+                (Op::Binary, &bytes[..], wire.len())
+            );
+            assert!(refused(wire, true), "a message of whole frames refuses the piece");
+        }
+        // Text and a control frame without FIN are no piece of a stream.
+        let mut text = encode(Op::Text, b"x", Some(KEY));
+        text[0] &= 0x7f;
+        assert!(decode_with(&text, true, MAX, true).is_err());
+        let mut ping = encode(Op::Ping, b"x", Some(KEY));
+        ping[0] &= 0x7f;
+        assert!(decode_with(&ping, true, MAX, true).is_err());
     }
 
     #[test]
