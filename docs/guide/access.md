@@ -141,7 +141,8 @@ kithd --node-policy no-exec-units,no-run  # everything but exec units and `kith 
 
 The words: `exec-units`; `root-containers` (off: no container is root without an id range of its
 own, as a pod's on kith OS); `unconfined` (a `seccomp` that is unconfined or allows refused
-calls back); `node-network` (containers that are no pod); `vms`; `vm-paths` (a VM's kernel,
+calls back, or a nested unit's); `host-users` (containers that keep the node's own users with no
+range of their own, as a NodeWorkload's do: off, no NodeWorkload runs); `node-network` (containers that are no pod); `vms`; `vm-paths` (a VM's kernel,
 firmware or disks as node paths, or a hypervisor other than qemu; `vms` alone runs none of use); `passthrough`; `host-paths` (a Volume in `kith-system` at any path on the node);
 `run` (`kith run`); `wipe` (the cluster erasing this node's key or setting duress codes);
 `devices=gpu+input` (the Device classes a DeviceClaim hands out: `all`, or none after the `=`;

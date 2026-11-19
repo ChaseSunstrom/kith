@@ -299,9 +299,12 @@ and sysfs, as one process cannot:**
   against the device's name in its own sysfs inventory and the unit it was granted to.
 - *Exec units and VMs skip `Create`'s check* today (they have their own start path): each needs
   a check of its own at the same boundary, not none.
-- *`check_create` ignores `host_users`, `drop`, `nested`, `project` and `dmem`.* Each is a
-  widening or a limit that the asker chooses; the root part must hold them to its own policy and
-  to limits it set, not to what is sent.
+- *`check_create` and the fields it once ignored* (T-0915). `host_users` is held to the
+  `hostUsers` key (a serving part could send it with `no_node_root`, skip `rootContainers`, and
+  have the node's users with no range of its own; not `rootContainers`, since every NodeWorkload
+  has it). `nested` is held to `unconfined` (it lets the refused calls back). `drop` needs no
+  check: it only narrows. `project` and `dmem` are left to the Devices item above: the root
+  part holds no project id or device share to bound them against.
 
 **The sixth criterion is corrected by this record**: it said "none for a Service
 connection". With sockets made ahead it is "at most N/8 + 1 for N connections into a
@@ -326,7 +329,8 @@ as a Node's status says them, each on where nothing is said:
 policy:
   execUnits: true        # a process of the node's root, with all of /dev
   rootContainers: true   # a container that is the node's root (root, and no range of ids of its own)
-  unconfined: true       # seccomp unconfined, or refused calls allowed back by name
+  unconfined: true       # seccomp unconfined, or refused calls allowed back by name, or a nested unit
+  hostUsers: true        # a container that keeps the node's own users, with no range of its own (a NodeWorkload)
   nodeNetwork: true      # containers that are no pod: the node's own network
   devices: [all]         # which classes a DeviceClaim may hand a container: gpu, input, usb, …
   vms: true

@@ -430,11 +430,20 @@ pub fn check_create(create: &Create, ground: &Ground, owns: &dyn Fn(&Path) -> bo
     {
         return Err(refusal);
     }
-    if (unit.unconfined || !unit.allow.is_empty())
+    // (Not the node's root, so not `rootContainers`: a non-root uid of the node's own users,
+    // with no range of ids of its own. A NodeWorkload is always this.)
+    if unit.host_users
+        && let Some(refusal) = policy.refusal("hostUsers")
+    {
+        return Err(refusal);
+    }
+    // (`nested` lets the calls of `NESTED` back through the filter.)
+    if (unit.unconfined || unit.nested || !unit.allow.is_empty())
         && let Some(refusal) = policy.refusal("unconfined")
     {
         return Err(refusal);
     }
+    // (`drop` only narrows what the container has; `project` and `dmem` are T-0810's Devices item.)
     Ok(())
 }
 
@@ -1692,6 +1701,61 @@ mod tests {
             err: null(),
         };
         assert!(check_create(&create, &open, &|_| true).is_err());
+    }
+
+    #[test]
+    fn check_create_host_users() {
+        let (_, state) = book("host-users");
+        // Not the node's root by its own say (a non-root uid), but with the node's users and no
+        // range of its own: the node's policy holds it, whatever else the caller says.
+        let unit = Unit {
+            no_node_root: true,
+            host_users: true,
+            netns: Some(NETNS.into()),
+            ..plain()
+        };
+        let why = refused(&unit, &ground(&state, "no-host-users")).expect("host users were given");
+        assert!(why.contains("the node's own users"), "{why}");
+        assert_eq!(refused(&unit, &ground(&state, "")), None);
+        // No-root-containers is not this key: a NodeWorkload keeps running where roots are refused.
+        assert_eq!(refused(&unit, &ground(&state, "no-root-containers")), None);
+        let own = Unit {
+            host_users: false,
+            ..unit
+        };
+        assert_eq!(refused(&own, &ground(&state, "no-host-users")), None);
+    }
+
+    #[test]
+    fn check_create_nested() {
+        let (_, state) = book("nested");
+        let unit = Unit {
+            no_node_root: true,
+            nested: true,
+            netns: Some(NETNS.into()),
+            ..plain()
+        };
+        let why = refused(&unit, &ground(&state, "no-unconfined")).expect("nested was made");
+        assert!(why.contains("no system call filter"), "{why}");
+        assert_eq!(refused(&unit, &ground(&state, "")), None);
+        assert_eq!(refused(&unit, &ground(&state, "no-root-containers")), None);
+    }
+
+    #[test]
+    fn check_create_drop() {
+        let (_, state) = book("drop");
+        // It only narrows what the container has: made under the strictest policy.
+        let unit = Unit {
+            no_node_root: true,
+            drop: vec!["all".into()],
+            netns: Some(NETNS.into()),
+            ..plain()
+        };
+        let strict = Ground {
+            policy: policy("hardened"),
+            ..ground(&state, "")
+        };
+        assert_eq!(refused(&unit, &strict), None);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 /// Each key: the word that names it in `--node-policy`, as a Node's status and the design
 /// record name it, and what it lets the store have this node do. A new way for the store
 /// to be root on a node gets a row here in the same change.
-pub const KEYS: [(&str, &str, &str); 10] = [
+pub const KEYS: [(&str, &str, &str); 11] = [
     (
         "exec-units",
         "execUnits",
@@ -28,6 +28,11 @@ pub const KEYS: [(&str, &str, &str); 10] = [
         "unconfined",
         "unconfined",
         "containers with no system call filter, or with refused calls allowed back",
+    ),
+    (
+        "host-users",
+        "hostUsers",
+        "containers that keep the node's own users, with no range of ids of their own",
     ),
     (
         "node-network",

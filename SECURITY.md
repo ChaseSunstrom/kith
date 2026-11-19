@@ -531,7 +531,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   word: `exec` units (`no-exec-units`); containers that would be the node's root, which
   is root in one that keeps the node's users, not root in a pod's range of its own
   (`no-root-containers`); `seccomp` unconfined or with
-  refused calls allowed back (`no-unconfined`); containers on the node's own network
+  refused calls allowed back, `nested` included (`no-unconfined`); containers that keep the
+  node's own users with no range of ids of their own, as a NodeWorkload's do (`no-host-users`);
+  containers on the node's own network
   (`no-node-network`); VMs (`no-vms`), a VM's kernel, firmware or disks as paths on the
   node or another hypervisor than qemu (`no-vm-paths`), PCI devices handed to a VM
   (`no-passthrough`); a Volume of `kith-system`, which is a directory anywhere on the
