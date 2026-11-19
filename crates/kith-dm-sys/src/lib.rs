@@ -895,8 +895,16 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Held by each test here that has a child, so the one that looks for any ended child
+    /// (mapped_mount_refusals_are_errors) sees none of another test's.
+    static CHILDREN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn children() -> std::sync::MutexGuard<'static, ()> {
+        CHILDREN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn forked_brings_back_what_the_child_gave() {
+        let _children = children();
         let got = fork_start(|| b"said it".to_vec())
             .unwrap()
             .collect(Duration::from_secs(30));
@@ -905,6 +913,7 @@ mod tests {
 
     #[test]
     fn forked_cuts_an_answer_over_the_most() {
+        let _children = children();
         let got = fork_start(|| vec![7; FORKED_MOST + 100])
             .unwrap()
             .collect(Duration::from_secs(30));
@@ -913,6 +922,7 @@ mod tests {
 
     #[test]
     fn forked_gives_nothing_where_the_child_panicked() {
+        let _children = children();
         let got = fork_start(|| panic!("no answer"))
             .unwrap()
             .collect(Duration::from_secs(30));
@@ -922,6 +932,7 @@ mod tests {
     /// A child that does not end is killed and collected at the deadline, and says so.
     #[test]
     fn forked_kills_a_child_that_outlasts_the_deadline() {
+        let _children = children();
         let forked = fork_start(|| {
             std::thread::sleep(Duration::from_secs(300));
             Vec::new()
@@ -1222,6 +1233,7 @@ mod tests {
     fn mapped_mount_refusals_are_errors() {
         use std::os::fd::AsFd;
         use std::os::unix::fs::MetadataExt;
+        let _children = children();
         let no_users = File::open("/proc/self/stat").unwrap();
         let (nowhere, elsewhere) = (Path::new("/nowhere/at/all"), Path::new("/nowhere/else"));
         assert!(mount_mapped(nowhere, elsewhere, no_users.as_fd(), RDONLY).is_err());
@@ -1239,7 +1251,7 @@ mod tests {
             Err(e) => assert!(!root, "root made no user namespace: {e}"),
         }
         // Its helper is collected when it returns, made or refused: no child of this
-        // process is left that has ended. (No other test here has a child.)
+        // process is left that has ended. (The other tests here with a child hold CHILDREN.)
         // SAFETY: waitid that looks (WNOWAIT) at any child, writing to `info`, which is its own.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let looked = unsafe {
