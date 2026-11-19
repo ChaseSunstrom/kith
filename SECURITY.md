@@ -256,9 +256,16 @@ Only the newest version is fixed. There are no security releases of older ones.
   connection is accepted: a client that fills one port and all that the node shares leaves
   each other port its 2, and a connection past that is ended at once. A new UDP sender
   past that takes the place of the one of its port heard from longest ago. A pod publishes
-  8 ports at most and a node 64, so the relays hold at most 448 files; kithd does not raise
-  its limit of open files (1024), and its listeners, API and ingress take of it too, so a
-  node with many clients of its API or ingress besides can still run out. A port another
+  8 ports at most and a node 64, so the relays hold at most 448 files. kithd raises its
+  soft limit of open files to the hard one at start, 65536 at most, and leaves the hard
+  limit as it is: on kith OS it is the first process, started with the kernel's 1024
+  soft and 4096 hard, so it runs with 4096; on a host under systemd (524288 hard
+  here) it runs with 65536. Its listeners, API and ingress (1024 connections, two files
+  each, so 2048) take of it too, with the relays 448 and 64 guests of the API: about 2700
+  at most, under 4096. The raised limit is passed on to what kithd starts, a pod's
+  processes included (no per-container limit is set): a program there that uses
+  select() with an FD_SETSIZE bitmap can be handed a file at or above 1024, so it must
+  lower its own limit (a per-container limit is a possible follow-up). A port another
   namespace's Workload or Job publishes is refused when written, and so is a pod through
   an Exit that does not list its namespace: both are asked of every writer (a person's
   apply, a Release, a Source, kithd's own controllers), where the write goes into the
@@ -1438,11 +1445,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   until a waiting node's own is pushed out of the 64 that are kept: the node asks
   again every few seconds, and is not told while they keep at it. Only a control
   node forgets: a worker that is asked refuses, and the waiting node asks the next.
-  A node the cluster's code forgot (not the one it was typed at) keeps its own code
-  and loses the cluster's; unlocked again, it has neither until they are made anew.
-  One that was off when the cluster's code was used still knows that code: typed at
-  it later, it erases itself, and the cluster, which had forgotten its key already,
-  goes on saying forgotten and not wiped.
+  A node the cluster's code forgot (not the one it was typed at) keeps both codes, its
+  own and the cluster's. One that was off when the cluster's code was used still has
+  its record: either code typed at it later erases it, and the cluster says wiped.
+  `kith node duress --all --off` and a new `--all` reach a forgotten key too, so a
+  revoked cluster code wipes no node, and the forgotten key stays forgotten.
+  `kith node unlock` deletes a forgotten key: the node has neither code afterwards,
+  until they are made anew.
   **A new recovery key (`kith node recovery`) is written before it is shown**: an
   answer lost on its way leaves a key nobody saw, the old one opening no more and
   `recoverySeen` saying yes (the command says so when it fails: run it again). Where
