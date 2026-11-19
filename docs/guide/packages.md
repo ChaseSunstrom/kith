@@ -23,8 +23,14 @@ kith package render packages/web --name shop | kith apply -f -
   then each `-f` file, then each `--set`, merged by key), `release.name`, `release.namespace`,
   `package.name`, `package.version`, `name` (the release's resource name: `shop-web`) and
   `labels`. `toYaml` and `tojson` write a value (`{{ v | toYaml | indent(4) }}`); `required(v,
-  "why")` stops with `why` when there is none. A missing value, a template that never ends or
-  writes over 1 MB is an error. A template reads only its package; `namespace()` is not there.
+  "why")` stops with `why` when there is none. `lookup(kind, namespace, name)` is the spec of a
+  live resource, `{}` when there is none (`(lookup('Secret', release.namespace, 'db').data |
+  default({})).password`): only in the release's own namespace, and only of kinds whoever applied
+  the Release may `get` and, for a package pushed here rather than fetched from the Release's
+  Repository, its pusher may `get` too (the template is the pusher's: it reads no more than they
+  may, as its output makes no more); with `kith package render` nothing is live. The Release is
+  rendered again when a resource it looked up, a Role or binding, or the Identity of its writer
+  or pusher changes; a namespace over 1 MB of specs fails the lookup. A missing value, a template that never ends or writes over 1 MB is an error. A template reads only its package; `namespace()` is not there.
 - Output is checked like any resource (an error shows the rendered line), put in the release's
   namespace unless it names one, and labelled `kith.dev/release` and `kith.dev/package`.
 - `values.schema.json` may use `type`, `properties`, `required`, `additionalProperties`, `items`,
@@ -94,8 +100,8 @@ spec:
 | Fetched | It has no pusher: the Repository's key is its trust, so whoever may apply a Repository gives the rights of every Release that names it. Only kithd's fetcher sets `kith.dev/repository`: an apply or a Source's file that carries it is refused. |
 | Reaching a registry | `kith` goes through kithd. Plain HTTP only to a registry on the same machine. |
 
-Not yet: `dependencies` are read and nothing more; no hooks, no lookup of cluster objects from a
-template, no registry credentials.
+Not yet: `dependencies` are read and nothing more; no hooks, no `lookup` outside the release's
+namespace or in `.kith` files, no registry credentials.
 
 ### A desktop is a package
 

@@ -356,7 +356,7 @@ pub(crate) fn remove_unpacked(beside: &Path) -> usize {
         }
     }
     // (One left here fails the next unpack for the same Volume: said once, here.)
-    match std::fs::remove_dir_all(beside) {
+    match crate::controller::storage::remove_tree(beside, &|| false) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             eprintln!("kithd: {} was not removed: {e}", beside.display());
         }
@@ -1930,6 +1930,29 @@ mod tests {
         assert_eq!(remove_unpacked(&beside), 0);
         std::fs::set_permissions(outside.join("shut"), std::fs::Permissions::from_mode(0o700)).unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A chain 2,000 directories deep under what an unpack left (more than `remove_dir_all`
+    /// holds descriptors for) is freed, and no level is left beside it.
+    #[test]
+    fn remove_unpacked_deep_chain_is_freed() {
+        crate::controller::storage::tests::few_files(
+            concat!(module_path!(), "::remove_unpacked_deep_chain_is_freed"),
+            || {
+                let root = temp("deep-chain");
+                let beside = root.join(".v.restoring");
+                std::fs::create_dir_all(&beside).unwrap();
+                crate::controller::storage::tests::chain(&beside, 2000);
+                remove_unpacked(&beside);
+                let left: Vec<_> = std::fs::read_dir(&root)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.file_name())
+                    .collect();
+                let _ = std::fs::remove_dir_all(&root);
+                assert!(left.is_empty(), "{left:?}");
+            },
+        );
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 kith-yaml.workspace = true
 kith-api.workspace = true
-kith-packages = { path = "../kith-packages" }
+kith-packages = { path = "../kith-packages", default-features = false }
 kith-lang = { path = "../kith-lang" }
 kith-kube = { path = "../kith-kube" }
 # Makes its own tables of functions read-only at start (the workspace's one crate with unsafe).
