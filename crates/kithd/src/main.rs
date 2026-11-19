@@ -255,7 +255,7 @@ pub struct Shared {
     /// Where the output of every unit goes: `<unit id>.out` and `.err`.
     pub logs: PathBuf,
     /// Who changed what, and who was refused.
-    pub audit: audit::Audit,
+    pub audit: Arc<audit::Audit>,
     /// The WASM modules of `KindDefinition`s, compiled.
     pub wasm: Arc<wasm::Modules>,
     /// Counts changes to the store, for `GET /v1/watch`. Bumped while the store is
@@ -295,6 +295,40 @@ pub struct Shared {
 /// How many dry runs at once.
 const DRY_RUNS: usize = 4;
 
+/// The most open files kithd asks for: ingress's 1024 connections hold two each, and the
+/// relays, the API and the listeners come on top (SECURITY.md).
+const NOFILE_WANTED: u64 = 65536;
+
+/// The soft limit of open files to set: the hard limit, but no more than [`NOFILE_WANTED`],
+/// and never below what it has now (a limit kithd lowered would be worse than none).
+fn nofile_soft(soft: u64, hard: u64) -> u64 {
+    hard.min(NOFILE_WANTED).max(soft).min(hard)
+}
+
+/// Raise the soft limit of open files ([`nofile_soft`]); the hard one is not touched. A
+/// failure leaves the limit as it was and is only said.
+fn raise_nofile() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let said = |e: &dyn std::fmt::Display| {
+        // (Not `eprintln!`: it panics when stderr cannot be written, and PID 1 may not.)
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!("kithd: could not raise its limit of open files: {e}\n"),
+        );
+    };
+    match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok((soft, hard)) => {
+            let want = nofile_soft(soft, hard);
+            if want != soft
+                && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, want, hard)
+            {
+                said(&e);
+            }
+        }
+        Err(e) => said(&e),
+    }
+}
+
 fn main() -> ExitCode {
     // First of all, before a thread or an argument (and before the shim below, which is
     // this same program started again): what musl's start code left writable is shut. A node
@@ -310,6 +344,8 @@ fn main() -> ExitCode {
     kith_runtime::exec_shim();
     // Started again to render a package's templates? Then this never returns either.
     releases::render_shim();
+    // Then, before the runtime and its listeners, the limit of open files they share.
+    raise_nofile();
     // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
     if std::process::id() == 1 {
         keeper::keep();
@@ -611,22 +647,25 @@ async fn replica(
             _ => {}
         }
     }
-    // What each entry is asked once the store is in format 3: a signed one is refused (no
-    // kithd checks its signature in the log yet), so none is ever run. (Under the store's
-    // lock, and deterministic: it reads the command alone.)
-    let check: kith_store::Check = Arc::new(|_, command, _| match command {
-        kith_store::Command::Signed { .. } => Err(kith_api::store::Error::Invalid(
-            "refused: a signed entry, which this kithd does not check yet".into(),
-        )),
-        _ => Ok(()),
-    });
+    // What each entry is asked once the store is in format 3: a signed one is applied only
+    // where its signature, command, signer's rights and nonce hold by the store
+    // (`access_sign::admit`; under the store's lock, and deterministic). A CA whose fingerprint
+    // cannot be read stops the start: without it every signed entry would be refused here
+    // alone, and this store would part from the others'.
+    let audit = Arc::new(audit::Audit::new(state.join("audit.log")));
+    let id = cluster
+        .as_ref()
+        .map(|cluster| pki::fingerprint(&cluster.me.ca))
+        .transpose()
+        .map_err(|e| format!("the cluster CA's fingerprint: {e}"))?;
+    let check = access_sign::hook(id, audit.clone());
     let replica = kith_store::open(&state.join("raft"), kith_store::node_id(name), network, poke, check).await?;
     let shared = Arc::new(Shared {
         store: replica.state,
         raft: replica.raft,
         changed,
         logs: state.join("logs"),
-        audit: audit::Audit::new(state.join("audit.log")),
+        audit,
         wasm: Arc::default(),
         generation,
         members: members::Members::new(name),
@@ -1228,6 +1267,17 @@ async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, m
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nofile_soft_is_the_hard_limit_up_to_65536_and_never_less_than_now() {
+        use super::nofile_soft;
+        assert_eq!(nofile_soft(1024, 4096), 4096);
+        assert_eq!(nofile_soft(1024, 524288), 65536);
+        assert_eq!(nofile_soft(1024, 1024), 1024);
+        assert_eq!(nofile_soft(100_000, 524288), 100_000);
+        assert_eq!(nofile_soft(1024, u64::MAX), 65536);
+        assert_eq!(nofile_soft(u64::MAX, u64::MAX), u64::MAX);
+    }
+
     #[test]
     fn advertise_is_an_address_not_a_name() {
         use clap::Parser;

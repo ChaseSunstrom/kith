@@ -204,6 +204,13 @@ Only the newest version is fixed. There are no security releases of older ones.
   dropped, so a pod sends with only its own address, even as root, and a pod reaches its node only for DNS and Services:
   UDP and TCP port 53 to the gateway, and TCP to a Service's address, with nothing else of the node's (kithd's API among
   it) reached, ICMP included. An exit's pod (`kpx`) gets neither of those.
+- **A machine that already passed packets on** (IPv6 forwarding was `1` before kithd
+  first made a pod, a router, say) gets no guard: `inet kith-pods`
+  passes on what the node passes on for anyone, and only the pods' own rules are added.
+  A machine that did not forward gets the guard, which drops whatever is not a pod's, so
+  the two differ on purpose. kithd says so once, when it makes its first pod. To have the
+  guard on such a machine, set `net.ipv6.conf.all.forwarding=0` before kithd starts. The
+  guard is kept across a kithd restart (`/run/kith-pods`), until the machine restarts.
 - **A pod behind an Exit** (`exit:` on a Workload's template) leaves by that WireGuard
   tunnel or by nothing, and is given no capability, sysctl or device for it: kithd holds
   the tunnel (`kx` and a number) on the Exit's node. Before the pod's host link is made,
@@ -249,9 +256,16 @@ Only the newest version is fixed. There are no security releases of older ones.
   connection is accepted: a client that fills one port and all that the node shares leaves
   each other port its 2, and a connection past that is ended at once. A new UDP sender
   past that takes the place of the one of its port heard from longest ago. A pod publishes
-  8 ports at most and a node 64, so the relays hold at most 448 files; kithd does not raise
-  its limit of open files (1024), and its listeners, API and ingress take of it too, so a
-  node with many clients of its API or ingress besides can still run out. A port another
+  8 ports at most and a node 64, so the relays hold at most 448 files. kithd raises its
+  soft limit of open files to the hard one at start, 65536 at most, and leaves the hard
+  limit as it is: on kith OS it is the first process, started with the kernel's 1024
+  soft and 4096 hard, so it runs with 4096; on a host under systemd (524288 hard
+  here) it runs with 65536. Its listeners, API and ingress (1024 connections, two files
+  each, so 2048) take of it too, with the relays 448 and 64 guests of the API: about 2700
+  at most, under 4096. The raised limit is passed on to what kithd starts, a pod's
+  processes included (no per-container limit is set): a program there that uses
+  select() with an FD_SETSIZE bitmap can be handed a file at or above 1024, so it must
+  lower its own limit (a per-container limit is a possible follow-up). A port another
   namespace's Workload or Job publishes is refused when written, and so is a pod through
   an Exit that does not list its namespace: both are asked of every writer (a person's
   apply, a Release, a Source, kithd's own controllers), where the write goes into the
@@ -1439,11 +1453,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   until a waiting node's own is pushed out of the 64 that are kept: the node asks
   again every few seconds, and is not told while they keep at it. Only a control
   node forgets: a worker that is asked refuses, and the waiting node asks the next.
-  A node the cluster's code forgot (not the one it was typed at) keeps its own code
-  and loses the cluster's; unlocked again, it has neither until they are made anew.
-  One that was off when the cluster's code was used still knows that code: typed at
-  it later, it erases itself, and the cluster, which had forgotten its key already,
-  goes on saying forgotten and not wiped.
+  A node the cluster's code forgot (not the one it was typed at) keeps both codes, its
+  own and the cluster's. One that was off when the cluster's code was used still has
+  its record: either code typed at it later erases it, and the cluster says wiped.
+  `kith node duress --all --off` and a new `--all` reach a forgotten key too, so a
+  revoked cluster code wipes no node, and the forgotten key stays forgotten.
+  `kith node unlock` deletes a forgotten key: the node has neither code afterwards,
+  until they are made anew.
   **A new recovery key (`kith node recovery`) is written before it is shown**: an
   answer lost on its way leaves a key nobody saw, the old one opening no more and
   `recoverySeen` saying yes (the command says so when it fails: run it again). Where

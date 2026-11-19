@@ -584,6 +584,27 @@ fn main() {
                 let _ = stream.write_all(said.as_bytes());
             }
         }
+        // HOST PORT SECONDS: asks it ten times a second for that long and says how many
+        // answers came, how many failed (the first, with why) and what the rest said: a
+        // rolling update's check that something always answered.
+        ["hammer", host, port, seconds] => {
+            let until = std::time::Instant::now() + Duration::from_secs(seconds.parse().expect("seconds"));
+            let (mut asked_n, mut failed, mut heard) = (0, Vec::new(), std::collections::BTreeSet::new());
+            while std::time::Instant::now() < until {
+                asked_n += 1;
+                match asked(host, port) {
+                    Ok(said) if said.starts_with("HTTP/1.0 200") => drop(heard.insert(said)),
+                    Ok(said) => failed.push(format!("said {said:?}")),
+                    Err(e) => failed.push(e.to_string()),
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            println!(
+                "hammer: {asked_n} asked, {} failed ({}), heard {heard:?}",
+                failed.len(),
+                failed.first().map_or("none", String::as_str)
+            );
+        }
         ["ask", pairs @ ..] if !pairs.is_empty() && pairs.len() % 2 == 0 => {
             let mut heard = std::collections::BTreeSet::new();
             for pair in pairs.chunks(2) {

@@ -363,6 +363,59 @@ text above, the safe way was taken, and each is said here:
 - The first `adminKey` is written unsigned, while the cluster is `open`; after that the
   key and `spec.signing` change only by a write the admin signed.
 
+### Layer 3 as built: slice 2 (T-0783)
+
+Slice 1 (T-0779) put `Signed { header, method, path, body, command }` in the store, its
+per-signer nonce book, and FORMAT 3 (`MarkSigned`), proposed once every member reads it.
+Slice 2 makes the entry mean something:
+
+- **FORMAT 4 (`MarkChecked`).** A T-0779 kithd reads format 3 and refuses every Signed
+  entry at apply; one that checks it would take it, and the stores would part in a rolling
+  upgrade. So the leader proposes `MarkChecked` only once every member says it reads 4
+  (as for 2 and 3), and below 4 every node refuses a Signed entry, as T-0779's does.
+- **The leader writes it.** At format 4, a signed apply, delete or rollback the leader
+  applies goes in the log as `Signed`, with the header, method, path (query included) and
+  body (base64) it came with, around the command (`Shared::write_as`). Below format 4 it
+  is written bare. Any other signed route (a drain, a `kith run`) stays bare, as before.
+- **Every node checks it at apply** (`access_sign::admit`, run under the store's lock by
+  the hook main.rs hands the state machine), in this order, from the entry and its store
+  only: the signature holds by the store's keys (`access_sign::signature`: `verify` split,
+  no clock and no nonce); the target is `*` or the node that wrote the entry; the method,
+  path and body make the carried command over that store (re-derived as the route does:
+  `stamped`, a release's history for its rollback; never trusted); `Grants::of` lets the
+  signer do it, and the admin's key and `spec.signing` change only by the admin; and the
+  signer's book takes the nonce. A refusal applies nothing, on every node alike, and is
+  written in the audit log as `signed`. The edge keeps its clock and its in-memory nonce
+  cache (`verify`, as before).
+- **What a kind's admission may rewrite is taken as carried.** A custom kind's module runs
+  once, at the leader, and its answer is not deterministic to re-run: for those resources
+  only spec, labels and annotations come from the carried command; all else must match.
+  An apply's `at` is the leader's and is not compared.
+- **The nonce book is capped**: 4096 entries per signer within five minutes of each other
+  (`SIGNED_NONCES`), past which a signed entry is refused, so a key can't grow the store
+  without bound. Time is only the entries' `expires`.
+- **Only the leader moves the format and writes Signed.** `/v1/raft/write` and a control
+  node's own writes (`own_writes::checked`) refuse a Signed entry from any other node, and
+  a `Mark`, `MarkSigned` or `MarkChecked` above the store's format. One at or below it is a
+  no-op and is taken: an older follower's relayed write waits on a `Mark` as its barrier.
+  This build's barrier is an empty `Patch`.
+- **What slice 2 leaves:**
+  - A taken leader can still write any bare `Apply` or `Delete`. Slice 2 stops only
+    forged Signed entries. Bare user writes are refused only with slices 3 and 6.
+  - A Signed entry's `at` is not compared on `Apply` or `Rollback`: the revision and
+    `born` the leader stamps are taken as carried.
+  - A header held back can be applied late, past its `expires`, and after a newer one
+    from the same signer. Apply has no clock. Each signer's book is measured only by
+    that signer's newest `expires`, so a header stays good until the book holds one
+    expiring 300 s (`SIGNED_SKEW`) or more after it.
+  - A newest `expires` across all signers was weighed and not done. One signer, or a
+    taken leader, writing a far-future `expires` would lock every other signer out for
+    good.
+  - A definition or a key that changes between the write and its apply can refuse a
+    write the leader took. The signer sends it again.
+  - A refused entry replayed from the log is audited again.
+  - The controllers' entries (the table above) are not signed yet.
+
 ## Why not short-lived node certificates
 
 They were weighed and are not part of this:
