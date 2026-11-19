@@ -473,7 +473,7 @@ fn veiled(shared: &Shared, caller: &Caller, mut changes: Vec<Change>) -> Vec<Cha
 /// What a new resource may not be (`Resource::submitted`): asked where it is submitted, not when
 /// a log entry is replayed.
 fn submitted(resources: &[Resource]) -> Result<(), ApiError> {
-    let refused = resources.iter().try_for_each(Resource::submitted);
+    let refused = resources.iter().try_for_each(Resource::submitted_by_node);
     refused.map_err(|why| ApiError::Store(Error::Invalid(why)))
 }
 

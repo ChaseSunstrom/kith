@@ -262,7 +262,7 @@ fn derived(store: &Store, signer: &Caller, method: &str, path: &str, body: &[u8]
     let options = query.map_err(|e| format!("{path}: {}", e.body_text()))?.0;
     let route = uri.path();
     let applied = |resources: Vec<Resource>| -> Result<Command, String> {
-        resources.iter().try_for_each(Resource::submitted)?;
+        resources.iter().try_for_each(Resource::submitted_by_node)?;
         let resources = crate::api::stamped(store, signer, resources);
         Ok(Command::Apply { resources, at: 0 })
     };

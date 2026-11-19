@@ -2952,7 +2952,7 @@ mod access_tests {
             let spec = format!("{{ {side}: [{{ action: {action}, peers: [{{ cidr: '{cidr}' }}] }}] }}");
             let text = format!("apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: {{ name: p }}\nspec: {spec}\n");
             let docs = Resource::from_source(&text).unwrap();
-            docs.into_iter().next().unwrap().unwrap().submitted()
+            docs.into_iter().next().unwrap().unwrap().submitted_by_node()
         };
         for cidr in ["fd00::/8", "::/0", "fd00::1/128"] {
             submit("ingress", "deny", cidr).unwrap_or_else(|e| panic!("{cidr}: {e}"));

@@ -765,7 +765,7 @@ fn network_policy_cidr_replay_takes_one_an_older_binary_logged() {
         spec: json!({ "ingress": [{ "action": "deny", "peers": [{ "cidr": "nonsense" }] }, { "action": "allow" }] }),
         status: None,
     };
-    assert!(logged.submitted().is_err(), "a new one is refused");
+    assert!(logged.submitted_by_node().is_err(), "a new one is refused");
     let mut store = Store::default();
     store.apply_all(vec![logged]).unwrap();
     assert!(store.get("NetworkPolicy/default/old").is_some());
