@@ -33,6 +33,9 @@
         # worker: two, on the mesh; quota: one, on the mesh; services: one, with no mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os out='' dumps='' gateway='' https=''
         seed() { :; }
+        # (home: on the mesh, so the holder answers a WireGuard handshake to the house address
+        # (51820) and the nodes that roam dial it; and ingress, so it answers TCP 443 there.)
+        [ "$test" != home ] || more='--mesh --ingress'
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
         others=2 more=--mesh project=''
         [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] || others=''
@@ -241,7 +244,8 @@ EOF
             [ "${KITH_POD_NOUPSTREAM:-}" != 1 ] || { first='--dns-upstream 10.9.0.9:5353'; joined='--dns 0.0.0.0:5353 --dns-upstream 10.9.0.9:5353'; }
         fi
         # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
-        [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353'; }
+        # (home: the joined ones roam (--roaming, as a laptop joins): a reset one dials the house endpoint.)
+        [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353 --roaming'; }
         node 1 "--claim ${first:-}"
         tries=0
         until token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/n1.log" 2>/dev/null) && [ -n "$token" ] \
