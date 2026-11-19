@@ -1266,6 +1266,12 @@ impl<H: Hands> Root for Direct<'_, H> {
 }
 
 impl<H: Hands> Direct<'_, H> {
+    /// The unit `id`, which the sweep kept at start because processes of it remain, as made here: it
+    /// is deleted through this part like any other, once they are gone.
+    pub fn keep(&self, id: &str) -> Result<(), String> {
+        self.book.made(id.into())
+    }
+
     /// A request of the Units family that is acted on with a handle: counted, then checked as
     /// asked, then against what this part made and what was claimed.
     fn unit(&self, kind: Kind, request: Request) -> Result<(), String> {
