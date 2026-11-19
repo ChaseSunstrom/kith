@@ -454,14 +454,24 @@ pub async fn run(
             }
             // Those the sweep could not remove still run: they hold their ids and devices, and are
             // deleted through the root part (made as the units it took back are) once they are gone.
-            for unit in &left {
-                let _ = Direct::units().keep(&unit.id).inspect_err(|e| eprintln!("kithd: {e}"));
-                eprintln!(
-                    "kithd: {} of an earlier run still has processes: stopping, it keeps its name and devices until they are gone",
-                    unit.id
-                );
-            }
-            let left = left.into_iter().map(|unit| (unit.id.clone(), unit)).collect();
+            // One the root part does not take is not held (it could never be deleted): said once.
+            let left = left
+                .into_iter()
+                .filter(|unit| match Direct::units().keep(&unit.id) {
+                    Ok(()) => {
+                        eprintln!(
+                            "kithd: {} of an earlier run still has processes: stopping, it keeps its name and devices until they are gone",
+                            unit.id
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("kithd: {e}");
+                        false
+                    }
+                })
+                .map(|unit| (unit.id.clone(), unit))
+                .collect();
             if !adopted.is_empty() {
                 let ids: Vec<&str> = adopted.keys().map(String::as_str).collect();
                 eprintln!(
@@ -677,7 +687,16 @@ async fn delete(id: &str, handle: Handle) -> Result<(), Undeleted> {
 /// comes back while processes of it remain; with none left, only a cleanup that failed, nothing is
 /// held. A failure is said once, not at each retry.
 async fn delete_again(id: &str, handle: Handle, stuck: &mut BTreeMap<String, Instant>) -> Option<Handle> {
-    let Err((left, error)) = delete(id, handle).await else {
+    kept_if_stuck(id, delete(id, handle).await, stuck)
+}
+
+/// [`delete_again`] once the delete was tried: what is kept (and when it failed) is what still has processes.
+fn kept_if_stuck<H>(
+    id: &str,
+    deleted: Result<(), (Option<H>, String)>,
+    stuck: &mut BTreeMap<String, Instant>,
+) -> Option<H> {
+    let Err((left, error)) = deleted else {
         stuck.remove(id);
         return None;
     };
@@ -4272,6 +4291,29 @@ mod tests {
         assert_eq!(held_by_leaving("w_e_f_0_z", "Workload/e/f", &elsewhere, &leaving), None);
         let gone = leaving_of(&BTreeMap::new(), std::iter::empty());
         assert_eq!(held_by_leaving("w_a_b_0_x", "Workload/a/b", &card, &gone), None);
+    }
+
+    /// A delete retried keeps the handle while processes of the unit remain (and when it failed, so
+    /// the next try waits), and drops it once they are gone, whether the cleanup then went well or not.
+    #[test]
+    fn a_retried_delete_keeps_the_unit_while_it_has_processes_and_drops_it_once_empty() {
+        let mut stuck = BTreeMap::new();
+        let busy = || Err((Some(7u8), "busy".to_string()));
+        assert_eq!(kept_if_stuck("a", busy(), &mut stuck), Some(7));
+        assert!(stuck.contains_key("a"), "when it failed is written down");
+        assert_eq!(
+            kept_if_stuck("a", busy(), &mut stuck),
+            Some(7),
+            "still there on the next try"
+        );
+        assert_eq!(
+            kept_if_stuck::<u8>("a", Err((None, "cleanup".to_string())), &mut stuck),
+            None
+        );
+        assert!(stuck.is_empty(), "empty: nothing is held, nothing waits");
+        stuck.insert("a".into(), Instant::now());
+        assert_eq!(kept_if_stuck::<u8>("a", Ok(()), &mut stuck), None);
+        assert!(stuck.is_empty());
     }
 
     /// A unit that ended on its own, with processes left, is kept once they are gone: its state, exit
