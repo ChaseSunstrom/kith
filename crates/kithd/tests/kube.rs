@@ -683,6 +683,28 @@ fn workflows_kubectl_by_hand() {
 }
 
 #[test]
+fn workflows_kubectl_delete_pod_restarts_that_replica() {
+    let Some(cluster) = Cluster::start("kube-delete-pod") else {
+        return;
+    };
+    cluster.write("web.yaml", WEB);
+    cluster.ok(&["apply", "-f", "web.yaml"]);
+    let pods = || cluster.ok(&["get", "pods", "-l", "app=web", "-o", "name"]);
+    eventually("the two replicas are pods", 30, || pods() == "pod/web-0\npod/web-1\n");
+    let started = |name: &str| cluster.got(&["pod", name])["status"]["startTime"].clone();
+    let (first, second) = (started("web-0"), started("web-1"));
+    // A start time is whole seconds: wait past one, so the restart is a new one.
+    std::thread::sleep(Duration::from_millis(1100));
+    says(&cluster.ok(&["delete", "pod", "web-0"]), &["pod \"web-0\" deleted"]);
+    eventually("web-0 started again", 30, || started("web-0") != first);
+    assert_eq!(started("web-1"), second, "the other replica is not restarted");
+    assert_eq!(pods(), "pod/web-0\npod/web-1\n", "the same names");
+    assert_eq!(cluster.held("workload/web")["spec"]["replicas"], 2);
+    // A pod that no Workload runs is refused, and says its name.
+    cluster.refused(&["delete", "pod", "bare"], &["bare"]);
+}
+
+#[test]
 fn workflows_json_patch_by_kubectl() {
     let Some(cluster) = Cluster::start("kube-json-patch") else {
         return;

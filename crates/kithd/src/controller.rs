@@ -143,6 +143,8 @@ struct Slot {
     start_at: Option<Instant>,
     /// Its last run was ended for what its pod wrote (`replace`): its next run says so.
     replaced: bool,
+    /// When a `kubectl delete pod` last restarted it (seconds): its pod's start time from then.
+    restarted: Option<u64>,
 }
 
 impl Slot {
@@ -561,6 +563,27 @@ async fn stop_unit(slots: &mut BTreeMap<String, Slot>, id: &str, drop: bool) {
         stop(id, &mut slot).await;
         if slot.leaving || kept_once_gone(slot.drop) {
             slots.insert(id.to_string(), slot);
+        }
+    }
+}
+
+/// Restarts what `kubectl delete pod` asked for (`marked`, taken here): each replica's slots are
+/// stopped and set to start at once, whatever their restart policy says (`again`). The start is the
+/// pass's own (step 3), which starts a slot once its `start_at` is due.
+async fn apply_restarts(slots: &mut BTreeMap<String, Slot>, marked: &mut BTreeSet<(String, u32)>, now: Instant) {
+    for (owner, replica) in std::mem::take(marked) {
+        let ids: Vec<String> = slots
+            .iter()
+            .filter(|(_, slot)| slot.owner == owner && slot.replica == replica)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            stop_unit(slots, &id, false).await;
+            if let Some(slot) = slots.get_mut(&id) {
+                slot.state = "waiting";
+                slot.start_at = Some(now);
+                slot.restarted = Some(kith_api::store::now());
+            }
         }
     }
 }
@@ -1423,6 +1446,7 @@ impl Controller {
                             started: Instant::now(),
                             start_at: Some(not_before),
                             replaced: false,
+                            restarted: None,
                         })),
                     }
                 }
@@ -1468,6 +1492,9 @@ impl Controller {
             // Dropped when nothing is wanted under its id: once gone it is not adopted as an exit.
             stop_unit(&mut self.slots, id, !wanted.contains_key(id)).await;
         }
+        // What `kubectl delete pod` asked to restart is stopped here, and started by step 3 as due.
+        let mut marked = std::mem::take(&mut *shared.restarts.lock().expect("a handler panicked holding the restarts"));
+        apply_restarts(&mut self.slots, &mut marked, Instant::now()).await;
         // A replica found running as both generations by a kithd started again: one is wanted (the
         // new one) and the other held below, so that a restart mid-update stops neither at once.
         let marks: BTreeMap<String, String> = self
@@ -2121,6 +2148,9 @@ impl Controller {
                     let mut c = json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts, "revision": slot.revision });
                     if let Some(code) = slot.exit_code {
                         c["exitCode"] = json!(code);
+                    }
+                    if let Some(at) = slot.restarted {
+                        c["restarted"] = json!(at);
                     }
                     let said = says.iter().filter(|(r, _)| *r == slot.replica && me.is_some()).map(|(_, said)| said.as_str());
                     let message: Vec<&str> = slot.message.as_deref().into_iter().chain(said).collect();
@@ -3566,6 +3596,23 @@ mod tests {
         assert!(images_in_use(&BTreeMap::new()).is_empty());
     }
 
+    /// A restart a `kubectl delete pod` asked for stops that replica's slot and sets it to start
+    /// at once, whatever its restart policy says; the replica beside it is not touched, and the
+    /// mark is taken once.
+    #[tokio::test]
+    async fn delete_pod_stops_the_replica_and_starts_it_again_ignoring_policy() {
+        let mut slots = BTreeMap::new();
+        slots.insert("a".to_string(), slot_of("Workload/default/x", &[], "main"));
+        let mut beside = slot_of("Workload/default/x", &[], "main");
+        beside.replica = 1;
+        slots.insert("b".to_string(), beside);
+        let mut marked = BTreeSet::from([("Workload/default/x".to_string(), 0u32)]);
+        apply_restarts(&mut slots, &mut marked, Instant::now()).await;
+        assert!(marked.is_empty(), "the mark is taken once");
+        assert!(slots["a"].start_at.is_some(), "the replica is to start again");
+        assert!(slots["b"].start_at.is_none(), "the replica beside it is not touched");
+    }
+
     /// A slot of `owner`, with the device nodes `devices`, that runs the container `name`.
     fn slot_of(owner: &str, devices: &[&str], name: &str) -> Slot {
         let container: Container = serde_json::from_value(json!({ "name": name, "image": "img" })).unwrap();
@@ -3603,6 +3650,7 @@ mod tests {
             started: Instant::now(),
             start_at: None,
             replaced: false,
+            restarted: None,
         }
     }
 

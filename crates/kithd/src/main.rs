@@ -272,6 +272,9 @@ pub struct Shared {
     pub stop: watch::Sender<bool>,
     /// The pods of this node, and their networks.
     pub pods: Mutex<pods::Pods>,
+    /// The replicas a `kubectl delete pod` asked to restart here: (owner key, replica). The
+    /// controller takes them at its next pass; a restart is not kept over a restart of kithd.
+    pub restarts: Mutex<std::collections::BTreeSet<(String, u32)>>,
     /// The tunnels of the Exits this node holds.
     pub exits: Mutex<exits::Exits>,
     /// Dry runs (`/v1/diff`, `apply?dryRun`) at once, from asking admission to the answer:
@@ -673,6 +676,7 @@ async fn replica(
         cluster,
         stop: watch::channel(false).0,
         pods: Mutex::default(),
+        restarts: Mutex::default(),
         exits: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
         order: tokio::sync::RwLock::default(),
