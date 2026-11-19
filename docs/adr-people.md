@@ -391,8 +391,10 @@ Where the build differs from the text above:
 - An IPv6 overlap is not refused at apply: the mesh /48 and the people /64 come from the CA,
   which kith-api does not hold. kithd refuses an AccessLevel over either in its `refused` status
   instead. An IPv4 overlap with the people ranges or `100.88.0.0/16` is refused at apply.
-- The pods range checked is the default `100.88.0.0/16`. The start-time check of the people
-  ranges against `--pod-range` and the connected networks (condition 4) is not done yet.
+- The pods range checked at apply is the default `100.88.0.0/16`. At start, with `--people`,
+  kithd refuses a `--pod-range` that overlaps `100.89.0.0/16`, and a network of this node
+  (other than `kwg0` and loopback) that overlaps it; as PID 1 the second is only said, as the
+  pods' own clash is, since a refusal there restarts the machine (condition 4).
 - An IPv4 address is 16 bits of the name's SHA-256 inside `100.89.0.0/16`; the IPv6 address is
   the people /64 with the name's SHA-256 bytes 8 to 16 as its interface id. Of the peers that
   share a public key, one is given its addresses: the one already holding an address of ours,
@@ -482,6 +484,46 @@ had 2.92 before), `kith-remote` 3.59 (3.60), `kithd` 12.66 (13.00; `numbers.json
 are the figures slice C's text above, 2.93 and 11.35 MB, should have named; the 11.35 was an
 estimate. `kithd.order` was written again (`python3 ci/order.py`), as the new handler's functions
 and slice C's were not in it.
+
+## Built: slice E1
+
+Levels hold on the `--people` node (kithd's `levels.rs`). A pass reads the store (the node's
+RemotePeers, their AccessLevels and Services) and makes what the kernel holds match it:
+
+- The `kith-people` table is written whole, in one batch, from the people and their levels.
+  There is no `ct state established` accept, so a narrowed level is cut by the rewrite alone; a
+  peer taken away also has its connections' marks (`0x6b79_0000 | offset`) deleted from conntrack.
+- Rules 9010 (main table, `suppress_prefixlen 0`), 9012 (unreachable) for both families, and 9011
+  (the peer's /32, the full main table) for each peer of a level with `internet: true`, all `iif
+  kwg0`. exit.rs's 9000-9005 are untouched; its `Rule` gained `suppress`.
+- Order of a pass: the peers leaving come off kwg0 first; then the table, then the rules; then
+  the peers go on; the connections of those that left are flushed last, and only once they are
+  really off the device (a `set_peers` that failed leaves the pass's memory of the device as it
+  was, so the next pass asks again and nothing is flushed meanwhile). Any failed step empties
+  kwg0's peers (fail closed) and says why. A pass is run in `spawn_blocking`, and none runs once
+  the device is being taken away (a lock shared with the teardown). A start that fails takes the
+  old kwg0, its rules and its table away.
+- The rules counted as held are the whole rule (action, lengths, table, suppress): one by kwg0 at
+  9010 to 9012 that differs is not counted, and `people_hold` replaces it.
+- The kernel is read again each pass (table present, rules), so a rule or table removed by hand
+  is put back within 10 s; an unchanged pass writes nothing. `Tend` starts only after `up` has
+  finished its own order (the device, the table, the 9010/9012 base).
+- A peer's AllowedIPs on kwg0 are its own /32 and /128 and nothing else (condition 8 on this
+  side; what the client's shown configuration holds is slice D).
+- `--people-networks A,B` (env `KITH_PEOPLE_NETWORKS`; needs `--people`) names what a level's
+  `networks` may hold: a level's network outside them, or overlapping the mesh /48, the people
+  /64, 100.89.0.0/16, 100.88.0.0/16 or the pods' range (`--pod-range`), is left out with a note (condition 7: narrows, never widens). A Service reached only on UDP
+  is left out (an empty port list means all ports). A level that names an `exit` has no internet
+  until slice E2 ("exit X is not held yet").
+- Two peers with one address or key are both left out, as is an address that is the range's first
+  two or its last (condition 5). A level the store does not
+  have leaves its people out. What was left out, and why, is the Node's `peopleNotes` (up to 16
+  lines of 200 characters; a worker may say only its own).
+
+Not built: a conntrack flush for a peer deleted while kithd was down; the node's own IPv6 links
+in the table's link list (IPv4 only); the kithd resolver's own `may_forward` check that a people
+prefix may be forwarded to (condition 8's other half); a start failure's reason beyond stderr;
+exit levels, the Service listener and per-peer limits (slice E2).
 
 ## Open
 
