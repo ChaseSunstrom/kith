@@ -1734,7 +1734,8 @@ fn release_installs_a_package() {
 
     // A second version, followed (autoUpgrade), makes a map of its own.
     std::fs::write(package.join("package.yaml"), "name: maps\nversion: 2.0.0\n").unwrap();
-    let two = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }}-two }\nspec: { data: { a: b } }\n";
+    let two =
+        "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }}-two }\nspec: { data: { a: b } }\n";
     std::fs::write(package.join("templates/two.yaml"), two).unwrap();
     assert_eq!(daemon.ok(&["package", "push", "maps"]), "Package/maps-2.0.0 created\n");
     wait_for("the release to follow 2.0.0", || {

@@ -343,7 +343,13 @@ fn inputs<'a>(
     let spec: ReleaseSpec = serde_json::from_value(release.spec.clone()).map_err(|e| e.to_string())?;
     // (An upgrade's preview is what moving would do: it is not held back.)
     let pin = pinned(store, release).filter(|_| !preview);
-    let package = package(store, release, &spec, preview || spec.auto_upgrade == Some(true), pin.as_deref())?;
+    let package = package(
+        store,
+        release,
+        &spec,
+        preview || spec.auto_upgrade == Some(true),
+        pin.as_deref(),
+    )?;
     let (cluster, everywhere) = shared_values(store, "ConfigMap/kith-system/kith-values")?;
     let (local, here) = shared_values(store, &format!("ConfigMap/{}/{SHARED}", namespace(release)))?;
     let inputs = Inputs {
@@ -811,15 +817,24 @@ fn pinned(store: &Store, release: &Resource) -> Option<String> {
     let seen = release.status.as_ref()?["history"].as_array()?;
     let revisions = store.history(&release.key()).ok()?.iter().rev();
     let mut earlier = revisions.skip_while(|revision| revision.resource.spec == release.spec);
-    earlier.find(|revision| revision.resource.spec == release.spec).and_then(|revision| {
-        let at = revision.resource.metadata.revision?;
-        let entry = seen.iter().rev().find(|entry| entry["revision"].as_u64().is_some_and(|r| r <= at));
-        // (Installing the oldest entry's version drops it from the ten: the pin it made, said in
-        // the status, is the version then.)
-        let status = release.status.as_ref()?;
-        let held = (status["pinned"] == true).then(|| &status["version"]);
-        entry.map(|entry| &entry["version"]).or(held)?.as_str().map(str::to_string)
-    })
+    earlier
+        .find(|revision| revision.resource.spec == release.spec)
+        .and_then(|revision| {
+            let at = revision.resource.metadata.revision?;
+            let entry = seen
+                .iter()
+                .rev()
+                .find(|entry| entry["revision"].as_u64().is_some_and(|r| r <= at));
+            // (Installing the oldest entry's version drops it from the ten: the pin it made, said in
+            // the status, is the version then.)
+            let status = release.status.as_ref()?;
+            let held = (status["pinned"] == true).then(|| &status["version"]);
+            entry
+                .map(|entry| &entry["version"])
+                .or(held)?
+                .as_str()
+                .map(str::to_string)
+        })
 }
 
 /// Compare `resources` with the store for the owner `key`. Nothing of someone else's
@@ -1781,7 +1796,10 @@ mod tests {
         assert_eq!(status_of(&store)["version"], "1.0.0");
         assert_eq!(status_of(&store)["pinned"], true);
         // A spec equal to no earlier revision follows again.
-        apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: green"));
+        apply(
+            &mut store,
+            &RELEASE.replace("extra: true", "extra: true, colour: green"),
+        );
         settled(&mut store);
         assert_eq!(status_of(&store)["version"], "3.0.0");
         assert_eq!(status_of(&store)["pinned"], false);
@@ -1793,7 +1811,10 @@ mod tests {
         let status = status_of(&store);
         assert_eq!(status["state"], "error");
         let message = status["message"].as_str().unwrap();
-        assert!(message.contains("no Package maps 1.0.0") && message.contains("push it again"), "{message}");
+        assert!(
+            message.contains("no Package maps 1.0.0") && message.contains("push it again"),
+            "{message}"
+        );
         // (Said in the error too: a patch merges, so it would else keep the last pass's.)
         assert_eq!(status["pinned"], true);
         assert!(store.get("ConfigMap/shop/mine-maps-extra").is_some());
@@ -1817,7 +1838,9 @@ mod tests {
         let first = store.get(SELF).unwrap().metadata.revision.unwrap();
         apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: blue"));
         for major in 2..=10 {
-            store.apply(package(&format!("{major}.0.0"), &[("map.yaml", MAP)])).unwrap();
+            store
+                .apply(package(&format!("{major}.0.0"), &[("map.yaml", MAP)]))
+                .unwrap();
             settled(&mut store);
         }
         assert_eq!(status_of(&store)["history"].as_array().unwrap().len(), 10);
@@ -1866,7 +1889,10 @@ mod tests {
         assert_eq!((version(&store), pinned(&store)), (json!("4.0.0"), json!(false)));
         // A change to the annotations alone is not a return to anything.
         let noted = RELEASE.replace("extra: true", "extra: true, colour: blue");
-        apply(&mut store, &noted.replace("'local socket' }", "'local socket', note: x }"));
+        apply(
+            &mut store,
+            &noted.replace("'local socket' }", "'local socket', note: x }"),
+        );
         push(&mut store, "5.0.0");
         settled(&mut store);
         assert_eq!((version(&store), pinned(&store)), (json!("5.0.0"), json!(false)));
