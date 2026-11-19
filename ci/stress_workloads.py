@@ -68,6 +68,9 @@ class KithStress(Kith):
     def probe(self):
         return self.call("GET", "/v1/resources/Node/n1")
 
+    def running(self, node):
+        return None  # (kith's machine has no pods to count)
+
     def replica_log(self, name):
         log = self.get(f"/v1/logs/Workload/default/{name}?replica=0&tail=3")
         return (log or {}).get("data") or ""
@@ -100,7 +103,7 @@ class KubeStress(Kube):
         if pod is None:
             return ""
         status, body = self.call("GET", f"/api/v1/namespaces/default/pods/{pod['metadata']['name']}/log?tailLines=1")
-        return body.decode(errors="replace") if status == 200 else ""
+        return body.decode(errors="replace") if status == 200 else f"log HTTP {status}"
 
     def inventory(self):
         """What kith's API lists, from k3s's: each Deployment as a Workload (its ready replicas),
@@ -123,6 +126,11 @@ class KubeStress(Kube):
 
     def probe(self):
         return self.call("GET", "/api/v1/nodes/k1")
+
+    def running(self, node):
+        """The pods the node is let run, and how many of them are Running."""
+        pods = [p for p in (self.get("/api/v1/pods") or {}).get("items") or [] if p["spec"].get("nodeName") == node]
+        return len(pods), sum((p.get("status") or {}).get("phase") == "Running" for p in pods)
 
     def replica_log(self, name):
         pods = self.pods(name)
@@ -162,16 +170,25 @@ def cpu(api):
 
 
 def used(api):
-    return sum(reading(api.read(node, 1)[-1])[0] for node in api.nodes)
+    total = 0
+    for node in api.nodes:
+        lines = api.read(node, 1)
+        if not lines:  # (the reader's last line is not served this time: a limit, named for its node)
+            raise Limit(f"{node}'s memory reader has said nothing")
+        total += reading(lines[-1])[0]
+    return total
 
 
 def say(api, node):
     """What the node's own reader (`limits`) last said, as words, or what is wrong."""
-    found = re.search(r"MemAvailable:\s+(\d+) kB (\d+)/(\d+) (\d+) (\d+)", api.reader_said(node, "limits"))
-    if not found:
-        return f"{node}: no answer"
+    said = api.reader_said(node, "limits")
+    found = re.search(r"MemAvailable:\s+(\d+) kB (\d+)/(\d+) (\d+) (\d+)", said)
+    if not found:  # (say why, as far as the reader's answer tells: a log request's status, or what it printed)
+        return f"{node}: no answer ({' '.join(said.split())[:60] or 'nothing logged'})"
     free, running, tasks, files, cgroups = map(int, found.groups())
-    return f"{node}: free={free // 1024}MB tasks={tasks} (running {running}) files={files} cgroups={cgroups}"
+    pods = api.running(node)
+    text = f"{node}: free={free // 1024}MB tasks={tasks} (running {running}) files={files} cgroups={cgroups}"
+    return text + (f" pods={pods[0]} (running {pods[1]})" if pods else "")
 
 
 def console(n, lines):
@@ -192,7 +209,16 @@ def look(api):
     code, why = api.probe()
     said = [f"api: {code if code else why.decode(errors='replace')[:80]}"] + [say(api, node) for node in api.nodes]
     ooms = sum(len(re.findall(r"Out of memory|oom-kill|Killed process", " ".join(console(n, 400)))) for n in (1, 2, 3))
-    return " | ".join(said + [f"oom_kills={ooms}", "kithd: " + " / ".join(console(1, 3))])
+    label = "console" if isinstance(api, KubeStress) else "kithd"  # (k3s's machines are Alpine: not kithd)
+    return " | ".join(said + [f"oom_kills={ooms}", f"{label}: " + " / ".join(console(1, 3))])
+
+
+def nodes_now(api):
+    """What look() says, or why it could not say: the row keeps its cause either way."""
+    try:
+        return look(api)
+    except (Exception, SystemExit) as e:
+        return f"nodes not read: {type(e).__name__}: {e}"
 
 
 def load(api, out):
@@ -300,10 +326,11 @@ def after(api, out):
         out["back_s"] = f"{time.monotonic() - begun:.2f}"
     except Limit as e:
         out["limit"] = f"after the restart {e}"
-        out["where"] = look(api)
+        out["where"] = nodes_now(api)
 
 
 def row(out):
+    out = {k: " ".join(str(v).split()) for k, v in out.items()}  # (one line: an error's newlines would break the row)
     mem = out.get("mem_mb", MEMORY)
     # (A k3s row ends in its mark: the pods a node was let run. A kith row has none.)
     mark = f" k3s max_pods={out['max_pods']}" if out.get("system") == "k3s" else ""
@@ -326,6 +353,12 @@ def main():
     system = "k3s" if what == "k3s" else "kith"
     api = KubeStress() if system == "k3s" else KithStress()
     out.update(size=SIZE, nodes=NODES, mem_mb=MEMORY, system=system, max_pods=os.environ.get("KITH_COMPARE_MAX_PODS", "110"))
+    print(json.dumps(run(api, what, out)))
+
+
+def run(api, what, out):
+    """Load, stop or after, as `what` asks. A limit, a refusal or an error is written into `out` with what the
+    nodes say, and never raised: compare.sh must go on to print the row, and the row must say why."""
     try:
         if what in ("kith", "k3s"):
             load(api, out)
@@ -335,11 +368,13 @@ def main():
             after(api, out)
     except Limit as e:
         out["limit"] = str(e)
-        out["where"] = look(api)
     except SystemExit as e:  # (a request the node refused: api.must)
         out["limit"] = f"the node refused: {e.code}"
-        out["where"] = look(api)
-    print(json.dumps(out))
+    except Exception as e:  # (not a limit: a reading this adapter did not expect, said by name)
+        out["limit"] = f"the adapter failed: {type(e).__name__}: {e}"
+    if "limit" in out and "where" not in out:  # (after() says its own where)
+        out["where"] = nodes_now(api)
+    return out
 
 
 if __name__ == "__main__":

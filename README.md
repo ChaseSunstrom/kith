@@ -241,12 +241,15 @@ How each row is measured, and what the tables do not say: [How the numbers besid
 | 300 | 3 | kith | - | 2.51 | 0.57 | 5.13 | yes | ok | 0.23 |
 | 1000 | 3 | kith | - | 7.88 | 0.61 | 8.57 | yes | ok | 0.04 |
 | 100 | 3 | k3s | 110 | 7.10 | 12.76 | 6.14 | yes | - | - |
+| 1000 | 3 | k3s | 444 | limit | - | - | - | - | - |
 | 100 | 1 | k3s | 110 | limit | - | - | - | - | - |
 | 300 | 3 | k3s | 210 | limit | - | - | - | - | - |
-| 1000 | 3 | k3s | 444 | limit | - | - | - | - | - |
 
 - `limit` in the ready column: that size did not finish. Its row in ci/stress.txt says where it stopped and what the nodes said of themselves; the cells after it are `-`.
 - A k3s row's last column is the most pods a node was let run: 110 (k3s's default) up to 100 containers, and above that the containers' share per node plus 110, with kubelet's max-pods raised and a /22 pod range on the server.
 - k3s has no restart in this run, so its `store` and `back (s)` are `-`.
 - kith stopped at 100 containers on one node, at Services readiness: 0 of 10 Services had their backends after 121 s.
-- k3s stopped at 100 on one node and at 300 on three with "the workloads did not all run on k3s". The row keeps the console lines, not the adapter's error, so the cause is not recorded. At 1000 on three nodes, the API stopped answering after 171 s.
+- k3s stopped at 100 on one node: k1 ran 107 pods on 2 vCPUs, the kernel logged soft lockups (a CPU stuck for 22 s and for 51 s), and k1's kubelet did not serve its memory reader, so the row has no reading from it. k1's own counts are in the row (179 MB free, 104 of 107 pods running), and no node had an OOM kill. The cause is inferred from those lines and counts, not from a kubelet trace.
+- k3s stopped at 300 on three nodes: the API handshake timed out after 198 s and no node answered, with nothing logged on any of them. The cause is not established; the row does not say whether the API or the hosts were saturated.
+- k3s at 1000 on three nodes: the API stopped answering after 171 s.
+- Two earlier k3s rows at 100 on one node and 300 on three had no cause. The adapter raised an uncaught error reading the memory reader and the row kept only the console lines. That was a bug in ci/stress_workloads.py, fixed and tested; the rows above are the reruns.
