@@ -1,5 +1,5 @@
 # shellcheck shell=sh
-# shellcheck disable=SC2154 # (names the driver and its parts share)
+# shellcheck disable=SC2154,SC2034 # (names the driver and its parts share: more and nolink are read by cluster.sh)
 # Sourced by ci/vm.sh for --test services: it runs inside the driver's shell, with its
 # variables and functions; not a script to run alone.
             # A pod that sends back what it is sent, and its Service.
