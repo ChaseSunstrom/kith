@@ -635,13 +635,21 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   through the log); the node's own check before start still refuses an unlisted namespace.
   Of the node itself, an exit's pod reaches nothing (only answers to the node's own
   questions of it go back). A running pod keeps its tunnel after its namespace is taken
-  off its Exit's list, until it starts again (the node's check is at start). No NetworkPolicy's egress rules are enforced, for an exit's pod or any other (a
-  policy with them says so in its status). Not tested: a tunnel's link or table taken
+  off its Exit's list, until it starts again (the node's check is at start). Not tested: a tunnel's link or table taken
   away by hand on a running node (the code that makes it again is tested in a network
   namespace, not on kith OS), ICMP through or around a tunnel, kithd killed between
   starting a pod and making its rules (the rules come first; nothing shows the order
   holds under a kill), and names a pod's own resolver library cached before its exit
   changed.
+- **A NetworkPolicy's egress rules hold a pod's packets, on kith OS as root and for pod Workloads
+  and Jobs only.** The pods of the Workloads and Jobs a policy selects, an exit's pod included,
+  pass only what a rule allows, DNS included. Each pod is matched per pod link: its rules are the
+  chain `e-kpN` (`e-kpxN` for an exit's pod) in the node's `inet kith-pods` table, and its source
+  address is checked apart, so a packet from another address on its link is dropped. Exec and VM
+  Workloads are not held, and nothing is written when kithd is not root. A policy with a peer by
+  `namespace` or `selector`, or whose rules are not yet written on a node, says `partial` in its
+  status; `enforced` once they are. kithd writes the rules again when a policy changes. Not
+  tested: a policy changing under a running pod; access returning after the policy is deleted.
 - **What a replica writes outside its Volumes is held at the write where the state disk
   keeps project quotas, and counted elsewhere.** Its containers' writable roots and its
   disk scratch share the node's state disk. Where the state disk keeps project quotas (a
