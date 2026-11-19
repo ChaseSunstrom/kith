@@ -27,6 +27,7 @@ use crate::Shared;
 use crate::access::{Caller, Certificate, Grants};
 use crate::api::{self, ApiError, LogOptions};
 use crate::websocket;
+pub(crate) mod portforward;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as Route, Query, State};
 use axum::http::request::Parts;
@@ -2056,8 +2057,14 @@ async fn serve(
             )
             .await?
         }
+        ("GET" | "POST", Some(name), Some("portforward")) if kind.kind == "Pod" => {
+            let upgrade = parts.extensions.get::<OnUpgrade>().cloned();
+            let (method, headers) = (parts.method.as_str(), &parts.headers);
+            let namespace = namespace.unwrap_or_default();
+            portforward::forward(&call, namespace, name, method, headers, upgrade).await?
+        }
         (_, Some(_), Some("exec" | "attach" | "portforward")) => {
-            let why = "exec, attach and port-forward are not answered here: `kith run` runs a command in a replica";
+            let why = "exec and attach are not answered here: `kith run` runs a command in a replica";
             return Err(status(StatusCode::NOT_IMPLEMENTED, "NotImplemented", why.into()));
         }
         (method, ..) => {
@@ -3030,14 +3037,9 @@ async fn pod_stream(
     decided
 }
 
-async fn pod_decision(
-    call: &Call,
-    namespace: &str,
-    pod: &str,
-    method: &str,
-    headers: &HeaderMap,
-    upgrade: Option<OnUpgrade>,
-) -> Result<Response, No> {
+/// The Exec right on what runs `pod` (and on `Node` for a NodeWorkload's, which runs on the host), then the
+/// pod itself: the kind that holds it, its owner's key and its replica. Nothing of the request is read before.
+fn pod_access(call: &Call, namespace: &str, pod: &str) -> Result<(&'static str, String, u32), No> {
     // (What the pod's name says is enough to ask: a caller without the right is refused whether or not the pod is there.)
     let (holder, _, _) = pod_owner(pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
     let place = vec![(holder.to_string(), Some(namespace.to_string()))];
@@ -3047,9 +3049,19 @@ async fn pod_decision(
         let node = vec![("Node".to_string(), None)];
         api::permit(&call.shared, &call.caller, Verb::Exec, |_| node).map_err(refusal)?;
     }
-    if held_owner(call, namespace, pod).is_none() {
-        return Err(not_found(&KINDS[0], pod));
-    }
+    let (key, replica) = held_owner(call, namespace, pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
+    Ok((holder, key, replica))
+}
+
+async fn pod_decision(
+    call: &Call,
+    namespace: &str,
+    pod: &str,
+    method: &str,
+    headers: &HeaderMap,
+    upgrade: Option<OnUpgrade>,
+) -> Result<Response, No> {
+    pod_access(call, namespace, pod)?;
     // kubectl sends no Origin: one is a browser's, and a browser is not let upgrade to a shell.
     if headers.contains_key(header::ORIGIN) {
         let why = "an upgrade that carries an Origin is refused: kubectl sends none";

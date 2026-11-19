@@ -1,0 +1,587 @@
+//! `kubectl port-forward POD LOCAL:REMOTE`: `/api/v1/namespaces/NS/pods/NAME/portforward`, a WebSocket
+//! that speaks SPDY/3.1 (`SPDY/3.1+portforward.k8s.io`, spdy.rs). The Exec right on the Workload or Job
+//! that owns the pod is checked before anything is upgraded (`pod_access`); the plain `POST` + `Upgrade:
+//! SPDY/3.1` kubectl falls back to is not carried.
+//!
+//! One session is one WebSocket. Each local connection kubectl takes is a pair of streams with one
+//! `requestid`: an error stream, then a data stream. The data stream's bytes go to the pod's port and back;
+//! what goes wrong is said as text on the error stream; when the data stream ends both are FINed, which
+//! is what makes kubectl close the local connection.
+//!
+//! The bytes go to the node that runs the replica over `POD_HOP`, a byte tunnel between nodes that is
+//! asked for the replica and a port, never an address: that node connects to the pod's own address
+//! (`pods::connect`) and checks the right again for the caller the first node names, as `run-hop` does.
+//!
+//! Bounds: a caller has [`SESSIONS_MAX`] sessions at a node (counted at the upgrade, not by streams), a
+//! session [`STREAMS_MAX`] connections, and a connection that moves no byte for [`idle`] ends.
+
+use super::{Call, No, pod_access, status};
+use crate::Shared;
+use crate::access::Caller;
+use crate::cluster::{POD_HOP, Peer, refuse};
+use crate::ingress::Idle;
+use crate::pki::Subject;
+use crate::spdy::{self, Frame, Reader, Writer};
+use crate::view::Upstream;
+use crate::websocket::{self, Op};
+use axum::body::{Body, to_bytes};
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use hyper::upgrade::{OnUpgrade, Upgraded};
+use hyper_util::rt::TokioIo;
+use kith_api::kinds::Verb;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::task::{AbortHandle, JoinSet};
+
+/// The WebSocket subprotocol kubectl asks for, and the one between nodes.
+const PROTOCOL: &str = "SPDY/3.1+portforward.k8s.io";
+const HOP_PROTOCOL: &str = "kith-portforward";
+/// Sessions one caller holds at a node, and the connections one session carries at once.
+const SESSIONS_MAX: usize = 8;
+const STREAMS_MAX: usize = 16;
+/// A connection that moves no byte for this long ends (`KITHD_PORTFORWARD_IDLE_MS` sets it in a debug build).
+const IDLE: Duration = Duration::from_secs(300);
+/// The node that runs the replica has this long to answer, and the pod's port to accept.
+const HOP: Duration = Duration::from_secs(15);
+/// What a WebSocket frame may hold (kubectl writes 4 KiB pieces), what is read from a pod at once, and how many
+/// frames wait for the client and how many chunks of its bytes wait for a pod.
+const FRAME_MAX: usize = 64 << 10;
+const CHUNK: usize = 32 << 10;
+const QUEUE: usize = 64;
+const BACKLOG: usize = 4;
+
+fn idle() -> Duration {
+    let set = std::env::var("KITHD_PORTFORWARD_IDLE_MS").ok().filter(|_| cfg!(debug_assertions));
+    set.and_then(|ms| ms.parse().ok()).map_or(IDLE, Duration::from_millis)
+}
+
+/// What a byte stream to a pod's port is, here or through another node.
+trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+
+/// Sessions per caller, by who the first node says asked.
+static SESSIONS: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+
+/// A place among a caller's sessions, given back when dropped.
+struct Held(String);
+
+impl Held {
+    fn take(who: &str) -> Option<Held> {
+        let mut held = SESSIONS.lock().expect("nothing panics holding the sessions");
+        let count = held.entry(who.to_string()).or_default();
+        if *count >= SESSIONS_MAX {
+            return None;
+        }
+        *count += 1;
+        Some(Held(who.to_string()))
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut held = SESSIONS.lock().expect("nothing panics holding the sessions");
+        if let Some(count) = held.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// The replica a session reaches and who asked.
+#[derive(Clone)]
+struct Owner {
+    key: String,
+    replica: u32,
+    who: String,
+}
+
+/// `GET .../pods/NAME/portforward`: the right on what runs the pod, then the upgrade. Each decision is in the audit log.
+pub(super) async fn forward(
+    call: &Call,
+    namespace: &str,
+    pod: &str,
+    method: &str,
+    headers: &HeaderMap,
+    upgrade: Option<OnUpgrade>,
+) -> Result<Response, No> {
+    let decided = decide(call, namespace, pod, method, headers, upgrade);
+    let outcome = decided.as_ref().map(|_| ()).map_err(|no| no.why.clone());
+    let what = vec![format!("pod {namespace}/{pod}")];
+    call.shared.audit.record(&call.caller, "portforward", what, outcome);
+    decided
+}
+
+fn decide(
+    call: &Call,
+    namespace: &str,
+    pod: &str,
+    method: &str,
+    headers: &HeaderMap,
+    upgrade: Option<OnUpgrade>,
+) -> Result<Response, No> {
+    let (holder, key, replica) = pod_access(call, namespace, pod)?;
+    if holder == "NodeWorkload" {
+        let why = "port-forward does not reach a NodeWorkload's unit, which runs on the host";
+        return Err(status(StatusCode::NOT_IMPLEMENTED, "NotImplemented", why.into()));
+    }
+    // (The name says which replica; the owner's status says whether there is one: a replica past the last has no pod.)
+    place(&call.shared, &key, replica).map_err(|why| status(StatusCode::NOT_FOUND, "NotFound", why))?;
+    // kubectl sends no Origin: one is a browser's.
+    if headers.contains_key(header::ORIGIN) {
+        let why = "an upgrade that carries an Origin is refused: kubectl sends none";
+        return Err(status(StatusCode::FORBIDDEN, "Forbidden", why.into()));
+    }
+    let said = |name| headers.get(name).and_then(|value| value.to_str().ok()).unwrap_or_default();
+    let offered = said(header::SEC_WEBSOCKET_PROTOCOL).split(',').any(|one| one.trim() == PROTOCOL);
+    let upgrading = said(header::UPGRADE).eq_ignore_ascii_case("websocket")
+        && said(header::CONNECTION).to_ascii_lowercase().contains("upgrade")
+        && said(header::SEC_WEBSOCKET_VERSION) == "13";
+    let accept = crate::websocket::accept_key(said(header::SEC_WEBSOCKET_KEY));
+    let (Some(upgrade), Some(accept), true, true, "GET") = (upgrade, accept, offered, upgrading, method) else {
+        let why = format!("port-forward is a WebSocket: a GET that upgrades, with version 13 and the protocol {PROTOCOL}");
+        return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why));
+    };
+    let who = call.caller.to_string();
+    let Some(held) = Held::take(&who) else {
+        let why = format!("{who} has {SESSIONS_MAX} port-forward sessions at this node: one has to end first");
+        return Err(status(StatusCode::TOO_MANY_REQUESTS, "TooManyRequests", why));
+    };
+    let shared = call.shared.clone();
+    let owner = Owner { key, replica, who };
+    tokio::spawn(async move {
+        if let Ok(upgraded) = upgrade.await {
+            session(shared, owner, TokioIo::new(upgraded), held).await;
+        }
+    });
+    Ok((
+        StatusCode::SWITCHING_PROTOCOLS,
+        [
+            (header::UPGRADE, "websocket".to_string()),
+            (header::CONNECTION, "Upgrade".to_string()),
+            (header::SEC_WEBSOCKET_ACCEPT, accept),
+            (header::SEC_WEBSOCKET_PROTOCOL, PROTOCOL.to_string()),
+        ],
+    )
+        .into_response())
+}
+
+fn wire(frame: Vec<u8>) -> Vec<u8> {
+    websocket::encode(Op::Binary, &frame, None)
+}
+
+/// One WebSocket, until the client closes it, it breaks the protocol or kithd stops.
+async fn session(shared: Arc<Shared>, owner: Owner, io: TokioIo<Upgraded>, _held: Held) {
+    let (mut read, mut write) = tokio::io::split(io);
+    let (out, mut queue) = mpsc::channel::<Vec<u8>>(QUEUE);
+    let writer = tokio::spawn(async move {
+        while let Some(bytes) = queue.recv().await {
+            if write.write_all(&bytes).await.is_err() {
+                return;
+            }
+        }
+        let _ = write.shutdown().await;
+    });
+    let mut stop = shared.stop.subscribe();
+    let mut at = Session {
+        shared,
+        owner,
+        out,
+        reply: Writer::new(),
+        requests: HashMap::new(),
+        tasks: JoinSet::new(),
+        last: 0,
+    };
+    let (code, why) = tokio::select! {
+        ended = at.run(&mut read) => ended,
+        _ = stop.wait_for(|stopped| *stopped) => (1001, "kithd is stopping".to_string()),
+    };
+    // (Every connection ends before the queue's last sender does; the close is the last frame.)
+    at.tasks.shutdown().await;
+    let close = websocket::encode(Op::Close, &websocket::close_body(code, &why), None);
+    let _ = at.out.send(close).await;
+    drop(at);
+    // (A client that reads nothing is let hold this for five seconds.)
+    if tokio::time::timeout(Duration::from_secs(5), writer).await.is_err() {
+        // the writer is dropped with the connection
+    }
+}
+
+/// The connections of a session: a request is the error stream and the data stream of one.
+struct Pending {
+    port: u16,
+    error: u32,
+    data: Option<u32>,
+    /// What the client sends on the data stream, on its way to the pod (dropped: it sent FIN).
+    input: Option<mpsc::Sender<Vec<u8>>>,
+    abort: Option<AbortHandle>,
+}
+
+struct Session {
+    shared: Arc<Shared>,
+    owner: Owner,
+    out: mpsc::Sender<Vec<u8>>,
+    reply: Writer,
+    requests: HashMap<String, Pending>,
+    /// One task for each connection that has both its streams; it gives its request id when it ends.
+    tasks: JoinSet<String>,
+    last: u32,
+}
+
+impl Session {
+    /// Reads until the WebSocket ends: its close code and reason.
+    async fn run(&mut self, read: &mut (impl AsyncRead + Unpin)) -> (u16, String) {
+        let mut spdy = Reader::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            loop {
+                match websocket::decode_with(&buf, true, FRAME_MAX, true) {
+                    Ok(Some((frame, used))) => {
+                        buf.drain(..used);
+                        match frame.op {
+                            Op::Binary => spdy.push(&frame.payload),
+                            Op::Ping => {
+                                let pong = websocket::encode(Op::Pong, &frame.payload, None);
+                                if self.out.send(pong).await.is_err() {
+                                    return (1011, "the connection is gone".into());
+                                }
+                            }
+                            Op::Close => return (1000, String::new()),
+                            Op::Text => return (1003, "SPDY is binary".into()),
+                            Op::Pong => {}
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => return (1002, "a frame that is not one".into()),
+                }
+            }
+            loop {
+                match spdy.next() {
+                    Ok(Some(frame)) => {
+                        if let Err(ended) = self.handle(frame).await {
+                            return ended;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(why) => return (1002, why),
+                }
+            }
+            tokio::select! {
+                read = read.read(&mut chunk) => match read {
+                    Ok(0) | Err(_) => return (1000, String::new()),
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                },
+                Some(done) = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                    if let Ok(request) = done {
+                        self.requests.remove(&request);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn say(&self, frame: Vec<u8>) -> Result<(), (u16, String)> {
+        let gone = |_| (1011, "the connection is gone".to_string());
+        self.out.send(wire(frame)).await.map_err(gone)
+    }
+
+    async fn handle(&mut self, frame: Frame) -> Result<(), (u16, String)> {
+        match frame {
+            Frame::Open { id, headers } => self.open(id, &headers).await,
+            Frame::Data { id, fin, data } => {
+                // (Data on an error stream is ignored: kubectl FINs it as soon as it is open.)
+                if let Some(request) = self.requests.values_mut().find(|request| request.data == Some(id)) {
+                    if let Some(input) = &request.input {
+                        if !data.is_empty() && input.send(data).await.is_err() {
+                            request.input = None;
+                        }
+                    }
+                    if fin {
+                        request.input = None;
+                    }
+                }
+                Ok(())
+            }
+            Frame::Reset { id } => {
+                let found = self.requests.iter().find(|(_, r)| r.error == id || r.data == Some(id));
+                let found = found.map(|(request, _)| request.clone());
+                if let Some(request) = found.and_then(|request| self.requests.remove(&request)) {
+                    if let Some(abort) = request.abort {
+                        abort.abort();
+                    }
+                }
+                Ok(())
+            }
+            Frame::Ping(payload) => self.say(self.reply.ping(&payload)).await,
+            Frame::GoAway => Err((1000, String::new())),
+            Frame::Skip => Ok(()),
+        }
+    }
+
+    /// A stream the client opens: the error stream of a new connection, or its data stream.
+    async fn open(&mut self, id: u32, headers: &[(String, String)]) -> Result<(), (u16, String)> {
+        let get = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, value)| value.as_str());
+        let port = get("port").and_then(|port| port.parse::<u16>().ok()).filter(|port| *port != 0);
+        let (Some(request), Some(kind), Some(port), true) = (get("requestid"), get("streamtype"), port, id % 2 == 1)
+        else {
+            return self.say(self.reply.reset(id, spdy::PROTOCOL)).await;
+        };
+        // (Ids a client opens are odd and rise.)
+        if id <= self.last {
+            return self.say(self.reply.reset(id, spdy::PROTOCOL)).await;
+        }
+        self.last = id;
+        let full = self.requests.len() >= STREAMS_MAX;
+        match (kind, self.requests.get_mut(request)) {
+            ("error", None) if full => self.say(self.reply.reset(id, spdy::REFUSED)).await,
+            ("error", None) => {
+                let new = Pending { port, error: id, data: None, input: None, abort: None };
+                self.requests.insert(request.to_string(), new);
+                let reply = self.reply.reply(id);
+                self.say(reply).await
+            }
+            ("data", Some(open)) if open.data.is_none() && open.port == port => {
+                open.data = Some(id);
+                let (input, backlog) = mpsc::channel(BACKLOG);
+                open.input = Some(input);
+                let error = open.error;
+                let task = connection(self.shared.clone(), self.owner.clone(), request.to_string(), port, (error, id), backlog, self.out.clone());
+                let abort = self.tasks.spawn(task);
+                if let Some(open) = self.requests.get_mut(request) {
+                    open.abort = Some(abort);
+                }
+                let reply = self.reply.reply(id);
+                self.say(reply).await
+            }
+            _ => self.say(self.reply.reset(id, spdy::PROTOCOL)).await,
+        }
+    }
+}
+
+/// One connection: the data stream's bytes to the pod's port and back until one side ends, then both streams are
+/// FINed; why it went wrong, if it did, is said as text on the error stream first. Gives the request.
+async fn connection(
+    shared: Arc<Shared>,
+    owner: Owner,
+    request: String,
+    port: u16,
+    (error, data): (u32, u32),
+    mut input: mpsc::Receiver<Vec<u8>>,
+    out: mpsc::Sender<Vec<u8>>,
+) -> String {
+    let spdy = Writer::new();
+    let send = |id: u32, fin: bool, bytes: &[u8]| out.send(wire(spdy.data(id, fin, bytes)));
+    let said = match reach(&shared, &owner, port).await {
+        Err(why) => Some(why),
+        Ok(pod) => {
+            let (mut from_pod, mut to_pod) = tokio::io::split(pod);
+            let up = async {
+                while let Some(chunk) = input.recv().await {
+                    to_pod.write_all(&chunk).await?;
+                }
+                to_pod.shutdown().await
+            };
+            let down = async {
+                let mut chunk = vec![0u8; CHUNK];
+                loop {
+                    let n = from_pod.read(&mut chunk).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    if send(data, false, &chunk[..n]).await.is_err() {
+                        return Err(std::io::Error::other("the client is gone"));
+                    }
+                }
+            };
+            // The client's end of its bytes is no end of the connection: the pod may still answer. The pod's is.
+            let ended = tokio::select! {
+                ended = down => ended,
+                ended = async {
+                    let ended = up.await;
+                    if ended.is_ok() {
+                        std::future::pending::<()>().await;
+                    }
+                    ended
+                } => ended,
+            };
+            // (A silent connection that idles out is ended without a word: any text on the error stream ends kubectl
+            // itself, and with it every other connection of the session.)
+            ended.err().filter(|e| e.kind() != std::io::ErrorKind::TimedOut).map(|e| e.to_string())
+        }
+    };
+    if let Some(why) = said {
+        let _ = send(error, false, why.as_bytes()).await;
+    }
+    let _ = send(data, true, &[]).await;
+    let _ = send(error, true, &[]).await;
+    request
+}
+
+/// Where the replica `replica` of `key` runs: `None` is this node, else the node and where to reach it.
+fn place(shared: &Shared, key: &str, replica: u32) -> Result<Option<(String, Upstream)>, String> {
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    let owner = state.store.get(key).ok_or("what runs the pod is gone")?;
+    let units = owner.status.as_ref().and_then(|status| status["containers"].as_array());
+    let unit = units.into_iter().flatten().find(|unit| unit["replica"] == replica && unit["state"] != "exited");
+    let unit = unit.ok_or_else(|| format!("replica {replica} has no unit that runs"))?;
+    let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str());
+    let node = match (unit["node"].as_str(), me) {
+        (None, _) | (_, None) => return Ok(None),
+        (Some(node), Some(me)) if node == me => return Ok(None),
+        (Some(node), _) => node,
+    };
+    let there = state.store.get(&format!("Node/{node}")).and_then(Upstream::of);
+    let there = there.ok_or_else(|| format!("node {node} has no address"))?;
+    Ok(Some((node.to_string(), there)))
+}
+
+/// A connection to `port` of the pod that is the replica, on this node: its own address and no other. A byte
+/// that moves renews its idle time (`idle`).
+async fn pod(shared: &Shared, key: &str, replica: u32, port: u16) -> Result<Idle<TcpStream>, String> {
+    let live = {
+        let pods = shared.pods.lock().expect("nothing panics holding the pods");
+        pods.live_id(&crate::controller::pod_of(key, replica)).to_string()
+    };
+    let stream = tokio::time::timeout(HOP, crate::pods::connect(Some((shared, &live)), port)).await;
+    let stream = stream.map_err(|_| format!("port {port} did not answer in {} s", HOP.as_secs()))?;
+    let stream = stream.map_err(|e| format!("port {port} of the pod: {e}"))?;
+    Ok(Idle::new(stream, idle(), None))
+}
+
+/// A byte stream to `port` of the replica, from the node that runs it (through its `POD_HOP` when that is another).
+async fn reach(shared: &Shared, owner: &Owner, port: u16) -> Result<Box<dyn Io>, String> {
+    let Some((node, there)) = place(shared, &owner.key, owner.replica)? else {
+        return Ok(Box::new(pod(shared, &owner.key, owner.replica, port).await?));
+    };
+    let cluster = shared.cluster.as_ref().ok_or("this kithd is not part of a cluster")?;
+    let client = cluster.to(&there)?;
+    let spec = Spec { key: owner.key.clone(), replica: owner.replica, port, caller: owner.who.clone() };
+    let send = crate::access_sign::pass_on(client.post(format!("https://{}{POD_HOP}", there.address)))
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, HOP_PROTOCOL)
+        .json(&spec)
+        .send();
+    let reply = match tokio::time::timeout(HOP, send).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => return Err(format!("node {node} did not answer: {}", crate::cluster::why(&e))),
+        Err(_) => return Err(format!("node {node} did not answer in time")),
+    };
+    if reply.status() != StatusCode::SWITCHING_PROTOCOLS {
+        let code = reply.status();
+        let said = reply.text().await.unwrap_or_default();
+        let said = serde_json::from_str::<serde_json::Value>(&said)
+            .ok()
+            .and_then(|said| said["error"].as_str().map(str::to_string))
+            .unwrap_or(said);
+        return Err(format!("node {node} said {code}: {}", said.chars().take(512).collect::<String>()));
+    }
+    match reply.upgrade().await {
+        Ok(far) => Ok(Box::new(far)),
+        Err(_) => Err(format!("node {node} did not give the tunnel")),
+    }
+}
+
+/// What the first node asks the node that runs the replica.
+#[derive(Serialize, Deserialize)]
+struct Spec {
+    key: String,
+    replica: u32,
+    port: u16,
+    /// Who asked the first node.
+    caller: String,
+}
+
+fn say(code: StatusCode, why: impl std::fmt::Display) -> Response {
+    refuse(code, why).into_response()
+}
+
+/// `POST /v1/pod-hop`: the node the replica runs on, asked by the first node (members only). It takes the
+/// caller's name, not what the caller may do: the right is checked here, in this node's own store.
+pub(crate) async fn hop(
+    State(shared): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    mut request: Request,
+) -> Response {
+    let Some(Subject::Node(from, ..)) = peer.subject else {
+        return say(StatusCode::FORBIDDEN, "this is for the cluster's nodes");
+    };
+    if request.headers().get(header::UPGRADE).is_none_or(|v| v != HOP_PROTOCOL) {
+        return say(StatusCode::BAD_REQUEST, format!("ask with `Upgrade: {HOP_PROTOCOL}`"));
+    }
+    let signed = request.headers().get(crate::access_sign::SIGNED);
+    let signed = signed.map(|header| header.to_str().unwrap_or_default().to_string());
+    let path = request.uri().path_and_query().map_or(POD_HOP, |path| path.as_str()).to_string();
+    let upgrade = hyper::upgrade::on(&mut request);
+    let body = match to_bytes(request.into_body(), 4 << 10).await {
+        Ok(body) => body,
+        Err(e) => return say(StatusCode::PAYLOAD_TOO_LARGE, e),
+    };
+    let spec: Spec = match serde_json::from_slice(&body) {
+        Ok(spec) => spec,
+        Err(e) => return say(StatusCode::BAD_REQUEST, e),
+    };
+    let Some(who) = Caller::named(&spec.caller) else {
+        return say(StatusCode::BAD_REQUEST, format!("caller: {:?} is no caller a node passes on", spec.caller));
+    };
+    let asked = crate::access_sign::Asked { method: "POST", path: &path, body: &body };
+    if let Err(why) = crate::access_sign::hop(&shared, from.as_str(), signed.as_deref(), &asked, Some(&who), false) {
+        return say(StatusCode::FORBIDDEN, why);
+    }
+    let who = crate::access::passed(&shared, from, who);
+    // A Workload's or a Job's replica, and nothing else: the key is parsed, never trusted as a path.
+    let mut parts = spec.key.splitn(3, '/');
+    let (Some(kind @ ("Workload" | "Job")), Some(namespace)) = (parts.next(), parts.next()) else {
+        return say(StatusCode::BAD_REQUEST, format!("{:?} is no Workload or Job", spec.key));
+    };
+    let held = vec![(kind.to_string(), Some(namespace.to_string()))];
+    if let Err(refused) = crate::api::permit(&shared, &who, Verb::Exec, |_| held) {
+        return refused.into_response();
+    }
+    match place(&shared, &spec.key, spec.replica) {
+        Ok(None) => {}
+        Ok(Some(_)) => return say(StatusCode::CONFLICT, "that replica does not run on this node"),
+        Err(why) => return say(StatusCode::NOT_FOUND, why),
+    }
+    let mut pod = match pod(&shared, &spec.key, spec.replica, spec.port).await {
+        Ok(pod) => pod,
+        Err(why) => return say(StatusCode::BAD_GATEWAY, why),
+    };
+    let mut stop = shared.stop.subscribe();
+    tokio::spawn(async move {
+        if let Ok(upgraded) = upgrade.await {
+            let mut near = TokioIo::new(upgraded);
+            tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut near, &mut pod) => {}
+                _ = stop.wait_for(|stopped| *stopped) => {}
+            }
+        }
+    });
+    let mut reply = Response::new(Body::empty());
+    *reply.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    reply.headers_mut().insert(header::CONNECTION, "upgrade".parse().expect("a header value"));
+    reply.headers_mut().insert(header::UPGRADE, HOP_PROTOCOL.parse().expect("a header value"));
+    reply
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portforward_a_caller_has_as_many_sessions_as_the_bound_and_a_place_is_given_back() {
+        let held: Vec<_> = (0..SESSIONS_MAX).map(|_| Held::take("test-caller").expect("within the bound")).collect();
+        assert!(Held::take("test-caller").is_none());
+        assert!(Held::take("test-other").is_some(), "another caller's own");
+        drop(held);
+        assert!(Held::take("test-caller").is_some());
+    }
+}

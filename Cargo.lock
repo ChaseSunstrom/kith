@@ -1486,6 +1486,7 @@ dependencies = [
  "kith-sched",
  "kith-store",
  "kith-yaml",
+ "miniz_oxide",
  "nix 0.29.0",
  "oci-client",
  "rcgen",
