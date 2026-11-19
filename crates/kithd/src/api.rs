@@ -881,15 +881,30 @@ pub(crate) async fn restart_replica(
     // Who may apply the Workload may restart its replicas: get alone reads them (see `logs`).
     permit(shared, caller, Verb::Apply, |_| vec![place_of(key)])?;
     if !key.starts_with("Workload/") {
-        return Err(ApiError::Refused(format!("{key}: only a Workload's replicas are restarted")));
+        return Err(ApiError::Refused(format!(
+            "{key}: only a Workload's replicas are restarted"
+        )));
     }
-    let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.clone()).unwrap_or_default();
+    let me = shared
+        .cluster
+        .as_ref()
+        .map(|cluster| cluster.me.name.clone())
+        .unwrap_or_default();
     let (node, there) = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
-        let resource = state.store.get(key).ok_or_else(|| ApiError::Store(Error::NotFound(key.to_string())))?;
-        let node = resource.status.as_ref().and_then(|status| status["nodes"][replica.to_string()].as_str());
+        let resource = state
+            .store
+            .get(key)
+            .ok_or_else(|| ApiError::Store(Error::NotFound(key.to_string())))?;
+        let node = resource
+            .status
+            .as_ref()
+            .and_then(|status| status["nodes"][replica.to_string()].as_str());
         let node = node.unwrap_or_default().to_string();
-        let there = state.store.get(&format!("Node/{node}")).and_then(crate::view::Upstream::of);
+        let there = state
+            .store
+            .get(&format!("Node/{node}"))
+            .and_then(crate::view::Upstream::of);
         (node, there)
     };
     if node == me {
@@ -899,17 +914,27 @@ pub(crate) async fn restart_replica(
             .expect("a handler panicked holding the restarts")
             .insert((key.to_string(), replica));
         shared.changed.notify_one();
-        return Ok(Json(serde_json::json!({ "restarting": key, "replica": replica, "node": node })));
+        return Ok(Json(
+            serde_json::json!({ "restarting": key, "replica": replica, "node": node }),
+        ));
     }
     // (Passed on once: the node it is passed to is the one that runs it, or it is refused.)
     let cluster = match shared.cluster.as_ref() {
         Some(cluster) if !here => cluster,
-        _ => return Err(ApiError::Refused(format!("{key} replica {replica} does not run on this node"))),
+        _ => {
+            return Err(ApiError::Refused(format!(
+                "{key} replica {replica} does not run on this node"
+            )));
+        }
     };
-    let there = there.ok_or_else(|| ApiError::Refused(format!("{key} replica {replica} runs on {node}, which is not known")))?;
+    let there = there
+        .ok_or_else(|| ApiError::Refused(format!("{key} replica {replica} runs on {node}, which is not known")))?;
     let client = cluster.to(&there).map_err(|e| ApiError::Store(Error::Io(e)))?;
-    let url = reqwest::Url::parse(&format!("https://{}/v1/restart/{key}?replica={replica}&here=true", there.address))
-        .map_err(|e| ApiError::Store(Error::Io(e.to_string())))?;
+    let url = reqwest::Url::parse(&format!(
+        "https://{}/v1/restart/{key}?replica={replica}&here=true",
+        there.address
+    ))
+    .map_err(|e| ApiError::Store(Error::Io(e.to_string())))?;
     let asked = crate::access_sign::pass_on(client.post(url))
         .header(crate::access::FOR, caller.to_string())
         .timeout(std::time::Duration::from_secs(10))

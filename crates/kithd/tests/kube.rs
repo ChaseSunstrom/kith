@@ -1139,7 +1139,7 @@ fn refused_is_said_with_the_field_and_nothing_is_dropped_in_silence() {
         ok && said.contains("gracePeriodSeconds is taken and changes nothing"),
         "{said}"
     );
-    cluster.refused(&["delete", "pod", "web-0"], &["web-0"]);
+    // (A pod's delete is taken now: it starts that replica again, as `workflows` shows.)
     assert_eq!(cluster.held("workload/web")["spec"]["replicas"], 2);
 
     // What kith's own files made is not shown as a Kubernetes object, nor written over as one.

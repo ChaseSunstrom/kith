@@ -2648,7 +2648,9 @@ async fn delete_pod(
 ) -> Result<Response, No> {
     let namespace = namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE);
     let Some(("Workload", owner, replica)) = pod_owner(name) else {
-        let why = format!("Pod/{name}: only a replica of a Workload is restarted by a delete: kith runs no other pod that is restarted so");
+        let why = format!(
+            "Pod/{name}: only a replica of a Workload is restarted by a delete: kith runs no other pod that is restarted so"
+        );
         return Err(invalid(why));
     };
     // (Asked before the Workload is looked at: who may not restart it is not told what is there.)
@@ -2659,11 +2661,17 @@ async fn delete_pod(
     let key = format!("Workload/{namespace}/{owner}");
     let running = {
         let state = call.shared.store.lock().expect("a handler panicked holding the store");
-        state.store.get(&key).filter(|held| raw(held).is_some()).is_some_and(|held| {
-            held.status.as_ref().is_some_and(|status| {
-                status["containers"].as_array().is_some_and(|units| units.iter().any(|u| u["replica"] == replica))
+        state
+            .store
+            .get(&key)
+            .filter(|held| raw(held).is_some())
+            .is_some_and(|held| {
+                held.status.as_ref().is_some_and(|status| {
+                    status["containers"]
+                        .as_array()
+                        .is_some_and(|units| units.iter().any(|u| u["replica"] == replica))
+                })
             })
-        })
     };
     if !running {
         return Err(not_found(kind, name));
@@ -3857,13 +3865,27 @@ spec: {role: writer, subjects: [carol]}
                 "metadata": { "labels": { "app": "x" } }, "spec": { "containers": [{ "name": "main", "image": "i" }] },
             } },
         });
-        let (code, said) = answer_as(shared.clone(), Caller::Admin, "POST", "apps", "namespaces/default/deployments", deployment).await;
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "POST",
+            "apps",
+            "namespaces/default/deployments",
+            deployment,
+        )
+        .await;
         assert_eq!(code, StatusCode::CREATED, "{said}");
         let units = json!({ "containers": [
             { "name": "main", "replica": 0, "state": "running", "ready": true, "restarts": 0 },
             { "name": "main", "replica": 1, "state": "running", "ready": true, "restarts": 0 },
         ] });
-        shared.store.lock().unwrap().store.set_status("Workload/default/x", Some(units)).unwrap();
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .set_status("Workload/default/x", Some(units))
+            .unwrap();
     }
 
     /// `kubectl delete pod x-0` restarts that one replica: its slot is marked for the
@@ -3874,11 +3896,27 @@ spec: {role: writer, subjects: [carol]}
         let dir = std::env::temp_dir().join(format!("kithd-kube-delete-{}", std::process::id()));
         let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
         two_replicas_of_x(&shared).await;
-        let (code, said) = answer_as(shared.clone(), Caller::Admin, "DELETE", "", "namespaces/default/pods/x-0", Value::Null).await;
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
         assert_eq!(code, StatusCode::OK, "{said}");
         let marked: Vec<(String, u32)> = shared.restarts.lock().unwrap().iter().cloned().collect();
         assert_eq!(marked, [("Workload/default/x".to_string(), 0)]);
-        let (code, listed) = answer_as(shared.clone(), Caller::Admin, "GET", "", "namespaces/default/pods", Value::Null).await;
+        let (code, listed) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "GET",
+            "",
+            "namespaces/default/pods",
+            Value::Null,
+        )
+        .await;
         assert_eq!(code, StatusCode::OK, "{listed}");
         let listed: Value = serde_json::from_str(&listed).unwrap();
         let mut names: Vec<_> = listed["items"]
@@ -3891,15 +3929,39 @@ spec: {role: writer, subjects: [carol]}
         assert_eq!(names, ["x-0", "x-1"], "{listed}");
         // A pod kith runs no Workload replica of is refused by name, and marks nothing.
         for no in ["bare", "x-j0"] {
-            let (code, said) = answer_as(shared.clone(), Caller::Admin, "DELETE", "", &format!("namespaces/default/pods/{no}"), Value::Null).await;
+            let (code, said) = answer_as(
+                shared.clone(),
+                Caller::Admin,
+                "DELETE",
+                "",
+                &format!("namespaces/default/pods/{no}"),
+                Value::Null,
+            )
+            .await;
             assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{no}: {said}");
             assert!(said.contains(no), "{no}: {said}");
         }
         // A Workload that is not there has no such replica.
-        let (code, said) = answer_as(shared.clone(), Caller::Admin, "DELETE", "", "namespaces/default/pods/x-1-0", Value::Null).await;
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-1-0",
+            Value::Null,
+        )
+        .await;
         assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
         // A replica that is not there is no pod.
-        let (code, said) = answer_as(shared.clone(), Caller::Admin, "DELETE", "", "namespaces/default/pods/x-5", Value::Null).await;
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-5",
+            Value::Null,
+        )
+        .await;
         assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
         assert_eq!(shared.restarts.lock().unwrap().len(), 1, "only x-0 is marked");
         drop(shared);
@@ -3921,13 +3983,40 @@ spec: {role: writer, subjects: [carol]}
         }
         two_replicas_of_x(&shared).await;
         let ann = Caller::Identity("ann".into());
-        let (code, said) = answer_as(shared.clone(), ann.clone(), "DELETE", "", "namespaces/default/pods/x-0", Value::Null).await;
+        let (code, said) = answer_as(
+            shared.clone(),
+            ann.clone(),
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
         assert_eq!(code, StatusCode::FORBIDDEN, "{said}");
-        assert!(shared.restarts.lock().unwrap().is_empty(), "a refused delete marks nothing");
-        let (code, said) = answer_as(shared.clone(), ann, "GET", "", "namespaces/default/pods/x-0", Value::Null).await;
+        assert!(
+            shared.restarts.lock().unwrap().is_empty(),
+            "a refused delete marks nothing"
+        );
+        let (code, said) = answer_as(
+            shared.clone(),
+            ann,
+            "GET",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
         assert_eq!(code, StatusCode::OK, "{said}");
         let bob = Caller::Identity("bob".into());
-        let (code, said) = answer_as(shared.clone(), bob, "DELETE", "", "namespaces/default/pods/x-0", Value::Null).await;
+        let (code, said) = answer_as(
+            shared.clone(),
+            bob,
+            "DELETE",
+            "",
+            "namespaces/default/pods/x-0",
+            Value::Null,
+        )
+        .await;
         assert_eq!(code, StatusCode::OK, "{said}");
         assert_eq!(shared.restarts.lock().unwrap().len(), 1);
         drop(shared);
