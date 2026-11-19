@@ -86,7 +86,10 @@ fn readme_says_how_a_compose_stack_becomes_kiths() {
         assert!(section.contains(said), "the compose section does not say: {said}");
     }
     for key in refused {
-        assert!(section.contains(&format!("`{key}`")), "the compose section does not name `{key}`");
+        assert!(
+            section.contains(&format!("`{key}`")),
+            "the compose section does not name `{key}`"
+        );
     }
 }
 
@@ -103,26 +106,49 @@ fn compose_timing_is_written_beside_docker() {
             .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))
             .unwrap_or_else(|| panic!("no `{name} N.N s` figure in the section"));
         let number: String = tail.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
-        assert!(tail[number.len()..].starts_with(" s"), "`{name} {number}` is not in seconds");
+        assert!(
+            tail[number.len()..].starts_with(" s"),
+            "`{name} {number}` is not in seconds"
+        );
         number.parse().unwrap()
     }
     let mut seen = Vec::new();
     for (path, page) in [DOCS[0], DOCS[12]] {
         let section = page
             .split("\n#")
-            .find(|s| s.trim_start_matches('#').trim_start().to_lowercase().starts_with("the compose stack beside docker"))
+            .find(|s| {
+                s.trim_start_matches('#')
+                    .trim_start()
+                    .to_lowercase()
+                    .starts_with("the compose stack beside docker")
+            })
             .unwrap_or_else(|| panic!("{path} has no section `The compose stack beside docker`"));
-        assert!(section.contains("docker compose up"), "{path}: the section does not name `docker compose up`");
-        assert!(section.contains("ci/vm.sh --test compose"), "{path}: the section does not say how to run it");
+        assert!(
+            section.contains("docker compose up"),
+            "{path}: the section does not name `docker compose up`"
+        );
+        assert!(
+            section.contains("ci/vm.sh --test compose"),
+            "{path}: the section does not say how to run it"
+        );
         let (kith, docker) = (figure(section, "kith"), figure(section, "docker"));
         assert!(kith > 0.0 && docker > 0.0, "{path}: a figure of 0 s");
         if kith > docker {
-            assert!(section.contains("slower"), "{path}: kith is slower and the section does not say so");
-            assert!(section.contains("because"), "{path}: kith is slower and the section does not say why");
+            assert!(
+                section.contains("slower"),
+                "{path}: kith is slower and the section does not say so"
+            );
+            assert!(
+                section.contains("because"),
+                "{path}: kith is slower and the section does not say why"
+            );
         }
         seen.push((kith, docker));
     }
-    assert_eq!(seen[0], seen[1], "the front page and the numbers guide carry different figures");
+    assert_eq!(
+        seen[0], seen[1],
+        "the front page and the numbers guide carry different figures"
+    );
 }
 
 fn root() -> &'static Path {
