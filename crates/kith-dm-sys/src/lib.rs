@@ -605,7 +605,7 @@ pub struct Forked {
 /// process with other threads, the clone's child starts with whatever lock a thread held at
 /// that instant (the allocator's) and waits for it forever, since a raw `clone3` skips the
 /// handlers `fork` runs to put the allocator right. In a child of `fork` there is one thread,
-/// so the clone is safe. Whatever `f` makes with `clone` that outlives the child is the
+/// so the clone is safe. The child runs with no signal blocked, whatever the forking thread blocks. Whatever `f` makes with `clone` that outlives the child is the
 /// nearest child subreaper's afterwards.
 ///
 /// `fork` puts right only the allocator's locks. Any other lock of this process that a thread
@@ -634,7 +634,16 @@ pub fn fork_start(f: impl FnOnce() -> Vec<u8>) -> Result<Forked> {
         return Err(Error::last_os_error());
     }
     if child == 0 {
-        let mut bytes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_default();
+        // A child starts with the mask of the thread that forked it, and a container's process
+        // (made from this child, and exec'd) keeps it: a pod with SIGTERM blocked never hears
+        // `kith stop`. kithd's threads hold the keeper's block (SIGINT, SIGTERM, SIGCHLD).
+        // SAFETY: sigemptyset fills a set this child owns; pthread_sigmask sets its one thread's mask.
+        unsafe {
+            let mut none = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut none);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+        }
+        let mut bytes =std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_default();
         bytes.truncate(FORKED_MOST);
         // (A short write is the parent's empty or cut answer.)
         let _ = write.write_all(&bytes);
@@ -909,6 +918,43 @@ mod tests {
             .unwrap()
             .collect(Duration::from_secs(30));
         assert_eq!(got.unwrap(), b"said it");
+    }
+
+    /// Blocks SIGINT, SIGTERM and SIGCHLD on the calling thread, as the keeper's mask does
+    /// (bit N-1 of SigBlk is signal N), and returns the mask it had.
+    pub(crate) fn block_the_keepers_signals() -> libc::sigset_t {
+        // SAFETY: sigset_t is plain data; sigemptyset and sigaddset fill it, and
+        // pthread_sigmask changes only this thread's mask.
+        unsafe {
+            let (mut set, mut old) = (std::mem::zeroed::<libc::sigset_t>(), std::mem::zeroed());
+            libc::sigemptyset(&mut set);
+            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGCHLD] {
+                libc::sigaddset(&mut set, signal);
+            }
+            assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old), 0);
+            old
+        }
+    }
+
+    /// A container's process inherits the mask of the thread that forks it, and kithd's tokio
+    /// threads keep the keeper's block: the child starts with nothing blocked.
+    #[test]
+    fn forked_child_has_no_signal_blocked() {
+        let _children = children();
+        let old = block_the_keepers_signals();
+        let got = fork_start(|| {
+            std::fs::read("/proc/thread-self/status")
+                .unwrap_or_default()
+                .split(|&b| b == b'\n')
+                .find_map(|line| line.strip_prefix(b"SigBlk:\t"))
+                .unwrap_or(b"unread")
+                .to_vec()
+        })
+        .unwrap()
+        .collect(Duration::from_secs(30));
+        // SAFETY: puts back the mask this thread had.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+        assert_eq!(got.unwrap(), b"0000000000000000");
     }
 
     #[test]

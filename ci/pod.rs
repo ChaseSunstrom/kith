@@ -790,6 +790,10 @@ fn main() {
             let stat = std::fs::read_to_string("/proc/self/stat").expect("its stat");
             let start = stat.rsplit(") ").next().and_then(|rest| rest.split(' ').nth(19)).unwrap_or("?");
             println!("tick: process {} started at {start}", std::process::id());
+            // The signals it has blocked (SigBlk of its status): kithd's own mask is not its pods'.
+            let status = std::fs::read_to_string("/proc/self/status").expect("its status");
+            let blocked = status.lines().find_map(|l| l.strip_prefix("SigBlk:")).unwrap_or("?").trim();
+            println!("tick: blocked {blocked}");
             let last: u64 = times.first().map_or(u64::MAX, |n| n.parse().expect("N"));
             for n in 1..=last {
                 println!("tick {n}");

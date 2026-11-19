@@ -3230,6 +3230,55 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A container made from a thread that blocks SIGINT, SIGTERM and SIGCHLD (as kithd's tokio
+    /// threads do, from the keeper's mask) runs its process with nothing blocked: libcontainer
+    /// resets no mask, and a pod that has SIGTERM blocked never hears `kith stop`. (Read from the
+    /// init process's own status, which the program keeps when it execs.)
+    #[test]
+    fn container_starts_with_no_signal_blocked() {
+        let root = std::env::temp_dir().join(format!("kith-sigblk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        let rootfs = root.join("rootfs");
+        for dir in ["dev", "etc", "proc", "run", "sys", "tmp", "bin"] {
+            fs::create_dir_all(rootfs.join(dir)).unwrap();
+        }
+        fs::copy("/bin/true", rootfs.join("bin/true")).unwrap();
+        let image = Image {
+            rootfs,
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let (out, err) = (File::create(root.join("out")).unwrap(), File::create(root.join("err")).unwrap());
+        let made = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    // (This thread's mask only.)
+                    use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+                    let mut set = SigSet::empty();
+                    for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGCHLD] {
+                        set.add(signal);
+                    }
+                    pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&set), None).unwrap();
+                    runtime.create("sigblk", &image, &Unit::default(), out, err)
+                })
+                .join()
+                .unwrap()
+        });
+        let handle = match made {
+            Err(e) if cgroup_skip(&e.to_string()).is_some() => {
+                let _ = fs::remove_dir_all(&root);
+                return report_skip(&cgroup_skip(&e.to_string()).unwrap());
+            }
+            made => made.unwrap(),
+        };
+        let status = fs::read_to_string(format!("/proc/{}/status", handle.pid())).unwrap();
+        let blocked = status.lines().find_map(|line| line.strip_prefix("SigBlk:")).map(str::trim);
+        handle.discard(&root.join("runtime/state/sigblk"));
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(blocked, Some("0000000000000000"), "the container's process blocks signals");
+    }
+
     /// Only the overlay's EPERM is the kernel refusing the overlay root: the other failures of a
     /// create, and EPERM of another mount, are not, and stay errors.
     #[test]
