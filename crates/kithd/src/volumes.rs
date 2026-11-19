@@ -106,7 +106,7 @@ struct Vol {
 
 /// Whether `path` is one the namespace may use: any absolute path in `kith-system`, else a
 /// relative one with no `.`, `..` or empty part (so it stays inside the namespace's own directory).
-fn check_path(namespace: &str, path: &str) -> Result<(), String> {
+pub(crate) fn check_path(namespace: &str, path: &str) -> Result<(), String> {
     if path.contains('\0') {
         return Err(format!("path `{path:?}` must be relative, with no NUL"));
     }
@@ -693,7 +693,7 @@ pub fn host_dir(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
 
 /// [`host_dir`], under a node's policy: one that has `hostPaths` off makes and mounts no
 /// directory of the node's own that the store names.
-fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Policy) -> Result<PathBuf, String> {
+pub(crate) fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Policy) -> Result<PathBuf, String> {
     check_path(&dir.namespace, &dir.path)?;
     let made = |path: &Path, e: std::io::Error| format!("cannot make {}: {e}", path.display());
     if dir.namespace == SYSTEM {
