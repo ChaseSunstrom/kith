@@ -354,7 +354,13 @@ fn inputs<'a>(
     let spec: ReleaseSpec = serde_json::from_value(release.spec.clone()).map_err(|e| e.to_string())?;
     // (An upgrade's preview is what moving would do: it is not held back.)
     let pin = pinned(store, release).filter(|_| !preview);
-    let package = package(store, release, &spec, preview || spec.auto_upgrade == Some(true), pin.as_deref())?;
+    let package = package(
+        store,
+        release,
+        &spec,
+        preview || spec.auto_upgrade == Some(true),
+        pin.as_deref(),
+    )?;
     let (cluster, everywhere) = shared_values(store, "ConfigMap/kith-system/kith-values")?;
     let (local, here) = shared_values(store, &format!("ConfigMap/{}/{SHARED}", namespace(release)))?;
     let inputs = Inputs {
@@ -775,7 +781,12 @@ fn upgrade_of<'a>(
         Err(error) => json!({ "version": version, "error": error }),
         Ok(upgraded) => {
             let keyed = |output: &'a Output| -> BTreeMap<String, &'a Resource> {
-                output.resources.iter().filter(|r| !is_hook(r)).map(|r| (r.key(), r)).collect()
+                output
+                    .resources
+                    .iter()
+                    .filter(|r| !is_hook(r))
+                    .map(|r| (r.key(), r))
+                    .collect()
             };
             let (had, next) = (keyed(installed), keyed(upgraded));
             let apply: Vec<&String> = next
@@ -822,15 +833,24 @@ fn pinned(store: &Store, release: &Resource) -> Option<String> {
     let seen = release.status.as_ref()?["history"].as_array()?;
     let revisions = store.history(&release.key()).ok()?.iter().rev();
     let mut earlier = revisions.skip_while(|revision| revision.resource.spec == release.spec);
-    earlier.find(|revision| revision.resource.spec == release.spec).and_then(|revision| {
-        let at = revision.resource.metadata.revision?;
-        let entry = seen.iter().rev().find(|entry| entry["revision"].as_u64().is_some_and(|r| r <= at));
-        // (Installing the oldest entry's version drops it from the ten: the pin it made, said in
-        // the status, is the version then.)
-        let status = release.status.as_ref()?;
-        let held = (status["pinned"] == true).then(|| &status["version"]);
-        entry.map(|entry| &entry["version"]).or(held)?.as_str().map(str::to_string)
-    })
+    earlier
+        .find(|revision| revision.resource.spec == release.spec)
+        .and_then(|revision| {
+            let at = revision.resource.metadata.revision?;
+            let entry = seen
+                .iter()
+                .rev()
+                .find(|entry| entry["revision"].as_u64().is_some_and(|r| r <= at));
+            // (Installing the oldest entry's version drops it from the ten: the pin it made, said in
+            // the status, is the version then.)
+            let status = release.status.as_ref()?;
+            let held = (status["pinned"] == true).then(|| &status["version"]);
+            entry
+                .map(|entry| &entry["version"])
+                .or(held)?
+                .as_str()
+                .map(str::to_string)
+        })
 }
 
 /// Compare `resources` with the store for the owner `key`. Nothing of someone else's
@@ -897,7 +917,10 @@ struct Gate {
 /// one is `failed` (the caller says when).
 fn gate(store: &Store, release: &str, version: &str, hooks: &[&Resource], point: &str) -> Result<Gate, String> {
     let mut gate = Gate::default();
-    for hook in hooks.iter().filter(|hook| hook.metadata.annotations.get(HOOK).is_some_and(|at| at == point)) {
+    for hook in hooks
+        .iter()
+        .filter(|hook| hook.metadata.annotations.get(HOOK).is_some_and(|at| at == point))
+    {
         let at = hook.key();
         let ran = crate::pki::hex(&Sha256::digest(format!("{version} {}", hook.spec)));
         let Some(live) = store.get(&at) else {
@@ -917,8 +940,11 @@ fn gate(store: &Store, release: &str, version: &str, hooks: &[&Resource], point:
             match status.and_then(|status| status["state"].as_str()) {
                 Some("succeeded") => continue,
                 Some("failed") => {
-                    let said = status.and_then(|status| status["message"].as_str()).map_or(String::new(), |m| format!(": {m}"));
-                    gate.failed.get_or_insert(format!("the hook {at} failed{said}; delete it to run it again"));
+                    let said = status
+                        .and_then(|status| status["message"].as_str())
+                        .map_or(String::new(), |m| format!(": {m}"));
+                    gate.failed
+                        .get_or_insert(format!("the hook {at} failed{said}; delete it to run it again"));
                     continue;
                 }
                 _ => {}
@@ -949,7 +975,10 @@ fn plan(store: &Store, renders: &Renders, upgrades: &Renders, newer: &Newer, now
             fn point(hook: &Resource) -> &str {
                 hook.metadata.annotations.get(HOOK).map_or("", String::as_str)
             }
-            if let Some(odd) = hooks.iter().find(|hook| hook.kind != "Job" || !POINTS.contains(&point(hook))) {
+            if let Some(odd) = hooks
+                .iter()
+                .find(|hook| hook.kind != "Job" || !POINTS.contains(&point(hook)))
+            {
                 return Err(format!(
                     "{} is annotated {HOOK}: {}, but only a Job can be a hook, at one of {}",
                     odd.key(),
@@ -1009,7 +1038,17 @@ fn plan(store: &Store, renders: &Renders, upgrades: &Renders, newer: &Newer, now
         let status = match done {
             // The pre hooks are still to succeed: only they are made, and the rest waits (what was
             // installed before stays as it is, as for an error).
-            Ok((_, _, Gate { apply, delete, waiting: Some(job), .. }, _)) => {
+            Ok((
+                _,
+                _,
+                Gate {
+                    apply,
+                    delete,
+                    waiting: Some(job),
+                    ..
+                },
+                _,
+            )) => {
                 (step.apply, step.delete) = (apply, delete);
                 json!({
                     "state": "hooks", "message": format!("waiting for {job}"),
@@ -1908,7 +1947,10 @@ mod tests {
         assert_eq!(status_of(&store)["version"], "1.0.0");
         assert_eq!(status_of(&store)["pinned"], true);
         // A spec equal to no earlier revision follows again.
-        apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: green"));
+        apply(
+            &mut store,
+            &RELEASE.replace("extra: true", "extra: true, colour: green"),
+        );
         settled(&mut store);
         assert_eq!(status_of(&store)["version"], "3.0.0");
         assert_eq!(status_of(&store)["pinned"], false);
@@ -1920,7 +1962,10 @@ mod tests {
         let status = status_of(&store);
         assert_eq!(status["state"], "error");
         let message = status["message"].as_str().unwrap();
-        assert!(message.contains("no Package maps 1.0.0") && message.contains("push it again"), "{message}");
+        assert!(
+            message.contains("no Package maps 1.0.0") && message.contains("push it again"),
+            "{message}"
+        );
         // (Said in the error too: a patch merges, so it would else keep the last pass's.)
         assert_eq!(status["pinned"], true);
         assert!(store.get("ConfigMap/shop/mine-maps-extra").is_some());
@@ -1944,7 +1989,9 @@ mod tests {
         let first = store.get(SELF).unwrap().metadata.revision.unwrap();
         apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: blue"));
         for major in 2..=10 {
-            store.apply(package(&format!("{major}.0.0"), &[("map.yaml", MAP)])).unwrap();
+            store
+                .apply(package(&format!("{major}.0.0"), &[("map.yaml", MAP)]))
+                .unwrap();
             settled(&mut store);
         }
         assert_eq!(status_of(&store)["history"].as_array().unwrap().len(), 10);
@@ -1993,7 +2040,10 @@ mod tests {
         assert_eq!((version(&store), pinned(&store)), (json!("4.0.0"), json!(false)));
         // A change to the annotations alone is not a return to anything.
         let noted = RELEASE.replace("extra: true", "extra: true, colour: blue");
-        apply(&mut store, &noted.replace("'local socket' }", "'local socket', note: x }"));
+        apply(
+            &mut store,
+            &noted.replace("'local socket' }", "'local socket', note: x }"),
+        );
         push(&mut store, "5.0.0");
         settled(&mut store);
         assert_eq!((version(&store), pinned(&store)), (json!("5.0.0"), json!(false)));
@@ -2853,7 +2903,9 @@ mod tests {
                  spec: {{ template: {{ exec: [{{ name: run, command: ['{{{{ values.colour }}}}'] }}] }} }}\n"
             )
         };
-        let jobs: Vec<String> = ["pre-install", "post-install", "pre-upgrade", "post-upgrade"].map(job).into();
+        let jobs: Vec<String> = ["pre-install", "post-install", "pre-upgrade", "post-upgrade"]
+            .map(job)
+            .into();
         package(version, &[("map.yaml", &format!("{MAP}{}", jobs.concat()))])
     }
 
@@ -2880,10 +2932,18 @@ mod tests {
         store.apply(hooked("1.0.0")).unwrap();
         apply(&mut store, RELEASE);
         settle(&mut store, &mut renders);
-        assert_eq!((jobs(&store), maps(&store)), (vec!["mine-maps-pre-install".to_string()], 0));
+        assert_eq!(
+            (jobs(&store), maps(&store)),
+            (vec!["mine-maps-pre-install".to_string()], 0)
+        );
         let said = status_of(&store);
         assert_eq!(said["state"], "hooks");
-        assert!(said["message"].as_str().unwrap().contains("Job/shop/mine-maps-pre-install"));
+        assert!(
+            said["message"]
+                .as_str()
+                .unwrap()
+                .contains("Job/shop/mine-maps-pre-install")
+        );
         // (Running is not done: it still waits.)
         end(&mut store, "pre-install", "running");
         settle(&mut store, &mut renders);
@@ -2896,9 +2956,15 @@ mod tests {
         end(&mut store, "post-install", "succeeded");
         settle(&mut store, &mut renders);
         let said = status_of(&store);
-        assert_eq!((&said["state"], &said["version"], &said["message"]), (&json!("installed"), &json!("1.0.0"), &Value::Null));
+        assert_eq!(
+            (&said["state"], &said["version"], &said["message"]),
+            (&json!("installed"), &json!("1.0.0"), &Value::Null)
+        );
         // A hook is not one of the release's resources, so it is not pruned as one.
-        assert_eq!(said["resources"], json!(["ConfigMap/shop/mine-maps", "ConfigMap/shop/mine-maps-extra"]));
+        assert_eq!(
+            said["resources"],
+            json!(["ConfigMap/shop/mine-maps", "ConfigMap/shop/mine-maps-extra"])
+        );
         // The same again runs nothing again.
         let before: Vec<_> = store.list(Some("Job")).map(|job| job.metadata.revision).collect();
         assert_eq!(settle(&mut store, &mut renders), 0);
@@ -2921,7 +2987,12 @@ mod tests {
         settle(&mut store, &mut renders);
         let said = status_of(&store);
         assert_eq!(said["state"], "error");
-        assert!(said["message"].as_str().unwrap().contains("Job/shop/mine-maps-pre-install"));
+        assert!(
+            said["message"]
+                .as_str()
+                .unwrap()
+                .contains("Job/shop/mine-maps-pre-install")
+        );
         assert!(said["message"].as_str().unwrap().contains("delete it to run it again"));
         assert_eq!((jobs(&store).len(), maps(&store)), (1, 0));
         assert_eq!(said["version"], Value::Null);
@@ -2936,7 +3007,12 @@ mod tests {
         settle(&mut store, &mut renders);
         let said = status_of(&store);
         assert_eq!((&said["state"], maps(&store)), (&json!("error"), 2));
-        assert!(said["message"].as_str().unwrap().contains("Job/shop/mine-maps-post-install"));
+        assert!(
+            said["message"]
+                .as_str()
+                .unwrap()
+                .contains("Job/shop/mine-maps-post-install")
+        );
     }
 
     /// An upgrade runs the upgrade hooks, not the install ones; a hook as it was is not run
@@ -2957,7 +3033,11 @@ mod tests {
         assert_eq!(status_of(&store)["state"], "hooks");
         assert_eq!(
             jobs(&store),
-            ["mine-maps-post-install", "mine-maps-pre-install", "mine-maps-pre-upgrade"]
+            [
+                "mine-maps-post-install",
+                "mine-maps-pre-install",
+                "mine-maps-pre-upgrade"
+            ]
         );
         end(&mut store, "pre-upgrade", "succeeded");
         settle(&mut store, &mut renders);
@@ -2967,7 +3047,8 @@ mod tests {
         end(&mut store, "post-upgrade", "succeeded");
         settle(&mut store, &mut renders);
         assert_eq!(status_of(&store)["state"], "installed");
-        let revisions = |store: &Store| -> Vec<_> { store.list(Some("Job")).map(|job| job.metadata.revision).collect() };
+        let revisions =
+            |store: &Store| -> Vec<_> { store.list(Some("Job")).map(|job| job.metadata.revision).collect() };
         let before = revisions(&store);
         assert_eq!(settle(&mut store, &mut renders), 0);
         assert_eq!(before, revisions(&store), "nothing run again");
@@ -3000,20 +3081,39 @@ mod tests {
         settle(&mut store, &mut renders);
         assert!(status_of(&store)["message"].as_str().unwrap().contains("sometimes"));
         let (mut store, mut renders) = (Store::default(), Renders::new());
-        apply(&mut store, "apiVersion: kith.dev/v1\nkind: Job\nmetadata: { name: mine-maps-pre-install, namespace: shop }\nspec: { template: { exec: [{ name: a, command: ['true'] }] } }\n");
+        apply(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Job\nmetadata: { name: mine-maps-pre-install, namespace: shop }\nspec: { template: { exec: [{ name: a, command: ['true'] }] } }\n",
+        );
         store.apply(hooked("1.0.0")).unwrap();
         apply(&mut store, RELEASE);
         settle(&mut store, &mut renders);
-        assert!(status_of(&store)["message"].as_str().unwrap().contains("not Release/shop/mine's"));
+        assert!(
+            status_of(&store)["message"]
+                .as_str()
+                .unwrap()
+                .contains("not Release/shop/mine's")
+        );
         assert_eq!(maps(&store), 0);
         // One at the post point is asked at once too: no pre Job is made first.
         let (mut store, mut renders) = (Store::default(), Renders::new());
-        apply(&mut store, "apiVersion: kith.dev/v1\nkind: Job\nmetadata: { name: mine-maps-post-install, namespace: shop }\nspec: { template: { exec: [{ name: a, command: ['true'] }] } }\n");
+        apply(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Job\nmetadata: { name: mine-maps-post-install, namespace: shop }\nspec: { template: { exec: [{ name: a, command: ['true'] }] } }\n",
+        );
         store.apply(hooked("1.0.0")).unwrap();
         apply(&mut store, RELEASE);
         settle(&mut store, &mut renders);
-        assert!(status_of(&store)["message"].as_str().unwrap().contains("not Release/shop/mine's"));
-        assert_eq!((jobs(&store), maps(&store)), (vec!["mine-maps-post-install".to_string()], 0));
+        assert!(
+            status_of(&store)["message"]
+                .as_str()
+                .unwrap()
+                .contains("not Release/shop/mine's")
+        );
+        assert_eq!(
+            (jobs(&store), maps(&store)),
+            (vec!["mine-maps-post-install".to_string()], 0)
+        );
     }
 
     /// A hook Job the render of the version now there no longer names is deleted, so a way
@@ -3024,21 +3124,37 @@ mod tests {
         let job = "---\napiVersion: kith.dev/v1\nkind: Job\nmetadata: { name: {{ name }}-pre-upgrade, annotations: { 'kith.dev/hook': pre-upgrade } }\n\
                    spec: { template: { exec: [{ name: run, command: ['migrate'] }] } }\n";
         store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
-        store.apply(package("1.1.0", &[("map.yaml", &format!("{MAP}{job}"))])).unwrap();
-        let at = |version: &str| RELEASE.replace("autoUpgrade: true", "autoUpgrade: false").replace("name: maps }", &format!("name: maps, version: '={version}' }}"));
+        store
+            .apply(package("1.1.0", &[("map.yaml", &format!("{MAP}{job}"))]))
+            .unwrap();
+        let at = |version: &str| {
+            RELEASE
+                .replace("autoUpgrade: true", "autoUpgrade: false")
+                .replace("name: maps }", &format!("name: maps, version: '={version}' }}"))
+        };
         apply(&mut store, &at("1.0.0"));
         settle(&mut store, &mut renders);
         apply(&mut store, &at("1.1.0"));
         settle(&mut store, &mut renders);
         end(&mut store, "pre-upgrade", "succeeded");
         settle(&mut store, &mut renders);
-        assert_eq!((status_of(&store)["version"].clone(), jobs(&store)), (json!("1.1.0"), vec!["mine-maps-pre-upgrade".to_string()]));
+        assert_eq!(
+            (status_of(&store)["version"].clone(), jobs(&store)),
+            (json!("1.1.0"), vec!["mine-maps-pre-upgrade".to_string()])
+        );
         apply(&mut store, &at("1.0.0"));
         settle(&mut store, &mut renders);
-        assert_eq!((status_of(&store)["version"].clone(), jobs(&store)), (json!("1.0.0"), Vec::<String>::new()));
+        assert_eq!(
+            (status_of(&store)["version"].clone(), jobs(&store)),
+            (json!("1.0.0"), Vec::<String>::new())
+        );
         apply(&mut store, &at("1.1.0"));
         settle(&mut store, &mut renders);
         assert_eq!(status_of(&store)["state"], "hooks");
-        assert_eq!(store.get("Job/shop/mine-maps-pre-upgrade").unwrap().status, None, "made again");
+        assert_eq!(
+            store.get("Job/shop/mine-maps-pre-upgrade").unwrap().status,
+            None,
+            "made again"
+        );
     }
 }
