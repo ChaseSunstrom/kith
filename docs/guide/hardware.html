@@ -20,8 +20,9 @@
   </a>
   <nav aria-label="Sections">
     <a href="../guide/index.html">Guide</a>
-    <a href="../guide/index.html#decisions">Decisions</a>
-    <a href="../index.html#numbers">Numbers</a>
+    <a href="../install.html">Install</a>
+    <a class="more" href="../guide/index.html#decisions">Decisions</a>
+    <a class="more" href="../index.html#numbers">Numbers</a>
   </nav>
   <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
 </header>
@@ -150,7 +151,7 @@ spec:
 <p>kith OS 1.0.0 on an AMD mini PC (a Ryzen with a Radeon 780M), booted over HTTP from the firmware, claimed with <code>--claim</code>, and a desktop Linux PC beside it on the same LAN:</p>
 <ul><li><strong>Ran:</strong> images pulled from Docker Hub; two replicas of a web server, ready by an HTTP probe, one port with <code>publish: true</code> reached from the other PC; pod to pod over IPv4 and IPv6.</li><li><strong>A desktop on the real screen:</strong> a Workload in <code>kith-system</code> claiming the seat (<code>NODE-seat0</code>: the card and two inputs) runs Alpine's weston (DRM backend, pixman renderer) at 2560x1440 with a terminal. seatd in a container cannot make the seat active (there is no VT), so the session runs with <code>LIBSEAT_BACKEND=noop</code>, as root in its container.</li><li><strong>The other PC as a worker:</strong> its kithd (not root, a user's process) joined with a worker token; Jobs placed on it with <code>placement: { require: { kith.dev/trust: worker } }</code> ran an <code>exec</code> unit and a plain container, their logs read through the first node; <code>kith delete node/NAME</code> then took it out. <strong>A <code>pod: true</code> template does not start on a kithd that is not root</strong> ("failed to prepare rootfs").</li><li><strong>Not working yet:</strong> the GPU has only the firmware's framebuffer (no <code>amdgpu</code> in the plain image; the <code>gpu-amd-phoenix</code> <a href="os.html#a-node-that-needs-more-a-spec">spec</a> builds it in, not yet run here). (A Service used to have no status and its name reached nothing on a node started without <code>--mesh</code>, which kith OS's default is: now its address is on the node's loopback there, and a pod on that node reaches it, T-0723.)</li></ul>
 </article>
-<footer class="tail"><nav aria-label="Next page"><a class="before" href="storage.html"><span>Before</span>Storage</a><a class="after" href="packages.html"><span>After</span>Packages and Sources</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/hardware.md">docs/guide/hardware.md</a>.</p></footer>
+<footer class="tail"><nav aria-label="Previous and next pages"><a class="prev" rel="prev" href="storage.html"><span>Previous</span>Storage</a><a class="next" rel="next" href="packages.html"><span>Next</span>Packages and Sources</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/hardware.md">docs/guide/hardware.md</a>.</p></footer>
 </div>
 </div>
 </body>

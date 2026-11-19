@@ -12,7 +12,9 @@ motion.hidden = calm;
 motion.onclick = () => {
   paused = !paused;
   document.documentElement.classList.toggle("paused", paused);
-  motion.setAttribute("aria-pressed", paused); // the label stays "Pause": pressed means the motion is paused  for (const svg of $$("svg")) paused ? svg.pauseAnimations() : svg.unpauseAnimations();
+  motion.setAttribute("aria-pressed", paused);
+  motion.textContent = paused ? "Play" : "Pause";
+  for (const svg of $$("svg")) paused ? svg.pauseAnimations() : svg.unpauseAnimations();
 };
 const wait = ms => new Promise(done => setTimeout(done, ms));
 const sleep = async ms => {
@@ -37,45 +39,7 @@ function count(el) {
 // Bars: a value over its budget.
 for (const row of $$(".row[data-v]")) row.style.setProperty("--v", Math.min(1, N[row.dataset.v] / N[row.dataset.of]) || 0);
 
-// Beside k3s: drawn only when the comparison's runs are in the numbers.
-const versus = [
-  ["At rest", [
-    ["Memory in use on an idle node: the first node, or the server", "control", "MB"],
-    ["Memory in use on an idle node: another node, or an agent", "worker", "MB"],
-    ["CPU in use on an idle node: the first node, or the server", "cpu", "% of a CPU"],
-    ["CPU in use on an idle node: another node, or an agent", "cpu2", "% of a CPU"],
-    ["On the first node's disk at the end", "disk", "MB"],
-  ]],
-  ["Starting and changing", [
-    ["From switching a machine on to a node that is ready", "ready", "s"],
-    ["From apply to a ready container, its image on the node", "apply", "s"],
-    ["One workload of 30 replicas: until all are ready", "scale", "s"],
-    ["20 workloads at once: until all are ready", "burst", "s"],
-    ["A change to a workload of 6 replicas: until all 6 run it", "roll", "s"],
-    ["A container that exits: until it runs again", "crash", "s"],
-    ["A Job that does nothing: until it has succeeded", "job", "s"],
-  ]],
-  ["When a node is lost", [
-    ["Until its replica is ready on another, as each system comes", "lost", "s"],
-    ["The same, each told to wait about a minute", "lost60", "s"],
-  ]],
-  ["Through a Service to 3 web servers", [
-    ["Requests a second, a connection each (more is better)", "rps", "a second"],
-    ["Requests a second over connections that are kept (more is better)", "kept", "a second"],
-    ["Of those requests, half took under", "p50", "ms"],
-    ["and 99 in 100 under", "p99", "ms"],
-  ]],
-].map(([group, rows]) => [group, rows.filter(([, what]) => N[`cmp.kith.${what}`] != null && N[`cmp.k3s.${what}`] != null)]).filter(([, rows]) => rows.length);
-if (versus.length) {
-  $("#versus-said").textContent = `kith ${N.version} and k3s ${N["cmp.k3s.version"]} as it comes (on Alpine, which alone has ${N["cmp.k3s.before"]} MB in use before k3s starts), three QEMU machines each, the same workloads on both. The middle of ${N["cmp.runs"]} runs (a node lost and told to wait a minute: one run each), on a machine that was doing other work. Each pair has its own scale; a shorter bar is less, which is better in every row but the two that say otherwise.`;
-  // Only this file's own words and numbers from #measured go in: nothing a reader typed.
-  $("#versus-chart").innerHTML = versus.map(([group, rows]) => `<section><h4>${group}</h4>` + rows.map(([name, what, unit]) => {
-    const kith = N[`cmp.kith.${what}`], k3s = N[`cmp.k3s.${what}`], most = Math.max(kith, k3s);
-    const bar = (who, n, other) => `<span>${who}</span><div class="track"><i class="${other}" style="--v:${n / most}"></i></div><b>${n.toLocaleString("en")} <small>${unit}</small></b>`;
-    return `<div class="vs"><p>${name}</p>${bar("kith", kith, "")}${bar("k3s", k3s, "other")}</div>`;
-  }).join("") + "</section>").join("");
-  $("#versus").hidden = false;
-}
+// Beside k3s: drawn by chart.js (the front page and the guide's numbers page share it), only when the runs are in the numbers.
 
 // Where the code is: a bar of lines for each crate, and its tests.
 const crates = Object.entries(N.by_crate || {}).sort((a, b) => b[1][0] - a[1][0]);
@@ -194,10 +158,28 @@ async function disk() {
   }
 }
 
+// The map at the top, and a machine lost from it: where each of its replicas starts instead. Each goes to the machine with
+// the fewest, among those that have a place free. Nothing is changed here: the caller moves them (or, with less motion, at once).
+const label = (map, name) => $(`text[data-node=${name}]`, map).textContent;
+const machines = map => new Set($$(".rep.on", map).map(rep => rep.parentNode.dataset.node)).size;
+const gone = (map, name, is) => $$(`[data-node=${name}]`, map).forEach(el => el.classList.toggle("gone", is));
+const lost = (map, who, total) => `hello: ${$$(".rep.on", map).length} of ${total} replicas ready, on ${machines(map)} machines; ${who} is lost`;
+function lose(map, name) {
+  const taken = new Set(), moves = [];
+  const free = g => $$(".rep", g).find(rep => !rep.classList.contains("on") && !taken.has(rep));
+  const used = g => $$(".rep", g).filter(rep => rep.classList.contains("on") || taken.has(rep)).length;
+  for (const from of $$(".rep.on", $(`.reps[data-node=${name}]`, map))) {
+    const to = $$(".reps", map).filter(g => g.dataset.node !== name && free(g)).sort((a, b) => used(a) - used(b))[0], slot = free(to);
+    taken.add(slot);
+    moves.push([from, slot, to.dataset.node]);
+  }
+  return moves;
+}
+
 // The map at the top: a change to hello rolls through its replicas. A dot runs the line from the hub to
 // a machine, and that machine's replicas each wait while a new one starts, so the count dips by one at a time.
 async function live() {
-  const map = $("#live .map"), said = $("#live-said"), wave = $(".wave", map), ready = () => $$(".rep.on", map).length, total = ready();
+  const map = $("#live .map"), said = $("#live-said"), names = $$(".reps", map).map(g => g.dataset.node), wave = $(".wave", map), ready = () => $$(".rep.on", map).length, total = ready();
   const fly = (line, ms) => new Promise(done => {
     const len = line.getTotalLength();
     let t = 0, last = performance.now();
@@ -213,6 +195,28 @@ async function live() {
       done();
     })(last);
   });
+  // One machine is lost: its replicas still count as ready for a while, then each starts on another machine.
+  let next = names.length - 1;
+  const fail = async () => {
+    do next = (next + 1) % names.length; while (!$(`.reps[data-node=${names[next]}] .rep.on`, map));
+    const name = names[next], who = label(map, name), moves = lose(map, name);
+    gone(map, name, true);
+    said.textContent = `hello: ${ready()} of ${total} replicas ready; ${who} is unreachable, and its ${moves.length} still count`;
+    await sleep(3200);
+    moves.forEach(([from]) => from.classList.remove("on"));
+    for (const [, slot, to] of moves) {
+      said.textContent = `hello: ${ready()} of ${total} replicas ready; ${who}'s replica is starting on ${label(map, to)}`;
+      await fly($(`#m-${to}`), 600);
+      slot.classList.add("wait");
+      await sleep(900);
+      slot.classList.replace("wait", "on");
+    }
+    said.textContent = lost(map, who, total);
+    await sleep(4200);
+    gone(map, name, false);
+    said.textContent = `hello: ${ready()} of ${total} replicas ready; ${who} is back, with nothing on it`;
+    await sleep(3000);
+  };
   await sleep(2600); // the map draws itself first
   map.classList.add("go");
   await sleep(3000);
@@ -226,9 +230,17 @@ async function live() {
         rep.classList.replace("wait", "on");
       }
     }
-    said.textContent = `hello: ${ready()} of ${total} replicas ready, revision ${revision}, on 4 machines`;
+    said.textContent = `hello: ${ready()} of ${total} replicas ready, revision ${revision}, on ${machines(map)} machines`;
     await sleep(5000);
+    await fail();
   }
 }
 
 if (!calm) pulse(), disk(), live();
+// With less motion the story is not told, only where it ends: the old PC lost, its replicas started on the others.
+if (calm) {
+  const map = $("#live .map"), total = $$(".rep.on", map).length;
+  for (const [from, slot] of lose(map, "old")) from.classList.remove("on"), slot.classList.add("on");
+  gone(map, "old", true);
+  $("#live-said").textContent = lost(map, label(map, "old"), total);
+}

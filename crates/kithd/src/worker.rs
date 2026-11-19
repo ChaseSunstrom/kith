@@ -132,6 +132,31 @@ fn named(status: Option<&Value>) -> Vec<&str> {
     image.chain(backups).collect()
 }
 
+/// A node's own `alone` status: null, or the unix seconds it ran alone (`since`, `until`) and the
+/// risks it says, and nothing else.
+fn alone_shape(key: &str, alone: &Value) -> Result<(), String> {
+    let well = match alone {
+        Value::Null => true,
+        Value::Object(fields) => {
+            fields.len() <= 3
+                && fields.iter().all(|(name, value)| match (name.as_str(), value) {
+                    ("since" | "until", Value::Number(n)) => n.is_u64(),
+                    ("risks", Value::String(risks)) => risks.len() <= 1024 && !risks.chars().any(char::is_control),
+                    _ => false,
+                })
+        }
+        _ => false,
+    };
+    if well {
+        Ok(())
+    } else {
+        Err(refused(
+            key,
+            "`alone` is null or the times a node ran alone (since, until) and its risks",
+        ))
+    }
+}
+
 /// What a node says it serves (`status.serves`): null, or `dns` a port and `ingress` true, and nothing else.
 fn serving_shape(key: &str, serves: &Value) -> Result<(), String> {
     let fields = match serves {
@@ -213,6 +238,26 @@ fn people_shape(key: &str, people: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// What a node says of what its levels could not give (`status.peopleNotes`): null, or a few short
+/// lines of text.
+fn notes_shape(key: &str, notes: &Value) -> Result<(), String> {
+    let few = match notes {
+        Value::Null => true,
+        Value::Array(lines) => {
+            lines.len() <= 16
+                && lines
+                    .iter()
+                    .all(|line| line.as_str().is_some_and(|line| line.chars().count() <= 200))
+        }
+        _ => false,
+    };
+    if few {
+        Ok(())
+    } else {
+        Err(refused(key, "`peopleNotes` is null or up to 16 lines of text"))
+    }
+}
+
 pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), String> {
     let node = who.name;
     let Some(live) = store.get(key) else {
@@ -221,9 +266,28 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
     };
     match live.kind.as_str() {
         "Node" if live.metadata.name == node => {
-            only(key, fields, &["os", "mesh", "serves", "policy", "thumbprint", "people"])?;
+            only(
+                key,
+                fields,
+                &[
+                    "os",
+                    "mesh",
+                    "serves",
+                    "policy",
+                    "thumbprint",
+                    "people",
+                    "peopleNotes",
+                    "alone",
+                ],
+            )?;
             if let Some(people) = fields.get("people") {
                 people_shape(key, people)?;
+            }
+            if let Some(notes) = fields.get("peopleNotes") {
+                notes_shape(key, notes)?;
+            }
+            if let Some(alone) = fields.get("alone") {
+                alone_shape(key, alone)?;
             }
             // (Its own policy, as it says it: null, or a small object of yes and no and the classes of Device.)
             let small = |policy: &Value| match policy {
@@ -394,6 +458,7 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
                 "observedRevision",
                 "containers",
                 "message",
+                "notes",
             ],
         )?,
         _ => only(key, &said, &["replicas", "containers", "notes"])?,
@@ -418,7 +483,9 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
     let units = said.remove("containers");
     let units: Vec<Value> = units.as_ref().and_then(Value::as_array).cloned().unwrap_or_default();
     // (`hostUsers`: whether a container keeps the node's users, which the node says of its own unit.)
-    const UNIT: [&str; 10] = [
+    // (`gen`: which generation of a replica it is, the second where a rolling update started it beside the old.)
+    const UNIT: [&str; 11] = [
+        "gen",
         "name",
         "replica",
         "state",
@@ -543,6 +610,17 @@ pub(crate) fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Res
     }
 }
 
+/// Is the Volume `key` one `node` removes the data of ([`crate::volumes::wipes`]) that no
+/// workload placed on `node` mounts?
+fn is_wiped_here(store: &Store, node: &str, key: &str) -> bool {
+    let named = |dir: &crate::volumes::Dir| key == format!("Volume/{}/{}", dir.namespace, dir.name);
+    crate::volumes::wipes(store, node).iter().any(named)
+        && !crate::volumes::mounts(store, node)
+            .values()
+            .flat_map(|dirs| dirs.values())
+            .any(named)
+}
+
 pub(crate) fn delete(store: &Store, who: &Worker, key: &str) -> Result<(), String> {
     let Some(live) = store.get(key) else { return Ok(()) };
     let discovered = live.metadata.labels.get(DISCOVERED).is_some_and(|made| made == "true");
@@ -554,6 +632,10 @@ pub(crate) fn delete(store: &Store, who: &Worker, key: &str) -> Result<(), Strin
         }
         "Device" | "Seat" if discovered && live.spec["node"] == who.name => Ok(()),
         "Blob" if made_here => Ok(()),
+        // A Volume made for a claim that is gone, whose data is here: the node that removed the
+        // data deletes it (the same list that node removes from, `volumes::wipes`), and not while
+        // a unit placed on it still mounts it (as `tend_wipes` waits).
+        "Volume" if is_wiped_here(store, who.name, key) => Ok(()),
         _ => Err(refused(key, "it is not this node's to delete")),
     }
 }
@@ -772,12 +854,65 @@ spec: { volume: there, every: 1d }
     }
 
     #[test]
+    fn a_worker_says_what_its_levels_left_out_in_a_few_lines() {
+        let store = store();
+        let notes = |said: Value| patch_of("Node/w", json!({ "peopleNotes": said }));
+        let long = "x".repeat(201);
+        let many: Vec<String> = (0..17).map(|n| n.to_string()).collect();
+        for said in [
+            json!(["peer a: refused"]),
+            json!([]),
+            Value::Null,
+            json!(["é".repeat(200)]),
+        ] {
+            assert!(try_as(&store, "w", notes(said.clone())).is_ok(), "{said}");
+        }
+        for said in [
+            json!([long]),
+            json!(many),
+            json!("text"),
+            json!([1]),
+            json!({ "a": "b" }),
+        ] {
+            assert!(try_as(&store, "w", notes(said.clone())).is_err(), "{said}");
+        }
+        assert!(try_as(&store, "w-b", notes(json!(["x"]))).is_err(), "another node's");
+    }
+
+    #[test]
     fn the_barrier_and_what_a_node_says_of_itself_pass() {
         let store = store();
         assert!(try_as(&store, "w", Command::Patch { statuses: Vec::new() }).is_ok());
         assert!(try_as(&store, "w", patch_of("Node/w", json!({ "os": { "version": "1.0.1" } }))).is_ok());
         let mesh = json!({ "mesh": { "key": "TkVX", "port": 51820, "reaches": ["a"] } });
         assert!(try_as(&store, "w", patch_of("Node/w", mesh)).is_ok());
+    }
+
+    /// A worker that ran alone writes its own `alone` status (what it runs alone since, and its
+    /// risks), in that shape and no other.
+    #[test]
+    fn a_worker_says_its_own_alone_status_in_its_shape() {
+        let store = store();
+        let ran = json!({ "since": 1_700_000_000u64, "until": 1_700_000_090u64, "risks": "a replica runs twice" });
+        assert!(try_as(&store, "w", patch_of("Node/w", json!({ "alone": ran.clone() }))).is_ok());
+        assert!(try_as(&store, "w", patch_of("Node/w", json!({ "alone": null }))).is_ok());
+        for said in [
+            json!("yes"),
+            json!({ "since": "x" }),
+            json!({ "since": 1, "until": 2, "risks": "r", "more": 1 }),
+            json!({ "risks": 5 }),
+            json!({ "since": -1, "until": 2 }),
+            json!({ "since": 1, "until": 2.5 }),
+            json!({ "risks": "a replica runs twice\u{7}" }),
+            json!({ "risks": "two lines\nin one status" }),
+        ] {
+            assert!(
+                try_as(&store, "w", patch_of("Node/w", json!({ "alone": said.clone() }))).is_err(),
+                "{said}"
+            );
+        }
+        // Another node's status is not its own to say.
+        assert!(try_as(&store, "w-b", patch_of("Node/w", json!({ "alone": ran }))).is_err());
     }
 
     #[test]
@@ -1042,6 +1177,76 @@ spec: { volume: there, every: 1d }
     }
 
     #[test]
+    fn a_node_deletes_the_volume_it_removed_the_data_of_and_no_other() {
+        let mut store = store();
+        // A Volume on `node`, made for a claim (or not), with the annotations and spec fields given.
+        let volume = |name: &str, node: &str, made: bool, retain: bool, encrypted: bool| -> Resource {
+            let mut marks = serde_json::Map::new();
+            if made {
+                marks.insert(crate::volumes::MADE_FOR_CLAIM.into(), "true".into());
+            }
+            if retain {
+                marks.insert(crate::volumes::RECLAIM.into(), "retain".into());
+            }
+            serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": "Volume",
+                "metadata": { "name": name, "annotations": marks },
+                "spec": { "node": node, "path": name, "encrypted": encrypted, "size": "8Mi" },
+            }))
+            .unwrap()
+        };
+        let plain = |name: &str, node: &str| volume(name, node, true, false, false);
+        let more = [
+            plain("gone-w", "w"),
+            plain("gone-a", "a"),
+            volume("by-hand", "w", false, false, false),
+            volume("kept-w", "w", true, true, false),
+            volume("sealed-w", "w", true, false, true),
+            plain("claimed-w", "w"),
+            plain("mounted-w", "w"),
+        ];
+        for resource in more {
+            store.apply(resource).unwrap();
+        }
+        let from = |source: &str| Resource::from_source(source).unwrap().remove(0).unwrap();
+        // A claim that is still there, and a unit placed on `w` that mounts a Volume by its name.
+        store
+            .apply(from(
+                "apiVersion: kith.dev/v1\nkind: VolumeClaim\nmetadata: { name: claimed-w }\nspec: { size: 1Gi }",
+            ))
+            .unwrap();
+        store
+            .apply(from("apiVersion: kith.dev/v1\nkind: Workload\nmetadata: { name: user }\nspec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volume: mounted-w, path: /d }] }] } }"))
+            .unwrap();
+        let delete = |key: &str| Command::Delete { key: key.into() };
+        let allowed = |name: &str| try_as(&store, "w", delete(&format!("Volume/default/{name}"))).is_ok();
+        assert!(allowed("gone-w"));
+        // Not a node's to delete where the data is on another, nobody made it for a claim, its
+        // data is to stay (retain) or is in a file only a control node tends (encrypted), its
+        // claim is there, or a unit on this node still mounts it.
+        for name in [
+            "gone-a",
+            "by-hand",
+            "here",
+            "kept-w",
+            "sealed-w",
+            "claimed-w",
+            "mounted-w",
+        ] {
+            assert!(!allowed(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_job_report_may_carry_the_notes_kithd_writes_of_it() {
+        // A Job from `kubectl create job` has a restartPolicy, and the controller says so in its
+        // notes: the node that runs it must be able to send them with the rest.
+        let store = store();
+        let said = json!({ "state": "running", "succeeded": 0, "failed": 0, "containers": [], "notes": ["restartPolicy is ignored"] });
+        assert!(try_as(&store, "a", report_of("a", "Job/default/once", said)).is_ok());
+    }
+
+    #[test]
     fn a_report_is_taken_for_the_replicas_the_node_was_given() {
         let store = store();
         // One replica saying it is both: only its own is taken, and the replicas stay 2.
@@ -1109,6 +1314,16 @@ spec: { volume: there, every: 1d }
         let said = json!({ "containers": [unit(0, json!({ "hostUsers": false }))] });
         let taken = reported(try_as(&store, "w", report_of("w", "Workload/default/web", said)).unwrap()).unwrap();
         assert_eq!(taken["containers"], json!([unit(0, json!({ "hostUsers": false }))]));
+    }
+
+    /// Which generation of a replica a unit is (`gen`: the one a rolling update started beside the
+    /// old) is the node's to say of its own unit.
+    #[test]
+    fn a_unit_says_which_generation_of_its_replica_it_is() {
+        let store = store();
+        let said = json!({ "containers": [unit(0, json!({ "gen": 1 }))] });
+        let taken = reported(try_as(&store, "w", report_of("w", "Workload/default/web", said)).unwrap()).unwrap();
+        assert_eq!(taken["containers"], json!([unit(0, json!({ "gen": 1 }))]));
     }
 
     #[test]

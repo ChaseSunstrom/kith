@@ -29,7 +29,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-FILE, PAGE = ROOT / "docs/numbers.json", ROOT / "docs/index.html"
+FILE, PAGE, GUIDE = ROOT / "docs/numbers.json", ROOT / "docs/index.html", ROOT / "docs/guide/numbers.html"
 MB = 1024 * 1024
 
 
@@ -154,7 +154,18 @@ def filled(page, n):
     named = len(re.findall(r"<span>\w+</span>", kinds.group(0))) if kinds else 0
     if named != n.get("kinds"):
         missing.append(f"(kinds: {named} named, {n.get('kinds')} counted)")
-    return block.sub(lambda f: f.group(1) + json.dumps(n) + f.group(2), page), missing
+    return block.sub(lambda f: f.group(1) + dumped(n) + f.group(2), page), missing
+
+
+def dumped(n):
+    """The numbers as one line for a page's #measured block: a '<' is written \\u003c (ci/site_docs.py does the same)."""
+    return json.dumps(n).replace("<", "\\u003c")
+
+
+def embedded(page):
+    """The text of a page's #measured block ('' when it has none)."""
+    found = re.search(r'<script id="measured" type="application/json">(.*?)</script>', page, re.S)
+    return found.group(1) if found else ""
 
 
 def main():
@@ -174,6 +185,9 @@ def main():
         for file, drawn in charts(n).items():
             if not file.exists() or file.read_text() != drawn:
                 sys.exit(f"{file.relative_to(ROOT)} draws other numbers than docs/numbers.json: python3 ci/site_numbers.py draws it again")
+        # The guide's numbers page draws its bars in the browser from the block it embeds: that block is this file, whole.
+        if embedded(GUIDE.read_text(encoding="utf-8")) != dumped(n):
+            sys.exit("docs/guide/numbers.html embeds other numbers than docs/numbers.json: python3 ci/site_docs.py writes it again")
         print(f"ok: {len(re.findall('data-n=', page))} numbers in the page, all from docs/numbers.json")
         return
     FILE.write_text(json.dumps(n, indent=1) + "\n")

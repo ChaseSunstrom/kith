@@ -204,6 +204,13 @@ Only the newest version is fixed. There are no security releases of older ones.
   dropped, so a pod sends with only its own address, even as root, and a pod reaches its node only for DNS and Services:
   UDP and TCP port 53 to the gateway, and TCP to a Service's address, with nothing else of the node's (kithd's API among
   it) reached, ICMP included. An exit's pod (`kpx`) gets neither of those.
+- **A machine that already passed packets on** (IPv6 forwarding was `1` before kithd
+  first made a pod, a router, say) gets no guard: `inet kith-pods`
+  passes on what the node passes on for anyone, and only the pods' own rules are added.
+  A machine that did not forward gets the guard, which drops whatever is not a pod's, so
+  the two differ on purpose. kithd says so once, when it makes its first pod. To have the
+  guard on such a machine, set `net.ipv6.conf.all.forwarding=0` before kithd starts. The
+  guard is kept across a kithd restart (`/run/kith-pods`), until the machine restarts.
 - **A pod behind an Exit** (`exit:` on a Workload's template) leaves by that WireGuard
   tunnel or by nothing, and is given no capability, sysctl or device for it: kithd holds
   the tunnel (`kx` and a number) on the Exit's node. Before the pod's host link is made,
@@ -249,9 +256,16 @@ Only the newest version is fixed. There are no security releases of older ones.
   connection is accepted: a client that fills one port and all that the node shares leaves
   each other port its 2, and a connection past that is ended at once. A new UDP sender
   past that takes the place of the one of its port heard from longest ago. A pod publishes
-  8 ports at most and a node 64, so the relays hold at most 448 files; kithd does not raise
-  its limit of open files (1024), and its listeners, API and ingress take of it too, so a
-  node with many clients of its API or ingress besides can still run out. A port another
+  8 ports at most and a node 64, so the relays hold at most 448 files. kithd raises its
+  soft limit of open files to the hard one at start, 65536 at most, and leaves the hard
+  limit as it is: on kith OS it is the first process, started with the kernel's 1024
+  soft and 4096 hard, so it runs with 4096; on a host under systemd (524288 hard
+  here) it runs with 65536. Its listeners, API and ingress (1024 connections, two files
+  each, so 2048) take of it too, with the relays 448 and 64 guests of the API: about 2700
+  at most, under 4096. The raised limit is passed on to what kithd starts, a pod's
+  processes included (no per-container limit is set): a program there that uses
+  select() with an FD_SETSIZE bitmap can be handed a file at or above 1024, so it must
+  lower its own limit (a per-container limit is a possible follow-up). A port another
   namespace's Workload or Job publishes is refused when written, and so is a pod through
   an Exit that does not list its namespace: both are asked of every writer (a person's
   apply, a Release, a Source, kithd's own controllers), where the write goes into the
@@ -621,13 +635,24 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   through the log); the node's own check before start still refuses an unlisted namespace.
   Of the node itself, an exit's pod reaches nothing (only answers to the node's own
   questions of it go back). A running pod keeps its tunnel after its namespace is taken
-  off its Exit's list, until it starts again (the node's check is at start). No NetworkPolicy's egress rules are enforced, for an exit's pod or any other (a
-  policy with them says so in its status). Not tested: a tunnel's link or table taken
+  off its Exit's list, until it starts again (the node's check is at start). Not tested: a tunnel's link or table taken
   away by hand on a running node (the code that makes it again is tested in a network
   namespace, not on kith OS), ICMP through or around a tunnel, kithd killed between
   starting a pod and making its rules (the rules come first; nothing shows the order
   holds under a kill), and names a pod's own resolver library cached before its exit
   changed.
+- **A NetworkPolicy's egress rules hold a pod's packets, on kith OS as root and for pod Workloads
+  and Jobs only.** The pods of the Workloads and Jobs a policy selects, an exit's pod included,
+  pass only what a rule allows, DNS included. Each pod is matched per pod link: its rules are the
+  chain `e-kpN` (`e-kpxN` for an exit's pod) in the node's `inet kith-pods` table, and its source
+  address is checked apart, so a packet from another address on its link is dropped. Exec and VM
+  Workloads are not held, and nothing is written when kithd is not root. A policy with a peer by
+  `namespace` or `selector`, or whose rules are not yet written on a node, says `partial` in its
+  status; `enforced` once they are. kithd writes the rules again when a policy changes. A peer
+  `cidr` that cannot be read is refused when the policy is submitted; a stored one (a log an
+  older version took) fails closed: a deny rule with a cidr that cannot be read denies every
+  address in its direction, and an allow rule with one lets nothing through. Not tested: a policy
+  changing under a running pod; access returning after the policy is deleted.
 - **What a replica writes outside its Volumes is held at the write where the state disk
   keeps project quotas, and counted elsewhere.** Its containers' writable roots and its
   disk scratch share the node's state disk. Where the state disk keeps project quotas (a
@@ -831,8 +856,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     a write the admin signed; the first key is written unsigned (trust on first use), and
     `open`, the default, takes everything as before. What it does not close: a taken
     control node still writes into the log as itself (its own writes are held to a list
-    in layer 2), and one that leads still appends what it likes until every node checks
-    what the leader appends (layer 3, T-0742). Nonces are kept in memory: a node that starts
+    in layer 2), and one that leads still appends what it likes, but for what changes
+    access: under `required` at store format 4 every node refuses, at apply, a bare Role,
+    RoleBinding, Identity, KindDefinition or Cluster write and any import, so a taken leader
+    cannot grant itself rights (layer 3, slices 2 and 3, T-0783, T-0825). Still open: its
+    bare writes of any other spec, until every node also checks a node's own writes, ACME,
+    the scheduler and cron (slice 5) and a Release's, a Source's, the registry's, an
+    update's and wasm's (slice 6, T-0850). Nonces are kept in memory: a node that starts
     again, or a new leader, takes once more a request it took in the ten minutes before, if a
     node that saw it pass sends it again (layer 3 keeps them in the store). One Cluster that
     says `required` makes every node require a signature, and every Cluster's `adminKey`
@@ -868,14 +898,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     What a worker may write is a list the control node it writes to holds it to,
     against that node's own store: what it says of the replicas the scheduler gave it
     (how many are ready is counted again; a unit's address has to be in the worker's
-    own part of the mesh), `os`, `mesh`, `serves` and `thumbprint` in its own Node's
-    status (not a mesh key another Node says, which would cut both off; a thumbprint
-    in a thumbprint's shape), its own NodeKey once, the Devices
+    own part of the mesh), `os`, `mesh`, `serves`, `thumbprint` and `alone` in its own
+    Node's status (not a mesh key another Node says, which would cut both off; a thumbprint
+    in a thumbprint's shape; `alone` null, or the times it ran alone and its risks), its own NodeKey once, the Devices
     and Seats whose `spec.node` is the worker (under a name that starts with the
     worker's own, with the labels discovery writes and no other, the node and the
     class among them its own), the status of an Image or a Backup of
     a Volume that is on it, a Blob it made, its own name among a Blob's holders, and
-    when it synced as a Volume's replica. Everything else is refused and written to
+    when it synced as a Volume's replica, the notes of a Job placed on it, and the delete of
+    a Volume that is on it whose data it was told to wipe (its claim gone, not retained, not
+    encrypted, and no unit placed on it mounts it). Everything else is refused and written to
     the audit log under the worker's name: a template, a Secret, a Role, a Node's
     spec (its own `trust` too), another node's status or Device, a report in another
     node's name. So a change asked of a worker's own API is refused as well (`ask a
@@ -924,7 +956,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     was deleted or made a worker meanwhile is still a control node to it. A worker
     that starts again meanwhile runs nothing until a control node answers (what
     was moved off it while it was away is not known to it), as any node that
-    starts with no leader in reach. Its API
+    starts with no leader in reach, unless its Node says `alone: run`
+    ([a node away from its cluster](docs/guide/cluster.md#a-node-away-from-its-cluster)). Its API
     port answers no person, reads included: it has no Identity and no Role to answer
     by (`this node is a worker and answers no one by their rights: ask a control
     node`). What a control node passes on to it for someone (a unit's output, `kith
@@ -1431,11 +1464,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   until a waiting node's own is pushed out of the 64 that are kept: the node asks
   again every few seconds, and is not told while they keep at it. Only a control
   node forgets: a worker that is asked refuses, and the waiting node asks the next.
-  A node the cluster's code forgot (not the one it was typed at) keeps its own code
-  and loses the cluster's; unlocked again, it has neither until they are made anew.
-  One that was off when the cluster's code was used still knows that code: typed at
-  it later, it erases itself, and the cluster, which had forgotten its key already,
-  goes on saying forgotten and not wiped.
+  A node the cluster's code forgot (not the one it was typed at) keeps both codes, its
+  own and the cluster's. One that was off when the cluster's code was used still has
+  its record: either code typed at it later erases it, and the cluster says wiped.
+  `kith node duress --all --off` and a new `--all` reach a forgotten key too, so a
+  revoked cluster code wipes no node, and the forgotten key stays forgotten. So does
+  `kith node duress NAME --off`: a node's own code that leaked is revoked there without
+  an unlock, and the key stays forgotten (lock, seal and a new code are still refused
+  on it until `kith node unlock`).
+  `kith node unlock` deletes a forgotten key: the node has neither code afterwards,
+  until they are made anew.
   **A new recovery key (`kith node recovery`) is written before it is shown**: an
   answer lost on its way leaves a key nobody saw, the old one opening no more and
   `recoverySeen` saying yes (the command says so when it fails: run it again). Where

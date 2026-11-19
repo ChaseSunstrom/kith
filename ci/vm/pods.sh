@@ -98,6 +98,57 @@ EOF
             asks egress 10.0.2.2 $((port + 9))
             pinned=''
             grep -q 'HTTP/1.0 200 OK' "$work/egress.out" || fail "the pod on n2 (range of --pod-range) did not reach this machine from behind its node: $(cat "$work/egress.out")"
+            # A NetworkPolicy's egress rule holds the pods of app=fenced to this machine's web server
+            # (10.0.2.2, port+9) and to at-n2's port 80, and to nothing else: a fenced pod reaches
+            # 10.0.2.2:port+9 (answered); 10.0.2.2:port+10 (its port is not allowed) and at-n2's
+            # address on port 80 (the port is allowed, the address is not) are silent, the policy
+            # drops them. An unfenced pod on the same node reaches at-n2 (answered) and gets a
+            # refusal from 10.0.2.2:port+10, where nothing listens. All are pinned to on-n2.
+            # (at-n2's IPv4 is the address it reaches its resolver from, in its `where:` line above.)
+            listener=$(grep -o 'from 10\.77\.[0-9.]*' "$work/at-n2.out" | grep -o '10\.77\.[0-9.]*' | head -1)
+            [ -n "$listener" ] || fail "the pod at-n2 has no IPv4 address in the range of --pod-range: $(cat "$work/at-n2.out")"
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"NetworkPolicy","metadata":{"name":"fence"},"spec":{"selector":{"app":"fenced"},"egress":[{"action":"allow","peers":[{"cidr":"10.0.2.2/32"}],"ports":[$((port + 9)),80]}]}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the NetworkPolicy fence was not applied"
+            waited=0
+            until line=$(units NetworkPolicy fence) && case $line in '0 enforced'*) true ;; *) false ;; esac; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "the NetworkPolicy fence does not say its egress is enforced: $line"
+                sleep 1
+            done
+            # NAME, its metadata's extra fields (its labels), and the HOST PORT pairs it knocks
+            # once each from n2 (pod once: two seconds each); what it heard is in $work/NAME.out.
+            knock_from_n2() {
+                name=$1
+                labels=$2
+                shift 2
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$name"$labels},"spec":{"retries":0,"template":{"pod":true,"containers":[
+  {"name":"knock","image":"kith.test/pod:user","command":["/bin/pod","once"$(printf ',"%s"' "$@")],
+   "volumeMounts":[{"volume":"on-n2","path":"/state"}]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $name was not applied"
+                waited=0
+                until line=$(units Job "$name") && printf '%s\n' "$line" | grep -Eq '^[0-9]+ (succeeded|failed)( |$)'; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 240 ] || fail "waited for the Job $name; it says: $line"
+                    sleep 1
+                done
+                any GET "/v1/logs/Job/default/$name" >"$work/$name.out" || fail "what the Job $name wrote could not be read"
+                printf '%s\n' "$line" | grep -Eq '^[0-9]+ succeeded' || fail "the Job $name failed: $line: $(cat "$work/$name.out")"
+            }
+            knock_from_n2 fenced ',"labels":{"app":"fenced"}' 10.0.2.2 $((port + 9)) 10.0.2.2 $((port + 10)) "$listener" 80
+            # (The log is JSON: its lines are joined by a literal \n, so each state is matched with
+            # the space after its port, not as a whole line.)
+            grep -q "10.0.2.2:$((port + 9)) answered: HTTP/1.0 200 OK" "$work/fenced.out" || fail "the fenced pod did not reach 10.0.2.2:$((port + 9)), which its egress rule allows: $(cat "$work/fenced.out")"
+            grep -q "10.0.2.2:$((port + 10)) silent" "$work/fenced.out" || fail "the fenced pod was not kept from 10.0.2.2:$((port + 10)) (a port the rule does not allow): $(cat "$work/fenced.out")"
+            grep -q "$listener:80 silent" "$work/fenced.out" || fail "the fenced pod was not kept from $listener:80 (an address the rule does not allow): $(cat "$work/fenced.out")"
+            knock_from_n2 unfenced '' 10.0.2.2 $((port + 10)) "$listener" 80
+            grep -q "10.0.2.2:$((port + 10)) refused" "$work/unfenced.out" || fail "an unfenced pod did not get a refusal from 10.0.2.2:$((port + 10)), so the fenced pod's silence proves nothing: $(cat "$work/unfenced.out")"
+            grep -q "$listener:80 answered: HTTP/1.0 200 OK" "$work/unfenced.out" || fail "an unfenced pod did not reach $listener:80: $(cat "$work/unfenced.out")"
+            api 1 DELETE /v1/resources/NetworkPolicy/default/fence >/dev/null || fail "the NetworkPolicy fence was not deleted"
+            echo "vm.sh: ok: a NetworkPolicy's egress rule let a pod of app=fenced reach 10.0.2.2:$((port + 9)), and kept it from 10.0.2.2:$((port + 10)) and from $listener:80 (silent), where an unfenced pod on the same node is answered by $listener:80 and refused by 10.0.2.2:$((port + 10)); the policy says enforced" >&2
             # A Workload of an image nothing else uses, deleted once it runs: its image is
             # looked for again at the end.
             cat >"$work/apply.json" <<EOF

@@ -38,7 +38,7 @@ use crate::ingress::{Idle, Limits, Place};
 use futures_util::FutureExt;
 use kith_api::Resource;
 use kith_api::kinds::{
-    NetworkPolicySpec, Peer, PolicyAction, PolicyRule, PortRef, Protocol, ServiceSpec, WorkloadSpec,
+    NetworkPolicySpec, Peer, PolicyAction, PolicyRule, PortRef, Protocol, ServiceSpec, WorkloadSpec, parse_cidr,
 };
 use kith_api::store::Store;
 use kith_mesh::pod::Egress;
@@ -291,7 +291,8 @@ fn told_apart(peer: &Peer) -> bool {
 /// `workload` on `port`? Yes when no NetworkPolicy is for the Workload; otherwise the
 /// first ingress rule that fits says, and when none fits, no. Where a rule names peers
 /// that cannot be told apart yet, it errs on the side of no: an allow rule lets nobody
-/// in for them, a deny rule keeps everybody out.
+/// in for them, a deny rule keeps everybody out; so does a deny peer whose cidr cannot be read
+/// or is IPv4 (`from` is a mesh address, IPv6: see `unreadable`).
 pub fn admits(store: &Store, workload: &str, node: Option<&str>, from: IpAddr, port: u16) -> bool {
     let Some(target) = store.get(workload) else {
         return false;
@@ -302,6 +303,9 @@ pub fn admits(store: &Store, workload: &str, node: Option<&str>, from: IpAddr, p
         for rule in &spec.ingress {
             let allow = rule.action == PolicyAction::Allow;
             let fits = |peer: &Peer| {
+                if !allow && unreadable(peer, true) {
+                    return true;
+                }
                 let here = peer.node.as_deref().is_none_or(|name| Some(name) == node);
                 let there = peer.cidr.as_deref().is_none_or(|cidr| within_cidr(cidr, from));
                 here && there && (told_apart(peer) || !allow)
@@ -322,8 +326,10 @@ pub fn admits(store: &Store, workload: &str, node: Option<&str>, from: IpAddr, p
 /// `cidr` is one, `node` and `cidr` together are the node's address if it is within the
 /// cidr, and neither is everything (both families). One that cannot be told apart by
 /// `namespace` or `selector` fits nothing in an allow (as for ingress) and, but for what its
-/// `node` or `cidr` say, everything in a deny. A rule whose peers hold no network is left out
-/// (it would fit anything). Nothing is let through that no rule allows: the node's resolver
+/// `node` or `cidr` say, everything in a deny; so does a deny peer whose `cidr` cannot be read
+/// (one stored before the API refused it): a deny never fails open. A rule whose peers hold no
+/// network is left out (it would fit anything): so is a deny of a `node` where there is no
+/// mesh prefix, as that is only without a cluster, where no node has an address to keep out. Nothing is let through that no rule allows: the node's resolver
 /// too (DNS to the gateway), so a policy that holds a pod must name it.
 pub fn egress_of(store: &Store, workload: &str, prefix: Option<Ipv6Addr>) -> Option<Vec<Egress>> {
     let target = store.get(workload)?;
@@ -344,13 +350,18 @@ pub fn mesh_prefix(shared: &Shared) -> Option<Ipv6Addr> {
         .map(|cluster| crate::mesh::prefix(&cluster.me.ca))
 }
 
-/// `10.0.0.0/8` as an address and its length; `None` for one that cannot be read, or whose
-/// length is over its family's size (as `within_cidr` holds nothing for it).
-fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
-    let (address, length) = cidr.split_once('/')?;
-    let address: IpAddr = address.parse().ok()?;
-    let size = if address.is_ipv4() { 32 } else { 128 };
-    Some((address, length.parse::<u8>().ok().filter(|length| *length <= size)?))
+/// Both families whole: what a deny that must keep everything out names.
+const EVERYTHING: [(IpAddr, u8); 2] = [
+    (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+    (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+];
+
+/// Does the peer name a `cidr` that cannot be read, or that nothing is matched by: IPv4 on
+/// `ingress` (a caller comes from an IPv6 mesh address)? The API refuses one; this is one stored
+/// before it did. In a deny it fits everything (it must never fail open), in an allow nothing.
+fn unreadable(peer: &Peer, ingress: bool) -> bool {
+    let unmatched = |cidr: &str| parse_cidr(cidr).is_none_or(|(address, _)| ingress && address.is_ipv4());
+    peer.cidr.as_deref().is_some_and(unmatched)
 }
 
 fn egress_rule(rule: &PolicyRule, prefix: Option<Ipv6Addr>) -> Option<Egress> {
@@ -358,6 +369,10 @@ fn egress_rule(rule: &PolicyRule, prefix: Option<Ipv6Addr>) -> Option<Egress> {
     let mut to = Vec::new();
     for peer in &rule.peers {
         if allow && !told_apart(peer) {
+            continue;
+        }
+        if !allow && unreadable(peer, false) {
+            to.extend(EVERYTHING);
             continue;
         }
         match (&peer.node, &peer.cidr) {
@@ -370,7 +385,7 @@ fn egress_rule(rule: &PolicyRule, prefix: Option<Ipv6Addr>) -> Option<Egress> {
                 }
             }
             (None, Some(cidr)) => to.extend(parse_cidr(cidr)),
-            (None, None) => to.extend([(Ipv4Addr::UNSPECIFIED.into(), 0), (Ipv6Addr::UNSPECIFIED.into(), 0)]),
+            (None, None) => to.extend(EVERYTHING),
         }
     }
     (rule.peers.is_empty() || !to.is_empty()).then(|| Egress {
@@ -426,6 +441,15 @@ fn policy_report(policy: &Resource, unsent: bool) -> Value {
             "peers by namespace or selector cannot be told apart yet: \
              an allow rule lets none of them in, a deny rule keeps everybody out",
         );
+    }
+    let cannot = |rules: &[PolicyRule], ingress| {
+        rules
+            .iter()
+            .flat_map(|rule| &rule.peers)
+            .any(|p| unreadable(p, ingress))
+    };
+    if cannot(&spec.ingress, true) || cannot(&spec.egress, false) {
+        gaps.push("a cidr cannot be read: a deny rule keeps everybody out, an allow rule lets nobody in");
     }
     match gaps.is_empty() {
         // (A message from before has to go: fields that are not written stay.)
@@ -809,7 +833,11 @@ impl Proxy {
     /// A replica on this machine, wherever it listens: on the machine's own loopback, or
     /// in its pod.
     async fn local(&self, workload: &str, replica: Option<u32>, port: u16) -> std::io::Result<TcpStream> {
-        let pod = replica.map(|replica| crate::controller::pod_of(workload, replica));
+        let pod = replica.map(|replica| {
+            let pod = crate::controller::pod_of(workload, replica);
+            let pods = self.shared.pods.lock().expect("nothing panics holding the pods");
+            pods.live_id(&pod).to_string()
+        });
         let pod = pod.as_deref().map(|pod| (&*self.shared, pod));
         within(crate::pods::connect(pod, port)).await
     }
@@ -1619,7 +1647,8 @@ fn where_asked(shared: &Shared, plans: &[Plan]) -> BTreeMap<Backend, Vec<Ipv6Add
     let pods = shared.pods.lock().expect("nothing panics holding the pods");
     let at = |(_, _, workload, replica): &Backend| {
         let pod = replica.map_or_else(Vec::new, |replica| {
-            pods.addresses(&crate::controller::pod_of(workload, replica))
+            let pod = crate::controller::pod_of(workload, replica);
+            pods.addresses(pods.live_id(&pod))
         });
         reachable(*replica, pod)
     };
@@ -1864,6 +1893,136 @@ spec:
         let settled = settle(&mut store).unwrap();
         assert_eq!(settled, json!({ "state": "enforced", "message": null }));
         assert!(settle(&mut store).is_none());
+    }
+
+    /// A policy whose peer cidr cannot be read: the API refuses one now, so it is written into
+    /// the store as an older version left it. A deny with such a peer keeps everything out (ingress
+    /// and egress both), so the allow after it opens nothing; an allow with one lets nothing in.
+    #[test]
+    fn a_deny_with_a_peer_that_cannot_be_read_keeps_everything_out() {
+        let stored = stored_policy;
+        let web = "Workload/default/web";
+        let prefix = kith_mesh::prefix(b"test");
+        let from: IpAddr = "10.1.2.3".parse().unwrap();
+        let deny = "{ action: deny, peers: [{ cidr: 'nonsense' }] }";
+        let nodes = "{ action: deny, peers: [{ node: b, cidr: 'nonsense' }] }";
+        let (all, none) = ("{ action: allow }", "[]");
+        for deny in [deny, nodes] {
+            let store = stored(&format!("[{deny}, {all}]"), &format!("[{deny}, {all}]"));
+            for node in [None, Some("a"), Some("b")] {
+                assert!(!admits(&store, web, node, from, 80), "{deny}, {node:?}");
+                assert!(
+                    !admits(&store, web, node, "fd00::1".parse().unwrap(), 80),
+                    "{deny}, {node:?}"
+                );
+            }
+            let net = |cidr: &str| {
+                let (address, bits) = cidr.split_once('/').unwrap();
+                (address.parse::<IpAddr>().unwrap(), bits.parse::<u8>().unwrap())
+            };
+            let got = egress_of(&store, web, Some(prefix)).unwrap();
+            assert_eq!(got.len(), 2, "{deny}");
+            assert_eq!(got[0].to, vec![net("0.0.0.0/0"), net("::/0")], "{deny}");
+            assert!(!got[0].allow && got[1].allow, "{deny}");
+        }
+        // An allow with one lets nobody in, and holds nothing out of its egress.
+        let store = stored("[{ action: allow, peers: [{ cidr: 'nonsense' }] }]", none);
+        assert!(!admits(&store, web, Some("a"), from, 80));
+        let store = stored(
+            "[{ action: allow }]",
+            "[{ action: allow, peers: [{ cidr: 'nonsense' }] }]",
+        );
+        assert_eq!(egress_of(&store, web, Some(prefix)).unwrap(), vec![]);
+        // The status says so (not `enforced`).
+        let store = stored(
+            "[{ action: deny, peers: [{ cidr: 'nonsense' }] }, { action: allow }]",
+            none,
+        );
+        let report = policy_report(store.get("NetworkPolicy/default/p").unwrap(), false);
+        assert_eq!(report["state"], "partial");
+        assert!(
+            report["message"].as_str().unwrap().contains("cannot be read"),
+            "{report}"
+        );
+    }
+
+    /// A policy as an older version left it, which the store holds as it is (`put`), as a log
+    /// replayed does: the API refuses these now.
+    fn stored_policy(ingress: &str, egress: &str) -> Store {
+        let mut store = Store::default();
+        for source in [
+            HOME.to_string(),
+            format!(
+                "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: {{ name: p }}\n\
+                 spec:\n  selector: {{ app: web }}\n  ingress: {ingress}\n  egress: {egress}\n"
+            ),
+        ] {
+            for resource in Resource::from_source(&source).unwrap() {
+                store.put(resource.unwrap());
+            }
+        }
+        store
+    }
+
+    /// A cidr that reads but that nothing is matched by is as one that cannot be read: an IPv4
+    /// address written as IPv6 (a pod's IPv4 packets never meet it) in egress, and any IPv4 cidr in
+    /// ingress (a caller comes from an IPv6 mesh address). A deny keeps everything out, an allow
+    /// lets nothing through.
+    #[test]
+    fn a_deny_with_a_peer_that_cannot_be_read_by_what_asks_keeps_everything_out() {
+        let web = "Workload/default/web";
+        let prefix = kith_mesh::prefix(b"test");
+        let mesh: IpAddr = kith_mesh::node_address(prefix, "a").into();
+        let all = [
+            (IpAddr::from(Ipv4Addr::UNSPECIFIED), 0),
+            (IpAddr::from(Ipv6Addr::UNSPECIFIED), 0),
+        ];
+        let (denied, open) = (
+            "{ action: deny, peers: [{ cidr: '::ffff:10.0.0.0/104' }] }",
+            "{ action: allow }",
+        );
+        let store = stored_policy("[]", &format!("[{denied}, {open}]"));
+        let got = egress_of(&store, web, Some(prefix)).unwrap();
+        assert_eq!(got[0].to, all.to_vec(), "IPv4 as IPv6, in a deny");
+        let store = stored_policy(
+            "[]",
+            "[{ action: allow, peers: [{ cidr: '::ffff:10.0.0.0/104' }] }, { action: allow, peers: [{ cidr: '10.0.0.0/8' }] }]",
+        );
+        let got = egress_of(&store, web, Some(prefix)).unwrap();
+        assert_eq!((got.len(), got[0].to.len()), (1, 1), "an allow of it holds nothing");
+        for cidr in ["0.0.0.0/0", "10.0.0.0/8", "::ffff:10.0.0.0/104"] {
+            let store = stored_policy(
+                &format!("[{{ action: deny, peers: [{{ cidr: '{cidr}' }}] }}, {open}]"),
+                "[]",
+            );
+            assert!(!admits(&store, web, Some("a"), mesh, 80), "{cidr}");
+            let store = stored_policy(&format!("[{{ action: allow, peers: [{{ cidr: '{cidr}' }}] }}]"), "[]");
+            assert!(!admits(&store, web, Some("a"), mesh, 80), "{cidr}");
+        }
+        // A deny of a network an IPv6 caller is in still says so, as before.
+        let store = stored_policy(
+            "[{ action: deny, peers: [{ cidr: 'fd00::/8' }] }, { action: allow }]",
+            "[]",
+        );
+        assert!(!admits(&store, web, None, "fd00::1".parse().unwrap(), 80));
+        assert!(admits(&store, web, None, "fe80::1".parse().unwrap(), 80));
+    }
+
+    /// A deny of a node, on a node with no mesh prefix, is left out: `mesh_prefix` is `None`
+    /// only where there is no cluster, so there is no node address to keep out.
+    #[test]
+    fn a_deny_of_a_node_without_a_mesh_is_left_out() {
+        let mut store = Store::default();
+        let policy = "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: { name: p }\n\
+             spec:\n  selector: { app: web }\n  egress: [{ action: deny, peers: [{ node: b }] }, { action: allow }]\n";
+        for source in [HOME, policy] {
+            for resource in Resource::from_source(source).unwrap() {
+                store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        let got = egress_of(&store, "Workload/default/web", None).unwrap();
+        assert_eq!(got.len(), 1, "the deny has no address to hold out");
+        assert!(got[0].allow && got[0].to.is_empty());
     }
 
     #[test]
@@ -2638,9 +2797,10 @@ spec:
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = dripping.accept().await {
                 tokio::spawn(async move {
-                    // Five bytes over two seconds, then (its client's end heard) its own.
-                    for _ in 0..5 {
-                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    // Twelve bytes a quarter second apart (three seconds), then (its client's end
+                    // heard) its own.
+                    for _ in 0..12 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
                         stream.write_all(b".").await.unwrap();
                     }
                     let _ = stream.read_to_end(&mut Vec::new()).await;
@@ -2652,13 +2812,13 @@ spec:
         assert!(ask(&mut relay, "kept 8080 web\n", b"").await.unwrap());
         let (mut client, held) = pair().await;
         let hearing = async {
-            let mut heard = [0; 5];
+            let mut heard = [0; 12];
             client.read_exact(&mut heard).await.unwrap();
             client.shutdown().await.unwrap();
             client.read_to_end(&mut Vec::new()).await.unwrap()
         };
         let begun = std::time::Instant::now();
-        let (carried, more) = tokio::join!(carry(held, &mut relay, Duration::from_secs(1)), hearing);
+        let (carried, more) = tokio::join!(carry(held, &mut relay, Duration::from_secs(2)), hearing);
         carried.unwrap();
         assert!(more == 0 && begun.elapsed() >= Duration::from_secs(2));
 
@@ -2670,9 +2830,9 @@ spec:
         let (mut client, held) = pair().await;
         client.shutdown().await.unwrap();
         let begun = std::time::Instant::now();
-        let cut = carry(held, &mut relay, Duration::from_secs(1)).await;
+        let cut = carry(held, &mut relay, Duration::from_secs(2)).await;
         assert_eq!(cut.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
-        assert!(begun.elapsed() >= Duration::from_secs(1) && begun.elapsed() < Duration::from_secs(3));
+        assert!(begun.elapsed() >= Duration::from_secs(2) && begun.elapsed() < Duration::from_secs(10));
     }
 
     /// A replica that speaks first and ends first: its bytes and its end reach the client,

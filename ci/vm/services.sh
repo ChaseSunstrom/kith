@@ -69,6 +69,57 @@ EOF
                 fi
                 checked="$checked${checked:+; }$job: ${said#check: }, reached $reached"
             done
+            # A rolling update of a one-replica Workload behind a Service (T-0020): the new pod
+            # starts beside the old and the old stops once it is ready, so a Job asking the
+            # Service ten times a second all through the update is answered every time, and
+            # hears the new answer before it ends.
+            web() {
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"web","labels":{"app":"web"}},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"web","image":"kith.test/pod:1","command":["/bin/pod","say"],"env":[{"name":"PASSWORD","value":"$1"}],"ports":[{"port":80}],"readiness":{"tcp":{"port":80}}}]}}},
+ {"apiVersion":"kith.dev/v1","kind":"Service","metadata":{"name":"web"},"spec":{"selector":{"app":"web"},"ports":[{"port":80}]}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the web Workload ($1) was not applied"
+            }
+            web one
+            waited=0
+            until line=$(units Workload web) && [ "${line%% *}" = 1 ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 300 ] || fail "waited for the web pod to be ready; the Workload says: $line"
+                sleep 1
+            done
+            waited=0
+            until any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+sys.exit(0 if any(r["kind"] == "Service" and r["metadata"]["name"] == "web" and (r.get("status") or {}).get("backends") for r in found) else 1)
+'; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the Service web was given no replica"
+                sleep 1
+            done
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"hammer"},"spec":{"retries":0,"template":{"pod":true,"containers":[
+  {"name":"hammer","image":"kith.test/pod:1","command":["/bin/pod","hammer","web","80","60"]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job hammer was not applied"
+            sleep 8
+            web two
+            waited=0
+            until line=$(units Job hammer) && printf '%s\n' "$line" | grep -Eq '^[0-9]+ (succeeded|failed)( |$)'; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 600 ] || fail "waited for the Job hammer; it says: $line"
+                sleep 1
+            done
+            any GET /v1/logs/Job/default/hammer >"$work/hammer.out" 2>/dev/null || true
+            rolled=$(grep -o 'hammer: [0-9].*' "$work/hammer.out" | head -1) || fail "the Job hammer said nothing of how it went: $(cat "$work/hammer.out")"
+            printf '%s\n' "$line" | grep -q succeeded || fail "the Job hammer did not end well: $line: $rolled"
+            case $rolled in *" 0 failed"*) ;; *) fail "the Service web did not answer every request through a rolling update: $rolled" ;; esac
+            case $rolled in *one*two* | *two*one*) ;; *) fail "the update did not finish while the Job asked (it should hear both answers): $rolled" ;; esac
             # (Its state disk has no project quotas, as a node's from before: kithd says it counts.)
             grep -aq "kithd: pods' storage limits are held by a count every 10 s of what each pod wrote" "$work/n1.log" \
                 || fail "kithd did not say it counts what pods write on a state disk with no project quotas: $(grep -a 'storage limits' "$work/n1.log")"
@@ -150,5 +201,5 @@ EOF
                 grep -q 'check: [0-9]' "$work/mix.out" || fail "the Job mix-$from-$to said nothing of how it went: $(cat "$work/mix.out" "$work/mix.err")"
             done
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: one node, a pod that sent back what it was sent and its Service; Jobs on the same node, one in a pod (passed by kithd) and one on the node's own network (passed by the kernel straight to the replica), sent through the Service on connections closed at once, half closed, reset by either end with bytes on their way, side by side and kept for small turns, and every byte came back in order ($checked); then on the mesh with a second node that says no link (as a node of before), a pod on each sent through the Service of a pod on the other, both ways"
+            echo "vm.sh: ok: one node, a pod that sent back what it was sent and its Service; Jobs on the same node, one in a pod (passed by kithd) and one on the node's own network (passed by the kernel straight to the replica), sent through the Service on connections closed at once, half closed, reset by either end with bytes on their way, side by side and kept for small turns, and every byte came back in order ($checked); a one-replica Workload behind a Service rolled to a new spec answered every request ($rolled); then on the mesh with a second node that says no link (as a node of before), a pod on each sent through the Service of a pod on the other, both ways"
             exit 0

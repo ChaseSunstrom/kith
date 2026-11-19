@@ -32,14 +32,38 @@ spec:
   show the pairing). If its Volume is deleted it takes no other: make the Volume again, or
   delete the claim and apply it again.
 - `provision: true` on a claim with no Volume makes one of its name and size on the ready node
-  with the fewest Volumes; it goes with the claim, its directory stays. Whoever applies such a
-  claim must be allowed to apply a Volume.
+  with the fewest Volumes. Whoever applies such a claim must be allowed to apply a Volume.
+- Deleting a claim that provisioned its Volume deletes the Volume and its data on its node
+  (only the directory kithd made for it; a link inside that points elsewhere is removed, not
+  followed), as Kubernetes does by default. To keep the data, put the annotation
+  `kith.dev/reclaim: retain` on the claim: the Volume goes and its directory stays, and a later
+  claim of the same name that provisions finds that data in its place. A Volume you applied
+  yourself is never deleted with a claim, nor is its data: it is free again for another claim.
 - The container sees a bind mount (`readOnly: true` for read-only) of
   `<state>/volumes/<namespace>/<name>/<path>`. `path` must be relative, with no `..` or symbolic
   link in it (in `kith-system`, an absolute host path). A container path that is relative, has
   `..`, or is `/`, `/proc`, `/sys` or `/dev` (or under them) stops the unit.
 - Not yet: `subvolume: true` makes a plain directory; `size` is no quota; an `exec` unit and a
   NodeWorkload mount nothing.
+
+### A claim for each replica
+
+A mount with `perReplica: true` names the *base* of a claim, and replica `i` mounts the claim
+(or Volume) `<volume>-<i>`: the claim of a StatefulSet's `volumeClaimTemplates`, which the
+Kubernetes layer makes for each replica (`data-db-0`, `data-db-1`, ...).
+
+```yaml
+volumeMounts: [{ volume: data-db, perReplica: true, path: /var/lib/db }]
+```
+
+- Each replica is placed on the node of its own Volume, so three replicas can be on three nodes.
+  A plain mount beside it still puts all of them on its one node.
+- A replica whose claim has no Volume, or whose Volume's node is gone, waits (`unschedulable`
+  says why) and is never started on an empty directory elsewhere. The others go on.
+- Scaling down removes no claim and no data; scaling up again finds them. Deleting a claim is
+  what removes its Volume, as above. A claim deleted while its replica is still there is not
+  made again until the StatefulSet is applied again, so that replica waits until then. Moving a
+  Volume's data to another node is not done.
 
 ### Shared volumes
 
