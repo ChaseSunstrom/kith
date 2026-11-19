@@ -91,7 +91,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Where in the config partition the record is (the node's config is its first 64 kB),
 /// and how long it may be. A copy of it follows, written first: a write cut by a power
@@ -945,12 +945,45 @@ fn unsealed<T: std::io::Read + std::io::Write>(
 /// Whether this kernel's slot is one still counting its tries on the ESP: an update that
 /// has not come up yet (os.rs). No slot, or an ESP that cannot be read: not.
 async fn on_trial() -> bool {
-    let slot = std::fs::read_to_string("/proc/cmdline").ok();
-    let Some(slot) = slot.and_then(|line| init::options(&line).0.slot) else {
+    let Some(slot) = running_slot() else {
         return false;
     };
     let said = tokio::task::spawn_blocking(move || crate::os::esp(|esp| crate::os::trial(slot, esp)));
     said.await.is_ok_and(|said| said.unwrap_or(false))
+}
+
+/// The slot this kernel booted from, from the kernel command line.
+fn running_slot() -> Option<char> {
+    let line = std::fs::read_to_string("/proc/cmdline").ok()?;
+    init::options(&line).0.slot
+}
+
+/// Check 3 of docs/adr-unlock.md: the running system is release-signed by a key this node
+/// takes, and the TPM's PCR 4 and 9 are the ones its boot predicts (the log replayed with
+/// the running files as they are).
+fn system_vouched(keys: &crate::update::Keys) -> Result<(), String> {
+    let slot = running_slot().ok_or("the kernel command line names no slot")?;
+    let running = crate::os::esp(|esp| crate::os::running_image(esp, slot))??;
+    let log = measurements()?;
+    let mut tpm = crate::tpm::open()?;
+    let (read4, read9) = (tpm.read(4)?, tpm.read(9)?);
+    // (predict_pcrs refuses unless the running image is in the log once in PCR 4 and once in PCR 9.)
+    crate::predict::predict_pcrs(&log, &read4, &read9, &running, &running)?;
+    let events = crate::predict::parse_log(&log)?;
+    vouched(&events, &[(4, read4), (9, read9)], || {
+        keys.signed_system(slot, &running)
+    })
+}
+
+/// [`system_vouched`]'s decision on values: the log explains PCRs 4 and 9 as read, and `signed`
+/// (the release header, and the piece of it that runs) vouches for the system.
+fn vouched(
+    events: &[crate::predict::Event],
+    read: &[(u32, [u8; 32])],
+    signed: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    crate::predict::explains(events, read)?;
+    signed()
 }
 
 /// Open and mount the state of a node that has `record`. Returns once it is mounted,
@@ -1067,10 +1100,50 @@ fn adopt(record: &mut Record, left: Record) {
 /// opened without the check it stands for.
 const UNREAD: &str = "the lock record's tpm-parent: line cannot be read, so its TPM seal is not opened (kith node seal NAME --off, then kith node seal NAME, makes a new one)";
 
+/// NodeKey's status of a node's key: sealed when the seal fits this system (`fits`: it opened
+/// this start, or was made again), else why the last try refused, when a seal is wanted; and
+/// the secrets the node holds.
+fn sealed_status(record: &Record, fits: bool, unsealed: Option<&(Instant, String)>, seal: bool) -> Value {
+    let sealed = fits && (record.tpm.is_some() || record.pin.is_some());
+    let mut status = match unsealed.filter(|_| seal && !sealed) {
+        Some((_, why)) => json!({ "sealed": false, "message": why }),
+        None => json!({ "sealed": sealed }),
+    };
+    for (name, set) in [
+        ("passphrase", record.pass.is_some()),
+        // (Not while a plain seal is beside it: that opens with no PIN.)
+        ("pin", record.pin.is_some() && record.tpm.is_none()),
+        ("recoverySeen", record.seen),
+        ("duress", record.duress.is_some()),
+        ("duressAll", record.duress_all.is_some()),
+    ] {
+        if set {
+            status[name] = true.into();
+        }
+    }
+    status
+}
+
+/// Whether a seal may be made again now (docs/adr-unlock.md): the NodeKey says `seal`, a
+/// cluster handed this node's key out this start, and `system` vouches for the running
+/// system. Else the check that failed, as the NodeKey's status says it.
+fn again(seal: bool, handed: bool, system: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    if !seal {
+        return Err("the NodeKey does not say seal (the node is locked, forgotten, or seal is off)".into());
+    }
+    if !handed {
+        return Err(
+            "no cluster handed this node's key out this start: it opened by its recovery key, passphrase or PIN".into(),
+        );
+    }
+    system()
+}
+
 /// `opened` sealed by this machine's TPM again (under the storage key whose name `record`
 /// keeps, if it keeps one), written in place of `record`'s seal in one write, read back,
 /// and unsealed from what was read: the record as it now is. When that does not open,
-/// `record` is written back as it was.
+/// `record` is written back as it was. A PIN node's seal is of k1 alone (k2 and the wrapped
+/// key stay as they are: the state key is the same).
 fn sealed_anew<T: std::io::Read + std::io::Write>(
     tpm: &mut crate::tpm::Tpm<T>,
     record: &Record,
@@ -1080,15 +1153,31 @@ fn sealed_anew<T: std::io::Read + std::io::Write>(
     if record.parent.as_ref().is_some_and(|name| name.len() != 34) {
         return Err(UNREAD.into());
     }
-    let (sealed, parent) = tpm.seal(opened, record.parent.as_deref())?;
-    let with = Record {
-        tpm: Some(sealed),
-        parent: Some(parent),
-        ..record.clone()
+    let k1 = k1_of(opened);
+    let data: &[u8] = if record.pin.is_some() { &k1[..] } else { opened };
+    let (sealed, parent) = tpm.seal(data, record.parent.as_deref())?;
+    let with = match &record.pin {
+        Some(pin) => Record {
+            pin: Some(PinSeal {
+                k1: sealed,
+                ..pin.clone()
+            }),
+            parent: Some(parent),
+            ..record.clone()
+        },
+        None => Record {
+            tpm: Some(sealed),
+            parent: Some(parent),
+            ..record.clone()
+        },
     };
     tried(record, &with, config, |back| {
-        let key = tpm.unseal(back.tpm.as_deref().unwrap_or_default(), back.parent.as_deref())?;
-        (key == opened)
+        let (sealed, expect): (&[u8], &[u8]) = match &back.pin {
+            Some(pin) => (&pin.k1, &k1[..]),
+            None => (back.tpm.as_deref().unwrap_or_default(), opened),
+        };
+        let key = tpm.unseal(sealed, back.parent.as_deref())?;
+        (key == expect)
             .then_some(())
             .ok_or("the TPM gave another key back".into())
     })
@@ -1440,6 +1529,9 @@ pub async fn ahead(boots: crate::os::Boots) -> Result<Option<String>, String> {
 type Chosen = (Change, tokio::sync::oneshot::Sender<Result<Option<String>, String>>);
 static CHOSEN: std::sync::OnceLock<tokio::sync::mpsc::Sender<Chosen>> = std::sync::OnceLock::new();
 
+/// How long a seal that [`again`] refused waits before it is tried again.
+const UNSEALED_RETRY: Duration = Duration::from_secs(300);
+
 /// For as long as the node runs: have the cluster hold the key and take it off the disk
 /// once another node does; restart when the cluster locks this node, and end when it
 /// wipes it. `opened`: the key the state was opened with, and who gave it at this start
@@ -1447,8 +1539,9 @@ static CHOSEN: std::sync::OnceLock<tokio::sync::mpsc::Sender<Chosen>> = std::syn
 /// what is not this key, is given again: without it the next start has no key.
 ///
 /// And the TPM's seal: made while the cluster's NodeKey says `seal` and the node is not
-/// locked (again after a start the TPM refused: the system is another now), dropped as
-/// soon as it says otherwise; the NodeKey's status says which, and why not.
+/// locked, and only when a cluster handed the key out this start and the running system is
+/// signed and predicted ([`again`]); a refused one is tried again every [`UNSEALED_RETRY`].
+/// Dropped as soon as the NodeKey says otherwise; the NodeKey's status says which, and why not.
 ///
 /// And the passphrase: its line is written when one is given ([`pass`]), and dropped when
 /// one is taken away or the cluster locks this node.
@@ -1457,6 +1550,7 @@ pub async fn keep(
     config: PathBuf,
     mut record: Record,
     (opened, by): (Vec<u8>, By),
+    keys: crate::update::Keys,
     mut stopping: tokio::sync::watch::Receiver<bool>,
 ) {
     let Some(cluster) = &shared.cluster else {
@@ -1473,7 +1567,7 @@ pub async fn keep(
     // and stays open.)
     let mut was_locked = (!matches!(by, By::Owner | By::Recovery)).then_some(false);
     // Whether the record's seal is one this system opens, and why none could be made.
-    let (mut fits, mut unsealed) = (by == By::Tpm, None::<String>);
+    let (mut fits, mut unsealed) = (matches!(by, By::Tpm | By::Pin), None::<(Instant, String)>);
     let (chosen, mut chosen_here) = tokio::sync::mpsc::channel::<Chosen>(1);
     let _ = CHOSEN.set(chosen);
     let mut shut = false;
@@ -1609,7 +1703,7 @@ pub async fn keep(
                         }
                     }
                 } else if record.peers != peers && !peers.is_empty() {
-                    record.peers = peers;
+                    record.peers = peers.clone();
                     write(&record);
                 }
                 // (The system runs and is good: the seal made ahead for it, if it opens here,
@@ -1642,46 +1736,49 @@ pub async fn keep(
                         Err(why) => eprintln!("kithd: the seal made ahead is not promoted: {why}"),
                     }
                 }
-                // (Once the key is off the disk: beside it, a seal keeps nothing. A seal of
-                // the old form, with no storage key's name, is made again with it. Beside a
-                // PIN, none: it would open the state with no PIN typed.)
+                // (Once the key is off the disk: beside it, a seal keeps nothing. A seal that
+                // does not fit this system, or has no storage key's name, is made again: a
+                // plain seal, or a PIN node's k1 alone. Refused ones wait [`UNSEALED_RETRY`].)
                 let due = seal
                     && record.key.is_none()
-                    && record.pin.is_none()
-                    && !(fits && record.tpm.is_some() && record.parent.is_some());
-                if due && unsealed.is_none() {
-                    let tpm = crate::tpm::open();
-                    let kept = tpm.and_then(|mut tpm| sealed_anew(&mut tpm, &record, &opened, &config));
+                    && !(fits && record.parent.is_some() && (record.tpm.is_some() || record.pin.is_some()));
+                let retry = unsealed.as_ref().is_none_or(|(at, _)| at.elapsed() >= UNSEALED_RETRY);
+                if due && retry {
+                    // (A cluster handed the key out this start: it opened by one, or a peer
+                    // answers with it. Only then is the system checked, off the runtime.)
+                    let mut handed = by == By::Cluster;
+                    for peer in &peers {
+                        if handed {
+                            break;
+                        }
+                        handed = asked(&client, peer, &record).await.as_ref() == Ok(&opened);
+                    }
+                    let system = if handed {
+                        let keys = keys.clone();
+                        let checked = tokio::task::spawn_blocking(move || system_vouched(&keys));
+                        checked
+                            .await
+                            .unwrap_or_else(|_| Err("checking the running system failed".into()))
+                    } else {
+                        Ok(())
+                    };
+                    let kept = again(seal, handed, || system).and_then(|()| {
+                        let mut tpm = crate::tpm::open()?;
+                        sealed_anew(&mut tpm, &record, &opened, &config)
+                    });
                     match kept {
                         Ok(with) => {
-                            eprintln!(
-                                "kithd: this machine's TPM holds the key of its state, for this system: it opens with no node asked"
-                            );
+                            eprintln!("kithd: this machine's TPM holds the key of its state, for this system");
                             (record, fits) = (with, true);
+                            unsealed = None;
                         }
                         Err(why) => {
                             eprintln!("kithd: the key of this node's state is not sealed: {why}");
-                            unsealed = Some(why);
+                            unsealed = Some((Instant::now(), why));
                         }
                     }
                 }
-                let sealed = record.tpm.is_some();
-                let mut status = match unsealed.as_ref().filter(|_| seal && !sealed) {
-                    Some(why) => json!({ "sealed": false, "message": why }),
-                    None => json!({ "sealed": sealed }),
-                };
-                for (name, set) in [
-                    ("passphrase", record.pass.is_some()),
-                    // (Not while a plain seal is beside it: that opens with no PIN.)
-                    ("pin", record.pin.is_some() && record.tpm.is_none()),
-                    ("recoverySeen", record.seen),
-                    ("duress", record.duress.is_some()),
-                    ("duressAll", record.duress_all.is_some()),
-                ] {
-                    if set {
-                        status[name] = true.into();
-                    }
-                }
+                let status = sealed_status(&record, fits, unsealed.as_ref(), seal);
                 if said.flatten() != Some(status.clone()) {
                     let statuses = vec![(me.clone(), Some(status))];
                     if let Err(e) = shared.submit(Command::Status { statuses }).await {
@@ -2566,6 +2663,138 @@ mod tests {
         assert!(kept.peers.len() > 100 && kept.peers.len() < 400);
         assert_eq!(Record::read(&path), Ok(Some(kept)));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The checks of docs/adr-unlock.md before the TPM's: a node seals its key again only when
+    /// it is asked to, a cluster handed the key out this start, and the system is signed. The
+    /// reason of the first that fails is what NodeKey's status says.
+    #[test]
+    fn seals_again_only_when_every_check_holds() {
+        assert_eq!(again(true, true, || Ok(())), Ok(()));
+        assert!(again(false, true, || Ok(())).unwrap_err().contains("seal"));
+        assert!(again(true, false, || Ok(())).unwrap_err().contains("cluster"));
+        assert_eq!(
+            again(true, true, || Err("the system is not signed".to_string())),
+            Err("the system is not signed".to_string())
+        );
+        // (The system is not looked at when an earlier check does not hold.)
+        assert!(again(false, true, || panic!("the system was looked at")).is_err());
+    }
+
+    /// A PIN node seals again only k1 (`tpm-pin:`): k2 and the wrapped key stay as they are, and
+    /// the k1 read back opens under the storage key's name.
+    #[test]
+    fn seals_again_a_pin_node_reseals_k1_only() {
+        use crate::tpm::{Tpm, tests};
+        let Some((_software, wire)) = tests::software() else {
+            return;
+        };
+        let mut tpm = Tpm(wire);
+        tests::measured(&mut tpm);
+        let key = vec![5; 64]; // pragma: allowlist secret
+        let k1 = k1_of(&key);
+        let (old_k1, _) = tpm.seal(&k1[..], None).unwrap();
+        let pin = PinSeal {
+            k1: old_k1.clone(),
+            k2: vec![6; 32],
+            wrapped: vec![8; 60],
+        };
+        let record = Record {
+            secret: vec![7; 32],
+            pin: Some(pin.clone()),
+            ..Record::default()
+        };
+        let path = std::env::temp_dir().join(format!("kith-crypt-seals-again-pin-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + ROOM]).unwrap();
+        record
+            .write(&File::options().read(true).write(true).open(&path).unwrap(), AT)
+            .unwrap();
+        let with = sealed_anew(&mut tpm, &record, &key, &path).unwrap();
+        let now = with.pin.clone().unwrap();
+        assert_ne!(now.k1, old_k1);
+        assert_eq!((&now.k2, &now.wrapped), (&pin.k2, &pin.wrapped));
+        assert!(with.parent.is_some());
+        assert_eq!(&tpm.unseal(&now.k1, with.parent.as_deref()).unwrap()[..], &k1[..]);
+        assert_eq!(Record::read(&path), Ok(Some(with.clone())));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A storage key whose name is not the one kept is ANOTHER: nothing is sealed under it, and
+    /// the record stays as it was.
+    #[test]
+    fn seals_again_refuses_another_storage_key_name() {
+        use crate::tpm::{ANOTHER, Tpm, tests};
+        let Some((_software, wire)) = tests::software() else {
+            return;
+        };
+        let mut tpm = Tpm(wire);
+        tests::measured(&mut tpm);
+        let key = vec![4; 64]; // pragma: allowlist secret
+        let (sealed, _) = tpm.seal(&key, None).unwrap();
+        let path = std::env::temp_dir().join(format!("kith-crypt-seals-again-name-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + ROOM]).unwrap();
+        let record = Record {
+            secret: vec![7; 32],
+            tpm: Some(sealed),
+            parent: Some(vec![0; 34]),
+            ..Record::default()
+        };
+        record
+            .write(&File::options().read(true).write(true).open(&path).unwrap(), AT)
+            .unwrap();
+        assert_eq!(sealed_anew(&mut tpm, &record, &key, &path), Err(ANOTHER.to_string()));
+        assert_eq!(Record::read(&path), Ok(Some(record.clone())));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Check 3 on values: the log must explain PCRs 4 and 9 as read (`explains`), and only then
+    /// does the signed check (the header and its piece) decide. A log that does not explain them
+    /// refuses before the signed check is asked; a refusal by the check is the refusal.
+    #[test]
+    fn seals_again_vouched_refuses_a_log_that_does_not_explain_the_pcrs() {
+        use crate::predict::{Event, UNEXPLAINED, replay};
+        let events = vec![Event {
+            pcr: 4,
+            kind: 0,
+            digest: [1; 32],
+        }];
+        let replayed = replay(&events).unwrap();
+        let read = [(4, replayed[4]), (9, replayed[9])];
+        assert_eq!(vouched(&events, &read, || Ok(())), Ok(()));
+        let other = [(4, [2; 32]), (9, replayed[9])];
+        assert_eq!(
+            vouched(&events, &other, || panic!("asked")),
+            Err(UNEXPLAINED.to_string())
+        );
+        let refused = || Err("the image that runs is not the piece the release names for slot b".to_string());
+        assert_eq!(vouched(&events, &read, refused), refused());
+    }
+
+    /// The status shows why a seal is refused, when one is wanted and does not fit (even with
+    /// an old TPM record beside the key); a PIN seal that fits says sealed, and no message.
+    #[test]
+    fn seals_again_status_shows_the_refusal_and_is_quiet_for_a_fitting_pin_seal() {
+        let refused = (Instant::now(), "the system is not signed".to_string());
+        let plain = Record {
+            tpm: Some(vec![1]),
+            parent: Some(vec![2; 34]),
+            ..Record::default()
+        };
+        let shown = sealed_status(&plain, false, Some(&refused), true);
+        assert_eq!(shown["sealed"], false);
+        assert_eq!(shown["message"], "the system is not signed");
+        let pin = Record {
+            pin: Some(PinSeal {
+                k1: vec![1],
+                k2: vec![2],
+                wrapped: vec![3],
+            }),
+            parent: Some(vec![2; 34]),
+            ..Record::default()
+        };
+        let quiet = sealed_status(&pin, true, None, true);
+        assert_eq!(quiet["sealed"], true);
+        assert!(quiet.get("message").is_none());
     }
 
     fn holds(bytes: &[u8], secret: &[u8]) -> bool {

@@ -1077,7 +1077,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             );
             let key = async {
                 if let Some(((record, config), opened)) = sealed.zip(opened) {
-                    crypt::keep(shared.clone(), config, record, opened, stopping.clone()).await;
+                    let keys = update::keys(args.release_key.clone(), &state);
+                    crypt::keep(shared.clone(), config, record, opened, keys, stopping.clone()).await;
                 }
             };
             let hardware = devices::run(shared.clone(), stopping.clone(), dmem);

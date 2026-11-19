@@ -435,6 +435,8 @@ fn version_in(os_release: &str) -> Option<String> {
 #[derive(Clone)]
 pub struct Keys {
     given: Vec<String>,
+    /// This node's state directory: where its kept keys, floor and kept headers are.
+    state: PathBuf,
     kept: PathBuf,
     /// Where the floor is kept: see `floor`.
     floor: PathBuf,
@@ -457,15 +459,38 @@ pub(crate) fn keys_in(file: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// This node's keys for releases: the given ones, else kept, else the system's own.
+pub fn keys(given: Vec<String>, state: &Path) -> Keys {
+    Keys {
+        image: Some(PathBuf::from("/etc/kith/release-keys")),
+        ..Keys::new(given, state)
+    }
+}
+
 impl Keys {
     pub fn new(given: Vec<String>, state: &Path) -> Keys {
         let (kept, floor) = (state.join("os-release-keys"), state.join("os-release-floor"));
         Keys {
             given,
+            state: state.to_path_buf(),
             kept,
             floor,
             image: None,
         }
+    }
+
+    /// Check 3 of docs/adr-unlock.md for the system in `slot`, which runs the image `running`:
+    /// its header, as kept, is signed by a key this node takes releases from, is not under the
+    /// floor, and is the piece of the image that runs. Says which of those does not hold.
+    pub fn signed_system(&self, slot: char, running: &[u8]) -> Result<(), String> {
+        let (signature, public, block) = crate::os::kept_signed(&self.state, slot)?;
+        let (mine, _) = self.mine()?;
+        if !mine.iter().any(|key| key.eq_ignore_ascii_case(public.trim())) {
+            return Err("the system's release is signed by a key this node does not take releases from".into());
+        }
+        crate::os::signed(Some(&signature), Some(&public))(&block)?;
+        let version = crate::os::piece_of(&block, slot, running)?;
+        above(&self.floor, &version)
     }
 
     /// The keys this node takes releases from, and whose they are: `given`, `kept`,
@@ -862,7 +887,11 @@ async fn fetch(
                         let keep = crate::pki::write_whole(&kept, keys.first_kept(public).as_bytes());
                         keep.map_err(|e| format!("keeping the release's key ({}): {e}", kept.display()))?;
                     }
-                    keys.pend(&release, version, header, &runs)
+                    keys.pend(&release, version, header, &runs)?;
+                    // (The header is kept for the slot it writes, with its signature: check 3 of
+                    // docs/adr-unlock.md reads it there.)
+                    let into = crate::os::other(slot);
+                    crate::os::keep_signed(&keys.state, into, signature.as_deref(), public.as_deref(), header)
                 }
                 version => Err(format!(
                     "the update at that address is kith OS {}",
@@ -927,10 +956,7 @@ pub async fn node(
     lan: bool,
     mut stopping: watch::Receiver<bool>,
 ) {
-    let keys = Keys {
-        image: Some(PathBuf::from("/etc/kith/release-keys")),
-        ..Keys::new(keys, &state)
-    };
+    let keys = crate::update::keys(keys, &state);
     if let Some(cluster) = &shared.cluster {
         let _ = MESH.set(crate::mesh::prefix(&cluster.me.ca));
     }
@@ -1073,6 +1099,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Check 3 of docs/adr-unlock.md: the running system's header, kept for its slot, is signed
+    /// by a key this node takes releases from, is not under the floor, and vouches for the image
+    /// that runs. Each of those failing is a node that does not seal again.
+    #[test]
+    fn seals_again_the_running_system_is_signed_by_a_key_this_node_takes() {
+        let state = scratch("seals-again");
+        let (sign, public) = pair();
+        let running = b"the kernel image that runs".to_vec();
+        let sum = |bytes: &[u8]| crate::pki::hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+        let header = serde_json::json!({
+            "format": 1, "version": "9.9", "hash": "0".repeat(64),
+            "pieces": [
+                {"name": "root", "size": 0, "sha256": sum(&[])},
+                {"name": "verity", "size": 0, "sha256": sum(&[])},
+                {"name": "a", "size": 0, "sha256": sum(&[])},
+                {"name": "b", "size": running.len(), "sha256": sum(&running)},
+            ],
+        })
+        .to_string();
+        let mut block = header.into_bytes();
+        block.resize(4096, b' ');
+        let signature = sign(&block);
+        crate::os::keep_signed(&state, 'b', Some(&signature), Some(&public), &block).unwrap();
+        let keys = Keys::new(vec![public.clone()], &state);
+        assert_eq!(keys.signed_system('b', &running), Ok(()));
+        // A key this node does not take, or no key at all: refused.
+        let (_, stranger) = pair();
+        assert!(Keys::new(vec![stranger], &state).signed_system('b', &running).is_err());
+        assert!(Keys::new(Vec::new(), &state).signed_system('b', &running).is_err());
+        // An image that is not the piece the header names: refused.
+        assert!(keys.signed_system('b', b"another image").is_err());
+        // A signature that is not the header's: refused.
+        let (forge, _) = pair();
+        let forged = forge(&block);
+        crate::os::keep_signed(&state, 'b', Some(&forged), Some(&public), &block).unwrap();
+        assert!(keys.signed_system('b', &running).is_err());
+        // A floor above the header's version: refused.
+        crate::os::keep_signed(&state, 'b', Some(&signature), Some(&public), &block).unwrap();
+        crate::pki::write_whole(&keys.floor, b"10\n").unwrap();
+        assert!(keys.signed_system('b', &running).is_err());
     }
 
     #[test]
