@@ -335,7 +335,6 @@ mod refuse {
 
 #[cfg(test)]
 mod key {
-    use super::support::*;
     use super::*;
 
     /// A key is 64 bytes, and two made for one disk differ (it takes no id and no state key, so
