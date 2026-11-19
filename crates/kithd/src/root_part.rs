@@ -1584,10 +1584,7 @@ pub fn volume(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
 /// The directory of the Volume `dir` to write into (an upload, a replica's copy): the files made
 /// take the directory's own owner.
 pub fn open(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
-    path_of(
-        state,
-        Request::Open { volume: Place::of(dir) },
-    )
+    path_of(state, Request::Open { volume: Place::of(dir) })
 }
 
 /// The directory of the Volume `dir` a backup is restored into.
@@ -3746,7 +3743,9 @@ mod tests {
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
         // A plain one is made beneath the root, and the reply says where.
         for ask in volume_asks(place("shop", "data", "deep/er")) {
-            let Ok(Reply::Path(at)) = root.request(ask) else { panic!("not a path") };
+            let Ok(Reply::Path(at)) = root.request(ask) else {
+                panic!("not a path")
+            };
             assert_eq!(at, shop.join("deep/er"));
         }
         // And one of the node's own is made where the policy has hostPaths.
@@ -3780,7 +3779,9 @@ mod tests {
         // Nothing was made beside the directory, and one that does not climb is.
         assert!(!outside.join("../escaped").exists());
         assert!(!outside.join("x").exists());
-        let ask = Request::Volume { volume: place("kith-system", "data", &format!("{at}/own")) };
+        let ask = Request::Volume {
+            volume: place("kith-system", "data", &format!("{at}/own")),
+        };
         assert!(matches!(root.request(ask), Ok(Reply::Path(_))));
         std::fs::remove_dir_all(&outside).unwrap();
     }
@@ -3814,12 +3815,10 @@ mod tests {
     fn run_is_refused_where_the_policy_has_it_off() {
         let (book, _) = book("run");
         let run = |words: &str, via: &str, argv: &[&str]| {
-            Direct::with(Nobody, &book)
-                .under(policy(words))
-                .request(Request::Run {
-                    via: via.into(),
-                    argv: argv.iter().map(|a| a.to_string()).collect(),
-                })
+            Direct::with(Nobody, &book).under(policy(words)).request(Request::Run {
+                via: via.into(),
+                argv: argv.iter().map(|a| a.to_string()).collect(),
+            })
         };
         let why = run("hardened", "waypipe", &["firefox"]).unwrap_err();
         assert!(why.contains("run"), "{why}");
@@ -3842,9 +3841,15 @@ mod tests {
     #[test]
     fn the_volumes_and_run_requests_are_on_the_wire() {
         for request in [
-            Request::Volume { volume: place("shop", "data", "x") },
-            Request::Open { volume: place("shop", "data", "x") },
-            Request::Restore { volume: place("shop", "data", "x") },
+            Request::Volume {
+                volume: place("shop", "data", "x"),
+            },
+            Request::Open {
+                volume: place("shop", "data", "x"),
+            },
+            Request::Restore {
+                volume: place("shop", "data", "x"),
+            },
             Request::VolumeGone {
                 namespace: "shop".into(),
                 name: "data".into(),
@@ -3880,7 +3885,10 @@ mod tests {
         assert_eq!(volume(&state, &dir).unwrap(), own);
         assert_eq!(open(&state, &dir).unwrap(), own);
         assert_eq!(restore(&state, &dir).unwrap(), own);
-        let climbing = Dir { path: "../x".into(), ..dir.clone() };
+        let climbing = Dir {
+            path: "../x".into(),
+            ..dir.clone()
+        };
         assert!(volume(&state, &climbing).is_err() && open(&state, &climbing).is_err());
         assert!(restore(&state, &climbing).is_err());
         volume_gone(&state, &dir).unwrap();
@@ -3898,7 +3906,9 @@ mod tests {
         // The ADR's three, and one `Volume` for each the unit mounts, which the controller asks
         // before it makes the unit (it is not counted among the three).
         for i in 0..2 {
-            let ask = Request::Volume { volume: place("ns", &format!("data{i}"), "x") };
+            let ask = Request::Volume {
+                volume: place("ns", &format!("data{i}"), "x"),
+            };
             assert!(matches!(root.request(ask), Ok(Reply::Path(_))));
         }
         assert_eq!(book.crossed(Kind::Volume), 2);
