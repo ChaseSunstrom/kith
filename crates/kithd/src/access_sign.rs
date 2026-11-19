@@ -1439,7 +1439,9 @@ mod tests {
                     applies(vec![map("b")]),
                 ),
             ];
-            let (mut one, mut two) = (signing_store(), signing_store());
+            // (One store and its clone: two built apart can differ in the second they were stamped.)
+            let mut one = signing_store();
+            let mut two = one.clone();
             let taken = [true, false, false, false, false, false, true];
             assert_eq!(feed(&mut one, &log), taken, "expires {expires}");
             assert_eq!(feed(&mut two, &log), taken, "expires {expires}");
@@ -1566,7 +1568,9 @@ mod tests {
         assert!(admit(&store, CLUSTER, &signed, leader).is_ok());
         // Run in a log: the refused entries leave the store as it was, on two nodes alike.
         let log: Vec<Command> = bare_access().into_iter().chain([signed]).collect();
-        let (mut one, mut two) = (required_store(), required_store());
+        // (One store and its clone: two built apart can differ in the second they were stamped.)
+        let mut one = required_store();
+        let mut two = one.clone();
         let taken = [vec![false; bare_access().len()], vec![true]].concat();
         assert_eq!(feed(&mut one, &log), taken);
         assert_eq!(feed(&mut two, &log), taken);
@@ -1630,12 +1634,16 @@ mod tests {
         let mut identity = new_identity("alice");
         identity.spec = serde_json::json!({ "publicKey": public, "more": 1 });
         let forged = |entry: Command| {
-            let (mut one, mut two) = (required_store(), required_store());
+            // (One store and its clone: two built apart can differ in the second they were stamped.)
+            let mut one = required_store();
+            let mut two = one.clone();
             let log = [entry, good.clone()];
             (feed(&mut one, &log), feed(&mut two, &log), one == two)
         };
         // Taken, where nothing else is: the Identity has its key.
-        let (mut one, mut two) = (required_store(), required_store());
+        // (One store and its clone: two built apart can differ in the second they were stamped.)
+        let mut one = required_store();
+        let mut two = one.clone();
         assert_eq!(
             feed(&mut one, &[good.clone(), good.clone()]),
             [true, false],
