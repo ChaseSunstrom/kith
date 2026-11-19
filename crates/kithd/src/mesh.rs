@@ -39,7 +39,8 @@ fn hex(bytes: &[u8]) -> String {
 /// other nodes pass a Service's on by; `link`: it takes a link to another node's kithd, a
 /// stream for each (services.rs). A node of before says neither, and is reached as it was.
 fn says_of(public: &[u8], address: Ipv6Addr, port: u16) -> Value {
-    let mut says = json!({ "key": hex(public), "address": address.to_string(), "port": port, "kept": true, "link": true });
+    let mut says =
+        json!({ "key": hex(public), "address": address.to_string(), "port": port, "kept": true, "link": true });
     if crate::services::links_off() {
         says.as_object_mut().expect("an object").remove("link");
     }
