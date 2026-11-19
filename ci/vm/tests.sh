@@ -9,6 +9,8 @@
         [ -r "$f" ] && { firmware=$f; break; }
     done
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
+    # (The guests reach nothing outside their forwards, unless KITH_E2E=1 asks for image pulls: then net_restrict is set empty.)
+    [ "${KITH_E2E:-}" != 1 ] || net_restrict=''
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     # (KITH_OS_SPEC=os/examples/all.yaml tries the image of a spec instead of the plain one.)
     # (modules: the 'all' image, whose drivers are modules.)
@@ -32,7 +34,7 @@
         : >"$work/log"
         timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none ${once:+-no-reboot} \
             -machine q35 -bios "$firmware" -drive "file=$work/disk.raw,format=raw,if=virtio" \
-            -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:7443" -device virtio-net-pci,netdev=n0 \
+            -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:7443${net_restrict-,restrict=on}" -device virtio-net-pci,netdev=n0 \
             -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=$more" "$@" \
             -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" </dev/null >/dev/null 2>&1 8>&- &
         vm=$!
