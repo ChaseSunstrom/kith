@@ -45,9 +45,17 @@
         old=$(od -An -tu1 -j1024 -N1 "$m" | tr -d ' ')
         printf "\\$(printf %o $(((old + 1) % 256)))" | dd of="$m" bs=1 seek=1024 count=1 conv=notrunc status=none
     done
-    KITH_OS_CACHE=$cache sh "$root/os/build.sh" --check --spec "$root/$KITH_OS_SPEC" --out "$work/os-bad" >&2 \
-        || fail "the image with a changed module did not build"
-    cp "$work/os-bad/kith-os.raw" "$work/disk.raw"
+    # The build is 14 GB: it goes on disk under target/ (the work folder is a tmpfs), its output
+    # to a log whose tail a failure prints, and the first boot's disk is gone before it starts.
+    # (One VM test runs at a time, so a folder a killed run left is stale.)
+    rm -rf "$root"/target/vm-modules-*
+    out=$root/target/vm-modules-$$
+    mkdir -p "$out"
+    rm -f "$work/disk.raw"
+    KITH_OS_CACHE=$cache sh "$root/os/build.sh" --check --spec "$root/$KITH_OS_SPEC" --out "$out/os-bad" >"$out/os-bad.log" 2>&1 \
+        || { tail -n 40 "$out/os-bad.log" >&2; rm -rf "$out"; fail "the image with a changed module did not build"; }
+    cp "$out/os-bad/kith-os.raw" "$work/disk.raw"
+    rm -rf "$out"
     boot $audio -device qemu-xhci,id=xhci
     up
     echo 'device_add usb-audio,id=audio0,bus=xhci.0,audiodev=snd0' | socat - "unix-connect:$work/keys" >/dev/null

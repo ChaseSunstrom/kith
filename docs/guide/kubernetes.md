@@ -55,7 +55,7 @@ needs pods that run):
 
 | Client | What works |
 |---|---|
-| kubectl | `apply` (client-side and `--server-side`), `create` (deployment, job, `job --from=cronjob/…`, cronjob, configmap, secret, namespace, serviceaccount), `get` (tables, `-o yaml\|json\|wide\|name\|jsonpath`, `-A`, `--watch`, `get all`), `describe`, `diff`, `replace`, `patch` (strategic and merge), `label`, `annotate`, `scale`, `expose`, `set image`, `rollout status`, `rollout restart`, `wait`, `logs` (`-f`, `--tail`, of a pod, a Deployment or a Job), `delete` |
+| kubectl | `apply` (client-side and `--server-side`), `create` (deployment, job, `job --from=cronjob/…`, cronjob, configmap, secret, namespace, serviceaccount), `get` (tables, `-o yaml\|json\|wide\|name\|jsonpath`, `-A`, `--watch`, `get all`), `describe`, `diff`, `replace`, `patch` (strategic, merge and `--type json`: the six RFC 6902 operations, a failing `test` or a path not there refuses the whole patch with a 422), `label`, `annotate`, `scale`, `expose`, `set image`, `rollout status`, `rollout restart`, `wait`, `logs` (`-f`, `--tail`, of a pod, a Deployment or a Job), `delete` |
 | helm | `install`, `upgrade`, `rollback`, `uninstall`, `list`, `status`, `history`, `get manifest`, each with and without `--wait`, into a namespace it creates |
 | Field managers | `kubectl apply --server-side` keeps who set which field (`metadata.managedFields`, up to 64 managers an object). Managers that apply one object each keep their own fields; a second manager's different value for a field the first set is a `409 Conflict` in Kubernetes's words, unless it says `--force-conflicts` (it then takes the field). A field a manager leaves out of its next apply goes, when no other manager has it. Fields are owned by their exact path, a list with no one key to merge by is owned whole, and only an apply makes a manager (a `replace` or a `patch` takes a field from whoever had it). Applying onto an object that exists, or replacing one, needs `get` as well as `apply`, as a patch does |
 | AGE | `kubectl get namespaces` and `get nodes` show the time of the oldest revision the store kept: when it was made, unless the history was trimmed or the node is a worker that runs from a view and holds only what the view carried (an implicit namespace, one that only holds objects, has none) |
@@ -72,11 +72,11 @@ Not answered, each refused in words:
 | What it is not, and is not meant to become | kith is not a conformant Kubernetes (the conformance tests are not run and would not pass). It takes no CNI, CSI or device plugin (a pod's network, a volume and a device are kith's own), serves no aggregated API, and never starts, fetches or packages Kubernetes: what needs the real thing needs a real cluster |
 | In a pod: `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, `privileged`, added capabilities | kith gives no Workload these, by any API |
 | In a pod: a `projected` or `downwardAPI` volume, a mode for one item of a volume, an initContainer with a `restartPolicy` (a sidecar) | What a chart commonly says is carried, as [kith's own fields](workloads.md#what-a-container-is-given): volumes from a ConfigMap, a Secret or an `emptyDir`, `subPath` of any of them, `envFrom`, `fieldRef`, `initContainers`, `runAsNonRoot`, dropped capabilities, and `limits.ephemeral-storage` with a disk `emptyDir`'s `sizeLimit` as `resources.storage` (either under 64Ki raised to it) |
-| A StatefulSet with a claim template and more than one replica; a CronJob in a time zone other than UTC; `kubectl rollout undo` | use `kith rollback` |
-| `kubectl delete pod` (a pod is its owner's replica), `--cascade=orphan`, `kubectl patch --type json`, `kubectl logs --previous`, `--since`, `--timestamps` | a unit's output is kept as it was written, not when |
+| A CronJob in a time zone other than UTC; `kubectl rollout undo` | use `kith rollback` |
+| `kubectl delete pod` (a pod is its owner's replica), `--cascade=orphan`, `kubectl logs --previous`, `--since`, `--timestamps` | a unit's output is kept as it was written, not when |
 
-What it costs: it is in the one kithd there is and added 0.38 MB to it (the budget of 13 MB is
-not raised; kithd is 10.92 MB today). With pods and CronJobs kithd with nothing to do holds
+What it costs: it is in the one kithd there is and added 0.38 MB to it, and the JSON patch 0.01 MB
+more (the budget of 13 MB is not raised; kithd is 12.72 MB today). With pods and CronJobs kithd with nothing to do holds
 7.8 MB of memory, as before (`python3 ci/budgets.py`); a node no client asks runs none of it.
 
 Who may do what is kith's own: a request on `/api` is checked as the same request on `/v1`
@@ -95,7 +95,7 @@ it.
 
 | Kubernetes | kith |
 |---|---|
-| Deployment, StatefulSet | Workload with `pod: true` (a StatefulSet's `volumeClaimTemplates` each become a VolumeClaim `<template>-<name>-0`; with more than one replica that is refused) |
+| Deployment, StatefulSet | Workload with `pod: true` (a StatefulSet's `volumeClaimTemplates` each become a VolumeClaim for each replica, `<template>-<name>-<ordinal>`, and its mount is `perReplica`: [each replica its own](storage.md#a-claim-for-each-replica). Scaling down keeps the claims and their data, as Kubernetes does, and scaling up again finds them) |
 | DaemonSet, Service | NodeWorkload, Service |
 | Ingress | `expose: {host, via: edge, paths}` on the Service behind each host (the one behind `/`, else the first named) |
 | ConfigMap, Secret | ConfigMap, Secret (`data` decoded from base64: the output holds the plain text) |
@@ -157,4 +157,4 @@ Moving a guest's data, one guest at a time:
 
 kith does not need the hypervisor gone first: a kith OS image boots as a guest (UEFI, virtio
 disk and network), the way to try it beside what runs today. It is tested in QEMU, not on
-Proxmox itself.
+Proxmox itself: see [As a guest on Proxmox VE](os.md#as-a-guest-on-proxmox-ve).

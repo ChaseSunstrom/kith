@@ -76,6 +76,12 @@ pub(crate) fn private_key(path: &std::path::Path) -> std::io::Result<Key> {
     file.write_all(hex(&key).as_bytes())?;
     file.sync_all()?;
     std::fs::rename(&new, path)?;
+    // The rename is in the directory, not the file: synced so a power cut keeps the key.
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(key)
 }
 

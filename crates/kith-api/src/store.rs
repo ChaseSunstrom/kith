@@ -706,7 +706,14 @@ impl FileStore {
             .map_err(io)?;
         file.write_all(&bytes).map_err(io)?;
         file.sync_all().map_err(io)?;
-        std::fs::rename(&tmp, &self.path).map_err(io)
+        std::fs::rename(&tmp, &self.path).map_err(io)?;
+        // The rename is in the directory, not the file: synced so a power cut keeps the new one.
+        let dir = self
+            .path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        File::open(dir).and_then(|d| d.sync_all()).map_err(io)
     }
 }
 

@@ -1375,6 +1375,62 @@ fn httpd_variants_name_the_one_that_stops() {
     assert!(report.is_empty(), "variants that did not stay up:\n{report}");
 }
 
+/// What a unit's status says when its root is read-only: where a kithd that is not root asks for a
+/// writable root and the kernel refuses the overlay it would be (kith-runtime's ROOT_READ_ONLY).
+const READ_ONLY_ROOT: &str =
+    "root is read-only: this kernel does not mount overlay in a user namespace (kithd is not root)";
+
+/// A pod's root is writable unless it asks otherwise, and a kithd that is not root gets that root as
+/// an overlay the kernel may refuse. Whichever way the kernel goes, the pod runs, and what it says
+/// agrees with the write: `ok` with no message, or `denied` with the read-only root's message.
+/// (T-0753 shipped a create that failed here and named no mount: the unit never ran.)
+#[test]
+fn a_writable_pod_runs_on_a_kithd_that_is_not_root() {
+    if !e2e() {
+        return;
+    }
+    if nix::unistd::getuid().is_root() {
+        eprintln!("skipped: kithd runs as root here, so its pod roots are overlays it can always mount");
+        return;
+    }
+    let daemon = Daemon::start("writable-pod");
+    let target = "Workload/writable";
+    let unit = || daemon.status(target)["containers"][0].clone();
+    daemon.apply(&boxed(
+        "writable",
+        1,
+        "rolling",
+        "if touch /w 2>/dev/null; then echo ok; else echo denied; fi; sleep 300",
+        "    pod: true\n",
+    ));
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while unit()["state"] != "running" {
+        assert!(
+            Instant::now() < deadline,
+            "writable never ran: {}\nstderr: {:?}",
+            daemon.status(target),
+            daemon.kith(&["logs", target, "--stderr"]).1,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let verdict = || {
+        daemon
+            .kith(&["logs", target])
+            .1
+            .lines()
+            .find(|line| matches!(*line, "ok" | "denied"))
+            .map(str::to_string)
+    };
+    wait_for("writable to write or be denied", || verdict().is_some());
+    let message = unit()["message"].as_str().unwrap_or_default().to_string();
+    let said = verdict().expect("wait_for saw ok or denied");
+    eprintln!("writable: the write to / said {said}; its message: {message:?}");
+    match said.as_str() {
+        "denied" => assert_eq!(message, READ_ONLY_ROOT, "the write to / was denied"),
+        _ => assert_eq!(message, "", "the write to / succeeded: no note, no error"),
+    }
+}
+
 #[test]
 fn rolling_updates_keep_replicas_ready() {
     if !e2e() {
