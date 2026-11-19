@@ -467,7 +467,7 @@ Only the newest version is fixed. There are no security releases of older ones.
 ## What splitting kithd in two would and would not change
 
 Design in `docs/adr-privilege.md` (T-0334). Built today: the node's own policy and the
-typed request list's seam (`crates/kithd/src/root_part.rs`, listeners only), in one
+typed request list's seam (`crates/kithd/src/root_part.rs`, for listeners, pods and the mesh), in one
 process. There is no second process yet, so everything below is what the split is for,
 not what a node has.
 
