@@ -819,10 +819,13 @@ fn workflows_kubectl_delete_pod_restarts_that_replica() {
     cluster.refused(&["delete", "pod", "bare"], &["bare"]);
 }
 
-/// The Deployment `web` of one replica whose image is `kith.test/box:1`, made and applied.
+/// The Deployment `web` of one replica whose image is `kith.test/box:1`, made and applied. Its
+/// container is `box`: a unit's id holds it, and the containers of the tests that run at once
+/// (each in a kithd of its own, in one cgroup tree) must not share an id, or one's delete ends the other's.
 fn apply_box(cluster: &Cluster) {
     cluster.fill_box();
     let web = WEB
+        .replace("- name: web\n", "- name: box\n")
         .replace("mirror.gcr.io/library/busybox:1.36", "kith.test/box:1")
         .replace("replicas: 2", "replicas: 1")
         .replace("[sleep,", "[/bin/sleep,");

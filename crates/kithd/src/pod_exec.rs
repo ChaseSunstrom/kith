@@ -37,6 +37,7 @@ use kith_api::kinds::Verb;
 use kith_runtime::Entered;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +59,47 @@ const DRAIN: Duration = Duration::from_secs(2);
 /// The most a command may be, in bytes of all its words: the hop's body has room for it.
 const COMMAND_MAX: usize = 32 << 10;
 
+/// The most exec sessions open on this node at once, and the most one caller holds: each is a
+/// process, three pipes and a task, so a loop of `kubectl exec` is refused, not queued.
+const SESSIONS_MAX: usize = 64;
+const PER_CALLER: usize = 8;
+
+/// The sessions open now, by the caller that asked. (ponytail: one per process, as a node has one kithd.)
+static OPEN: std::sync::Mutex<BTreeMap<String, usize>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// A place among the open sessions, given back when it is dropped.
+struct Slot(String);
+
+/// A place for a session of `who`, or the refusal that says which cap it met.
+fn take(who: &str) -> Result<Slot, Failed> {
+    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    let full = |why: String| Failed::new(429, "TooManyRequests", why);
+    if open.values().sum::<usize>() >= SESSIONS_MAX {
+        return Err(full(format!(
+            "this node has {SESSIONS_MAX} exec sessions open: try again when one ends"
+        )));
+    }
+    if open.get(who).is_some_and(|n| *n >= PER_CALLER) {
+        return Err(full(format!(
+            "{who} has {PER_CALLER} exec sessions open: end one first"
+        )));
+    }
+    *open.entry(who.to_string()).or_default() += 1;
+    Ok(Slot(who.to_string()))
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = open.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.0);
+            }
+        }
+    }
+}
+
 /// What a client asked of `exec`, from the query of its request.
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 pub struct Ask {
@@ -67,6 +109,7 @@ pub struct Ask {
 }
 
 /// An answer that is no: the Status's code and reason, and what it says.
+#[derive(Debug)]
 struct Failed {
     code: u16,
     reason: &'static str,
@@ -88,6 +131,7 @@ impl Failed {
             StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => "Forbidden",
             StatusCode::NOT_FOUND => "NotFound",
             StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => "Invalid",
+            StatusCode::TOO_MANY_REQUESTS => "TooManyRequests",
             _ => "InternalError",
         };
         Failed::new(status.as_u16(), reason, message)
@@ -203,7 +247,14 @@ pub async fn session<IO>(
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let stop = shared.stop.subscribe();
-    let run = prepare(&shared, &who, &verb, &namespace, &pod, &query).await;
+    // (The slot is held until the session ends, whichever way it goes.)
+    let (run, _slot) = match take(&who.to_string()) {
+        Ok(slot) => (
+            prepare(&shared, &who, &verb, &namespace, &pod, &query).await,
+            Some(slot),
+        ),
+        Err(failed) => (Err(failed), None),
+    };
     let failed = match run {
         Ok(Run::There(far)) => return crate::api::run::join(stop, io, far).await,
         Ok(Run::Here(run, stdin)) => {
@@ -288,10 +339,11 @@ async fn relay(
         let said = said["error"].as_str().map_or_else(|| said.to_string(), str::to_string);
         return Err(Failed::of(status, said));
     }
-    reply
-        .upgrade()
-        .await
-        .map_err(|_| down("did not give the session".into()))
+    match tokio::time::timeout(HOP, reply.upgrade()).await {
+        Ok(Ok(far)) => Ok(far),
+        Ok(Err(_)) => Err(down("did not give the session".into())),
+        Err(_) => Err(down("did not give the session in time".into())),
+    }
 }
 
 /// What node A asks node B: the pod, the caller, and what to run.
@@ -384,6 +436,13 @@ pub async fn hop(
         audit(Err(why.clone()));
         return say(StatusCode::CONFLICT, why);
     }
+    let slot = match take(&hop.caller) {
+        Ok(slot) => slot,
+        Err(failed) => {
+            audit(Err(failed.message.clone()));
+            return say(StatusCode::TOO_MANY_REQUESTS, failed.message);
+        }
+    };
     let run = match enter(placed.id, hop.ask.command.clone()).await {
         Ok(run) => run,
         Err(failed) => {
@@ -394,9 +453,14 @@ pub async fn hop(
     audit(Ok(()));
     let (stop, stdin) = (shared.stop.subscribe(), hop.ask.stdin);
     tokio::spawn(async move {
-        if let Ok(upgraded) = upgrade.await {
-            let (from, to) = tokio::io::split(TokioIo::new(upgraded));
-            pump(from, &Mutex::new(to), run, stdin, stop).await;
+        let _slot = slot;
+        match upgrade.await {
+            Ok(upgraded) => {
+                let (from, to) = tokio::io::split(TokioIo::new(upgraded));
+                pump(from, &Mutex::new(to), run, stdin, stop).await;
+            }
+            // The client never took the connection: nobody is left to end the process.
+            Err(_) => run.kill(),
         }
     });
     let mut reply = Response::new(Body::empty());
@@ -630,6 +694,33 @@ mod tests {
             &websocket::close_body(1011, "x"),
         );
         farewell(&to, said, listen(from, &to, None)).await;
+    }
+
+    /// A caller holds at most `PER_CALLER` sessions and the node `SESSIONS_MAX`: the next is a
+    /// named 429, and a place given back is free for the next.
+    #[test]
+    fn sessions_are_capped_per_caller_and_per_node_and_given_back() {
+        let mut held: Vec<Slot> = (0..PER_CALLER).map(|_| take("cap-alice").unwrap()).collect();
+        let refused = take("cap-alice").err().expect("a ninth session of one caller");
+        assert_eq!((refused.code, refused.reason), (429, "TooManyRequests"));
+        assert!(refused.message.contains("cap-alice"), "{}", refused.message);
+        assert!(take("cap-bob").is_ok(), "another caller is not held up by it");
+        held.pop();
+        let again = take("cap-alice").expect("a place given back is free");
+        drop((held, again));
+        assert!(
+            !OPEN.lock().unwrap().contains_key("cap-alice"),
+            "no entry is left once all are back"
+        );
+        let many: Vec<Slot> = (0..SESSIONS_MAX).map(|n| take(&format!("cap-{n}")).unwrap()).collect();
+        let refused = take("cap-last").err().expect("a session over the node's cap");
+        assert!(
+            refused.message.contains(&SESSIONS_MAX.to_string()),
+            "{}",
+            refused.message
+        );
+        drop(many);
+        assert!(take("cap-last").is_ok());
     }
 
     #[test]

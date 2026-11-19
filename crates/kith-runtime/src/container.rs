@@ -1013,6 +1013,8 @@ pub struct Entered {
     pub stdout: Option<File>,
     pub stderr: Option<File>,
     pid: Pid,
+    /// Its status was taken by `wait`: its pid is free for another process, and is not signalled.
+    reaped: AtomicBool,
     _awaited: Awaited,
 }
 
@@ -1021,9 +1023,14 @@ impl Entered {
         self.pid.as_raw()
     }
 
-    /// Ends it (its own process: what it started in turn is the container's to end).
+    /// Ends it (its own process: what it started in turn is the container's to end). Nothing is
+    /// signalled once `wait` has taken its status: the pid may be another process's by then.
+    // ponytail: a pid reused between the check and the signal is not guarded; the window is the
+    // two instructions, and the pid space has to wrap in it.
     pub fn kill(&self) {
-        let _ = nix::sys::signal::kill(self.pid, nix::sys::signal::Signal::SIGKILL);
+        if !self.reaped.load(Ordering::SeqCst) {
+            let _ = nix::sys::signal::kill(self.pid, nix::sys::signal::Signal::SIGKILL);
+        }
     }
 
     /// Blocks until it ends: its exit code, or 128 + the signal that killed it.
@@ -1031,8 +1038,14 @@ impl Entered {
         loop {
             match waitpid(self.pid, None) {
                 Err(nix::errno::Errno::EINTR) => {}
-                Ok(WaitStatus::Exited(_, code)) => return Ok(code),
-                Ok(WaitStatus::Signaled(_, signal, _)) => return Ok(128 + signal as i32),
+                Ok(WaitStatus::Exited(_, code)) => {
+                    self.reaped.store(true, Ordering::SeqCst);
+                    return Ok(code);
+                }
+                Ok(WaitStatus::Signaled(_, signal, _)) => {
+                    self.reaped.store(true, Ordering::SeqCst);
+                    return Ok(128 + signal as i32);
+                }
                 other => return err(format!("waiting for the process: {other:?}")),
             }
         }
@@ -1059,6 +1072,12 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
         .ctx(&what)?;
     let pipe = || nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).ctx(&what);
     let ((stdin, to_stdin), (from_stdout, stdout), (from_stderr, stderr)) = (pipe()?, pipe()?, pipe()?);
+    let container = Container::load(root.join("state").join(id)).ctx(&what)?;
+    // libcontainer's tenant takes no user, groups or working directory of its init's: left
+    // unsaid they are root, no groups and `/`, so they are read from the init's spec and said.
+    let made = oci_spec::runtime::Spec::load(container.bundle().join("config.json")).ctx(&what)?;
+    let process = made.process().as_ref();
+    let who = process.map(|process| process.user());
     let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
         .with_root_path(root.join("state"))
         .ctx(&what)?
@@ -1068,15 +1087,18 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
         // (The same entry as its init's: the filter and the user its image says.)
         .with_executor(Entry)
         .as_tenant()
-        .with_container_args(argv.to_vec());
+        .with_container_args(argv.to_vec())
+        .with_user(who.map(|who| who.uid()))
+        .with_group(who.map(|who| who.gid()))
+        .with_additional_gids(who.and_then(|who| who.additional_gids().clone()).unwrap_or_default())
+        .with_cwd(process.map(|process| process.cwd().clone()));
     // libcontainer's tenant joins every namespace of its init but the user one, so a process
     // without the rights over the container's other namespaces (a rootless kithd) is refused
     // the first of them. The helper that makes it joins the user namespace that owns the
     // container's pid namespace first (not its init's own: that may be one the image's user
     // made inside it, see `Entry`), when that is not this process's: a single-threaded process
     // may, which the helper is.
-    let init = Container::load(root.join("state").join(id))
-        .ctx(&what)?
+    let init = container
         .pid()
         .ok_or(crate::Error(format!("{what}: it is not running")))?;
     let pidns = File::open(format!("/proc/{init}/ns/pid")).ctx(&what)?;
@@ -1121,6 +1143,7 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
         stdout: Some(File::from(from_stdout)),
         stderr: Some(File::from(from_stderr)),
         pid,
+        reaped: AtomicBool::new(false),
         _awaited: Awaited(pid.as_raw()),
     })
 }
@@ -3537,6 +3560,75 @@ mod tests {
             "{init:?}"
         );
         assert!(init.len() >= 9, "{init:?}");
+    }
+
+    /// A process entered into a container whose unit has a user and a working directory runs as
+    /// that user, with its groups, in that directory: the init's own, not root in "/". (Root only:
+    /// a non-root runtime gives the init no user of its own to compare.)
+    #[test]
+    fn enter_runs_as_the_inits_user_groups_and_directory() {
+        use std::io::Read;
+        if !nix::unistd::getuid().is_root() {
+            return report_skip("not root: the init's user is not set by the runtime");
+        }
+        let root = std::env::temp_dir().join(format!("kith-enter-user-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        host_rootfs(&root.join("rootfs"), &["sleep", "sh", "cat"]);
+        fs::create_dir_all(root.join("rootfs/work")).unwrap();
+        let image = Image {
+            rootfs: root.join("rootfs"),
+            entrypoint: vec!["/bin/sleep".into(), "300".into()],
+            ..Image::default()
+        };
+        let unit = Unit {
+            user: Some(1234),
+            working_dir: Some("/work".into()),
+            ..Unit::default()
+        };
+        let (out, err) = (
+            File::create(root.join("out")).unwrap(),
+            File::create(root.join("err")).unwrap(),
+        );
+        let mut handle = match runtime.create("enter2", &image, &unit, out, err) {
+            Err(e) if cgroup_skip(&e.to_string()).is_some() => {
+                let _ = fs::remove_dir_all(&root);
+                return report_skip(&cgroup_skip(&e.to_string()).unwrap());
+            }
+            made => made.unwrap(),
+        };
+        handle.start().unwrap();
+        let state = root.join("runtime");
+        let run = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            let mut entered = enter(&state, "enter2", &argv)?;
+            drop(entered.stdin.take());
+            let mut out = String::new();
+            entered.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+            Ok::<_, crate::Error>((out, entered.wait()?))
+        };
+        let mine = |pid: &str| {
+            let said = run(&["/bin/cat", &format!("/proc/{pid}/status")]).unwrap().0;
+            said.lines()
+                .filter(|l| ["Uid:", "Gid:", "Groups:"].iter().any(|k| l.starts_with(k)))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let (tenant, init) = (mine("self"), mine("1"));
+        let cwd = run(&["/bin/sh", "-c", "pwd"]);
+        let _ = handle.kill();
+        while let Ok(None) = handle.try_wait() {
+            reap_orphans(&[handle.pid()]);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = handle.delete();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(tenant, init, "the tenant has its init's uid, gid and groups");
+        assert!(
+            init.iter().any(|l| l.starts_with("Uid:") && l.contains("1234")),
+            "the init is the unit's user: {init:?}"
+        );
+        assert_eq!(cwd.unwrap().0.trim(), "/work", "the init's working directory");
     }
 
     /// Only the overlay's EPERM is the kernel refusing the overlay root: the other failures of a
