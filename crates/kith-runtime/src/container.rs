@@ -28,6 +28,12 @@
 //! subreaper, see [`Runtime::new`]) once it has ended, so [`Handle::wait`] is as before. The
 //! helper is registered as awaited ([`spawn_awaited`]) while it is forked, so that
 //! [`reap_orphans`] leaves it to the create.
+//!
+//! [`enter`] makes a process in a running container the same way, in a child of `fork`, whose
+//! one extra step is a `setns` into the user namespace that owns the container's pid namespace
+//! (found with `NS_GET_USERNS`, and only when it is not the child's own), because libcontainer's
+//! tenant joins every namespace but that one, and a rootless process may join the others only
+//! from inside it; kithd's own process never does, and an ioctl that fails is a refusal.
 // ponytail: `fork` puts right the allocator's lock only. The child does take locks of tracing's
 // (a subscriber is made and set, and its first events register their call sites), of the
 // environment and of stderr, and another thread of this process may hold one at the fork. A
@@ -57,6 +63,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -997,6 +1004,125 @@ impl Runtime {
             }
         }
     }
+}
+
+/// A process [`enter`] started in a running container: its three ends of the pipes it runs on
+/// (each one `take`n by whoever drives it), and its exit status to [`Entered::wait`] for.
+pub struct Entered {
+    pub stdin: Option<File>,
+    pub stdout: Option<File>,
+    pub stderr: Option<File>,
+    pid: Pid,
+    _awaited: Awaited,
+}
+
+impl Entered {
+    pub fn pid(&self) -> i32 {
+        self.pid.as_raw()
+    }
+
+    /// Ends it (its own process: what it started in turn is the container's to end).
+    pub fn kill(&self) {
+        let _ = nix::sys::signal::kill(self.pid, nix::sys::signal::Signal::SIGKILL);
+    }
+
+    /// Blocks until it ends: its exit code, or 128 + the signal that killed it.
+    pub fn wait(&self) -> Result<i32> {
+        loop {
+            match waitpid(self.pid, None) {
+                Err(nix::errno::Errno::EINTR) => {}
+                Ok(WaitStatus::Exited(_, code)) => return Ok(code),
+                Ok(WaitStatus::Signaled(_, signal, _)) => return Ok(128 + signal as i32),
+                other => return err(format!("waiting for the process: {other:?}")),
+            }
+        }
+    }
+}
+
+/// Run `argv` in the running container `id` of the runtime kept under `root` (the `root` of
+/// [`Runtime::new`]): in its pid, mount, net and other namespaces, as its init's user, with its
+/// capabilities and its seccomp filter, and in its cgroup. What it reads and writes is the pipes
+/// of the [`Entered`] it returns. Nothing is run if the container is not running, and a program
+/// the image lacks is an error here, not a process that ends 127.
+///
+/// A tenant is made by libcontainer in a child of `fork`, as a create is (see the module doc's
+/// "Clone"); it is a child of this process once that ends, and is held as awaited until
+/// [`Entered`] is gone, so [`reap_orphans`] leaves its exit status to `wait`.
+// ponytail: the caller says the container is one this node made; nothing here checks that.
+pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
+    let what = format!("running a process in container `{id}`");
+    if argv.is_empty() {
+        return err(format!("{what}: no program to run"));
+    }
+    ContainerBuilder::new(id.into(), SyscallType::Linux)
+        .validate_id()
+        .ctx(&what)?;
+    let pipe = || nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).ctx(&what);
+    let ((stdin, to_stdin), (from_stdout, stdout), (from_stderr, stderr)) = (pipe()?, pipe()?, pipe()?);
+    let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
+        .with_root_path(root.join("state"))
+        .ctx(&what)?
+        .with_stdin(stdin)
+        .with_stdout(stdout)
+        .with_stderr(stderr)
+        // (The same entry as its init's: the filter and the user its image says.)
+        .with_executor(Entry)
+        .as_tenant()
+        .with_container_args(argv.to_vec());
+    // libcontainer's tenant joins every namespace of its init but the user one, so a process
+    // without the rights over the container's other namespaces (a rootless kithd) is refused
+    // the first of them. The helper that makes it joins the user namespace that owns the
+    // container's pid namespace first (not its init's own: that may be one the image's user
+    // made inside it, see `Entry`), when that is not this process's: a single-threaded process
+    // may, which the helper is.
+    let init = Container::load(root.join("state").join(id))
+        .ctx(&what)?
+        .pid()
+        .ok_or(crate::Error(format!("{what}: it is not running")))?;
+    let pidns = File::open(format!("/proc/{init}/ns/pid")).ctx(&what)?;
+    // (Refused by name when the kernel will not say: entering without its user namespace is no fallback.)
+    let owner = kith_dm_sys::owner_userns(&pidns).ctx(format!(
+        "{what}: refused, the user namespace that owns its pid namespace is not found"
+    ))?;
+    let own = File::open("/proc/self/ns/user").ctx(&what)?;
+    let user = (own.metadata().ctx(&what)?.ino() != owner.metadata().ctx(&what)?.ino()).then_some(owner);
+    let log = root.join(format!("enter-{}.log", nix::unistd::gettid()));
+    // (Held until the tenant is listed: it is no orphan the reaper may take before that.)
+    let mut awaited = AWAITED.lock().expect("nothing panics holding the list");
+    let said = {
+        let forking = FORKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dispatch = init_dispatch(&log)?;
+        let forked = kith_dm_sys::fork_start(|| {
+            let refused = AtomicBool::new(false);
+            let built = || {
+                if let Some(user) = &user {
+                    nix::sched::setns(user, nix::sched::CloneFlags::CLONE_NEWUSER)
+                        .map_err(|e| format!("joining its user namespace: {e}"))?;
+                }
+                builder.build().map_err(|e| e.to_string())
+            };
+            match logged_build(dispatch, &log, &refused, built) {
+                Ok(pid) => [&[0][..], &pid.as_raw().to_le_bytes()].concat(),
+                Err(e) => [&[1][..], e.to_string().as_bytes()].concat(),
+            }
+        })
+        .ctx(&what)?;
+        drop(forking);
+        forked.collect(HELPER_DEADLINE).ctx(&what)?
+    };
+    let pid = match said.split_first() {
+        Some((0, pid)) if pid.len() == 4 => Pid::from_raw(i32::from_le_bytes(pid.try_into().expect("four bytes"))),
+        Some((_, text)) => return err(format!("{what}: {}", String::from_utf8_lossy(text))),
+        None => return err(format!("{what}: the process making it ended before it said how")),
+    };
+    awaited.push(pid.as_raw());
+    Ok(Entered {
+        stdin: Some(File::from(to_stdin)),
+        stdout: Some(File::from(from_stdout)),
+        stderr: Some(File::from(from_stderr)),
+        pid,
+        _awaited: Awaited(pid.as_raw()),
+    })
 }
 
 /// Held while libcontainer starts a container: it reaches the notify socket by changing the
@@ -3299,6 +3425,118 @@ mod tests {
             Some(0),
             "the container's process ignores SIGPIPE: {ignored:x?}"
         );
+    }
+
+    /// A rootfs of this host's own programs: each of `bins` under `/bin`, and the libraries
+    /// `ldd` names for it at the same paths.
+    fn host_rootfs(rootfs: &Path, bins: &[&str]) {
+        for dir in [
+            "dev", "etc", "proc", "run", "sys", "tmp", "bin", "lib", "lib64", "usr/lib",
+        ] {
+            fs::create_dir_all(rootfs.join(dir)).unwrap();
+        }
+        for bin in bins {
+            let from = Path::new("/usr/bin").join(bin);
+            fs::copy(&from, rootfs.join("bin").join(bin)).unwrap();
+            let listed = Command::new("ldd").arg(&from).output().unwrap();
+            for lib in String::from_utf8_lossy(&listed.stdout)
+                .lines()
+                .filter_map(|line| line.split_whitespace().find(|word| word.starts_with('/')))
+            {
+                let to = rootfs.join(lib.trim_start_matches('/'));
+                fs::create_dir_all(to.parent().unwrap()).unwrap();
+                let _ = fs::copy(lib, to);
+            }
+        }
+    }
+
+    /// A process entered into a running container runs in its pid and mount namespaces (it sees
+    /// the container's own init as pid 1, and the image's files), takes input and gives output
+    /// by the pipes it is handed, and its exit status is the one `wait` returns; a program the
+    /// image lacks is an error, not a hang.
+    #[test]
+    fn enter_runs_a_process_in_the_containers_namespaces() {
+        use std::io::Read;
+        let root = std::env::temp_dir().join(format!("kith-enter-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        host_rootfs(&root.join("rootfs"), &["sleep", "sh", "cat"]);
+        let image = Image {
+            rootfs: root.join("rootfs"),
+            entrypoint: vec!["/bin/sleep".into(), "300".into()],
+            ..Image::default()
+        };
+        let (out, err) = (
+            File::create(root.join("out")).unwrap(),
+            File::create(root.join("err")).unwrap(),
+        );
+        let mut handle = match runtime.create("enter1", &image, &Unit::default(), out, err) {
+            Err(e) if cgroup_skip(&e.to_string()).is_some() => {
+                let _ = fs::remove_dir_all(&root);
+                return report_skip(&cgroup_skip(&e.to_string()).unwrap());
+            }
+            made => made.unwrap(),
+        };
+        handle.start().unwrap();
+        let state = root.join("runtime");
+        let run = |argv: &[&str], input: &str| {
+            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            let mut entered = enter(&state, "enter1", &argv)?;
+            let mut stdin = entered.stdin.take().unwrap();
+            stdin.write_all(input.as_bytes()).unwrap();
+            drop(stdin);
+            let (mut out, mut err) = (String::new(), String::new());
+            entered.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+            entered.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+            Ok::<_, crate::Error>((out, err, entered.wait()?))
+        };
+        let seen = run(&["/bin/cat", "/proc/1/cmdline"], "");
+        let echoed = run(&["/bin/sh", "-c", "cat; echo oops >&2; exit 7"], "hello");
+        // The user, capabilities and seccomp filter of the process are the container init's own, not
+        // those of the helper that joined its user namespace to make it.
+        let mine = |pid: &str| {
+            let said = run(&["/bin/cat", &format!("/proc/{pid}/status")], "").unwrap().0;
+            let keep = [
+                "Uid:",
+                "Gid:",
+                "CapInh:",
+                "CapPrm:",
+                "CapEff:",
+                "CapBnd:",
+                "CapAmb:",
+                "NoNewPrivs:",
+                "Seccomp:",
+            ];
+            said.lines()
+                .filter(|l| keep.iter().any(|k| l.starts_with(k)))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let (tenant, init) = (mine("self"), mine("1"));
+        let missing = run(&["/bin/nothing"], "").map(|_| ());
+        let _ = handle.kill();
+        // (A process that failed to start is left a zombie in the container's pid namespace, which
+        // its init waits for before it ends: kithd's reaper takes it, here the test does.)
+        while let Ok(None) = handle.try_wait() {
+            reap_orphans(&[handle.pid()]);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = handle.delete();
+        let _ = fs::remove_dir_all(&root);
+        let (out, _, code) = seen.unwrap();
+        assert!(
+            out.starts_with("/bin/sleep"),
+            "pid 1 of the container is its init: {out:?}"
+        );
+        assert_eq!(code, 0);
+        assert_eq!(echoed.unwrap(), ("hello".into(), "oops\n".into(), 7));
+        assert!(missing.is_err(), "a program the image lacks");
+        assert_eq!(tenant, init, "the tenant has its init's user, capabilities and filter");
+        assert!(
+            init.iter().any(|l| l.starts_with("Seccomp:") && l.ends_with('2')),
+            "{init:?}"
+        );
+        assert!(init.len() >= 9, "{init:?}");
     }
 
     /// Only the overlay's EPERM is the kernel refusing the overlay root: the other failures of a
