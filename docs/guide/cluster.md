@@ -107,6 +107,35 @@ spec:
 `kith node status` says of each peer `direct`, `through an edge node` or `unreachable`. Tunnels
 are WireGuard between the nodes' own keys, and kithd's traffic inside them is TLS as well.
 
+**Rotating a node's key.** Do it when the key file may have been read (a disk or backup that left
+the building, a node taken apart), or on whatever schedule you keep for keys. Nothing does it for
+you, and nothing about it is timed. Name the rotation on the node's Node, and apply it:
+
+```yaml
+spec:
+  mesh: { rotate: 2026-q4 }   # any name, up to 64 characters, that this node has not rotated under
+```
+
+The node makes a new key beside the old one (`mesh.next`, 0600, written whole or not at all) and
+says its public half (`status.mesh.next`). Each peer it reaches adds that key as a standby peer,
+with no addresses until it has shaken hands on it, and says so (`status.mesh.takes`). When every
+one has, the node switches its interface to the new key; when every one has shaken hands on it,
+the new key replaces `mesh.key` and the node says `status.mesh.rotated`. Until then the old key
+is the node's: the file is not touched. If either wait passes two minutes (a peer down, or
+withholding its word) the node goes back to the old key and says `status.mesh.failed`; nothing is
+lost, and the same name is not tried again, so rotate under a new name to try again. Details to
+know:
+
+- One node rotates at a time in a cluster, and only with a peer reached; a node with none is
+  refused (it would have nothing to prove the new key with).
+- Traffic between the node and its peers pauses from the switch until their next handshake, up to
+  half a minute. Rotate a node when that is fine; the others are not touched.
+- A node that stops half way starts on the old key (the file is it), and rotates again at once if
+  its Node still names a rotation it has not said it did. Take the name off once it says
+  `rotated`.
+- It changes the node's key only. The cluster's CA and certificates stay, so `kith node` access
+  and kithd's TLS are unchanged; there is no pre-shared key.
+
 ### Workers
 
 A node is a control node unless made a worker, which is trusted with less. The token's maker

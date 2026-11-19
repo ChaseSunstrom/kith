@@ -2963,6 +2963,13 @@
             }
           ],
           "description": "`never`: this node's traffic goes straight to the other node or not at all,\nnever through an edge node (which would see it). Defaults to `auto`."
+        },
+        "rotate": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Rotate this node's WireGuard key: a name of the rotation (any text, up to 64\ncharacters), made once for each new one. The node makes a new key, the nodes it is\nconnected to take it, and the old key stays in force until they have shaken hands on\nthe new one; none that do, and it stays. The node's status says the last one made\n(`status.mesh.rotated`)."
         }
       }
     },

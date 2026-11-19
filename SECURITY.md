@@ -840,6 +840,22 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - a log of Rekor v2 (an inclusion proof and a time from a timestamp authority, no
     promise) is not read: such a signature is refused, naming it;
   - an attestation (an in-toto statement of another kind) is never taken as a signature.
+- **A node's WireGuard key is replaced on its own Node's word, and never leaves it with no key.**
+  `spec.mesh.rotate` (a name; nothing rotates by itself or on a timer) makes the node write a
+  new key beside the old (`mesh.next`, mode 0600, written whole and synced, then renamed: half a
+  key file is never there) and say its public half. Each peer it reaches holds that key as a
+  standby peer with no addresses until a handshake on it, so a key nobody holds is no route for
+  anyone's traffic. The node switches its interface only when every such peer has said it holds
+  the new key, and writes it over the old one only when every one has shaken hands since the
+  switch (and the interface runs on it). After two minutes in either wait it goes back to the old
+  key and says `failed`; a node with no peer reached is refused. A node that says another's key
+  or next key is refused at the write (and ignored by the readers), as for `key`; the root
+  part's `MeshKey` steps are for the mesh's interface only and one at a time (the `meshing`
+  lock). What it does not do: it is no answer to a key that is already stolen while the node
+  runs on it (the thief holds the old key until the commit and the peers drop it; the switch is
+  the cut-off), the pause until the next handshake is up to half a minute, and a crash between
+  the rename and the status leaves the node on the new key saying the old one until its next
+  pass, which it corrects.
 - **A control node that is taken is the cluster taken, until its Node is deleted.** It has the
   whole store, every Secret in it, and a node's rights (a worker has less: below). `kith delete node/NAME` ends
   what it can ask for: each node looks a node certificate's name up in its own copy of
@@ -905,7 +921,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     against that node's own store: what it says of the replicas the scheduler gave it
     (how many are ready is counted again; a unit's address has to be in the worker's
     own part of the mesh), `os`, `mesh`, `serves`, `thumbprint` and `alone` in its own
-    Node's status (not a mesh key another Node says, which would cut both off; a thumbprint
+    Node's status (not a mesh key another Node says, nor a `next` one, which would cut both off; a thumbprint
     in a thumbprint's shape; `alone` null, or the times it ran alone and its risks), its own NodeKey once, the Devices
     and Seats whose `spec.node` is the worker (under a name that starts with the
     worker's own, with the labels discovery writes and no other, the node and the

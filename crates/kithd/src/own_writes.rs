@@ -473,6 +473,35 @@ mod tests {
         assert!(checked(&shared, "mesh-c", own("TkVX")).is_ok());
     }
 
+    /// The key a node is to take next (T-1017) may be neither another node's key nor its next one:
+    /// a node that says another's cannot make the others call that node by a key it does not hold.
+    #[tokio::test]
+    async fn own_writes_refuse_a_next_mesh_key_another_node_holds() {
+        let ca = pki::Ca::create().unwrap();
+        let shared: Arc<Shared> = shared_with("own-next", node(&ca, "next-c"), &[]).await;
+        {
+            let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: next-o}\nspec: {}\n";
+            let other = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(other).unwrap();
+            let mesh = serde_json::json!({ "mesh": { "key": "QUFB", "next": "Qk5O", "port": 51820 } });
+            store.set_status("Node/next-o", Some(mesh)).unwrap();
+        }
+        let own = |next: &str| Command::Patch {
+            statuses: vec![(
+                "Node/next-c".to_string(),
+                serde_json::json!({ "mesh": { "key": "TkVX", "next": next, "port": 51820 } })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )],
+        };
+        for refused in ["QUFB", "Qk5O"] {
+            assert!(checked(&shared, "next-c", own(refused)).is_err(), "{refused}");
+        }
+        assert!(checked(&shared, "next-c", own("Wlpa")).is_ok());
+    }
+
     /// The join a control node that holds the CA makes (`cluster.rs` `join` and `register`), not
     /// the leader: a new name's Node and its status pass; a Node already there is not made again
     /// or patched once registered; a node that holds no CA, and any other field, are refused.

@@ -183,18 +183,25 @@ fn serving_shape(key: &str, serves: &Value) -> Result<(), String> {
 }
 
 /// Refused where the mesh key `fields` say is another node's: two nodes that say one key are both
-/// left out of the mesh, so saying another's cuts it off. (A Node's own patch, by a worker or a
-/// control node alike: `own_writes` calls it too.)
+/// left out of the mesh, so saying another's cuts it off. The key a node is to take next
+/// (`next`, T-1017) is the same: it may be neither another node's key nor its next one. (A Node's
+/// own patch, by a worker or a control node alike: `own_writes` calls it too.)
 pub(crate) fn mesh_key_elsewhere(store: &Store, node: &str, key: &str, fields: &Fields) -> Result<(), String> {
-    let said = fields.get("mesh").and_then(|mesh| mesh["key"].as_str());
-    let theirs = |other: &Resource| {
-        let has = other.status.as_ref().and_then(|status| status["mesh"]["key"].as_str());
-        other.metadata.name != node && has.is_some() && has == said
+    let said = |field: &str| fields.get("mesh").and_then(|mesh| mesh[field].as_str());
+    let has = |other: &Resource, field: &str| {
+        other
+            .status
+            .as_ref()
+            .and_then(|status| status["mesh"][field].as_str().map(str::to_string))
     };
-    match store.list(Some("Node")).find(|other| theirs(other)) {
-        Some(other) => Err(refused(key, format!("the mesh key is node {}'s", other.metadata.name))),
-        None => Ok(()),
+    for other in store.list(Some("Node")).filter(|other| other.metadata.name != node) {
+        // (The same field is another's, and so is the other's current key for a next.)
+        let same = |mine: &str, theirs: &str| said(mine).is_some() && has(other, theirs).as_deref() == said(mine);
+        if same("key", "key") || same("next", "next") || same("next", "key") || same("key", "next") {
+            return Err(refused(key, format!("the mesh key is node {}'s", other.metadata.name)));
+        }
     }
+    Ok(())
 }
 
 /// What a node says of its people's device (`status.people`): null, or the device's public key
