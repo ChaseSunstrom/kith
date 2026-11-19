@@ -112,6 +112,10 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each held by al
             # once the cluster says signing is required and the admin's key is in it.
             # The nodes check signed entries once the store is in format 4, which the leader moves it to
             # when every member reads it.
+            # Each says on its console that it is a forge build, which a build that ships never does.
+            for log in "$work"/n?.log; do
+                grep -aq 'kithd: built with forge: POST /v1/forge appends unchecked entries; never ship this' "$log" || fail "$log has no line saying kithd is built with forge"
+            done
             tries=0
             until grep -aq 'every node checking them' "$work"/n?.log; do
                 tries=$((tries + 1))
@@ -131,8 +135,8 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each held by al
             }
             # An entry the admin signed (or not), in $work/NAME.entry; its nonce is the number, in 32 hex digits.
             expires=$(($(date +%s) + 300))
-            entry() { # NAME NONCE EXPIRES-PLUS SIGNED-BODY [CARRIED-BODY]
-                python3 "$root/ci/vm/forge_entry.py" "$work/admin.der" "$clusterid" "$((expires + $3))" "$(printf '%032x' "$2")" "$work/$4.json" ${5:+"$work/$5.json"} \
+            entry() { # NAME NONCE EXPIRES-PLUS SIGNED-BODY [CARRIED-BODY [COMMAND-BODY]]
+                python3 "$root/ci/vm/forge_entry.py" "$work/admin.der" "$clusterid" "$((expires + $3))" "$(printf '%032x' "$2")" "$work/$4.json" ${5:+"$work/$5.json"} ${6:+"$work/$6.json"} \
                     >"$work/$1.entry" || fail "the entry $1 was not made"
             }
             # The entry appended by whichever node leads (a follower says it does not): its answer, in $work/forged.json.
@@ -199,7 +203,12 @@ for r in sorted(found, key=lambda r: r["metadata"]["name"]):
             cp "$work/first.entry" "$work/replayed.entry"
             forge replayed
             grep -q '"applied":false' "$work/forged.json" || fail "a signed entry with a nonce taken was applied: $(cat "$work/forged.json")"
-            # Each node refused all three at apply, and wrote it in its audit log.
+            # (4) the signature kept whole, and the body it signed, but a command that is not what they make:
+            # the check of the signature passes, and what refuses it is the one that derives the command from the request.
+            entry swapped 5 4 harmless harmless changed
+            forge swapped
+            grep -q '"applied":false' "$work/forged.json" || fail "a signed entry with another command than its body makes was applied: $(cat "$work/forged.json")"
+            # Each node refused all four at apply, and wrote it in its audit log.
             audited() { # N WHO WHAT WHY
                 api "$1" GET '/v1/audit?tail=200' 2>/dev/null | python3 -c '
 import json, sys
@@ -213,9 +222,10 @@ sys.exit(0 if any(e["verb"] == "signed" and not e["ok"] and e["who"] == who and 
                 tries=0
                 until audited "$n" unsigned forged-bare 'a bare write that changes access is refused' \
                     && audited "$n" 'local socket' /v1/apply 'over this request' \
-                    && audited "$n" 'local socket' /v1/apply "$(printf '%032x' 2) of local socket was seen already"; do
+                    && audited "$n" 'local socket' /v1/apply "$(printf '%032x' 2) of local socket was seen already" \
+                    && audited "$n" 'local socket' /v1/apply 'is not what its method, path and body make'; do
                     tries=$((tries + 1))
-                    [ "$tries" -lt 60 ] || fail "n$n did not write all three refusals in its audit log: $(api "$n" GET '/v1/audit?tail=6' 2>&1 | head -c 1500)"
+                    [ "$tries" -lt 60 ] || fail "n$n did not write all four refusals in its audit log: $(api "$n" GET '/v1/audit?tail=6' 2>&1 | head -c 1500)"
                     sleep 1
                 done
             done
@@ -224,7 +234,7 @@ sys.exit(0 if any(e["verb"] == "signed" and not e["ok"] and e["who"] == who and 
             ! grep -q 'forged\|harmless' "$work/held" || fail "a forged resource is held: $(cat "$work/held")"
             agreed RoleBinding
             ! grep -q 'forged\|mallory' "$work/held" || fail "a forged RoleBinding is held: $(cat "$work/held")"
-            echo "vm.sh: three entries the leader was not asked for, a bare RoleBinding, a signed one with its body changed and one with a replayed nonce, each refused by all three nodes at apply" >&2
+            echo "vm.sh: four entries the leader was not asked for, a bare RoleBinding, a signed one with its body changed, one with a replayed nonce and one with a command its signed body does not make, each refused by all three nodes at apply" >&2
             ! grep -al 'Kernel panic\|panicked at' "$work"/n?.log || fail "a node panicked"
-            echo "vm.sh: ok: three nodes; the admin writing through n2 and n3 by a RoleBinding deleted through n1 while n2 was cut off: $said; and a leader that appended a bare RoleBinding, a signed entry with its body changed and one with a replayed nonce: all three nodes refused each at apply, and hold the same"
+            echo "vm.sh: ok: three nodes; the admin writing through n2 and n3 by a RoleBinding deleted through n1 while n2 was cut off: $said; and a leader that appended a bare RoleBinding, a signed entry with its body changed, one with a replayed nonce and one with a command its signed body does not make: all three nodes refused each at apply, and hold the same"
             exit 0

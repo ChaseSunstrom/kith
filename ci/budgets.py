@@ -435,7 +435,7 @@ def main():
     # package built alone gets other features of the crates both share, so it is another binary
     # (and each order would build those crates again).
     built = subprocess.run(["sh", "ci/musl.sh"], check=True, stdout=subprocess.PIPE, text=True,
-                           env={**os.environ, "KITH_MUSL_REMOTE": "1"})
+                           env={**{k: v for k, v in os.environ.items() if k != "KITHD_FEATURES"}, "KITH_MUSL_REMOTE": "1"})
     bin_dir = built.stdout.strip()
     with tempfile.TemporaryDirectory() as tmp:
         if args.times:

@@ -343,8 +343,12 @@ release binaries are not rebuilt with it; `ci/vm.sh --test access` boots that im
 (target/os-forge). The host crafts the entries (ci/vm/forge_entry.py signs with the admin's
 Ed25519 key, since a signed header is honoured only on the local socket) after setting
 `signing: required` by an admin-signed write: a bare RoleBinding, a Signed entry whose
-carried body differs from the signed one, and a Signed entry with a replayed nonce. n1, n2 and
-n3 each refuse all three at apply, audit each refusal, and `GET /v1/resources` lists agree.
+carried body differs from the signed one, a Signed entry with a replayed nonce, and one whose
+signature and body are whole but whose command is not what they make (the `same()` check). n1,
+n2 and n3 each refuse all four at apply, audit each refusal, and `GET /v1/resources` lists
+agree. A forge build says so on its console at start; `ci/musl.sh` fails a default build that
+has the route or that line in it, `os/build.sh` refuses `KITHD_FEATURES` outside
+`target/os-forge`, and `ci/budgets.py` builds without it.
 
 ### Layer 1a as built (T-0743), and where the code said otherwise
 

@@ -275,10 +275,14 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    when it reaches the leader, which decided again. Then, on an
                    image of a kithd built with the cargo feature forge (a leader
                    that can append an entry it was not asked for), under
-                   signing: required, three such entries: a bare RoleBinding, a
-                   signed entry whose body was changed and one with a replayed
-                   nonce; every node refuses each at apply (and audits it), and
-                   the three nodes' lists agree; needs what --test rollout needs
+                   signing: required, four such entries: a bare RoleBinding, a
+                   signed entry whose body was changed, one with a replayed
+                   nonce and one with a command its signed body does not make;
+                   every node refuses each at apply (and audits it), and the
+                   three nodes' lists agree; needs what --test rollout needs.
+                   The first run per checkout does a cold forge release build
+                   (kithd and kith, into a target folder of its own) and an
+                   image of it in target/os-forge: far longer than a warm one
   --test policy    instead: two nodes on the mesh started with --node-policy
                    no-exec-units,no-vm-paths,no-run. Expected: each says what it
                    kept of the bounding set (never SYS_MODULE, SYS_RAWIO,
