@@ -174,6 +174,12 @@ def test_nested_on_a_machine_that_cannot_run_it_writes_no_row():
     assert status == 77 and not any(line.startswith("nested ") for line in lines), (status, lines)
 
 
+def test_nested_when_vm_sh_skips_with_status_0_is_77():
+    with tempfile.TemporaryDirectory() as tmp:
+        status, lines = nested_sh("echo skipped: no kvm\nexit 0\n", tmp)
+    assert status == 77 and not any(line.startswith("nested ") for line in lines), (status, lines)
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):

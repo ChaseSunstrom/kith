@@ -69,6 +69,8 @@ if [ -n "$nested" ]; then
     status=0
     KITH_NESTED_OUT=$work/nested sh "$root/ci/vm.sh" --test nested --time 3000 || status=$?
     [ "$status" -ne 77 ] || exit 77
+    # (vm.sh skips with status 0: no rows at all means it could not run here.)
+    [ "$status" -ne 0 ] || [ -s "$work/nested" ] || exit 77
     # (Whatever rows the run made are kept, a failed run's too: a refusal is the finding.)
     [ ! -s "$work/nested" ] || tr -cd '[:print:]\n' <"$work/nested" >>"$out"
     cat "$work/nested" 2>/dev/null || true

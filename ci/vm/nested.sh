@@ -34,6 +34,8 @@ EOF
                     # (The probe itself did not run to its end: the Job's own words are the row.)
                     printf 'nested %s | the probe did not finish: %s | %s\n' "$1" "$line" "$(tr '\n' ' ' <"$work/$1.err" | cut -c1-400)" >>"$work/nested.rows"
                 fi
+                # (Each row goes out as it is made: a later wait that times out keeps the earlier rows.)
+                tail -n 1 "$work/nested.rows" >>"$rows"
             }
             # kith's defaults first; then each opening that the one before it showed to be needed.
             variant defaults ''
@@ -41,7 +43,6 @@ EOF
             variant userns ',"userNamespaces":true'
             variant userns-unconfined ',"userNamespaces":true,"seccomp":{"unconfined":true}'
             variant root ',"runAsUser":0'
-            cat "$work/nested.rows" >>"$rows"
             # The smallest opening: the first variant whose container (kithd's) ran.
             first=$(grep -m1 'its container: ran' "$work/nested.rows" | cut -d ' ' -f 2 || true)
             printf 'nested smallest opening: %s\n' "${first:-none of those tried}" | tee -a "$rows" >&2
