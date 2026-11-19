@@ -402,7 +402,10 @@ pub fn new_identity(name: &str) -> Resource {
 pub(crate) fn bare(store: &Store, command: &Command) -> Result<(), String> {
     // A Node's certificate or raft id is what its signature is checked by: a node's own, signed.
     let node = |(key, fields): &(String, serde_json::Map<String, serde_json::Value>)| {
-        key.starts_with("Node/") && ["certificate", "raftId"].iter().any(|field| fields.contains_key(*field))
+        key.starts_with("Node/")
+            && ["certificate", "raftId"]
+                .iter()
+                .any(|field| fields.contains_key(*field))
     };
     let what = match command {
         _ if crate::raft::changes_access(command) => "changes access",
@@ -411,7 +414,9 @@ pub(crate) fn bare(store: &Store, command: &Command) -> Result<(), String> {
     };
     // (The command first: the scan of the store for `required` only runs for such a write.)
     match store.checking() && required(store) {
-        true => Err(format!("a bare write that {what} is refused under spec.signing: required")),
+        true => Err(format!(
+            "a bare write that {what} is refused under spec.signing: required"
+        )),
         false => Ok(()),
     }
 }

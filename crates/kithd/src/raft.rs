@@ -917,7 +917,10 @@ impl Shared {
                 Err(_) => return Err(no_majority(refused)),
             };
             if let Some((id, leader)) = leader {
-                match self.forward(id, &leader, if own_signed { &entry } else { &command }, who).await {
+                match self
+                    .forward(id, &leader, if own_signed { &entry } else { &command }, who)
+                    .await
+                {
                     Forward::Done(reply, index) => return reply.map(|done| (done, index)),
                     Forward::Failed(e) => return Err(e),
                     Forward::Again(why) => refused = why.or(refused),
@@ -2320,13 +2323,19 @@ mod tests {
              ---\napiVersion: kith.dev/v1\nkind: Secret\nmetadata: {{name: acme-account, namespace: kith-system}}\nspec: {{data: {{}}}}\n",
             "a".repeat(64)
         );
-        let mut resources = kith_api::Resource::from_source(&text).unwrap().into_iter().map(Result::unwrap);
+        let mut resources = kith_api::Resource::from_source(&text)
+            .unwrap()
+            .into_iter()
+            .map(Result::unwrap);
         {
             let store = &mut shared.store.lock().unwrap().store;
             store.apply(resources.next().unwrap()).unwrap();
             kith_store::run(store, Command::MarkChecked).unwrap();
         }
-        let command = Command::Apply { resources: resources.collect(), at: 0 };
+        let command = Command::Apply {
+            resources: resources.collect(),
+            at: 0,
+        };
         let said = shared.submit_node(command).await.unwrap_err().to_string();
         assert!(said.contains("cannot sign its own write"), "{said}");
     }
