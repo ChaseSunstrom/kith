@@ -1,5 +1,3 @@
 # size nodes mem_mb ready_s mem_each_mb cpu_each_pct kithd_mb down_s up_s roll_s crash_s services svc_s spread answers store back_s
 # a size that fails has SIZE NODES MEM_MB, then the word in place of ready_s and what it waited for in vain | each node's free memory, tasks, open files, cgroups | oom kills | kithd's last console lines
 100 3 2048 0.55 0.50 -0.009 23.0 0.56 0.56 2.63 0.02 10 4.08 10/10 yes ok 0.01
-100 1 2048 limit the machines did not run it | kithd: pods' storage limits are held at the write, by the state disk's project quota;[    1.667426] images (97) used greatest stack depth: 13224 bytes left;[   53.822246] tokio-rt-worker (98) used greatest stack depth: 12728 bytes left;compare.sh: FAIL: the memory readers did not all run
-100 3 2048 limit the machines did not run it | kithd: pods' storage limits are held at the write, by the state disk's project quota;[    1.748823] images (98) used greatest stack depth: 13320 bytes left;[  176.860970] tokio-rt-worker (105) used greatest stack depth: 13144 bytes left;compare.sh: FAIL: the memory readers did not all run
