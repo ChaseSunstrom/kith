@@ -26,6 +26,8 @@ mod dns;
 mod encrypted;
 mod exits;
 mod files;
+#[cfg(feature = "forge")]
+mod forge;
 mod gpt;
 mod home;
 mod images;
@@ -356,6 +358,12 @@ fn main() -> ExitCode {
     releases::render_shim();
     // Then, before the runtime and its listeners, the limit of open files they share.
     raise_nofile();
+    // A test build says so, loudly, each time it starts (ci/vm/access.sh looks for the line).
+    #[cfg(feature = "forge")]
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"kithd: built with forge: POST /v1/forge appends unchecked entries; never ship this\n",
+    );
     // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
     if std::process::id() == 1 {
         keeper::keep();

@@ -17,7 +17,10 @@
     [ "$test" != modules ] || KITH_OS_SPEC=os/examples/all.yaml
     osdir=$root/target/os
     [ -z "${KITH_OS_SPEC:-}" ] || osdir=$root/target/os-spec
-    sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC" --out "$osdir"} >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
+    # (access: the image of a kithd built with the feature forge, whose leader can append an entry it
+    # was not asked for (ci/vm/access.sh); in a folder of its own, so the plain image stays plain.)
+    [ "$test" != access ] || { KITHD_FEATURES=forge osdir=$root/target/os-forge; export KITHD_FEATURES; }
+    sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC"} --out "$osdir" >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
     if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
         . "$root/ci/vm/cluster.sh"
     fi

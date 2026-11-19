@@ -52,7 +52,9 @@
 #                               and DNS answers from it; the holder reset, and the next stopped: another
 #                               announces it within 10 s and two are never heard at once
 #   sh ci/vm.sh --test access   three nodes: a write let through by a node that had not heard its
-#                               RoleBinding was deleted is refused where the log is kept
+#                               RoleBinding was deleted is refused where the log is kept; and
+#                               three entries a forging leader appends (bare, a changed body,
+#                               a replayed nonce) are refused at apply by every node
 #   sh ci/vm.sh --test policy   two nodes whose policy turns off exec units, VM paths and /v1/run: kithd
 #                               cut its bounding set, and a pod that is root, a container with no filter
 #                               and a sandbox inside a container still run
@@ -274,8 +276,17 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    n1, once while n2 is cut off from the others. Expected: no write
                    begun after the deletion was acknowledged is acknowledged or
                    kept, and the one n2 let through while it was cut off is refused
-                   when it reaches the leader, which decided again; needs what
-                   --test rollout needs
+                   when it reaches the leader, which decided again. Then, on an
+                   image of a kithd built with the cargo feature forge (a leader
+                   that can append an entry it was not asked for), under
+                   signing: required, four such entries: a bare RoleBinding, a
+                   signed entry whose body was changed, one with a replayed
+                   nonce and one with a command its signed body does not make;
+                   every node refuses each at apply (and audits it), and the
+                   three nodes' lists agree; needs what --test rollout needs.
+                   The first run per checkout does a cold forge release build
+                   (kithd and kith, into a target folder of its own) and an
+                   image of it in target/os-forge: far longer than a warm one
   --test policy    instead: two nodes on the mesh started with --node-policy
                    no-exec-units,no-vm-paths,no-run. Expected: each says what it
                    kept of the bounding set (never SYS_MODULE, SYS_RAWIO,

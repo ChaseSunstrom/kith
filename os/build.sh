@@ -95,6 +95,12 @@ root=$(cd "$here/.." && pwd)
 # (Absolute: systemd-repart ignores a relative CopyBlocks= path and leaves the partition empty.)
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
+# KITHD_FEATURES (ci/musl.sh) builds a kithd with test-only routes: only into the folder
+# ci/vm.sh gives that image, so one left in the environment never makes an image that ships.
+if [ -n "${KITHD_FEATURES:-}" ] && [ "$out" != "$root/target/os-forge" ]; then
+    echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): only for --out target/os-forge, not $out (unset it)" >&2
+    exit 2
+fi
 cache=${KITH_OS_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/kith-os}
 efi=/usr/lib/systemd/boot/efi
 die() { echo "build.sh: $1" >&2; exit 1; }

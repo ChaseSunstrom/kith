@@ -48,7 +48,11 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 pub fn router(shared: Arc<Shared>) -> Router {
-    Router::new()
+    let router = Router::new();
+    // (Test only: a build with the feature `forge`, never a release's.)
+    #[cfg(feature = "forge")]
+    let router = router.route("/v1/forge", post(crate::forge::append));
+    router
         .route("/v1/apply", post(apply))
         .route("/v1/watch", get(watch))
         .route("/v1/resources", get(list))
