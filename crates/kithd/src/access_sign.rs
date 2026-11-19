@@ -471,7 +471,7 @@ pub fn admit(store: &Store, cluster: &str, command: &Command, leader: kith_store
     };
     // A control node's own write, signed by its node key (`own_writes::sign`).
     if let Some(node) = said.who.strip_prefix("node:") {
-        return crate::own_writes::admit(store, cluster, node, header, &asked, command);
+        return crate::own_writes::admit(store, cluster, node, leader, header, &asked, command);
     }
     let (signer, read) = signature(header, cluster, &[target], &asked, store)?;
     match certificate_of(path) {

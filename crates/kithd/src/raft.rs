@@ -878,21 +878,14 @@ impl Shared {
             (state.store.checking(), access_sign::required(&state.store))
         };
         // A node's own write (`submit_node`) is signed by its key where callers sign, and goes
-        // to the leader so (`own_writes`).
-        let own = OWN
-            .try_with(|_| ())
-            .ok()
-            .filter(|()| checking && required)
-            .and(self.cluster.as_ref())
-            .and_then(|cluster| {
-                let id = pki::fingerprint(&cluster.me.ca).ok()?;
-                crate::own_writes::sign(&cluster.me, &id, &command)
-            });
+        // to the leader so (`own_writes`): signed afresh at each try below (a nonce is taken once,
+        // and a try whose answer was lost may have taken it), and refused where it cannot be
+        // signed (a bare Volume, Job or Secret is refused at apply).
+        let own = OWN.try_with(|_| ()).is_ok() && checking && required;
+        let own = self.cluster.as_ref().filter(|_| own);
         let relay = access_sign::current().and_then(|signed| Some((signed.header, signed.relay?)));
-        let own_signed = own.is_some();
-        let entry = match (own, relay) {
-            (Some(entry), _) => entry,
-            (None, Some((header, relay))) if checking && relay.signs(&command) => Command::Signed {
+        let plain = match relay {
+            Some((header, relay)) if checking && relay.signs(&command) => Command::Signed {
                 header,
                 method: relay.method,
                 path: relay.path,
@@ -904,6 +897,15 @@ impl Shared {
         let deadline = Instant::now() + PATIENCE;
         let mut refused = None;
         loop {
+            let signed = own.map(|cluster| {
+                let id = pki::fingerprint(&cluster.me.ca).ok();
+                id.and_then(|id| crate::own_writes::sign(&cluster.me, &id, &command))
+            });
+            let own_signed = signed.is_some();
+            let entry = match signed {
+                Some(entry) => entry.ok_or_else(|| unavailable("this node cannot sign its own write"))?,
+                None => plain.clone(),
+            };
             let turn = self.turn(&command, who).await?;
             let written = tokio::time::timeout(PATIENCE, self.raft.client_write(entry.clone())).await;
             // (Let go before the leader is asked: it holds its own.)
@@ -2301,6 +2303,32 @@ mod tests {
         HEARD.lock().unwrap().insert(id, (4, Instant::now()));
         mark(&shared, &mut said).await.unwrap();
         assert_eq!(format(&shared), 4);
+    }
+
+    /// Under `required` a node's own write that cannot be signed fails at once: written bare, a
+    /// Volume, Job or Secret is refused at apply, and the caller would be told nothing of it.
+    #[tokio::test]
+    async fn a_node_that_cannot_sign_its_own_write_fails_it_under_required() {
+        use crate::cluster::pinned_peer::{node, shared_of};
+        let ca = pki::Ca::create().unwrap();
+        // (A cluster whose node key was read, then lost: `Cluster::new` reads it, so it is spoilt after.)
+        let mut cluster = crate::cluster::Cluster::new(node(&ca, "cannot-sign-c"), None).unwrap();
+        cluster.me.key = "not a key".into();
+        let shared = shared_of("cannot-sign", cluster, &[]).await;
+        let text = format!(
+            "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{name: home}}\nspec: {{adminKey: '{}', signing: required}}\n\
+             ---\napiVersion: kith.dev/v1\nkind: Secret\nmetadata: {{name: acme-account, namespace: kith-system}}\nspec: {{data: {{}}}}\n",
+            "a".repeat(64)
+        );
+        let mut resources = kith_api::Resource::from_source(&text).unwrap().into_iter().map(Result::unwrap);
+        {
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(resources.next().unwrap()).unwrap();
+            kith_store::run(store, Command::MarkChecked).unwrap();
+        }
+        let command = Command::Apply { resources: resources.collect(), at: 0 };
+        let said = shared.submit_node(command).await.unwrap_err().to_string();
+        assert!(said.contains("cannot sign its own write"), "{said}");
     }
 
     #[test]

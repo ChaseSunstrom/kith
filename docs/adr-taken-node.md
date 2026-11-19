@@ -464,9 +464,13 @@ nodes too, and a replay decides alike.
   secret, the scheduler's Volume and a cron Job are `Signed` by the node's own key, header
   `who=node:<name>`, path `/v1/own`, carrying `key=<P-256 point>`. The point is accepted only
   when its fingerprint is the one in that Node's `status.certificate`, so another node's key
-  is refused. The body must equal the command; the command must be one the node may make
-  (`made`: a Volume for a provisioned claim on that node, a Job of an existing CronJob, the
-  ACME account or an exposed host's TLS secret); the nonce is taken once. `own_writes::checked`
+  is refused, and so is a worker's. The body, parsed, must be the command (not its bytes); the
+  command must be the work of the node that signs it (`made`): the leader's scheduler makes a
+  Volume (new, for a claim that says `provision`, of the claim's size) and its cron a Job (new,
+  its spec the CronJob's `job`); a Secret (the ACME account or an exposed host's TLS secret) is
+  the leader's, or a node's whose status says it serves ingress. The nonce is taken once, and a
+  retry signs again with a fresh one; a node that cannot sign fails the write under `required`
+  rather than send it bare. `own_writes::checked`
   is a pure function of the store and the entry. A follower forwards its signed entry to the
   leader, which accepts it only from the control node named in `who`. Callers use
   `raft::submit_node`. A bare Patch of a Node's `certificate` or `raftId` is refused at apply
@@ -484,6 +488,8 @@ nodes too, and a replay decides alike.
   nothing under `required` (`releases::refuse_access`) and says so in the Release's or
   Source's status, once, not in an entry every node audits again each round. Slice 6
   (T-0850, `writer_may` for a Release and a Source) lifts it.
+- **What a taken control node can still do:** set `serves.ingress` on its own Node status
+  and then sign a Secret for an exposed host; the status is not itself signed yet.
 - **What a taken leader can still do:** put its own `publicKey` on an Identity the admin
   signed the route for: `certified` checks the key is a valid P-256 point and that nothing
   else changed, but not whose it is, as the key is made after the signature (see "What

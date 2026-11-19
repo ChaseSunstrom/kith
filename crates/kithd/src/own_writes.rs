@@ -325,6 +325,7 @@ pub fn admit(
     store: &Store,
     cluster: &str,
     node: &str,
+    leader: kith_store::NodeId,
     header: &str,
     asked: &Asked,
     command: &Command,
@@ -340,13 +341,19 @@ pub fn admit(
     if status.is_none_or(|status| status["certificate"] != print.as_str()) {
         return Err(not("its key is not its Node's"));
     }
+    if crate::access::is_worker(store, node) {
+        return Err(not("it is not a control node"));
+    }
     let message = crate::access_sign::bytes(cluster, read.target, asked, read.who, read.expires, read.nonce);
     let holds = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &point).verify(message.as_bytes(), &sig);
-    // (The body is the JSON `sign` wrote of this command: the bytes this build writes of it.)
-    if holds.is_err() || !serde_json::to_vec(command).is_ok_and(|body| body == asked.body) {
+    // (The body parsed is this command, as this build writes each: not the bytes another build wrote.)
+    let json = |command: &Command| serde_json::to_vec(command).ok();
+    let sent = serde_json::from_slice::<Command>(asked.body).ok();
+    if holds.is_err() || !sent.as_ref().and_then(json).is_some_and(|sent| json(command) == Some(sent)) {
         return Err(not("its signature or body is not this entry's"));
     }
-    signed(store, kith_mesh::prefix(cluster.as_bytes()), node, command)?;
+    let leads = kith_store::node_id(node) == leader;
+    signed(store, kith_mesh::prefix(cluster.as_bytes()), (node, leads), command)?;
     let taken = store.takes_nonce(read.who, read.expires, read.nonce);
     taken.map_err(|e| e.to_string())
 }
@@ -354,19 +361,22 @@ pub fn admit(
 /// What `node`, a control node, may write signed: an Apply of Volumes, Jobs and Secrets that
 /// [`made`] allows; else what it writes as itself bare, but for the blobs it holds (a signed
 /// entry is decided by the store alone: no blob is held) and the register of a Node by its join.
-fn signed(store: &Store, prefix: Ipv6Addr, node: &str, command: &Command) -> Result<(), String> {
+fn signed(store: &Store, prefix: Ipv6Addr, by: (&str, bool), command: &Command) -> Result<(), String> {
     match command {
         Command::Apply { resources, .. } if resources.iter().all(|r| ["Volume", "Job", "Secret"].contains(&r.kind.as_str())) => {
-            resources.iter().try_for_each(|resource| made(store, prefix, resource))
+            resources.iter().try_for_each(|resource| made(store, prefix, by, resource))
         }
-        _ => rules(store, Some(prefix), &|_| false, node, command.clone()).map(drop),
+        _ => rules(store, Some(prefix), &|_| false, by.0, command.clone()).map(drop),
     }
 }
 
-/// May a control node make `resource`? A Volume: one a claim that says `provision` asks for, on a
-/// Node, in its own `data` directory. A Job: one of a CronJob that is there, new. A Secret: the
-/// account of ACME, or the certificate of a host the Services expose.
-fn made(store: &Store, prefix: Ipv6Addr, resource: &Resource) -> Result<(), String> {
+/// May the control node `by` (its name, and whether it leads) make `resource`? Each is the work of
+/// the node that does it: the leader's scheduler makes a Volume and its cron a Job; a Secret is the
+/// leader's, or a node's that serves ingress (it orders its own certificates). A Volume: one a
+/// claim that says `provision` asks for (its size), on a Node, in its own `data` directory. A Job:
+/// new, of a CronJob that is there, with that CronJob's `job` as its spec. A Secret: the account
+/// of ACME, or the certificate of a host the Services expose.
+fn made(store: &Store, prefix: Ipv6Addr, by: (&str, bool), resource: &Resource) -> Result<(), String> {
     let key = resource.key();
     let there = |key: &str| store.get(key).is_some();
     let spec = &resource.spec;
@@ -374,12 +384,19 @@ fn made(store: &Store, prefix: Ipv6Addr, resource: &Resource) -> Result<(), Stri
         "Volume" => {
             let claim = store.get(&key.replacen("Volume", "VolumeClaim", 1));
             let home = spec["node"].as_str().is_some_and(|node| there(&format!("Node/{node}")));
-            !there(&key) && home && spec["path"] == "data" && claim.is_some_and(|claim| claim.spec["provision"] == true)
+            let asked = claim.is_some_and(|claim| claim.spec["provision"] == true && claim.spec["size"] == spec["size"]);
+            by.1 && !there(&key) && home && spec["path"] == "data" && asked
         }
-        "Job" => !there(&key) && crate::releases::owner(resource).is_some_and(|owner| owner.starts_with("CronJob/") && there(owner)),
+        "Job" => {
+            let cron = crate::releases::owner(resource).filter(|owner| owner.starts_with("CronJob/"));
+            let cron = cron.and_then(|owner| store.get(owner));
+            by.1 && !there(&key) && cron.is_some_and(|cron| cron.spec["job"] == *spec)
+        }
         _ => {
+            let status = store.get(&format!("Node/{}", by.0)).and_then(|node| node.status.as_ref());
+            let orders = by.1 || status.is_some_and(|status| status["serves"]["ingress"] == true);
             let (hosts, _) = crate::ingress::exposed(store, prefix);
-            key == crate::ingress::ACCOUNT || hosts.iter().any(|(host, e)| crate::ingress::tls_secret(host, e) == key)
+            orders && (key == crate::ingress::ACCOUNT || hosts.iter().any(|(host, e)| crate::ingress::tls_secret(host, e) == key))
         }
     };
     match allowed {
@@ -947,10 +964,10 @@ mod tests {
         let admitted = |store: &Store, entry: &Command| crate::access_sign::admit(store, &id, entry, kith_store::node_id("a"));
         let by = |me: &pki::Identity, command: Command| sign(me, &id, &command).unwrap();
 
-        // What is asked: applied, signed by either node, and once (its nonce is taken).
+        // What is asked: applied, signed by the leader that does the work, and once (its nonce is taken).
         for (me, command) in [
             (a, apply(vec![volume("db", "b", "data")])),
-            (b, apply(vec![job.clone()])),
+            (a, apply(vec![job.clone()])),
             (a, apply(vec![account.clone()])),
         ] {
             let entry = by(me, command);
@@ -992,6 +1009,82 @@ mod tests {
         let bare_key = header.split("; key=").next().unwrap().to_string();
         let entry = Command::Signed { header: bare_key, method, path, body, command: Box::new(command) };
         assert!(admitted(&store, &entry).unwrap_err().contains("not its Node's"));
+    }
+
+    /// A write is the work of the node that does it: the leader's scheduler makes a Volume and its
+    /// cron a Job, and a Secret is the leader's or a serving node's. Another control node's key (a
+    /// Node's own, so it passes the key check) makes none of them, nor does a worker's; and what the
+    /// CronJob's template or the claim's size does not say is refused from the leader too.
+    #[test]
+    fn own_writes_signed_are_the_work_of_the_node_that_does_it() {
+        let ca = pki::Ca::create().unwrap();
+        let (mut store, nodes) = required(&ca, &["a", "b", "w"]);
+        let (a, b, w) = (&nodes[0], &nodes[1], &nodes[2]);
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        store.apply(named("Node", "w", serde_json::json!({ "trust": "worker" }))).unwrap();
+        let template = serde_json::json!({ "template": { "exec": [{ "name": "tick", "command": ["true"] }] } });
+        store.apply(named("VolumeClaim", "db", serde_json::json!({ "size": "1Gi", "provision": true }))).unwrap();
+        store.apply(named("CronJob", "tick", serde_json::json!({ "schedule": "* * * * *", "job": template }))).unwrap();
+        let volume = |size: &str| named("Volume", "db", serde_json::json!({ "node": "b", "path": "data", "size": size }));
+        let job = |spec: serde_json::Value| {
+            let mut job = named("Job", "tick-1", spec);
+            job.metadata.annotations.insert(crate::releases::OWNER.into(), "CronJob/default/tick".into());
+            job
+        };
+        let secret = || resource(serde_json::json!({
+            "apiVersion": kith_api::API_VERSION, "kind": "Secret",
+            "metadata": { "name": "acme-account", "namespace": "kith-system" }, "spec": { "data": {} },
+        }));
+        let admitted = |store: &Store, me: &pki::Identity, command: Command| {
+            let entry = sign(me, &id, &command).unwrap();
+            crate::access_sign::admit(store, &id, &entry, kith_store::node_id("a"))
+        };
+        let writes = [
+            apply(vec![volume("1Gi")]),
+            apply(vec![job(template.clone())]),
+            apply(vec![secret()]),
+        ];
+        for command in &writes {
+            assert_eq!(admitted(&store, a, command.clone()), Ok(()), "{command:?}");
+            let said = admitted(&store, b, command.clone()).unwrap_err();
+            assert!(said.contains("asks for it"), "another control node: {command:?}: {said}");
+            let said = admitted(&store, w, command.clone()).unwrap_err();
+            assert!(said.contains("not a control node"), "a worker: {command:?}: {said}");
+        }
+        // The leader's Job is its CronJob's template, and its Volume the claim's size.
+        let other = serde_json::json!({ "template": { "exec": [{ "name": "x", "command": ["rm"] }] } });
+        assert!(admitted(&store, a, apply(vec![job(other)])).is_err());
+        assert!(admitted(&store, a, apply(vec![volume("9Gi")])).is_err());
+        // A Secret that is there is overwritten by the leader (it renews), never by another node ...
+        store.apply(secret()).unwrap();
+        assert_eq!(admitted(&store, a, apply(vec![secret()])), Ok(()));
+        assert!(admitted(&store, b, apply(vec![secret()])).is_err());
+        // ... unless that one serves ingress, and orders its own certificates.
+        let status = serde_json::json!({ "certificate": pki::print_of(&b.cert).unwrap(), "serves": { "ingress": true } });
+        store.set_status("Node/b", Some(status)).unwrap();
+        assert_eq!(admitted(&store, b, apply(vec![secret()])), Ok(()));
+        assert!(admitted(&store, b, apply(vec![volume("1Gi")])).is_err());
+    }
+
+    /// A try again of a write whose answer was lost (`raft.rs` `write_as` signs at each try) is
+    /// signed with a nonce of its own: the first try's is taken, and the second is not refused for it.
+    #[test]
+    fn own_writes_signed_again_take_a_nonce_of_their_own() {
+        let ca = pki::Ca::create().unwrap();
+        let (mut store, nodes) = required(&ca, &["a"]);
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        let secret = resource(serde_json::json!({
+            "apiVersion": kith_api::API_VERSION, "kind": "Secret",
+            "metadata": { "name": "acme-account", "namespace": "kith-system" }, "spec": { "data": {} },
+        }));
+        let command = apply(vec![secret]);
+        let (first, again) = (sign(&nodes[0], &id, &command).unwrap(), sign(&nodes[0], &id, &command).unwrap());
+        let leader = kith_store::node_id("a");
+        for entry in [&first, &again] {
+            assert_eq!(crate::access_sign::admit(&store, &id, entry, leader), Ok(()));
+            kith_store::run(&mut store, entry.clone()).unwrap();
+        }
+        assert!(crate::access_sign::admit(&store, &id, &first, leader).is_err(), "the same nonce twice");
     }
 
     /// The CA node registers a joiner, signed: its address, raft id and certificate, once. Another
