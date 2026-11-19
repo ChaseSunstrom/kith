@@ -62,12 +62,25 @@ const BETWEEN_ORDERS: u64 = 3600;
 /// How long the leader waits on an ingress worker that does not say its view holds the account's
 /// thumbprint (one that hangs, or was taken, never says it) before it orders anyway.
 const WAIT_AT_MOST: u64 = 600;
+/// How long a leader waits for its linearizable read before a term's first order: past it the round
+/// orders nothing, and the read is tried again at the next look.
+const READ_AT_MOST: Duration = Duration::from_secs(30);
 
 /// The seconds between two orders for a host: shorter where the last was asked while a worker
 /// had not said it holds the thumbprint, so that worker's 404 holds the host up less (four
 /// tries an hour: an authority allows about five failed ones for a host, Let's Encrypt five).
 fn between(hurried: bool) -> u64 {
     if hurried { 900 } else { BETWEEN_ORDERS }
+}
+
+/// Whether a host was asked for within `between` seconds at `now`: by this process (`tried_at`), or
+/// as the store says (`store_at`, the Service's status `tls.at`, written before the ACME call, so it
+/// holds across a leader change, where `tried` starts empty).
+fn asked_lately(tried_at: Option<u64>, store_at: Option<u64>, now: u64, between: u64) -> bool {
+    [tried_at, store_at]
+        .into_iter()
+        .flatten()
+        .any(|at| now.saturating_sub(at) < between)
 }
 
 /// Whether orders still wait on `waits`, the ingress workers that have not said their view holds
@@ -1003,19 +1016,13 @@ async fn order(
     between: u64,
 ) {
     let me = shared.members.me();
-    // (Whatever the store says or cannot be told: this node asks once in that time at most.)
-    if tried
-        .get(host)
-        .is_some_and(|tried| now().saturating_sub(*tried) < between)
-    {
-        return;
-    }
     let asked = {
         let state = shared.store.lock().expect("nothing panics holding the store");
         let status = state.store.get(&of.service).and_then(|service| service.status.clone());
         status.and_then(|status| status["tls"]["at"].as_u64())
     };
-    if asked.is_some_and(|asked| now().saturating_sub(asked) < between) {
+    // (Whatever the store says or cannot be told: this node asks once in that time at most.)
+    if asked_lately(tried.get(host).copied(), asked, now(), between) {
         return;
     }
     tried.insert(host.to_string(), now());
@@ -1144,6 +1151,8 @@ pub async fn run(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut generation = shared.generation.subscribe();
     let mut tried = BTreeMap::new();
+    // (The term whose first order followed a linearizable read: a new leader's store may lag the old leader's.)
+    let mut read_term: Option<u64> = None;
     // (Since when orders wait on a worker; the hosts last ordered without waiting on one.)
     let (mut since, mut hurried) = (None, std::collections::BTreeSet::<String>::new());
     let mut said = false;
@@ -1151,9 +1160,9 @@ pub async fn run(
     let mut saying: Option<(String, Instant)> = None;
     let mut waited = Vec::new();
     loop {
-        let leading = {
+        let (leading, term) = {
             let metrics = shared.raft.metrics().borrow().clone();
-            metrics.current_leader == Some(metrics.id)
+            (metrics.current_leader == Some(metrics.id), metrics.current_term)
         };
         let (worker, wanted, (wanting, account, naming)) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -1251,6 +1260,27 @@ pub async fn run(
                             );
                         }
                         waited = waits;
+                        // The leader's first order of a term follows a linearizable read: the store has then
+                        // applied what the old leader committed, its `tls.at` for each host, which an empty
+                        // `tried` cannot tell. A read that fails or is late orders nothing this round.
+                        if leading && read_term != Some(term) {
+                            let read = tokio::time::timeout(READ_AT_MOST, shared.raft.ensure_linearizable());
+                            match read.await {
+                                Ok(Ok(_)) => read_term = Some(term),
+                                Ok(Err(e)) => {
+                                    eprintln!(
+                                        "kithd: ingress: no certificate is asked for yet, the store is not read: {e}"
+                                    );
+                                    return;
+                                }
+                                Err(_) => {
+                                    eprintln!(
+                                        "kithd: ingress: no certificate is asked for yet, the store is not read in time"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
                         for (host, of) in &wanting {
                             let before = tried.get(host).copied();
                             let pause = between(hurried.contains(host));
@@ -1346,6 +1376,24 @@ mod tests {
         assert!(!holds_up(&mut since, &silent, 6000 + WAIT_AT_MOST));
         // (Four tries an hour: an authority allows about five failed ones for a host.)
         assert_eq!((between(true), between(false)), (900, BETWEEN_ORDERS));
+    }
+
+    /// A new leader's `tried` is empty: the store's `tls.at`, which the old leader wrote before its
+    /// ACME call, is what keeps it from ordering a host the old one asked for within `between`.
+    /// One asked long ago, or never, is due; this process's own ask counts the same way.
+    #[test]
+    fn asked_lately_a_new_leader_orders_no_host_the_old_one_asked_for() {
+        let (now, between) = (1_000_000, BETWEEN_ORDERS);
+        let ago = |secs: u64| now - secs;
+        assert!(asked_lately(None, Some(ago(60)), now, between));
+        assert!(!asked_lately(None, Some(ago(2 * between)), now, between));
+        assert!(!asked_lately(None, None, now, between));
+        assert!(asked_lately(Some(ago(60)), None, now, between));
+        let long_ago = ago(2 * between);
+        assert!(!asked_lately(Some(long_ago), Some(long_ago), now, between));
+        // (Exactly `between` seconds ago is due again; one second less is not.)
+        assert!(!asked_lately(None, Some(ago(between)), now, between));
+        assert!(asked_lately(None, Some(ago(between - 1)), now, between));
     }
 
     #[test]
