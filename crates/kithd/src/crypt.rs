@@ -91,7 +91,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Where in the config partition the record is (the node's config is its first 64 kB),
 /// and how long it may be. A copy of it follows, written first: a write cut by a power
@@ -781,6 +781,8 @@ async fn console(
             if line.is_empty() {
                 continue;
             }
+            // (Somebody is there: the wait of a system on trial starts over.)
+            TYPED.notify_one();
             let due = tokio::time::Instant::now() + ANSWER;
             let (judge, by) = (record.clone(), pin.clone());
             let judged = tokio::task::spawn_blocking(move || judged(&judge, &line, by.as_ref())).await;
@@ -940,6 +942,50 @@ fn unsealed<T: std::io::Read + std::io::Write>(
     Err(refused.unwrap_or_default())
 }
 
+/// Whether this kernel's slot is one still counting its tries on the ESP: an update that
+/// has not come up yet (os.rs). No slot, or an ESP that cannot be read: not.
+async fn on_trial() -> bool {
+    let Some(slot) = running_slot() else {
+        return false;
+    };
+    let said = tokio::task::spawn_blocking(move || crate::os::esp(|esp| crate::os::trial(slot, esp)));
+    said.await.is_ok_and(|said| said.unwrap_or(false))
+}
+
+/// The slot this kernel booted from, from the kernel command line.
+fn running_slot() -> Option<char> {
+    let line = std::fs::read_to_string("/proc/cmdline").ok()?;
+    init::options(&line).0.slot
+}
+
+/// Check 3 of docs/adr-unlock.md: the running system is release-signed by a key this node
+/// takes, and the TPM's PCR 4 and 9 are the ones its boot predicts (the log replayed with
+/// the running files as they are).
+fn system_vouched(keys: &crate::update::Keys) -> Result<(), String> {
+    let slot = running_slot().ok_or("the kernel command line names no slot")?;
+    let running = crate::os::esp(|esp| crate::os::running_image(esp, slot))??;
+    let log = measurements()?;
+    let mut tpm = crate::tpm::open()?;
+    let (read4, read9) = (tpm.read(4)?, tpm.read(9)?);
+    // (predict_pcrs refuses unless the running image is in the log once in PCR 4 and once in PCR 9.)
+    crate::predict::predict_pcrs(&log, &read4, &read9, &running, &running)?;
+    let events = crate::predict::parse_log(&log)?;
+    vouched(&events, &[(4, read4), (9, read9)], || {
+        keys.signed_system(slot, &running)
+    })
+}
+
+/// [`system_vouched`]'s decision on values: the log explains PCRs 4 and 9 as read, and `signed`
+/// (the release header, and the piece of it that runs) vouches for the system.
+fn vouched(
+    events: &[crate::predict::Event],
+    read: &[(u32, [u8; 32])],
+    signed: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    crate::predict::explains(events, read)?;
+    signed()
+}
+
 /// Open and mount the state of a node that has `record`. Returns once it is mounted,
 /// however long the key takes to come: the key, and who gave it.
 pub async fn open(record: &Record, config: &Path, join: Option<&String>) -> Result<(Vec<u8>, By), String> {
@@ -980,7 +1026,27 @@ pub async fn open(record: &Record, config: &Path, join: Option<&String>) -> Resu
                     }
                 }
             });
-            fetched(record, config, join, pin).await
+            // (A system on trial that holds a TPM seal and could not open by it: its measured
+            // start is not the one that seal was made for. It does not wait for a key for
+            // good: five minutes with nobody typing, and it restarts, the boot loader counting
+            // the try, until it goes back to the system that was sealed for.)
+            let holds = record.tpm.is_some() || record.next.is_some() || record.pin.is_some();
+            let trial = holds && on_trial().await;
+            let waiting = fetched(record, config, join, pin);
+            if trial {
+                match given_up(waiting, TRIAL_WAIT, &TYPED).await {
+                    Some(fetched) => fetched,
+                    None => {
+                        eprintln!(
+                            "kithd: init: this system is on trial, its TPM seal did not open, and no key came in {} minutes: restarting",
+                            TRIAL_WAIT.as_secs() / 60
+                        );
+                        init::end(true)
+                    }
+                }
+            } else {
+                waiting.await
+            }
         }
     };
     let mapped = kith_dm_sys::crypt("kith-state", &device, 0, sectors, &key);
@@ -1034,10 +1100,50 @@ fn adopt(record: &mut Record, left: Record) {
 /// opened without the check it stands for.
 const UNREAD: &str = "the lock record's tpm-parent: line cannot be read, so its TPM seal is not opened (kith node seal NAME --off, then kith node seal NAME, makes a new one)";
 
+/// NodeKey's status of a node's key: sealed when the seal fits this system (`fits`: it opened
+/// this start, or was made again), else why the last try refused, when a seal is wanted; and
+/// the secrets the node holds.
+fn sealed_status(record: &Record, fits: bool, unsealed: Option<&(Instant, String)>, seal: bool) -> Value {
+    let sealed = fits && (record.tpm.is_some() || record.pin.is_some());
+    let mut status = match unsealed.filter(|_| seal && !sealed) {
+        Some((_, why)) => json!({ "sealed": false, "message": why }),
+        None => json!({ "sealed": sealed }),
+    };
+    for (name, set) in [
+        ("passphrase", record.pass.is_some()),
+        // (Not while a plain seal is beside it: that opens with no PIN.)
+        ("pin", record.pin.is_some() && record.tpm.is_none()),
+        ("recoverySeen", record.seen),
+        ("duress", record.duress.is_some()),
+        ("duressAll", record.duress_all.is_some()),
+    ] {
+        if set {
+            status[name] = true.into();
+        }
+    }
+    status
+}
+
+/// Whether a seal may be made again now (docs/adr-unlock.md): the NodeKey says `seal`, a
+/// cluster handed this node's key out this start, and `system` vouches for the running
+/// system. Else the check that failed, as the NodeKey's status says it.
+fn again(seal: bool, handed: bool, system: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    if !seal {
+        return Err("the NodeKey does not say seal (the node is locked, forgotten, or seal is off)".into());
+    }
+    if !handed {
+        return Err(
+            "no cluster handed this node's key out this start: it opened by its recovery key, passphrase or PIN".into(),
+        );
+    }
+    system()
+}
+
 /// `opened` sealed by this machine's TPM again (under the storage key whose name `record`
 /// keeps, if it keeps one), written in place of `record`'s seal in one write, read back,
 /// and unsealed from what was read: the record as it now is. When that does not open,
-/// `record` is written back as it was.
+/// `record` is written back as it was. A PIN node's seal is of k1 alone (k2 and the wrapped
+/// key stay as they are: the state key is the same).
 fn sealed_anew<T: std::io::Read + std::io::Write>(
     tpm: &mut crate::tpm::Tpm<T>,
     record: &Record,
@@ -1047,15 +1153,31 @@ fn sealed_anew<T: std::io::Read + std::io::Write>(
     if record.parent.as_ref().is_some_and(|name| name.len() != 34) {
         return Err(UNREAD.into());
     }
-    let (sealed, parent) = tpm.seal(opened, record.parent.as_deref())?;
-    let with = Record {
-        tpm: Some(sealed),
-        parent: Some(parent),
-        ..record.clone()
+    let k1 = k1_of(opened);
+    let data: &[u8] = if record.pin.is_some() { &k1[..] } else { opened };
+    let (sealed, parent) = tpm.seal(data, record.parent.as_deref())?;
+    let with = match &record.pin {
+        Some(pin) => Record {
+            pin: Some(PinSeal {
+                k1: sealed,
+                ..pin.clone()
+            }),
+            parent: Some(parent),
+            ..record.clone()
+        },
+        None => Record {
+            tpm: Some(sealed),
+            parent: Some(parent),
+            ..record.clone()
+        },
     };
     tried(record, &with, config, |back| {
-        let key = tpm.unseal(back.tpm.as_deref().unwrap_or_default(), back.parent.as_deref())?;
-        (key == opened)
+        let (sealed, expect): (&[u8], &[u8]) = match &back.pin {
+            Some(pin) => (&pin.k1, &k1[..]),
+            None => (back.tpm.as_deref().unwrap_or_default(), opened),
+        };
+        let key = tpm.unseal(sealed, back.parent.as_deref())?;
+        (key == expect)
             .then_some(())
             .ok_or("the TPM gave another key back".into())
     })
@@ -1172,17 +1294,243 @@ fn pin_sealed<T: std::io::Read + std::io::Write>(
 }
 
 /// What its owner asks of this node's record: a passphrase to give its state (none: to take
-/// away), a PIN (the same), or a new recovery key.
+/// away), a PIN (the same), or a new recovery key. And what an update asks: the TPM's seal
+/// made ahead for the system it has put in the other slot.
 enum Change {
     Passphrase(Option<String>),
     Pin(Option<zeroize::Zeroizing<String>>),
     Recovery,
+    Ahead(crate::os::Boots),
+}
+
+/// The PCR 4 and PCR 9 values the system `boots.new` will start with, as an override for
+/// sealing: the log of the firmware's measurements, replayed with the two files that
+/// change, once it is shown to explain the values the TPM holds now (predict.rs).
+fn ahead_over<T: std::io::Read + std::io::Write>(
+    tpm: &mut crate::tpm::Tpm<T>,
+    log: &[u8],
+    boots: &crate::os::Boots,
+) -> Result<[(u8, [u8; 32]); 2], String> {
+    let (read4, read9) = (tpm.read(4)?, tpm.read(9)?);
+    let (four, nine) = crate::predict::predict_pcrs(log, &read4, &read9, &boots.running, &boots.new)?;
+    Ok([(4, four), (9, nine)])
+}
+
+/// The firmware's event log, as the kernel gives it.
+const MEASUREMENTS: &str = "/sys/kernel/security/tpm0/binary_bios_measurements";
+
+/// [`MEASUREMENTS`] read (securityfs mounted first, where nothing mounted it yet).
+fn measurements() -> Result<Vec<u8>, String> {
+    if !Path::new(MEASUREMENTS).exists() {
+        use nix::mount::{MsFlags, mount};
+        let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+        // (Already mounted, or no TPM: the read says.)
+        let _ = mount(
+            Some("securityfs"),
+            "/sys/kernel/security",
+            Some("securityfs"),
+            flags,
+            None::<&str>,
+        );
+    }
+    std::fs::read(MEASUREMENTS).map_err(|e| format!("reading {MEASUREMENTS}: {e}"))
+}
+
+/// What `record` can have no seal made ahead beside: one that is not promoted yet, and a
+/// storage key's name that is not there to check the TPM by.
+const AHEAD_NOT_NOW: &str =
+    "the seal made ahead for the system that runs is not promoted yet, so none is made for the next";
+const AHEAD_NAMELESS: &str = "the TPM seal has no tpm-parent: line (it is of the old form), so none is made ahead";
+
+/// `opened` sealed by this machine's TPM for the PCRs `over` gives (the system an update
+/// put in the other slot will start with them), written beside the seal that stays
+/// (`tpm-next:`, or `tpm-pin-next:` for the PIN's k1) in one write, read back. The seal
+/// that opens this system is opened again from what was read: where it does not, or the
+/// write does not read back, the record is put back as it was. The record as it now is.
+fn ahead_sealed<T: std::io::Read + std::io::Write>(
+    tpm: &mut crate::tpm::Tpm<T>,
+    record: &Record,
+    opened: &[u8],
+    config: &Path,
+    over: &[(u8, [u8; 32])],
+) -> Result<Record, String> {
+    let parent = match &record.parent {
+        Some(name) if name.len() == 34 => name,
+        Some(_) => return Err(UNREAD.into()),
+        None => return Err(AHEAD_NAMELESS.into()),
+    };
+    // (The key that the PCR-bound seal holds: k1 in PIN mode.)
+    let now = zeroize::Zeroizing::new(if record.pin.is_some() {
+        k1_of(opened).to_vec()
+    } else {
+        opened.to_vec()
+    });
+    // A seal ahead that opens here is this system's, not promoted yet: it stays. One that does
+    // not, because the TPM's PCR policy refuses it, is for a system that did not come up (the
+    // node fell back to this one): the new signed update's takes its place. Any other failure
+    // (a device error, a busy TPM, a seal that is not TPM-shaped) cannot tell whether the seal
+    // still opens: it stays, and the seal ahead waits for the next update or wake. (`tpm:` is
+    // untouched either way.)
+    let waiting = if record.pin.is_some() {
+        &record.pin_next
+    } else {
+        &record.next
+    };
+    if let Some(seal) = waiting.as_ref().filter(|seal| !seal.is_empty()) {
+        match tpm.unseal(seal, Some(parent)).map(zeroize::Zeroizing::new) {
+            Ok(key) if key[..] == now[..] => return Err(AHEAD_NOT_NOW.into()),
+            Ok(_) => {}
+            Err(why) if why == crate::tpm::NOT_THIS_SYSTEM => {}
+            Err(why) => return Err(format!("{AHEAD_NOT_NOW} (the seal that waits was not tried: {why})")),
+        }
+    }
+    let with = match (&record.pin, &record.tpm) {
+        (Some(_), _) => {
+            let (sealed, _) = tpm.seal_over(&now[..], Some(parent), over)?;
+            Record {
+                pin_next: Some(sealed),
+                ..record.clone()
+            }
+        }
+        (None, Some(_)) => {
+            let (sealed, _) = tpm.seal_over(&now[..], Some(parent), over)?;
+            Record {
+                next: Some(sealed),
+                ..record.clone()
+            }
+        }
+        (None, None) => return Err("the record holds no TPM seal".into()),
+    };
+    tried(record, &with, config, |back| {
+        let kept = match &back.pin {
+            Some(pin) => &pin.k1,
+            None => back.tpm.as_ref().ok_or("the lock record lost its TPM seal")?,
+        };
+        let gives = zeroize::Zeroizing::new(tpm.unseal(kept, Some(parent))?);
+        let ahead = back.next.as_ref().or(back.pin_next.as_ref());
+        (gives[..] == now[..] && ahead.is_some_and(|ahead| !ahead.is_empty()))
+            .then_some(())
+            .ok_or("the record did not keep the seal for this system and the one ahead".into())
+    })
+}
+
+/// The seal made ahead, promoted: it opens what this system runs on now, so it takes the
+/// place of the seal of the system before (one write, read back, and opened from what was
+/// read). `None` where there is nothing to promote, or the seal ahead does not open here
+/// (the old seal stays). A write that fails is put back as it was.
+fn promoted<T: std::io::Read + std::io::Write>(
+    tpm: &mut crate::tpm::Tpm<T>,
+    record: &Record,
+    opened: &[u8],
+    config: &Path,
+) -> Result<Option<Record>, String> {
+    let parent = record.parent.as_deref().filter(|name| name.len() == 34);
+    let Some(parent) = parent else { return Ok(None) };
+    let ahead = |seal: &Option<Vec<u8>>| seal.clone().filter(|seal| !seal.is_empty());
+    let (with, wanted) = match (&record.pin, ahead(&record.next), ahead(&record.pin_next)) {
+        (Some(pin), _, Some(next)) => {
+            let with = Record {
+                pin: Some(PinSeal {
+                    k1: next.clone(),
+                    ..pin.clone()
+                }),
+                pin_next: None,
+                ..record.clone()
+            };
+            (with, k1_of(opened).to_vec())
+        }
+        (None, Some(next), _) => {
+            let with = Record {
+                tpm: Some(next),
+                next: None,
+                ..record.clone()
+            };
+            (with, opened.to_vec())
+        }
+        _ => return Ok(None),
+    };
+    let now = with.pin.as_ref().map(|pin| &pin.k1).or(with.tpm.as_ref());
+    let opens = |tpm: &mut crate::tpm::Tpm<T>, seal: Option<&Vec<u8>>| {
+        let given = seal
+            .ok_or("no seal".to_string())
+            .and_then(|seal| tpm.unseal(seal, Some(parent)));
+        given.map(zeroize::Zeroizing::new)
+    };
+    // (Not this system's seal: the old one stays. Asked before anything is written.)
+    if opens(tpm, now).is_ok_and(|key| key[..] == wanted[..]) {
+        let kept = tried(record, &with, config, |back| {
+            let seal = back.pin.as_ref().map(|pin| &pin.k1).or(back.tpm.as_ref());
+            let key = opens(tpm, seal)?;
+            (key[..] == wanted[..] && back.next.is_none() && back.pin_next.is_none())
+                .then_some(())
+                .ok_or("the promoted seal did not open the state's key".into())
+        });
+        return kept.map(Some);
+    }
+    Ok(None)
+}
+
+/// How many times promoting one seal made ahead is tried, a failure (the TPM would not
+/// open, the write did not read back) being tried again at a later wake of [`keep`].
+const PROMOTE_TRIES: u8 = 3;
+
+/// How many of those tries `seal` has used up, given what [`promotion_tried`] last said.
+fn promotions_used(tried: &Option<(Vec<u8>, u8)>, seal: &[u8]) -> u8 {
+    tried
+        .as_ref()
+        .filter(|(was, _)| was == seal)
+        .map_or(0, |(_, used)| *used)
+}
+
+/// What is known of the tries after one more at `seal`: all used up when it ended (done or
+/// refused, `ended`), one more when it failed.
+fn promotion_tried(tried: &Option<(Vec<u8>, u8)>, seal: &[u8], ended: bool) -> (Vec<u8>, u8) {
+    let used = if ended {
+        PROMOTE_TRIES
+    } else {
+        promotions_used(tried, seal) + 1
+    };
+    (seal.to_vec(), used)
+}
+
+/// How long a system on trial waits for the key of its state (see `open`) with nobody typing:
+/// its seal was made ahead and did not open, so what it would run and measure is not what was
+/// predicted, and the boot loader is better off counting the try and going back.
+const TRIAL_WAIT: Duration = Duration::from_secs(300);
+
+/// Told when a line is typed at the console (the wait for the key starts over).
+static TYPED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// What `waiting` gives, or `None` once `limit` has passed since the start, or since a line
+/// was last typed (`typed`).
+async fn given_up<F: std::future::Future>(
+    waiting: F,
+    limit: Duration,
+    typed: &tokio::sync::Notify,
+) -> Option<F::Output> {
+    tokio::pin!(waiting);
+    loop {
+        tokio::select! {
+            out = &mut waiting => return Some(out),
+            () = typed.notified() => {}
+            () = tokio::time::sleep(limit) => return None,
+        }
+    }
+}
+
+/// Have [`keep`] seal this node's key ahead for the system an update put in the other slot
+/// (docs/adr-unlock.md). `Ok(None)` where the node holds no TPM seal: nothing to make ahead.
+pub async fn ahead(boots: crate::os::Boots) -> Result<Option<String>, String> {
+    changed("this node", Change::Ahead(boots)).await
 }
 
 /// A change, and where to say how it went (a new recovery key: the key, as shown): from
 /// [`pass`] and [`recovery`] to [`keep`], which alone writes the record.
 type Chosen = (Change, tokio::sync::oneshot::Sender<Result<Option<String>, String>>);
 static CHOSEN: std::sync::OnceLock<tokio::sync::mpsc::Sender<Chosen>> = std::sync::OnceLock::new();
+
+/// How long a seal that [`again`] refused waits before it is tried again.
+const UNSEALED_RETRY: Duration = Duration::from_secs(300);
 
 /// For as long as the node runs: have the cluster hold the key and take it off the disk
 /// once another node does; restart when the cluster locks this node, and end when it
@@ -1191,8 +1539,9 @@ static CHOSEN: std::sync::OnceLock<tokio::sync::mpsc::Sender<Chosen>> = std::syn
 /// what is not this key, is given again: without it the next start has no key.
 ///
 /// And the TPM's seal: made while the cluster's NodeKey says `seal` and the node is not
-/// locked (again after a start the TPM refused: the system is another now), dropped as
-/// soon as it says otherwise; the NodeKey's status says which, and why not.
+/// locked, and only when a cluster handed the key out this start and the running system is
+/// signed and predicted ([`again`]); a refused one is tried again every [`UNSEALED_RETRY`].
+/// Dropped as soon as the NodeKey says otherwise; the NodeKey's status says which, and why not.
 ///
 /// And the passphrase: its line is written when one is given ([`pass`]), and dropped when
 /// one is taken away or the cluster locks this node.
@@ -1201,6 +1550,7 @@ pub async fn keep(
     config: PathBuf,
     mut record: Record,
     (opened, by): (Vec<u8>, By),
+    keys: crate::update::Keys,
     mut stopping: tokio::sync::watch::Receiver<bool>,
 ) {
     let Some(cluster) = &shared.cluster else {
@@ -1217,10 +1567,13 @@ pub async fn keep(
     // and stays open.)
     let mut was_locked = (!matches!(by, By::Owner | By::Recovery)).then_some(false);
     // Whether the record's seal is one this system opens, and why none could be made.
-    let (mut fits, mut unsealed) = (by == By::Tpm, None::<String>);
+    let (mut fits, mut unsealed) = (matches!(by, By::Tpm | By::Pin), None::<(Instant, String)>);
     let (chosen, mut chosen_here) = tokio::sync::mpsc::channel::<Chosen>(1);
     let _ = CHOSEN.set(chosen);
     let mut shut = false;
+    // The seal made ahead that was tried to be promoted last (once each: one that does not
+    // open here is not asked of the TPM again every half minute).
+    let mut promote_tried = None::<(Vec<u8>, u8)>;
     // (Typed at the console: somebody has this disk's recovery key.)
     if by == By::Recovery && !record.seen {
         let with = Record {
@@ -1350,49 +1703,82 @@ pub async fn keep(
                         }
                     }
                 } else if record.peers != peers && !peers.is_empty() {
-                    record.peers = peers;
+                    record.peers = peers.clone();
                     write(&record);
                 }
-                // (Once the key is off the disk: beside it, a seal keeps nothing. A seal of
-                // the old form, with no storage key's name, is made again with it. Beside a
-                // PIN, none: it would open the state with no PIN typed.)
-                let due = seal
-                    && record.key.is_none()
-                    && record.pin.is_none()
-                    && !(fits && record.tpm.is_some() && record.parent.is_some());
-                if due && unsealed.is_none() {
-                    let tpm = crate::tpm::open();
-                    let kept = tpm.and_then(|mut tpm| sealed_anew(&mut tpm, &record, &opened, &config));
-                    match kept {
-                        Ok(with) => {
+                // (The system runs and is good: the seal made ahead for it, if it opens here,
+                // takes the old seal's place. Tried once for each seal ahead.)
+                let ahead = record
+                    .next
+                    .clone()
+                    .or(record.pin_next.clone())
+                    .filter(|seal| !seal.is_empty());
+                if let Some(seal) = ahead.filter(|seal| {
+                    crate::os::GOOD.load(std::sync::atomic::Ordering::Relaxed)
+                        && promotions_used(&promote_tried, seal) < PROMOTE_TRIES
+                }) {
+                    let (now, key, at) = (record.clone(), opened.clone(), config.clone());
+                    let made = tokio::task::spawn_blocking(move || {
+                        let mut tpm = crate::tpm::open()?;
+                        promoted(&mut tpm, &now, &key, &at)
+                    });
+                    let made = made.await.unwrap_or_else(|_| Err("promoting failed".into()));
+                    // (A failure is tried again at a later wake; done, or refused, is not.)
+                    promote_tried = Some(promotion_tried(&promote_tried, &seal, made.is_ok()));
+                    match made {
+                        Ok(Some(with)) => {
                             eprintln!(
-                                "kithd: this machine's TPM holds the key of its state, for this system: it opens with no node asked"
+                                "kithd: this machine's TPM seal for this system is the one made ahead: the old seal is dropped"
                             );
                             (record, fits) = (with, true);
                         }
+                        Ok(None) => {}
+                        Err(why) => eprintln!("kithd: the seal made ahead is not promoted: {why}"),
+                    }
+                }
+                // (Once the key is off the disk: beside it, a seal keeps nothing. A seal that
+                // does not fit this system, or has no storage key's name, is made again: a
+                // plain seal, or a PIN node's k1 alone. Refused ones wait [`UNSEALED_RETRY`].)
+                let due = seal
+                    && record.key.is_none()
+                    && !(fits && record.parent.is_some() && (record.tpm.is_some() || record.pin.is_some()));
+                let retry = unsealed.as_ref().is_none_or(|(at, _)| at.elapsed() >= UNSEALED_RETRY);
+                if due && retry {
+                    // (A cluster handed the key out this start: it opened by one, or a peer
+                    // answers with it. Only then is the system checked, off the runtime.)
+                    let mut handed = by == By::Cluster;
+                    for peer in &peers {
+                        if handed {
+                            break;
+                        }
+                        handed = asked(&client, peer, &record).await.as_ref() == Ok(&opened);
+                    }
+                    let system = if handed {
+                        let keys = keys.clone();
+                        let checked = tokio::task::spawn_blocking(move || system_vouched(&keys));
+                        checked
+                            .await
+                            .unwrap_or_else(|_| Err("checking the running system failed".into()))
+                    } else {
+                        Ok(())
+                    };
+                    let kept = again(seal, handed, || system).and_then(|()| {
+                        let mut tpm = crate::tpm::open()?;
+                        sealed_anew(&mut tpm, &record, &opened, &config)
+                    });
+                    match kept {
+                        Ok(with) => {
+                            eprintln!("kithd: this machine's TPM holds the key of its state, for this system");
+                            (record, fits) = (with, true);
+                            unsealed = None;
+                        }
                         Err(why) => {
                             eprintln!("kithd: the key of this node's state is not sealed: {why}");
-                            unsealed = Some(why);
+                            unsealed = Some((Instant::now(), why));
                         }
                     }
                 }
-                let sealed = record.tpm.is_some();
-                let mut status = match unsealed.as_ref().filter(|_| seal && !sealed) {
-                    Some(why) => json!({ "sealed": false, "message": why }),
-                    None => json!({ "sealed": sealed }),
-                };
-                for (name, set) in [
-                    ("passphrase", record.pass.is_some()),
-                    // (Not while a plain seal is beside it: that opens with no PIN.)
-                    ("pin", record.pin.is_some() && record.tpm.is_none()),
-                    ("recoverySeen", record.seen),
-                    ("duress", record.duress.is_some()),
-                    ("duressAll", record.duress_all.is_some()),
-                ] {
-                    if set {
-                        status[name] = true.into();
-                    }
-                }
+                let status = sealed_status(&record, fits, unsealed.as_ref(), seal);
                 if said.flatten() != Some(status.clone()) {
                     let statuses = vec![(me.clone(), Some(status))];
                     if let Err(e) = shared.submit(Command::Status { statuses }).await {
@@ -1463,6 +1849,25 @@ pub async fn keep(
                 }
                 Change::Pin(Some(_)) if shut => {
                     let _ = done.send(Err("the cluster does not hand this node's key out (locked, or forgotten): unlock it first".into()));
+                }
+                Change::Ahead(_) if record.tpm.is_none() && record.pin.is_none() => {
+                    let _ = done.send(Ok(None));
+                }
+                Change::Ahead(boots) => {
+                    // (Off the threads that serve: the TPM takes its time.)
+                    let (now, key, at) = (record.clone(), opened.clone(), config.clone());
+                    let made = tokio::task::spawn_blocking(move || {
+                        let log = measurements()?;
+                        let mut tpm = crate::tpm::open()?;
+                        let over = ahead_over(&mut tpm, &log, &boots)?;
+                        ahead_sealed(&mut tpm, &now, &key, &at, &over)
+                    });
+                    let made = made.await.unwrap_or_else(|_| Err("sealing ahead failed".into()));
+                    let _ = done.send(made.map(|with| {
+                        record = with;
+                        eprintln!("kithd: this machine's TPM holds the key of its state for the next system too (tpm-next:)");
+                        Some("sealed ahead".to_string())
+                    }));
                 }
                 Change::Pin(Some(pin)) => {
                     // (Off the threads that serve: the TPM takes its time.)
@@ -1550,6 +1955,9 @@ pub async fn set(
                 return deleted.map(|_| said).map_err(|e| e.to_string());
             }
             "wipe" => {}
+            // (Taking a code away gives nobody power: a leaked one is revoked before the unlock.
+            // The write below is held to `stays_forgotten` as any is.)
+            "no-duress" if held.spec["forgotten"] == true && !wiped => {}
             _ if held.spec["forgotten"] == true => {
                 return Err(format!(
                     "the cluster has forgotten {name}'s key (a duress code was typed): `kith node unlock {name}` has it held again"
@@ -1728,6 +2136,25 @@ fn never_shown(keys: &[kith_api::Resource]) -> Vec<&str> {
         .collect()
 }
 
+/// The NodeKeys the cluster's code is written to or taken from: every one not wiped. A
+/// forgotten one too, for it keeps the code (its node's record is still there to erase).
+fn under_all(store: &kith_api::store::Store) -> Vec<kith_api::Resource> {
+    let kept = store.list(Some("NodeKey")).filter(|key| key.spec["wiped"] != true);
+    kept.cloned().collect()
+}
+
+/// Set the cluster's code `public` on these keys, or (`None`) take it from them; a
+/// forgotten key stays forgotten.
+fn code_all(keys: &mut [kith_api::Resource], public: Option<&String>) {
+    for key in keys {
+        match (public, key.spec.as_object_mut()) {
+            (None, Some(spec)) => drop(spec.remove("duressAll")),
+            (Some(public), _) => key.spec["duressAll"] = public.clone().into(),
+            (None, None) => {}
+        }
+    }
+}
+
 /// `POST /v1/duress[?off]` (`kith node duress --all`): one duress code for the cluster,
 /// its public key written to every NodeKey there is (`off`: taken from each). Typed at
 /// any of those nodes' waiting consoles, it has the cluster forget all of their keys. For
@@ -1743,16 +2170,12 @@ pub async fn duress_all(
     }
     let (code, public) = duress_made();
     let off = asked.contains_key("off");
-    let mut keys: Vec<kith_api::Resource> = {
+    let mut keys = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
-        state
-            .store
-            .list(Some("NodeKey"))
-            .filter(|key| !gone(key))
-            .cloned()
-            .collect()
+        under_all(&state.store)
     };
-    let unseen = never_shown(&keys);
+    let held: Vec<kith_api::Resource> = keys.iter().filter(|key| !gone(key)).cloned().collect();
+    let unseen = never_shown(&held);
     if !off && !unseen.is_empty() {
         let why = format!(
             "nobody was shown the recovery key of {}: `kith node recovery NAME` shows a new one, and with the cluster's key forgotten it alone opens a node",
@@ -1760,12 +2183,7 @@ pub async fn duress_all(
         );
         return refuse(StatusCode::CONFLICT, why).into_response();
     }
-    for key in &mut keys {
-        match (off, key.spec.as_object_mut()) {
-            (true, Some(spec)) => drop(spec.remove("duressAll")),
-            _ => key.spec["duressAll"] = public.clone().into(),
-        }
-    }
+    code_all(&mut keys, (!off).then_some(&public));
     let names: Vec<String> = keys.iter().map(|key| key.metadata.name.clone()).collect();
     let what = if off {
         "no duress code for all"
@@ -1773,7 +2191,7 @@ pub async fn duress_all(
         "duress code for all"
     };
     let done = async {
-        if keys.is_empty() {
+        if held.is_empty() {
             return Err("the cluster holds no node's key: no node's state is encrypted".to_string());
         }
         let applied = shared
@@ -1879,22 +2297,30 @@ fn forgetting(store: &kith_api::store::Store, id: &str, nonce: &[u8], signature:
         public.is_some_and(|public| public.verify(&text, signature).is_ok())
     };
     // (The disk the code was typed at erased its record: wiped. Another node under the
-    // cluster's code has its record still, and its recovery key: forgotten. Its own
-    // code stays with it: typed at it later, that still erases its record.)
+    // cluster's code has its record still, and its recovery key: forgotten. Both codes
+    // stay with it: typed at it later, either still erases its record.)
     let without = |key: &kith_api::Resource| {
         let mut spec = json!({ "id": key.spec["id"] });
         match key.spec["id"] == id {
             true => spec["wiped"] = true.into(),
             false => {
                 spec["forgotten"] = true.into();
-                if let Some(own) = key.spec.get("duress") {
-                    spec["duress"] = own.clone();
+                // (Both codes stay: a node that was off when the cluster's was used has
+                // its record still, and typed at it later, either one erases it.)
+                for code in ["duress", "duressAll"] {
+                    if let Some(kept) = key.spec.get(code) {
+                        spec[code] = kept.clone();
+                    }
                 }
             }
         }
         kith_api::Resource { spec, ..key.clone() }
     };
-    let live = || store.list(Some("NodeKey")).filter(|key| !gone(key));
+    // (The disk asked for is in it though forgotten: its record is what the code erases.)
+    let live = || {
+        let live = store.list(Some("NodeKey"));
+        live.filter(|key| !gone(key) || (key.spec["id"] == id && key.spec["wiped"] != true))
+    };
     // (Every NodeKey of that id is asked: one written beside it hides no code. A
     // forgotten one too, for its node's own code.)
     let kept = store.list(Some("NodeKey")).filter(|key| key.spec["wiped"] != true);
@@ -2239,8 +2665,391 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// The checks of docs/adr-unlock.md before the TPM's: a node seals its key again only when
+    /// it is asked to, a cluster handed the key out this start, and the system is signed. The
+    /// reason of the first that fails is what NodeKey's status says.
+    #[test]
+    fn seals_again_only_when_every_check_holds() {
+        assert_eq!(again(true, true, || Ok(())), Ok(()));
+        assert!(again(false, true, || Ok(())).unwrap_err().contains("seal"));
+        assert!(again(true, false, || Ok(())).unwrap_err().contains("cluster"));
+        assert_eq!(
+            again(true, true, || Err("the system is not signed".to_string())),
+            Err("the system is not signed".to_string())
+        );
+        // (The system is not looked at when an earlier check does not hold.)
+        assert!(again(false, true, || panic!("the system was looked at")).is_err());
+    }
+
+    /// A PIN node seals again only k1 (`tpm-pin:`): k2 and the wrapped key stay as they are, and
+    /// the k1 read back opens under the storage key's name.
+    #[test]
+    fn seals_again_a_pin_node_reseals_k1_only() {
+        use crate::tpm::{Tpm, tests};
+        let Some((_software, wire)) = tests::software() else {
+            return;
+        };
+        let mut tpm = Tpm(wire);
+        tests::measured(&mut tpm);
+        let key = vec![5; 64]; // pragma: allowlist secret
+        let k1 = k1_of(&key);
+        let (old_k1, _) = tpm.seal(&k1[..], None).unwrap();
+        let pin = PinSeal {
+            k1: old_k1.clone(),
+            k2: vec![6; 32],
+            wrapped: vec![8; 60],
+        };
+        let record = Record {
+            secret: vec![7; 32],
+            pin: Some(pin.clone()),
+            ..Record::default()
+        };
+        let path = std::env::temp_dir().join(format!("kith-crypt-seals-again-pin-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + ROOM]).unwrap();
+        record
+            .write(&File::options().read(true).write(true).open(&path).unwrap(), AT)
+            .unwrap();
+        let with = sealed_anew(&mut tpm, &record, &key, &path).unwrap();
+        let now = with.pin.clone().unwrap();
+        assert_ne!(now.k1, old_k1);
+        assert_eq!((&now.k2, &now.wrapped), (&pin.k2, &pin.wrapped));
+        assert!(with.parent.is_some());
+        assert_eq!(&tpm.unseal(&now.k1, with.parent.as_deref()).unwrap()[..], &k1[..]);
+        assert_eq!(Record::read(&path), Ok(Some(with.clone())));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A storage key whose name is not the one kept is ANOTHER: nothing is sealed under it, and
+    /// the record stays as it was.
+    #[test]
+    fn seals_again_refuses_another_storage_key_name() {
+        use crate::tpm::{ANOTHER, Tpm, tests};
+        let Some((_software, wire)) = tests::software() else {
+            return;
+        };
+        let mut tpm = Tpm(wire);
+        tests::measured(&mut tpm);
+        let key = vec![4; 64]; // pragma: allowlist secret
+        let (sealed, _) = tpm.seal(&key, None).unwrap();
+        let path = std::env::temp_dir().join(format!("kith-crypt-seals-again-name-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + ROOM]).unwrap();
+        let record = Record {
+            secret: vec![7; 32],
+            tpm: Some(sealed),
+            parent: Some(vec![0; 34]),
+            ..Record::default()
+        };
+        record
+            .write(&File::options().read(true).write(true).open(&path).unwrap(), AT)
+            .unwrap();
+        assert_eq!(sealed_anew(&mut tpm, &record, &key, &path), Err(ANOTHER.to_string()));
+        assert_eq!(Record::read(&path), Ok(Some(record.clone())));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Check 3 on values: the log must explain PCRs 4 and 9 as read (`explains`), and only then
+    /// does the signed check (the header and its piece) decide. A log that does not explain them
+    /// refuses before the signed check is asked; a refusal by the check is the refusal.
+    #[test]
+    fn seals_again_vouched_refuses_a_log_that_does_not_explain_the_pcrs() {
+        use crate::predict::{Event, UNEXPLAINED, replay};
+        let events = vec![Event {
+            pcr: 4,
+            kind: 0,
+            digest: [1; 32],
+        }];
+        let replayed = replay(&events).unwrap();
+        let read = [(4, replayed[4]), (9, replayed[9])];
+        assert_eq!(vouched(&events, &read, || Ok(())), Ok(()));
+        let other = [(4, [2; 32]), (9, replayed[9])];
+        assert_eq!(
+            vouched(&events, &other, || panic!("asked")),
+            Err(UNEXPLAINED.to_string())
+        );
+        let refused = || Err("the image that runs is not the piece the release names for slot b".to_string());
+        assert_eq!(vouched(&events, &read, refused), refused());
+    }
+
+    /// The status shows why a seal is refused, when one is wanted and does not fit (even with
+    /// an old TPM record beside the key); a PIN seal that fits says sealed, and no message.
+    #[test]
+    fn seals_again_status_shows_the_refusal_and_is_quiet_for_a_fitting_pin_seal() {
+        let refused = (Instant::now(), "the system is not signed".to_string());
+        let plain = Record {
+            tpm: Some(vec![1]),
+            parent: Some(vec![2; 34]),
+            ..Record::default()
+        };
+        let shown = sealed_status(&plain, false, Some(&refused), true);
+        assert_eq!(shown["sealed"], false);
+        assert_eq!(shown["message"], "the system is not signed");
+        let pin = Record {
+            pin: Some(PinSeal {
+                k1: vec![1],
+                k2: vec![2],
+                wrapped: vec![3],
+            }),
+            parent: Some(vec![2; 34]),
+            ..Record::default()
+        };
+        let quiet = sealed_status(&pin, true, None, true);
+        assert_eq!(quiet["sealed"], true);
+        assert!(quiet.get("message").is_none());
+    }
+
     fn holds(bytes: &[u8], secret: &[u8]) -> bool {
         bytes.windows(secret.len()).any(|window| window == secret)
+    }
+
+    /// A lock record file with `record` in it, and the PCRs 4 and 9 a TPM that was `measured`
+    /// holds after one more event each: what a sealing ahead is given for the next system.
+    #[allow(clippy::type_complexity)]
+    fn ahead_disk(what: &str, record: &Record) -> (PathBuf, [(u8, [u8; 32]); 2], [[u8; 32]; 2]) {
+        use sha2::{Digest, Sha256};
+        let path = std::env::temp_dir().join(format!("kith-crypt-next-{what}-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + ROOM]).unwrap();
+        record
+            .write(&File::options().read(true).write(true).open(&path).unwrap(), AT)
+            .unwrap();
+        let (event4, event9) = ([0x44u8; 32], [0x99u8; 32]);
+        let after = |pcr: u8, event: [u8; 32]| -> (u8, [u8; 32]) {
+            // (`measured` extends each PCR once, with its own number repeated.)
+            let was: [u8; 32] = Sha256::digest([&[0u8; 32][..], &[pcr; 32]].concat()).into();
+            (pcr, Sha256::digest([&was[..], &event[..]].concat()).into())
+        };
+        (path, [after(4, event4), after(9, event9)], [event4, event9])
+    }
+
+    /// Against a software TPM: a key sealed ahead for the PCRs of the next system is written
+    /// as `tpm-next:` beside the seal of this one, which is kept and still opens; none is
+    /// made while one waits, nor where no seal, or no storage key's name, is held. Before the
+    /// next system runs, promoting does nothing; once it does, `tpm:` is the seal that was
+    /// made ahead and `tpm-next:` is gone, read back from the disk.
+    #[test]
+    fn tpm_next_seal_ahead_keeps_the_old_seal_until_promotion() {
+        use crate::tpm::{Tpm, tests};
+        let Some((_software, wire)) = tests::software() else {
+            return;
+        };
+        let mut tpm = Tpm(wire);
+        tests::measured(&mut tpm);
+        let key = vec![5; 64]; // pragma: allowlist secret
+        let (old, name) = tpm.seal(&key, None).unwrap();
+        let record = Record {
+            secret: vec![7; 32],
+            tpm: Some(old.clone()),
+            parent: Some(name),
+            ..Record::default()
+        };
+        let (path, over, events) = ahead_disk("plain", &record);
+
+        // No seal held, or no name to check the TPM by: none is made, and nothing is written.
+        let bare = Record {
+            tpm: None,
+            ..record.clone()
+        };
+        assert!(
+            ahead_sealed(&mut tpm, &bare, &key, &path, &over)
+                .unwrap_err()
+                .contains("no TPM seal")
+        );
+        let nameless = Record {
+            parent: None,
+            ..record.clone()
+        };
+        assert_eq!(
+            ahead_sealed(&mut tpm, &nameless, &key, &path, &over),
+            Err(AHEAD_NAMELESS.to_string())
+        );
+        assert_eq!(Record::read(&path), Ok(Some(record.clone())));
+
+        let with = ahead_sealed(&mut tpm, &record, &key, &path, &over).unwrap();
+        assert_eq!(with.tpm.as_ref(), Some(&old), "the old seal stays until promotion");
+        assert!(with.next.as_ref().is_some_and(|next| !next.is_empty() && *next != old));
+        assert_eq!(Record::read(&path), Ok(Some(with.clone())));
+        // This system still opens by the seal it had, not by the one ahead.
+        assert_eq!(unsealed(&mut tpm, &with), Ok((key.clone(), false)));
+        // Not the next system yet: nothing is promoted, nothing is written.
+        assert_eq!(promoted(&mut tpm, &with, &key, &path), Ok(None));
+        assert_eq!(Record::read(&path), Ok(Some(with.clone())));
+        // A fallback: this system runs again and the seal ahead (for the system that did not
+        // come up) opens nothing here. The next signed update replaces it, and `tpm:` stays.
+        let other = [(4, [0x11; 32]), over[1]];
+        let again = ahead_sealed(&mut tpm, &with, &key, &path, &other).unwrap();
+        assert_eq!(again.tpm.as_ref(), Some(&old), "the old seal stays until promotion");
+        assert!(
+            again
+                .next
+                .as_ref()
+                .is_some_and(|next| !next.is_empty() && Some(next) != with.next.as_ref())
+        );
+        assert_eq!(Record::read(&path), Ok(Some(again.clone())));
+        assert_eq!(unsealed(&mut tpm, &again), Ok((key.clone(), false)));
+
+        // A seal waiting that the TPM could not be asked about (here one that is cut, so no
+        // refusal of the PCRs' but another failure) may be this system's: it stays, none is
+        // made now, and nothing is written.
+        let unknown = Record {
+            next: with.next.as_ref().map(|next| next[..next.len() / 2].to_vec()),
+            ..again.clone()
+        };
+        let refused = ahead_sealed(&mut tpm, &unknown, &key, &path, &other).unwrap_err();
+        assert!(
+            refused.starts_with(AHEAD_NOT_NOW) && refused.contains("not tried"),
+            "{refused}"
+        );
+        assert_eq!(Record::read(&path), Ok(Some(again.clone())));
+
+        // The next system starts (the PCRs move to what was predicted): the seal ahead opens
+        // and the old one no longer does.
+        tpm.extend(4, &events[0]).unwrap();
+        tpm.extend(9, &events[1]).unwrap();
+        assert_eq!(unsealed(&mut tpm, &with), Ok((key.clone(), true)));
+        // That seal is this system's and not promoted yet: it is not replaced.
+        assert_eq!(
+            ahead_sealed(&mut tpm, &with, &key, &path, &over),
+            Err(AHEAD_NOT_NOW.to_string())
+        );
+        assert_eq!(Record::read(&path), Ok(Some(again)), "a refusal writes nothing");
+        let now = promoted(&mut tpm, &with, &key, &path).unwrap().unwrap();
+        assert_eq!((now.tpm.as_ref(), now.next.as_ref()), (with.next.as_ref(), None));
+        assert_eq!(Record::read(&path), Ok(Some(now.clone())));
+        assert_eq!(unsealed(&mut tpm, &now), Ok((key.clone(), false)));
+        assert_eq!(promoted(&mut tpm, &now, &key, &path), Ok(None));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// With a PIN the seal that is made ahead is k1's (`tpm-pin-next:`): `tpm-pin:` is kept,
+    /// and the next system's k1 takes its place once that system runs. No plain `tpm-next:`
+    /// is made, which would open the state with no PIN.
+    #[test]
+    fn tpm_next_seal_ahead_of_the_pin_seals_k1() {
+        use crate::tpm::{Tpm, tests};
+        let Some((_software, wire)) = tests::software() else {
+            return;
+        };
+        let mut tpm = Tpm(wire);
+        tests::measured(&mut tpm);
+        tests::lockout_set(&mut tpm, 3, 40);
+        let key: [u8; 64] = random();
+        let (sealed, parent) = tpm.seal(&key, None).unwrap();
+        let record = Record {
+            secret: vec![7; 32],
+            tpm: Some(sealed),
+            parent: Some(parent.clone()),
+            ..Record::default()
+        };
+        let (path, over, events) = ahead_disk("pin", &record);
+        let kept = std::env::temp_dir().join(format!("kith-crypt-next-lockout-{}", std::process::id()));
+        let _ = std::fs::remove_file(&kept);
+        let (with, _) = pin_sealed(&mut tpm, &record, &key, b"40917253", &path, &kept).unwrap();
+        let seal = with.pin.clone().unwrap();
+
+        let ahead = ahead_sealed(&mut tpm, &with, &key, &path, &over).unwrap();
+        assert_eq!(
+            (ahead.pin.as_ref(), ahead.next.as_ref(), ahead.tpm.as_ref()),
+            (Some(&seal), None, None)
+        );
+        assert!(
+            ahead
+                .pin_next
+                .as_ref()
+                .is_some_and(|next| !next.is_empty() && *next != seal.k1)
+        );
+        assert_eq!(Record::read(&path), Ok(Some(ahead.clone())));
+        // (Not yet: nothing is promoted.)
+        assert_eq!(promoted(&mut tpm, &ahead, &key, &path), Ok(None));
+        tpm.extend(4, &events[0]).unwrap();
+        tpm.extend(9, &events[1]).unwrap();
+        // The seal of k1 for the system before opens no more, the one ahead does, and with
+        // it (and the PIN) the state's key.
+        assert!(tpm.unseal(&seal.k1, Some(&parent)).is_err());
+        let now = promoted(&mut tpm, &ahead, &key, &path).unwrap().unwrap();
+        assert_eq!(now.pin.as_ref().map(|pin| &pin.k1), ahead.pin_next.as_ref());
+        assert_eq!((now.pin_next.as_ref(), now.tpm.as_ref()), (None, None));
+        assert_eq!(
+            now.pin.as_ref().map(|pin| (&pin.k2, &pin.wrapped)),
+            Some((&seal.k2, &seal.wrapped))
+        );
+        assert_eq!(Record::read(&path), Ok(Some(now.clone())));
+        let (k1, k2) = (
+            tpm.unseal(&now.pin.as_ref().unwrap().k1, Some(&parent)).unwrap(),
+            tpm.unseal_pin(&seal.k2, b"40917253", Some(&parent)).unwrap(),
+        );
+        let both = zeroize::Zeroizing::new([&k1[..], &k2[..]].concat());
+        assert_eq!(unwrap(&both, &seal.wrapped).as_deref(), Some(&key[..]));
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&kept);
+    }
+
+    /// No event log that explains the PCRs the TPM holds (here none at all): nothing is
+    /// predicted, so nothing is sealed ahead.
+    #[test]
+    fn tpm_next_no_log_no_prediction() {
+        use crate::tpm::{Tpm, tests};
+        let Some((_software, wire)) = tests::software() else {
+            return;
+        };
+        let mut tpm = Tpm(wire);
+        tests::measured(&mut tpm);
+        let boots = crate::os::Boots {
+            running: vec![1; 64],
+            new: vec![2; 64],
+        };
+        assert!(ahead_over(&mut tpm, &[], &boots).is_err());
+    }
+
+    /// A promotion that failed (the TPM could not be opened, a write did not read back) is
+    /// tried again, a few times; one that was done, or refused, is not tried again.
+    #[test]
+    fn tpm_next_promotion_is_retried_after_a_failure() {
+        let seal = vec![1u8, 2, 3];
+        let mut tried = None;
+        assert_eq!(promotions_used(&tried, &seal), 0);
+        tried = Some(promotion_tried(&tried, &seal, false));
+        assert_eq!(promotions_used(&tried, &seal), 1);
+        assert!(
+            promotions_used(&tried, &seal) < PROMOTE_TRIES,
+            "one failure is not the end"
+        );
+        // (A seal made ahead later is a new one.)
+        assert_eq!(promotions_used(&tried, &[9u8]), 0);
+        tried = Some(promotion_tried(&tried, &seal, false));
+        tried = Some(promotion_tried(&tried, &seal, false));
+        assert!(
+            promotions_used(&tried, &seal) >= PROMOTE_TRIES,
+            "a fault that stays is not tried for ever"
+        );
+        let done = promotion_tried(&None, &seal, true);
+        assert!(promotions_used(&Some(done), &seal) >= PROMOTE_TRIES);
+    }
+
+    /// A wait for the key ends after the limit, starts over with each line typed, and gives
+    /// the key when it comes first.
+    #[tokio::test(start_paused = true)]
+    async fn tpm_next_trial_wait_is_five_minutes_and_a_typed_line_restarts_it() {
+        let typed = tokio::sync::Notify::new();
+        let five = Duration::from_secs(300);
+        let never = || std::future::pending::<u8>();
+        let start = tokio::time::Instant::now();
+        assert_eq!(given_up(never(), five, &typed).await, None);
+        assert_eq!(start.elapsed(), five);
+        // A line at four minutes: five more from then.
+        let start = tokio::time::Instant::now();
+        let line = async {
+            tokio::time::sleep(Duration::from_secs(240)).await;
+            typed.notify_one();
+        };
+        let (gave, ()) = tokio::join!(given_up(never(), five, &typed), line);
+        assert_eq!(gave, None);
+        assert_eq!(start.elapsed(), Duration::from_secs(540));
+        // The key before the limit.
+        let key = async {
+            tokio::time::sleep(Duration::from_secs(299)).await;
+            7u8
+        };
+        assert_eq!(given_up(key, five, &typed).await, Some(7));
+        assert_eq!(TRIAL_WAIT, five);
     }
 
     /// Against a software TPM (docs/adr-unlock.md, "TPM plus PIN"): a PIN too short for the
@@ -3034,6 +3843,104 @@ mod tests {
         assert!(matches!(judged(&none, &duress, None), Typed::Wrong));
     }
 
+    /// `do=ACTION` on `NodeKey/n` as an admin: the status and what it said.
+    async fn locked(shared: &Arc<Shared>, action: &str) -> (StatusCode, String) {
+        let asked = Query(BTreeMap::from([("do".to_string(), action.to_string())]));
+        let answer = set(
+            State(shared.clone()),
+            Extension(Caller::Admin),
+            Named("n".into()),
+            asked,
+        )
+        .await;
+        let status = answer.status();
+        let body = axum::body::to_bytes(answer.into_body(), 1 << 16).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// A cluster holding `NodeKey/n` with this spec, as a node's key is kept.
+    async fn holding(tag: &str, spec: Value) -> Arc<Shared> {
+        let dir = std::env::temp_dir().join(format!("kithd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .apply(node_key("n", spec, json!({})))
+            .unwrap();
+        shared
+    }
+
+    fn spec_of(shared: &Arc<Shared>) -> Value {
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .get("NodeKey/n")
+            .unwrap()
+            .spec
+            .clone()
+    }
+
+    /// A leaked per-node duress code is revoked while the key is forgotten (T-0879): that
+    /// takes the node's own code and nothing else, and the key stays forgotten; the other
+    /// actions on a forgotten key are refused as before, and a wiped key has no code to take.
+    #[tokio::test]
+    async fn no_duress_on_a_forgotten_key() {
+        let forgotten = json!({ "id": "aa", "forgotten": true, "duress": "d1", "duressAll": "d2" });
+        let shared = holding("no-duress-forgotten", forgotten.clone()).await;
+        let (status, said) = locked(&shared, "no-duress").await;
+        assert_eq!(status, StatusCode::OK, "{said}");
+        assert_eq!(
+            spec_of(&shared),
+            json!({ "id": "aa", "forgotten": true, "duressAll": "d2" })
+        );
+        // Every other action but unlock and wipe is refused, and changes nothing.
+        let after = spec_of(&shared);
+        for action in ["lock", "seal", "unseal", "duress", "bogus"] {
+            let (status, said) = locked(&shared, action).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{action}: {said}");
+            assert!(
+                said.contains("`kith node unlock n` has it held again"),
+                "{action}: {said}"
+            );
+        }
+        assert_eq!(spec_of(&shared), after);
+        // Wiped: no code is there to take, and it is refused as a wiped key is.
+        let wiped = holding("no-duress-wiped", json!({ "id": "aa", "wiped": true, "duress": "d1" })).await;
+        let (status, said) = locked(&wiped, "no-duress").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{said}");
+        assert!(said.contains("was wiped"), "{said}");
+        assert_eq!(spec_of(&wiped)["duress"], "d1");
+        // A key not forgotten takes it as it did.
+        let held = holding("no-duress-held", json!({ "id": "aa", "wrapped": "00", "duress": "d1" })).await;
+        assert_eq!(locked(&held, "no-duress").await.0, StatusCode::OK);
+        assert!(spec_of(&held).get("duress").is_none());
+    }
+
+    /// After that, the code once typed at the node (`/v1/forget`) forgets nothing more, and
+    /// the cluster's code still does.
+    #[tokio::test]
+    async fn a_revoked_duress_code_forgets_nothing() {
+        let (_, own, own_public) = code();
+        let (_, all, all_public) = code();
+        let spec = json!({ "id": "aa", "forgotten": true, "duress": own_public, "duressAll": all_public });
+        let shared = holding("revoked-duress", spec).await;
+        let nonce = [5; 32];
+        let typed = |pair: &ring::signature::Ed25519KeyPair| {
+            let signature = pair.sign(&forget_text("aa", &nonce));
+            let state = shared.store.lock().unwrap();
+            forgetting(&state.store, "aa", &nonce, signature.as_ref())
+        };
+        assert_eq!(typed(&own).len(), 1);
+        assert_eq!(locked(&shared, "no-duress").await.0, StatusCode::OK);
+        assert!(typed(&own).is_empty());
+        assert_eq!(typed(&all).len(), 1);
+    }
+
     #[test]
     fn forgotten_keys_written_over_are_put_back() {
         let wrapped = json!({ "id": "a", "wrapped": "00" });
@@ -3114,7 +4021,7 @@ mod tests {
         // a's record is erased (wiped), b has its record and its recovery key (forgotten).
         let wiped = ("a".to_string(), json!({ "id": "aa", "wiped": true }));
         assert_eq!(keys(&store, "aa", &own), std::slice::from_ref(&wiped));
-        let forgotten = json!({ "id": "bb", "forgotten": true, "duress": bs_public });
+        let forgotten = json!({ "id": "bb", "forgotten": true, "duress": bs_public, "duressAll": public });
         assert_eq!(keys(&store, "aa", &pair), [wiped, ("b".to_string(), forgotten)]);
         // (Signed for another disk than the one asked for, or by a's code for b: nothing.)
         let other = forgetting(&store, "bb", &nonce, signed(&pair, "aa").as_ref());
@@ -3126,10 +4033,12 @@ mod tests {
         }
         assert_eq!((handed_out(&store, "aa"), handed_out(&store, "bb")), (None, None));
         assert_eq!(handed_out(&store, "cc"), Some(("c", "0102")));
-        // And a code that was used forgets nothing more.
-        assert!(keys(&store, "aa", &pair).is_empty() && keys(&store, "bb", &pair).is_empty());
-        // b, forgotten, has its own code still: typed at b, its record goes too (wiped).
+        // And a code that was used forgets nothing more at a (wiped, it asks nothing).
+        assert!(keys(&store, "aa", &pair).is_empty());
+        // b, forgotten, was off when the cluster's code was used: typed at b later, that
+        // code (and b's own) erases its record too (wiped), and no other key with it.
         let gone = ("b".to_string(), json!({ "id": "bb", "wiped": true }));
+        assert_eq!(keys(&store, "bb", &pair), std::slice::from_ref(&gone));
         assert_eq!(keys(&store, "bb", &bs), [gone]);
         assert!(keys(&store, "aa", &own).is_empty());
 
@@ -3142,6 +4051,43 @@ mod tests {
         let never = node_key("e", json!({ "id": "ee", "wrapped": "0102" }), Value::Null);
         assert_eq!(never_shown(&[held("a", "aa"), unseen, never]), ["d", "e"]);
         assert!(never_shown(&[held("a", "aa")]).is_empty());
+    }
+
+    #[test]
+    fn duress_all_off_and_anew_reach_a_forgotten_key() {
+        let (_, old, old_public) = code();
+        let (_, new, new_public) = code();
+        let seen = json!({ "recoverySeen": true });
+        let nonce = [5; 32];
+        let held = |name: &str, id: &str| {
+            let spec = json!({ "id": id, "wrapped": "0102", "duressAll": old_public });
+            node_key(name, spec, seen.clone())
+        };
+        let erases = |store: &kith_api::store::Store, pair: &ring::signature::Ed25519KeyPair| {
+            let signature = pair.sign(&forget_text("bb", &nonce));
+            let wiped = forgetting(store, "bb", &nonce, signature.as_ref());
+            wiped.iter().any(|key| key.spec["wiped"] == true)
+        };
+        // The code used at a: a is wiped, b forgotten (it keeps the code).
+        let mut store = stored(&[held("a", "aa"), held("b", "bb")]);
+        let signature = old.sign(&forget_text("aa", &nonce));
+        for key in forgetting(&store, "aa", &nonce, signature.as_ref()) {
+            store.apply(key).unwrap();
+        }
+        assert!(erases(&store, &old));
+        // Revoked (`--off`): it reaches the forgotten key, which stays forgotten and is not
+        // erased by the revoked code.
+        let (mut revoked, mut anew) = (under_all(&store), under_all(&store));
+        assert_eq!(revoked.len(), 1);
+        code_all(&mut revoked, None);
+        assert!(gone(&revoked[0]) && revoked[0].spec.get("duressAll").is_none());
+        let mut off = store.clone();
+        off.apply(revoked.remove(0)).unwrap();
+        assert!(!erases(&off, &old));
+        // A new code for all replaces the old one there: it erases the node, the old one no more.
+        code_all(&mut anew, Some(&new_public));
+        store.apply(anew.remove(0)).unwrap();
+        assert!(erases(&store, &new) && !erases(&store, &old));
     }
 
     #[test]

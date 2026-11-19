@@ -683,6 +683,95 @@ fn workflows_kubectl_by_hand() {
 }
 
 #[test]
+fn workflows_json_patch_by_kubectl() {
+    let Some(cluster) = Cluster::start("kube-json-patch") else {
+        return;
+    };
+    cluster.write("web.yaml", WEB);
+    cluster.ok(&["apply", "-f", "web.yaml"]);
+    // Replicas and the image in one patch: each is the kith Workload's change.
+    let ops = r#"[{"op":"replace","path":"/spec/replicas","value":3},{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"docker.io/library/nginx:1.27-alpine"}]"#;
+    cluster.ok(&["patch", "deployment", "web", "--type", "json", "-p", ops]);
+    let held = cluster.held("workload/web");
+    assert_eq!(held["spec"]["replicas"], 3, "{held}");
+    assert_eq!(
+        held["spec"]["template"]["containers"][0]["image"],
+        "docker.io/library/nginx:1.27-alpine"
+    );
+
+    // A test that is not so refuses the whole patch (422), and what is there stays as it was.
+    // (Its spec, not all of it: the status of the containers is what runs, and moves on its own.)
+    let before = cluster.held("workload/web")["spec"].clone();
+    let stale =
+        r#"[{"op":"test","path":"/spec/replicas","value":2},{"op":"replace","path":"/spec/replicas","value":5}]"#;
+    cluster.refused(
+        &["patch", "deployment", "web", "--type", "json", "-p", stale],
+        &["test /spec/replicas: the value is not the one given"],
+    );
+    assert_eq!(cluster.held("workload/web")["spec"], before);
+
+    // A replace of a path that is not there is refused, not made.
+    let missing = r#"[{"op":"replace","path":"/spec/nope","value":1}]"#;
+    cluster.refused(
+        &["patch", "deployment", "web", "--type", "json", "-p", missing],
+        &["/spec/nope: the path is not there"],
+    );
+    assert_eq!(cluster.held("workload/web")["spec"], before);
+
+    // A label added, and removed again, as kubectl sees it.
+    let add = r#"[{"op":"add","path":"/metadata/labels/tier","value":"front"}]"#;
+    cluster.ok(&["patch", "deployment", "web", "--type", "json", "-p", add]);
+    assert_eq!(
+        cluster.got(&["deployment", "web"])["metadata"]["labels"]["tier"],
+        "front"
+    );
+    let remove = r#"[{"op":"remove","path":"/metadata/labels/tier"}]"#;
+    cluster.ok(&["patch", "deployment", "web", "--type", "json", "-p", remove]);
+    assert!(
+        cluster.got(&["deployment", "web"])["metadata"]["labels"]
+            .get("tier")
+            .is_none()
+    );
+}
+
+/// A Deployment with no replicas: the server defaults them to 1, and kubectl reads 1.
+const BARE: &str = r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      containers:
+        - name: api
+          image: mirror.gcr.io/library/busybox:1.36
+          command: [sleep, "3600"]
+"#;
+
+#[test]
+fn workflows_json_patch_sees_what_kubectl_sees() {
+    let Some(cluster) = Cluster::start("kube-json-patch-served") else {
+        return;
+    };
+    cluster.write("api.yaml", BARE);
+    cluster.ok(&["apply", "-f", "api.yaml"]);
+    // The base of the patch is what kubectl reads: the replicas the server defaulted, and the
+    // resourceVersion it reads, so a test of that and a replace of the replicas both find their paths.
+    let version = cluster.got(&["deployment", "api"])["metadata"]["resourceVersion"].clone();
+    let ops = serde_json::json!([
+        { "op": "test", "path": "/metadata/resourceVersion", "value": version },
+        { "op": "replace", "path": "/spec/replicas", "value": 3 },
+    ])
+    .to_string();
+    cluster.ok(&["patch", "deployment", "api", "--type", "json", "-p", ops.as_str()]);
+    assert_eq!(cluster.got(&["deployment", "api"])["spec"]["replicas"], 3);
+}
+
+#[test]
 fn workflows_helm() {
     for (n, helm) in helms().iter().enumerate() {
         let Some(cluster) = Cluster::start(&format!("kube-helm-{n}")) else {
@@ -786,8 +875,11 @@ fn unchanged_manifests_and_a_chart_are_held_as_they_were_sent() {
     }
     // What kith runs for them is its own kinds.
     let db = cluster.held("workload/db");
+    // (Each replica's claim is `data-db-ORDINAL`: the mount names what they share.)
+    let mount = &db["spec"]["template"]["containers"][0]["volumeMounts"][0];
     assert_eq!(
-        db["spec"]["template"]["containers"][0]["volumeMounts"][0]["volume"], "data-db-0",
+        (&mount["volume"], &mount["perReplica"]),
+        (&"data-db".into(), &true.into()),
         "{db}"
     );
     // A claim is given a Volume on the node (Kubernetes would ask a storage class for one).
@@ -966,11 +1058,6 @@ fn refused_is_said_with_the_field_and_nothing_is_dropped_in_silence() {
     // (kubectl asks for no port of a pod that is not running: `sh ci/vm.sh --test kube` does.)
     cluster.refused(&["logs", "web-0", "--previous"], &["previous"]);
     cluster.refused(&["logs", "web-0", "--since=1h"], &["sinceSeconds"]);
-    let json = r#"[{"op":"replace","path":"/spec/replicas","value":1}]"#;
-    cluster.refused(
-        &["patch", "deployment", "web", "--type", "json", "-p", json],
-        &["json-patch"],
-    );
     cluster.refused(&["delete", "deployment", "web", "--cascade=orphan"], &["Orphan"]);
     // Deleted only as it was seen (not another by its name), and no sooner or later for the asking.
     let seen =
@@ -1158,6 +1245,41 @@ fn access_is_kiths_own_and_the_kubernetes_api_is_no_way_past_it() {
     // And a certificate that was taken back is nobody's.
     cluster.kith(&["delete", "identity/bob"]);
     bob.refused(&["get", "deployments", "-n", "team"], &[]);
+}
+
+/// A StatefulSet of several replicas has a claim and a Volume of each replica's own, named
+/// TEMPLATE-NAME-ORDINAL, as Kubernetes names them; scaling down keeps them.
+#[test]
+fn statefulset_of_three_has_a_claim_and_a_volume_for_each_replica() {
+    let Some(cluster) = Cluster::start("kube-statefulset") else {
+        return;
+    };
+    let set = REST
+        .split("\n---\n")
+        .next()
+        .unwrap()
+        .replace("replicas: 1", "replicas: 3");
+    cluster.write("db.yaml", &set);
+    cluster.ok(&["apply", "-f", "db.yaml"]);
+    let db = cluster.held("workload/db");
+    assert_eq!(db["spec"]["replicas"], 3, "{db}");
+    for ordinal in 0..3 {
+        let claim = format!("data-db-{ordinal}");
+        eventually("a claim bound to the Volume made for it", 30, || {
+            cluster.got(&["pvc", &claim])["status"]["phase"] == "Bound"
+        });
+        let volume = cluster.held(&format!("volume/{claim}"));
+        assert_eq!(volume["spec"]["node"], "alpha", "{volume}");
+    }
+    // Scaled down, the claims (and what they hold) stay, as Kubernetes keeps them.
+    cluster.ok(&["scale", "statefulset/db", "--replicas=1"]);
+    assert_eq!(cluster.held("workload/db")["spec"]["replicas"], 1);
+    let claims = cluster.ok(&["get", "pvc", "-o", "name"]);
+    says(&claims, &["data-db-0", "data-db-1", "data-db-2"]);
+    // Scaled up again, they are the replicas' again (and nothing new is made for them).
+    cluster.ok(&["scale", "statefulset/db", "--replicas=3"]);
+    let after = cluster.ok(&["get", "pvc", "-o", "name"]);
+    assert_eq!(after.lines().count(), 3, "{after}");
 }
 
 /// Server-side apply by two managers: each keeps its own fields, a field one has is not
