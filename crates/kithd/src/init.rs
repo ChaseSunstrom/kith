@@ -883,6 +883,45 @@ pub fn resident() -> Option<(u64, u64)> {
     Some((kb("VmRSS:")?, kb("RssFile:")? + kb("RssShmem:")?))
 }
 
+/// Waits `ticks` ticks, and not the rest of them once `stop` says so; whether it did.
+fn rest(ticks: u64, tick: std::time::Duration, stop: impl Fn() -> bool) -> bool {
+    for _ in 0..ticks {
+        if stop() {
+            return true;
+        }
+        std::thread::sleep(tick);
+    }
+    stop()
+}
+
+/// From now on SIGTERM sets `POWER_OFF`, heard on a thread of its own with a runtime of its
+/// own: the runtime that serves is gone when a failed start waits to restart (`end`), and one
+/// that is still there does not run between its `block_on`s. So a SIGTERM that comes before
+/// serving is kept for `end`, and one that comes during its wait is heard. Once is enough.
+pub fn hear_term() {
+    use tokio::signal::unix::{SignalKind, signal};
+    static HEARD: std::sync::Once = std::sync::Once::new();
+    HEARD.call_once(|| {
+        let (ready, registered) = std::sync::mpsc::channel();
+        let hearing = std::thread::Builder::new().stack_size(256 << 10).spawn(move || {
+            let made = tokio::runtime::Builder::new_current_thread().enable_all().build();
+            let Ok(runtime) = made else { return };
+            runtime.block_on(async {
+                let Ok(mut term) = signal(SignalKind::terminate()) else { return };
+                // (A kept kithd's mask holds it back: see `keeper::unblock_heard`.)
+                crate::keeper::unblock_heard();
+                let _ = ready.send(());
+                term.recv().await;
+                POWER_OFF.store(true, Ordering::Relaxed);
+            });
+        });
+        // (The handler is set before this returns: a SIGTERM from here on is not lost.)
+        if hearing.is_ok() {
+            let _ = registered.recv();
+        }
+    });
+}
+
 /// kithd is done (it has stopped what it ran): restart the machine or power it off.
 /// After a failure it restarts, once the reason has had time to be read on a console. A
 /// start that fails again waits longer, the count being on the ESP (see `os::wait`).
@@ -899,15 +938,13 @@ pub fn end(failed: bool) -> ! {
             None => crate::os::wait(0),
         };
         eprintln!("kithd: init: restarting in {} s", wait.as_secs());
-        // The power button is still heard (its thread outlives the runtime): it ends the
-        // wait, and the machine powers off.
-        // ponytail: SIGTERM is not, with the runtime that listened for it gone.
-        for _ in 0..wait.as_secs() {
-            if POWER_OFF.load(Ordering::Relaxed) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
+        // The power button (its thread outlives the runtime) and SIGTERM (`hear_term`) end
+        // the wait, and the machine powers off.
+        // ponytail: Ctrl-Alt-Del (SIGINT) restarts at the end of the wait, not at once.
+        hear_term();
+        rest(wait.as_secs(), std::time::Duration::from_secs(1), || {
+            POWER_OFF.load(Ordering::Relaxed)
+        });
     }
     let off = POWER_OFF.load(Ordering::Relaxed);
     eprintln!("kithd: init: {}", if off { "powering off" } else { "restarting" });
@@ -943,6 +980,41 @@ pub fn end(failed: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_a_wait_ends_when_its_stop_flag_is_raised() {
+        let tick = std::time::Duration::from_millis(5);
+        let stop = AtomicBool::new(false);
+        // Never raised: all the ticks are waited.
+        let started = std::time::Instant::now();
+        assert!(!rest(4, tick, || stop.load(Ordering::Relaxed)));
+        assert!(started.elapsed() >= tick * 4);
+        // Raised meanwhile: the wait ends long before ten minutes.
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(tick * 4);
+                stop.store(true, Ordering::Relaxed);
+            });
+            assert!(rest(100_000, tick, || stop.load(Ordering::Relaxed)));
+        });
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Raised before it starts (a stop kept from before): no tick is waited.
+        let started = std::time::Instant::now();
+        assert!(rest(100_000, std::time::Duration::from_secs(60), || stop.load(Ordering::Relaxed)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn init_sigterm_is_heard_after_the_runtime_that_took_it_is_gone() {
+        hear_term();
+        POWER_OFF.store(false, Ordering::Relaxed);
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+        // (A wait of the machine's: ends as soon as the signal has set the flag.)
+        let heard = rest(1000, std::time::Duration::from_millis(5), || POWER_OFF.load(Ordering::Relaxed));
+        POWER_OFF.store(false, Ordering::Relaxed);
+        assert!(heard, "SIGTERM set POWER_OFF");
+    }
 
     fn words(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_string).collect()

@@ -450,6 +450,8 @@ fn installer(boot: init::Boot, source: String) -> ! {
                         _ = again.recv() => {}
                         () = init::BUTTON.notified() => {}
                     }
+                    // (A disk being written is finished first, then the machine stops.)
+                    install::stopped().await;
                     init::end(false)
                 });
             }
@@ -806,6 +808,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     if let Some(boot) = boot {
         let _in = rt.enter();
         early = stops().ok();
+        // (Also on a thread of its own: a stop heard from here on is kept for a failed start's `end`.)
+        init::hear_term();
         boot.network();
     }
     // Pods are made as root only; elsewhere the range is never used, so a clash is no matter.
