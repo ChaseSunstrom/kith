@@ -404,6 +404,23 @@ impl Device {
     }
 }
 
+/// The public key of a private one, the kernel's own answer: no X25519 is in the tree, so a
+/// WireGuard link is made for the asking (never up), given the key, read, and taken away again
+/// whatever came of it. Takes the right to make links (root).
+pub fn public_of(key: &Key) -> Result<Key> {
+    static MADE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // (At most 14 characters; no `kp` or `kx` start, which are the pods'.)
+    let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1000;
+    let mut device = Device::make(&format!("wgk{:x}n{n}", std::process::id()))?;
+    let public = device
+        .set(vec![WireguardAttribute::PrivateKey(*key)])
+        .and_then(|()| device.public_key());
+    let gone = device.remove();
+    let public = public?;
+    gone?;
+    Ok(public)
+}
+
 pub(crate) fn ask_route(message: RouteNetlinkMessage, flags: u16) -> Result<Vec<RouteNetlinkMessage>> {
     ask(protocols::NETLINK_ROUTE, message, flags)
 }

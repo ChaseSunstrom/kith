@@ -5,7 +5,7 @@
 A tiny, immutable operating system that turns all of your machines into one
 cluster, configured entirely through declarative resources. On every node one
 process, `kithd`, is the API, the store, the scheduler and the container
-runtime (under 13 MB, a budget the build is held to); `kith` is the command you
+runtime (under 13.1 MB, a budget the build is held to); `kith` is the command you
 drive it with.
 
 <picture>

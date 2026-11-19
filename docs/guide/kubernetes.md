@@ -76,7 +76,7 @@ Not answered, each refused in words:
 | `--cascade=orphan`, `kubectl logs --previous`, `--since`, `--timestamps` | a unit's output is kept as it was written, not when |
 
 What it costs: it is in the one kithd there is and added 0.38 MB to it, and the JSON patch 0.01 MB
-more (the budget of 13 MB is not raised; kithd is 12.72 MB today). With pods and CronJobs kithd with nothing to do holds
+more (the budget, then 13 MB, was not raised for it; kithd was 12.72 MB then). With pods and CronJobs kithd with nothing to do holds
 7.8 MB of memory, as before (`python3 ci/budgets.py`); a node no client asks runs none of it.
 
 Who may do what is kith's own: a request on `/api` is checked as the same request on `/v1`

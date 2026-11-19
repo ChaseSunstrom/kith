@@ -69,6 +69,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/audit", get(audit))
         .route("/v1/run", post(run::run))
         .route("/v1/tokens", post(crate::cluster::token))
+        .route("/v1/peers", post(crate::people::add))
         .route("/v1/lock", get(crate::crypt::warned))
         .route("/v1/lock/{name}", post(crate::crypt::set))
         .route("/v1/lock/{name}/passphrase", post(crate::crypt::pass))

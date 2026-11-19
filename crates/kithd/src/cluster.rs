@@ -54,6 +54,8 @@ pub struct Cluster {
     /// What the voters this node last knew said of a node it has not heard of, by its name and
     /// the print of its key ([`vouched`]).
     vouched: std::sync::Mutex<std::collections::HashMap<(String, String), Kept>>,
+    /// The keys `POST /v1/peers` is making here and has made lately (`people.rs`).
+    pub keys: crate::people::Making,
 }
 
 type Fallible<T> = Result<T, String>;
@@ -82,6 +84,7 @@ impl Cluster {
             joining: tokio::sync::Mutex::new(()),
             pinned: Default::default(),
             vouched: Default::default(),
+            keys: Default::default(),
         })
     }
 

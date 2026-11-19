@@ -6,7 +6,9 @@
                                           the review of a change and a kind with nothing in it,
                                           as OUT/ui-SCENE-SCHEME.png; the Install part and a join
                                           token shown once, as OUT/ui-install-WIDTH-SCHEME.png
-                                          and OUT/ui-token-WIDTH-SCHEME.png
+                                          and OUT/ui-token-WIDTH-SCHEME.png; Add a peer, its question
+                                          and the QR code it shows once, as OUT/ui-peer-WIDTH-SCHEME.png
+                                          and OUT/ui-qr-WIDTH-SCHEME.png
     python3 ci/ui_shots.py OUT --serve    the same cluster left up at the printed address, to look
                                           at by hand; Enter ends it
 
@@ -52,14 +54,54 @@ if (scene === 'Install' || scene === 'Token') {
     if (document.getElementById('install').hidden) throw new Error('the Install part is not in view');
   });
 }
+if (scene === 'Peer' || scene === 'Qr') {
+  // Add a peer: Peer is its question, filled in; Qr the configuration it shows once (see SHIM).
+  step(1800, () => {
+    press('peer-add');
+    step(400, () => {
+      for (const [id, value] of [['peer-name', 'phone'], ['peer-node', 'alpha'], ['peer-level', 'family']]) document.getElementById(id).value = value;
+      if (scene === 'Qr') step(300, () => press('dialog-yes'));
+    });
+  });
+  step(3500, () => {
+    if (!document.getElementById('dialog').open) throw new Error('the dialog is not open');
+    if (document.documentElement.scrollWidth > innerWidth) throw new Error(`sideways overflow: ${document.documentElement.scrollWidth} > ${innerWidth}`);
+    if (scene === 'Qr' && !document.querySelector('canvas.qr')) throw new Error('no QR code is drawn');
+  });
+}
 step(1500, () => {
-  if (scene === 'Install' || scene === 'Token') return;
+  if (['Install', 'Token', 'Peer', 'Qr'].includes(scene)) return;
   if (scene !== 'Review') return scene && scene !== 'Empty' && tab(scene);
   const replicas = [...document.querySelectorAll('.field')].find((field) => field.querySelector('label')?.textContent.startsWith('replicas')).querySelector('input');
   replicas.value = '5';
   replicas.dispatchEvent(new Event('input', { bubbles: true }));
   step(700, () => document.getElementById('review').click());
 });
+"""
+# The Peer and Qr scenes: these nodes have no people device (that takes root, and a kernel's WireGuard), so
+# what the page asks of kithd is answered here: alpha says it has one, and a peer is made with
+# the documentation's own sample key. Nothing else is touched, and it is for photographs only.
+SHIM = """\
+const scene = new URLSearchParams(location.search).get('scene');
+if (scene === 'Peer' || scene === 'Qr') {
+  const real = window.fetch;
+  const config = ['[Interface]', 'PrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=', 'Address = 100.89.2.3/32, fd8a:1c3f:5b9d:2::3/128',
+    'DNS = 10.1.0.53', '', '[Peer]', 'PublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=', 'Endpoint = vpn.example.org:51821',
+    'AllowedIPs = 192.168.0.0/16, fd12::/16, 100.89.0.1/32, fd8a:1c3f:5b9d::1/128, 10.1.0.53/32', 'PersistentKeepalive = 25', ''].join('\\n');
+  window.fetch = async (url, init = {}) => {
+    const text = String(url);
+    if (init.method === 'POST' && text.endsWith('/v1/peers')) {
+      return new Response(JSON.stringify({ ...JSON.parse(init.body), config }), { headers: { 'content-type': 'application/json' } });
+    }
+    const got = await real(url, init);
+    if (!/\\/v1\\/(watch|resources)/.test(text)) return got;
+    const json = await got.json();
+    for (const one of Array.isArray(json) ? json : json.resources) {
+      if (one.kind === 'Node' && one.metadata.name === 'alpha') one.status = { ...one.status, people: { endpoint: 'vpn.example.org:51821' } };
+    }
+    return new Response(JSON.stringify(json), { status: got.status, headers: got.headers });
+  };
+}
 """
 # And a still hand: what waits blinks, and a photograph would catch it at any point of that.
 STILL = b".wait, .wait::before { animation: none !important; }"
@@ -93,6 +135,12 @@ kind: ConfigMap
 metadata: { name: site }
 spec:
   data: { title: kith }
+---
+apiVersion: kith.dev/v1
+kind: AccessLevel
+metadata: { name: family }
+spec:
+  networks: [10.1.0.0/24]
 """
 
 
@@ -159,11 +207,11 @@ def main():
                 if self.path == "/ui/hold":
                     time.sleep(HOLD)
                     return self.send_error(404)
-                if self.path in ("/ui/drive.js", "/ui/still.css"):
+                if self.path in ("/ui/drive.js", "/ui/shim.js", "/ui/still.css"):
                     self.send_response(200)
                     self.send_header("content-type", KINDS[self.path[-3:] if self.path.endswith(".js") else ".css"])
                     self.end_headers()
-                    return self.wfile.write(DRIVE.encode() if self.path.endswith(".js") else STILL)
+                    return self.wfile.write({"/ui/drive.js": DRIVE.encode(), "/ui/shim.js": SHIM.encode(), "/ui/still.css": STILL}[self.path])
                 if file and file.name == "overpass.woff2":
                     file = ROOT / "docs/fonts/overpass.woff2"  # (kithd carries the website's own copy)
                 if file and file.is_file() and file.parent in (UI, ROOT / "docs/fonts") and file.suffix in KINDS:
@@ -174,7 +222,7 @@ def main():
                     # ponytail: Chromium photographs at the load event, which is before the watch has
                     # brought anything; an image that is slow to not be there holds that event back.
                     # A devtools client could wait for the board instead.
-                    held = b'<img src="hold" alt="" hidden><link rel="stylesheet" href="still.css"><script type="module" src="drive.js"></script>' if file.name == "index.html" and "--serve" not in sys.argv else b""
+                    held = b'<img src="hold" alt="" hidden><link rel="stylesheet" href="still.css"><script src="shim.js"></script><script type="module" src="drive.js"></script>' if file.name == "index.html" and "--serve" not in sys.argv else b""
                     return self.wfile.write(file.read_bytes() + held)
                 # Not the page's: to kithd, word for word, and back until kithd is done (a watch never is).
                 body = self.rfile.read(int(self.headers.get("content-length") or 0))
@@ -205,13 +253,18 @@ def main():
         views += [(1440, 900, scheme, scene) for scene in ("YAML", "Status", "History", "Logs", "Review", "Empty") for scheme in ("light", "dark")]
         # (The Install part, and a join token shown once, at both widths.)
         views += [(width, height, scheme, scene) for scene in ("Install", "Token") for width, height in ((1440, 1500), (390, 2400)) for scheme in ("light", "dark")]
+        # (Add a peer: its question, and the configuration it shows once, at both widths.)
+        views += [(width, height, scheme, scene) for scene in ("Peer", "Qr") for width, height in ((1440, 900), (390, 1500)) for scheme in ("light", "dark")]
         for width, height, scheme, scene in views:
-            shot = out / (f"ui-{scene.lower()}-{width}-{scheme}.png" if scene in ("Install", "Token") else f"ui-{scene.lower() or width}-{scheme}.png")
+            shot = out / (f"ui-{scene.lower()}-{width}-{scheme}.png" if scene in ("Install", "Token", "Peer", "Qr") else f"ui-{scene.lower() or width}-{scheme}.png")
             flags = ["--no-sandbox", "--disable-gpu", "--hide-scrollbars", f"--window-size={width},{height}", f"--screenshot={shot}"]
             if scheme == "dark":
                 flags.append("--blink-settings=preferredColorScheme=0")
             # (Empty: a kind the scene has none of, open with nothing in it.)
-            url = address.replace("scene=", f"scene={scene}").replace("#/Workload/default/web" if scene in ("Empty", "Install", "Token") else "#/none", "#/Secret" if scene == "Empty" else "#/install")
+            opened = {"Empty": "#/Secret", "Install": "#/install", "Token": "#/install", "Peer": "#/RemotePeer", "Qr": "#/RemotePeer"}.get(scene)
+            url = address.replace("scene=", f"scene={scene}")
+            if opened:
+                url = url.replace("#/Workload/default/web", opened)
             subprocess.run([chrome, *flags, url], check=True, capture_output=True, timeout=120)
             print(shot)
         if failed:
