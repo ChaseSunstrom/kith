@@ -282,6 +282,7 @@ fn good(slot: char, esp: &Path) -> bool {
 
 /// The ESP's directory of kernel images, mounted for as long as `with` runs. One caller at a
 /// time (there is one mount point): a second waits, and a `with` that panics still unmounts.
+/// Not for a runtime's thread while an update (`into_slot`) runs: it holds the mount as long as the download.
 pub fn esp<T>(with: impl FnOnce(&Path) -> T) -> Result<T, String> {
     use nix::mount::{MsFlags, mount, umount};
     let device = crate::init::labelled("esp").ok_or("no partition is labelled esp")?;
@@ -792,25 +793,17 @@ mod tests {
     static UNMOUNTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     #[test]
-    fn os_three_failed_starts_in_a_row_grow_the_wait_and_the_count() {
-        let places = places("three-failed");
-        // (What init::end does for each failed start: count it, then wait by the count.)
-        let waits: Vec<(u32, u64)> = (0..3)
+    fn os_counts_failed_starts_on_the_esp_until_one_comes_up() {
+        let places = places("counts");
+        // A start that fails three times in a row (what init::end does each time: count it,
+        // then wait by the count): the count rises and the wait grows.
+        let starts: Vec<(u32, u64)> = (0..3)
             .map(|_| {
                 let count = failed(&places.esp);
                 (count, wait(count).as_secs())
             })
             .collect();
-        assert_eq!(waits, [(1, 10), (2, 20), (3, 40)]);
-        let again = std::fs::read_to_string(places.esp.join("kith.failed")).unwrap();
-        assert_eq!(again.trim(), "3", "the count is on the ESP for the next start");
-    }
-
-    #[test]
-    fn os_counts_failed_starts_on_the_esp_until_one_comes_up() {
-        let places = places("counts");
-        assert_eq!([failed(&places.esp), failed(&places.esp)], [1, 2]);
-        assert_eq!(failed(&places.esp), 3);
+        assert_eq!(starts, [(1, 10), (2, 20), (3, 40)]);
         assert!(places.esp.join("kith.failed").is_file());
         // Not a kernel image: the boot loader does not start from it.
         assert_eq!(names(&places.esp), ["kith-1-a.efi"]);

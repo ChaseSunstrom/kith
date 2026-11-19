@@ -1007,12 +1007,19 @@ mod tests {
 
     #[test]
     fn init_sigterm_is_heard_after_the_runtime_that_took_it_is_gone() {
+        // (Puts the flag back, whether the test passes or not.)
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                POWER_OFF.store(false, Ordering::Relaxed);
+            }
+        }
+        let _reset = Reset;
         hear_term();
         POWER_OFF.store(false, Ordering::Relaxed);
         nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
         // (A wait of the machine's: ends as soon as the signal has set the flag.)
         let heard = rest(1000, std::time::Duration::from_millis(5), || POWER_OFF.load(Ordering::Relaxed));
-        POWER_OFF.store(false, Ordering::Relaxed);
         assert!(heard, "SIGTERM set POWER_OFF");
     }
 
