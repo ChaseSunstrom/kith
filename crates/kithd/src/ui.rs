@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// The page: name under `/ui/`, content type, content.
-const FILES: [(&str, &str, &[u8]); 6] = [
+const FILES: [(&str, &str, &[u8]); 7] = [
     ("", "text/html; charset=utf-8", include_bytes!("../ui/index.html")),
     ("app.css", "text/css; charset=utf-8", include_bytes!("../ui/app.css")),
     (
@@ -42,6 +42,8 @@ const FILES: [(&str, &str, &[u8]); 6] = [
         "text/javascript; charset=utf-8",
         include_bytes!("../ui/install.js"),
     ),
+    // The QR code of a peer's WireGuard configuration, drawn in the page: no library, no service.
+    ("qr.js", "text/javascript; charset=utf-8", include_bytes!("../ui/qr.js")),
     // The page's face (Overpass, SIL OFL: its copyright and licence are in the file's own
     // name table and in docs/fonts/OFL.txt). The website's copy: there is one in the tree.
     (
@@ -280,7 +282,7 @@ mod tests {
         );
         assert!(run.status.success(), "{said}");
         // Every script the page loads is one node could read.
-        for script in ["app.js", "forms.js", "install.js"] {
+        for script in ["app.js", "forms.js", "install.js", "qr.js"] {
             let check = std::process::Command::new("node")
                 .arg("--check")
                 .arg(dir.join(script))

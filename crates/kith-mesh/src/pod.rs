@@ -400,7 +400,7 @@ pub struct Served {
 /// goes to one of the networks `to` (any, if none) at one of `ports` (any TCP or UDP port, or
 /// no port, if none: a rule with ports fits TCP and UDP only). What answers what came to the
 /// pod passes before any rule; nothing else does, DNS at the node's resolver included.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Egress {
     pub allow: bool,
     pub to: Vec<(IpAddr, u8)>,
