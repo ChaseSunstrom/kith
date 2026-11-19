@@ -1,5 +1,5 @@
 //! The people's levels held on the node started with `--people` (docs/adr-people.md, "Built:
-//! slice E1"): the store's AccessLevels and RemotePeers become kith-mesh's table of level chains,
+//! slices E1 and E2a"): the store's AccessLevels and RemotePeers become kith-mesh's table of level chains,
 //! the routing rules 9010 to 9012, and the peers of kwg0, in that order, and a removed or narrowed
 //! peer is cut within seconds. [`wanted`] says what the store asks for; [`Tend`] makes the kernel so.
 //
@@ -8,6 +8,7 @@
 // a table taken away by hand is put back.
 
 use crate::Shared;
+use crate::exits::Held;
 use kith_api::Resource;
 use kith_api::kinds::{AccessLevelSpec, Protocol, RemotePeerSpec, ServiceSpec};
 use kith_api::store::Store;
@@ -69,8 +70,9 @@ fn within(outer: (IpAddr, u8), inner: (IpAddr, u8)) -> bool {
 pub struct Wanted {
     levels: Vec<(String, Level)>,
     people: Vec<(Person, Peer)>,
-    /// The IPv4 addresses of the peers whose level has the home's internet (rule 9011).
-    internet: BTreeSet<Ipv4Addr>,
+    /// The IPv4 addresses of the peers whose level has an internet, with the table rule 9011 sends
+    /// them to: main (254) for the home's, an Exit's own for its levels'.
+    internet: BTreeMap<Ipv4Addr, u32>,
     /// The node's own networks, which a level's `-out` never reaches.
     links: Vec<(IpAddr, u8)>,
     /// What was left out, and why.
@@ -97,14 +99,16 @@ fn tcp_ports(service: &Resource) -> Vec<u16> {
     ports.into_iter().collect()
 }
 
-/// One AccessLevel as the table has it, with what was left out of it: its `internet` too.
+/// One AccessLevel as the table has it, with what was left out of it: its `internet` too, which
+/// is an Exit's table only while `exits` has that Exit held here and listing this level.
 fn level_of(
     store: &Store,
     spec: &AccessLevelSpec,
     name: &str,
     (mesh, people64): (Ipv6Addr, Ipv6Addr),
     config: &Config,
-) -> (Level, bool, Vec<String>) {
+    exits: &Held,
+) -> (Level, Vec<String>) {
     let mut notes = Vec::new();
     let addresses = crate::services::addresses(store, mesh);
     let mut services: BTreeMap<Ipv6Addr, Vec<u16>> = BTreeMap::new();
@@ -175,14 +179,26 @@ fn level_of(
         }
         parsed
     });
-    let mut home = false;
+    // (A level that names an exit leaves by it or not at all, whatever its `internet` says.)
     let internet = if let Some(exit) = &spec.exit {
-        notes.push(format!(
-            "level {name}: exit {exit} is not held yet (docs/adr-people.md, slice E2): no internet"
-        ));
-        Internet::None
+        match exits.get(exit) {
+            Some(Ok((number, carried))) if carried.iter().any(|carried| carried == name) => Internet::Exit(*number),
+            Some(Ok(_)) => {
+                notes.push(format!("level {name}: exit {exit} does not list level {name}: no internet"));
+                Internet::None
+            }
+            Some(Err(why)) => {
+                notes.push(format!("level {name}: exit {exit}: {why}: no internet"));
+                Internet::None
+            }
+            None => {
+                notes.push(format!(
+                    "level {name}: exit {exit} is not held on this node (no such Exit, or another node's, or no tunnel yet): no internet"
+                ));
+                Internet::None
+            }
+        }
     } else if spec.internet == Some(true) {
-        home = true;
         Internet::Home
     } else {
         Internet::None
@@ -194,7 +210,7 @@ fn level_of(
         resolver,
         internet,
     };
-    (level, home, notes)
+    (level, notes)
 }
 
 /// A RemotePeer of this node that has its addresses, as far as it can be put on the device.
@@ -261,12 +277,14 @@ fn candidate(resource: &Resource, node: &str, people64: Ipv6Addr, notes: &mut Ve
 /// What the store asks of this node (`node`): the levels its peers are in, and its peers with
 /// theirs, and `notes` of what it left out. A peer is left out when its address or key is another's
 /// (neither has it: docs/adr-people.md, Review 5), when it is refused, or when its level is not there.
+/// `exits` are this node's Exits as it holds them now.
 pub fn wanted(
     store: &Store,
     (mesh, people64): (Ipv6Addr, Ipv6Addr),
     node: &str,
     config: &Config,
     links: Vec<(IpAddr, u8)>,
+    exits: &Held,
 ) -> Wanted {
     let mut notes = Vec::new();
     let all: Vec<Candidate> = store
@@ -303,16 +321,17 @@ pub fn wanted(
             continue;
         };
         if !out.levels.iter().any(|(name, _)| *name == one.level) {
-            let (level, _, said) = level_of(store, spec, &one.level, (mesh, people64), config);
+            let (level, said) = level_of(store, spec, &one.level, (mesh, people64), config, exits);
             notes.extend(said);
             out.levels.push((one.level.clone(), level));
         }
-        let home = out
-            .levels
-            .iter()
-            .any(|(name, l)| *name == one.level && l.internet == Internet::Home);
-        if let (true, Some(v4)) = (home, one.person.v4) {
-            out.internet.insert(v4);
+        let table = out.levels.iter().find(|(name, _)| *name == one.level).and_then(|(_, l)| match l.internet {
+            Internet::Home => Some(254),
+            Internet::Exit(number) => Some(kith_mesh::exit::table(number)),
+            Internet::None => None,
+        });
+        if let (Some(table), Some(v4)) = (table, one.person.v4) {
+            out.internet.insert(v4, table);
         }
         out.people.push((one.person.clone(), one.peer.clone()));
     }
@@ -343,7 +362,8 @@ pub fn own_links() -> Vec<(IpAddr, u8)> {
 
 type Table = fn(Ipv6Addr, &[Person], &[(String, Level)], &str, &[(IpAddr, u8)]) -> io::Result<()>;
 
-type Rules = io::Result<Vec<(u32, bool, Option<Ipv4Addr>)>>;
+/// The people's rules the kernel has: priority, IPv6, source, table.
+type Rules = io::Result<Vec<(u32, bool, Option<Ipv4Addr>, Option<u32>)>>;
 type Sent = (Vec<Person>, Vec<(String, Level)>, Vec<(IpAddr, u8)>);
 
 /// What a pass asks of the kernel, as plain functions, so a test can make one fail.
@@ -352,7 +372,8 @@ pub struct Kernel {
     pub present: fn() -> io::Result<bool>,
     pub rules: fn() -> Rules,
     pub hold: fn() -> io::Result<()>,
-    pub internet: fn(Ipv4Addr, bool) -> io::Result<()>,
+    /// Rule 9011 from an address to a table: made, or with `false` taken away.
+    pub internet: fn(Ipv4Addr, u32, bool) -> io::Result<()>,
     pub set_peers: fn(&[Peer]) -> io::Result<()>,
     pub forget: fn(u32) -> io::Result<()>,
 }
@@ -508,7 +529,7 @@ impl Tend {
             [9010, 9012].iter().all(|&priority| {
                 rules
                     .iter()
-                    .any(|&(p, six, from)| (p, six, from) == (priority, v6, None))
+                    .any(|&(p, six, from, _)| (p, six, from) == (priority, v6, None))
             })
         };
         if !base(false) || !base(true) {
@@ -516,17 +537,25 @@ impl Tend {
             (self.kernel.hold)().map_err(|e| format!("routing rules 9010 and 9012: {e}"))?;
             rules.clear();
         }
-        let have: BTreeSet<Ipv4Addr> = rules
+        // (A rule that is not the wanted table's goes first, before the right one is made: a peer
+        // is never sent by two, and between the two falls to 9012, nowhere.)
+        let have: BTreeSet<(Ipv4Addr, u32)> = rules
             .iter()
-            .filter_map(|&(priority, six, from)| if priority == 9011 && !six { from } else { None })
+            .filter_map(|&(priority, six, from, table)| match (priority == 9011 && !six, from, table) {
+                (true, Some(from), Some(table)) => Some((from, table)),
+                _ => None,
+            })
             .collect();
-        for address in w.internet.difference(&have) {
-            self.steps.push(format!("rule 9011 + {address}"));
-            (self.kernel.internet)(*address, true).map_err(|e| format!("routing rule 9011 for {address}: {e}"))?;
+        let wanted: BTreeSet<(Ipv4Addr, u32)> = w.internet.iter().map(|(&from, &table)| (from, table)).collect();
+        let said = |table: u32| if table == 254 { String::new() } else { format!(" to table {table:#x}") };
+        for &(address, table) in have.difference(&wanted) {
+            self.steps.push(format!("rule 9011 - {address}{}", said(table)));
+            (self.kernel.internet)(address, table, false)
+                .map_err(|e| format!("taking away rule 9011 for {address}: {e}"))?;
         }
-        for address in have.difference(&w.internet) {
-            self.steps.push(format!("rule 9011 - {address}"));
-            (self.kernel.internet)(*address, false).map_err(|e| format!("taking away rule 9011 for {address}: {e}"))?;
+        for &(address, table) in wanted.difference(&have) {
+            self.steps.push(format!("rule 9011 + {address}{}", said(table)));
+            (self.kernel.internet)(address, table, true).map_err(|e| format!("routing rule 9011 for {address}: {e}"))?;
         }
         Ok(())
     }
@@ -576,9 +605,11 @@ pub async fn run(shared: Arc<Shared>, config: Option<Config>, mut stopping: watc
         let up = DEVICE_UP.load(Ordering::Acquire);
         if up {
             let links = own_links();
+            // (The exits before the store: neither lock is held with the other.)
+            let held = shared.exits.lock().expect("nothing panics holding the exits").held();
             let (asked, said) = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
-                let asked = wanted(&state.store, prefixes, &cluster.me.name, &config, links);
+                let asked = wanted(&state.store, prefixes, &cluster.me.name, &config, links, &held);
                 let said = state.store.get(&node).map(|own| {
                     own.status
                         .as_ref()
@@ -716,7 +747,7 @@ pub(crate) mod tests {
             with("top-six", 5, u64::MAX),
         ];
         kith_store::run(&mut store, Command::Patch { statuses }).unwrap();
-        let asked = wanted(&store, (mesh, people64), "n1", &config(&[]), Vec::new());
+        let asked = wanted(&store, (mesh, people64), "n1", &config(&[]), Vec::new(), &Held::new());
         let mut offsets: Vec<u16> = asked.people.iter().map(|(person, _)| person.offset).collect();
         offsets.sort();
         assert_eq!(offsets, [2, 0xfffe], "{:?}", asked.notes);
@@ -743,7 +774,7 @@ pub(crate) mod tests {
             ]
         }))
         .unwrap();
-        let (level, _, notes) = level_of(&store, &spec, "family", (mesh, people64), &flag);
+        let (level, notes) = level_of(&store, &spec, "family", (mesh, people64), &flag, &Held::new());
         assert_eq!(
             level.networks,
             vec![network("192.168.4.0/24").unwrap(), network("100.96.0.0/16").unwrap()],
@@ -818,7 +849,7 @@ pub(crate) mod tests {
         // (One that has no addresses yet.)
         apply(&mut store, &peer_yaml("phone-7", "n1", "family", 7));
 
-        let asked = wanted(&store, (mesh, people64), "n1", &config(&["192.168.0.0/16"]), Vec::new());
+        let asked = wanted(&store, (mesh, people64), "n1", &config(&["192.168.0.0/16"]), Vec::new(), &Held::new());
         let names: Vec<&str> = asked.levels.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(names, ["away", "named"], "{:?}", asked.notes);
 
@@ -846,7 +877,7 @@ pub(crate) mod tests {
         // Without the clash: phone-1 is held, with the whole level.
         let mut store = store;
         store.delete("RemotePeer/phone-8").unwrap();
-        let asked = wanted(&store, (mesh, people64), "n1", &config(&["192.168.0.0/16"]), vec![]);
+        let asked = wanted(&store, (mesh, people64), "n1", &config(&["192.168.0.0/16"]), vec![], &Held::new());
         let family = &asked
             .levels
             .iter()
@@ -872,7 +903,7 @@ pub(crate) mod tests {
             assert!(said.contains(part), "{part}: {said}");
         }
         let (phone, peer) = asked.people.iter().find(|(p, _)| p.level == "family").expect("phone-1");
-        assert_eq!(asked.internet, BTreeSet::from([phone.v4.unwrap()]));
+        assert_eq!(asked.internet, BTreeMap::from([(phone.v4.unwrap(), 254)]));
         assert_eq!(peer.key, [1; 32]);
         assert_eq!(
             peer.allowed,
@@ -886,7 +917,7 @@ pub(crate) mod tests {
         // An exit's level has no internet, and says why; Services named are looked up one by one.
         let away = &asked.levels.iter().find(|(name, _)| name == "away").expect("away").1;
         assert_eq!(away.internet, Internet::None);
-        assert!(said.contains("exit somewhere is not held yet"), "{said}");
+        assert!(said.contains("exit somewhere is not held on this node"), "{said}");
         let named = &asked.levels.iter().find(|(name, _)| name == "named").expect("named").1;
         assert_eq!(named.services, vec![(web, vec![80, 8080])]);
         assert!(
@@ -895,7 +926,7 @@ pub(crate) mod tests {
         );
 
         // With no --people-networks, a level's networks are all left out: Services only.
-        let none = wanted(&store, (mesh, people64), "n1", &config(&[]), vec![]);
+        let none = wanted(&store, (mesh, people64), "n1", &config(&[]), vec![], &Held::new());
         assert!(none.levels.iter().all(|(_, level)| level.networks.is_empty()));
     }
 
@@ -995,7 +1026,7 @@ pub(crate) mod tests {
             people: offsets.iter().map(|&offset| person(offset, "family")).collect(),
             internet: offsets
                 .iter()
-                .map(|&offset| Ipv4Addr::new(100, 89, 0, offset as u8))
+                .map(|&offset| (Ipv4Addr::new(100, 89, 0, offset as u8), 254))
                 .collect(),
             ..Wanted::default()
         }
@@ -1009,7 +1040,19 @@ pub(crate) mod tests {
         let rules = kith_mesh::exit::people_rules().unwrap();
         rules
             .into_iter()
-            .filter_map(|(priority, _, from)| if priority == 9011 { from } else { None })
+            .filter_map(|(priority, _, from, _)| if priority == 9011 { from } else { None })
+            .collect()
+    }
+
+    /// Rule 9011 as the kernel has it: (source, table).
+    fn internet_rules() -> Vec<(Ipv4Addr, u32)> {
+        kith_mesh::exit::people_rules()
+            .unwrap()
+            .into_iter()
+            .filter_map(|(priority, _, from, table)| match (priority, from, table) {
+                (9011, Some(from), Some(table)) => Some((from, table)),
+                _ => None,
+            })
             .collect()
     }
 
@@ -1029,7 +1072,7 @@ pub(crate) mod tests {
         for six in [false, true] {
             for priority in [9010, 9012] {
                 assert!(
-                    rules.contains(&(priority, six, None)),
+                    rules.contains(&(priority, six, None, (priority == 9010).then_some(254))),
                     "rule {priority} (v6 {six}): {rules:?}"
                 );
             }
@@ -1055,7 +1098,7 @@ pub(crate) mod tests {
 
         // A rule that cannot be written: no peers at all, the table made again, and the reason.
         let mut failed = tend;
-        failed.kernel.internet = |_, _| failing();
+        failed.kernel.internet = |_, _, _| failing();
         let notes = failed.pass(&asks(&[2, 3], Vec::new()));
         assert_eq!(failed.steps, ["table", "rule 9011 + 100.89.0.3", "peers emptied"]);
         assert_eq!(peers_on_device(), 0);
@@ -1167,7 +1210,7 @@ pub(crate) mod tests {
 
         // The fail-closed emptying that fails flushes nothing either.
         tend.kernel.set_peers = |_| failing();
-        tend.kernel.internet = |_, _| failing();
+        tend.kernel.internet = |_, _, _| failing();
         tend.steps.clear();
         let notes = tend.pass(&asks(&[], Vec::new()));
         assert_eq!(
@@ -1209,7 +1252,7 @@ pub(crate) mod tests {
                 failing()
             }
         };
-        tend.kernel.internet = |_, _| failing();
+        tend.kernel.internet = |_, _, _| failing();
         let notes = tend.pass(&asks(&[3], Vec::new()));
         assert_eq!(tend.steps.first().map(String::as_str), Some("off the device"));
         assert_eq!(tend.steps.last().map(String::as_str), Some("peers emptied"));
@@ -1274,6 +1317,104 @@ pub(crate) mod tests {
         );
         assert!(kith_mesh::people::device_found().unwrap().is_none());
 
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// What `wanted` asks of a peer on a level that names the exit `somewhere`, by what this node
+    /// holds of its Exits: the rule only while the Exit is held and lists the level; else none, and
+    /// the note says why.
+    #[test]
+    fn people_exit_rule_wanted_only_while_the_exit_is_held() {
+        let (mesh, people64) = ids();
+        let mut store = Store::default();
+        apply(&mut store, &level_yaml("away", "{ dns: '192.0.2.53', exit: somewhere }"));
+        apply(&mut store, &peer_yaml("phone-2", "n1", "away", 2));
+        settle(&mut store);
+        let ask = |held: &Held| wanted(&store, (mesh, people64), "n1", &config(&[]), Vec::new(), held);
+        let v4 = |asked: &Wanted| asked.people.iter().find_map(|(person, _)| person.v4).expect("the peer");
+        let up = |levels: &[&str]| {
+            Held::from([("somewhere".to_string(), Ok((7, levels.iter().map(|l| l.to_string()).collect())))])
+        };
+
+        let asked = ask(&up(&["away"]));
+        assert_eq!(asked.internet, BTreeMap::from([(v4(&asked), kith_mesh::exit::table(7))]));
+        assert_eq!(asked.internet.values().copied().collect::<Vec<_>>(), [0x6b78_0007]);
+        assert_eq!(asked.levels[0].1.internet, Internet::Exit(7), "{:?}", asked.notes);
+        assert!(asked.notes.is_empty(), "{:?}", asked.notes);
+
+        for (held, why) in [
+            (up(&["family"]), "exit somewhere does not list level away"),
+            (up(&[]), "exit somewhere does not list level away"),
+            (Held::new(), "exit somewhere is not held on this node"),
+            (
+                Held::from([("elsewhere".to_string(), Ok((8, vec!["away".to_string()])))]),
+                "exit somewhere is not held on this node",
+            ),
+            (
+                Held::from([("somewhere".to_string(), Err("no DNS".to_string()))]),
+                "exit somewhere: no DNS",
+            ),
+        ] {
+            let asked = ask(&held);
+            assert!(asked.internet.is_empty(), "{why}: {:?}", asked.internet);
+            assert_eq!(asked.levels[0].1.internet, Internet::None);
+            assert_eq!(asked.people.len(), 1, "the peer is still held, with no internet");
+            let said = asked.notes.join("\n");
+            assert!(said.contains(why) && said.contains("no internet"), "{why}: {said}");
+        }
+    }
+
+    /// Rule 9011 to an Exit's table, made on the pass that asks for it, taken away on the next that
+    /// does not, swapped with the home's by the one then the other, and put right when the table is
+    /// not the wanted one (`KITH_E2E=1 unshare -Urn`; a rule may name a table that is not there).
+    #[test]
+    fn people_exit_rule_is_made_and_taken_away() {
+        let Some((_guard, state)) = alone() else { return };
+        start(&state);
+        let (phone, table) = (Ipv4Addr::new(100, 89, 0, 2), kith_mesh::exit::table(7));
+        let exit = |table: u32| {
+            let mut asked = asks(&[2], Vec::new());
+            asked.levels = vec![("family".into(), level(Vec::new(), Internet::Exit(7)))];
+            asked.internet = BTreeMap::from([(phone, table)]);
+            asked
+        };
+        let mut tend = tend();
+        let notes = tend.pass(&exit(table));
+        assert_eq!(notes, Vec::<String>::new());
+        assert_eq!(tend.steps, ["table", "rule 9011 + 100.89.0.2 to table 0x6b780007", "peers"]);
+        assert_eq!(internet_rules(), [(phone, table)]);
+        assert_eq!(peers_on_device(), 1);
+        tend.steps.clear();
+        assert!(tend.pass(&exit(table)).is_empty());
+        assert!(tend.steps.is_empty(), "nothing changed: {:?}", tend.steps);
+
+        // The Exit gone: the next pass takes the rule away (the peer falls to 9012, nowhere).
+        let mut gone = asks(&[2], Vec::new());
+        gone.internet.clear();
+        gone.levels = vec![("family".into(), level(Vec::new(), Internet::None))];
+        tend.pass(&gone);
+        assert_eq!(tend.steps, ["table", "rule 9011 - 100.89.0.2 to table 0x6b780007"]);
+        assert!(internet_rules().is_empty(), "{:?}", internet_rules());
+        tend.steps.clear();
+
+        // The home's and an Exit's: swapped, the old rule first (never two for one peer).
+        tend.pass(&asks(&[2], Vec::new()));
+        assert_eq!(internet_rules(), [(phone, 254)]);
+        tend.steps.clear();
+        tend.pass(&exit(table));
+        let steps = tend.steps.join(" | ");
+        let (old, new) = (steps.find("rule 9011 - 100.89.0.2"), steps.find("rule 9011 + 100.89.0.2 to table"));
+        assert!(old.is_some() && new.is_some() && old < new, "{steps}");
+        assert_eq!(internet_rules(), [(phone, table)]);
+        tend.steps.clear();
+
+        // A rule by hand to another table is not the wanted one: taken away, the right one made.
+        kith_mesh::exit::people_internet(phone, table, false).unwrap();
+        kith_mesh::exit::people_internet(phone, kith_mesh::exit::table(9), true).unwrap();
+        tend.pass(&exit(table));
+        assert_eq!(internet_rules(), [(phone, table)]);
+
+        kith_mesh::people::remove().unwrap();
         let _ = std::fs::remove_dir_all(&state);
     }
 }
