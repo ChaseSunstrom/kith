@@ -36,6 +36,8 @@ jobs:
       - run: cargo test -p kith-cli --features remote
       # kithd's forge feature (a leader appends an entry it was not asked for; the access VM test) is in no release build: its code is built and tested here.
       - run: cargo clippy -p kithd --all-targets --features forge -- -D warnings
+      # kithd's fido2-test feature (a software security key on /dev/uhid; the fido2 VM test) is in no release build either.
+      - run: cargo clippy -p kithd --all-targets --features fido2-test -- -D warnings
       - run: cargo test -p kithd --features forge forge
       # A container of a kithd that is not root goes beside kithd's own cgroup, which has to be the
       # user's: the runner's is the system's, so the budget steps run in a scope of the user's systemd.
