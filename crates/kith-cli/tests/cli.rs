@@ -947,6 +947,12 @@ fn launch_makes_a_job_follows_its_logs_and_exits_with_its_code() {
             let sent: serde_json::Value = serde_json::from_str(body).unwrap();
             serde_json::json!([{ "action": "created", "before": null, "after": sent[0] }]).to_string()
         }
+        ("GET", p) if p.starts_with("/v1/logs/Job/default/alpine-2?replica=0&unit=main&stderr=true") => {
+            match p.ends_with("&offset=0") {
+                true => r#"{"data":"boom\n","next":5,"more":false}"#.into(),
+                false => r#"{"data":"","next":5,"more":false}"#.into(),
+            }
+        }
         ("GET", p) if p.starts_with("/v1/logs/Job/default/alpine-2?replica=0&unit=main") => {
             let n = polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match n {
@@ -956,10 +962,9 @@ fn launch_makes_a_job_follows_its_logs_and_exits_with_its_code() {
             }
         }
         ("GET", "/v1/resources/Job/default/alpine-2") => {
-            let unit =
-                serde_json::json!({ "name": "main", "replica": 0, "node": "a", "state": "exited", "exitCode": 3 });
-            let status =
-                serde_json::json!({ "state": "failed", "message": "exited with code 3", "containers": [unit] });
+            // (The shape kithd gives a finished Job: no containers, the culprit in the message,
+            // crates/kithd/src/controller.rs `job.message = Some(format!("run {run}, {}: {why}"`.)
+            let status = serde_json::json!({ "state": "failed", "message": "run 0, main: exited with code 3", "containers": [] });
             bare("Job", "default", "alpine-2", serde_json::json!({}), status).to_string()
         }
         _ => panic!("unexpected {method} {path}"),
@@ -969,7 +974,7 @@ fn launch_makes_a_job_follows_its_logs_and_exits_with_its_code() {
         &["launch", "alpine:3.20", "-e", "A=b=c", "-p", "8080", "--", "echo", "hi"],
     );
     assert_eq!((code, out.as_str()), (3, "hi\n"), "{err}");
-    assert!(err.contains("exited with code 3"), "{err}");
+    assert!(err.contains("exited with code 3") && err.contains("boom"), "{err}");
     let seen = seen.lock().unwrap();
     let applied = seen.iter().find_map(|s| s.strip_prefix("POST /v1/apply ")).unwrap();
     let job: serde_json::Value = serde_json::from_str(applied).unwrap();
@@ -1005,13 +1010,13 @@ fn launch_exits_0_for_a_job_that_succeeded() {
             let sent: serde_json::Value = serde_json::from_str(body).unwrap();
             serde_json::json!([{ "action": "created", "before": null, "after": sent[0] }]).to_string()
         }
+        ("GET", p) if p.contains("&stderr=true") => r#"{"data":"","next":0,"more":false}"#.into(),
         ("GET", p) if p.ends_with("/v1/logs/Job/team/batch?replica=0&unit=main&offset=0") => {
             r#"{"data":"done\n","next":5,"more":false}"#.into()
         }
         ("GET", p) if p.ends_with("&offset=5") => r#"{"data":"","next":5,"more":false}"#.into(),
         ("GET", "/v1/resources/Job/team/batch") => {
-            let unit = serde_json::json!({ "name": "main", "replica": 0, "state": "exited", "exitCode": 0 });
-            let status = serde_json::json!({ "state": "succeeded", "containers": [unit] });
+            let status = serde_json::json!({ "state": "succeeded", "containers": [] });
             bare("Job", "team", "batch", serde_json::json!({}), status).to_string()
         }
         _ => panic!("unexpected {method} {path}"),
@@ -1058,6 +1063,10 @@ fn launch_against_a_store_file() {
     }
     let (code, _, err) = sb.kith(&["launch", "-d", "--name", "alpine-2", "alpine"]);
     assert!(code == 2 && err.contains("already there"), "{code}: {err}");
+    assert!(err.contains("`kith delete workload/alpine-2`"), "{err}");
+    sb.kith(&["launch", "-d", "-n", "team", "--name", "x", "alpine"]);
+    let (_, _, err) = sb.kith(&["launch", "-d", "-n", "team", "--name", "x", "alpine"]);
+    assert!(err.contains("`kith delete workload/x -n team`"), "{err}");
     let (code, _, err) = sb.kith(&["launch", "-d", "-e", "NOEQUALS", "alpine"]);
     assert!(code == 2 && err.contains("KEY=VALUE"), "{code}: {err}");
     let (code, out, err) = sb.kith(&["get", "workload"]);
@@ -1092,9 +1101,13 @@ fn ps_lists_replicas_job_runs_and_exec_units() {
             ]).to_string(),
             "/v1/resources?kind=NodeWorkload" => "[]".into(),
             "/v1/resources?kind=Job" => {
-                let mut run = unit("main", 0, "a", "exited");
-                run["exitCode"] = 3.into();
-                serde_json::json!([bare("Job", "default", "alpine-1", job.clone(), serde_json::json!({ "state": "failed", "containers": [run] }))]).to_string()
+                // (A finished Job as kithd writes it: no containers; the code is in the message.)
+                let failed = serde_json::json!({ "state": "failed", "message": "run 0, main: exited with code 3", "containers": [] });
+                let ok = serde_json::json!({ "state": "succeeded", "containers": [] });
+                serde_json::json!([
+                    bare("Job", "default", "alpine-1", job.clone(), failed),
+                    bare("Job", "default", "alpine-2", job.clone(), ok),
+                ]).to_string()
             }
             p if p.starts_with("/v1/history/") => at("h").to_string(),
             _ => panic!("unexpected {path}"),
@@ -1114,13 +1127,14 @@ fn ps_lists_replicas_job_runs_and_exec_units() {
             "default workload web-0 web a running - nginx:1.27 3h",
             "default workload web-1 web b running - nginx:1.27 3h",
             "default workload tick-0 t a running - sleep 9 3h",
-            "default job alpine-1-0 main a exited 3 alpine 3h",
+            "default job alpine-1 main - failed 3 alpine 3h",
+            "default job alpine-2 main - succeeded 0 alpine 3h",
         ]
     );
     let team = rows(&["ps", "-n", "team"]);
     assert_eq!(team.len(), 2, "{team:?}");
     assert!(team[1].starts_with("team workload api-0 web c running"), "{team:?}");
-    assert_eq!(rows(&["ps", "-A"]).len(), 6);
+    assert_eq!(rows(&["ps", "-A"]).len(), 7);
     assert_eq!(kith_at(&socket, &["ps", "-A", "-n", "team"]).0, 2);
 }
 

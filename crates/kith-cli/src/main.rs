@@ -1404,7 +1404,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             if let Some(unit) = unit {
                 path += &format!("&unit={}", escape(&unit));
             }
-            stream_logs(&kithd, &path, tail, follow)?;
+            stream_logs(&kithd, &path, tail, follow, &mut std::io::stdout())?;
         }
         Command::Launch(launch) => return launch::launch(launch, &backend()?),
         Command::Ps(ps) => launch::ps(&ps, &backend()?)?,
@@ -2499,18 +2499,20 @@ fn load(files: &Files) -> Result<Vec<Resource>, String> {
 
 /// Print a unit's output from kithd's `path` (`kith logs`, and `kith launch` following its Job):
 /// from `tail` lines back or the start; with `follow`, until no more may come. False when stdout
-/// was closed first (`kith logs | head`).
-fn stream_logs(kithd: &Kithd, path: &str, tail: Option<u64>, follow: bool) -> Result<bool, String> {
+/// was closed first (`kith logs | head`). It is written to `out`.
+fn stream_logs(
+    kithd: &Kithd,
+    path: &str,
+    tail: Option<u64>,
+    follow: bool,
+    out: &mut dyn std::io::Write,
+) -> Result<bool, String> {
     let mut from = tail.map_or("&offset=0".into(), |lines| format!("&tail={lines}"));
     loop {
         let reply: serde_json::Value = request(kithd, "GET", &format!("{path}{from}"), b"")?;
         let data = reply["data"].as_str().unwrap_or_default();
-        {
-            use std::io::Write;
-            let mut out = std::io::stdout();
-            if out.write_all(data.as_bytes()).and_then(|()| out.flush()).is_err() {
-                return Ok(false);
-            }
+        if out.write_all(data.as_bytes()).and_then(|()| out.flush()).is_err() {
+            return Ok(false);
         }
         from = format!("&offset={}", reply["next"].as_u64().unwrap_or(0));
         if data.is_empty() {

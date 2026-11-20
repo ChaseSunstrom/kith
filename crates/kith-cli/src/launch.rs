@@ -102,11 +102,18 @@ fn free_name(backend: &Backend, kind: &str, l: &Launch) -> Result<String, String
         .collect();
     if let Some(name) = &l.name {
         return match taken.contains(name) {
-            true => fail(format!(
-                "{kind}/{}/{name} is already there: pick another --name, or `kith delete {}/{name}` it",
-                l.namespace,
-                kind.to_lowercase()
-            )),
+            true => {
+                let ns = if l.namespace == DEFAULT_NAMESPACE {
+                    String::new()
+                } else {
+                    format!(" -n {}", l.namespace)
+                };
+                fail(format!(
+                    "{kind}/{}/{name} is already there: pick another --name, or `kith delete {}/{name}{ns}` it",
+                    l.namespace,
+                    kind.to_lowercase()
+                ))
+            }
             false => Ok(name.clone()),
         };
     }
@@ -133,18 +140,22 @@ pub fn launch(l: Launch, backend: &Backend) -> Result<ExitCode, String> {
     let key = job.key();
     backend.apply(vec![job], false)?;
     let path = format!("/v1/logs/{}?replica=0&unit=main", escape(&key));
-    if !stream_logs(kithd, &path, None, true)? {
+    if !stream_logs(kithd, &path, None, true, &mut std::io::stdout())? {
         eprintln!("{key} goes on: `kith logs {} -f` follows it", key.replacen('/', " ", 1));
         return Ok(ExitCode::SUCCESS);
     }
-    // The logs end when the Job does (kithd says no more may come), so its state is final.
-    let done = backend.get(&key)?;
-    let status = done.status.unwrap_or_default();
-    let code = status["containers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find_map(|unit| unit["exitCode"].as_i64());
+    // The logs end when the Job does (kithd says no more may come), so its state is final and
+    // its stderr is whole: it is read after the output, not interleaved with it.
+    // ponytail: a failed command's error comes after its output; interleave if that ever misleads.
+    stream_logs(
+        kithd,
+        &format!("{path}&stderr=true"),
+        None,
+        false,
+        &mut std::io::stderr(),
+    )?;
+    let status = backend.get(&key)?.status.unwrap_or_default();
+    let code = job_code(&status);
     match (status["state"].as_str(), code) {
         (Some("failed"), code) => {
             if let Some(message) = status["message"].as_str() {
@@ -156,6 +167,28 @@ pub fn launch(l: Launch, backend: &Backend) -> Result<ExitCode, String> {
         (_, Some(code)) => Ok(ExitCode::from((code & 0xff) as u8)),
         _ => Ok(ExitCode::SUCCESS),
     }
+}
+
+/// The exit code of a Job's run: a unit's own `exitCode` when kithd reports units, else the one
+/// its message names. kithd clears a finished Job's `containers` and keeps the culprit in
+/// `message`, as `run 0, main: exited with code 3` (crates/kithd/src/controller.rs, where
+/// `job.message` is made): a change to that text shows here as an exit code of 1.
+fn job_code(status: &Value) -> Option<i64> {
+    let from_units = status["containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|u| u["exitCode"].as_i64());
+    from_units.or_else(|| {
+        let (_, tail) = status["message"].as_str()?.split_once("exited with code ")?;
+        let digits: String = tail
+            .chars()
+            .enumerate()
+            .take_while(|(i, c)| c.is_ascii_digit() || (*i == 0 && *c == '-'))
+            .map(|(_, c)| c)
+            .collect();
+        digits.parse().ok()
+    })
 }
 
 /// One row per unit of each Workload, NodeWorkload and Job: where it runs, its state, how it
@@ -234,12 +267,15 @@ fn unit_rows(r: &Resource, backend: &Backend) -> Vec<[String; 9]> {
         // (Applied and not yet reported: a launch is there to see at once.)
         let first = template["containers"][0]["name"].as_str().unwrap_or("-");
         let state = status["state"].as_str().unwrap_or("pending");
+        // (A finished Job has no units: its code is the one in its message, or 0 if it succeeded.)
+        let exit = job_code(&status).map(|c| c.to_string());
+        let exit = exit.or_else(|| (state == "succeeded").then(|| "0".to_string()));
         return vec![row(
             r.metadata.name.clone(),
             first.into(),
             "-".into(),
             state.into(),
-            "-".into(),
+            exit.unwrap_or("-".into()),
         )];
     }
     units
@@ -285,5 +321,17 @@ mod tests {
         ] {
             assert_eq!(base_name(image), name, "{image}");
         }
+    }
+
+    #[test]
+    fn a_jobs_code_is_a_units_or_the_messages() {
+        let code = |s: Value| job_code(&s);
+        let said = json!({ "message": "run 0, main: exited with code 3", "containers": [] });
+        assert_eq!(code(said), Some(3));
+        let both = json!({ "message": "run 0, main: exited with code 3", "containers": [{ "exitCode": 7 }] });
+        assert_eq!(code(both), Some(7));
+        assert_eq!(code(json!({ "message": "run 1, main: exited with code -1" })), Some(-1));
+        assert_eq!(code(json!({ "message": "not finished after 5 s" })), None);
+        assert_eq!(code(json!({})), None);
     }
 }
