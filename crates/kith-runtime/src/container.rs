@@ -178,6 +178,10 @@ pub struct Unit {
     /// The project its writable root's layers are put in (ext4's, `chattr -p`), whose quota
     /// holds what it writes there at the write: its pod's. `None`: they keep their parent's.
     pub project: Option<u32>,
+    /// The namespace of the resource that made it: a tenant, whose starts share what the root
+    /// part gives a volume's owner with (see `GiveSlots`: half at most). Empty: none is named.
+    #[serde(default)]
+    pub namespace: String,
 }
 
 /// How many ids a container's user namespace has where kithd is root: 0 to 65535, all an
@@ -956,7 +960,7 @@ impl Runtime {
             // (A volume is its user's on disk as it is in the container: an id-mapped mount
             // shows its owners as they are. A new one is root's until given.)
             for volume in unit.mounts.iter().filter(|volume| volume.give && user.uid() != 0) {
-                let left = give_volume(volume, user.uid(), user.gid()).ctx(format!(
+                let left = give_volume(volume, &unit.namespace, user.uid(), user.gid()).ctx(format!(
                     "{what}: giving {} to user {}",
                     volume.host.display(),
                     user.uid()
@@ -1856,10 +1860,10 @@ impl Executor for Entry {
 // users on one volume walk it at every start. (A container's range of ids never walks one:
 // its volumes are id-mapped, see `stage`.) A mount that maps the volume's owner to the
 // container's user, when a volume is big enough for that to hurt.
-fn give_volume(volume: &Mount, uid: u32, gid: u32) -> io::Result<u32> {
+fn give_volume(volume: &Mount, namespace: &str, uid: u32, gid: u32) -> io::Result<u32> {
     match &volume.held {
-        Some(held) => give_fd(held.reopen()?, uid, gid),
-        None => give_path(&volume.host, uid, gid),
+        Some(held) => give_fd(held.reopen()?, namespace, uid, gid),
+        None => give_path(&volume.host, namespace, uid, gid),
     }
 }
 
@@ -1909,49 +1913,87 @@ const GIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// [`GIVE_COST`] before it opens one and returns it when it is done, so no number of starts, deep
 /// trees or slow ones, can run the root part out of descriptors. A give that finds it short
 /// waits for another to finish, up to a limit, and then fails alone.
+///
+/// One namespace holds at most half of it: a tenant with many starts of big or slow volumes waits
+/// on its own share, and the other half is always there for the rest.
+///
+/// ponytail: a give holds its slots for its whole walk, so a slow volume (a network file system)
+/// holds its namespace's share as long as it is walked, and starts of that namespace past it wait
+/// (30 s, then fail, and the volume is walked again by the next start: the walk is idempotent).
+/// If that ever bites, give the slots back between directories and take them again.
 struct GiveSlots {
-    free: std::sync::Mutex<usize>,
+    total: usize,
+    /// The descriptors held, all together and for each namespace.
+    held: std::sync::Mutex<(usize, std::collections::HashMap<String, usize>)>,
     freed: std::sync::Condvar,
 }
 
 /// The descriptors a take holds, given back on drop (a walk that fails or panics included).
-struct GiveHeld<'a>(&'a GiveSlots);
+struct GiveHeld<'a> {
+    slots: &'a GiveSlots,
+    namespace: String,
+}
 
 impl GiveSlots {
     fn new(total: usize) -> Self {
         // (At least one walk's worth: a smaller total would refuse every give.)
         Self {
-            free: std::sync::Mutex::new(total.max(GIVE_COST)),
+            total: total.max(GIVE_COST),
+            held: std::sync::Mutex::new(Default::default()),
             freed: std::sync::Condvar::new(),
         }
     }
 
-    fn take(&self, wait: std::time::Duration) -> io::Result<GiveHeld<'_>> {
-        // (A walk that panicked left the count whole, so a poisoned lock is still a good one.)
-        let free = self.free.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (mut free, timeout) = self
+    /// What one namespace may hold: half, and never less than one walk.
+    fn share(&self) -> usize {
+        (self.total / 2).max(GIVE_COST)
+    }
+
+    fn take(&self, namespace: &str, wait: std::time::Duration) -> io::Result<GiveHeld<'_>> {
+        // (A walk that panicked left the counts whole, so a poisoned lock is still a good one.)
+        let held = self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // (Waits while the pool is out of room, or this namespace is at its share.)
+        let blocked = |(all, each): &mut (usize, std::collections::HashMap<String, usize>)| {
+            *all + GIVE_COST > self.total || each.get(namespace).copied().unwrap_or(0) + GIVE_COST > self.share()
+        };
+        let (mut held, timeout) = self
             .freed
-            .wait_timeout_while(free, wait, |free| *free < GIVE_COST)
+            .wait_timeout_while(held, wait, blocked)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if timeout.timed_out() && *free < GIVE_COST {
+        if timeout.timed_out() && blocked(&mut held) {
             return Err(io::Error::other(format!(
-                "no descriptors to give the volume with after {wait:?}: other starts are giving theirs"
+                "no descriptors to give the volume with after {wait:?}: the starts giving volumes hold them"
             )));
         }
-        *free -= GIVE_COST;
-        Ok(GiveHeld(self))
+        held.0 += GIVE_COST;
+        *held.1.entry(namespace.into()).or_insert(0) += GIVE_COST;
+        Ok(GiveHeld {
+            slots: self,
+            namespace: namespace.into(),
+        })
     }
 }
 
 impl Drop for GiveHeld<'_> {
     fn drop(&mut self) {
-        *self.0.free.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) += GIVE_COST;
-        self.0.freed.notify_all();
+        let mut held = self.slots.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.0 -= GIVE_COST;
+        if let Some(mine) = held.1.get_mut(&self.namespace) {
+            *mine -= GIVE_COST;
+            if *mine == 0 {
+                held.1.remove(&self.namespace);
+            }
+        }
+        drop(held);
+        self.slots.freed.notify_all();
     }
 }
 
 /// The process's slots: half its soft limit of descriptors, at most 8192 (each walk also keeps a
 /// listing buffer for every directory it is inside), so the rest stays for everything else.
+/// (The limit is read at the first give, after kithd has raised its soft one to the hard one,
+/// 65536 at most: `raise_nofile`, T-1075. The root part is a thread of kithd; a root part that is
+/// a process of its own must raise its own first, or the pool is half of what it started with.)
 fn give_slots() -> &'static GiveSlots {
     static SLOTS: std::sync::OnceLock<GiveSlots> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| {
@@ -1963,7 +2005,7 @@ fn give_slots() -> &'static GiveSlots {
 }
 
 /// [`give_volume`] for a directory named by path (a volume that is not held, one file of a map).
-fn give_path(dir: &Path, uid: u32, gid: u32) -> io::Result<u32> {
+fn give_path(dir: &Path, namespace: &str, uid: u32, gid: u32) -> io::Result<u32> {
     use std::os::unix::fs::OpenOptionsExt;
     // (One file of a map, mounted alone.)
     if fs::symlink_metadata(dir)?.is_file() {
@@ -1975,6 +2017,7 @@ fn give_path(dir: &Path, uid: u32, gid: u32) -> io::Result<u32> {
     let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW;
     give_fd(
         fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)?,
+        namespace,
         uid,
         gid,
     )
@@ -1988,12 +2031,19 @@ fn give_path(dir: &Path, uid: u32, gid: u32) -> io::Result<u32> {
 /// one file system, so a link a program made to a file of the node's is one of these): what is
 /// written beside it must not change its owner. The workload may then find such a file not its
 /// own, and the count is what the caller says of it.
-fn give_fd(top: File, uid: u32, gid: u32) -> io::Result<u32> {
-    give_fd_in(give_slots(), GIVE_WAIT, top, uid, gid)
+fn give_fd(top: File, namespace: &str, uid: u32, gid: u32) -> io::Result<u32> {
+    give_fd_in(give_slots(), GIVE_WAIT, namespace, top, uid, gid)
 }
 
 /// [`give_fd`] with its slots and how long it waits for them named.
-fn give_fd_in(slots: &GiveSlots, wait: std::time::Duration, top: File, uid: u32, gid: u32) -> io::Result<u32> {
+fn give_fd_in(
+    slots: &GiveSlots,
+    wait: std::time::Duration,
+    namespace: &str,
+    top: File,
+    uid: u32,
+    gid: u32,
+) -> io::Result<u32> {
     use nix::dir::Dir;
     use nix::fcntl::OFlag;
     use nix::sys::stat::{Mode, SFlag, fstatat};
@@ -2045,7 +2095,7 @@ fn give_fd_in(slots: &GiveSlots, wait: std::time::Duration, top: File, uid: u32,
         return Ok(0);
     }
     // (Taken before the walk opens a directory of its own, given back when it is done.)
-    let _held = slots.take(wait)?;
+    let _held = slots.take(namespace, wait)?;
     let mut skipped = 0;
     walk(Dir::from(top)?, (uid, gid), GIVE_DEEP, &mut skipped)?;
     Ok(skipped)
@@ -3130,7 +3180,7 @@ mod tests {
         symlink(&outside, volume.join("a/to-dir")).unwrap();
         let group = |path: &str| fs::symlink_metadata(dir.join(path)).unwrap().gid();
 
-        give_path(&volume, uid, other).unwrap();
+        give_path(&volume, "", uid, other).unwrap();
         for given in [
             "volume",
             "volume/top",
@@ -3146,10 +3196,10 @@ mod tests {
         }
         // Theirs already: nothing is walked (what is under it is as it was left).
         nix::unistd::chown(&volume.join("a/b/file"), None, Some(gid.into())).unwrap();
-        give_path(&volume, uid, other).unwrap();
+        give_path(&volume, "", uid, other).unwrap();
         assert_eq!(group("volume/a/b/file"), gid);
         // A volume that is itself a link is not a volume.
-        assert!(give_path(&volume.join("a/to-dir"), uid, other).is_err());
+        assert!(give_path(&volume.join("a/to-dir"), "", uid, other).is_err());
         assert_eq!(group("outside"), gid);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -3208,7 +3258,7 @@ mod tests {
             fs::rename(&volume, &moved).unwrap();
             symlink(&outside, &volume).unwrap();
 
-            give_volume(&mount, uid, other).unwrap();
+            give_volume(&mount, "", uid, other).unwrap();
             let group = |path: &str| fs::symlink_metadata(dir.join(path)).unwrap().gid();
             for given in ["moved", "moved/sub", "moved/sub/f"] {
                 assert_eq!(group(given), other, "{given} (path only: {path_only})");
@@ -3265,7 +3315,7 @@ mod tests {
                 // (Given back to the group it had, then given again.)
                 nix::unistd::chown(&moved, None, Some(gid.into())).unwrap();
                 nix::unistd::chown(&moved.join("f"), None, Some(gid.into())).unwrap();
-                give_volume(&mount, uid, other).unwrap();
+                give_volume(&mount, "", uid, other).unwrap();
                 assert_eq!(fs::metadata(moved.join("f")).unwrap().gid(), other, "round {round}");
                 for kept in [&outside, &outside.join("f")] {
                     assert_eq!(
@@ -3427,13 +3477,13 @@ mod tests {
                 .unwrap()
         };
         fs::create_dir_all(nested(128)).unwrap();
-        assert_eq!(give_fd(open(&dir), uid, other).unwrap(), 0);
+        assert_eq!(give_fd(open(&dir), "", uid, other).unwrap(), 0);
         assert_eq!(fs::metadata(nested(128)).unwrap().gid(), other);
 
         // One level more is refused, and says so.
         fs::create_dir_all(nested(129)).unwrap();
         nix::unistd::chown(&dir, None, Some(gid.into())).unwrap();
-        let said = give_fd(open(&dir), uid, other).unwrap_err().to_string();
+        let said = give_fd(open(&dir), "", uid, other).unwrap_err().to_string();
         assert!(said.contains("128 deep"), "{said}");
         // Nothing of it is left open: the same tree is walked again and again (a leak of the
         // descriptors of a failed walk would show as the process running out of them).
@@ -3441,7 +3491,7 @@ mod tests {
             .unwrap()
             .0;
         for _ in 0..(limit / 100).min(2000) {
-            assert!(give_fd(open(&dir), uid, other).is_err());
+            assert!(give_fd(open(&dir), "", uid, other).is_err());
         }
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -3478,7 +3528,7 @@ mod tests {
                             // (Given back to the group it had, then given again.)
                             let (to, from) = if round % 2 == 0 { (other, gid) } else { (gid, other) };
                             nix::unistd::chown(&volume, None, Some(from.into())).unwrap();
-                            give_fd(open(&volume), uid, to).unwrap();
+                            give_fd(open(&volume), "", uid, to).unwrap();
                         }
                     })
                 })
@@ -3519,7 +3569,7 @@ mod tests {
                             .custom_flags(flags)
                             .open(dir.join(format!("v{walk}")))
                             .unwrap();
-                        give_fd_in(slots, std::time::Duration::from_secs(120), open, uid, other).unwrap();
+                        give_fd_in(slots, std::time::Duration::from_secs(120), "", open, uid, other).unwrap();
                     })
                 })
                 .collect();
@@ -3545,11 +3595,11 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let short = std::time::Duration::from_millis(100);
         let slots = GiveSlots::new(GIVE_COST);
-        let held = slots.take(short).unwrap();
-        let said = slots.take(short).err().expect("no slot was free").to_string();
+        let held = slots.take("", short).unwrap();
+        let said = slots.take("", short).err().expect("no slot was free").to_string();
         assert!(said.contains("no descriptors to give the volume with"), "{said}");
         // (A total smaller than one walk is made one walk: it never refuses every give.)
-        assert!(GiveSlots::new(1).take(short).is_ok());
+        assert!(GiveSlots::new(1).take("", short).is_ok());
         let Some((uid, _, other)) = second_group() else {
             drop(held);
             return;
@@ -3558,13 +3608,57 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("a")).unwrap();
         let open = || fs::OpenOptions::new().read(true).open(&dir).unwrap();
-        let said = give_fd_in(&slots, short, open(), uid, other).unwrap_err().to_string();
+        let said = give_fd_in(&slots, short, "", open(), uid, other)
+            .unwrap_err()
+            .to_string();
         assert!(said.contains("no descriptors to give the volume with"), "{said}");
         // (Nothing was given, nothing opened.)
         assert_ne!(fs::metadata(dir.join("a")).unwrap().gid(), other);
         drop(held);
-        assert_eq!(give_fd_in(&slots, short, open(), uid, other).unwrap(), 0);
+        assert_eq!(give_fd_in(&slots, short, "", open(), uid, other).unwrap(), 0);
         assert_eq!(fs::metadata(dir.join("a")).unwrap().gid(), other);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One namespace holding its whole share (half the pool) cannot stop another's give: its own
+    /// next give waits and times out, and the other namespace's gives finish, here with real walks
+    /// while the first namespace's slots are held. Counts are whole again after.
+    #[test]
+    fn give_nofollow_a_namespace_at_its_share_leaves_the_rest_to_the_others() {
+        use std::os::unix::fs::MetadataExt;
+        let short = std::time::Duration::from_millis(100);
+        // (Room for four walks: a share is two.)
+        let slots = GiveSlots::new(4 * GIVE_COST);
+        assert_eq!(slots.share(), 2 * GIVE_COST);
+        let greedy = [slots.take("big", short).unwrap(), slots.take("big", short).unwrap()];
+        let said = slots
+            .take("big", short)
+            .err()
+            .expect("a third slot of one namespace")
+            .to_string();
+        assert!(said.contains("no descriptors to give the volume with"), "{said}");
+        // (The others have the other half, between them and whatever they ask.)
+        let small = [slots.take("small", short).unwrap(), slots.take("other", short).unwrap()];
+        assert!(slots.take("third", short).is_err(), "the pool is full");
+        drop(small);
+        let Some((uid, _, other)) = second_group() else {
+            drop(greedy);
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-share-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("a")).unwrap();
+        let open = || fs::OpenOptions::new().read(true).open(&dir).unwrap();
+        // (A give of a namespace that has none of its own held, while "big" holds all it may.)
+        assert_eq!(give_fd_in(&slots, short, "small", open(), uid, other).unwrap(), 0);
+        assert_eq!(fs::metadata(dir.join("a")).unwrap().gid(), other);
+        // (And "big" gets its own back when one of its walks is done.)
+        let [first, second] = greedy;
+        drop(first);
+        drop(slots.take("big", short).unwrap());
+        drop(second);
+        assert_eq!(slots.held.lock().unwrap().0, 0);
+        assert!(slots.held.lock().unwrap().1.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3585,7 +3679,7 @@ mod tests {
             fs::create_dir(dir.join(format!("{sub}"))).unwrap();
         }
         let open = fs::OpenOptions::new().read(true).open(&dir).unwrap();
-        assert_eq!(give_fd(open, uid, other).unwrap(), 0);
+        assert_eq!(give_fd(open, "", uid, other).unwrap(), 0);
         for sub in [0, WIDE / 2, WIDE - 1] {
             assert_eq!(fs::metadata(dir.join(format!("{sub}"))).unwrap().gid(), other);
         }
@@ -3612,7 +3706,7 @@ mod tests {
         fs::hard_link(outside.join("one"), volume.join("hard")).unwrap();
         fs::hard_link(outside.join("two"), volume.join("a/hard")).unwrap();
         assert_eq!(
-            give_volume(&held_mount(&volume, "/data", false), uid, other).unwrap(),
+            give_volume(&held_mount(&volume, "/data", false), "", uid, other).unwrap(),
             2
         );
         assert_eq!(fs::metadata(outside.join("one")).unwrap().gid(), gid);
@@ -3653,7 +3747,7 @@ mod tests {
         fs::hard_link(outside.join("file"), volume.join("a/hard")).unwrap();
         let group = |path: &str| fs::symlink_metadata(dir.join(path)).unwrap().gid();
 
-        give_volume(&held_mount(&volume, "/data", false), uid, other).unwrap();
+        give_volume(&held_mount(&volume, "/data", false), "", uid, other).unwrap();
         for given in [
             "volume",
             "volume/a",
@@ -3694,7 +3788,7 @@ mod tests {
         // `d` is a link to a directory, not a directory: it is not entered.
         fs::remove_dir(volume.join("d")).unwrap();
         symlink(&outside, volume.join("d")).unwrap();
-        give_volume(&held_mount(&volume, "/data", false), uid, other).unwrap();
+        give_volume(&held_mount(&volume, "/data", false), "", uid, other).unwrap();
         assert_eq!(fs::metadata(outside.join("file")).unwrap().gid(), gid);
         assert_eq!(fs::metadata(&outside).unwrap().gid(), gid);
         assert_eq!(fs::symlink_metadata(volume.join("d")).unwrap().gid(), other);

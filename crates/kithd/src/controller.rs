@@ -3224,6 +3224,8 @@ async fn start(
         // A NodeWorkload is the node's own: it keeps the node's users.
         host_users: slot.owner.starts_with("NodeWorkload/"),
         project,
+        // ("Kind/namespace/name": the share of the root part's descriptors a give is held to.)
+        namespace: slot.owner.split('/').nth(1).unwrap_or_default().into(),
         ..Unit::default()
     };
     // The volumes' directories are made here, on the node, under the state directory (the

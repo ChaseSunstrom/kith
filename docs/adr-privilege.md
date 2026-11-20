@@ -294,7 +294,12 @@ deep (deeper fails that start), and keeps no list of names, so its cost is bound
 depth, not by a tenant's width. The walks of a process together hold at most half its soft limit
 of descriptors (8192 at most), each taking its 130 before it opens one: a give that finds them
 taken waits for another to finish, 30 s at most, and then only that start fails, with a plain
-error. A check between
+error. One namespace holds at most half of them (a Unit carries its namespace), so a tenant with
+many starts of big volumes waits on its own share and the other half stays for the rest; the limit
+is read after kithd raised its soft one to the hard one (T-1075), so a normal node has the 8192.
+Ceiling: a give holds its slots for its whole walk (a slow volume holds its namespace's share
+while it is walked), and a volume whose give times out is walked again by the next start (the walk
+is idempotent); if that bites, the slots are given back between directories. A check between
 the stat and the
 chown of one entry is still a race; `protected_hardlinks` limits what it gains. In `--split` the
 descriptor follows the unit across the socket (`Call::Create.volumes` names the mounts, their
