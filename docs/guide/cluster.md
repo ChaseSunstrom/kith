@@ -277,8 +277,9 @@ when kithd starts, so a Tailscale or a link that comes up later, or on another n
 caught. Where such a network is in use, name another range on every node. The next Service gets
 the free address after the highest in use, wrapping at the range's end: the address of a deleted
 Service is free again at once only if it was the highest, and otherwise after the allocation wraps.
-A pod reaches a Service only at its address and port (a TCP listener of the host on a Service's
-address at any other port is not open to pods).
+A pod reaches a Service only at its address and a port kithd listens on there (a TCP listener of
+the host on a Service's address at any other port is not open to pods, nor is a Service's port that
+a host listener on every address already holds: kithd cannot listen there).
 
 A Service with `headless: true` (`clusterIP: None` in Kubernetes) has no address of its own: its
 name answers the addresses of its ready replicas, and it cannot be `expose`d. Each ready replica

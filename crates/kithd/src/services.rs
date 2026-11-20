@@ -221,11 +221,15 @@ fn ready_on(workload: &Resource) -> Vec<(String, u32)> {
         .collect()
 }
 
-/// The (address, port) pairs the Services listen on here, IPv4 and IPv6: all a pod may reach of the
-/// node's addresses over TCP, besides the resolver (`pods::keep_held` keeps the node's tables in step).
-pub fn open_to_pods(store: &Store, prefix: Option<Ipv6Addr>) -> Vec<(IpAddr, u16)> {
-    let Some(prefix) = prefix else { return Vec::new() };
-    table(store, prefix, crate::pods::service_range()).into_keys().collect()
+/// The (address, port) pairs kithd really listens on for the Services, IPv4 and IPv6 (not the relay's
+/// port): all a pod may reach of the node's addresses over TCP, besides the resolver. A pair whose bind
+/// failed (a host listener on the wildcard holds that port: a Service made to name it) is not among them,
+/// so the pod's connection there is not let through to that listener.
+fn open_keys(
+    listening: &BTreeMap<(IpAddr, u16), Vec<tokio::task::JoinHandle<()>>>,
+    relay: Option<(IpAddr, u16)>,
+) -> Vec<(IpAddr, u16)> {
+    listening.keys().copied().filter(|key| Some(*key) != relay).collect()
 }
 
 /// What every Service listens on, and where its connections go: on its IPv6 address, and on its
@@ -1293,7 +1297,12 @@ pub async fn run(
         Ok((netns, Ok(four))) => {
             eprintln!("kithd: services: the kernel passes connections to a replica here");
             // (Its IPv4 hook refused: the IPv6 one works, and the Services' IPv4 addresses are kithd's.)
-            let no4 = four.is_err();
+            // (With a program an earlier kithd left, if there is one, it may still pass: tried to empty each round.)
+            let no4 = match (&four, left) {
+                (Ok(()), _) => V4::Works,
+                (Err(_), true) => V4::Stale,
+                (Err(_), false) => V4::Refused,
+            };
             if let Err(e) = four {
                 eprintln!(
                     "kithd: services: the kernel's IPv4 program: {e}: kithd passes the connections to a Service's IPv4 address itself"
@@ -1486,6 +1495,8 @@ pub async fn run(
             });
             listening.insert(key, tasks.collect());
         }
+        // (Only what is listened on is open to the pods, the tables made again when that changes.)
+        crate::pods::open_to(&shared, open_keys(&listening, relay));
         install(&mut kernel, entries, &listening);
         let again = Duration::from_millis(if waiting { 500 } else { 5000 });
         tokio::select! {
@@ -1584,14 +1595,25 @@ impl Loopback {
     }
 }
 
+/// The kernel's IPv4 program, apart from the IPv6 one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum V4 {
+    Works,
+    /// Refused (said once): it has none of IPv4 entries, put again at each round with one, and kithd
+    /// passes the connections to the Services' IPv4 addresses itself.
+    Refused,
+    /// Refused, and the one before could not be emptied: it may pass to a replica that is gone, so
+    /// emptying it is tried again at each round.
+    Stale,
+}
+
 /// The kernel's program on the containers' cgroup, for the network namespace (`u64`, its
 /// cookie) it passes connections of.
 enum Kernel {
     /// None: kithd passes every connection itself.
     Off,
-    /// What it has, and whether its IPv4 program was refused (then it has none of IPv4 entries, put again at each round, and
-    /// kithd passes the connections to the Services' IPv4 addresses itself).
-    Has(u64, Vec<connect::Entry>, bool),
+    /// What it has, and what of its IPv4 program ([`V4`]).
+    Has(u64, Vec<connect::Entry>, V4),
     /// One kithd could not empty: it may pass what kithd no longer knows of.
     Stuck(u64),
 }
@@ -1631,7 +1653,7 @@ fn install_with(
     put: &impl Fn(bool, &[u8]) -> std::io::Result<()>,
     say: &mut impl FnMut(String),
 ) {
-    let (netns, last, no4) = match kernel {
+    let (netns, last, v4) = match kernel {
         Kernel::Off => return,
         Kernel::Stuck(netns) => {
             if connect::attach_with(&[], *netns, put).all().is_ok() {
@@ -1643,8 +1665,12 @@ fn install_with(
             }
             return;
         }
-        Kernel::Has(netns, last, no4) => (netns, last, no4),
+        Kernel::Has(netns, last, v4) => (netns, last, v4),
     };
+    if *v4 == V4::Stale && put(true, &connect::program4(&[], *netns)).is_ok() {
+        say("kithd: services: the kernel's IPv4 program is emptied at last".into());
+        *v4 = V4::Refused;
+    }
     entries.retain(|entry| {
         entry
             .elsewhere
@@ -1653,7 +1679,7 @@ fn install_with(
     if entries == *last {
         return;
     }
-    let said_v4 = *no4;
+    let said_v4 = *v4 != V4::Works;
     let attached = connect::attach_with(&entries, *netns, put);
     if let Err(e) = attached.v6 {
         *kernel = match connect::attach_with(&[], *netns, put).all() {
@@ -1676,12 +1702,13 @@ fn install_with(
     // (One refused is put again at each round that has an IPv4 entry, as `last` then lacks them:
     // the next that is accepted lifts it, and a refusal after that is said again.)
     if attached.v4.is_ok() {
-        *no4 = false;
+        *v4 = V4::Works;
     }
     if let Err(e) = attached.v4 {
         if !said_v4 {
             // (Emptied if it can be: the one before may still pass to a replica that is gone.)
             let emptied = put(true, &connect::program4(&[], *netns));
+            *v4 = if emptied.is_ok() { V4::Refused } else { V4::Stale };
             let then = match emptied {
                 Ok(()) => String::new(),
                 Err(left) => format!(
@@ -1692,7 +1719,6 @@ fn install_with(
                 "kithd: services: the kernel's IPv4 program: {e}{then}: kithd passes the connections to a Service's IPv4 address itself, and those of IPv6 are still the kernel's"
             ));
         }
-        *no4 = true;
         entries.retain(|entry| entry.service.0.is_ipv6());
     }
     *last = entries;
@@ -1980,9 +2006,6 @@ spec:
         };
         let wanted = Table::from([((address, 80), to(8080)), ((address, 9000), to(9000))]);
         assert_eq!(table, wanted);
-        // What a pod may reach of the node's own by TCP: those pairs, and nothing with no mesh.
-        assert_eq!(open_to_pods(&store, Some(prefix)), vec![(address, 80), (address, 9000)]);
-        assert_eq!(open_to_pods(&store, None), vec![]);
 
         // The Service's name, where the cluster's names are asked.
         let (zones, _) = crate::dns::zones_of(&store, Some(prefix));
@@ -3838,6 +3861,37 @@ spec:
     }
 }
 
+/// A Service made to name a port a host listener holds on the wildcard (7443, 22) gets no listener
+/// of kithd's there, as the bind fails; the pair is then not open to the pods, which would else reach
+/// the host's listener at the Service's address.
+#[tokio::test]
+async fn a_port_a_host_wildcard_listener_holds_is_not_open_to_pods() {
+    let host = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let taken = host.local_addr().unwrap().port();
+    let free = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let at = |port| (IpAddr::from([127, 0, 0, 1]), port);
+    let relay = at(free + 1);
+    let mut listening = BTreeMap::new();
+    for key in [at(taken), at(free), relay] {
+        if listen(SocketAddr::new(key.0, key.1), 1).is_ok() {
+            listening.insert(key, Vec::new());
+        }
+    }
+    assert!(
+        !listening.contains_key(&at(taken)),
+        "the bind next to a wildcard listener fails"
+    );
+    assert_eq!(
+        open_keys(&listening, Some(relay)),
+        vec![at(free)],
+        "not the held port, nor the relay's"
+    );
+}
+
 /// An IPv4 program the kernel refused is put again at the next round, and said once.
 #[test]
 fn a_refused_ipv4_program_is_put_again_and_said_once() {
@@ -3859,7 +3913,7 @@ fn a_refused_ipv4_program_is_put_again_and_said_once() {
         }
     };
     let mut said = Vec::new();
-    let mut kernel = Kernel::Has(1, Vec::new(), false);
+    let mut kernel = Kernel::Has(1, Vec::new(), V4::Works);
     install_with(&mut kernel, entries.clone(), &no_listeners, &put, &mut |t| said.push(t));
     install_with(&mut kernel, entries.clone(), &no_listeners, &put, &mut |t| said.push(t));
     assert_eq!(said.len(), 1, "said once: {said:?}");
@@ -3867,7 +3921,7 @@ fn a_refused_ipv4_program_is_put_again_and_said_once() {
         panic!("kernel gone")
     };
     assert!(
-        *no4 && last.len() == 1 && last[0].service.0.is_ipv6(),
+        *no4 == V4::Stale && last.len() == 1 && last[0].service.0.is_ipv6(),
         "only IPv6 passed"
     );
     // The hook takes it at a later round: both are passed, and a refusal after is said again.
@@ -3876,12 +3930,48 @@ fn a_refused_ipv4_program_is_put_again_and_said_once() {
     let Kernel::Has(_, last, no4) = &kernel else {
         panic!("kernel gone")
     };
-    assert!(!*no4 && *last == entries, "IPv4 passed again");
+    assert!(*no4 == V4::Works && *last == entries, "IPv4 passed again");
     refuse4.store(true, Relaxed);
     let mut other = entries.clone();
     other[0].all = 2;
     install_with(&mut kernel, other, &no_listeners, &put, &mut |t| said.push(t));
-    assert_eq!(said.len(), 2, "said again after it worked: {said:?}");
+    // (The refusal, the one before emptied at last, and the refusal after it worked.)
+    assert_eq!(said.len(), 3, "said again after it worked: {said:?}");
+}
+
+/// An IPv4 program refused, whose one before could not be emptied either, is emptied again at each
+/// round, with nothing else changed, until it is.
+#[test]
+fn an_ipv4_program_that_could_not_be_emptied_is_emptied_again() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let address: IpAddr = "fd00::1".parse().unwrap();
+    let entries = vec![connect::Entry {
+        service: (address, 80),
+        here: vec![SocketAddr::new(address, 8080)],
+        all: 1,
+        elsewhere: None,
+    }];
+    let refuse4 = AtomicBool::new(true);
+    let put = |v4: bool, _: &[u8]| -> std::io::Result<()> {
+        if v4 && refuse4.load(Relaxed) {
+            Err(std::io::Error::other("no hook"))
+        } else {
+            Ok(())
+        }
+    };
+    let no_listeners = BTreeMap::new();
+    let mut said = Vec::new();
+    let mut kernel = Kernel::Has(1, Vec::new(), V4::Works);
+    install_with(&mut kernel, entries.clone(), &no_listeners, &put, &mut |t| said.push(t));
+    assert!(matches!(kernel, Kernel::Has(_, _, V4::Stale)), "not emptied: stale");
+    // Nothing changed, and the put still fails: still stale, nothing said again.
+    install_with(&mut kernel, entries.clone(), &no_listeners, &put, &mut |t| said.push(t));
+    assert!(matches!(kernel, Kernel::Has(_, _, V4::Stale)));
+    assert_eq!(said.len(), 1, "{said:?}");
+    refuse4.store(false, Relaxed);
+    install_with(&mut kernel, entries, &no_listeners, &put, &mut |t| said.push(t));
+    assert!(matches!(kernel, Kernel::Has(_, _, V4::Refused)), "emptied at last");
+    assert_eq!(said.len(), 2, "said: {said:?}");
 }
 
 /// A Service `name` in `namespace`, as an Apply has it.

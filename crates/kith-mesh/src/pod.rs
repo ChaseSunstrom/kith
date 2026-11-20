@@ -715,6 +715,9 @@ fn pod_guard_rules(range: Range, services: &[(IpAddr, u16)], pods: &[Served]) ->
     // A Service's address and port, TCP only, a rule for each: the Services' addresses are the
     // node's own (on its loopback or its mesh link), so a listener bound to every address is
     // there at them too, on ports that are no Service's.
+    // ponytail: one rule each, so the "in" chain grows with the Services x their TCP ports, and each
+    // make of the tables (on a change of the pairs) sends them all; an nft set of (address, port)
+    // is the upgrade when a node holds thousands.
     for (address, port) in services {
         let bits = if address.is_ipv4() { 32 } else { 128 };
         let mut rule = vec![came_by(b"kp")];

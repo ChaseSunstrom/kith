@@ -540,7 +540,7 @@ spec: { selector: { app: web }, headless: true, ports: [{ port: 80 }] }
                 Ok(())
             }
         };
-        let mut kernel = Kernel::Has(netns, Vec::new(), false);
+        let mut kernel = Kernel::Has(netns, Vec::new(), V4::Works);
         let mut said = Vec::new();
         let listening = BTreeMap::new();
         install_with(&mut kernel, entries.clone(), &listening, &refuse4, &mut |text| {
@@ -551,7 +551,8 @@ spec: { selector: { app: web }, headless: true, ports: [{ port: 80 }] }
             panic!("the IPv6 hook is still on")
         };
         assert_eq!(last, &entries[..1]);
-        assert!(*no4);
+        // (Refused, and the empty one before it as well: stale.)
+        assert_eq!(*no4, V4::Stale);
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("IPv4") && said[0].contains("refused"), "{said:?}");
         // The IPv6 program written is the one for the entry.
