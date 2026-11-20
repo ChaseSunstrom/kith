@@ -146,6 +146,40 @@ def test_a_row_that_does_not_parse_is_a_limit_row():
     assert status == 1 and row.startswith("100 1 2048 limit the adapter's row did not parse: "), row
 
 
+def nested_sh(vm, tmp):
+    """Runs a copy of ci/stress.sh --nested whose vm.sh is `vm`; returns its exit status and every line it wrote to the file."""
+    ci = os.path.join(tmp, "ci")
+    os.mkdir(ci)
+    for name in ("stress.sh", "stress_workloads.py", "compare_workloads.py"):
+        shutil.copy(os.path.join(HERE, name), ci)
+    with open(os.path.join(ci, "vm.sh"), "w") as f:
+        f.write(vm)
+    out = os.path.join(tmp, "out.txt")
+    run = subprocess.run(["sh", os.path.join(ci, "stress.sh"), "--nested", "--out", out], capture_output=True, text=True)
+    with open(out) as f:
+        return run.returncode, f.read().splitlines()
+
+
+def test_nested_keeps_the_rows_of_a_run_that_failed():
+    vm = 'printf "nested defaults | user namespace: refused\\nnested smallest opening: none\\n" >>"$KITH_NESTED_OUT"\nexit 1\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        status, lines = nested_sh(vm, tmp)
+    assert status == 1 and lines[-2:] == ["nested defaults | user namespace: refused", "nested smallest opening: none"], (status, lines)
+    assert lines[0].startswith("# size nodes"), lines
+
+
+def test_nested_on_a_machine_that_cannot_run_it_writes_no_row():
+    with tempfile.TemporaryDirectory() as tmp:
+        status, lines = nested_sh("exit 77\n", tmp)
+    assert status == 77 and not any(line.startswith("nested ") for line in lines), (status, lines)
+
+
+def test_nested_when_vm_sh_skips_with_status_0_is_77():
+    with tempfile.TemporaryDirectory() as tmp:
+        status, lines = nested_sh("echo skipped: no kvm\nexit 0\n", tmp)
+    assert status == 77 and not any(line.startswith("nested ") for line in lines), (status, lines)
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):

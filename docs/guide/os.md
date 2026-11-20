@@ -108,7 +108,11 @@ sh os/build.sh --spec n1.yaml --out target/os-n1
 
 A node with no card a feature matches prints `features: []`; a node that runs no kith OS has no
 `wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
-card the catalogue does not list yet) is chosen by hand, as above.
+card the catalogue does not list yet) is chosen by hand, as above. A line may give `vendor:*`
+instead of a device id, which matches any display card (PCI class 03) of that vendor and not its
+audio function: `all` has `10de:*`, so a node with an NVIDIA GPU wants `all` (nouveau's driver is
+in it). A node that also has an AMD Phoenix GPU wants `all` alone, which build.sh would refuse with
+`gpu-amd-phoenix` and whose modules cover that GPU.
 
 #### The `all` feature: drivers as signed modules
 
@@ -535,6 +539,11 @@ that disk is lost**, and nobody is asked at the machine: name only cards of mach
 erase. `--disk only` (the default) installs on a machine's one disk and refuses a machine with
 several; `--disk nvme0n1` names it. Netboot turns itself off after `--minutes` (30; at most 60),
 when the node restarts, or with `--off`.
+
+The machine is installed with this node's release keys (as the node holds them when netboot is
+turned on) and `--lan-releases`, if the node has them: it takes kith OS releases from the same
+keys, not from the first release's. The answers hold 8 keys at most: a node with more, or with
+keys it cannot read, does not turn netboot on and says which.
 
 The node must be the one that started the cluster (it holds the CA, which makes the join tokens)
 and run with `--listen`. An Identity that may apply Nodes, Roles and RoleBindings sends the same

@@ -5,8 +5,9 @@
 //! A Volume with `replicas: N` is on N nodes: the one that has it now (`status.primary`,
 //! its `spec.node` to begin with) and N-1 the leader picks (`status.replicas`). Every
 //! `sync` (5m unless said) each replica asks the primary for an archive of the directory,
-//! unpacks it beside its own copy and puts it in its place, and writes when in
-//! `status.synced`. When the primary is not heard from for as long as a lost node's
+//! unpacks it beside its own copy and puts it in its place, and writes when in its own
+//! field of the status, `synced-NODE` (the whole `synced` object is what an older kithd wrote,
+//! and is read still). When the primary is not heard from for as long as a lost node's
 //! workloads wait (`--lost-after`), the leader makes the replica that synced last the
 //! primary: workloads that mount the volume are placed there, on the copy as it was then.
 //!
@@ -41,9 +42,41 @@ const SYNC: u64 = 300;
 /// A primary that sends nothing for this long is given up on, for this time.
 const QUIET: Duration = Duration::from_secs(30);
 
+/// A replica's own field of the status: `synced-NODE`, when it last synced. One field a node,
+/// so that two replicas writing at once (each a Patch of its own field) never put the other's
+/// time back, as one `synced` object written whole by each could.
+pub const SYNCED: &str = "synced-";
+
+/// Is `field` one of a Volume's status fields that say where its copies are (kept when the
+/// rest of the status is worked out again)?
+pub fn is_copy_field(field: &str) -> bool {
+    FIELDS.contains(&field) || field.starts_with(SYNCED)
+}
+
 fn names(value: &Value) -> Vec<String> {
     let names = value.as_array().into_iter().flatten().filter_map(Value::as_str);
     names.map(String::from).collect()
+}
+
+/// When each replica synced, by node: each node's own `synced-NODE`, and what an older kithd
+/// wrote in the whole `synced` object (the later of the two where a node has both).
+fn synced_at(status: &Value) -> BTreeMap<String, u64> {
+    let mut at: BTreeMap<String, u64> = BTreeMap::new();
+    let mut note = |node: &str, time: Option<u64>| {
+        if let Some(time) = time {
+            let known = at.entry(node.to_string()).or_default();
+            *known = (*known).max(time);
+        }
+    };
+    for (node, time) in status["synced"].as_object().into_iter().flatten() {
+        note(node, time.as_u64());
+    }
+    for (field, time) in status.as_object().into_iter().flatten() {
+        if let Some(node) = field.strip_prefix(SYNCED) {
+            note(node, time.as_u64());
+        }
+    }
+    at
 }
 
 /// The leader's part: for each replicated Volume whose `primary` or `replicas` should be
@@ -70,7 +103,8 @@ pub fn writes(
         replicas.retain(|node| *node != primary);
         if gone(&primary) {
             // The copy brought up to date last, of those on nodes that are there.
-            let synced = |node: &&String| status["synced"][node.as_str()].as_u64();
+            let times = synced_at(&status);
+            let synced = |node: &&String| times.get(node.as_str()).copied();
             let ready = replicas
                 .iter()
                 .filter(|node| there(node))
@@ -103,9 +137,22 @@ pub fn writes(
         let mut synced = status["synced"].as_object().cloned().unwrap_or_default();
         let before = synced.len();
         synced.retain(|node, _| replicas.contains(node));
-        if status["primary"].as_str() != Some(&primary) || was != replicas || synced.len() != before {
+        // (A node's own field goes with it: nothing to remove from a Patch but to null it.)
+        let own = status.as_object().into_iter().flatten();
+        let stale: Vec<&String> = own
+            .filter(|(field, time)| !time.is_null() && field.starts_with(SYNCED))
+            .map(|(field, _)| field)
+            .filter(|field| !replicas.iter().any(|node| format!("{SYNCED}{node}") == **field))
+            .collect();
+        if status["primary"].as_str() != Some(&primary)
+            || was != replicas
+            || synced.len() != before
+            || !stale.is_empty()
+        {
             let fields = json!({ "primary": primary, "replicas": replicas, "synced": synced });
-            writes.push((key, fields.as_object().expect("an object").clone()));
+            let mut fields = fields.as_object().expect("an object").clone();
+            fields.extend(stale.into_iter().map(|field| (field.clone(), Value::Null)));
+            writes.push((key, fields));
         }
     }
     writes
@@ -384,7 +431,7 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
                     .as_str()
                     .and_then(kith_api::kinds::every)
                     .unwrap_or(SYNC);
-                let last = status["synced"][&me].as_u64().max(tried.get(&key).copied());
+                let last = synced_at(&status).get(&me).copied().max(tried.get(&key).copied());
                 let there = store.get(&format!("Node/{}", dir.node));
                 let there = there.and_then(crate::view::Upstream::of);
                 if let (true, Some(there)) = (last.is_none_or(|last| now >= last + every), there) {
@@ -408,22 +455,10 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
             match synced {
                 Ok(_) => {
                     said.remove(&key);
-                    // ponytail: each replica writes the whole `synced` with its own time in;
-                    // two that write at once can put the other's back by one sync, which its
-                    // next sync puts right (a takeover then may pick a copy one sync older).
-                    // A status field per node, or a merging Patch, would close it.
-                    let synced = {
-                        let state = shared.store.lock().expect("a handler panicked holding the store");
-                        let was = state
-                            .store
-                            .get(&key)
-                            .and_then(|volume| volume.status.as_ref()?["synced"].as_object().cloned());
-                        let mut synced = was.unwrap_or_default();
-                        synced.insert(me.clone(), now.into());
-                        synced
-                    };
-                    let fields = json!({ "synced": synced });
-                    let statuses = vec![(key.clone(), fields.as_object().expect("an object").clone())];
+                    // Only this node's own field: a Patch of the whole `synced` would, with two
+                    // replicas writing at once, put the other's time back.
+                    let fields = Map::from_iter([(format!("{SYNCED}{me}"), Value::from(now))]);
+                    let statuses = vec![(key.clone(), fields)];
                     if let Err(e) = shared.submit(Command::Patch { statuses }).await {
                         eprintln!("kithd: volume {key}: that its copy is up to date was not said: {e}");
                     }
@@ -793,5 +828,65 @@ mod tests {
         drop(incoming);
         assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// Two replicas that write when they synced at once, each having read the status before the
+    /// other's write came in, leave both times: each writes its own field and no other.
+    #[test]
+    fn two_replicas_writing_when_they_synced_at_once_keep_both_times() {
+        let mut store = store(json!({ "primary": "a", "replicas": ["b", "c"] }));
+        let patch = |node: &str, at: u64| Command::Patch {
+            statuses: vec![(
+                KEY.to_string(),
+                Map::from_iter([(format!("{SYNCED}{node}"), Value::from(at))]),
+            )],
+        };
+        // (Both made their write from the same view of the status; the store runs them one
+        // after the other, in whichever order they arrive.)
+        for order in [[("b", 100), ("c", 200)], [("c", 200), ("b", 100)]] {
+            for (node, at) in order {
+                kith_store::run(&mut store, patch(node, at)).unwrap();
+            }
+            let status = store.get(KEY).unwrap().status.clone().unwrap();
+            assert_eq!(
+                synced_at(&status),
+                BTreeMap::from([("b".to_string(), 100), ("c".to_string(), 200)])
+            );
+            assert_eq!(status["primary"], "a", "the rest of the status stays");
+        }
+        // A later sync of one moves its time alone.
+        kith_store::run(&mut store, patch("b", 300)).unwrap();
+        let status = store.get(KEY).unwrap().status.clone().unwrap();
+        assert_eq!(synced_at(&status)["b"], 300);
+        assert_eq!(synced_at(&status)["c"], 200);
+    }
+
+    /// What an older kithd wrote (the whole `synced`) is read as before, the later of two times
+    /// counts, and a node that stops being a replica loses both kinds of time.
+    #[test]
+    fn a_nodes_own_field_and_the_older_whole_object_are_read_together() {
+        let both = store(json!({ "primary": "a", "replicas": ["b"], "synced": { "b": 100 }, "synced-b": 90 }));
+        let status = both.get(KEY).unwrap().status.clone().unwrap();
+        assert_eq!(synced_at(&status)["b"], 100);
+        let newer = store(json!({ "primary": "a", "replicas": ["b"], "synced": { "b": 100 }, "synced-b": 150 }));
+        let status = newer.get(KEY).unwrap().status.clone().unwrap();
+        assert_eq!(synced_at(&status)["b"], 150);
+        // A takeover goes to the replica with a time in its own field, as to one in the object.
+        let own = store(json!({ "primary": "a", "replicas": ["b"], "synced-b": 100 }));
+        assert_eq!(
+            decided(&own, &[("a", 60)]).unwrap(),
+            ("b".to_string(), vec!["c".to_string()])
+        );
+        // A node no replica any more: its field is nulled, once.
+        let gone = store(json!({ "primary": "a", "replicas": ["b"], "synced-b": 100, "synced-c": 50 }));
+        let (_, fields) = writes(&gone, &|_| None, GRACE).pop().unwrap();
+        assert_eq!(fields["synced-c"], Value::Null);
+        assert!(!fields.contains_key("synced-b"));
+        let cleared = store(json!({ "primary": "a", "replicas": ["b"], "synced-b": 100, "synced-c": null }));
+        assert_eq!(decided(&cleared, &[]), None);
+        // The status the Volume's controller works out again keeps the fields of the copies.
+        let again = crate::volumes::resolve(&gone).status;
+        assert_eq!(again[KEY].as_ref().unwrap()["synced-b"], 100);
+        assert!(is_copy_field("synced-w-b") && is_copy_field("primary") && !is_copy_field("claim"));
     }
 }
