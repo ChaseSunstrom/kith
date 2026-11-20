@@ -10,20 +10,24 @@
 //! not asked while the operator's is); and the cluster's leader (`GET /v1/clock` on the
 //! cluster port, a node asking another over mutual TLS: a closed network with one clock in
 //! it still has one time), whose time outweighs a server that is over two seconds from it.
-//! The first time a clock is set one source is enough (a machine that starts in 1970 has
-//! no other way); after that a step takes a second source to agree (see `ask`). What it found is in this
-//! Node's status as `clock`: `{server, offsetMs, delayMs, stepped, checked}`, or `{error,
-//! checked}` where no one answered.
+//! The operator's server is followed alone, by any step. Before the clock was ever set (it reads
+//! before `FLOOR_US`) the first answer is enough; after, a network's word alone moves it by an
+//! hour at most, and more takes a second source to agree (see `ask`). While the clock is
+//! unset, `/v1/clock` answers 503: a node that reads 1970 is no one's time. What it found is
+//! in this Node's status as `clock`: `{server, offsetMs, delayMs, stepped, checked}`, or
+//! `{error, checked}` where no one answered.
 //!
 //! Every timer of kithd is monotonic (tokio's `Instant`: Raft's elections and heartbeats, the
 //! controllers' ticks, request timeouts), so a step breaks none of them: the store's own time
 //! stamps are wall time and only read, and `controller/prune` measures what it prunes on
-//! CLOCK_BOOTTIME for this reason. A node with `--node-policy hardened` has no CAP_SYS_TIME: the
-//! step is refused there (and the status says so, with the offset it found).
+//! CLOCK_BOOTTIME for this reason. A node under the `hardened` policy does not set its clock:
+//! the step is refused in `set_under` (the policy's cuts only trim the bounding set, so the
+//! refusal is explicit), and the status says so, with the offset it found.
 
 use nix::time::{ClockId, clock_settime};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, watch};
@@ -37,6 +41,18 @@ use std::sync::Arc;
 const STEP_OVER_US: i64 = 2_000_000;
 /// Two sources say the same time when their offsets are this near (see `ask`).
 const AGREE_US: i64 = 1_000_000;
+/// A step of at most an hour may follow one source that is not the operator's (a drifting
+/// clock without a battery is off by seconds in hours); a longer one needs a second.
+const ONE_SOURCE_US: i64 = 3_600_000_000;
+/// 2026-01-01: a clock before it was never set (a machine that starts in 1970), one after it
+/// was, and a network's word alone does not move it by years. Stale in time, never wrong.
+const FLOOR_US: i64 = 1_767_225_600_000_000;
+/// Servers of a DHCP lease asked (a lease names few; more is a flood).
+const NETWORK_SERVERS: usize = 4;
+
+/// Set while this node keeps its clock and has not found the time yet: `serve` says nothing then
+/// (a leader whose clock reads 1970 must not be the time the others set theirs to).
+static UNSET: AtomicBool = AtomicBool::new(false);
 /// Between asks: after an answer, and after none (never under a minute).
 const EVERY: Duration = Duration::from_secs(3600);
 const RETRY: Duration = Duration::from_secs(60);
@@ -93,7 +109,10 @@ pub fn told(server: Option<SocketAddr>) {
 /// nothing is told, the DHCP's first, then the gateway, a home router often being one).
 /// No server twice.
 pub(crate) fn order(dhcp: &[Ipv4Addr], told: Option<SocketAddr>, gateway: Option<Ipv4Addr>) -> Vec<SocketAddr> {
-    let dhcp = dhcp.iter().map(|ip| SocketAddr::new((*ip).into(), 123));
+    let dhcp = dhcp
+        .iter()
+        .take(NETWORK_SERVERS)
+        .map(|ip| SocketAddr::new((*ip).into(), 123));
     let gateway = gateway.map(|ip| SocketAddr::new(ip.into(), 123));
     let mut all: Vec<SocketAddr> = Vec::new();
     let network = dhcp.chain(gateway).filter(|_| told.is_none());
@@ -162,23 +181,23 @@ fn decode(answer: &[u8], sent: [u8; 8], t1: i64, t4: i64) -> Result<Sample, Stri
     if mode != 4 || !(3..=4).contains(&version) {
         return Err("not an answer to a client".into());
     }
-    // (Stratum 0 is a "kiss of the death": the server's code for why it will not answer.)
+    if answer[24..32] != sent {
+        return Err("an answer to another question".into());
+    }
+    // (Stratum 0 is a "kiss of the death": the server's code for why it will not answer; heard
+    // only from an answer to this question, so that a forged one cannot end the wait.)
     if stratum == 0 {
-        return Err(format!(
-            "the server refuses: {}",
-            String::from_utf8_lossy(&answer[12..16])
-        ));
+        return Err(format!("{KISS}{}", String::from_utf8_lossy(&answer[12..16])));
     }
     if stratum > 15 || leap == 3 {
         return Err("the server's own clock is not set".into());
     }
-    if answer[24..32] != sent {
-        return Err("an answer to another question".into());
-    }
     if answer[32..48].iter().all(|b| *b == 0) {
         return Err("no time in the answer".into());
     }
-    let (t2, t3) = (from_ntp(&answer[32..], t1), from_ntp(&answer[40..], t1));
+    // (A clock that was never set reads 1970: the era of the answer is the one of the floor.)
+    let near = t1.max(FLOOR_US);
+    let (t2, t3) = (from_ntp(&answer[32..], near), from_ntp(&answer[40..], near));
     let delay_us = (t4 - t1) - (t3 - t2);
     if t3 < t2 || delay_us < 0 {
         return Err("the answer's times are out of order".into());
@@ -188,6 +207,9 @@ fn decode(answer: &[u8], sent: [u8; 8], t1: i64, t4: i64) -> Result<Sample, Stri
         delay_us,
     })
 }
+
+/// What `decode` says of a kiss of death: the wait for another answer is over.
+const KISS: &str = "the server refuses: ";
 
 fn failed(what: &'static str) -> impl FnOnce(std::io::Error) -> String {
     move |e| format!("{what}: {e}")
@@ -211,6 +233,7 @@ async fn exchange(server: SocketAddr, wait: Duration) -> Result<Sample, String> 
             let read = socket.recv(&mut packet).await.map_err(failed("reading"))?;
             match decode(&packet[..read], sent, t1, now_us()) {
                 Ok(sample) => return Ok(sample),
+                Err(e) if e.starts_with(KISS) => return Err(e),
                 Err(e) => bad = e,
             }
         }
@@ -258,12 +281,25 @@ async fn leader_time(shared: &Shared) -> Result<Sample, String> {
 }
 
 /// What this node answers another that asks the time (`/v1/clock`, for members): its clock.
-pub async fn serve() -> axum::Json<i64> {
-    axum::Json(now_us())
+/// Nothing (503) while this node has not found the time itself: its clock may read 1970.
+pub async fn serve() -> Result<axum::Json<i64>, axum::http::StatusCode> {
+    if UNSET.load(Ordering::Relaxed) {
+        return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(axum::Json(now_us()))
 }
 
-/// Set the wall clock to `us` microseconds since 1970.
+/// Set the wall clock to `us` microseconds since 1970, where this node's policy lets it.
 fn set(us: i64) -> std::io::Result<()> {
+    set_under(&crate::policy::get(), us)
+}
+
+/// A hardened node does not move its clock (certificates, update windows and CronJobs follow
+/// it): the status says the offset it found and this.
+fn set_under(policy: &crate::policy::Policy, us: i64) -> std::io::Result<()> {
+    if *policy == crate::policy::Policy::hardened() {
+        return Err(std::io::Error::other("this node's policy is hardened"));
+    }
     let to = u64::try_from(us).map_err(|_| std::io::Error::other("a time before 1970"))?;
     let to = nix::sys::time::TimeSpec::from_duration(Duration::from_micros(to));
     clock_settime(ClockId::CLOCK_REALTIME, to).map_err(std::io::Error::from)
@@ -293,21 +329,27 @@ fn nothing(why: &str, at: i64) -> Value {
 /// is over two seconds from it; and the status that says so. Whose time, when they differ:
 /// - the leader's (a member's, over the cluster's mutual TLS) when a server is over two seconds
 ///   from it, and when no server answered;
-/// - else the first server's. Time from a network is unsigned: once the clock has been set
-///   once (`synced`), a step takes a second source (another server, or the leader) within a
-///   second of the same time; one source alone is said in the status and not followed.
+/// - else the first server's. Time from a network is unsigned: once the clock was set (`synced`:
+///   by a check, or before kithd started), a step of over an hour takes a second source (another
+///   server, or the leader) within a second of the same time, and is otherwise said in the status
+///   and not followed. A step of less follows one source; so does any of the server the operator
+///   `told` (that is the operator's word). Before the clock was ever set, the first server answers.
 async fn ask(
     servers: &[SocketAddr],
     wait: Duration,
     leader: impl Future<Output = Result<Sample, String>>,
     set_to: impl Fn(i64) -> std::io::Result<()>,
     synced: bool,
+    told: bool,
 ) -> Value {
     let (mut found, mut why) = (Vec::new(), Vec::new());
     for server in servers {
         match exchange(*server, wait).await {
             Ok(sample) => found.push((server.to_string(), sample)),
             Err(e) => why.push(format!("{server}: {e}")),
+        }
+        if !synced && !found.is_empty() {
+            break;
         }
     }
     let leader = leader.await.map(|sample| ("the cluster's leader".to_string(), sample));
@@ -336,7 +378,7 @@ async fn ask(
         .any(|s| (s.offset_us - sample.offset_us).abs() <= AGREE_US);
     let step = if sample.offset_us.abs() <= STEP_OVER_US {
         None
-    } else if synced && !trusted && !agrees {
+    } else if synced && !trusted && !told && sample.offset_us.abs() > ONE_SOURCE_US && !agrees {
         Some(Err(format!(
             "{server} says the clock is {:+.1} s off and no second source agrees",
             sample.offset_us as f64 / 1e6
@@ -359,14 +401,21 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     let kept = async {
         let _ = tokio::time::timeout(Duration::from_secs(10), LEARNED.notified()).await;
         let mut said = String::new();
-        let mut synced = false;
+        let mut synced = now_us() > FLOOR_US;
+        UNSET.store(!synced, Ordering::Relaxed);
         loop {
-            let servers = {
+            let (servers, told) = {
                 let sources = SOURCES.lock().expect("nothing panics holding the sources");
-                order(&sources.dhcp, sources.told, sources.gateway)
+                (
+                    order(&sources.dhcp, sources.told, sources.gateway),
+                    sources.told.is_some(),
+                )
             };
-            let now = ask(&servers, WAIT, leader_time(&shared), set, synced).await;
-            synced |= now["error"].is_null() && now["server"].is_string();
+            let now = ask(&servers, WAIT, leader_time(&shared), set, synced, told).await;
+            if now["error"].is_null() && now["server"].is_string() {
+                synced = true;
+                UNSET.store(false, Ordering::Relaxed);
+            }
             let again = if now["error"].is_null() || now["stepped"] == true {
                 EVERY
             } else {
@@ -598,7 +647,7 @@ mod tests {
         let never = async { Err::<Sample, _>("not asked".to_string()) };
         // Eight hours behind: the clock is set to the server's time.
         let before = now_us();
-        let said = ask(&[fake(28_800_000_000, |_| {}).await], SOON, never, record, false).await;
+        let said = ask(&[fake(28_800_000_000, |_| {}).await], SOON, never, record, false, false).await;
         let to = set_to.get().expect("the clock was set");
         assert!((to - before - 28_800_000_000).abs() < 200_000, "{to} from {before}");
         assert_eq!(
@@ -609,12 +658,12 @@ mod tests {
         // Ahead by five seconds: stepped back. Three-quarters of a second: left alone.
         set_to.set(None);
         let never = async { Err::<Sample, _>("not asked".to_string()) };
-        let said = ask(&[fake(-5_000_000, |_| {}).await], SOON, never, record, false).await;
+        let said = ask(&[fake(-5_000_000, |_| {}).await], SOON, never, record, false, false).await;
         assert!(set_to.get().is_some_and(|to| to < now_us() - 4_500_000));
         assert_eq!(said["stepped"], true);
         set_to.set(None);
         let never = async { Err::<Sample, _>("not asked".to_string()) };
-        let said = ask(&[fake(750_000, |_| {}).await], SOON, never, record, true).await;
+        let said = ask(&[fake(750_000, |_| {}).await], SOON, never, record, true, false).await;
         assert_eq!(set_to.get(), None);
         assert_eq!(said["stepped"], false);
         assert!((said["offsetMs"].as_i64().unwrap() - 750).abs() < 100);
@@ -624,7 +673,7 @@ mod tests {
     async fn clock_a_step_that_is_refused_is_said_with_the_offset_found() {
         let never = async { Err::<Sample, _>("not asked".to_string()) };
         let refuse = |_| Err(std::io::Error::from_raw_os_error(1));
-        let said = ask(&[fake(7_200_000_000, |_| {}).await], SOON, never, refuse, false).await;
+        let said = ask(&[fake(7_200_000_000, |_| {}).await], SOON, never, refuse, false, false).await;
         assert_eq!(said["stepped"], false);
         assert!(said["error"].as_str().unwrap().contains("not set"), "{said}");
         assert!((said["offsetMs"].as_i64().unwrap() - 7_200_000).abs() < 200);
@@ -645,6 +694,7 @@ mod tests {
             leader,
             record,
             false,
+            false,
         )
         .await;
         assert_eq!(said["stepped"], true);
@@ -656,7 +706,7 @@ mod tests {
                 delay_us: 2_000,
             })
         };
-        let said = ask(&[nobody().await], SOON, leader, record, true).await;
+        let said = ask(&[nobody().await], SOON, leader, record, true, false).await;
         assert_eq!(
             (said["server"].as_str(), said["offsetMs"].as_i64()),
             (Some("the cluster's leader"), Some(-9000))
@@ -664,20 +714,33 @@ mod tests {
         assert_eq!(steps.get(), 2);
         // None of them: the status is the reason, and the clock is not touched.
         let leader = async { Err::<Sample, _>("no other node leads".to_string()) };
-        let said = ask(&[nobody().await], SOON, leader, record, false).await;
+        let said = ask(&[nobody().await], SOON, leader, record, false, false).await;
         let error = said["error"].as_str().unwrap();
         assert!(
             error.contains("no time server answered") && error.contains("no other node leads"),
             "{said}"
         );
         assert_eq!(steps.get(), 2);
-        let none = ask(&[], SOON, async { Err::<Sample, _>("x".to_string()) }, record, false).await;
+        let none = ask(
+            &[],
+            SOON,
+            async { Err::<Sample, _>("x".to_string()) },
+            record,
+            false,
+            false,
+        )
+        .await;
         assert!(none["error"].as_str().unwrap().contains("(leader: x)"), "{none}");
     }
 
     /// `ask` once the clock has been set, with servers at these skews and a leader at `leader`
     /// (microseconds ahead; none: not in a cluster): what it stepped to (the offset), and the status.
     async fn after_first_sync(skews: &[i64], leader: Option<i64>) -> (Option<i64>, Value) {
+        after_sync(skews, leader, false).await
+    }
+
+    /// The same, with the server the operator `told` (or not).
+    async fn after_sync(skews: &[i64], leader: Option<i64>, told: bool) -> (Option<i64>, Value) {
         let set_to = std::cell::Cell::new(None);
         let record = |us: i64| {
             set_to.set(Some(us));
@@ -696,7 +759,7 @@ mod tests {
                 .ok_or("not in a cluster".to_string())
         };
         let before = now_us();
-        let said = ask(&servers, SOON, leader, record, true).await;
+        let said = ask(&servers, SOON, leader, record, true, told).await;
         (set_to.get().map(|to| to - before), said)
     }
 
@@ -738,6 +801,85 @@ mod tests {
         let (to, said) = after_first_sync(&[0], Some(10_800_000_000)).await;
         assert!(to.is_some_and(|to| (to - 10_800_000_000).abs() < 200_000), "{to:?}");
         assert_eq!(said["server"], "the cluster's leader");
+    }
+
+    #[tokio::test]
+    async fn clock_the_server_told_is_followed_alone_the_others_to_an_hour() {
+        const HOUR: i64 = 3_600_000_000;
+        // The operator's server is the operator's word: five seconds, and eight hours, are stepped.
+        let (to, _) = after_sync(&[5_000_000], None, true).await;
+        assert!(to.is_some());
+        let (to, said) = after_sync(&[8 * HOUR], None, true).await;
+        assert!(to.is_some_and(|to| (to - 8 * HOUR).abs() < 200_000), "{to:?} {said}");
+        // The network's: five seconds alone is followed; two hours alone is not.
+        let (to, _) = after_sync(&[5_000_000], None, false).await;
+        assert!(to.is_some());
+        let (to, said) = after_sync(&[2 * HOUR], None, false).await;
+        assert_eq!(to, None);
+        assert!(
+            said["error"].as_str().unwrap().contains("no second source agrees"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn clock_a_hardened_node_does_not_set_its_clock() {
+        let hardened = crate::policy::Policy::hardened();
+        let said = set_under(&hardened, 1_795_089_600_000_000).unwrap_err().to_string();
+        assert!(said.contains("this node's policy is hardened"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn clock_serves_no_time_until_it_has_been_set() {
+        UNSET.store(true, Ordering::Relaxed);
+        assert_eq!(serve().await.err(), Some(axum::http::StatusCode::SERVICE_UNAVAILABLE));
+        UNSET.store(false, Ordering::Relaxed);
+        assert!(serve().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn clock_before_the_first_sync_the_first_answer_is_enough() {
+        // A server that never answers, bound and silent, after the one that does: not waited for.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let servers = [fake(4_000_000, |_| {}).await, silent.local_addr().unwrap()];
+        let never = async { Err::<Sample, _>("not asked".to_string()) };
+        let started = std::time::Instant::now();
+        let said = ask(&servers, Duration::from_secs(30), never, |_| Ok(()), false, false).await;
+        assert_eq!(said["stepped"], true);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn clock_a_clock_in_1970_reads_a_time_past_2038() {
+        // The pivot is the floor, not the clock: 2040 is not read as 1904.
+        let later = 2_240_000_000_000_000;
+        let (t1, t4) = (0, 100_000);
+        let sent = to_ntp(t1);
+        let mut packet = [0; 48];
+        packet[0] = 0x24;
+        packet[1] = 2;
+        packet[24..32].copy_from_slice(&sent);
+        packet[32..40].copy_from_slice(&to_ntp(later));
+        packet[40..48].copy_from_slice(&to_ntp(later));
+        let sample = decode(&packet, sent, t1, t4).unwrap();
+        assert!((sample.offset_us - (later - 50_000)).abs() < 1_000, "{sample:?}");
+    }
+
+    #[tokio::test]
+    async fn clock_a_refusal_is_returned_at_once_not_after_the_wait() {
+        let started = std::time::Instant::now();
+        let said = exchange(fake(0, |p| kiss(p, b"DENY")).await, Duration::from_secs(30)).await;
+        assert!(said.unwrap_err().contains("DENY"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn clock_no_more_than_four_of_the_networks_servers_are_asked() {
+        let dhcp: Vec<Ipv4Addr> = (1..=9).map(|n| [10, 0, 0, n].into()).collect();
+        assert_eq!(
+            order(&dhcp, None, Some([10, 0, 0, 99].into())).len(),
+            NETWORK_SERVERS + 1
+        );
     }
 }
 

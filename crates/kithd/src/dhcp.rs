@@ -90,7 +90,16 @@ pub fn reply(packet: &[u8], xid: u32, mac: [u8; 6]) -> Option<(u8, Lease)> {
                     1 => lease.bits = u32::from_be_bytes(four(value)?).leading_ones() as u8,
                     3 => lease.router = four(value).map(Ipv4Addr::from),
                     6 => lease.dns = value.as_chunks::<4>().0.iter().copied().map(Ipv4Addr::from).collect(),
-                    42 => lease.ntp = value.as_chunks::<4>().0.iter().copied().map(Ipv4Addr::from).collect(),
+                    42 => {
+                        lease.ntp = value
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .copied()
+                            .take(4)
+                            .map(Ipv4Addr::from)
+                            .collect()
+                    }
                     51 => lease.secs = u32::from_be_bytes(four(value)?),
                     54 => lease.server = four(value)?.into(),
                     _ => {}
@@ -486,6 +495,11 @@ mod ntp {
         assert!(none.ntp.is_empty());
         let (_, ragged) = reply(&offer(mac, &[42, 6, 10, 9, 0, 7, 1, 2]), 7, mac).unwrap();
         assert_eq!(ragged.ntp, [Ipv4Addr::new(10, 9, 0, 7)]);
+        // A server that names a hundred is heard for four.
+        let mut many = vec![42, 40];
+        many.extend((1..=10).flat_map(|n| [10, 9, 0, n]));
+        let (_, many) = reply(&offer(mac, &many), 7, mac).unwrap();
+        assert_eq!(many.ntp.len(), 4);
     }
 
     #[test]
