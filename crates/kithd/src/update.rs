@@ -64,10 +64,14 @@ struct Held {
     /// Nodes let go of before their drain ended, and why, until each is done.
     gave: BTreeMap<String, String>,
     drain: Vec<(String, bool)>,
+    /// Nodes whose drain was lifted, until a Node shows none: a lift that was lost is made up.
+    lifting: Vec<String>,
 }
 
 /// Seconds a drain waits for what moves, unless the plan says (`drainSeconds`).
 const DRAIN_SECONDS: u64 = 300;
+/// The most a plan may ask a drain to wait: a node is not held off its update for longer.
+const DRAIN_CEILING: u64 = 3600;
 
 /// How many replicas, as words. The plan's status says how many, never which: an UpdatePlan is
 /// read by whoever may read UpdatePlans, and a replica's name is its namespace's.
@@ -84,8 +88,31 @@ fn let_go(name: &str, cordoned: &mut Vec<String>, held: &mut Held, cordon: &mut 
     if let Some(at) = held.drained.iter().position(|drained| drained == name) {
         held.drained.remove(at);
         held.drain.push((name.to_string(), false));
+        held.lifting.push(name.to_string());
     }
     held.gave.remove(name);
+}
+
+/// Lets go of each node the plan is draining but `keep` does not name: it left the selector, the
+/// release is gone, or the plan stopped or no longer drains.
+fn let_go_draining(
+    states: &mut BTreeMap<String, String>,
+    since: &mut BTreeMap<String, u64>,
+    cordoned: &mut Vec<String>,
+    held: &mut Held,
+    cordon: &mut Vec<(String, bool)>,
+    keep: impl Fn(&str) -> bool,
+) {
+    let gone: Vec<String> = states
+        .iter()
+        .filter(|(name, state)| *state == "draining" && !keep(name))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in gone {
+        states.remove(&name);
+        since.remove(&name);
+        let_go(&name, cordoned, held, cordon);
+    }
 }
 
 /// Is `now` (minutes since Monday 00:00 UTC) inside `window`: `HH:MM-HH:MM`, every day,
@@ -164,7 +191,15 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
         drained: names("drained"),
         gave,
         drain: Vec::new(),
+        lifting: Vec::new(),
     };
+    // A lift that was lost (the Node still shows the drain) is asked for again.
+    for name in names("undraining") {
+        if nodes.iter().any(|node| node.name == name && node.drained) {
+            held.drain.push((name.clone(), false));
+            held.lifting.push(name);
+        }
+    }
     let done = |phase: &str, reason: String, states, since, cordoned: Vec<String>, cordon, held: Held| Decided {
         status: Map::from_iter([
             ("phase".to_string(), json!(phase)),
@@ -175,6 +210,7 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
             ("since".to_string(), json!(since)),
             ("cordoned".to_string(), json!(cordoned)),
             ("drained".to_string(), json!(held.drained)),
+            ("undraining".to_string(), json!(held.lifting)),
             ("gaveUp".to_string(), json!(held.gave)),
         ]),
         cordon,
@@ -182,6 +218,10 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
     };
     let Some((target, of)) = release else {
         let why = format!("there is no OSRelease {}", spec["release"].as_str().unwrap_or_default());
+        // (Nothing is being drained for a release that is not there.)
+        let_go_draining(&mut states, &mut since, &mut cordoned, &mut held, &mut cordon, |_| {
+            false
+        });
         return done("Waiting", why, states, since, cordoned, cordon, held);
     };
     // Another release than the one this status is about, or that one changed (signed
@@ -230,20 +270,11 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
     }
     let count = |state: &str, states: &BTreeMap<String, String>| states.values().filter(|s| *s == state).count();
     let paused = spec["paused"].as_bool() == Some(true);
-    // A plan that stops, or that no longer drains, lets go of the nodes it was draining: each
-    // goes again when the plan does.
-    if paused || count("failed", &states) > 0 || spec["drain"].as_bool() != Some(true) {
-        let draining: Vec<String> = states
-            .iter()
-            .filter(|(_, state)| *state == "draining")
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in draining {
-            states.remove(&name);
-            since.remove(&name);
-            let_go(&name, &mut cordoned, &mut held, &mut cordon);
-        }
-    }
+    // A plan that stops, or that no longer drains, lets go of the nodes it was draining, as does
+    // a node that left the selector: each goes again when the plan does.
+    let stops = paused || count("failed", &states) > 0 || spec["drain"].as_bool() != Some(true);
+    let keep = |name: &str| !stops && targets.iter().any(|node| node.name == name);
+    let_go_draining(&mut states, &mut since, &mut cordoned, &mut held, &mut cordon, keep);
     if count("failed", &states) > 0 {
         return done("Paused", reason, states, since, cordoned, cordon, held);
     }
@@ -271,7 +302,10 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
     }
     // A node whose drain has nothing left to move is told to restart; one whose movable replicas
     // are not running elsewhere after `drainSeconds` is let go, with the reason.
-    let patience = spec["drainSeconds"].as_u64().unwrap_or(DRAIN_SECONDS);
+    let patience = spec["drainSeconds"]
+        .as_u64()
+        .unwrap_or(DRAIN_SECONDS)
+        .min(DRAIN_CEILING);
     for node in &targets {
         if states.get(&node.name).map(String::as_str) != Some("draining") {
             continue;
@@ -354,7 +388,14 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
             states.insert(node.name.clone(), "draining".into());
             cordoned.push(node.name.clone());
             cordon.push((node.name.clone(), true));
-            if !node.drained {
+            // A drain on the Node is an operator's, unless this plan's own lift of it is still
+            // pending (a release changed under a drain: the node is picked again at once).
+            let lifting = held.lifting.iter().position(|name| *name == node.name);
+            if let Some(at) = lifting {
+                held.lifting.remove(at);
+                held.drain.retain(|(name, on)| *name != node.name || *on);
+            }
+            if !node.drained || lifting.is_some() {
                 held.drained.push(node.name.clone());
                 held.drain.push((node.name.clone(), true));
             }
@@ -2702,12 +2743,83 @@ mod tests {
             (Some("Paused"), gone.clone())
         );
         let changed = step(&plan(spec.clone(), Some(&first)), Some(("2", "next@2")), &nodes, 60);
-        // (Lifted, then put on again for the new rollout.)
-        assert_eq!(changed.drain, [("a".to_string(), false), ("a".to_string(), true)]);
+        // (Held for the new rollout: the lift is not written, the drain is asked for again.)
+        assert_eq!(changed.drain, [("a".to_string(), true)]);
         let not_now = step(&plan(json!({}), Some(&first)), Some(("2", "next@1")), &nodes, 60);
         assert_eq!(lifted(&not_now).0, [("a".to_string(), false)]);
         assert_eq!(told(&not_now), ["a"], "no longer drains: told at once");
         assert_eq!(not_now.status["drained"], json!([]));
+    }
+
+    #[test]
+    fn update_drain_is_let_go_when_the_plan_stops_caring() {
+        let spec = json!({ "drain": true, "selector": { "pool": "web" } });
+        let mut nodes = vec![node("a", "1", false)];
+        nodes[0].labels.insert("pool".into(), "web".into());
+        let go = |spec: &Value, last: Option<&Decided>, release: Option<(&str, &str)>, nodes: &[Node], at: u64| {
+            step(&plan(spec.clone(), last), release, nodes, at)
+        };
+        let rel = Some(("2", "next@1"));
+        let first = go(&spec, None, rel, &nodes, 0);
+        assert_eq!(first.status["drained"], json!(["a"]));
+        // (The drain is on the Node now, as the first step asked.)
+        nodes[0].drained = true;
+        nodes[0].waits = vec![WEB.into()];
+        let off = vec![("a".to_string(), false)];
+        let none = |decided: &Decided| {
+            assert_eq!(decided.status["nodes"], json!({}));
+            assert_eq!(
+                (&decided.status["drained"], &decided.status["cordoned"]),
+                (&json!([]), &json!([]))
+            );
+        };
+
+        // A release changed while the node holds the drain: its drain is the update's still, put
+        // on again for the new rollout, not read as an operator's.
+        let changed = go(&spec, Some(&first), Some(("2", "next@2")), &nodes, 60);
+        assert_eq!(changed.drain, [("a".to_string(), true)], "{:?}", changed.drain);
+        assert_eq!(changed.status["drained"], json!(["a"]));
+        assert_eq!(changed.status["undraining"], json!([]));
+
+        // The release is gone, or the plan names none that exists: nothing is updating.
+        let missing = go(&spec, Some(&first), None, &nodes, 60);
+        assert_eq!(
+            (missing.status["phase"].as_str(), missing.drain.clone()),
+            (Some("Waiting"), off.clone())
+        );
+        assert_eq!(missing.cordon, off);
+        none(&missing);
+
+        // The node leaves the selector (a label removed) while draining.
+        let mut moved = nodes.clone();
+        moved[0].labels.clear();
+        let out = go(&spec, Some(&first), rel, &moved, 60);
+        assert_eq!((out.drain.clone(), out.cordon.clone()), (off.clone(), off.clone()));
+        none(&out);
+
+        // A lift whose write was lost is made up while the node still shows the drain, and
+        // forgotten once it does not.
+        assert_eq!(out.status["undraining"], json!(["a"]));
+        let again = go(&spec, Some(&out), None, &moved, 65);
+        assert_eq!(again.drain, off);
+        assert_eq!(again.status["undraining"], json!(["a"]));
+        moved[0].drained = false;
+        let after = go(&spec, Some(&again), None, &moved, 70);
+        assert!(after.drain.is_empty(), "{:?}", after.drain);
+        assert_eq!(after.status["undraining"], json!([]));
+    }
+
+    #[test]
+    fn update_drain_seconds_has_a_ceiling() {
+        let spec = json!({ "drain": true, "drainSeconds": 1_000_000 });
+        let mut nodes = vec![node("a", "1", false)];
+        let first = step(&plan(spec.clone(), None), Some(("2", "next@1")), &nodes, 0);
+        nodes[0].waits = vec![WEB.into()];
+        let late = step(&plan(spec.clone(), Some(&first)), Some(("2", "next@1")), &nodes, 3599);
+        assert!(told(&late).is_empty());
+        let gave = step(&plan(spec, Some(&late)), Some(("2", "next@1")), &nodes, 3600);
+        assert_eq!(told(&gave), ["a"]);
+        assert!(gave.status["reason"].as_str().unwrap().contains("3600"));
     }
 
     #[test]

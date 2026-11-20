@@ -307,7 +307,7 @@ spec:
   maxUnavailable: 2                # how many at a time (1 unless said)
   windows: ["Sat,Sun 02:00-05:00"] # UTC; `23:00-04:00` is every night; none: any time
   drain: true                      # drain each node (`kith node drain`) before it restarts
-  drainSeconds: 300                # how long to wait for what moves to run elsewhere (300 unless said)
+  drainSeconds: 300                # how long to wait for what moves to run elsewhere (300 unless said; 3600 at most)
 ```
 
 The signature is over the update's header, which names the SHA-256 of every piece, so a node
@@ -433,11 +433,14 @@ With `drain: true` a node picked is drained as `kith node drain` does it: it is 
 says `Draining` (and which node, and how many replicas it waits for) and tells the node to restart only
 once each of those is running on another node, or none moves. A replica the plan says stays (pinned
 to the node, one a node selector puts on every node, a Job) holds nothing. A node whose replicas
-never start elsewhere is let go after `drainSeconds` (300 unless said), and the plan's `reason`
-says how many. The plan never names a replica (it is read by whoever may read UpdatePlans, and a
+never start elsewhere is let go after `drainSeconds` (300 unless said, and at most 3600), and the
+plan's `reason` says how many. The plan never names a replica (it is read by whoever may read UpdatePlans, and a
 replica's name belongs to its namespace): `kith node drain NODE --dry-run` names the ones you
-may read. When the node is done, or the plan is paused, changed or no longer drains, the update's
-drain is lifted; a drain or cordon you put on the node first is left as it was.
+may read. When the node is done, or the plan is paused, changed or no longer drains, or its
+OSRelease is deleted (or `release` names one that does not exist), or the node no longer matches
+the `selector` (a label removed, say), the update's drain is lifted; a drain or cordon you put on
+the node first is left as it was. A lift that did not take is asked for again until the node shows
+no drain.
 
 ### Installing on a machine
 

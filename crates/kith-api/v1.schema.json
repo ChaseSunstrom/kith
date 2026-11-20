@@ -4152,7 +4152,7 @@
           ],
           "format": "uint32",
           "minimum": 0,
-          "description": "How long a drain waits for what moves to run elsewhere before the node restarts\nanyway. Defaults to 300."
+          "description": "How long a drain waits for what moves to run elsewhere before the node restarts\nanyway. Defaults to 300; at most 3600."
         },
         "waitForIdleSeats": {
           "type": [

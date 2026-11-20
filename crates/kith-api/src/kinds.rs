@@ -1292,7 +1292,7 @@ spec! {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub drain: Option<bool>,
         /// How long a drain waits for what moves to run elsewhere before the node restarts
-        /// anyway. Defaults to 300.
+        /// anyway. Defaults to 300; at most 3600.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub drain_seconds: Option<u32>,
         /// Hold back nodes with an active seat until it is idle.

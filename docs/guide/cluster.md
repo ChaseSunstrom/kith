@@ -485,8 +485,9 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
 - An `UpdatePlan` with `drain: true` does this for each node it picks (see [what an update
   does](os.md#rolling-a-release-through-the-cluster)): it drains the node, restarts it once each replica the
   plan says moves runs on another node (a replica that stays holds nothing), and lifts the drain
-  when the node is done or the plan is paused or changed. It lifts only a drain it put on: yours,
-  put on first, stays until you undrain.
+  when the node is done, the plan is paused or changed, its OSRelease is gone, or the node leaves
+  its selector. It waits at most `drainSeconds` (300 unless said, 3600 at most). It lifts only a
+  drain it put on: yours, put on first, stays until you undrain.
 
 ### Checkpointing a long GPU Job
 
