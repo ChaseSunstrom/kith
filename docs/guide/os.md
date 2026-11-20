@@ -306,7 +306,8 @@ spec:
   selector: { ring: stable }       # nodes with these labels; without it, every node
   maxUnavailable: 2                # how many at a time (1 unless said)
   windows: ["Sat,Sun 02:00-05:00"] # UTC; `23:00-04:00` is every night; none: any time
-  drain: true                      # place no new workloads on a node while it updates
+  drain: true                      # drain each node (`kith node drain`) before it restarts
+  drainSeconds: 300                # how long to wait for what moves to run elsewhere (300 unless said; 3600 at most)
 ```
 
 The signature is over the update's header, which names the SHA-256 of every piece, so a node
@@ -416,8 +417,8 @@ plan's status says where the rollout is:
 
 ```
 status:
-  phase: Progressing      # or Done, Waiting (outside its windows, no such release), Paused
-  nodes: { n2: done, n3: updating }
+  phase: Progressing      # or Draining, Done, Waiting (outside its windows, no such release), Paused
+  nodes: { n2: done, n3: updating, n4: draining }
 ```
 
 `Paused`, with a `reason`, means a node did not take the release: it refused the file, or the
@@ -425,8 +426,21 @@ boot loader gave up after three tries and it is back on its old system (`os.fail
 Node's status). Nobody else is given that release until the OSRelease is changed or the plan
 names another, and then it starts over. `paused: true` stops it by hand (a node already told to
 go finishes). While a voting node is away no other is restarted. A node told to update that says
-nothing for fifteen minutes counts as failed. `drain` moves nothing already running;
-`waitForIdleSeats` does nothing yet.
+nothing for fifteen minutes counts as failed. `waitForIdleSeats` does nothing yet.
+
+With `drain: true` a node picked is drained as `kith node drain` does it: it is cordoned, the
+`kith.dev/drain` taint goes on, and what the drain plan says can move starts elsewhere. The plan
+says `Draining` (and which node, and how many replicas it waits for) and tells the node to restart only
+once each of those is running on another node, or none moves. A replica the plan says stays (pinned
+to the node, one a node selector puts on every node, a Job) holds nothing. A node whose replicas
+never start elsewhere is let go after `drainSeconds` (300 unless said, and at most 3600), and the
+plan's `reason` says how many. The plan never names a replica (it is read by whoever may read UpdatePlans, and a
+replica's name belongs to its namespace): `kith node drain NODE --dry-run` names the ones you
+may read. When the node is done, or the plan is paused, changed or no longer drains, or its
+OSRelease is deleted (or `release` names one that does not exist), or the node no longer matches
+the `selector` (a label removed, say), the update's drain is lifted; a drain or cordon you put on
+the node first is left as it was. A lift that did not take is asked for again until the node shows
+no drain.
 
 ### Installing on a machine
 
