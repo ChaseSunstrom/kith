@@ -1431,12 +1431,9 @@ impl Controller {
             // (A ConfigMap, a Secret and a scratch are on whichever node the replica is.)
             let mut mounts = template.containers().flat_map(|c| &c.volume_mounts);
             let mounts = mounts.any(|mount| mount.volume.is_some());
-            let allowed = allowed && (!mounts || (resource.kind != "NodeWorkload" && mounted.contains_key(&key)));
-            if mounts && resource.kind == "NodeWorkload" {
-                note.push("a NodeWorkload cannot mount volumes: it runs nothing (use a Workload)".into());
-            } else if mounts && me.is_none() {
-                note.push("volumes need a node with a name in a cluster: this one runs nothing".into());
-            }
+            let (may, said) = volume_gate(&resource.kind, mounts, mounted.contains_key(&key), me.is_some());
+            let allowed = allowed && may;
+            note.extend(said.map(String::from));
             // And a pod that leaves by an exit starts only with its tunnel up here (fail closed).
             let ready = template
                 .exit
@@ -3112,6 +3109,43 @@ fn write_files(state: &Path, id: &str, slot: &Slot, files: &[Files]) -> Result<(
     Ok(())
 }
 
+/// Whether a resource of `kind` that `mounts` Volumes may run on this node (`placed`: the scheduler
+/// has given it its Volumes' directories; `named`: this node has a name in a cluster), and what to
+/// say if the reason is that it never will: a NodeWorkload runs on every node and a Volume is on one,
+/// and a node alone has no Volume's node to be.
+fn volume_gate(kind: &str, mounts: bool, placed: bool, named: bool) -> (bool, Option<&'static str>) {
+    let said = match (mounts, kind == "NodeWorkload", named) {
+        (false, ..) => None,
+        (true, true, _) => Some("a NodeWorkload cannot mount volumes: it runs nothing (use a Workload)"),
+        (true, false, false) => Some("volumes need a node with a name in a cluster: this one runs nothing"),
+        _ => None,
+    };
+    (!mounts || (kind != "NodeWorkload" && placed), said)
+}
+
+const RESOLV: &str = "/etc/resolv.conf";
+
+/// Why `mounts` may not be given to a container: one over a directory that holds its resolver file
+/// (`/etc`) would hide the host's `/etc/resolv.conf` that the runtime binds in, and the container
+/// would have no DNS and no word of why. A mount of the file itself is its own resolver: that goes.
+fn hides_resolv(mounts: &[kith_runtime::Mount]) -> Option<String> {
+    let own = |m: &kith_runtime::Mount| Path::new(&m.container) == Path::new(RESOLV);
+    let over = |m: &kith_runtime::Mount| {
+        let at = Path::new(&m.container);
+        Path::new(RESOLV).starts_with(at) && at != Path::new(RESOLV) && at != Path::new("/")
+    };
+    // (The runtime binds mounts in order: its own file's mount must come after the one over it.)
+    let at = mounts.iter().position(over)?;
+    let hiding = &mounts[at];
+    (!mounts[at..].iter().any(own)).then(|| {
+        format!(
+            "a mount at `{}` would hide the container's {RESOLV}: mount under it (`{}/app`) or add a mount at {RESOLV} itself",
+            hiding.container,
+            hiding.container.trim_end_matches('/')
+        )
+    })
+}
+
 /// What a unit of replica `replica` mounts, from the Volumes its workload's mounts come to: only a
 /// container mounts. (A mount that is `perReplica` is of the replica's own claim, `NAME-REPLICA`.)
 fn mounts_of(
@@ -3200,7 +3234,14 @@ async fn start(
         // (Only a shared volume of another node ever gets here: `volumes::mounts`.)
         let host = match mesh.filter(|(_, me)| *me != dir.node) {
             Some((prefix, me)) => crate::share::mount(state, dir, prefix, me).await,
-            None => crate::root_part::volume(state, dir),
+            // (It makes the directory, and may ask the root part: blocking file I/O, not on the runtime.)
+            None => {
+                let (state, dir) = (state.to_path_buf(), dir.clone());
+                tokio::task::spawn_blocking(move || crate::root_part::volume(&state, &dir))
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|made| made)
+            }
         };
         let host = host.map_err(|e| format!("volume {}: {e}", dir.name))?;
         unit.mounts.push(kith_runtime::Mount {
@@ -3330,6 +3371,11 @@ async fn start(
                 });
             }
         }
+    }
+    if matches!(slot.run, Run::Container(_))
+        && let Some(why) = hides_resolv(&unit.mounts)
+    {
+        return Err(why);
     }
     if let Some(Resources { cpu, memory, .. }) = resources {
         unit.memory_bytes = memory.as_ref().map(|q| q.value() as u64);
@@ -4409,6 +4455,50 @@ mod tests {
             .map(|failures| restart_wait(failures).as_secs())
             .into();
         assert_eq!(waits, [0, 0, 1, 2, 4, 60]);
+    }
+
+    /// A NodeWorkload that mounts a Volume, and any workload on a node alone, runs nothing and says
+    /// why; one with no Volume mount is not asked; a Workload placed with its Volumes runs.
+    #[test]
+    fn a_node_workload_or_a_node_alone_runs_no_volumes_mount_and_says_why() {
+        let node_workload = volume_gate("NodeWorkload", true, true, true);
+        assert!(!node_workload.0);
+        assert!(node_workload.1.unwrap().contains("NodeWorkload cannot mount volumes"));
+        // (Alone: no name in a cluster, and the scheduler has put nothing anywhere.)
+        let alone = volume_gate("Workload", true, false, false);
+        assert!(!alone.0);
+        assert!(alone.1.unwrap().contains("need a node with a name in a cluster"));
+        // Not placed yet: waits, with nothing to say (the scheduler says why).
+        assert_eq!(volume_gate("Workload", true, false, true), (false, None));
+        assert_eq!(volume_gate("Workload", true, true, true), (true, None));
+        assert_eq!(volume_gate("NodeWorkload", false, false, false), (true, None));
+        assert_eq!(volume_gate("Job", false, false, true), (true, None));
+    }
+
+    /// A mount at `/etc` would hide the resolver file the runtime binds in: refused, with its own
+    /// resolver file or a path under `/etc` it is not.
+    #[test]
+    fn a_mount_over_etc_is_refused_and_one_under_it_or_at_the_resolver_file_is_not() {
+        let at = |container: &str| kith_runtime::Mount {
+            host: "/h".into(),
+            container: container.into(),
+            read_only: false,
+            give: false,
+            part: None,
+        };
+        for over in ["/etc", "/etc/", "//etc"] {
+            let why = hides_resolv(&[at("/data"), at(over)]).unwrap_or_else(|| panic!("{over}"));
+            assert!(why.contains("/etc/resolv.conf"), "{why}");
+        }
+        assert_eq!(
+            hides_resolv(&[at("/etc/app"), at("/etc/resolv.confd"), at("/data")]),
+            None
+        );
+        // Its own resolver file, mounted after or before: the runtime binds no other there.
+        assert_eq!(hides_resolv(&[at("/etc"), at("/etc/resolv.conf")]), None);
+        // Before it, the file is hidden by the mount over it.
+        assert!(hides_resolv(&[at("/etc/resolv.conf"), at("/etc")]).is_some());
+        assert_eq!(hides_resolv(&[]), None);
     }
 
     #[test]

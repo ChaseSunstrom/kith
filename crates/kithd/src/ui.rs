@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// The page: name under `/ui/`, content type, content.
-const FILES: [(&str, &str, &[u8]); 7] = [
+const FILES: [(&str, &str, &[u8]); 8] = [
     ("", "text/html; charset=utf-8", include_bytes!("../ui/index.html")),
     ("app.css", "text/css; charset=utf-8", include_bytes!("../ui/app.css")),
     (
@@ -44,6 +44,12 @@ const FILES: [(&str, &str, &[u8]); 7] = [
     ),
     // The QR code of a peer's WireGuard configuration, drawn in the page: no library, no service.
     ("qr.js", "text/javascript; charset=utf-8", include_bytes!("../ui/qr.js")),
+    // The overview (the main page): tiles, a panel per measure from `/v1/metrics`, drawn as SVG here.
+    (
+        "dash.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../ui/dash.js"),
+    ),
     // The page's face (Overpass, SIL OFL: its copyright and licence are in the file's own
     // name table and in docs/fonts/OFL.txt). The website's copy: there is one in the tree.
     (
@@ -282,7 +288,7 @@ mod tests {
         );
         assert!(run.status.success(), "{said}");
         // Every script the page loads is one node could read.
-        for script in ["app.js", "forms.js", "install.js", "qr.js"] {
+        for script in ["app.js", "forms.js", "install.js", "qr.js", "dash.js", "fixture.mjs"] {
             let check = std::process::Command::new("node")
                 .arg("--check")
                 .arg(dir.join(script))
@@ -498,5 +504,65 @@ mod tests {
             panic!("it is not YAML");
         };
         assert!(said.contains("yaml:2"), "{said}");
+    }
+
+    /// The main page is the overview: `#/` goes to it, it is the part in view before a script
+    /// runs, every place dash.js draws into is in the page, and what it asks for is
+    /// `/v1/metrics` for one of four ranges. It is drawn by node against a kithd that keeps
+    /// metrics (`ui/fixture.mjs`) and against ones that answer 404 and 403 (`ui/test.mjs`).
+    #[tokio::test]
+    async fn ui_dashboard_is_the_main_page() {
+        let text = |name: &str| {
+            let (.., content) = FILES.iter().find(|(file, ..)| *file == name).unwrap();
+            std::str::from_utf8(content).unwrap()
+        };
+        let (index, dash, app) = (text(""), text("dash.js"), text("app.js"));
+        assert_eq!(page(Path("dash.js".into())).await.status(), StatusCode::OK);
+        let opening = |id: &str| {
+            index
+                .lines()
+                .find(|line| line.contains(&format!("id=\"{id}\"")))
+                .unwrap_or_else(|| panic!("the page has no #{id}"))
+        };
+        assert!(
+            !opening("dash").contains("hidden"),
+            "the overview is not in view at first"
+        );
+        for other in ["events", "install"] {
+            assert!(opening(other).contains(" hidden"), "#{other} is in view at first");
+        }
+        assert!(
+            index.contains("<main class=\"board\" hidden>"),
+            "a kind's board is in view at first"
+        );
+        let mut drawn = 0;
+        for call in dash.split("$('").skip(1) {
+            let id = call.split('\'').next().unwrap();
+            drawn += 1;
+            assert!(
+                index.contains(&format!("id=\"{id}\"")),
+                "dash.js draws into #{id}, which the page lacks"
+            );
+        }
+        assert!(drawn >= 8, "dash.js draws into {drawn} places: it is not the overview");
+        assert!(app.contains("from './dash.js'"), "app.js does not load the overview");
+        assert!(app.contains("name || 'dash'"), "#/ does not go to the overview");
+        assert!(dash.contains("api('GET', `metrics?range=${asked}`)"));
+        for range in ["'15m'", "'1h'", "'6h'", "'24h'"] {
+            assert!(dash.contains(range), "no {range} range");
+        }
+        let run = std::process::Command::new("node")
+            .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/test.mjs"))
+            .output();
+        let Ok(run) = run else {
+            eprintln!("skipped: no node to draw the overview with");
+            return;
+        };
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(run.status.success() && said.contains("the dashboard: ok"), "{said}");
     }
 }
