@@ -3,7 +3,17 @@
 # (crates/kithd/src/os.rs): a header of 4096 bytes (a line of JSON, padded with spaces)
 # and then the pieces it names, in order. Written to standard output.
 #
-#   sh os/update.sh VERSION ROOTHASH ROOT VERITY UKI-A UKI-B >kith-os.update
+#   sh os/update.sh VERSION ROOTHASH ROOT VERITY UKI-A UKI-B [KITHD KERNEL REST] >kith-os.update
+#
+# The three digests at the end (64 hex digits each: kithd, what the boot file is but for
+# the root's hash, and the root but for kithd and its os-release; os/build.sh makes them)
+# go into the header as its `kithd` object, which is signed with the rest of it: a node
+# that runs a system with such a header can tell a kithd-only update from a full one
+# (crates/kithd/src/os.rs, `way`). Without them an update is always full.
+#
+#   sh os/update.sh --check
+#     packs an update of small files and says whether its header, with the digests, is
+#     under 4096 bytes and holds them.
 #
 #   sh os/update.sh --sign KEYFILE kith-os.update
 #
@@ -46,14 +56,38 @@ if [ "${1:-}" = --sign ] || [ "${1:-}" = --handover ]; then
     openssl pkeyutl -sign -rawin -keyform DER -inkey "$work/key" -in "$signed" | xxd -p -c 64
     exit 0
 fi
-[ $# -eq 6 ] || { echo "usage: sh os/update.sh VERSION ROOTHASH ROOT VERITY UKI-A UKI-B >FILE, or --sign KEYFILE UPDATE" >&2; exit 2; }
+if [ "${1:-}" = --check ]; then
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    for f in root verity a b; do printf '%s' "$f" >"$work/$f"; done
+    one=$(printf '%064d' 1) two=$(printf '%064d' 2) three=$(printf '%064d' 3)
+    sh "$0" 0.0.0-check "$one" "$work/root" "$work/verity" "$work/a" "$work/b" "$one" "$two" "$three" >"$work/with"
+    sh "$0" 0.0.0-check "$one" "$work/root" "$work/verity" "$work/a" "$work/b" >"$work/without"
+    head -c 4096 "$work/with" >"$work/header"
+    [ "$(stat -c %s "$work/with")" -eq $((4096 + 12)) ] || { echo "update.sh: --check: the update is not a header and its four pieces" >&2; exit 1; }
+    grep -q "\"kithd\":{\"sha256\":\"$one\",\"kernel\":\"$two\",\"rest\":\"$three\"}" "$work/header" || { echo "update.sh: --check: the header does not hold the kithd digests" >&2; exit 1; }
+    ! head -c 4096 "$work/without" | grep -q kithd || { echo "update.sh: --check: a header made without the digests holds them" >&2; exit 1; }
+    # (The same refusals, for what is not a digest.)
+    ! sh "$0" 0.0.0-check "$one" "$work/root" "$work/verity" "$work/a" "$work/b" "$one" "$two" xyz >/dev/null 2>&1 || { echo "update.sh: --check: a digest that is not 64 hex digits is taken" >&2; exit 1; }
+    echo "update.sh: --check: the header is $(head -c 4096 "$work/with" | tr -d ' \n' | wc -c) bytes of 4096, with the kithd digests"
+    exit 0
+fi
+{ [ $# -eq 6 ] || [ $# -eq 9 ]; } || { echo "usage: sh os/update.sh VERSION ROOTHASH ROOT VERITY UKI-A UKI-B [KITHD KERNEL REST] >FILE, or --sign KEYFILE UPDATE, or --check" >&2; exit 2; }
 version=$1 hash=$2
 # (Both go into JSON as they are.)
 case $version$hash in '' | *[!0-9A-Za-z.+-]*) echo "update.sh: a version is letters, digits, dots, + and -" >&2; exit 2 ;; esac
 shift 2
+kithd=
+if [ $# -eq 7 ]; then
+    for digest in "$5" "$6" "$7"; do
+        case ${#digest}:$digest in 64:*[!0-9A-Fa-f]*) false ;; 64:*) ;; *) false ;; esac ||
+            { echo "update.sh: $digest is not a digest (64 hex digits)" >&2; exit 2; }
+    done
+    kithd=$(printf ',"kithd":{"sha256":"%s","kernel":"%s","rest":"%s"}' "$5" "$6" "$7")
+fi
 piece() { printf '{"name":"%s","size":%s,"sha256":"%s"}' "$1" "$(stat -c %s "$2")" "$(sha256sum "$2" | cut -d ' ' -f 1)"; }
-header=$(printf '{"format":1,"version":"%s","hash":"%s","pieces":[%s,%s,%s,%s]}' "$version" "$hash" \
-    "$(piece root "$1")" "$(piece verity "$2")" "$(piece a "$3")" "$(piece b "$4")")
+header=$(printf '{"format":1,"version":"%s","hash":"%s","pieces":[%s,%s,%s,%s]%s}' "$version" "$hash" \
+    "$(piece root "$1")" "$(piece verity "$2")" "$(piece a "$3")" "$(piece b "$4")" "$kithd")
 [ ${#header} -lt 4096 ] || { echo "update.sh: the header is over 4096 bytes" >&2; exit 1; }
 printf '%-4095s\n' "$header"
 cat "$1" "$2" "$3" "$4"

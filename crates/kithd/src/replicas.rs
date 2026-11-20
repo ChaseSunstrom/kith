@@ -203,7 +203,7 @@ pub async fn copy(
     static SENDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _one = SENDING.lock().await;
     let archived = tokio::task::spawn_blocking(move || {
-        let from = crate::volumes::host_dir(&state, &dir)?;
+        let from = crate::root_part::volume(&state, &dir)?;
         let temp = state.join("replicas/.sending");
         let (hash, _) = crate::backups::archive(&from, &temp)?;
         // (Read through the open file, which has no name any more: nothing is left behind.)
@@ -321,7 +321,7 @@ async fn sync(
     let (state, dir, aside) = (state.to_path_buf(), dir.clone(), have.is_none().then_some(now));
     let shared = shared.clone();
     let placed = tokio::task::spawn_blocking(move || {
-        let into = crate::volumes::host_dir(&state, &dir)?;
+        let into = crate::root_part::open(&state, &dir)?;
         let marker = self::marker(&state, &dir);
         let hash = place(incoming, &temp, &into, cap, |new| {
             let me = shared.members.me();

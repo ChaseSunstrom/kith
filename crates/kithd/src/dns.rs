@@ -168,6 +168,7 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
     // Our own names. Having the zone means a name that is not in it is answered "no
     // such name" here, and never sent to the internet to ask.
     let mut own = vec![soa("kith"), soa("cluster.local")];
+    let mut empty: Vec<String> = Vec::new();
     for node in store.list(Some("Node")) {
         // (`<node>.node.kith` stays its LAN address, not the mesh one the leader may have moved it to.)
         let address = node.node_addresses().next();
@@ -236,15 +237,17 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
                 .into_iter()
                 .collect()
         };
-        for address in addresses {
-            for named in [
-                format!("{name}.{namespace}.kith"),
-                format!("{name}.{namespace}.svc.cluster.local"),
-            ] {
+        for named in [
+            format!("{name}.{namespace}.kith"),
+            format!("{name}.{namespace}.svc.cluster.local"),
+        ] {
+            // The Service's name is there with no address: NODATA, as Kubernetes answers an empty headless one.
+            empty.push(named.clone());
+            for address in &addresses {
                 own.push(Record {
-                    name: named,
+                    name: named.clone(),
                     ttl: NODE_TTL,
-                    data: Rdata::Aaaa(address),
+                    data: Rdata::Aaaa(*address),
                 });
             }
         }
@@ -348,6 +351,11 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
             // only fails where one zone's domain lies inside another's and they collide, or
             // past the RRset limit. Said once: the first, with a line on stderr.
             if let Err(error) = records.add(record) {
+                refused.get_or_insert(error);
+            }
+        }
+        for name in &empty {
+            if let Err(error) = records.add_name(name) {
                 refused.get_or_insert(error);
             }
         }
@@ -1533,6 +1541,49 @@ spec: { selector: { app: web }, ports: [{ port: 80 }] }
             answers6(&zones, client, "web-1.api.default.svc.cluster.local"),
             [ip("fd00:1::99")]
         );
+    }
+
+    /// A headless Service with no ready replica is a name that exists with no records (NODATA, as
+    /// Kubernetes answers), not one that is missing (NXDOMAIN, which a client holds for the SOA's
+    /// minimum); a Service that is not there is still NXDOMAIN.
+    #[test]
+    fn a_headless_service_with_no_replica_answers_nodata() {
+        let mut store = store(
+            "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db, namespace: prod, labels: { app: db } }
+spec:
+  replicas: 1
+  template:
+    containers: [{ name: main, image: example.org/db }]
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: db, namespace: prod }
+spec: { headless: true, selector: { app: db }, ports: [{ port: 80 }] }
+",
+        );
+        let (zones, _) = zones_of(&store, Some(kith_mesh::prefix(b"test")));
+        let client = "10.0.0.1".parse().unwrap();
+        for name in ["db.prod.kith", "db.prod.svc.cluster.local"] {
+            let found = zones.lookup(client, name, 28).unwrap();
+            assert_eq!(
+                (found.rcode, found.answers.len(), found.authority.len()),
+                (0, 0, 1),
+                "{name}"
+            );
+        }
+        let missing = zones.lookup(client, "nope.prod.svc.cluster.local", 28).unwrap();
+        assert_eq!(missing.rcode, 3);
+        // With no mesh prefix a Service has no address of its own either, and still exists.
+        let (bare, _) = zones_of(&store, None);
+        let found = bare.lookup(client, "db.prod.kith", 28).unwrap();
+        assert_eq!((found.rcode, found.answers.len(), found.authority.len()), (0, 0, 1));
+        // Deleted, the name is missing again.
+        store.delete("Service/prod/db").unwrap();
+        let (gone, _) = zones_of(&store, Some(kith_mesh::prefix(b"test")));
+        assert_eq!(gone.lookup(client, "db.prod.kith", 28).unwrap().rcode, 3);
     }
 
     #[test]

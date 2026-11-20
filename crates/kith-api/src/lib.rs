@@ -283,8 +283,9 @@ fn finish<S: Spec + Serialize + DeserializeOwned>(
     })
 }
 
-/// DNS-label-like, so names work in `<service>.<namespace>.kith`.
-fn check_name(name: &str) -> Result<(), String> {
+/// DNS-label-like, so names work in `<service>.<namespace>.kith`. (`pub`: the root part asks a
+/// Volume's names in the very form the store gives, one part of a path.)
+pub fn check_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= 63
         && name
@@ -379,8 +380,10 @@ impl Resource {
 
     /// What a new resource must meet beyond `validated`: a Service's and a Namespace's name, and a
     /// namespace, are one DNS label (a dot makes another Service's or replica's name). Asked where
-    /// a resource is submitted (kithd's apply and plan, the CLI's apply), not in `validated`: replay
-    /// validates every logged resource too, and a log written before this rule holds dotted ones.
+    /// a resource is submitted (kithd's apply, plan and signed apply, the Kubernetes API's writes, and
+    /// the CLI's `apply`), not in `validated`: replay validates every logged resource too, and a log
+    /// written before this rule holds dotted ones. Not asked of what kithd applies itself (a Release's
+    /// rendered Workload, a cron or controller's): those are not checked.
     pub fn submitted(&self) -> Result<(), String> {
         let one_label = |what: &str, name: &str| match name.contains('.') {
             true => Err(format!("{what} names are one DNS label: no `.` in `{name}`")),
@@ -388,6 +391,17 @@ impl Resource {
         };
         if matches!(self.kind.as_str(), "Service" | "Namespace") {
             one_label(&self.kind, &self.metadata.name)?;
+        }
+        // A Workload's replicas are named `NAME-N`: one DNS label too, as a Service names them.
+        if self.kind == "Workload" {
+            let replicas = self.spec.get("replicas").and_then(Value::as_u64).unwrap_or(1);
+            let last = format!("{}-{}", self.metadata.name, replicas.saturating_sub(1));
+            if replicas > 0 && last.len() > 63 {
+                return Err(format!(
+                    "Workload `{}`: its replica name `{last}` is over 63 characters (a DNS label): use a shorter name",
+                    self.metadata.name
+                ));
+            }
         }
         self.metadata
             .namespace

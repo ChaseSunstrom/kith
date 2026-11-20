@@ -220,7 +220,10 @@ that name. A kithd restart drops the connections through it.
 A Service with `headless: true` (`clusterIP: None` in Kubernetes) has no address of its own: its
 name answers the addresses of its ready replicas, and it cannot be `expose`d. Each ready replica
 is also named `NAME-N.SERVICE.NAMESPACE.svc.cluster.local` (a StatefulSet's pod names) under every
-Service that selects its Workload.
+Service that selects its Workload. With no ready replica the name still exists: it answers NODATA
+(no records), not NXDOMAIN. A Service's name exists exactly, so a wildcard `DNSRecord` no longer
+answers it (it answers NODATA for a type the Service has no address for). A Workload whose longest replica name `NAME-N` passes 63 characters (a
+DNS label) is refused when applied, by name.
 
 - Relaying runs on up to four threads of its own and DNS on one more, so a busy Service holds up
   neither the API nor lookups.
@@ -297,7 +300,7 @@ port 80 redirects. The ports need CAP_NET_BIND_SERVICE.
   PEM): apply your own, or start with `--acme` (`--acme URL` for another directory; the flag
   accepts its terms) to get and renew one from Let's Encrypt. Point the host's DNS at the
   ingress nodes first, and give `--acme` to every control node that may lead (the leader orders
-  for ingress workers). `kith get service/NAME -o yaml` shows `tls`; a failure is retried an
+  for ingress workers; under `spec.signing: required` a control node that does not lead orders only once the admin has set `spec.ingress: true` on its Node). `kith get service/NAME -o yaml` shows `tls`; a failure is retried an
   hour later. Keys, and the ACME account's (`Secret/kith-system/acme-account`), are Secrets in
   the store.
 - **Bytes as they are:** TLS ends at the ingress and nothing is added; NetworkPolicy sees the

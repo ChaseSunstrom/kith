@@ -1278,7 +1278,8 @@ async fn register(
         status.extend(more);
     }
     let statuses = vec![(node_key(name), status)];
-    shared.submit(Command::Patch { statuses }).await.map(drop)
+    // (Signed by this node's key, where callers sign: a bare Patch of a certificate or raft id is refused.)
+    shared.submit_node(Command::Patch { statuses }).await.map(drop)
 }
 
 /// Why `name` may not be a node: its Raft id ([`kith_store::node_id`]) is the one a Node of the

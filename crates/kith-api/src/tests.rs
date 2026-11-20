@@ -737,6 +737,35 @@ fn a_new_service_or_namespace_name_is_one_dns_label() {
     assert!(said.contains("namespace") && said.contains("a.b"), "{said}");
 }
 
+/// A Workload's replicas are named `NAME-N`, one DNS label (63 characters): a name whose longest
+/// replica name passes that is refused by name when submitted, and not left without replica names.
+/// Not in `validated`: replay takes what an older binary logged.
+#[test]
+fn replica_name_limit() {
+    let workload = |name: &str, replicas: u32| {
+        let text = format!(
+            "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {{ name: {name} }}\nspec:\n  replicas: {replicas}\n  template:\n    containers: [{{ name: main, image: example.org/web }}]\n"
+        );
+        one(&text)
+    };
+    let (sixty, sixty_two, sixty_three) = ("a".repeat(60), "a".repeat(62), "a".repeat(63));
+    workload(&sixty, 1).submitted().unwrap();
+    // The longest replica name counts: `NAME-99` is 63 characters (100 replicas), `NAME-100` 64.
+    workload(&"a".repeat(60), 100).submitted().unwrap();
+    workload(&"a".repeat(60), 101).submitted().unwrap_err();
+    for name in [&sixty_two, &sixty_three] {
+        let said = workload(name, 1).submitted().unwrap_err();
+        assert!(said.contains(name.as_str()) && said.contains("replica"), "{said}");
+    }
+    // Replay still takes it, and no replicas means no names to fit.
+    assert!(Store::default().apply_all(vec![workload(&sixty_three, 1)]).is_ok());
+    workload(&sixty_three, 0).submitted().unwrap();
+    // Other kinds are not named `NAME-N`.
+    one("apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }\nspec: { data: { k: v } }\n")
+        .submitted()
+        .unwrap();
+}
+
 /// Replay takes what an older binary logged: a dotted Service and namespace are applied, as
 /// they were, because the one-label rule is only at submission (`submitted`), not in `validated`.
 #[test]
@@ -2000,9 +2029,17 @@ fn an_exit_and_a_published_port_are_checked() {
     };
     let exit = "{ node: n1, secret: vpn, namespaces: [media], dns: [10.2.0.1] }";
     read("Exit", exit).unwrap();
+    // (Levels of the people, with or without namespaces.)
+    read("Exit", "{ node: n1, secret: vpn, levels: [family] }").unwrap();
+    read(
+        "Exit",
+        "{ node: n1, secret: vpn, namespaces: [media], levels: [family] }",
+    )
+    .unwrap();
     assert!(!kind("Exit").unwrap().namespaced);
     for (bad, why) in [
         ("{ node: n1, secret: vpn, namespaces: [] }", "namespaces: at least one"),
+        ("{ node: n1, secret: vpn, levels: [Family] }", "levels: invalid name"),
         (
             "{ node: n1, secret: vpn, namespaces: [Media] }",
             "namespaces: invalid name",

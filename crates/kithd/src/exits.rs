@@ -33,6 +33,25 @@ struct Up {
     tunnel: Tunnel,
     dns: Vec<Ipv4Addr>,
     namespaces: Vec<String>,
+    /// The people's levels whose peers may leave by it.
+    levels: Vec<String>,
+}
+
+/// The Exits of this node by name, as the people's levels see them: the tunnel's number and the
+/// levels it carries when it is up, or why it is not.
+pub type Held = BTreeMap<String, Result<(u16, Vec<String>), String>>;
+
+impl Exits {
+    /// What `levels.rs` needs of the tunnels: the held ones, and why the others are not.
+    pub fn held(&self) -> Held {
+        let failed = self.failed.iter().map(|(name, why)| (name.clone(), Err(why.clone())));
+        let up = self
+            .up
+            .iter()
+            .map(|(name, up)| (name.clone(), Ok((up.number, up.levels.clone()))));
+        // (One that failed is not up: a tunnel kept while its Exit now fails is the failure's.)
+        up.chain(failed).collect()
+    }
 }
 
 impl Up {
@@ -201,6 +220,7 @@ fn wanted(shared: &Shared) -> BTreeMap<String, Result<Up, String>> {
                 tunnel,
                 dns,
                 namespaces: spec.namespaces.clone(),
+                levels: spec.levels.clone(),
             })
         })();
         wanted.insert(name, up);
@@ -326,10 +346,12 @@ mod tests {
             tunnel,
             dns,
             namespaces: vec!["media".into()],
+            levels: vec!["family".into()],
         };
-        // Another namespace or DNS: the same tunnel.
+        // Another namespace, level or DNS: the same tunnel.
         let mut now = held.clone();
         now.namespaces.push("other".into());
+        now.levels.clear();
         now.dns = vec![Ipv4Addr::new(10, 2, 0, 9)];
         assert!(now.tunnel_of(&held));
         // Another endpoint or number: another.
@@ -338,6 +360,32 @@ mod tests {
         let mut moved = held.clone();
         moved.number = 8;
         assert!(!moved.tunnel_of(&held));
+    }
+
+    /// What the people's levels see of the Exits: the up ones by number and levels, the failed ones by why.
+    #[test]
+    fn people_exit_held_says_the_levels_and_the_failures() {
+        let peer = format!("[Peer]\nPublicKey = {KEY}\nEndpoint = 192.0.2.7:51820\n");
+        let (tunnel, dns) = parse(&conf(&peer)).unwrap();
+        let mut exits = Exits::default();
+        exits.up.insert(
+            "vpn".into(),
+            Up {
+                number: 7,
+                tunnel,
+                dns,
+                namespaces: Vec::new(),
+                levels: vec!["family".into()],
+            },
+        );
+        exits.failed.insert("broken".into(), "no secret".into());
+        assert_eq!(
+            exits.held(),
+            Held::from([
+                ("vpn".to_string(), Ok((7, vec!["family".to_string()]))),
+                ("broken".to_string(), Err("no secret".to_string())),
+            ])
+        );
     }
 
     #[test]
