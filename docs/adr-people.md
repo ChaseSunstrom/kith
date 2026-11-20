@@ -579,7 +579,7 @@ Not built: IPv6 through an Exit, the Exit of another node, the API or DNS throug
   people pool leaves the 64 free; each peer holds 2 of the 16 (`PEOPLE_GUESTS_EACH`; the others
   hold 8 of 64), by its address, so eight peers fill it, not one. A connection is accepted first
   and then takes a place in its own pool's line (a full line, or an address at its share: it is hung
-  up on) and waits there for a slot, up to 15 s, so a burst of members beyond 64 waits its turn
+  up on) and waits there for a slot, up to 15 s, and then has 5 s of its own to shake hands, so a burst of members beyond 64 waits its turn
   and a crowd of strangers holding the others' 64 does not keep a person's connection from being
   picked up. The API port is still
   not opened to peers by this slice.

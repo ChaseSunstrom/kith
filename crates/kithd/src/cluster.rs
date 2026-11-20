@@ -225,6 +225,8 @@ pub struct TlsListener {
 const GUESTS: usize = 64;
 /// How long a handshake may take, and how long a guest connection may last.
 const GUEST_TIME: Duration = Duration::from_secs(15);
+/// How long a handshake may take once it has a slot (a connection waits `GUEST_TIME` for one first).
+const SHAKE_TIME: Duration = Duration::from_secs(5);
 
 /// Of the [`GUESTS`] slots, how many one address may hold: a host that opens connections
 /// and says nothing fills its own share, and nobody else's.
@@ -409,14 +411,7 @@ fn listen_pools(tcp: TcpListener, config: Arc<rustls::ServerConfig>, pools: Pool
             };
             let (acceptor, tx) = (acceptor.clone(), tx.clone());
             tokio::spawn(async move {
-                // A client that connects and says nothing does not hold a slot for long, nor wait
-                // for one for long.
-                let shaken = tokio::time::timeout(GUEST_TIME, async {
-                    let slot = seat.slot().await?;
-                    Some((slot, acceptor.accept(stream).await.ok()?))
-                })
-                .await;
-                if let Ok(Some((slot, stream))) = shaken {
+                if let Some((slot, stream)) = served(seat, acceptor.accept(stream)).await {
                     let certs = stream.get_ref().1.peer_certificates();
                     let subject = certs.and_then(|certs| pki::subject_of(certs.first()?));
                     // Whoever the CA vouches for gives the slot back; a guest keeps it, for a short while.
@@ -430,6 +425,17 @@ fn listen_pools(tcp: TcpListener, config: Arc<rustls::ServerConfig>, pools: Pool
         }
     });
     Ok(TlsListener { ready, local })
+}
+
+/// Waits for the seat's slot (at most `GUEST_TIME`), then runs `shake` (the handshake) with a
+/// fresh `SHAKE_TIME` of its own: one that waited its turn is not left without time to speak, and a
+/// client that connects and says nothing holds a slot only that long.
+//
+// ponytail: loopback is not capped by address (`Crowd::place`), only by the line, so a process
+// of this machine can fill the others' line; it is the machine's own.
+async fn served<T>(seat: Seat, shake: impl Future<Output = std::io::Result<T>>) -> Option<(Slot, T)> {
+    let slot = tokio::time::timeout(GUEST_TIME, seat.slot()).await.ok()??;
+    Some((slot, tokio::time::timeout(SHAKE_TIME, shake).await.ok()?.ok()?))
 }
 
 impl axum::serve::Listener for TlsListener {
@@ -2859,6 +2865,59 @@ mod tests {
         );
         drop(line);
         assert!(pools.seat(loopback).is_some());
+    }
+
+    /// A connection that waited nearly all of `GUEST_TIME` for its slot still has its own time to
+    /// shake hands; one that waited longer is let go, with its line, its place and nothing else held.
+    #[tokio::test(start_paused = true)]
+    async fn a_seat_waits_and_then_shakes_hands_each_in_its_own_time() {
+        let pools = Pools::new(Some("fd12:3456:789a:1::".parse().unwrap()));
+        let mut full = pools.others.room.clone().try_acquire_many_owned(GUESTS as u32).unwrap();
+        let stranger: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let shake = || async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok::<_, std::io::Error>(())
+        };
+        // The per-address cap counts the seats that wait: 8 in line, the 9th is hung up on.
+        let seats: Vec<_> = (0..GUESTS_EACH)
+            .map(|_| pools.seat(stranger).expect("a seat"))
+            .collect();
+        assert!(pools.seat(stranger).is_none());
+        let mut seats = seats.into_iter();
+        let served_late = tokio::spawn(served(seats.next().unwrap(), shake()));
+        let timed_out: Vec<_> = seats.map(|seat| tokio::spawn(served(seat, shake()))).collect();
+        tokio::time::sleep(GUEST_TIME - Duration::from_secs(1)).await;
+        // One slot frees at 14 s: its seat is served, with 2 s of handshake after 14 s of waiting.
+        drop(full.split(1));
+        assert!(
+            served_late.await.unwrap().is_some(),
+            "the handshake has a time of its own"
+        );
+        // The rest were waiting for a slot that never came: after GUEST_TIME they let go.
+        for seat in timed_out {
+            assert!(seat.await.unwrap().is_none());
+        }
+        assert_eq!(
+            pools.others.line.available_permits(),
+            GUESTS * LINE,
+            "the line is given back"
+        );
+        assert!(
+            pools.others.crowd.0.lock().unwrap().is_empty(),
+            "so is the address's place"
+        );
+    }
+
+    /// With every slot of the others' taken, a person's seat still gets a slot at once.
+    #[tokio::test]
+    async fn a_person_is_seated_while_the_others_pool_is_stalled() {
+        let pools = Pools::new(Some("fd12:3456:789a:1::".parse().unwrap()));
+        let _full = pools.others.room.clone().try_acquire_many_owned(GUESTS as u32).unwrap();
+        let _waiting: Vec<_> = (0..GUESTS * LINE)
+            .map(|_| pools.seat("127.0.0.1".parse().unwrap()))
+            .collect();
+        let person = pools.seat("100.89.0.2".parse().unwrap()).and_then(Seat::try_slot);
+        assert!(person.is_some());
     }
 
     /// With every slot of the others' taken, a connection of theirs waits in its own task, not in

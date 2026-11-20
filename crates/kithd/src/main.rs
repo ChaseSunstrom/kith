@@ -322,7 +322,8 @@ pub struct Shared {
 const DRY_RUNS: usize = 4;
 
 /// The most open files kithd asks for: ingress's 1024 connections hold two each, and the
-/// relays, the API and the listeners come on top (SECURITY.md).
+/// relays, the API and the listeners come on top (SECURITY.md); the API's handshakes and the
+/// line waiting for a slot are about 400 sockets (64 + 256 the others', 16 + 64 the people's).
 const NOFILE_WANTED: u64 = 65536;
 
 /// The soft limit of open files to set: the hard limit, but no more than [`NOFILE_WANTED`],
