@@ -76,6 +76,12 @@ the plan allowed 0.3 ms).
 - Without `--mesh` (kith OS's default) a Service still answers the pods of the node it is on:
   kithd puts the Service's address on the loopback, and its status says the address and
   backends as ever. Other nodes' replicas are out of reach, as no mesh carries them.
+- A cluster turns the mesh on for kith OS nodes with no reinstall: `spec.mesh: { enabled: true }`
+  (`port:` is the UDP port, 51820 without) on its `Cluster`. Every node started without `--mesh`,
+  the members already running included, brings `kith0` up within seconds, and takes it down
+  again, and goes back to loopback Services, when the switch is removed or set to `false`.
+  Nothing restarts. A node started with `--mesh` keeps it whatever the Cluster says. Off is the
+  default. At install, `mesh: true` in the answers starts a node with it on.
 - Each node gets a stable IPv6 address derived from the CA and its name; `kith get node/NAME -o
   yaml` shows it and the public key (`mesh`), `kith node status` the peers and their last
   handshakes. The private key stays in `<state>/pki`.

@@ -664,6 +664,9 @@ pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut sto
         // (Asked before the store is read: it only gets newer.)
         let current = current(&shared);
         let (asking, mut asked) = published(&shared);
+        // (The mesh's port may come with the Cluster's switch, after the flags were read.)
+        let mesh = (*shared.mesh_port.borrow()).map(|port| (port, "mesh"));
+        let own: Vec<_> = own.iter().copied().chain(mesh).collect();
         let mut refused = refuse_own(&mut asked, &own);
         refused.extend(keep_for(&mut kept, current.then_some(&asking), &mut asked));
         let held = open.iter().map(|(port, (pod, _))| (*port, pod.clone())).collect();

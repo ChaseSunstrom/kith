@@ -199,6 +199,10 @@ pub struct Answers {
     /// server on the LAN).
     #[serde(default, rename = "lanReleases")]
     pub lan_releases: bool,
+    /// Start the node with its WireGuard mesh on (`--mesh`), without waiting for the
+    /// cluster's `spec.mesh` switch.
+    #[serde(default)]
+    pub mesh: bool,
     /// What the cluster may have this node do as its root: `hardened`, or the words of
     /// `--node-policy` with commas between (policy.rs). Without, everything, as before.
     #[serde(default, rename = "nodePolicy")]
@@ -345,6 +349,9 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
     }
     if answers.lan_releases {
         words.push("--lan-releases".into());
+    }
+    if answers.mesh {
+        words.push("--mesh".into());
     }
     // (Read here by the parser kithd reads it with: a word it does not know is refused now,
     // not at the node's first start, where it would run hardened and say so to nobody.)
@@ -1765,5 +1772,43 @@ mod tests {
                 && seen[2].1.contains("--join 10.0.0.7:7443 --token ")
                 && seen[2].1.contains("--node-policy hardened,vms,devices=gpu+input")
         );
+    }
+}
+
+/// The `mesh: true` answer: the node starts with `--mesh` and says so on its command line.
+#[cfg(test)]
+mod mesh_answer {
+    use super::*;
+
+    fn config(yaml: &str) -> Result<Vec<String>, String> {
+        let disks = [Disk {
+            name: "sda".into(),
+            bytes: 8 << 30,
+            removable: false,
+            model: String::new(),
+            serial: String::new(),
+        }];
+        let (_, config) = plan(&answers(yaml)?, &disks, 300 << 20, 1 << 20)?;
+        Ok(crate::init::configured(&config).1)
+    }
+
+    #[test]
+    fn mesh_true_gives_the_node_its_mesh_flag() {
+        let on = config("disk: sda\nip: 10.0.0.5/24\nmesh: true\n").unwrap();
+        assert_eq!(
+            on,
+            [
+                "--listen",
+                "0.0.0.0:7443",
+                "--advertise",
+                "10.0.0.5:7443",
+                "--mesh",
+                "--claim"
+            ]
+        );
+        for off in ["disk: sda\nmesh: false\n", "disk: sda\n"] {
+            assert!(!config(off).unwrap().contains(&"--mesh".to_string()), "{off}");
+        }
+        assert!(config("disk: sda\nmesh: sometimes\n").is_err());
     }
 }

@@ -446,6 +446,7 @@ join:                         # without it the node starts a new cluster
 encrypt: true                 # its state under a key the cluster holds: see "Encrypted state"
 releaseKey: $KEY              # kith OS releases signed by this key only: see "Rolling a release"
 lanReleases: true             # releases may come from a server on the node's private ranges
+mesh: true                    # starts with its WireGuard mesh on (`--mesh`); see "The mesh" in the cluster guide
 nodePolicy: hardened          # what the cluster may not have this node do: see "What a node refuses, whatever the cluster says"
 ```
 
