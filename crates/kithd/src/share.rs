@@ -571,7 +571,7 @@ pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio
                 lans(store, me),
                 store
                     .list(Some("Node"))
-                    .flat_map(|node| reached(node))
+                    .flat_map(reached)
                     .collect::<BTreeSet<Ipv4Addr>>(),
             )
         };
