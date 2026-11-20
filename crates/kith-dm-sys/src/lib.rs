@@ -979,49 +979,65 @@ fn stopped_within(pid: i32, limit: std::time::Duration) {
     }
 }
 
-/// A process to kill: by descriptor where the kernel gave one (it names that process for as long
-/// as it is held, whatever its number becomes), else by number.
+/// A process to kill, held by descriptor: it names that process for as long as it is held,
+/// whatever its number becomes.
 struct Victim {
-    pid: i32,
-    held: Option<OwnedFd>,
+    held: OwnedFd,
 }
 
 impl Victim {
-    /// Process `pid`, if it is still `parent`'s child: a descriptor is opened first and the
-    /// parent read after, so that a match is of the process the descriptor names.
-    fn pin(pid: i32, parent: i32) -> Option<Victim> {
+    /// Process `pid` if it is still `parent`'s child, `None` if it is gone or is not: a
+    /// descriptor is opened first and the parent read after, so that a match is of the process
+    /// the descriptor names. No descriptor (no file left, a kernel before 5.3, a sandbox) is an
+    /// error, not a kill by number: a number may be another process's by then.
+    fn pin(pid: i32, parent: i32) -> Result<Option<Victim>> {
         // SAFETY: pidfd_open takes a process id and flags, and gives a descriptor or -1.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            let e = Error::last_os_error();
+            return if e.raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(e)
+            };
+        }
         // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
-        let held = (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) });
-        // (No pidfd: a kernel before 5.3, or no descriptor left. By its number, then.)
-        (parent_of(pid)? == parent).then_some(Victim { pid, held })
+        let held = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+        Ok((parent_of(pid) == Some(parent)).then_some(Victim { held }))
     }
 
     fn kill(&self) {
-        match &self.held {
-            // SAFETY: pidfd_send_signal on a descriptor this holds, with no info.
-            Some(fd) => unsafe {
-                libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), libc::SIGKILL, 0, 0);
-            },
-            // SAFETY: kill takes a number and a signal.
-            None => unsafe {
-                libc::kill(self.pid, libc::SIGKILL);
-            },
-        }
+        // SAFETY: pidfd_send_signal on a descriptor this holds, with no info.
+        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.held.as_raw_fd(), libc::SIGKILL, 0, 0) };
     }
+}
+
+/// What `descendants` found under a process, and what it could not.
+struct Tree {
+    victims: Vec<Victim>,
+    /// What went unlisted or unheld, for the error `collect` gives ("" where nothing did).
+    missed: String,
 }
 
 /// Every process under `root` (its children, theirs, ...) as `/proc` lists them now, each held
 /// by descriptor and checked to be still its parent's child once held.
 // ponytail: a process that forks while this reads may escape it, one reparented away mid-scan
-// (its parent ended) is dropped by the check, and one already reparented (to a subreaper) is
-// not under `root` to be found; `collect` stops the child first, which closes the first for
-// its own children. A cgroup kill, where the caller has the cgroup, catches all three.
-fn descendants(root: i32) -> Result<Vec<Victim>> {
+// (its parent ended) is dropped by the check, one already reparented (to a subreaper) is not
+// under `root` to be found, and one no descriptor could be opened for is skipped and named;
+// `collect` stops the child first, which closes the first for its own children. A cgroup kill,
+// where the caller has the cgroup, catches all of them.
+fn descendants(root: i32) -> Result<Tree> {
     let mut parents = std::collections::HashMap::<i32, Vec<i32>>::new();
+    let mut unread = (0, None);
     // (A `/proc` that cannot be listed, not mounted or hidden, is an error: not an empty tree.)
-    for entry in std::fs::read_dir("/proc")?.flatten() {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                unread = (unread.0 + 1, unread.1.or(Some(e)));
+                continue;
+            }
+        };
         let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<i32>().ok()) else {
             continue;
         };
@@ -1029,17 +1045,29 @@ fn descendants(root: i32) -> Result<Vec<Victim>> {
             parents.entry(parent).or_default().push(pid);
         }
     }
-    let mut found = Vec::new();
+    let mut victims = Vec::new();
+    let mut skipped = (0, None);
     let mut next = vec![root];
     while let Some(parent) = next.pop() {
         for &child in parents.get(&parent).into_iter().flatten() {
-            if let Some(victim) = Victim::pin(child, parent) {
-                found.push(victim);
-                next.push(child);
+            match Victim::pin(child, parent) {
+                Ok(Some(victim)) => {
+                    victims.push(victim);
+                    next.push(child);
+                }
+                Ok(None) => {}
+                Err(e) => skipped = (skipped.0 + 1, skipped.1.or(Some(e))),
             }
         }
     }
-    Ok(found)
+    let mut missed = String::new();
+    if let (n, Some(e)) = skipped {
+        missed += &format!("; {n} descendants skipped: pidfd_open: {e}");
+    }
+    if let (n, Some(e)) = unread {
+        missed += &format!("; {n} /proc entries unreadable: {e}");
+    }
+    Ok(Tree { victims, missed })
 }
 
 impl Forked {
@@ -1078,7 +1106,7 @@ impl Forked {
                     libc::kill(self.pid, libc::SIGKILL);
                 }
                 if let Ok(tree) = &tree {
-                    tree.iter().for_each(Victim::kill);
+                    tree.victims.iter().for_each(Victim::kill);
                 }
                 // (Bounded: a helper stuck in the kernel must not hold the caller past its deadline.)
                 let reaped = reap_within(self.pid, REAP_WITHIN);
@@ -1093,7 +1121,7 @@ impl Forked {
                             "did not die (left to the reaper)"
                         },
                         match &tree {
-                            Ok(_) => String::new(),
+                            Ok(tree) => tree.missed.clone(),
                             Err(e) => format!("; its descendants could not be listed: {e}"),
                         }
                     ),
@@ -1424,24 +1452,61 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
     }
 
-    /// What the helper made (a tenant, an init) is the one that may hang, and it outlives the
-    /// helper that is killed: at the deadline the whole tree under the child goes, not only it.
     #[test]
     fn a_victim_is_held_only_while_its_parent_is_the_one_listed() {
+        let _children = children();
         let me = std::process::id() as i32;
         // SAFETY: getppid takes nothing.
         let parent = unsafe { libc::getppid() };
+        let mine = match Victim::pin(me, parent) {
+            Ok(held) => held.expect("this process is its parent's child"),
+            // (A sandbox that blocks pidfd_open: nothing here can be tried.)
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::ENOSYS)) => return,
+            Err(e) => panic!("pidfd_open: {e}"),
+        };
+        drop(mine);
         // (A number whose parent is not the one it was listed under, as a reused one is: dropped.)
-        assert!(Victim::pin(me, parent + 1).is_none());
-        assert!(Victim::pin(i32::MAX, parent).is_none());
-        let mine = Victim::pin(me, parent).expect("this process is its parent's child");
-        assert!(mine.held.is_some(), "a kernel with pidfd_open gives a descriptor");
+        assert!(Victim::pin(me, parent + 1).unwrap().is_none());
+        assert!(Victim::pin(i32::MAX, parent).unwrap().is_none());
         // The signal goes by descriptor to the process it names.
         let mut sleeper = std::process::Command::new("sleep").arg("300").spawn().unwrap();
         Victim::pin(sleeper.id() as i32, me)
+            .unwrap()
             .expect("the sleeper is this process's child")
             .kill();
         assert!(!sleeper.wait().unwrap().success());
+    }
+
+    #[test]
+    fn a_process_no_descriptor_can_be_opened_for_is_an_error_not_a_kill_by_number() {
+        let _children = children();
+        let said = fork_start(|| {
+            let me = std::process::id() as i32;
+            // SAFETY: getppid takes nothing; setrlimit takes a limit and a pointer to its value.
+            let parent = unsafe { libc::getppid() };
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: as above; the soft limit goes to 0 under the hard one it has.
+            unsafe {
+                libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+                limit.rlim_cur = 0;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return b"the limit was not lowered".to_vec();
+                }
+            }
+            match Victim::pin(me, parent) {
+                Err(e) if e.raw_os_error() == Some(libc::EMFILE) => b"ok".to_vec(),
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::ENOSYS)) => b"ok".to_vec(),
+                Err(e) => format!("{e}").into_bytes(),
+                Ok(_) => b"a victim was made with no descriptor to hold it".to_vec(),
+            }
+        })
+        .unwrap()
+        .collect(Duration::from_secs(30))
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&said), "ok");
     }
 
     // (Taken by `reap_within`, the thing under test, not by `Child::wait`.)
@@ -1477,6 +1542,8 @@ mod tests {
         assert!(reap_within(pid, Duration::from_secs(10)));
     }
 
+    /// What the helper made (a tenant, an init) is the one that may hang, and it outlives the
+    /// helper that is killed: at the deadline the whole tree under the child goes, not only it.
     #[test]
     fn forked_kills_what_the_child_started_too() {
         let _children = children();
