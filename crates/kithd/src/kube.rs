@@ -627,7 +627,7 @@ fn condition(kind: &str, is: bool, reason: &str) -> Value {
 }
 
 /// kith's status of a resource, as the status of the Kubernetes object it holds.
-fn status_of(kind: &str, object: &Value, resource: &Resource) -> Option<Value> {
+pub(crate) fn status_of(kind: &str, object: &Value, resource: &Resource) -> Option<Value> {
     let live = resource.status.as_ref();
     let revision = resource.metadata.revision.unwrap_or(1);
     let [all, new, ready, both] = counts(resource);

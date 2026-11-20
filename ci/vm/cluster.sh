@@ -87,7 +87,7 @@
                 # (kube: what `kubectl exec` and `kubectl cp` run in a pod, this machine's own with the
                 # libraries ldd names: a tar that gives a file no owner, as a cp has no right to give.)
                 if [ "$test" = kube ]; then
-                    for tool in sh cat tar true; do
+                    for tool in sh cat tar true sleep; do
                         from=/usr/bin/$tool
                         [ -x "$from" ] || fail "no $from on this machine, for the pods of the kube test"
                         cp -L "$from" "$image/rootfs/bin/$tool"

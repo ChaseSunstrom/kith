@@ -161,6 +161,19 @@ EOF
             must 'the Deployment made by hand did not roll out again' k rollout status deployment/made --timeout=240s
             said=$(k get deployment made -o 'jsonpath={.status.readyReplicas} {.spec.template.spec.containers[0].image}' 2>&1)
             [ "$said" = '3 kith.test/pod:again' ] || fail "the Deployment made by hand says: $said"
+            # A pod whose readinessProbe is an exec (ci/kube/gate.yaml: its file comes five seconds after it
+            # starts): a rollout that has come back has pods each with the file, none called ready before.
+            must 'kubectl apply of the Deployment gated by an exec probe' k apply -f "$root/ci/kube/gate.yaml"
+            must 'the gated Deployment did not roll out' k rollout status deployment/gate --timeout=240s
+            must 'kubectl set env' k set env deployment/gate ROUND=2
+            must 'the gated Deployment did not roll out again' k rollout status deployment/gate --timeout=240s
+            for pod in $(k get pods -l app=gate -o name); do
+                if ! k exec "$pod" -- cat /gate/ready >"$work/said" 2>&1; then
+                    ! k get "$pod" >/dev/null 2>&1 || fail "a rollout of the gated Deployment came back before $pod was ready: $(cat "$work/said")"
+                fi
+            done
+            said=$(k get deployment gate -o 'jsonpath={.status.readyReplicas} {.status.updatedReplicas}' 2>&1)
+            [ "$said" = '3 3' ] || fail "the gated Deployment says: $said"
             must 'kubectl create job' k create job ask-made --image=kith.test/pod:1 -- /bin/pod ask made 80
             heard ask-made made-0 made-1 made-2
 
@@ -276,6 +289,7 @@ EOF
             # Deleted, nothing of it is left: not the volume made for the claim either.
             must 'kubectl delete of the manifests' k delete -f "$root/ci/kube"
             must 'kubectl delete of what was made by hand' k delete deployment,service made
+            must 'kubectl delete of the gated Deployment' k delete deployment gate
             must 'kubectl delete of the Jobs made by hand' k delete job again ask-made
             must 'kubectl delete of the claims' k delete pvc data-db-0 data-ring-0 data-ring-2
             left() {
