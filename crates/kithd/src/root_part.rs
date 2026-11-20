@@ -15,6 +15,12 @@
 //! nothing to act on until the root part is a process. An exec unit ([`Root::exec`]) and one
 //! taken back from an earlier run ([`Root::adopt`]) are made here as a created one is.
 //!
+//! The Volumes family (`Volume`, `Open`, `Restore`, `VolumeGone`: [`volume`], [`open`],
+//! [`restore`] and [`volume_gone`] ask them) names a Volume as the store does and has the
+//! directory derived here, beneath `<state>/volumes`, from the state directory the Book has;
+//! and `Run` ([`run`]) is the node's policy on `POST /v1/run`, asked before the program is
+//! started. `Update`, `Reboot` and `Lock` of the Node family are not built.
+//!
 //! A claim is of the node's devices, not of a unit's, as it is for `Create`: any unit made here
 //! may be given a device any claim granted, and a `Plug` or `Unplug` is no finer than that.
 //!
@@ -31,6 +37,7 @@
 
 use crate::pods::{Given, Pods};
 use crate::policy::Policy;
+use crate::volumes::Dir;
 use kith_runtime::{Handle, Image, ImageStore, Mount, Runtime, Unit};
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
 use serde::{Deserialize, Serialize};
@@ -61,6 +68,10 @@ const MOST_LAYERS: usize = 256;
 /// thousandths): a request for more is for what no node has.
 const MOST_GUARANTEED: u64 = 1 << 42;
 const MOST_CPU_MILLIS: u64 = 1_024_000;
+/// The most a `Run` is: arguments, and bytes of them and of the program's name (the API reads a
+/// body of at most 64 KiB, which is what a run's whole spec is in).
+const MOST_ARGS: usize = 1024;
+const MOST_ARGV_BYTES: usize = 64 << 10;
 
 /// What a socket is for: only these two, so a request for any other protocol does not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,11 +150,51 @@ pub enum Request {
     /// ends in `b`) holds of the state disk, if it is held to a limit as it writes. The path is
     /// derived here, from the state directory.
     Usage { pod: String },
+    /// The directory of the Volume `volume` on this node, made if it is not there (what
+    /// `volumes::host_dir` does): the one a unit mounts, a backup, a replica or a download reads.
+    Volume { volume: Place },
+    /// The directory of the Volume to be written into, as for `Volume`: an upload's, a replica's
+    /// copy. The files made take the Volume directory's own owner, as unpacking derives it.
+    Open { volume: Place },
+    /// The directory of the Volume a backup is restored into, as for `Open`.
+    Restore { volume: Place },
+    /// The data of the Volume `namespace`/`name` removed: `<state>/volumes/<namespace>/<name>`
+    /// and nothing beside it (`volumes::wipe`).
+    VolumeGone { namespace: String, name: String },
+    /// An app run for a caller (`POST /v1/run`): `via` is the program, `argv` what it runs. Refused
+    /// where the node's policy has `run` off; the process itself is the serving part's, which
+    /// holds the connection it is joined to.
+    Run { via: String, argv: Vec<String> },
+}
+
+/// Where a Volume's data is, as the Volume says it (`volumes::Dir`, but for the node it is on:
+/// this one's, and the state directory is the root part's own).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Place {
+    pub namespace: String,
+    pub name: String,
+    /// The Volume's `spec.path`.
+    pub path: String,
+    pub encrypted: bool,
+}
+
+impl Place {
+    fn of(dir: &Dir) -> Place {
+        Place {
+            namespace: dir.namespace.clone(),
+            name: dir.name.clone(),
+            path: dir.path.clone(),
+            encrypted: dir.encrypted,
+        }
+    }
 }
 
 /// What a request gives back.
 #[derive(Debug)]
 pub enum Reply {
+    /// A Volume's directory, as the root part made it.
+    Path(PathBuf),
     /// `(bytes, files, most files)` of a pod's project, or `None` when it has none.
     Usage(Option<(u64, u64, u64)>),
     /// The bytes an image's removal freed, or `None` when it stayed.
@@ -193,6 +244,13 @@ pub(crate) fn label(what: &str, text: &str) -> Result<(), String> {
     }
 }
 
+/// A Volume's namespace and name, in the form the store gives every name (kith-api's
+/// `check_name`, the one the controller's own names pass: at most 63, lowercase letters, digits,
+/// `-` and `.`, a letter or digit at both ends), so that each is one part of a path.
+fn names(namespace: &str, name: &str) -> Result<(), String> {
+    kith_api::check_name(namespace).and_then(|()| kith_api::check_name(name))
+}
+
 /// Why a request is refused, or `Ok` when the root part may do it. It looks at what is
 /// asked and never at who asks.
 pub fn check(request: &Request) -> Result<(), String> {
@@ -239,6 +297,26 @@ pub fn check(request: &Request) -> Result<(), String> {
         // (Against the units made here and the claims: [`Book::known`].)
         Request::Kill { id } | Request::Delete { id } => label("unit id", id),
         Request::Usage { pod } => label("pod id", pod),
+        // (The place is of this node's state directory, the root part's own: the form of the names
+        // and the path only here, and where it may be, in `act`, under the node's policy.)
+        Request::Volume { volume } | Request::Open { volume } | Request::Restore { volume } => {
+            names(&volume.namespace, &volume.name)?;
+            crate::volumes::check_path(&volume.namespace, &volume.path)
+        }
+        Request::VolumeGone { namespace, name } => names(namespace, name),
+        Request::Run { via, argv } => {
+            let all = || argv.iter().chain([via]);
+            let bad = via.is_empty()
+                || argv.is_empty()
+                || argv.len() > MOST_ARGS
+                || all().map(String::len).sum::<usize>() > MOST_ARGV_BYTES
+                || all().any(|text| text.contains('\0'));
+            // (1024 arguments and 64 KiB: `MOST_ARGS`, `MOST_ARGV_BYTES`.)
+            match bad {
+                true => Err("run: a program, at most 1024 arguments of 64 KiB, no NUL".into()),
+                false => Ok(()),
+            }
+        }
         Request::Tune {
             id,
             guaranteed,
@@ -547,7 +625,7 @@ pub struct Book {
     mesh: Mutex<Option<MeshTold>>,
     /// Held by a mesh request from its check to its end: one at a time.
     meshing: Mutex<()>,
-    crossed: [AtomicUsize; 15],
+    crossed: [AtomicUsize; 20],
 }
 
 /// What a request is, for counting.
@@ -574,6 +652,15 @@ pub enum Kind {
     Plug,
     Unplug,
     Usage,
+    /// A Volume's directory asked for (`Volume`, `Open`, `Restore`: once each, by whatever mounts,
+    /// reads or fills a Volume), and its data removed (`VolumeGone`). A unit's start asks one
+    /// `Volume` for each Volume it mounts, besides its three.
+    Volume,
+    Open,
+    Restore,
+    VolumeGone,
+    /// An app run for a caller (`Run`).
+    Run,
 }
 
 impl Book {
@@ -584,7 +671,7 @@ impl Book {
             units: Mutex::new(BTreeSet::new()),
             mesh: Mutex::new(None),
             meshing: Mutex::new(()),
-            crossed: [const { AtomicUsize::new(0) }; 15],
+            crossed: [const { AtomicUsize::new(0) }; 20],
         }
     }
 
@@ -1321,6 +1408,41 @@ impl<H: Hands> Direct<'_, H> {
         }
     }
 
+    /// The node's policy, or the one a test gave.
+    fn policy(&self) -> Policy {
+        self.policy.clone().unwrap_or_else(crate::policy::get)
+    }
+
+    /// A request of the Volumes family: the state directory is the Book's, never the asker's, and
+    /// every path is derived beneath `<state>/volumes/<namespace>/<name>` (`volumes::host_dir`:
+    /// nothing is made or followed outside it; a directory of the node's own, where a Volume
+    /// of `kith-system` says one, only where the policy has `hostPaths`).
+    fn volumes_request(&self, request: Request) -> Result<Reply, String> {
+        let state = self.book.state().ok_or("this root part has no state directory")?;
+        let volume = match request {
+            Request::VolumeGone { namespace, name } => {
+                let dir = Dir {
+                    namespace,
+                    name,
+                    path: String::new(),
+                    node: String::new(),
+                    encrypted: false,
+                };
+                return crate::volumes::wipe(&state, &dir).map(|()| Reply::Done);
+            }
+            Request::Volume { volume } | Request::Open { volume } | Request::Restore { volume } => volume,
+            _ => return Err("not a request of the volumes".into()),
+        };
+        let dir = Dir {
+            namespace: volume.namespace,
+            name: volume.name,
+            path: volume.path,
+            node: String::new(),
+            encrypted: volume.encrypted,
+        };
+        crate::volumes::host_dir_under(&state, &dir, &self.policy()).map(Reply::Path)
+    }
+
     fn act(&self, request: Request, files: Vec<File>) -> Result<Reply, String> {
         self.book.count(match request {
             Request::Bind { .. } => Kind::Bind,
@@ -1336,7 +1458,18 @@ impl<H: Hands> Direct<'_, H> {
             Request::Plug { .. } => Kind::Plug,
             Request::Unplug { .. } => Kind::Unplug,
             Request::Usage { .. } => Kind::Usage,
+            Request::Volume { .. } => Kind::Volume,
+            Request::Open { .. } => Kind::Open,
+            Request::Restore { .. } => Kind::Restore,
+            Request::VolumeGone { .. } => Kind::VolumeGone,
+            Request::Run { .. } => Kind::Run,
         });
+        // (Where run is off that is what is said, not the shape of what was asked.)
+        if matches!(request, Request::Run { .. }) {
+            if let Some(why) = self.policy().refusal("run") {
+                return Err(why);
+            }
+        }
         check(&request)?;
         if !files.is_empty() && !matches!(request, Request::Unpack { .. }) {
             return Err("only an unpack comes with files".into());
@@ -1356,6 +1489,12 @@ impl<H: Hands> Direct<'_, H> {
                 Ok(Reply::Usage(crate::controller::storage::Projects::usage(&state, pod)))
             }
             images @ (Request::Unpack { .. } | Request::Drop { .. }) => self.images_request(images, files),
+            volumes @ (Request::Volume { .. }
+            | Request::Open { .. }
+            | Request::Restore { .. }
+            | Request::VolumeGone { .. }) => self.volumes_request(volumes),
+            // (The program is the serving part's to start: it holds the connection it is joined to.)
+            Request::Run { .. } => Ok(Reply::Done),
             mesh @ (Request::MeshUp { .. }
             | Request::Mesh { .. }
             | Request::MeshSeen { .. }
@@ -1409,6 +1548,61 @@ pub fn drop_image(image: &str, before: std::time::SystemTime) -> Result<Option<u
         Reply::Freed(freed) => Ok(freed),
         _ => Err("the root part answered a drop with another reply".into()),
     }
+}
+
+/// A request of the Volumes family asked of the root part of this node. The state directory is
+/// the root part's own, the one `set_state` told it; `state` is the caller's and is read only in
+/// a test, whose book is one of its own with that directory (each test has a state directory
+/// of its own, and the process has the one book).
+fn asked_of_volumes(state: &Path, request: Request) -> Result<Reply, String> {
+    #[cfg(test)]
+    {
+        let book = Book::new();
+        book.set_state(state.canonicalize().map_err(|e| format!("{}: {e}", state.display()))?);
+        Direct::with(Nobody, &book).request(request)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = state;
+        Direct::new().request(request)
+    }
+}
+
+fn path_of(state: &Path, request: Request) -> Result<PathBuf, String> {
+    match asked_of_volumes(state, request)? {
+        Reply::Path(path) => Ok(path),
+        _ => Err("the root part answered a volume with another reply".into()),
+    }
+}
+
+/// The directory of the Volume `dir` on this node, made if it is not there: for what mounts it,
+/// reads it (a backup, a replica's source, a download).
+pub fn volume(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
+    path_of(state, Request::Volume { volume: Place::of(dir) })
+}
+
+/// The directory of the Volume `dir` to write into (an upload, a replica's copy): the files made
+/// take the directory's own owner.
+pub fn open(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
+    path_of(state, Request::Open { volume: Place::of(dir) })
+}
+
+/// The directory of the Volume `dir` a backup is restored into.
+pub fn restore(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
+    path_of(state, Request::Restore { volume: Place::of(dir) })
+}
+
+/// The data of the Volume `dir` removed from this node (not there is done).
+pub fn volume_gone(state: &Path, dir: &Dir) -> Result<(), String> {
+    let (namespace, name) = (dir.namespace.clone(), dir.name.clone());
+    asked_of_volumes(state, Request::VolumeGone { namespace, name }).map(drop)
+}
+
+/// Whether this node runs an app for a caller, as the root part has it: `Ok` or why not. The
+/// program is started by the caller.
+pub fn run(via: &str, argv: &[String]) -> Result<(), String> {
+    let (via, argv) = (via.into(), argv.to_vec());
+    Direct::new().request(Request::Run { via, argv }).map(drop)
 }
 
 /// The pod `ask` (a [`Request::Pod`]) as a container of it is given it: asked of the root part
@@ -3476,5 +3670,248 @@ mod tests {
         start_one(&root, &pods, &state, "w_a_b_0", "first");
         assert_eq!(book.total(), 3);
         assert_eq!((book.crossed(Kind::Unpack), book.crossed(Kind::Drop)), (0, 0));
+    }
+
+    fn place(namespace: &str, name: &str, path: &str) -> Place {
+        Place {
+            namespace: namespace.into(),
+            name: name.into(),
+            path: path.into(),
+            encrypted: false,
+        }
+    }
+
+    /// The three requests that name a Volume's directory, for one place.
+    fn volume_asks(place: Place) -> [Request; 3] {
+        [
+            Request::Volume { volume: place.clone() },
+            Request::Open { volume: place.clone() },
+            Request::Restore { volume: place },
+        ]
+    }
+
+    #[test]
+    fn a_volume_outside_the_volume_root_is_refused_whatever_the_caller_says() {
+        let (book, state) = book("volume-outside");
+        let outside = std::env::temp_dir().join(format!("kith-root-part-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let root = Direct::with(Nobody, &book).under(policy("hardened"));
+        let refused = [
+            // A path that climbs, repeats a slash or starts from here.
+            place("shop", "data", "../x"),
+            place("shop", "data", "a/../.."),
+            place("shop", "data", "a//b"),
+            place("shop", "data", "./a"),
+            place("shop", "data", "/etc"),
+            place("shop", "data", ""),
+            place("shop", "data", "a\0b"),
+            // A name that is not one of the store's, as a path in itself.
+            place("shop", "../x", "data"),
+            place("../x", "data", "data"),
+            place("shop", "a/b", "data"),
+            place("shop", "", "data"),
+            place("shop", "UPPER", "data"),
+            place("shop", &"a".repeat(64), "data"),
+            place("shop", "-a", "data"),
+            // A directory of the node's own, where the policy has no hostPaths.
+            place("kith-system", "data", outside.to_str().unwrap()),
+        ];
+        for one in refused {
+            for ask in volume_asks(one.clone()) {
+                let kind = format!("{ask:?}");
+                assert!(root.request(ask).is_err(), "{kind}");
+            }
+            let gone = Request::VolumeGone {
+                namespace: one.namespace.clone(),
+                name: one.name.clone(),
+            };
+            if one.namespace != "shop" || one.name != "data" {
+                assert!(root.request(gone).is_err(), "{one:?}");
+            }
+        }
+        // Nothing was made, in the state directory or at the node's own path.
+        assert!(!state.join("volumes").exists() || std::fs::read_dir(state.join("volumes/shop")).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        // A symbolic link in the way is not followed.
+        let shop = state.join("volumes/shop/data");
+        std::fs::create_dir_all(&shop).unwrap();
+        std::os::unix::fs::symlink(&outside, shop.join("link")).unwrap();
+        for ask in volume_asks(place("shop", "data", "link/inner")) {
+            let why = root.request(ask).unwrap_err();
+            assert!(why.contains("symbolic link"), "{why}");
+        }
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        // A plain one is made beneath the root, and the reply says where.
+        for ask in volume_asks(place("shop", "data", "deep/er")) {
+            let Ok(Reply::Path(at)) = root.request(ask) else {
+                panic!("not a path")
+            };
+            assert_eq!(at, shop.join("deep/er"));
+        }
+        // And one of the node's own is made where the policy has hostPaths.
+        let open = Direct::with(Nobody, &book).under(policy("hardened,host-paths"));
+        let own = outside.join("own");
+        let ask = Request::Volume {
+            volume: place("kith-system", "data", own.to_str().unwrap()),
+        };
+        assert!(matches!(open.request(ask), Ok(Reply::Path(at)) if at == own));
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn a_node_path_that_climbs_is_refused_even_where_the_policy_has_host_paths() {
+        let (book, _) = book("volume-climb");
+        let outside = std::env::temp_dir().join(format!("kith-root-part-climb-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let root = Direct::with(Nobody, &book).under(policy("hardened,host-paths"));
+        let at = outside.to_str().unwrap();
+        for path in [
+            "/a/../../etc".to_string(),
+            format!("{at}/../escaped"),
+            format!("{at}/./x"),
+            format!("{at}//x"),
+            format!("{at}/"),
+        ] {
+            for ask in volume_asks(place("kith-system", "data", &path)) {
+                assert!(root.request(ask).is_err(), "{path}");
+            }
+        }
+        // Nothing was made beside the directory, and one that does not climb is.
+        assert!(!outside.join("../escaped").exists());
+        assert!(!outside.join("x").exists());
+        let ask = Request::Volume {
+            volume: place("kith-system", "data", &format!("{at}/own")),
+        };
+        assert!(matches!(root.request(ask), Ok(Reply::Path(_))));
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn a_volume_gone_removes_only_the_volumes_own_directory() {
+        let (book, state) = book("volume-gone");
+        let root = Direct::with(Nobody, &book).under(policy("hardened"));
+        let own = state.join("volumes/shop/data");
+        let next = state.join("volumes/shop/data2");
+        std::fs::create_dir_all(own.join("deep")).unwrap();
+        std::fs::create_dir_all(&next).unwrap();
+        let gone = |namespace: &str, name: &str| {
+            root.request(Request::VolumeGone {
+                namespace: namespace.into(),
+                name: name.into(),
+            })
+        };
+        for (namespace, name) in [("kith-system", "data"), ("shop", ".."), ("..", "shop"), ("shop", "a/b")] {
+            assert!(gone(namespace, name).is_err(), "{namespace}/{name}");
+        }
+        assert!(own.exists() && next.exists());
+        assert!(matches!(gone("shop", "data"), Ok(Reply::Done)));
+        assert!(!own.exists() && next.exists());
+        // A second one finds it gone and says so as done.
+        assert!(matches!(gone("shop", "data"), Ok(Reply::Done)));
+        assert_eq!(book.crossed(Kind::VolumeGone), 6);
+    }
+
+    #[test]
+    fn run_is_refused_where_the_policy_has_it_off() {
+        let (book, _) = book("run");
+        let run = |words: &str, via: &str, argv: &[&str]| {
+            Direct::with(Nobody, &book).under(policy(words)).request(Request::Run {
+                via: via.into(),
+                argv: argv.iter().map(|a| a.to_string()).collect(),
+            })
+        };
+        let why = run("hardened", "waypipe", &["firefox"]).unwrap_err();
+        assert!(why.contains("run"), "{why}");
+        assert!(matches!(run("hardened,run", "waypipe", &["firefox"]), Ok(Reply::Done)));
+        assert!(matches!(run("hardened,run", "/usr/bin/waypipe", &[]), Err(_)));
+        // What would not be one program's name and arguments is refused where it is allowed too.
+        assert!(run("hardened,run", "", &["a"]).is_err());
+        assert!(run("hardened,run", "waypipe", &["a\0b"]).is_err());
+        assert!(run("hardened,run", "waypipe", &["a"; MOST_ARGS + 1]).is_err());
+        let wide = "a".repeat(MOST_ARGV_BYTES + 1);
+        assert!(run("hardened,run", "waypipe", &[wide.as_str()]).is_err());
+        // Each, refused or not, was one crossing.
+        assert_eq!(book.crossed(Kind::Run), 7);
+        // Where it is off, the policy is what is said, not the shape of the request.
+        let why = run("hardened", "", &[]).unwrap_err();
+        assert!(!why.starts_with("run: a program"), "{why}");
+        assert_eq!(why, run("hardened", "waypipe", &["firefox"]).unwrap_err());
+    }
+
+    #[test]
+    fn the_volumes_and_run_requests_are_on_the_wire() {
+        for request in [
+            Request::Volume {
+                volume: place("shop", "data", "x"),
+            },
+            Request::Open {
+                volume: place("shop", "data", "x"),
+            },
+            Request::Restore {
+                volume: place("shop", "data", "x"),
+            },
+            Request::VolumeGone {
+                namespace: "shop".into(),
+                name: "data".into(),
+            },
+            Request::Run {
+                via: "waypipe".into(),
+                argv: vec!["firefox".into()],
+            },
+        ] {
+            let sent = serde_json::to_vec(&request).unwrap();
+            assert_eq!(decode(&sent).unwrap(), request);
+        }
+        // The state directory is the root part's own: the asker has no field to give one in.
+        let state = br#"{"Volume":{"volume":{"namespace":"a","name":"b","path":"c","encrypted":false},"state":"/"}}"#;
+        assert!(decode(state).is_err());
+        let inner = br#"{"Volume":{"volume":{"namespace":"a","name":"b","path":"c","encrypted":false,"state":"/"}}}"#;
+        assert!(decode(inner).is_err());
+    }
+
+    #[test]
+    fn what_asks_of_the_volumes_gets_the_directory_a_request_would() {
+        let state = std::env::temp_dir().join(format!("kith-root-part-wrappers-{}", std::process::id()));
+        std::fs::create_dir_all(&state).unwrap();
+        let dir = Dir {
+            namespace: "shop".into(),
+            name: "data".into(),
+            path: "in/side".into(),
+            node: "a".into(),
+            encrypted: false,
+        };
+        let state = state.canonicalize().unwrap();
+        let own = state.join("volumes/shop/data/in/side");
+        assert_eq!(volume(&state, &dir).unwrap(), own);
+        assert_eq!(open(&state, &dir).unwrap(), own);
+        assert_eq!(restore(&state, &dir).unwrap(), own);
+        let climbing = Dir {
+            path: "../x".into(),
+            ..dir.clone()
+        };
+        assert!(volume(&state, &climbing).is_err() && open(&state, &climbing).is_err());
+        assert!(restore(&state, &climbing).is_err());
+        volume_gone(&state, &dir).unwrap();
+        assert!(!state.join("volumes/shop/data").exists());
+        std::fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn a_start_with_volumes_adds_one_crossing_for_each_and_nothing_else() {
+        let (book, state) = book("start-volumes");
+        let root = Direct::with(Fake::default(), &book).under(policy("no-host-paths"));
+        let pods = Mutex::new(Pods::default());
+        pods.lock().unwrap().pretend("w_a_b_0", &state);
+        start_one(&root, &pods, &state, "w_a_b_0", "first");
+        // The ADR's three, and one `Volume` for each the unit mounts, which the controller asks
+        // before it makes the unit (it is not counted among the three).
+        for i in 0..2 {
+            let ask = Request::Volume {
+                volume: place("ns", &format!("data{i}"), "x"),
+            };
+            assert!(matches!(root.request(ask), Ok(Reply::Path(_))));
+        }
+        assert_eq!(book.crossed(Kind::Volume), 2);
+        assert_eq!(book.total(), 5);
     }
 }

@@ -283,8 +283,9 @@ fn finish<S: Spec + Serialize + DeserializeOwned>(
     })
 }
 
-/// DNS-label-like, so names work in `<service>.<namespace>.kith`.
-fn check_name(name: &str) -> Result<(), String> {
+/// DNS-label-like, so names work in `<service>.<namespace>.kith`. (`pub`: the root part asks a
+/// Volume's names in the very form the store gives, one part of a path.)
+pub fn check_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= 63
         && name

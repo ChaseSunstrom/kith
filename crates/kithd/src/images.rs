@@ -145,7 +145,7 @@ fn pack(dir: &Path, blobs: &Path, spec: &ImageSpec) -> Result<[Piece; 3], String
 
 /// Makes the image: its pieces in the blob store, a Blob for each, and the status that says so.
 async fn make(shared: &Shared, state: &Path, job: &Job) -> Result<Value, String> {
-    let from = crate::volumes::host_dir(state, &job.dir)?;
+    let from = crate::root_part::volume(state, &job.dir)?;
     let (blobs, spec) = (crate::blobs::dir(shared), job.spec.clone());
     let packed = tokio::task::spawn_blocking(move || pack(&from, &blobs, &spec)).await;
     let pieces = packed.map_err(|e| e.to_string())??;

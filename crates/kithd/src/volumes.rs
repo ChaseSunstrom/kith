@@ -104,19 +104,20 @@ struct Vol {
     refused: Option<String>,
 }
 
-/// Whether `path` is one the namespace may use: any absolute path in `kith-system`, else a
-/// relative one with no `.`, `..` or empty part (so it stays inside the namespace's own directory).
-fn check_path(namespace: &str, path: &str) -> Result<(), String> {
+/// Whether `path` is one the namespace may use: an absolute path in `kith-system`, else a relative
+/// one; either with no `.`, `..` or empty part (so none climbs out of where it starts).
+pub(crate) fn check_path(namespace: &str, path: &str) -> Result<(), String> {
     if path.contains('\0') {
         return Err(format!("path `{path:?}` must be relative, with no NUL"));
     }
+    let mut parts = path.split('/');
     if namespace == SYSTEM {
-        let absolute = path.starts_with('/');
-        return absolute
-            .then_some(())
-            .ok_or(format!("path `{path}` must be absolute in {SYSTEM}"));
+        // (The first part of an absolute path is the empty one before its slash.)
+        if parts.next() != Some("") || path.len() < 2 {
+            return Err(format!("path `{path}` must be absolute in {SYSTEM}"));
+        }
     }
-    let plain = path.split('/').all(|part| !matches!(part, "" | "." | ".."));
+    let plain = parts.all(|part| !matches!(part, "" | "." | ".."));
     plain.then_some(()).ok_or(format!(
         "path `{path}` must be relative to the namespace's own directory, with no `..`, `.` or empty part"
     ))
@@ -693,7 +694,7 @@ pub fn host_dir(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
 
 /// [`host_dir`], under a node's policy: one that has `hostPaths` off makes and mounts no
 /// directory of the node's own that the store names.
-fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Policy) -> Result<PathBuf, String> {
+pub(crate) fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Policy) -> Result<PathBuf, String> {
     check_path(&dir.namespace, &dir.path)?;
     let made = |path: &Path, e: std::io::Error| format!("cannot make {}: {e}", path.display());
     if dir.namespace == SYSTEM {
