@@ -2667,6 +2667,18 @@ mod drain_tests {
     }
 
     #[test]
+    fn features_spec_writes_all_for_a_node_that_wants_all() {
+        use super::features_spec;
+        use kith_api::Resource;
+        let node = json!({
+            "apiVersion": "kith.dev/v1", "kind": "Node", "metadata": { "name": "gtx" },
+            "spec": {}, "status": { "os": { "wants": ["all"] } },
+        });
+        let spec = features_spec(&serde_json::from_value::<Resource>(node).unwrap()).unwrap();
+        assert!(spec.ends_with("features: [all]\n"), "{spec}");
+    }
+
+    #[test]
     fn node_features_prints_the_spec_the_node_wants() {
         use super::features_spec;
         use kith_api::Resource;
