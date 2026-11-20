@@ -15,6 +15,21 @@ As process 1, kithd:
   six digits of its first network card's address;
 - brings every card up and asks for an address (DHCP, renewed). Where there is none, say
   `kith.ip=10.0.0.5/24,10.0.0.1` (address, gateway) and `kith.dns=9.9.9.9`;
+- keeps the time: a machine has no clock battery to trust, so after the network is up kithd asks
+  an SNTP server for the time at start and every hour, and sets the clock when it is more than
+  two seconds off. The server is the one you name, `kith.ntp=ADDRESS[:PORT]` (the only one asked
+  when set: what a network says is whatever a machine on it sent); where none is named, the one
+  DHCP names (option 42), then the gateway. The cluster's leader (a worker asks its control node)
+  is asked too, over the cluster's own TLS, and its time wins over a server over two seconds
+  from it. The server you name is followed alone, whatever the step. Before the clock was ever
+  set (it reads before 2026) the first answer is enough; after that a network's word alone moves
+  it by ten seconds in all (its steps together, until the leader agrees), and more needs the
+  leader within a second of the same time (servers a network names do not vouch for each
+  other), or it is left and the status says so; a node that runs alone for long should set
+  `kith.ntp`. A node whose clock is not yet set answers its peers' time
+  question with a 503. Each Node's status says its `clock`: the server, the offset and whether it
+  stepped it. A node under the `hardened` policy does not set its clock: its status says the
+  offset and the refusal;
 - reads its own arguments after ` -- ` on the command line: `console=ttyS0 kith.hostname=alpha
   -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443`;
 - collects orphaned processes and says what it says on every console the kernel has;
@@ -108,7 +123,11 @@ sh os/build.sh --spec n1.yaml --out target/os-n1
 
 A node with no card a feature matches prints `features: []`; a node that runs no kith OS has no
 `wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
-card the catalogue does not list yet) is chosen by hand, as above.
+card the catalogue does not list yet) is chosen by hand, as above. A line may give `vendor:*`
+instead of a device id, which matches any display card (PCI class 03) of that vendor and not its
+audio function: `all` has `10de:*`, so a node with an NVIDIA GPU wants `all` (nouveau's driver is
+in it). A node that also has an AMD Phoenix GPU wants `all` alone, which build.sh would refuse with
+`gpu-amd-phoenix` and whose modules cover that GPU.
 
 #### The `all` feature: drivers as signed modules
 
@@ -299,8 +318,17 @@ The header also carries a `kithd` object: the digests of kithd, of the boot file
 hash, and of the root but for kithd and its os-release. It is signed with the rest. Before it writes,
 a node reads it against the header kept for the system it runs, and works out whether only kithd
 differs (the kernel and the rest of the root are the same) or the update is a full one. A header
-without it, or no kept header, is a full update. Nothing is done with a kithd-only answer yet: the
-update is still a full one.
+without it, or no kept header, is a full update, and the log says which part differed.
+
+Where only kithd differs, the node does not restart. It writes the other slot as ever, mounts its
+root for a moment, and copies the new kithd out of it into `/run/kith/bin`, a tmpfs of its own that
+is root-only and mounted exec, nosuid and nodev (`/run` stays noexec). It stages the file only if its
+SHA-256 is the signed digest. Then kithd ends with a hand-over, and the machine's first process starts
+the staged kithd. Every container keeps running and the new kithd takes them back by their record, as
+at any restart of kithd. A staged kithd that fails within a minute is given up for the one that was
+running; that end counts toward the ten failures in a minute, a hand-over does not. The root still
+says the old version (it is read-only), so the node says the new one from a note in `/run` that holds
+only for the kithd it names: a reboot starts the slot that was written, which has the new release whole.
 
 **Which keys a node takes.** Its own only, whatever key an OSRelease names. Give them before the
 first release:
@@ -434,10 +462,17 @@ another size, or a disk named by serial that now gives another, writes nothing; 
 name not typed twice the same. It then copies kith OS to
 the disk, reads it back to check, and powers off: take the stick out and start it.
 
-On a screen with 32 bits a pixel (the console's framebuffer), each question is also drawn in the
-look of the [installer's page](../install.html): the install's steps as stops on a rail, the one
-being asked in blue, on paper. The answers are still typed, one line each, as above, and the text
-stays on the serial line. An encrypted install's recovery key is shown on the screen too. When the
+On a screen with 32 bits a pixel (the console's framebuffer), the whole install is drawn in the
+look of the [installer's page](../install.html), whatever the answers' source (typed, a file on the
+stick, a URL, or the network): each question, then the steps answered as stops on a rail, done one
+by one with what was answered at each (never the join token), the disk's write as a bar that moves
+with each percent (a sealed state's step after it), and an end screen that says the machine is
+powering off (take the installer out, then start it from its disk), held a few seconds before it
+does. Paper, the site's colours and font, the stop being worked at in blue. The kernel's own
+messages are kept off the picture while it is drawn (the console's log level is turned down, and put
+back when the picture is handed back), and a failure is written as text where it can be read. With
+no such screen the install is text only, as before. The answers are still typed, one line each, as
+above, and the text stays on the serial line. An encrypted install's recovery key is shown on the screen too. When the
 answers were typed, that screen holds until a key is pressed, or for five minutes, then clears; an
 install that was given its answers (from a file, a URL, or the network) does not stop for it. The
 picture is cleared from the text console when the installer hands the screen back. The key is
@@ -457,6 +492,7 @@ disk: "serial:S4EWNX0R123456"  # or nvme0n1, or `only`: the one disk of a machin
 hostname: alpha
 ip: 10.0.0.5/24,10.0.0.1      # without it the network is asked (DHCP)
 dns: 10.0.0.1
+ntp: 10.0.0.1                 # a time server, ADDRESS or ADDRESS:PORT; the only one asked when set, and followed alone; without it DHCP's (four at most), then the gateway
 join:                         # without it the node starts a new cluster
   address: 10.0.0.7:7443
   token: $TOKEN
@@ -526,6 +562,11 @@ that disk is lost**, and nobody is asked at the machine: name only cards of mach
 erase. `--disk only` (the default) installs on a machine's one disk and refuses a machine with
 several; `--disk nvme0n1` names it. Netboot turns itself off after `--minutes` (30; at most 60),
 when the node restarts, or with `--off`.
+
+The machine is installed with this node's release keys (as the node holds them when netboot is
+turned on) and `--lan-releases`, if the node has them: it takes kith OS releases from the same
+keys, not from the first release's. The answers hold 8 keys at most: a node with more, or with
+keys it cannot read, does not turn netboot on and says which.
 
 The node must be the one that started the cluster (it holds the CA, which makes the join tokens)
 and run with `--listen`. An Identity that may apply Nodes, Roles and RoleBindings sends the same

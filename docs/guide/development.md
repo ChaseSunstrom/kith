@@ -37,12 +37,34 @@ python3 ci/budgets.py            # binary-size and memory budgets, enforced in C
 python3 ci/bench.py              # the plan's numbers for one node: cached start < 150 ms, 20+ containers under 30 MB of kithd
 ```
 
-The tests of a pushed commit can run on another kith node instead, as a Job there:
-`KITH_REMOTE=ADDR KITH_REMOTE_CREDS=DIR sh ci/remote.sh [COMMIT [CARGO TEST ARGS]]`, with DIR
-holding the cluster's `ca.crt` and a client's `root.crt` and `root.key`. It prints what failed
-and exits as `cargo test` did. On a kith OS mini PC (16 CPUs) the whole workspace took 218 s from
-a fresh clone, with one test that differs there: `node_policy_refuses_what_the_node_turned_off`
-(kithd's e2e) timed out in the pod.
+The workspace's tests can run on a kith cluster instead, spread over all its nodes, from a commit
+that is not pushed:
+`KITH_REMOTE=ADDR KITH_REMOTE_CREDS=DIR sh ci/remote.sh --fan [COMMIT [CARGO TEST ARGS]]`
+(`COMMIT` is `HEAD` unless named; the arguments are `cargo test`'s and `--workspace` unless
+given), with DIR holding the cluster's `ca.crt` and a client's `root.crt` and `root.key`.
+
+- **What is sent.** Only what GitHub lacks: a `git bundle` of `origin/main..COMMIT`, put into the
+  node's Volume `ci-NODE` (made if it is not there). The node fetches the commits the bundle
+  builds on from GitHub, shallow, so a push is never needed.
+- **The cache.** The same Volume keeps the node's cargo registry, its target folder and the
+  checkout, so only what changed builds on a second run. A node whose target folder is over
+  `KITH_REMOTE_CACHE_MB` (30000) drops it at the start of a run. The Volume stays; its folder
+  `ci-cache` on the node is what to remove to free the disk.
+- **The split.** Each node lists the workspace's tests (`cargo test -- --list`), keeps the names
+  whose hash is its place among the nodes' and runs them (`-- --exact NAMES`, `--no-fail-fast`)
+  as a user who is not root, in a pod. Every node builds all of it, so a cold node takes as long
+  as one alone; the run time is the longest share's.
+- **The result.** One merged report: each node's summary line (tests passed and failed, the
+  seconds, whether its cache was warm) and `FAILED: NODE: TEST` for each failure. The exit is 0,
+  101 when a test or a build failed, or 2 when a node's Job did not run to its end. A second run
+  of the same user waits for the first on each node (a lock in the Volume).
+- **No cluster.** With `KITH_REMOTE` unset, or no node answering, `cargo test` runs here with
+  the same arguments and exit status, on the working tree.
+- **Check it.** `sh ci/remote.sh --self-test` runs offline: the bundle of a commit GitHub lacks,
+  shares of 1 to 5 nodes covering each test once, a Job of three nodes against a folder for a
+  GitHub, the merged report and the fallback.
+
+Not yet: a Job has no low priority, so a run uses the nodes' CPUs as any Job does.
 
 Time budgets are medians of five runs on one machine, no VM. `python3 ci/budgets.py --times`
 prints them; `python3 ci/budgets.py` holds each to twice the slowest of three medians on main on

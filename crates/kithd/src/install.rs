@@ -181,6 +181,9 @@ pub struct Answers {
     pub ip: Option<String>,
     #[serde(default)]
     pub dns: Option<String>,
+    /// The time server, `ADDRESS` or `ADDRESS:PORT`; without, the network's (DHCP), then the way out.
+    #[serde(default)]
+    pub ntp: Option<String>,
     /// How many bytes the disk holds, where its name was looked up under another kernel
     /// (os/vps.sh): a disk of that name and another size is not the one that was meant.
     #[serde(default)]
@@ -311,6 +314,7 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
         ("kith.hostname", &answers.hostname),
         ("kith.ip", &answers.ip),
         ("kith.dns", &answers.dns),
+        ("kith.ntp", &answers.ntp),
     ] {
         let Some(value) = value.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
             continue;
@@ -493,7 +497,7 @@ fn found(image: &File, wanted: &str) -> Result<(u64, u64, u64), String> {
 }
 
 /// Copy the image to the disk, read it back, and write the node's config. `said` is told
-/// how far it is, in tenths.
+/// how far the copy is, in percent, each time it moves on.
 pub fn write(image: &mut File, disk: &mut File, config: &str, mut said: impl FnMut(u64)) -> Result<(), String> {
     use ring::digest::{Context, SHA256};
     let (length, at, room) = layout(image)?;
@@ -509,8 +513,8 @@ pub fn write(image: &mut File, disk: &mut File, config: &str, mut said: impl FnM
         image.read_exact(&mut block[..some]).map_err(io("reading the image"))?;
         disk.write_all(&block[..some]).map_err(io("writing the disk"))?;
         wrote.update(&block[..some]);
-        if (copied + some as u64) * 10 / length > copied * 10 / length {
-            said((copied + some as u64) * 10 / length);
+        if (copied + some as u64) * 100 / length > copied * 100 / length {
+            said((copied + some as u64) * 100 / length);
         }
         copied += some as u64;
     }
@@ -632,8 +636,102 @@ fn lines_of(mut console: impl std::io::BufRead, lines: &std::sync::mpsc::Sender<
     }
 }
 
+/// The framebuffer while the install is drawn on it, whatever the answers' source (none
+/// where the machine has no 32 bpp one: the text is then all there is). The console is held
+/// in graphics mode and the kernel's messages off it while it is here.
+static SCREEN: std::sync::Mutex<Option<fb::Device>> = std::sync::Mutex::new(None);
+
+fn screen() -> std::sync::MutexGuard<'static, Option<fb::Device>> {
+    SCREEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Take the framebuffer if there is one (and it is not held yet): whether one is held.
+fn open_screen() -> bool {
+    let mut held = screen();
+    if held.is_none() {
+        *held = fb::open();
+    }
+    held.is_some()
+}
+
+/// Give the framebuffer back: the console is text again, and cleared, so what is printed
+/// next can be read. (A failure is told in text, not drawn: it must be read where nothing
+/// is drawn.)
+fn put_away() {
+    drop(screen().take());
+}
+
+/// Draw on the held framebuffer: `draw` fills a picture, which is shown whole. Whether there
+/// was a screen to draw on.
+fn paint(draw: impl FnOnce(&mut fb::Frame)) -> bool {
+    let mut held = screen();
+    let Some(device) = held.as_mut() else {
+        return false;
+    };
+    let mut frame = device.frame();
+    draw(&mut frame);
+    if let Err(e) = device.show(&frame) {
+        eprintln!("kithd: install: the picture is not on the screen: {e}");
+    }
+    true
+}
+
+/// The rail of an install that has its answers: each stop (`fb::PROGRESS`) with what was
+/// answered for it. (Never the join token: only the address it joins.)
+fn rail_details(answers: &Answers, disk: &Disk) -> Vec<(&'static str, String)> {
+    let said = |value: &Option<String>, otherwise: &str| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(otherwise)
+            .to_string()
+    };
+    let details = [
+        String::new(),
+        format!("{}, {:.1} GB", disk.name, disk.bytes as f64 / 1e9),
+        said(&answers.hostname, "from its card"),
+        said(&answers.ip, "asked of the network"),
+        match &answers.join {
+            Some(join) => format!("joins {}", join.address.trim()),
+            None => "a new cluster".into(),
+        },
+        (if answers.encrypt { "on" } else { "off" }).into(),
+        String::new(),
+        if answers.encrypt { "shown once" } else { "none" }.into(),
+    ];
+    fb::PROGRESS.into_iter().zip(details).collect()
+}
+
+/// Draw the install under way: `done` stops of `rail` done, the bar at `percent` if there is
+/// one. Whether there was a screen.
+fn show(
+    rail: &[(&'static str, String)],
+    done: usize,
+    percent: Option<u64>,
+    title: &str,
+    line: &str,
+    footer: &str,
+) -> bool {
+    paint(|frame| {
+        let stops: Vec<(&str, &str)> = rail.iter().map(|(label, detail)| (*label, detail.as_str())).collect();
+        fb::draw_progress(frame, &stops, done, percent, title, line, footer);
+    })
+}
+
+/// How long the end screen stays before the machine powers off, where there is one: long
+/// enough to be read.
+const END_HOLD: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The stop of the rail the disk is written at: everything before it is answered.
+const AT_WRITING: usize = 6;
+
+/// What the foot of the picture says while the disk is not yet whole.
+const FOOT: &str = "Do not turn the machine off.";
+
 /// Nothing more is done, and the machine stays as it is for someone to read why.
 async fn stop(why: &str) -> ! {
+    put_away();
     eprintln!("kithd: install: nothing was installed: {why}");
     // Nobody sits at a machine installed from its own memory, and its way in went with the
     // system that ran: started again, that system is back if its disk was not written yet.
@@ -696,6 +794,19 @@ fn sealed(
 /// Install mode, start to end. `source` is the URL of the answers, or empty.
 pub async fn run(source: String) -> ! {
     eprintln!("kithd: install: this is the kith OS installer: it erases a disk of this machine and puts kith OS on it");
+    // The picture is up from here to the end, whatever the answers' source (none where the
+    // machine has no 32 bpp framebuffer: the text is all there is).
+    let bare: Vec<(&'static str, String)> = fb::PROGRESS.into_iter().map(|label| (label, String::new())).collect();
+    if open_screen() {
+        show(
+            &bare,
+            0,
+            None,
+            "Installing kith OS",
+            "Looking for the machine's disks.",
+            FOOT,
+        );
+    }
     // Started from a stick, the image is a partition of it. Started in place of a running
     // system (os/vps.sh), all there is is in memory: the image and the answers are files.
     let memory = Path::new(CARRIED).exists();
@@ -743,7 +854,7 @@ pub async fn run(source: String) -> ! {
         Some(fetched(&source).await)
     };
     let typed = std::sync::Arc::new(std::sync::Mutex::new(keyboard()));
-    let ((disk, config), encrypt) = loop {
+    let (((disk, config), encrypt), rail) = loop {
         let told = match &given {
             Some(Ok(yaml)) => answers(yaml),
             Some(Err(e)) => Err(e.clone()),
@@ -753,18 +864,12 @@ pub async fn run(source: String) -> ! {
                 let asked = tokio::task::spawn_blocking(move || {
                     let typed = typed.lock().expect("nothing panics holding the keyboard");
                     let mut gone = false;
-                    // The picture is held while the questions are asked: dropped when this block
-                    // ends, the console is text again (none where there is no 32 bpp framebuffer).
-                    let mut screen = fb::open();
+                    // The picture is held while the questions are asked (and after: see
+                    // `put_away`). None where there is no 32 bpp framebuffer: text then.
+                    open_screen();
                     let told = interview(&disks, |stop, question| {
                         eprintln!("\n{question}");
-                        if let Some(device) = screen.as_mut() {
-                            let mut frame = device.frame();
-                            fb::draw_question(&mut frame, &fb::STOPS, stop, question, fb::ANSWER);
-                            if let Err(e) = device.show(&frame) {
-                                eprintln!("kithd: install: the question is not on the screen: {e}");
-                            }
-                        }
+                        paint(|frame| fb::draw_question(frame, &fb::STOPS, stop, question, fb::ANSWER));
                         typed.recv().unwrap_or_else(|_| {
                             gone = true;
                             String::new()
@@ -778,17 +883,41 @@ pub async fn run(source: String) -> ! {
                 }
             }
         };
-        match told.and_then(|told| Ok((plan(&told, &found, length, room)?, told.encrypt))) {
+        let planned = told.and_then(|told| {
+            let planned = plan(&told, &found, length, room)?;
+            let rail = rail_details(&told, &planned.0);
+            Ok(((planned, told.encrypt), rail))
+        });
+        match planned {
             Ok(planned) => break planned,
             Err(e) if given.is_some() || found.is_empty() => stop(&e).await,
-            Err(e) => eprintln!("kithd: install: {e}\nkithd: install: once more."),
+            Err(e) => {
+                // (Said in text, where it is read: the question comes back drawn.)
+                put_away();
+                eprintln!("kithd: install: {e}\nkithd: install: once more.")
+            }
         }
     };
+    // The stops answered, done one by one as the rail is shown.
+    for done in 1..=AT_WRITING {
+        if !show(
+            &rail,
+            done,
+            None,
+            "Installing kith OS",
+            "Getting ready to write the disk.",
+            FOOT,
+        ) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
     // (Not the join token: a console is read by more people than a disk.)
     let shown = config.split(" --token ").next().unwrap_or_default();
     eprintln!("kithd: install: writing kith OS to {disk}; its node will start with: {shown}");
     let device = Path::new("/dev").join(&disk.name);
     let planned = disk.clone();
+    let (rail_here, sealing) = (rail.clone(), encrypt);
     let wrote = tokio::task::spawn_blocking(move || {
         // (Held through the seal, and handed out with the key: a stop waits for it.)
         let writing = begin_write()?;
@@ -796,8 +925,16 @@ pub async fn run(source: String) -> ! {
         size_unchanged(Path::new("/sys/block"), &planned)?;
         let mut disk = exclusive(&device)?;
         opened_size(&mut disk, planned.bytes)?;
-        if let Err(e) = write(&mut image, &mut disk, &config, |tenths| {
-            eprintln!("kithd: install: {}%", tenths * 10)
+        let line = format!("Writing kith OS to {}.", planned.name);
+        let mut tenth = u64::MAX;
+        show(&rail_here, AT_WRITING, Some(0), "Installing kith OS", &line, FOOT);
+        if let Err(e) = write(&mut image, &mut disk, &config, |percent| {
+            // The bar moves with each percent; the log says each tenth once.
+            show(&rail_here, AT_WRITING, Some(percent), "Installing kith OS", &line, FOOT);
+            if percent / 10 != tenth {
+                tenth = percent / 10;
+                eprintln!("kithd: install: {}%", tenth * 10)
+            }
         }) {
             // (Written from here on: the image may be partly on the disk, so its tables go too.)
             eprintln!("kithd: install: {planned} may hold part of kith OS now and nothing of what it held before");
@@ -808,6 +945,16 @@ pub async fn run(source: String) -> ! {
         }
         // (The disk let go of first: the kernel takes it for the mapping.)
         drop(disk);
+        if sealing {
+            show(
+                &rail_here,
+                AT_WRITING,
+                Some(100),
+                "Installing kith OS",
+                "Sealing the node's state with its key.",
+                FOOT,
+            );
+        }
         let recovery = encrypt
             .then(|| sealed(&image, &device, crate::crypt::seal))
             .transpose()?;
@@ -842,14 +989,15 @@ pub async fn run(source: String) -> ! {
                     // On the screen too, where there is one: held until a key is pressed (or KEY_WAIT
                     // goes by), then cleared.
                     let held = tokio::task::spawn_blocking(move || {
-                        let Some(mut device) = fb::open() else {
+                        let mut held = screen();
+                        let Some(device) = held.as_mut() else {
                             return Ok(());
                         };
                         let mut frame = device.frame();
                         let key = format!("Recovery key:\n{recovery}");
                         fb::draw_question(&mut frame, &fb::STOPS, fb::STOPS.len() - 1, &key, fb::KEY);
                         let typed = typed.lock().expect("nothing panics holding the keyboard");
-                        fb::hold_until_key(&mut device, &frame, || wait_for_key_line(&typed, KEY_WAIT))
+                        fb::hold_until_key(device, &frame, || wait_for_key_line(&typed, KEY_WAIT))
                     });
                     match held.await {
                         Ok(Ok(())) => {}
@@ -867,6 +1015,17 @@ pub async fn run(source: String) -> ! {
                 "Take the installer out and start the machine."
             };
             eprintln!("kithd: install: kith OS is on {disk}. {then}");
+            // The end screen, held long enough to be read; then the console is text again.
+            let end = if memory {
+                "Starting it from its disk."
+            } else {
+                "Powering off. Take the installer out, then start it from its disk."
+            };
+            let stops: Vec<(&str, &str)> = rail.iter().map(|(label, detail)| (*label, detail.as_str())).collect();
+            if paint(|frame| fb::draw_end(frame, &stops, "kith OS is installed", end)) {
+                tokio::time::sleep(END_HOLD).await;
+            }
+            put_away();
             // (A stop that came meanwhile has set it already: not undone.)
             if !memory {
                 crate::init::POWER_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1022,6 +1181,46 @@ mod tests {
         );
         assert_eq!(got.iter().map(String::len).sum::<usize>(), 10_004);
         assert_eq!(got.last().map(String::as_str), Some("1234"));
+    }
+
+    /// A machine with no 32 bpp framebuffer (the test machine has none): nothing is drawn, the
+    /// text stays, and putting the screen away is no error.
+    #[test]
+    fn install_screen_draws_nothing_where_there_is_no_framebuffer() {
+        assert!(!open_screen(), "no /dev/fb0 here");
+        assert!(!paint(|_| panic!("nothing to draw on")));
+        put_away();
+        assert!(!paint(|_| panic!("still nothing")));
+    }
+
+    /// The write's progress, in percent, and the rail's details from the answers: the join
+    /// token is never one of them.
+    #[test]
+    fn install_rail_details_come_from_the_answers_and_never_hold_the_token() {
+        let answers = Answers {
+            disk: "vdb".into(),
+            hostname: Some("alpha".into()),
+            ip: Some("10.9.0.1/24".into()),
+            join: Some(Join {
+                address: "10.9.0.7:7443".into(),
+                token: "kith1.secret".into(),
+            }),
+            encrypt: true,
+            ..Answers::default()
+        };
+        let details = rail_details(&answers, &disk("vdb", 2));
+        let said = format!("{details:?}");
+        assert!(!said.contains("secret"), "{said}");
+        assert_eq!(details[1].1, "vdb, 2.0 GB");
+        assert_eq!(details[2].1, "alpha");
+        assert_eq!(details[3].1, "10.9.0.1/24");
+        assert_eq!(details[4].1, "joins 10.9.0.7:7443");
+        assert_eq!(details[5].1, "on");
+        let plain = rail_details(&Answers::default(), &disk("vdb", 2));
+        assert_eq!(plain[2].1, "from its card");
+        assert_eq!(plain[3].1, "asked of the network");
+        assert_eq!(plain[4].1, "a new cluster");
+        assert_eq!(plain[5].1, "off");
     }
 
     fn disk(name: &str, gigabytes: u64) -> Disk {
@@ -1225,20 +1424,20 @@ mod tests {
         let told = |yaml: &str| answers(yaml).unwrap();
         let config = |yaml: &str, disks: &[Disk]| plan(&told(yaml), disks, 300 << 20, 1 << 20);
         let (on, config_new) = config(
-            "disk: nvme0n1\nhostname: alpha\nip: 10.0.0.5/24,10.0.0.1\ndns: 9.9.9.9\n",
+            "disk: nvme0n1\nhostname: alpha\nip: 10.0.0.5/24,10.0.0.1\ndns: 9.9.9.9\nntp: 10.0.2.2:5123\n",
             &two,
         )
         .unwrap();
         assert_eq!(on.name, "nvme0n1");
         assert_eq!(
             config_new,
-            "kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9 -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443 --claim"
+            "kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9 kith.ntp=10.0.2.2:5123 -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443 --claim"
         );
         // The node reads it back as it was meant.
         let (read, args) = crate::init::configured(&config_new);
         assert_eq!(
             read,
-            "kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9"
+            "kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9 kith.ntp=10.0.2.2:5123"
         );
         assert_eq!(
             args,
@@ -1293,6 +1492,7 @@ mod tests {
             "disk: sda\nhostname: a kith.slot=b\n",
             "disk: sda\nip: 10.0.0.5\n",
             "disk: sda\ndns: nine\n",
+            "disk: sda\nntp: pool.ntp.org\n",
             "disk: sda\njoin: { address: 10.0.0.7, token: kith1.ab }\n",
             "disk: sda\njoin: { address: '10.0.0.7:7443 --claim', token: kith1.ab }\n",
             "disk: sda\njoin: { address: 10.0.0.7:7443, token: 'kith1.ab --state /tmp' }\n",
@@ -1499,12 +1699,13 @@ mod tests {
         assert_eq!(layout(&from).unwrap(), (64 * 512, 40 * 512, 4 * 512));
         // A disk bigger than the image, with something on it, also where the config goes.
         let mut disk = open("disk", &vec![0xee; 100 * 512]);
-        let mut tenths = Vec::new();
-        write(&mut from, &mut disk, "kith.hostname=alpha -- --claim", |tenth| {
-            tenths.push(tenth)
+        let mut percents = Vec::new();
+        write(&mut from, &mut disk, "kith.hostname=alpha -- --claim", |percent| {
+            percents.push(percent)
         })
         .unwrap();
-        assert_eq!(tenths.last(), Some(&10));
+        assert_eq!(percents.last(), Some(&100));
+        assert!(percents.windows(2).all(|pair| pair[0] < pair[1]), "{percents:?}");
         let wrote = std::fs::read(dir.join("disk")).unwrap();
         assert_eq!(wrote[..40 * 512], source[..40 * 512]);
         assert_eq!(wrote[44 * 512..64 * 512], source[44 * 512..]);

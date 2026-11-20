@@ -10,7 +10,7 @@ drive it with.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/ui-dark.png">
-  <img src="docs/ui-light.png" alt="kith's web UI over a cluster of three nodes: the kinds down the left as stops on a line, the nodes and each workload's replicas drawn as a line map, the list of Workloads, and the form of the one that is open" width="100%">
+  <img src="docs/ui-light.png" alt="kith's web UI over a cluster of three nodes, its overview: the kinds down the left as stops on a line, tiles for nodes and workloads ready and CPU and memory used, the nodes and each workload's replicas drawn as a line map, a chart per measure (CPU, memory, disk, disk and network traffic, load) with a line per node, the busiest workloads and what was done last" width="100%">
 </picture>
 
 A page that shows it, with every number measured: <https://chasesunstrom.github.io/kith/>.
