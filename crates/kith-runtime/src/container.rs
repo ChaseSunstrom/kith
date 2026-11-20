@@ -2275,6 +2275,11 @@ mod tests {
             parent_of_own("0::/user.slice/user-1000.slice/session-1.scope\n").unwrap(),
             "/user.slice/user-1000.slice"
         );
+        // (A hybrid host: v1 lines first, then the v2 one.)
+        assert_eq!(
+            parent_of_own("1:name=x:/a/b\n0::/user.slice/a.slice/b.scope\n").unwrap(),
+            "/user.slice/a.slice"
+        );
         for no in ["0::/\n", "0::/kith-job\n", "", "1:name=x:/a/b\n"] {
             let said = parent_of_own(no).unwrap_err().to_string();
             assert!(said.contains("no delegated cgroup"), "{no:?}: {said}");
