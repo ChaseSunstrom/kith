@@ -653,6 +653,7 @@ fn inside<T: Send>(shared: &Shared, id: &str, make: impl FnOnce() -> std::io::Re
 // and says nothing of it but kithd's log.
 pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut stopping: watch::Receiver<bool>) {
     let mut generation = shared.generation.subscribe();
+    let mut mesh_port = shared.mesh_port.subscribe();
     // (Each port's pod, and its relay.)
     type Relay = (Asker, tokio::task::JoinHandle<()>);
     let mut open: BTreeMap<(bool, u16), Relay> = BTreeMap::new();
@@ -705,6 +706,8 @@ pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut sto
         }
         tokio::select! {
             _ = generation.changed() => {}
+            // (The Cluster's switch moves the mesh's port: a port a pod asked for is free of it, or refused for it, at once.)
+            _ = mesh_port.changed() => {}
             // (A pod is made, or goes, with nothing written: looked at again soon.)
             () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
             _ = stopping.changed() => break,

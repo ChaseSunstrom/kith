@@ -46,7 +46,8 @@ struct Active {
     encrypt: bool,
     /// The serving node's release keys and LAN releases, as they were when netboot was turned on.
     releases: (Vec<String>, bool),
-    /// The serving node's mesh was on when netboot was turned on: the machines start with it on too.
+    /// The serving node was started with `--mesh` when netboot was turned on: the machines start
+    /// with it too. (Not for a node on the Cluster's switch: the machines follow the Cluster.)
     mesh: bool,
     machines: BTreeMap<Mac, Machine>,
     until: Instant,
@@ -223,7 +224,8 @@ fn releases() -> Result<(Vec<String>, bool), String> {
 
 /// A machine's answers, as long as the room the file has for them. `keys` and `lan` are the
 /// serving node's release keys and LAN releases (`releases`); keys the install parser would
-/// refuse are no answers. `mesh` is whether that node's WireGuard mesh is on (`mesh: true`).
+/// refuse are no answers. `mesh` is whether that node was started with `--mesh` (`mesh: true`: a permanent flag on the
+/// new node, so not asked for by a node that follows the Cluster's switch, T-1076).
 fn answers(
     disk: &str,
     encrypt: bool,
@@ -749,8 +751,9 @@ mod tests {
         );
     }
 
-    /// A serving node with its mesh on has the machines start with theirs: `mesh: true` in
-    /// the answers, read back by the install parser and on the new node's command line.
+    /// A serving node started with `--mesh` has the machines start with theirs: `mesh: true` in
+    /// the answers, read back by the install parser and on the new node's command line. Without
+    /// it (a node on the Cluster's switch) the answers say nothing of the mesh.
     #[test]
     fn netboot_answers_carry_the_mesh_of_the_serving_node() {
         let join: SocketAddr = "10.0.2.15:7443".parse().unwrap();
@@ -766,6 +769,8 @@ mod tests {
         }];
         let (_, config) = crate::install::plan(&told, &disks, 300 << 20, 1 << 20).unwrap();
         assert!(crate::init::configured(&config).1.contains(&"--mesh".to_string()));
+        let off = answers("only", false, join, "t", &[], false, false).unwrap();
+        assert!(!String::from_utf8(off).unwrap().contains("mesh"));
     }
 
     /// What the node holds is what the answers carry: the given keys over the kept ones, 8 at

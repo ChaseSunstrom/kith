@@ -742,12 +742,18 @@ impl Book {
     // own (T-0810) it is given these by its own arguments, which the serving part cannot change.
     pub fn set_mesh(&self, interface: String, port: u16, key: PathBuf, name: String) -> Result<(), String> {
         let mut told = self.mesh.lock().expect("nothing panics holding the book");
-        match told.as_ref() {
+        match told.as_mut() {
             Some(had) if (&had.interface, had.port, &had.key, &had.name) != (&interface, port, &key, &name) => {
-                Err(format!(
-                    "the mesh was told as {} of {} on port {}: not told again as another",
-                    had.interface, had.name, had.port
-                ))
+                // Down, the mesh is told again as another (a Cluster's other port, T-1076): the
+                // cluster's prefix stays. Up, it is not.
+                if had.up {
+                    return Err(format!(
+                        "the mesh was told as {} of {} on port {}: not told again as another while it is up",
+                        had.interface, had.name, had.port
+                    ));
+                }
+                (had.interface, had.port, had.key, had.name) = (interface, port, key, name);
+                Ok(())
             }
             Some(_) => Ok(()),
             None => {
@@ -1858,6 +1864,8 @@ mod tests {
         failing: Mutex<Vec<&'static str>>,
         /// The units a run before this one left, for `adopt`.
         left: Mutex<Vec<&'static str>>,
+        /// The ports `mesh_up` was asked for, in order.
+        ports: Mutex<Vec<u16>>,
         /// How many of the mesh's calls are inside one at once, and the most there were.
         inside: AtomicUsize,
         most: AtomicUsize,
@@ -1989,7 +1997,8 @@ mod tests {
             Ok(())
         }
 
-        fn mesh_up(&self, _: &str, _: &Path, _: u16, _: Ipv6Addr) -> Result<kith_mesh::Key, String> {
+        fn mesh_up(&self, _: &str, _: &Path, port: u16, _: Ipv6Addr) -> Result<kith_mesh::Key, String> {
+            self.ports.lock().unwrap().push(port);
             self.slow("mesh_up").map(|()| [7; 32])
         }
 
@@ -3200,12 +3209,21 @@ mod tests {
     }
 
     #[test]
-    fn the_mesh_is_told_once_and_a_second_telling_that_differs_is_refused() {
+    fn the_mesh_told_while_it_is_up_is_not_told_again_as_another() {
         let book = Book::new();
         let key = || PathBuf::from("/nowhere/mesh.key");
         book.set_mesh(WG.into(), 51820, key(), "a".into()).unwrap();
-        // The same again is heeded as nothing; another interface, port, key file or name is refused.
+        // The same again is heeded as nothing.
         book.set_mesh(WG.into(), 51820, key(), "a".into()).unwrap();
+        let prefix = kith_mesh::prefix(b"a cluster");
+        book.set_prefix(prefix).unwrap();
+        let root = Direct::with(Fake::default(), &book);
+        let ask = |name: &str| Request::MeshUp {
+            interface: WG.into(),
+            address: kith_mesh::node_address(prefix, name),
+        };
+        assert!(root.request(ask("a")).is_ok());
+        // Up, another interface, port, key file or name is refused ...
         for (interface, port, path, name) in [
             ("eth0", 51820, key(), "a"),
             (WG, 51821, key(), "a"),
@@ -3215,16 +3233,26 @@ mod tests {
             let why = book.set_mesh(interface.into(), port, path, name.into()).unwrap_err();
             assert!(why.contains("told"), "{why}");
         }
-        // (What was told first still is: a prefix goes with it, and the up is for that name.)
-        let prefix = kith_mesh::prefix(b"a cluster");
-        book.set_prefix(prefix).unwrap();
-        let root = Direct::with(Fake::default(), &book);
-        let ask = |name: &str| Request::MeshUp {
-            interface: WG.into(),
-            address: kith_mesh::node_address(prefix, name),
-        };
+        // ... and what was told first still is.
         assert!(root.request(ask("b")).is_err());
         assert!(root.request(ask("a")).is_ok());
+    }
+
+    #[test]
+    fn a_mesh_that_is_down_is_told_again_with_another_port_and_comes_up_on_it() {
+        // The Cluster's `mesh.port` changed, or the mesh went off and on with another (T-1076):
+        // the real book takes the new port when it is down, keeps the prefix, and the up is on it.
+        let (book, prefix) = meshed("a cluster");
+        let key = || PathBuf::from("/nowhere/mesh.key");
+        let fake = Fake::default();
+        let root = Direct::with(fake, &book);
+        up(&root, prefix).unwrap();
+        // Up: refused. Down: told again.
+        assert!(book.set_mesh(WG.into(), 51999, key(), "a".into()).is_err());
+        root.request(Request::MeshDown { interface: WG.into() }).unwrap();
+        book.set_mesh(WG.into(), 51999, key(), "a".into()).unwrap();
+        up(&root, prefix).unwrap();
+        assert_eq!(*root.hands.ports.lock().unwrap(), [51820, 51999]);
     }
 
     #[test]

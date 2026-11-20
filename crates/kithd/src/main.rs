@@ -294,6 +294,9 @@ pub struct Shared {
     /// The UDP port of the mesh this node is to be on, none without one: from `--mesh`, or from
     /// the Cluster's `spec.mesh` (`mesh::follow`). What listens by it (Services, the published ports) follows.
     pub mesh_port: watch::Sender<Option<u16>>,
+    /// kithd was started with `--mesh` (not told by the Cluster's switch): what a netbooted
+    /// machine is started with, for it is a flag that stays.
+    pub mesh_flag: std::sync::atomic::AtomicBool,
     /// Set once kithd is told to stop: long-polls answer at once instead of holding it up.
     pub stop: watch::Sender<bool>,
     /// The pods of this node, and their networks.
@@ -715,6 +718,7 @@ async fn replica(
         members: members::Members::new(name),
         mesh: Mutex::default(),
         mesh_port: watch::channel(None).0,
+        mesh_flag: false.into(),
         cluster,
         stop: watch::channel(false).0,
         pods: Mutex::default(),
@@ -989,6 +993,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     shared.pods.lock().expect("nothing panics holding the pods").mesh = args.mesh_interface.clone();
     // (With the flag the mesh is there from the first moment; without, the Cluster's switch says: `mesh::follow`.)
     shared.mesh_port.send_replace(args.mesh);
+    shared
+        .mesh_flag
+        .store(args.mesh.is_some(), std::sync::atomic::Ordering::Relaxed);
     // The root part on the far end of a socket pair, a thread of this process for now (T-0811).
     if args.split {
         let end = root_part::split().map_err(|e| fail("splitting the root part", &e))?;

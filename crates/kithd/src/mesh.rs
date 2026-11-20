@@ -328,7 +328,16 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
         Ok(public) => public,
         Err(e) => {
             let hint = "it takes the kernel's WireGuard and the right to set up interfaces, CAP_NET_ADMIN";
-            return eprintln!("kithd: no mesh: {e} ({hint})");
+            eprintln!("kithd: no mesh: {e} ({hint})");
+            // Not a mesh this node is on: what listens by the port (services, pods) is not to
+            // wait on one, and `kith node status` says why (T-1076). One try: until the switch
+            // changes, or kithd starts again.
+            shared.mesh_port.send_replace(None);
+            let error = json!({ "error": format!("no mesh: {e} ({hint})") });
+            if let Err(e) = say(&shared, &format!("Node/{me}"), "mesh", error).await {
+                eprintln!("kithd: mesh: telling the cluster why there is none: {e}");
+            }
+            return;
         }
     };
     // What the root part was last asked for the interface: not asked again while it is the same.
@@ -433,6 +442,8 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
 pub async fn left(shared: Arc<Shared>, field: &str, mut stopping: watch::Receiver<bool>) {
     let Some(cluster) = &shared.cluster else { return };
     let node = format!("Node/{}", cluster.me.name);
+    // (The peers of the mesh that was: the interface is gone, `status` is not to show them.)
+    *shared.mesh.lock().expect("nothing panics holding the mesh") = Value::Null;
     loop {
         // (Not known until the store has this node: asked again until it does.)
         let says = {
@@ -634,6 +645,54 @@ mod spec_tests {
         assert_eq!(seen(), vec![Some(51821)]);
         stop.send(true).unwrap();
         followed.await.unwrap();
+    }
+
+    /// The switch off takes the paths of the last mesh away: `status` would otherwise show peers of
+    /// a mesh that is gone.
+    #[tokio::test]
+    async fn spec_switch_off_clears_the_paths_of_the_mesh_that_was() {
+        use crate::cluster::pinned_peer::{node, shared_with};
+        let ca = crate::pki::Ca::create().unwrap();
+        let shared = shared_with("mesh-off", node(&ca, "mo-a"), &[]).await;
+        *shared.mesh.lock().unwrap() = json!([{ "node": "b", "address": "fd00::b" }]);
+        let (stop, stopping) = watch::channel(false);
+        stop.send(true).unwrap();
+        left(shared.clone(), "mesh", stopping).await;
+        assert!(shared.mesh.lock().unwrap().is_null());
+    }
+
+    /// A node the switch is on for that cannot bring the mesh up (no WireGuard, no right to make an
+    /// interface) says so on its Node, and does not say it is on a mesh: `mesh_port` is what the
+    /// services listen by.
+    #[tokio::test]
+    async fn spec_switch_on_that_cannot_come_up_says_why_and_claims_no_mesh() {
+        // (A node that leads a cluster of its own, with its Node in the store: it can say.)
+        let ca = crate::pki::Ca::create().unwrap();
+        let me = crate::cluster::pinned_peer::node(&ca, "mf-a");
+        let up = crate::view::Upstream {
+            name: "mf-a".into(),
+            address: "127.0.0.1:1".into(),
+            certificate: None,
+        };
+        let cluster = crate::cluster::Cluster::new(me, Some(ca)).unwrap();
+        let shared = crate::cluster::pinned_peer::shared_of("mesh-fail", cluster, &[up]).await;
+        let id = shared.raft.metrics().borrow().id;
+        let leads = shared.raft.wait(Some(Duration::from_secs(30)));
+        leads.current_leader(id, "leads").await.unwrap();
+        shared.mesh_port.send_replace(Some(4000));
+        let options = Options {
+            interface: "kith0".into(),
+            port: 4000,
+            // (Not made: its directory is not there, so the interface is not either.)
+            key: PathBuf::from("/nonexistent/kithd-test/mesh.key"),
+        };
+        let (_stop, stopping) = watch::channel(false);
+        run(shared.clone(), options, stopping).await;
+        assert_eq!(*shared.mesh_port.borrow(), None);
+        let state = shared.store.lock().unwrap();
+        let status = state.store.get("Node/mf-a").and_then(|node| node.status.clone());
+        let error = status.as_ref().and_then(|status| status["mesh"]["error"].as_str());
+        assert!(error.is_some_and(|e| e.contains("no mesh")), "{status:?}");
     }
 }
 

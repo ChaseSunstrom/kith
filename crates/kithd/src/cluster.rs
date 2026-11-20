@@ -1044,7 +1044,8 @@ pub async fn netboot(
             let minutes = minutes.map_err(|_| "minutes is a number")?;
             let disk = asked.get("disk").map_or("only", String::as_str);
             let encrypt = asked.get("encrypt").is_some_and(|encrypt| encrypt == "true");
-            let mesh = shared.mesh_port.borrow().is_some();
+            // (Only a node started with `--mesh`: a machine given the flag could not follow the Cluster's switch.)
+            let mesh = shared.mesh_flag.load(std::sync::atomic::Ordering::Relaxed);
             netboot::on(image.to_vec(), machines, minutes, disk, encrypt, mesh, || {
                 cluster.tokens.mint(&ca.cert, Some(&cluster.me), pki::Lets::Control)
             })
