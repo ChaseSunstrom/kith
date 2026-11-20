@@ -95,12 +95,13 @@
         # shellcheck disable=SC2046
         vm install-alpha $(drive alpha.stick) $(drive alpha.disk)
         installed install-alpha vdb
-        # A machine whose disk already has kith OS, that disk before the stick: the kernel takes
-        # the first partition with a label, so the installer's root has its own (install-root),
-        # not the disk's root-a; it starts from the stick and installs on that disk (T-1064).
+        # A machine whose disk already has kith OS, that disk before the stick (vda), the firmware
+        # told to start the stick: the kernel takes the first partition with a label, so the
+        # installer's root has its own (install-root), not the disk's root-a; it starts from the
+        # stick and installs on that disk (T-1064).
         cp "$work/alpha.disk" "$work/old.disk"
-        # shellcheck disable=SC2046
-        vm reinstall $(drive old.disk) $(drive alpha.stick)
+        vm reinstall -drive "file=$work/old.disk,format=raw,if=none,id=old" -device virtio-blk-pci,drive=old,bootindex=1 \
+            -drive "file=$work/alpha.stick,format=raw,if=none,id=stick" -device virtio-blk-pci,drive=stick,bootindex=0
         installed reinstall vda
         rm -f "$work/old.disk"
         # shellcheck disable=SC2046
