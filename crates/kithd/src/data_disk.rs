@@ -10,12 +10,13 @@
 //! The add's order of writes ([`add`]), what a disk is to this node ([`standing`], [`off_ours`])
 //! and the remove ([`remove`]) are here too; the mapping step is the [`Mapper`] trait, so a file
 //! and a fake show every cut of the order. The real mapper and the mount are [`seed`], the task
-//! that mounts the known disks after the state opens is [`boot`]; the verbs are T-0958's.
-// (The add and the remove are called by the verbs, the second half of T-0958: not yet.)
-#![allow(dead_code)]
+//! that mounts the known disks after the state opens is [`boot`]; the verbs (`kith node disk add`,
+//! `remove`, `list`) are [`verbs`], and what they tell the audit log is [`audit`].
 
+pub mod audit;
 pub mod boot;
 pub mod seed;
+pub mod verbs;
 
 use ring::digest;
 use std::fs::File;
@@ -59,6 +60,7 @@ pub fn write_header(clear: &Clear<impl Dev>, id: &Id) -> io::Result<()> {
 /// The id of the header at the start of `file`, or why there is none. Strict: the header is
 /// taken only when it is, byte for byte, what [`write_header`] writes for the id it names
 /// (a sum that is wrong, a byte of the room that is not zero, an upper-case digit all fail).
+#[allow(dead_code)] // the tests read a file with it; the boot and the verbs have the 4 KiB already and call `parse`
 pub fn read_header(file: &File) -> Result<Id, String> {
     let mut room = [0u8; ROOM];
     file.read_exact_at(&mut room, 0)
@@ -622,6 +624,7 @@ mod support {
     /// A mapper that writes nothing and says what was asked of it. `fail` makes one call fail
     /// (by its name), `answers` is what the resume's check says, and `headed` lists the calls
     /// made while the disk's first 4 KiB were not zero (the header comes last, so none for an add).
+    #[derive(Debug)]
     pub struct Map {
         pub disk: File,
         pub calls: Vec<&'static str>,

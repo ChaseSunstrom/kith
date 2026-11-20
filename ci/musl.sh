@@ -43,14 +43,7 @@ case "${KITHD_FEATURES:-}" in
         echo "$dir/fido2-test/$target/release"
         exit 0
         ;;
-    # disk-test: the one that makes a data disk from the command line (crates/kithd/src/data_disk/
-    # boot.rs, docs/adr-second-disk.md), for the disk VM test alone; its folder is its own too.
-    disk-test)
-        CARGO_TARGET_DIR="$dir/disk-test" cargo build --release --quiet --target "$target" -p kithd -p kith-cli --features kithd/disk-test >&2
-        echo "$dir/disk-test/$target/release"
-        exit 0
-        ;;
-    *) echo "musl.sh: KITHD_FEATURES knows: forge, fido2-test, disk-test" >&2; exit 1 ;;
+    *) echo "musl.sh: KITHD_FEATURES knows: forge, fido2-test" >&2; exit 1 ;;
 esac
 out="$dir/$target/release"
 # kith with TLS to a node (cargo feature remote) is built first and kept as kith-remote, beside
@@ -73,12 +66,6 @@ fi
 # its VM run prints and the touch file it reads are in nothing else (fido2_test.rs).
 if grep -aqE 'built with fido2-test: |kithd: fido2-test: |/run/fido2-touch' "$out/kithd"; then
     echo "musl.sh: $out/kithd has the fido2-test authenticator in it: a build that ships has none" >&2
-    exit 1
-fi
-# And no disk made from the command line: the startup line of a disk-test build is in nothing
-# else (data_disk/boot.rs).
-if grep -aq 'built with disk-test: ' "$out/kithd"; then
-    echo "musl.sh: $out/kithd has the disk-test hook in it: a build that ships has none" >&2
     exit 1
 fi
 # cargo reads a relative CARGO_TARGET_DIR from here; the line printed is absolute (order.py

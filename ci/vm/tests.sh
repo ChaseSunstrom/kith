@@ -26,15 +26,11 @@
     # key on /dev/uhid (docs/adr-fido2.md section 2), and of a kernel with that device (the uhid-test
     # spec); in a folder of its own, so the plain image stays plain, and no other test has either.)
     [ "$test" != fido2 ] || { KITHD_FEATURES=fido2-test KITH_OS_SPEC=os/examples/fido2-test.yaml osdir=$root/target/os-fido2; export KITHD_FEATURES; }
-    # (disk: the image of a kithd built with the cargo feature disk-test, which makes the disk named on
-    # the kernel command line a data disk at start (kith.disk-add=SERIAL), so the real mapping and the
-    # mount are seen without the verbs; in a folder of its own, so the plain image stays plain.)
-    [ "$test" != disk ] || { KITHD_FEATURES=disk-test osdir=$root/target/os-disk; export KITHD_FEATURES; }
     sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC"} --out "$osdir" >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
     if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = nofile ]; then
         . "$root/ci/vm/cluster.sh"
     fi
-    if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ] || [ "$test" = blackout ] || [ "$test" = alone ]; then
+    if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ] || [ "$test" = blackout ] || [ "$test" = alone ] || [ "$test" = disk ]; then
         . "$root/ci/vm/machines.sh"
     fi
     # A copy: the node writes its state to the disk, and this test damages its root.
@@ -86,9 +82,6 @@
     fi
     if [ "$test" = clock ]; then
         . "$root/ci/vm/clock.sh"
-    fi
-    if [ "$test" = disk ]; then
-        . "$root/ci/vm/disk.sh"
     fi
     if [ "$test" = fido2 ]; then
         . "$root/ci/vm/fido2.sh"

@@ -165,8 +165,10 @@ impl Grants {
 
 /// What an Identity can reach on the TLS port. A new route is not open to them until it
 /// is named here: name it once its handler asks [`Grants`].
-const FOR_IDENTITIES: [&str; 26] = [
+const FOR_IDENTITIES: [&str; 27] = [
     "/v1/duress",
+    // (A second disk's verbs, data_disk/verbs.rs: asked as a NodeKey is, like /v1/lock.)
+    "/v1/disks",
     "/v1/peers",
     "/v1/backups",
     "/v1/blobs",

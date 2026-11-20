@@ -79,6 +79,14 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/lock/{name}/passphrase", post(crate::crypt::pass))
         .route("/v1/lock/{name}/pin", post(crate::crypt::pin))
         .route("/v1/lock/{name}/recovery", post(crate::crypt::recovery))
+        .route(
+            "/v1/disks/{node}",
+            get(crate::data_disk::verbs::list_all).post(crate::data_disk::verbs::add_one),
+        )
+        .route(
+            "/v1/disks/{node}/{id}",
+            axum::routing::delete(crate::data_disk::verbs::remove_one),
+        )
         .route("/v1/duress", post(crate::crypt::duress_all))
         .route("/v1/seats/{name}/activity", post(crate::seats::activity))
         .route("/v1/drain/{name}", get(drain_plan).post(drain_set))

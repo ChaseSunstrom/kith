@@ -10,7 +10,7 @@
 #   sh ci/vm.sh --test image    kith OS's disk image (os/build.sh), booted under UEFI on a longer disk
 #   sh ci/vm.sh --test update   that image updating itself, and going back when it must
 #   sh ci/vm.sh --test clock    the node's clock started hours off, stepped to an SNTP server's time
-#   sh ci/vm.sh --test disk     a disk file made a data disk and mounted, another left alone
+#   sh ci/vm.sh --test disk     disk files added, mounted and removed by the verbs, one with a GPT refused
 #   sh ci/vm.sh --test rollout  three nodes of it taking a release, one at a time
 #   sh ci/vm.sh --test install  the installer, onto virtual disks, and what it installed
 #   sh ci/vm.sh --test vps      the installer started from memory, as os/vps.sh starts it
@@ -113,12 +113,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    audio device the monitor adds later, in the same boot; the same spec built
                    with one byte of snd-usb-audio changed is refused on one console line; same
                    needs as image, and the image is built twice
-  --test disk      instead: the image of a kithd built with the cargo feature disk-test
-                   (target/os-disk, never shipped), two more disks that are files: one the
-                   kernel command line makes a data disk at start (the mapping, the seed ext4
-                   grown to the disk, the mount after the state opens), one nobody added.
-                   Expected: the first mounted, again at the next start from its key; the
-                   second listed as left alone and unchanged byte for byte; same needs as image
+  --test disk      instead: one node the installer made, its state encrypted, claimed over TLS,
+                   with three more disks that are files: one of 16 GiB (sparse) the add verb
+                   makes a data disk, one with a GPT on it (refused), one nobody names.
+                   Expected: the first added, mounted, listed and audited, mounted again at
+                   the next start from its header and key, then removed (its header zero,
+                   nobody's again); the other two unchanged byte for byte; needs what
+                   install needs (curl, python3, cpio, mtools, socat)
   --test rollout   instead: three nodes on a network of their own, claimed and joined
                    over TLS, their image built with a release key; a first release by
                    another key (refused), one with another file's signature (refused), a signed
