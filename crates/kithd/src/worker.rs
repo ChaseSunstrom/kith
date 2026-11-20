@@ -427,11 +427,44 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
             // (`synced-NODE` is the node's own time, written alone so two replicas never overwrite
             // each other's; `synced` is the whole object an older kithd wrote.)
             let own = format!("{}{node}", crate::replicas::SYNCED);
-            only(key, fields, &["synced", own.as_str()])?;
+            only(
+                key,
+                fields,
+                &["synced", own.as_str(), "handover-done", "handover-error"],
+            )?;
             let status = live.status.as_ref();
             let replica = status.and_then(|status| status["replicas"].as_array());
             if !replica.is_some_and(|replicas| replicas.iter().any(|replica| replica == node)) {
                 return Err(refused(key, "this node is no replica of it"));
+            }
+            // The answer to a drain's ask of this node, with its time or alone: that it is current
+            // (the very ask, `to` and `at` as made) or that it failed.
+            let asked = status.map(|status| &status["handover"]).filter(|ask| ask["to"] == node);
+            if fields.keys().any(|field| field.starts_with("handover")) {
+                let times = fields
+                    .keys()
+                    .all(|field| field.starts_with("handover") || *field == own);
+                let said = match (fields.get("handover-done"), fields.get("handover-error")) {
+                    (Some(done), None) => Some(done) == asked,
+                    // (`{to, at, why}`: of this very ask, so that a late word of one long gone does
+                    // not end the ask made since; `why` is at most 1 KiB.)
+                    (None, Some(error)) => asked.is_some_and(|ask| {
+                        let why = error["why"].as_str();
+                        error["to"] == node
+                            && error["at"] == ask["at"]
+                            && why.is_some_and(|why| why.len() <= 1024)
+                            && error.as_object().is_some_and(|error| error.len() == 3)
+                    }),
+                    _ => false,
+                };
+                let time = fields.get(&own).is_none_or(Value::is_u64);
+                return match times && said && time {
+                    true => Ok(()),
+                    false => Err(refused(
+                        key,
+                        "a replica answers only the drain's ask of it, with its own time",
+                    )),
+                };
             }
             if let Some(at) = fields.get(&own) {
                 return match at.is_u64() && fields.len() == 1 {
@@ -1768,6 +1801,71 @@ spec: { volume: there, every: 1d }
         assert!(try_as(&store, "w", patch_of(kept, json!({ "synced-a": 900 }))).is_err());
         assert!(try_as(&store, "w", patch_of(kept, json!({ "synced-w": 200, "primary": "w" }))).is_err());
         assert!(try_as(&store, "w-b", patch_of(kept, json!({ "synced-w-b": 200 }))).is_err());
+    }
+
+    /// A worker's copy answers a drain's ask in one Patch with its time: that it is current for the
+    /// very ask made of it, or that it failed. Not another worker's, not an older ask's.
+    #[test]
+    fn a_worker_copy_answers_the_handover_asked_of_it() {
+        let mut store = store();
+        let kept = "Volume/default/kept";
+        let asked = json!({ "primary": "a", "replicas": ["w"], "synced": { "w": 100 },
+            "handover": { "to": "w", "at": 1000 } });
+        store.set_status(kept, Some(asked)).unwrap();
+        let done = json!({ "to": "w", "at": 1000 });
+        assert!(
+            try_as(
+                &store,
+                "w",
+                patch_of(kept, json!({ "synced-w": 200, "handover-done": done }))
+            )
+            .is_ok()
+        );
+        let error = |to: &str, at: u64| json!({ "handover-error": { "to": to, "at": at, "why": "no" } });
+        assert!(try_as(&store, "w", patch_of(kept, error("w", 1000))).is_ok());
+        // Not a late error of an ask gone (it would end the one made since), not another node's.
+        assert!(try_as(&store, "w", patch_of(kept, error("w", 999))).is_err());
+        assert!(try_as(&store, "w", patch_of(kept, error("w-b", 1000))).is_err());
+        let long = json!({ "handover-error": { "to": "w", "at": 1000, "why": "x".repeat(1025) } });
+        assert!(try_as(&store, "w", patch_of(kept, long)).is_err());
+        let extra = json!({ "handover-error": { "to": "w", "at": 1000, "why": "no", "more": 1 } });
+        assert!(try_as(&store, "w", patch_of(kept, extra)).is_err());
+        // Not an older ask's answer, not another node's, not a time that is not its own.
+        let old = json!({ "to": "w", "at": 999 });
+        assert!(
+            try_as(
+                &store,
+                "w",
+                patch_of(kept, json!({ "synced-w": 200, "handover-done": old }))
+            )
+            .is_err()
+        );
+        let other = json!({ "to": "w-b", "at": 1000 });
+        assert!(
+            try_as(
+                &store,
+                "w",
+                patch_of(kept, json!({ "synced-w": 200, "handover-done": other }))
+            )
+            .is_err()
+        );
+        assert!(try_as(&store, "w-b", patch_of(kept, error("w", 1000))).is_err());
+        assert!(try_as(&store, "w-b", patch_of(kept, error("w-b", 1000))).is_err());
+        assert!(
+            try_as(
+                &store,
+                "w",
+                patch_of(kept, json!({ "handover-done": done, "primary": "w" }))
+            )
+            .is_err()
+        );
+        assert!(try_as(&store, "w", patch_of(kept, json!({ "handover-error": 3 }))).is_err());
+        assert!(try_as(&store, "w", patch_of(kept, json!({ "handover-error": "no" }))).is_err());
+        // Nothing is asked of it: no answer.
+        store
+            .set_status(kept, Some(json!({ "primary": "a", "replicas": ["w"] })))
+            .unwrap();
+        assert!(try_as(&store, "w", patch_of(kept, json!({ "handover-done": done }))).is_err());
     }
 
     #[test]
