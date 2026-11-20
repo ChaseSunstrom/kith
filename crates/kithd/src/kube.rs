@@ -2820,10 +2820,10 @@ async fn delete(
         // (Before the store is looked at, for a bare Pod's name or any other: who holds no right to
         // delete a Job or a Workload, or to restart a replica, is told that and nothing of which names exist.)
         let place = Some(namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE));
-        if let Err(refused) = call.allowed(&BARE[1], place, Verb::Apply) {
-            if !BARE.iter().any(|row| call.allowed(row, place, Verb::Delete).is_ok()) {
-                return Err(refused);
-            }
+        if let Err(refused) = call.allowed(&BARE[1], place, Verb::Apply)
+            && !BARE.iter().any(|row| call.allowed(row, place, Verb::Delete).is_ok())
+        {
+            return Err(refused);
         }
         let held = {
             let state = call.shared.store.lock().expect("a handler panicked holding the store");
