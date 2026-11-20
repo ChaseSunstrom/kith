@@ -2020,7 +2020,7 @@ mod tests {
         crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
         // (And a key is kept only once it has signed the update asked for.)
         assert!(!keys.kept.exists());
-        said
+        said.map(|(text, _)| text)
     }
 
     /// Runs `test` where [`serving`] can spawn.
