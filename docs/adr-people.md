@@ -578,8 +578,10 @@ Not built: IPv6 through an Exit, the Exit of another node, the API or DNS throug
   API's handshakes (`cluster::Pools`) have 16 slots for the people besides the others' 64: a full
   people pool leaves the 64 free; each peer holds 2 of the 16 (`PEOPLE_GUESTS_EACH`; the others
   hold 8 of 64), by its address, so eight peers fill it, not one. A connection is accepted first
-  and then asks its own pool for a slot (none: it is hung up on), so a crowd of strangers holding
-  the others' 64 does not keep a person's connection from being picked up. The API port is still
+  and then takes a place in its own pool's line (a full line, or an address at its share: it is hung
+  up on) and waits there for a slot, up to 15 s, so a burst of members beyond 64 waits its turn
+  and a crowd of strangers holding the others' 64 does not keep a person's connection from being
+  picked up. The API port is still
   not opened to peers by this slice.
 - **The resolver does not forward for a person.** `kithd`'s forwarders are the local networks and
   the pods' range less the people's range and /64 (`dns::forwarders`, `Cidr::without`), so the deny
