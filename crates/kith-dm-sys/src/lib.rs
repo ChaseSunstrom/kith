@@ -97,6 +97,46 @@ fn ioctl_value(file: &File, number: u32, value: u64) -> Result<i32> {
     }
 }
 
+/// `struct rtc_time` of `secs` since 1970 in UTC: second, minute, hour, day of the month, month
+/// (from 0), years since 1900, then the weekday, the day of the year and the DST flag (the kernel
+/// reads none of the last three on a set). A day is counted from the civil calendar's 0000-03-01
+/// (H. Hinnant's days_from_civil, run backwards).
+fn rtc_time_of(secs: i64) -> [i32; 9] {
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted = (5 * day_of_year + 2) / 153; // months from March
+    let day = day_of_year - (153 * shifted + 2) / 5 + 1;
+    let month = if shifted < 10 { shifted + 3 } else { shifted - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    [
+        (rest % 60) as i32,
+        (rest / 60 % 60) as i32,
+        (rest / 3600) as i32,
+        day as i32,
+        month as i32 - 1,
+        (year - 1900) as i32,
+        0,
+        0,
+        0,
+    ]
+}
+
+/// Set the hardware clock (`/dev/rtc0`) to `secs` since 1970: it is kept in UTC, as Linux
+/// expects of a machine that has no other OS (RTC_SET_TIME, which needs CAP_SYS_TIME). What
+/// a machine boots with, when nothing sets its clock at start.
+pub fn set_rtc(secs: i64) -> Result<()> {
+    const RTC_SET_TIME: u32 = 0x4024_700a; // _IOW('p', 0x0a, struct rtc_time)
+    let mut bytes = Vec::with_capacity(36);
+    for field in rtc_time_of(secs) {
+        bytes.extend_from_slice(&field.to_ne_bytes());
+    }
+    ioctl(&File::open("/dev/rtc0")?, RTC_SET_TIME, &mut bytes).map(drop)
+}
+
 /// The bit each of the red, green and blue channels starts at in a pixel of the framebuffer
 /// `file` (a /dev/fbN), as FBIOGET_VSCREENINFO reports them.
 pub fn fb_channels(file: &File) -> Result<[u32; 3]> {
@@ -1176,6 +1216,15 @@ mod tests {
     use super::*;
     use std::os::fd::AsFd;
     use std::time::Duration;
+
+    #[test]
+    fn rtc_time_is_the_civil_time_in_utc() {
+        // 1970-01-01 00:00:00; 2026-11-20 13:45:59; a 29 February; the last second of a year.
+        assert_eq!(rtc_time_of(0), [0, 0, 0, 1, 0, 70, 0, 0, 0]);
+        assert_eq!(rtc_time_of(1_795_182_359), [59, 45, 13, 20, 10, 126, 0, 0, 0]);
+        assert_eq!(rtc_time_of(951_782_400), [0, 0, 0, 29, 1, 100, 0, 0, 0]);
+        assert_eq!(rtc_time_of(1_798_761_599), [59, 59, 23, 31, 11, 126, 0, 0, 0]);
+    }
 
     /// Held by each test here that has a child, so the one that looks for any ended child
     /// (mapped_mount_refusals_are_errors) sees none of another test's.

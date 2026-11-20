@@ -28,8 +28,10 @@ As process 1, kithd:
   other), or it is left and the status says so; a node that runs alone for long should set
   `kith.ntp`. A node whose clock is not yet set answers its peers' time
   question with a 503. Each Node's status says its `clock`: the server, the offset and whether it
-  stepped it. A node under the `hardened` policy does not set its clock: its status says the
-  offset and the refusal;
+  stepped it. A step is written to the hardware clock (the RTC, in UTC) too, so a restarted node
+  boots with the time it had; a write that fails is in the status as `rtcError`, and the step
+  still counts. A node under the `hardened` policy does not set its clock, either of them: its
+  status says the offset and the refusal;
 - reads its own arguments after ` -- ` on the command line: `console=ttyS0 kith.hostname=alpha
   -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443`;
 - collects orphaned processes and says what it says on every console the kernel has;
