@@ -1961,7 +1961,9 @@ impl Executor for Entry {
             // (Said on the unit's own stderr too: that is where its operator looks.)
             let failed = |what: &str, e: &dyn std::fmt::Display| {
                 let said = format!("kith: the container's user {user}:{group}: {what}: {e}\n");
-                let _ = std::io::Write::write_all(&mut std::io::stderr(), said.as_bytes());
+                // (write(2) on fd 2, not std's `Stderr`: a sibling thread's `eprintln!` holds
+                // std's lock across our fork, and the child would wait on it for good.)
+                let _ = nix::unistd::write(std::io::stderr(), said.as_bytes());
                 ExecutorError::Other(format!("{what}: {e}"))
             };
             nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).map_err(|e| failed("a user namespace", &e))?;
@@ -1996,7 +1998,7 @@ impl Executor for Entry {
             crate::seccomp::filters(&allowed, node_users)
                 .and_then(|filters| crate::seccomp::install(&filters))
                 .map_err(|e| {
-                    let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("kith: {e}\n").as_bytes());
+                    let _ = nix::unistd::write(std::io::stderr(), format!("kith: {e}\n").as_bytes());
                     ExecutorError::Other(e)
                 })?;
         }
@@ -3870,7 +3872,13 @@ mod tests {
         }
         // (Past the scratch copy, the next thing `enter` does is take its locks.)
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let list_free = AWAITED.try_lock().is_ok();
+        // (A sweep or a start on another test's thread may hold the list for a moment: retry.)
+        let list_free = (0..100).any(|_| {
+            AWAITED.try_lock().is_ok() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
         drop(forking);
         let _ = waiting.join();
         assert!(

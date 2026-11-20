@@ -632,9 +632,17 @@ pub fn no_new_privs() -> Result<()> {
 /// Replaces this process's whole environment with `vars`, through the C library and not
 /// through `std::env`: std keeps a lock on the environment that `Command::spawn` of any
 /// other thread holds across its fork, so a child forked then holds it for good and
-/// `remove_var` there waits forever. For a process that has one thread (a forked child);
-/// a process with more must use `std::env`.
+/// `remove_var` there waits forever. For a process that has one thread (a forked child): in
+/// one with more it is refused, for another thread may read the environment meanwhile, which
+/// C allows no more than std does; such a process must use `std::env`. A name or value C
+/// cannot hold (an empty name, a `=` in a name, a NUL) is refused before anything is changed.
 pub fn replace_environ(vars: &[(String, String)]) -> Result<()> {
+    if std::fs::read_dir("/proc/self/task")?.count() != 1 {
+        return Err(Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the environment is replaced only by a process with one thread",
+        ));
+    }
     let bad = |what: &str| {
         Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -650,7 +658,8 @@ pub fn replace_environ(vars: &[(String, String)]) -> Result<()> {
         cs.push((pair(key)?, pair(value)?));
     }
     // SAFETY: clearenv takes no argument; setenv copies its two NUL-ended strings (live here).
-    // No thread of this process reads the environment meanwhile (see above).
+    // No other thread of this process exists (checked above), and none can start: this is the
+    // only one running.
     unsafe {
         if libc::clearenv() != 0 {
             return Err(Error::last_os_error());
@@ -920,6 +929,39 @@ pub fn fork_start(f: impl FnOnce() -> Vec<u8>) -> Result<Forked> {
     Ok(Forked { pid: child, read })
 }
 
+/// Every process under `root` (its children, theirs, ...) as `/proc` lists them now.
+// ponytail: a process that forks while this reads may escape it, and a number may be reused
+// between the read and the kill; `collect` stops the child first, which closes the first
+// for its own children, and the second needs a number to wrap within microseconds. A cgroup
+// kill, where the caller has the cgroup, when either hurts.
+fn descendants(root: i32) -> Vec<i32> {
+    let mut parents = std::collections::HashMap::<i32, Vec<i32>>::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<i32>().ok()) else {
+            continue;
+        };
+        // (The name in `stat` may hold spaces and `)`: the fields follow the last one.)
+        let parent = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, rest) = stat.rsplit_once(") ")?;
+                rest.split(' ').nth(1)?.parse::<i32>().ok()
+            });
+        if let Some(parent) = parent {
+            parents.entry(parent).or_default().push(pid);
+        }
+    }
+    let mut found = Vec::new();
+    let mut next = vec![root];
+    while let Some(pid) = next.pop() {
+        for &child in parents.get(&pid).into_iter().flatten() {
+            found.push(child);
+            next.push(child);
+        }
+    }
+    found
+}
+
 impl Forked {
     /// The child's process number.
     pub fn pid(&self) -> i32 {
@@ -928,7 +970,7 @@ impl Forked {
 
     /// Waits for the child, and returns what it gave: empty where it ended without giving any
     /// (it panicked, or was killed). A child that has not ended within `deadline` is killed and
-    /// collected, and the error says it did not end.
+    /// collected, with every process it started, and the error says it did not end.
     pub fn collect(self, deadline: std::time::Duration) -> Result<Vec<u8>> {
         use std::io::Read;
         let until = std::time::Instant::now() + deadline;
@@ -944,9 +986,19 @@ impl Forked {
                     return Err(e);
                 }
             } else if std::time::Instant::now() >= until {
+                // What the child started (a tenant, an init: the very process that hung may be
+                // one) is killed with it: stopped first, so it starts no more, and listed
+                // before it is killed, as its children are this process's after.
                 // SAFETY: kill and waitpid on this process's own child.
+                unsafe { libc::kill(self.pid, libc::SIGSTOP) };
+                let tree = descendants(self.pid);
+                // SAFETY: kill and waitpid on this process's own child and its descendants'
+                // numbers (a number that ended since is at worst another's: see `descendants`).
                 unsafe {
                     libc::kill(self.pid, libc::SIGKILL);
+                    for pid in tree {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
                     libc::waitpid(self.pid, std::ptr::null_mut(), 0);
                 }
                 return Err(Error::new(
@@ -1280,6 +1332,95 @@ mod tests {
         // Collected: there is no child of that number left to wait for.
         // SAFETY: waitpid on a number that is no child of this process, with no status wanted.
         assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+    }
+
+    /// What the helper made (a tenant, an init) is the one that may hang, and it outlives the
+    /// helper that is killed: at the deadline the whole tree under the child goes, not only it.
+    #[test]
+    fn forked_kills_what_the_child_started_too() {
+        let _children = children();
+        let note = std::env::temp_dir().join(format!("kith-dm-sys-grandchild-{}", std::process::id()));
+        let _ = std::fs::remove_file(&note);
+        let forked = fork_start({
+            let note = note.clone();
+            move || {
+                // SAFETY: the child has one thread; the grandchild only waits for signals.
+                let grandchild = unsafe { libc::fork() };
+                if grandchild == 0 {
+                    loop {
+                        // SAFETY: pause takes nothing.
+                        unsafe { libc::pause() };
+                    }
+                }
+                let _ = std::fs::write(&note, grandchild.to_string());
+                std::thread::sleep(Duration::from_secs(300));
+                Vec::new()
+            }
+        })
+        .unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let grandchild = loop {
+            match std::fs::read_to_string(&note)
+                .ok()
+                .and_then(|text| text.parse::<i32>().ok())
+            {
+                Some(pid) => break pid,
+                None if std::time::Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+                None => panic!("the child never started a process"),
+            }
+        };
+        assert!(forked.collect(Duration::from_millis(300)).is_err());
+        let _ = std::fs::remove_file(&note);
+        // (Gone, or a zombie its new parent has yet to collect.)
+        let dead = || {
+            std::fs::read_to_string(format!("/proc/{grandchild}/stat")).map_or(true, |stat| {
+                stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('Z'))
+            })
+        };
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !dead() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dead(), "the process the child started outlived it");
+    }
+
+    /// A name or a value C cannot hold is refused before the environment is touched, and what
+    /// is allowed replaces it whole; a process with other threads is refused outright.
+    #[test]
+    fn replace_environ_refuses_what_c_cannot_hold_and_leaves_the_environment() {
+        let _children = children();
+        let refused = replace_environ(&[("A".into(), "1".into())]).unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::Unsupported,
+            "this test process has threads"
+        );
+        let said = fork_start(|| {
+            let before: Vec<_> = std::env::vars().collect();
+            let bad = [("", "x"), ("A=B", "x"), ("A\0B", "x"), ("A", "x\0y")];
+            for (key, value) in bad {
+                // (A good pair first: the refusal is of the whole call, before any change.)
+                let vars = [
+                    ("GOOD".to_string(), "1".to_string()),
+                    (key.to_string(), value.to_string()),
+                ];
+                if replace_environ(&vars).is_ok() || std::env::vars().collect::<Vec<_>>() != before {
+                    return format!("{key:?}={value:?} was not refused whole").into_bytes();
+                }
+            }
+            if replace_environ(&[("ONLY".into(), "1".into())]).is_err() {
+                return b"a good environment was refused".to_vec();
+            }
+            let now: Vec<_> = std::env::vars().collect();
+            if now != [("ONLY".to_string(), "1".to_string())] {
+                return format!("{now:?}").into_bytes();
+            }
+            b"ok".to_vec()
+        })
+        .unwrap()
+        .collect(Duration::from_secs(30))
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&said), "ok");
     }
 
     #[test]
