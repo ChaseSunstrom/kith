@@ -219,6 +219,19 @@ pub fn booted() -> Option<String> {
     disk(&under)?.into_string().ok()
 }
 
+/// What `data_disk::off_ours` is given: whether the root is a verity device, the disk it is read
+/// from, and the disk of the partition labelled `state` (read the way `labelled` finds it).
+pub fn whose_disks() -> (bool, Option<String>, Option<String>) {
+    let verity = std::path::Path::new(ROOT_SLAVES)
+        .parent()
+        .is_some_and(std::path::Path::exists);
+    let state = labelled("state").and_then(|device| {
+        let seen = std::path::Path::new("/sys/class/block").join(device.file_name()?);
+        disk(&seen)?.into_string().ok()
+    });
+    (verity, booted(), state)
+}
+
 fn static_ip(value: &str) -> Option<(Ipv4Addr, u8, Option<Ipv4Addr>)> {
     let (address, gateway) = match value.split_once(',') {
         Some((address, gateway)) => (address, Some(gateway.parse().ok()?)),
@@ -963,8 +976,9 @@ pub fn end(failed: bool) -> ! {
     // Written out, then let go of: by now kithd has closed what it had open there. (If
     // not, as after a panic, the file system's journal is what keeps it whole.)
     nix::unistd::sync();
-    // (What is mounted from a file of the state, first.)
+    // (What is mounted from a file of the state, first, and the data disks: both are under it.)
     crate::encrypted::close(std::path::Path::new(STATE));
+    crate::data_disk::boot::close();
     // (EINVAL: nothing is mounted there, as in the installer.)
     if let Err(e) = nix::mount::umount(STATE).or_else(|e| if e == nix::errno::Errno::EINVAL { Ok(()) } else { Err(e) })
     {

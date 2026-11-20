@@ -25,7 +25,7 @@ use kith_api::kinds::{
     SecretSpec, Strategy, Template, WorkloadSpec,
 };
 use kith_api::store::Error;
-use kith_runtime::{Handle, Runtime, Unit};
+use kith_runtime::{Handle, Left, Runtime, Unit};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -217,8 +217,13 @@ struct Controller {
     /// Units a kithd before this one started that still run, with their marks: each is taken
     /// by its slot when that slot would start, or stopped if it is not wanted or not the same.
     adopted: BTreeMap<String, (Handle, String)>,
-    /// When the stop of an adopted unit last failed (it stays in `adopted`, tried again after STOP_RETRY).
+    /// When the stop of an adopted unit, or of one in `left`, last failed (it stays in its map,
+    /// tried again after STOP_RETRY).
     stuck: BTreeMap<String, Instant>,
+    /// Units an earlier kithd left running that the start's sweep could not remove (processes of
+    /// theirs remain), by id. They have no slot: they are leaving with no owner (see `leaving_of`),
+    /// so their ids and devices go to no other unit, and each is deleted once its processes are gone.
+    left: BTreeMap<String, Left>,
     runtime: Runtime,
     logs: PathBuf,
     log_cap: u64,
@@ -442,11 +447,31 @@ pub async fn run(
         let kept = adopted.keys().cloned().collect();
         rt.cleanup_but(&kept).map(|old| (rt, old, adopted))
     });
-    let (runtime, adopted) = match swept {
-        Ok((runtime, old, adopted)) => {
+    let (runtime, adopted, left) = match swept {
+        Ok((runtime, (old, left), adopted)) => {
             if old > 0 {
                 eprintln!("kithd: removed {old} unit(s) left by an earlier run");
             }
+            // Those the sweep could not remove still run: they hold their ids and devices, and are
+            // deleted through the root part (made as the units it took back are) once they are gone.
+            // One the root part does not take is not held (it could never be deleted): said once.
+            let left = left
+                .into_iter()
+                .filter(|unit| match Direct::units().keep(&unit.id) {
+                    Ok(()) => {
+                        eprintln!(
+                            "kithd: {} of an earlier run still has processes: stopping, it keeps its name and devices until they are gone",
+                            unit.id
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("kithd: {e}");
+                        false
+                    }
+                })
+                .map(|unit| (unit.id.clone(), unit))
+                .collect();
             if !adopted.is_empty() {
                 let ids: Vec<&str> = adopted.keys().map(String::as_str).collect();
                 eprintln!(
@@ -455,7 +480,7 @@ pub async fn run(
                     ids.join(", ")
                 );
             }
-            (runtime, adopted)
+            (runtime, adopted, left)
         }
         Err(e) => {
             // The API still works, so resources can be inspected and edited.
@@ -542,6 +567,7 @@ pub async fn run(
         adopted,
         alone,
         stuck: BTreeMap::new(),
+        left,
         gens: BTreeMap::new(),
         surging: BTreeMap::new(),
         stopped_first: BTreeMap::new(),
@@ -657,6 +683,38 @@ async fn delete(id: &str, handle: Handle) -> Result<(), Undeleted> {
     )
 }
 
+/// The unit `id` deleted again after a stop that failed (`stuck`: when each last failed). Its handle
+/// comes back while processes of it remain; with none left, only a cleanup that failed, nothing is
+/// held. A failure is said once, not at each retry.
+async fn delete_again(id: &str, handle: Handle, stuck: &mut BTreeMap<String, Instant>) -> Option<Handle> {
+    kept_if_stuck(id, delete(id, handle).await, stuck)
+}
+
+/// [`delete_again`] once the delete was tried: what is kept (and when it failed) is what still has processes.
+fn kept_if_stuck<H>(
+    id: &str,
+    deleted: Result<(), (Option<H>, String)>,
+    stuck: &mut BTreeMap<String, Instant>,
+) -> Option<H> {
+    let Err((left, error)) = deleted else {
+        stuck.remove(id);
+        return None;
+    };
+    if !stuck.contains_key(id) {
+        eprintln!("kithd: {id}: {error}");
+    }
+    match left {
+        Some(handle) => {
+            stuck.insert(id.to_string(), Instant::now());
+            Some(handle)
+        }
+        None => {
+            stuck.remove(id);
+            None
+        }
+    }
+}
+
 /// What a stop leaves in its slot once the delete was tried with `deleted`.
 fn stopped(id: &str, slot: &mut Slot, deleted: Result<(), Undeleted>) {
     match deleted {
@@ -770,6 +828,20 @@ fn held_by_leaving(
             .find(|path| held.contains(path))
             .map(|path| format!("waiting: {other} is still stopping and has {}", path.display()))
     })
+}
+
+/// The units still stopping, each with its owner and the device nodes it holds: the slots that
+/// leave, and `left`, the units an earlier kithd left running, which have no slot and no owner (so
+/// nobody shares their devices: they are refused to every other unit).
+fn leaving_of<'a>(
+    slots: &BTreeMap<String, Slot>,
+    left: impl Iterator<Item = (&'a String, &'a [PathBuf])>,
+) -> Vec<(String, String, Vec<PathBuf>)> {
+    let slots = slots.iter().filter(|(_, s)| s.leaving);
+    let slots = slots.map(|(id, s)| (id.clone(), s.owner.clone(), s.devices.clone()));
+    slots
+        .chain(left.map(|(id, devices)| (id.clone(), String::new(), devices.to_vec())))
+        .collect()
 }
 
 /// May a container that was given the device nodes `was` be given `now` as it runs, with
@@ -1639,6 +1711,17 @@ impl Controller {
             // Dropped when nothing is wanted under its id: once gone it is not adopted as an exit.
             stop_unit(&mut self.slots, id, !wanted.contains_key(id)).await;
         }
+        // A unit an earlier kithd left running is asked again as the units above are: once its
+        // processes are gone it is deleted, and what waits for its id or its devices starts below.
+        for id in self.left.keys().cloned().collect::<Vec<_>>() {
+            if !retry_due(self.stuck.get(&id).copied()) {
+                continue;
+            }
+            let Some(unit) = self.left.remove(&id) else { continue };
+            if let Some(handle) = delete_again(&id, unit.handle, &mut self.stuck).await {
+                self.left.insert(id, Left { handle, ..unit });
+            }
+        }
         // What `kubectl delete pod` asked to restart is stopped here, and started by step 3 as due.
         let mut marked = std::mem::take(&mut *shared.restarts.lock().expect("a handler panicked holding the restarts"));
         apply_restarts(&mut self.slots, &mut marked, Instant::now()).await;
@@ -1733,20 +1816,8 @@ impl Controller {
                 }
                 // One that is not gone is asked again after STOP_RETRY, not forgotten running; its
                 // slot, if wanted, waits for it (see `taken_back`).
-                match delete(&id, handle).await {
-                    Ok(()) => drop(self.stuck.remove(&id)),
-                    Err((left, error)) => {
-                        if !self.stuck.contains_key(&id) {
-                            eprintln!("kithd: {id}: {error}");
-                        }
-                        match left {
-                            Some(handle) => {
-                                self.stuck.insert(id.clone(), Instant::now());
-                                self.adopted.insert(id, (handle, was));
-                            }
-                            None => drop(self.stuck.remove(&id)),
-                        }
-                    }
+                if let Some(handle) = delete_again(&id, handle, &mut self.stuck).await {
+                    self.adopted.insert(id, (handle, was));
                 }
             }
         }
@@ -1925,12 +1996,7 @@ impl Controller {
         }
         // What a unit still stopping holds (one stopped this pass that did not go included) is
         // not given to another, and what waits for it says so in its status.
-        let leaving_now: Vec<(String, String, Vec<PathBuf>)> = self
-            .slots
-            .iter()
-            .filter(|(_, s)| s.leaving)
-            .map(|(id, s)| (id.clone(), s.owner.clone(), s.devices.clone()))
-            .collect();
+        let leaving_now = leaving_of(&self.slots, self.left.values().map(|l| (&l.id, &l.devices[..])));
         for (id, slot) in &mut self.slots {
             let (Some(new), Some(handle), false) = (wanted.get(id), &slot.handle, slot.leaving) else {
                 continue;
@@ -2020,7 +2086,7 @@ impl Controller {
                 .values()
                 .flat_map(|slot| slot.volumes.iter().map(|(dir, _, _)| dir));
             let theirs: Vec<_> = mounts.filter(|dir| dir.node != me).collect();
-            crate::share::release(self.logs.parent().unwrap_or(&self.logs), &theirs);
+            crate::share::release(self.logs.parent().unwrap_or(&self.logs), &theirs).await;
         }
 
         // What pods wrote outside their volumes: one past its limit, or the biggest writer on a
@@ -2057,12 +2123,7 @@ impl Controller {
             .set_live(answering);
         // The units still stopping, with their devices: what is due waits for them (see
         // held_by_leaving). One that starts stopping in this pass is added as it does.
-        let mut leaving: Vec<(String, String, Vec<PathBuf>)> = self
-            .slots
-            .iter()
-            .filter(|(_, slot)| slot.leaving)
-            .map(|(id, slot)| (id.clone(), slot.owner.clone(), slot.devices.clone()))
-            .collect();
+        let mut leaving = leaving_of(&self.slots, self.left.values().map(|l| (&l.id, &l.devices[..])));
         let limits = pod_limits(&self.slots);
         for (id, slot) in self.slots.iter_mut() {
             if *stopping.borrow() {
@@ -4202,6 +4263,57 @@ mod tests {
             None,
             "a sibling of the same owner shares the devices"
         );
+    }
+
+    /// A unit an earlier kithd left running has no slot and no owner: it is leaving all the same,
+    /// beside the slots that are, so its id is refused to every unit, and its devices to every owner
+    /// (an owner of the same name is none). One that is gone from the list holds nothing.
+    #[test]
+    fn left_running_units_hold_their_id_and_devices_from_every_owner() {
+        let card = vec![PathBuf::from("/dev/dri/card0")];
+        let left = [("w_a_b_0_x".to_string(), card.clone())];
+        let mut slots = BTreeMap::from([(
+            "w_c_d_0_y".to_string(),
+            slot_of("Workload/c/d", &["/dev/input/event0"], "y"),
+        )]);
+        slots.get_mut("w_c_d_0_y").unwrap().leaving = true;
+        let leaving = leaving_of(&slots, left.iter().map(|(id, devices)| (id, &devices[..])));
+        assert_eq!(leaving.len(), 2, "the slot that leaves and the unit left running");
+        let same_id = held_by_leaving("w_a_b_0_x", "Workload/a/b", &[], &leaving).expect("its id is held");
+        assert!(same_id.contains("still stopping"), "{same_id}");
+        for owner in ["Workload/a/b", "Workload/e/f"] {
+            assert!(
+                held_by_leaving("w_e_f_0_z", owner, &card, &leaving).is_some_and(|why| why.contains("/dev/dri/card0")),
+                "its devices are held from {owner:?}"
+            );
+        }
+        let elsewhere = [PathBuf::from("/dev/dri/card1")];
+        assert_eq!(held_by_leaving("w_e_f_0_z", "Workload/e/f", &elsewhere, &leaving), None);
+        let gone = leaving_of(&BTreeMap::new(), std::iter::empty());
+        assert_eq!(held_by_leaving("w_a_b_0_x", "Workload/a/b", &card, &gone), None);
+    }
+
+    /// A delete retried keeps the handle while processes of the unit remain (and when it failed, so
+    /// the next try waits), and drops it once they are gone, whether the cleanup then went well or not.
+    #[test]
+    fn a_retried_delete_keeps_the_unit_while_it_has_processes_and_drops_it_once_empty() {
+        let mut stuck = BTreeMap::new();
+        let busy = || Err((Some(7u8), "busy".to_string()));
+        assert_eq!(kept_if_stuck("a", busy(), &mut stuck), Some(7));
+        assert!(stuck.contains_key("a"), "when it failed is written down");
+        assert_eq!(
+            kept_if_stuck("a", busy(), &mut stuck),
+            Some(7),
+            "still there on the next try"
+        );
+        assert_eq!(
+            kept_if_stuck::<u8>("a", Err((None, "cleanup".to_string())), &mut stuck),
+            None
+        );
+        assert!(stuck.is_empty(), "empty: nothing is held, nothing waits");
+        stuck.insert("a".into(), Instant::now());
+        assert_eq!(kept_if_stuck::<u8>("a", Ok(()), &mut stuck), None);
+        assert!(stuck.is_empty());
     }
 
     /// A unit that ended on its own, with processes left, is kept once they are gone: its state, exit

@@ -17,6 +17,11 @@
         if [ "$test" = pods ] || [ "$test" = policy ]; then
             bwrap=$(command -v bwrap) || skip "no bwrap (bubblewrap) to start a sandbox inside a container with"
         fi
+        if [ "$test" = nested ]; then
+            for tool in bwrap unshare bash ldd; do
+                command -v "$tool" >/dev/null 2>&1 || skip "no $tool for the second runtime inside a container"
+            done
+        fi
         if [ "$test" = tunnel ]; then
             # (The provider's: this machine's ip and wg, run there; and keys made by wg here.)
             for tool in ip wg cpio ldd socat; do
@@ -33,11 +38,17 @@
         # worker: two, on the mesh; quota: one, on the mesh; services: one, with no mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os dumps='' gateway='' https='' guest=''
         seed() { :; }
+        # (home: on the mesh, so the holder answers a WireGuard handshake to the house address
+        # (51820) and the node that roams dials it; and ingress, so it answers TCP 443 there.
+        # Three voters, and a fourth node that roams: a roaming node never votes, so it joins as a
+        # learner, and the cluster says four nodes.)
+        nodes=three four=''
+        [ "$test" != home ] || { more='--mesh --ingress' others='2 3 4' nodes=four four=',[^,? ]+'; }
         # (access: the nodes run the image tests.sh built with the forge feature.)
         [ "$test" != access ] || base=$osdir
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ]; then
         others=2 more=--mesh project=''
-        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] || others=''
+        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != nested ] || others=''
         # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
         # as a node's state from before had none: kithd counts what their pods write.)
         [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
@@ -78,7 +89,11 @@
                 # as one that names a user who is not root, and as two that say what to start
                 # (an image nothing more is said of, as a chart has one). (share: what a
                 # container's ids are, and what it sees of files.)
-                rustc --edition 2024 -O -C panic=abort --target x86_64-unknown-linux-musl -o "$work/pod" "$root/ci/pod.rs" >&2
+                # (nested: pod without its symbols, 0.8 MB and not 5, for the state partition's 32 MB.)
+                symbols=''
+                [ "$test" != nested ] || symbols='-C strip=symbols'
+                # shellcheck disable=SC2086 # (one option or none)
+                rustc --edition 2024 -O -C panic=abort $symbols --target x86_64-unknown-linux-musl -o "$work/pod" "$root/ci/pod.rs" >&2
                 digest=$(printf pod | sha256sum | cut -d ' ' -f 1)
                 image=$work/seed/runtime/images/$digest
                 mkdir -p "$image/rootfs/bin"
@@ -100,6 +115,43 @@
                     head -c 1048576 /dev/urandom >"$image/rootfs/data/small"
                     head -c 1048576 /dev/urandom >"$image/rootfs/data/other"
                     echo leaf >"$image/rootfs/tree/leaf"
+                fi
+                if [ "$test" = nested ]; then
+                    # And an image that holds a second runtime and kithd in agent mode (ci/vm/nested.sh):
+                    # this machine's bash, bubblewrap and the tools the probe asks of them, with what they
+                    # are linked to; kithd, kith and pod, static; the probe and the inner Job; and, in
+                    # /seed/runtime, pod as an image for the inner kithd to run. For a user who is not root,
+                    # as a sandbox is (the pods image above). (Bubblewrap and not runc: the state partition
+                    # is 32 MB as built, and runc with kithd is more than it holds. Kith and pod are the
+                    # first images' own, linked and not copied, for the same reason.)
+                    digest=$(printf nested | sha256sum | cut -d ' ' -f 1)
+                    image=$work/seed/runtime/images/$digest
+                    mkdir -p "$image/rootfs/bin" "$image/rootfs/seed/runtime/refs"
+                    cp "$(sh "$root/ci/musl.sh")/kithd" "$image/rootfs/bin/kithd"
+                    for tool in kith pod; do
+                        ln "$work/seed/runtime/images/$(printf %s "$tool" | sha256sum | cut -d ' ' -f 1)/rootfs/bin/$tool" "$image/rootfs/bin/$tool"
+                    done
+                    : >"$work/linked"
+                    for tool in bash bwrap unshare timeout seq id rmdir grep tail tr cp mkdir sleep; do
+                        path=$(command -v "$tool") || fail "no $tool to put in the image of the nested test"
+                        cp -L "$path" "$image/rootfs/bin/$tool"
+                        ldd "$path" | awk '$2 == "=>" && $3 ~ /^\// { print ($1 ~ /^\// ? $1 : $3), $3 } $1 ~ /^\// && $2 != "=>" { print $1, $1 }' >>"$work/linked"
+                    done
+                    ln "$image/rootfs/bin/bash" "$image/rootfs/bin/sh"
+                    sort -u "$work/linked" | while read -r to from; do
+                        mkdir -p "$image/rootfs${to%/*}"
+                        cp -L "$from" "$image/rootfs$to"
+                    done
+                    cp "$root/ci/vm/nested-probe.sh" "$image/rootfs/probe.sh"
+                    cp "$root/ci/vm/nested-job.json" "$image/rootfs/inner-job.json"
+                    inner=$image/rootfs/seed/runtime
+                    mkdir -p "$inner/images/$(printf pod | sha256sum | cut -d ' ' -f 1)/rootfs/bin"
+                    ln "$image/rootfs/bin/pod" "$inner/images/$(printf pod | sha256sum | cut -d ' ' -f 1)/rootfs/bin/pod"
+                    echo '{}' >"$inner/images/$(printf pod | sha256sum | cut -d ' ' -f 1)/config.json"
+                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$(printf pod | sha256sum | cut -d ' ' -f 1)" >"$inner/refs/kith.test%2fpod:1"
+                    echo '{}' >"$image/config.json"
+                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fnested:1"
+                    touch -d '+1 day' "$work"/seed/runtime/images/*/config.json "$inner"/images/*/config.json
                 fi
                 if [ "$test" = pods ] || [ "$test" = policy ]; then
                     # And bubblewrap as this machine has it, with what it is linked to, beside
@@ -139,7 +191,7 @@
             # (quota: room for what its pods write. pods: room above its reserve, which its
             # full pod crosses on purpose.)
             case $test${KITH_E2E:-} in
-                pods1 | kube1 | quota*) truncate -s 2G "$1" ;;
+                pods1 | kube1 | quota* | nested*) truncate -s 2G "$1" ;;
                 pods) truncate -s 512M "$1" ;;
             esac
         }
@@ -178,11 +230,13 @@
         # reaches the node's API through it, and tries its NFS port, or port $inside).
         node() { # N [kithd's further arguments]
             [ -f "$work/n$1.raw" ] || { cp "$base/kith-os.raw" "$work/n$1.raw" && seed "$work/n$1.raw"; }
+            lanport=$((port + 8))
+            [ "$test$1" != home4 ] || lanport=$((port + 9)) # (the bridge's other side)
             timeout --foreground "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
-                -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
+                -netdev "socket,id=lan,mcast=230.0.0.1:$lanport,localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
                 -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside${https:+,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:443}$guest${net_restrict-,restrict=on}" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $dumps \
-                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway${nolink:+ KITH_NO_LINK=1} -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
+                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway${nolink:+ KITH_NO_LINK=1} -- --listen ${listen:-0.0.0.0:7443} --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 8>&- &
             vms="$vms $!"
         }
@@ -251,7 +305,14 @@ EOF
         keep=${net_restrict-,restrict=on}
         [ "$test" != pods ] || net_restrict=''
         # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
+        # (home: every joined one serves DNS too; node 4 roams (--roaming, as a laptop joins): it is reset, and dials the house endpoint.)
         [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353'; }
+        # (home: node 4 is on a LAN of its own, joined to the others' by a bridge that, while $work/cut
+        # exists, passes nothing from or to the voters' own addresses: the house address stays reachable.)
+        if [ "$test" = home ]; then
+            python3 -I "$root/ci/lan_bridge.py" $((port + 8)) $((port + 9)) "$work/cut" 2>"$work/bridge.err" &
+            vms="$vms $!"
+        fi
         node 1 "--claim ${first:-}"
         net_restrict=$keep
         tries=0
@@ -271,8 +332,11 @@ EOF
             [ "$test" != worker ] || asks='/v1/tokens?trust=worker'
             join=$(api 1 POST "$asks" | field token) || fail "no join token over TLS"
             # (pods: the second node takes its pods' addresses from another range than the first's.)
-            range=''
+            range='' listen=0.0.0.0:7443
             [ "$test$n" != pods2 ] || range='--pod-range 10.77.0.0/20'
+            # (home: node 4 roams, as a laptop joins. It listens on [::] as a roaming node does by default
+            # (main.rs): the leader reaches it at its mesh address, which is IPv6; 0.0.0.0 has no listener there.)
+            [ "$test$n" != home4 ] || { range='--roaming' listen='[::]:7443'; }
             # (poddns: a joined node asks this machine's resolver over UDP, which restrict=on
             # drops. unrestricted: only that test's joined nodes keep their card out open; the
             # value is put back after each, so no other node of it is opened.)
@@ -350,6 +414,9 @@ EOF
         if [ "$test" = outlive ]; then
             . "$root/ci/vm/outlive.sh"
         fi
+        if [ "$test" = nested ]; then
+            . "$root/ci/vm/nested.sh"
+        fi
         if [ "$test" = compose ]; then
             . "$root/ci/vm/compose.sh"
         fi
@@ -368,7 +435,7 @@ EOF
         if [ "$test" = share ]; then
             . "$root/ci/vm/share.sh"
         fi
-        until_says "three nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+ "
+        until_says "$nodes nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+$four "
         was=${line#- 0 } was=${was%% *}
         if [ "$test" = access ]; then
             . "$root/ci/vm/access.sh"
