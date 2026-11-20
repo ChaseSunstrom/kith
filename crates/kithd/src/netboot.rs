@@ -44,6 +44,8 @@ struct Active {
     disk: String,
     /// The machines keep their state encrypted (crypt.rs).
     encrypt: bool,
+    /// The serving node's release keys and LAN releases, as they were when netboot was turned on.
+    releases: (Vec<String>, bool),
     machines: BTreeMap<Mac, Machine>,
     until: Instant,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -183,10 +185,44 @@ pub fn answer(asked: &Asks, us: Ipv4Addr) -> Vec<u8> {
     packet
 }
 
-/// A machine's answers, as long as the room the file has for them.
-fn answers(disk: &str, encrypt: bool, join: SocketAddr, token: &str) -> Option<Vec<u8>> {
+/// What this node was started with about kith OS releases: the keys it was given (`--release-key`),
+/// its state, and `--lan-releases`. Set once, by main, beside `PORT`.
+pub static RELEASES: OnceLock<(Vec<String>, std::path::PathBuf, bool)> = OnceLock::new();
+
+/// The release keys this node takes releases from (the ones it was given, else the ones it
+/// kept or its image holds) and whether it fetches from the LAN: what a machine installed from
+/// here is told to take too. At most 8 keys, of the 64 hex digits the install answers hold.
+fn releases_of(given: Vec<String>, state: &std::path::Path, lan: bool) -> (Vec<String>, bool) {
+    let keys = crate::update::keys(given, state).mine().map(|(keys, _)| keys);
+    let valid = |key: &String| crate::release_key(key).is_ok();
+    (
+        keys.unwrap_or_default().into_iter().filter(valid).take(8).collect(),
+        lan,
+    )
+}
+
+fn releases() -> (Vec<String>, bool) {
+    RELEASES.get().map_or_else(Default::default, |(given, state, lan)| {
+        releases_of(given.clone(), state, *lan)
+    })
+}
+
+/// A machine's answers, as long as the room the file has for them. `keys` and `lan` are the
+/// serving node's release keys and LAN releases (`releases`); keys the install parser would
+/// refuse are no answers.
+fn answers(disk: &str, encrypt: bool, join: SocketAddr, token: &str, keys: &[String], lan: bool) -> Option<Vec<u8>> {
+    if keys.len() > 8 || keys.iter().any(|key| crate::release_key(key).is_err()) {
+        return None;
+    }
     let encrypt = if encrypt { "encrypt: true\n" } else { "" };
-    let mut text = format!("disk: {disk}\n{encrypt}join:\n  address: {join}\n  token: {token}\n").into_bytes();
+    let keys = if keys.is_empty() {
+        String::new()
+    } else {
+        format!("releaseKey: '{}'\n", keys.join(","))
+    };
+    let lan = if lan { "lanReleases: true\n" } else { "" };
+    let mut text =
+        format!("disk: {disk}\n{encrypt}{keys}{lan}join:\n  address: {join}\n  token: {token}\n").into_bytes();
     (text.len() <= ROOM).then(|| {
         text.resize(ROOM, b'\n');
         text
@@ -303,7 +339,7 @@ async fn tftp(socket: UdpSocket) {
                 mac,
                 active.image.clone(),
                 active.at,
-                (active.disk.clone(), active.encrypt),
+                (active.disk.clone(), active.encrypt, active.releases.clone()),
                 machine.token.clone(),
             ))
         });
@@ -324,7 +360,8 @@ async fn tftp(socket: UdpSocket) {
             let (Ok(us), Some(port)) = (transfer.local_addr(), PORT.get()) else {
                 return;
             };
-            let Some(answers) = answers(&disk.0, disk.1, SocketAddr::new(us.ip(), *port), &token) else {
+            let join = SocketAddr::new(us.ip(), *port);
+            let Some(answers) = answers(&disk.0, disk.1, join, &token, &disk.2.0, disk.2.1) else {
                 return;
             };
             let sent = send(&transfer, image.len(), &options, |from, len| {
@@ -474,6 +511,7 @@ pub async fn on(
         at,
         disk: disk.to_string(),
         encrypt,
+        releases: releases(),
         machines: held,
         until: Instant::now() + Duration::from_secs(minutes * 60),
         tasks,
@@ -617,7 +655,7 @@ mod tests {
         image.extend(vec![b'#'; ROOM - MARKER.len()]);
         image.extend(vec![b'z'; 50]);
         let join = "10.0.2.15:7443".parse().unwrap();
-        let answers = answers("only", false, join, "kith1.ab.cd").unwrap(); // (made up) pragma: allowlist secret
+        let answers = answers("only", false, join, "kith1.ab.cd", &[], false).unwrap(); // (made up) pragma: allowlist secret
         assert_eq!(answers.len(), ROOM);
         let text = String::from_utf8(answers.clone()).unwrap();
         let told = crate::install::answers(&text).unwrap();
@@ -636,7 +674,55 @@ mod tests {
         }
         assert!(read(&image, 100, &answers, image.len(), 512).is_empty());
         // Answers longer than the room are none.
-        assert_eq!(super::answers(&"x".repeat(ROOM), true, join, "t"), None);
+        assert_eq!(super::answers(&"x".repeat(ROOM), true, join, "t", &[], false), None);
+    }
+
+    /// The serving node's release keys and `lanReleases` are in the answers, read back by the
+    /// install parser and onto the new node's command line; keys the parser would refuse, or
+    /// more than the room, are no answers at all.
+    #[test]
+    fn netboot_answers_name_the_release_keys_and_lan_releases_of_the_serving_node() {
+        let join: SocketAddr = "10.0.2.15:7443".parse().unwrap();
+        let keys = ["a".repeat(64), "0B".repeat(32)];
+        let made = answers("only", true, join, "kith1.ab.cd", &keys, true).unwrap(); // (made up) pragma: allowlist secret
+        assert_eq!(made.len(), ROOM);
+        let told = crate::install::answers(&String::from_utf8(made).unwrap()).unwrap();
+        assert_eq!(told.release_key.as_deref(), Some(keys.join(",").as_str()));
+        assert!(told.lan_releases && told.encrypt && told.join.is_some());
+        // Neither: the answers say neither.
+        let bare = answers("only", false, join, "t", &[], false).unwrap();
+        let told = crate::install::answers(&String::from_utf8(bare).unwrap()).unwrap();
+        assert!(told.release_key.is_none() && !told.lan_releases);
+        // What the install parser refuses (more than 8, not a key, a way to add a line) is not sent.
+        let nine = vec!["a".repeat(64); 9];
+        for bad in [
+            nine,
+            vec!["abc".into()],
+            vec![format!("{}'\nencrypt: true", "a".repeat(64))],
+        ] {
+            assert_eq!(answers("only", false, join, "t", &bad, false), None, "{bad:?}");
+        }
+        // Eight keys fit the room; a disk name that fills it with the keys does not.
+        assert!(answers("only", false, join, "t", &vec!["a".repeat(64); 8], true).is_some());
+        let long = "d".repeat(ROOM - 8 * 65);
+        assert_eq!(answers(&long, false, join, "t", &vec!["a".repeat(64); 8], true), None);
+    }
+
+    /// What the node holds is what the answers carry: the given keys over the kept ones, 8 at
+    /// most, a key that is none dropped.
+    #[test]
+    fn netboot_releases_are_the_nodes_keys_and_lan_releases() {
+        let dir = std::env::temp_dir().join(format!("kith-netboot-releases-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let held = |given: &[String]| releases_of(given.to_vec(), &dir, true);
+        std::fs::write(dir.join("os-release-keys"), format!("# kept\n{b}\n")).unwrap();
+        assert_eq!(held(&[]), (vec![b.clone()], true));
+        assert_eq!(held(std::slice::from_ref(&a)), (vec![a.clone()], true));
+        let many = vec![a.clone(); 12];
+        assert_eq!(held(&many).0.len(), 8);
+        assert!(held(&["not a key".into(), b.clone()]).0 == [b]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A TFTP client as firmware is one: asks with options, acknowledges each block.
@@ -688,6 +774,7 @@ mod tests {
             at: 1000,
             disk: "only".into(),
             encrypt: false,
+            releases: (vec!["c".repeat(64)], true),
             machines: [CARD, SMALL]
                 .map(|card| {
                     let token = "kith1.ab.cd".to_string(); // (made up) pragma: allowlist secret
@@ -718,7 +805,11 @@ mod tests {
         let whole = fetch(server, &file(&CARD), 1428, 97).await.unwrap();
         assert_eq!(whole.len(), image.len());
         assert_eq!(whole[..1000], image[..1000]);
-        assert!(whole[1000..].starts_with(b"disk: only\njoin:\n  address: 127.0.0.1:7443\n  token: kith1.ab.cd\n\n"));
+        let held = format!(
+            "disk: only\nreleaseKey: '{}'\nlanReleases: true\njoin:\n  address: 127.0.0.1:7443\n  token: kith1.ab.cd\n\n",
+            "c".repeat(64)
+        );
+        assert!(whole[1000..].starts_with(held.as_bytes()));
         assert_eq!(whole[1000 + ROOM..], image[1000 + ROOM..]);
         // (The mark is made after the last acknowledgement is heard.)
         for _ in 0..50 {
@@ -769,6 +860,7 @@ mod tests {
             at: 0,
             disk: "only".into(),
             encrypt: false,
+            releases: Default::default(),
             machines: BTreeMap::from([(CARD, machine(false)), (SMALL, machine(true))]),
             until: Instant::now() + Duration::from_secs(60),
             tasks: vec![serving],
@@ -835,6 +927,7 @@ mod tests {
             at: 64,
             disk: "only".into(),
             encrypt: false,
+            releases: Default::default(),
             machines: BTreeMap::new(),
             until: Instant::now() + Duration::from_secs(MINUTES * 30),
             tasks: vec![],
