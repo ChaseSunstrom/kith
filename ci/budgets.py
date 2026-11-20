@@ -88,7 +88,9 @@ TIME_BUDGETS = {
     # RAISED 10 -> 20 ms (T-1096): under a 25+ load it read 16.1 and 18.0 ms and refused closes and prechecks;
     # bring it back to 10 ms once the trains are done and the host is quiet.
     "a status change reaching a second kithd": 0.020,
-    "one DNS answer from kithd": 0.007,
+    # RAISED 7 -> 15 ms (T-1175): under a 20+ load it read 12.3 ms and refused closes; bring it back
+    # to 7 ms once the trains are done and the host is quiet.
+    "one DNS answer from kithd": 0.015,
 }
 # A local image (no registry): a rootfs holding the static kithd, which runs until stopped.
 IMAGE = "local.test/timing:1"
