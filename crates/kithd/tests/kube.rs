@@ -2113,8 +2113,11 @@ fn with_running(test: &str, host: bool) -> Option<Cluster> {
             break;
         }
         let status = held.to_string();
-        if status.contains("cgroup error") {
-            eprintln!("::warning title=SKIP::SKIP (not a pass): this host's cgroup takes no container");
+        // A container's create says "cgroup error"; an exec unit's says it could not make its dir under /sys/fs/cgroup
+        // (CI: "failed to create dir /sys/fs/cgroup/system.slice/kith-w_team_tool_0_main: Permission denied").
+        if status.contains("cgroup error") || status.contains("failed to create dir /sys/fs/cgroup") {
+            // Straight to stderr: the harness captures eprintln! and drops a passing test's output.
+            let _ = writeln!(std::io::stderr(), "::warning title=SKIP::SKIP (not a pass): this host's cgroup takes no unit");
             return None;
         }
         assert!(Instant::now() < deadline, "tool-0 to run: not within 60 s\n{status}");
