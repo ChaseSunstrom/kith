@@ -1179,10 +1179,23 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     let backend = || {
         // A named context always counts; the file's current one only when no flag says where kithd is.
         let wanted = cli.context.is_some() || (cli.store.is_none() && cli.server.is_none() && cli.socket.is_none());
-        let chosen = match wanted {
-            true => context::pick(&context::file()?, cli.context.as_deref())?,
-            false => None,
+        let chosen = match (wanted, cli.context.is_some()) {
+            (true, true) => context::pick(&context::file()?, cli.context.as_deref())?,
+            // (The file's own current context is not asked for: one that cannot be read is said, and kith goes on without it.)
+            (true, false) => context::file()
+                .and_then(|file| context::pick(&file, None))
+                .unwrap_or_else(|e| {
+                    eprintln!("kith: {e} (going on without a context)");
+                    None
+                }),
+            (false, _) => None,
         };
+        // (An explicit --socket is not sent to a context's server.)
+        let chosen = chosen.filter(|_| cli.socket.is_none());
+        if let (Some(c), None) = (&chosen, &cli.context) {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("kith: using the current context's server {}", c.server));
+        }
         let server = cli.server.clone().or_else(|| chosen.as_ref().map(|c| c.server.clone()));
         let identity = cli.identity.clone().or_else(|| chosen.map(|c| c.identity));
         match (&cli.store, server, cli.socket.clone().or_else(kith_api::default_socket)) {

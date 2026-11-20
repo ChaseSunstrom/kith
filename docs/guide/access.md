@@ -122,8 +122,8 @@ kith --server HOST:PORT --identity ~/alice logs Workload/web -f
 ```
 
 `KITH_SERVER` and `KITH_IDENTITY` say the same. `get`, `apply`, `watch`, `logs -f`, and the
-tunnels of `run` and `ui` all work over `--server`; `--store` and `--socket` still win over it
-when they are given. HOST:PORT is the node's `--listen` address, and its certificate must be
+tunnels of `run` and `ui` all work over `--server`; `--store` still wins over it
+when it is given. HOST:PORT is the node's `--listen` address, and its certificate must be
 signed by the cluster's CA and name `kith`: a node of another cluster, or one whose name is
 something else, is refused before anything is sent. The identity directory must hold one
 `NAME.key` and its `NAME.crt`; a key that anyone but its owner can read is refused, and `kith`

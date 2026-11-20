@@ -163,10 +163,36 @@ fn known<'a>(held: &'a mut File, file: &Path, name: &str) -> Result<&'a mut File
     Err(format!("error: no context {name:?} in {}", file.display()))
 }
 
+/// Hold the file's lock (a sibling file) until the returned handle drops: two `context` verbs
+/// at once each read and write the whole file.
+fn locked(file: &Path) -> Result<std::fs::File, String> {
+    let wrong = |e: std::io::Error| format!("error: {}: {e}", file.display());
+    let dir = file.parent().unwrap_or(Path::new("."));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(wrong)?;
+    let mut name = file.as_os_str().to_os_string();
+    name.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(PathBuf::from(name))
+        .map_err(wrong)?;
+    lock.lock().map_err(wrong)?;
+    Ok(lock)
+}
+
 /// `kith context add`: a second add of a name replaces it.
 pub fn add(file: &Path, name: &str, server: &str, identity: &Path) -> Result<(), String> {
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
-        return Err(format!("error: context name {name:?}: use letters, digits, . _ and -"));
+    let plain = !name.is_empty() && !name.starts_with(['-', '.']);
+    if !plain || !name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
+        return Err(format!(
+            "error: context name {name:?}: use letters, digits, . _ and -, not starting with - or ."
+        ));
     }
     if !server
         .rsplit_once(':')
@@ -180,6 +206,7 @@ pub fn add(file: &Path, name: &str, server: &str, identity: &Path) -> Result<(),
         .ok()
         .filter(|path| path.is_dir())
         .ok_or_else(|| format!("error: --identity {}: not a directory", identity.display()))?;
+    let _lock = locked(file)?;
     let mut held = load(file)?;
     held.contexts.insert(
         name.into(),
@@ -193,6 +220,7 @@ pub fn add(file: &Path, name: &str, server: &str, identity: &Path) -> Result<(),
 
 /// `kith context use`.
 pub fn use_(file: &Path, name: &str) -> Result<(), String> {
+    let _lock = locked(file)?;
     let mut held = load(file)?;
     known(&mut held, file, name)?.current = Some(name.into());
     save(file, &held)
@@ -200,6 +228,7 @@ pub fn use_(file: &Path, name: &str) -> Result<(), String> {
 
 /// `kith context rm`: the current one stops being so.
 pub fn rm(file: &Path, name: &str) -> Result<(), String> {
+    let _lock = locked(file)?;
     let mut held = load(file)?;
     known(&mut held, file, name)?.contexts.remove(name);
     if held.current.as_deref() == Some(name) {
@@ -335,7 +364,9 @@ mod tests {
         assert!(add(&file, "a b", "h:1", &alice).is_err());
         assert!(add(&file, "x", "no-port", &alice).is_err());
         assert!(add(&file, "x", "h:1", &alice.join("nope")).is_err());
-        // No draft is left beside it.
-        assert_eq!(std::fs::read_dir(file.parent().unwrap()).unwrap().count(), 1);
+        assert!(add(&file, "-x", "h:1", &alice).is_err());
+        assert!(add(&file, "..", "h:1", &alice).is_err());
+        // No draft is left beside it (only its lock).
+        assert_eq!(std::fs::read_dir(file.parent().unwrap()).unwrap().count(), 2);
     }
 }
