@@ -1746,6 +1746,26 @@ spec: { selector: { app: web }, ports: [{ port: 80 }] }
         }
     }
 
+    /// A client that is not a bare TCP stream (the TLS stream of port 443, whose bytes are not
+    /// the socket's) is carried by the copy, never by splice.
+    #[tokio::test]
+    async fn splice_is_not_reached_by_a_tls_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, mut theirs) = tokio::io::duplex(64);
+        let mut service = TcpStream::connect(backend.local_addr().unwrap()).await.unwrap();
+        let (mut seen, _) = backend.accept().await.unwrap();
+        let carried = tokio::spawn(async move { carry(&mut theirs, &mut service, None).await });
+        client.write_all(b"GET /").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut got = String::new();
+        seen.read_to_string(&mut got).await.unwrap();
+        assert_eq!(got, "GET /");
+        drop(seen);
+        let _ = carried.await;
+        assert_eq!(crate::services::SPLICED.get(), 0);
+    }
+
     #[tokio::test]
     async fn port_80_takes_so_many_connections_at_a_time() {
         use axum::serve::Listener;
