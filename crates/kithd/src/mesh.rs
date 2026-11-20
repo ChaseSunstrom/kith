@@ -494,7 +494,16 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
         Ok(public) => public,
         Err(e) => {
             let hint = "it takes the kernel's WireGuard and the right to set up interfaces, CAP_NET_ADMIN";
-            return eprintln!("kithd: no mesh: {e} ({hint})");
+            eprintln!("kithd: no mesh: {e} ({hint})");
+            // Not a mesh this node is on: what listens by the port (services, pods) is not to
+            // wait on one, and `kith node status` says why (T-1076). One try: until the switch
+            // changes, or kithd starts again.
+            shared.mesh_port.send_replace(None);
+            let error = json!({ "error": format!("no mesh: {e} ({hint})") });
+            if let Err(e) = say(&shared, &format!("Node/{me}"), "mesh", error).await {
+                eprintln!("kithd: mesh: telling the cluster why there is none: {e}");
+            }
+            return;
         }
     };
     // What the root part was last asked for the interface: not asked again while it is the same.
@@ -760,6 +769,8 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
 pub async fn left(shared: Arc<Shared>, field: &str, mut stopping: watch::Receiver<bool>) {
     let Some(cluster) = &shared.cluster else { return };
     let node = format!("Node/{}", cluster.me.name);
+    // (The peers of the mesh that was: the interface is gone, `status` is not to show them.)
+    *shared.mesh.lock().expect("nothing panics holding the mesh") = Value::Null;
     loop {
         // (Not known until the store has this node: asked again until it does.)
         let says = {
@@ -779,6 +790,236 @@ pub async fn left(shared: Arc<Shared>, field: &str, mut stopping: watch::Receive
             () = tokio::time::sleep(Duration::from_secs(10)) => {}
             _ = stopping.changed() => return,
         }
+    }
+}
+
+/// The cluster's mesh switch (`Cluster.spec.mesh`), for a node started without `--mesh`.
+pub mod spec {
+    use kith_api::store::Store;
+
+    /// The mesh's port where no flag or Cluster names one.
+    pub const PORT: u16 = 51820;
+
+    /// What the Clusters in `store` say: `None` while it holds none (a store just opened may not
+    /// have them yet, which is not an answer); `Some(Some(port))` if one has `mesh.enabled: true`,
+    /// else `Some(None)`.
+    pub fn wanted(store: &Store) -> Option<Option<u16>> {
+        let mut all = store.list(Some("Cluster")).peekable();
+        all.peek()?;
+        let on = all.find(|cluster| cluster.spec["mesh"]["enabled"] == true);
+        Some(on.map(|cluster| {
+            let port = cluster.spec["mesh"]["port"].as_u64();
+            port.and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+                .unwrap_or(PORT)
+        }))
+    }
+}
+
+/// How long a node with no Cluster in its store waits before it takes that for "off".
+const SETTLE: Duration = Duration::from_secs(60);
+
+/// Keep `work` going for what the mesh is to be: the port from `--mesh` (`flag`), else the
+/// Cluster's switch ([`spec::wanted`]). `work(Some(port), ended)` is the mesh task, `work(None, ended)`
+/// takes back what it said; each ends when `ended` is set, which is when the switch changes or
+/// `stopping` is. The port is told to `shared.mesh_port` too, for what listens by it.
+///
+/// ponytail: a node whose store is not there yet (a restart) is held off for [`SETTLE`] rather
+/// than told "off", so it is not taken off the mesh for a few seconds each start; one whose store
+/// is older than the switch (it has a Cluster that does not say) can still flap once.
+pub async fn follow<F>(
+    shared: Arc<Shared>,
+    flag: Option<u16>,
+    mut stopping: watch::Receiver<bool>,
+    work: impl Fn(Option<u16>, watch::Receiver<bool>) -> F,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    let (mut generation, since) = (shared.generation.subscribe(), Instant::now());
+    let decide = || {
+        let said = flag.map(Some).or_else(|| {
+            let state = shared.store.lock().expect("nothing panics holding the store");
+            spec::wanted(&state.store)
+        });
+        said.or_else(|| (since.elapsed() >= SETTLE).then_some(None))
+    };
+    loop {
+        let port = loop {
+            if let Some(port) = decide() {
+                break port;
+            }
+            tokio::select! {
+                _ = generation.changed() => {}
+                () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = stopping.changed() => return,
+            }
+        };
+        shared.mesh_port.send_replace(port);
+        let (end, ended) = watch::channel(false);
+        let watching = async {
+            loop {
+                tokio::select! {
+                    _ = generation.changed() => {}
+                    () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = stopping.changed() => return true,
+                }
+                if decide().is_some_and(|now| now != port) {
+                    return false;
+                }
+            }
+        };
+        let watching = async {
+            let stop = watching.await;
+            let _ = end.send(true);
+            stop
+        };
+        if tokio::join!(work(port, ended), watching).1 {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+    use kith_api::Resource;
+
+    fn store_of(clusters: &[&str]) -> Store {
+        let mut store = Store::default();
+        for (i, spec) in clusters.iter().enumerate() {
+            let text = format!("apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: c{i} }}\nspec: {spec}\n");
+            store
+                .apply(Resource::from_source(&text).unwrap().remove(0).unwrap())
+                .unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn spec_switch_says_on_only_when_enabled_is_true() {
+        let wanted = |clusters: &[&str]| spec::wanted(&store_of(clusters));
+        assert_eq!(wanted(&[]), None, "no Cluster in the store yet: not said");
+        for off in [
+            "{}",
+            "{ mesh: {} }",
+            "{ mesh: { cidr: 'fd00::/48', port: 4000 } }",
+            "{ mesh: { enabled: false } }",
+        ] {
+            assert_eq!(wanted(&[off]), Some(None), "{off}");
+        }
+        assert_eq!(wanted(&["{ mesh: { enabled: true } }"]), Some(Some(51820)));
+        assert_eq!(wanted(&["{ mesh: { enabled: true, port: 4000 } }"]), Some(Some(4000)));
+        assert_eq!(wanted(&["{ mesh: { enabled: true, port: 0 } }"]), Some(Some(51820)));
+        assert_eq!(wanted(&["{}", "{ mesh: { enabled: true } }"]), Some(Some(51820)));
+    }
+
+    /// A node started without `--mesh` follows the Cluster: the mesh task is started when it says on,
+    /// and stopped again when it says off; one started with the flag keeps it whatever the Cluster says.
+    #[tokio::test]
+    async fn spec_switch_starts_and_stops_the_mesh_task() {
+        use crate::cluster::pinned_peer::{node, shared_with};
+        let ca = crate::pki::Ca::create().unwrap();
+        let shared = shared_with("mesh-spec", node(&ca, "ms-a"), &[]).await;
+        let apply = |spec: &str| {
+            let store = store_of(&[spec]);
+            let mut state = shared.store.lock().unwrap();
+            state.store = store;
+            drop(state);
+            shared.generation.send_modify(|g| *g += 1);
+        };
+        let (stop, stopping) = watch::channel(false);
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let work = {
+            let log = log.clone();
+            move |port: Option<u16>, mut ended: watch::Receiver<bool>| {
+                let log = log.clone();
+                async move {
+                    log.lock().unwrap().push(port);
+                    let _ = ended.changed().await;
+                }
+            }
+        };
+        let seen = || log.lock().unwrap().clone();
+        let waits = |want: Vec<Option<u16>>| async move {
+            for _ in 0..200 {
+                if seen() == want {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the mesh task was started as {:?}, not {want:?}", seen());
+        };
+        apply("{ mesh: { enabled: false } }");
+        let followed = tokio::spawn(follow(shared.clone(), None, stopping.clone(), work.clone()));
+        waits(vec![None]).await;
+        assert_eq!(*shared.mesh_port.borrow(), None);
+        apply("{ mesh: { enabled: true, port: 4000 } }");
+        waits(vec![None, Some(4000)]).await;
+        assert_eq!(*shared.mesh_port.borrow(), Some(4000));
+        apply("{ mesh: { enabled: false } }");
+        waits(vec![None, Some(4000), None]).await;
+        assert_eq!(*shared.mesh_port.borrow(), None);
+        stop.send(true).unwrap();
+        followed.await.unwrap();
+
+        // With the flag: on at once, and the Cluster does not take it away.
+        log.lock().unwrap().clear();
+        let (stop, stopping) = watch::channel(false);
+        let followed = tokio::spawn(follow(shared.clone(), Some(51821), stopping, work));
+        waits(vec![Some(51821)]).await;
+        apply("{ mesh: { enabled: false } }");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(seen(), vec![Some(51821)]);
+        stop.send(true).unwrap();
+        followed.await.unwrap();
+    }
+
+    /// The switch off takes the paths of the last mesh away: `status` would otherwise show peers of
+    /// a mesh that is gone.
+    #[tokio::test]
+    async fn spec_switch_off_clears_the_paths_of_the_mesh_that_was() {
+        use crate::cluster::pinned_peer::{node, shared_with};
+        let ca = crate::pki::Ca::create().unwrap();
+        let shared = shared_with("mesh-off", node(&ca, "mo-a"), &[]).await;
+        *shared.mesh.lock().unwrap() = json!([{ "node": "b", "address": "fd00::b" }]);
+        let (stop, stopping) = watch::channel(false);
+        stop.send(true).unwrap();
+        left(shared.clone(), "mesh", stopping).await;
+        assert!(shared.mesh.lock().unwrap().is_null());
+    }
+
+    /// A node the switch is on for that cannot bring the mesh up (no WireGuard, no right to make an
+    /// interface) says so on its Node, and does not say it is on a mesh: `mesh_port` is what the
+    /// services listen by.
+    #[tokio::test]
+    async fn spec_switch_on_that_cannot_come_up_says_why_and_claims_no_mesh() {
+        // (A node that leads a cluster of its own, with its Node in the store: it can say.)
+        let ca = crate::pki::Ca::create().unwrap();
+        let me = crate::cluster::pinned_peer::node(&ca, "mf-a");
+        let up = crate::view::Upstream {
+            name: "mf-a".into(),
+            address: "127.0.0.1:1".into(),
+            certificate: None,
+        };
+        let cluster = crate::cluster::Cluster::new(me, Some(ca)).unwrap();
+        let shared = crate::cluster::pinned_peer::shared_of("mesh-fail", cluster, &[up]).await;
+        let id = shared.raft.metrics().borrow().id;
+        let leads = shared.raft.wait(Some(Duration::from_secs(30)));
+        leads.current_leader(id, "leads").await.unwrap();
+        shared.mesh_port.send_replace(Some(4000));
+        let options = Options {
+            interface: "kith0".into(),
+            port: 4000,
+            // (Not made: its directory is not there, so the interface is not either.)
+            key: PathBuf::from("/nonexistent/kithd-test/mesh.key"),
+        };
+        let (_stop, stopping) = watch::channel(false);
+        run(shared.clone(), options, stopping).await;
+        assert_eq!(*shared.mesh_port.borrow(), None);
+        let state = shared.store.lock().unwrap();
+        let status = state.store.get("Node/mf-a").and_then(|node| node.status.clone());
+        let error = status.as_ref().and_then(|status| status["mesh"]["error"].as_str());
+        assert!(error.is_some_and(|e| e.contains("no mesh")), "{status:?}");
     }
 }
 
