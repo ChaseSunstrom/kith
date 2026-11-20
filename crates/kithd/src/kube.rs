@@ -103,8 +103,10 @@ static BARE: [Kind; 2] = [
 /// The row a Pod sent is held as: Job when it is not run again, else a Workload (as Kubernetes
 /// says of a missing `restartPolicy`).
 fn bare(pod: &Value) -> &'static Kind {
-    let held = kith_kube::pod_holder(pod.pointer("/spec/restartPolicy").and_then(Value::as_str));
-    &BARE[usize::from(held != "Job")]
+    match kith_kube::pod_holder(pod.pointer("/spec/restartPolicy").and_then(Value::as_str)) {
+        "Job" => &BARE[0],
+        _ => &BARE[1],
+    }
 }
 
 const ACCESS: &str =
@@ -894,6 +896,25 @@ fn taken(store: &Store, namespace: Option<&str>, name: &str) -> bool {
     held("Job", name) || held("Workload", name) || pod_owner(name).is_some_and(|(holder, owner, _)| held(holder, owner))
 }
 
+/// Whether a bare Pod of `namespace` has the name of a pod that `holder`'s resource `name` would run
+/// (any replica: `taken`'s own reading, the other way). Two pods of one name are one to every verb.
+fn shadowed(store: &Store, namespace: Option<&str>, runs: &str, name: &str) -> bool {
+    let namespace = namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE);
+    ["Job", "Workload"].into_iter().any(|kind| {
+        store.list(Some(kind)).any(|held| {
+            let here = held
+                .metadata
+                .namespace
+                .as_deref()
+                .unwrap_or(kith_api::DEFAULT_NAMESPACE)
+                == namespace;
+            let pod = &held.metadata.name;
+            here && held_bare(store, Some(namespace), pod).is_some()
+                && pod_owner(pod).is_some_and(|(of, owner, _)| of == runs && owner == name)
+        })
+    })
+}
+
 /// What a pod's name says: the kind that runs it, that kind's resource's name and the
 /// replica. The one place a pod's name is read, and only what [`pod_name`] makes is read
 /// (so `x-j0` is the Workload `x`'s pod 0 only as `x-j0-0`): anything else is no pod.
@@ -931,7 +952,11 @@ fn pods(owner: &Value, resource: &Resource) -> Vec<Value> {
     });
     let mut ended = Vec::new();
     if let Some(status) = over {
-        let succeeded = status["succeeded"].as_u64().unwrap_or(0);
+        // (A Job that succeeded ran once at least, whatever count its status kept.)
+        let succeeded = status["succeeded"]
+            .as_u64()
+            .unwrap_or(0)
+            .max(u64::from(status["state"] == "succeeded"));
         let runs = succeeded + u64::from(status["state"] == "failed");
         let names = template["spec"]["containers"].as_array();
         for run in 0..runs {
@@ -2656,6 +2681,13 @@ async fn write(
         {
             return Err(exists());
         }
+        // And the other way: what runs pods may not be made where a bare Pod has the name of one of them.
+        if matches!(kind.held, Held::As("Job" | "Workload" | "NodeWorkload"))
+            && (how == How::Create || (how == How::Apply && !there))
+            && shadowed(&state.store, namespace, holder(kind), &name)
+        {
+            return Err(exists());
+        }
         // What is there and was not made here, or not as this kind, is not written over.
         if live.is_some() && before.is_none() {
             let why = format!(
@@ -3260,11 +3292,8 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
         let why = format!("{asked}: a unit's output is kept as it was written, all its runs in one file and not when");
         return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why));
     }
-    let (key, replica) = held_owner(call, namespace, pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
     // What a unit wrote is read by who may read the resource that runs it.
-    let holder = key.split('/').next().unwrap_or_default().to_string();
-    let place = vec![(holder, Some(namespace.to_string()))];
-    api::permit(&call.shared, &call.caller, Verb::Get, |_| place).map_err(refusal)?;
+    let (key, replica) = pod_run(call, namespace, pod, Verb::Get)?;
     let follow = call.asked.get("follow").is_some_and(|follow| follow == "true");
     let mut reading = Reading {
         shared: call.shared.clone(),
@@ -3295,17 +3324,44 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
     Ok(([(header::CONTENT_TYPE, "text/plain")], Body::from_stream(chunks)).into_response())
 }
 
-/// The resource that runs `pod` in `namespace` and the replica the pod is, if the store holds
-/// that resource: what the pod's name says, checked against what is there.
-fn held_owner(call: &Call, namespace: &str, pod: &str) -> Option<(String, u32)> {
-    let (holder, owner, replica) = pod_owner(pod)?;
-    let state = call.shared.store.lock().expect("a handler panicked holding the store");
+/// The resource that runs `pod` in `namespace` and the replica the pod is, for a caller who may `verb`
+/// it: a bare Pod's name first (as `delete` does: it is its own Job's or Workload's run 0), else what
+/// the pod's name says, checked against what is there. The right is asked before anything of the
+/// store is, so a caller with none is told the same of every name, a pod's or not.
+fn pod_run(call: &Call, namespace: &str, pod: &str, verb: Verb) -> Result<(String, u32), No> {
+    let may = |holder: &str| {
+        let place = vec![(holder.to_string(), Some(namespace.to_string()))];
+        api::permit(&call.shared, &call.caller, verb.clone(), |_| place).map_err(refusal)
+    };
+    // (Any of the holders a pod might be of; the first refusal, the Workload's, is what is said.)
+    if let Err(refused) = may("Workload")
+        && ["Job", "NodeWorkload"].into_iter().all(|holder| may(holder).is_err())
+    {
+        return Err(refused);
+    }
+    let found = |key: &str| {
+        let state = call.shared.store.lock().expect("a handler panicked holding the store");
+        state.store.get(key).is_some_and(|held| raw(held).is_some())
+    };
+    let bare = {
+        let state = call.shared.store.lock().expect("a handler panicked holding the store");
+        held_bare(&state.store, Some(namespace), pod).map(holder)
+    };
+    if let Some(holder) = bare {
+        may(holder)?;
+        return Ok((format!("{holder}/{namespace}/{pod}"), 0));
+    }
+    let (holder, owner, replica) = pod_owner(pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
+    may(holder)?;
+    // A NodeWorkload's pod runs on the host, as `kith run` runs there: that takes Exec on `Node`, cluster-wide.
+    if holder == "NodeWorkload" && matches!(verb, Verb::Exec) {
+        let node = vec![("Node".to_string(), None)];
+        api::permit(&call.shared, &call.caller, verb, |_| node).map_err(refusal)?;
+    }
     let key = format!("{holder}/{namespace}/{owner}");
-    state
-        .store
-        .get(&key)
-        .is_some_and(|held| raw(held).is_some())
+    found(&key)
         .then_some((key, replica))
+        .ok_or_else(|| not_found(&KINDS[0], pod))
 }
 
 /// The channel protocols kithd answers for exec and attach, in the order it prefers them.
@@ -3343,18 +3399,7 @@ async fn pod_decision(
     headers: &HeaderMap,
     upgrade: Option<OnUpgrade>,
 ) -> Result<Response, No> {
-    // (What the pod's name says is enough to ask: a caller without the right is refused whether or not the pod is there.)
-    let (holder, _, _) = pod_owner(pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
-    let place = vec![(holder.to_string(), Some(namespace.to_string()))];
-    api::permit(&call.shared, &call.caller, Verb::Exec, |_| place).map_err(refusal)?;
-    // A NodeWorkload's pod runs on the host, as `kith run` runs there: that takes Exec on `Node`, cluster-wide.
-    if holder == "NodeWorkload" {
-        let node = vec![("Node".to_string(), None)];
-        api::permit(&call.shared, &call.caller, Verb::Exec, |_| node).map_err(refusal)?;
-    }
-    if held_owner(call, namespace, pod).is_none() {
-        return Err(not_found(&KINDS[0], pod));
-    }
+    pod_run(call, namespace, pod, Verb::Exec)?;
     // kubectl sends no Origin: one is a browser's, and a browser is not let upgrade to a shell.
     if headers.contains_key(header::ORIGIN) {
         let why = "an upgrade that carries an Origin is refused: kubectl sends none";
@@ -4712,6 +4757,201 @@ spec: {role: writer, subjects: [carol]}
         assert!(shared.store.lock().unwrap().store.get("Job/default/once").is_some());
         drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bare Pod named as a replica of an owner (`x-0` of a Workload `x`, `x-j0` of a Job `x`) and a
+    /// Workload, Deployment, DaemonSet or Job `x` made after it would be two pods of one name: the
+    /// later create is refused (409), as the Pod create is in the other order. A Job `x` and a Pod
+    /// `x-0` do not meet (the Job's pod is `x-j0`), nor does a Pod `x-1` of a Deployment `y`.
+    #[tokio::test]
+    async fn bare_pod_name_collision() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-collide-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let template = |name: &str| json!({ "metadata": { "labels": { "a": name } }, "spec": { "restartPolicy": "Never", "containers": [{ "name": "main", "image": "i" }] } });
+        let made = |kind: &str, name: &str| {
+            let mut object = json!({ "apiVersion": "apps/v1", "kind": kind, "metadata": { "name": name }, "spec": { "selector": { "matchLabels": { "a": name } }, "template": template(name) } });
+            if kind == "Deployment" {
+                object["spec"]["replicas"] = 1.into();
+            }
+            if kind == "Job" {
+                object["apiVersion"] = "batch/v1".into();
+                object["spec"].as_object_mut().unwrap().remove("selector");
+            }
+            object
+        };
+        let create = |kind: &'static str, name: &str| {
+            let (shared, body) = (shared.clone(), made(kind, name));
+            let (group, plural) = match kind {
+                "Job" => ("batch", "jobs"),
+                "Deployment" => ("apps", "deployments"),
+                _ => ("apps", "daemonsets"),
+            };
+            async move {
+                let rest = format!("namespaces/default/{plural}");
+                answer_as(shared, Caller::Admin, "POST", group, &rest, body).await
+            }
+        };
+        // A Pod `x-0` (a Workload's replica name, whichever it is held as) and `x-j0` (a Job's).
+        for (pod, policy, refused, fine) in [
+            ("a-0", None, ["Deployment"], ["Job", "DaemonSet"]),
+            ("b-0", Some("Never"), ["Deployment"], ["Job", "DaemonSet"]),
+            ("c-j0", Some("Never"), ["Job"], ["Deployment", "DaemonSet"]),
+            ("d-j0", None, ["Job"], ["Deployment", "DaemonSet"]),
+            ("e-n0", None, ["DaemonSet"], ["Deployment", "Job"]),
+        ] {
+            let (code, said) = send_pod(&shared, Caller::Admin, a_pod(pod, policy)).await;
+            assert_eq!(code, StatusCode::CREATED, "{pod}: {said}");
+            let owner = pod.rsplit_once('-').unwrap().0;
+            for kind in refused {
+                let (code, said) = create(kind, owner).await;
+                assert_eq!(code, StatusCode::CONFLICT, "{kind} {owner} after Pod {pod}: {said}");
+                let held = match kind {
+                    "Job" => "Job",
+                    "DaemonSet" => "NodeWorkload",
+                    _ => "Workload",
+                };
+                let key = format!("{held}/default/{owner}");
+                assert!(shared.store.lock().unwrap().store.get(&key).is_none(), "{key}");
+            }
+            for kind in fine {
+                let (code, said) = create(kind, owner).await;
+                assert_eq!(code, StatusCode::CREATED, "{kind} {owner} after Pod {pod}: {said}");
+            }
+            // The pod still reads back, once, under the name it was sent as.
+            let (code, one) = pods_of(&shared, &format!("namespaces/default/pods/{pod}")).await;
+            assert_eq!(code, StatusCode::OK, "{pod}: {one}");
+            assert_eq!(one["metadata"]["labels"]["app"], pod, "{one}");
+        }
+        // The other order: the owner first, then the Pod (a replica number is not asked after).
+        for (kind, owner, pod) in [
+            ("Deployment", "p", "p-0"),
+            ("Job", "q", "q-j3"),
+            ("DaemonSet", "r", "r-n4"),
+        ] {
+            let (code, said) = create(kind, owner).await;
+            assert_eq!(code, StatusCode::CREATED, "{kind} {owner}: {said}");
+            let (code, said) = send_pod(&shared, Caller::Admin, a_pod(pod, Some("Never"))).await;
+            assert_eq!(code, StatusCode::CONFLICT, "Pod {pod} after {kind} {owner}: {said}");
+        }
+        // Another namespace's Pod is not this one's.
+        let other = a_pod("h-0", None);
+        let (code, said) = answer_as(shared.clone(), Caller::Admin, "POST", "", "namespaces/else/pods", other).await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let (code, said) = create("Deployment", "h").await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `kubectl logs` and `exec` on a bare Pod's name find it (a Job-held one and a Workload-held one);
+    /// a caller with no right on Jobs or Workloads is told the same 403 for a bare name, a replica's
+    /// and one that is nothing, so neither verb tells what exists.
+    #[tokio::test]
+    async fn bare_pod_logs_and_exec() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-verbs-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let who = "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: nobody}\nspec: {}\n";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(who).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        two_replicas_of_x(&shared).await;
+        for (name, policy) in [("once", Some("Never")), ("always", None)] {
+            let (code, said) = send_pod(&shared, Caller::Admin, a_pod(name, policy)).await;
+            assert_eq!(code, StatusCode::CREATED, "{name}: {said}");
+        }
+        std::fs::create_dir_all(&shared.logs).unwrap();
+        std::fs::write(shared.logs.join("j_default_once_0_main.out"), "the job pod's\n").unwrap();
+        std::fs::write(shared.logs.join("w_default_always_0_main.out"), "the workload pod's\n").unwrap();
+        for (name, wrote) in [("once", "the job pod's\n"), ("always", "the workload pod's\n")] {
+            let (code, said) = answer_as(
+                shared.clone(),
+                Caller::Admin,
+                "GET",
+                "",
+                &format!("namespaces/default/pods/{name}/log"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!((code, said.as_str()), (StatusCode::OK, wrote), "{name}");
+            // (No upgrade is asked: a pod that is found says so, and one that is not is not found.)
+            let (code, said) = answer_as(
+                shared.clone(),
+                Caller::Admin,
+                "GET",
+                "",
+                &format!("namespaces/default/pods/{name}/exec"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{name}: {said}");
+        }
+        for verb in ["log", "exec"] {
+            let (code, said) = answer_as(
+                shared.clone(),
+                Caller::Admin,
+                "GET",
+                "",
+                &format!("namespaces/default/pods/ghost/{verb}"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(code, StatusCode::NOT_FOUND, "{verb}: {said}");
+            let mut answers = Vec::new();
+            for name in ["once", "always", "x-0", "x-j0", "x-n0", "ghost"] {
+                let rest = format!("namespaces/default/pods/{name}/{verb}");
+                let (code, said) = answer_as(
+                    shared.clone(),
+                    Caller::Identity("nobody".into()),
+                    "GET",
+                    "",
+                    &rest,
+                    Value::Null,
+                )
+                .await;
+                assert_eq!(code, StatusCode::FORBIDDEN, "{verb} {name}: {said}");
+                answers.push(said);
+            }
+            assert!(answers.windows(2).all(|two| two[0] == two[1]), "{verb}: {answers:?}");
+        }
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Job that ended with no unit in its status (so no run is counted) is Succeeded or Failed,
+    /// and not Pending for ever, whether it is a Job's pod or a bare Pod held as one.
+    #[test]
+    fn ended_job_pod_phase() {
+        let sent = json!({
+            "apiVersion": "v1", "kind": "Pod", "metadata": { "name": "once", "namespace": "default" },
+            "spec": { "restartPolicy": "Never", "containers": [{ "name": "main", "image": "i" }] },
+        });
+        let held = |status: Value| -> Resource {
+            let meta = json!({ "name": "once", "namespace": "default" });
+            serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": "Job", "metadata": meta, "spec": {}, "status": status,
+            }))
+            .unwrap()
+        };
+        for (status, phase) in [
+            (json!({ "state": "succeeded", "containers": [] }), "Succeeded"),
+            (
+                json!({ "state": "succeeded", "succeeded": 0, "containers": [] }),
+                "Succeeded",
+            ),
+            (
+                json!({ "state": "succeeded", "succeeded": 1, "containers": [] }),
+                "Succeeded",
+            ),
+            (json!({ "state": "failed", "failed": 1, "containers": [] }), "Failed"),
+            (json!({ "state": "running", "containers": [] }), "Pending"),
+        ] {
+            let pod = bare_pod(&sent, &held(status.clone())).expect("a bare pod");
+            assert_eq!(pod["status"]["phase"], phase, "{status}: {pod}");
+            assert_eq!(pod["metadata"]["name"], "once", "{pod}");
+        }
     }
 
     /// The lists a strategic patch merges by a key are the ones Kubernetes's types tag with
