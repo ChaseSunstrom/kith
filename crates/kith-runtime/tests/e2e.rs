@@ -41,6 +41,10 @@ async fn rig(name: &str) -> Option<(Runtime, kith_runtime::Image, std::path::Pat
         eprintln!("skipped: set KITH_E2E=1 to run");
         return None;
     }
+    if !kith_runtime::has_delegated_cgroup() {
+        eprintln!("skipped: no delegated cgroup here");
+        return None;
+    }
     let image_ref = std::env::var("KITH_E2E_IMAGE").unwrap_or(IMAGE.into());
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("e2e-{name}-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
@@ -291,6 +295,10 @@ async fn output_by_name() {
 async fn pull_and_run() {
     if std::env::var_os("KITH_E2E").is_none() {
         eprintln!("skipped: set KITH_E2E=1 to run");
+        return;
+    }
+    if !kith_runtime::has_delegated_cgroup() {
+        eprintln!("skipped: no delegated cgroup here");
         return;
     }
     let image_ref = std::env::var("KITH_E2E_IMAGE").unwrap_or(IMAGE.into());
