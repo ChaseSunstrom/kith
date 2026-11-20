@@ -291,6 +291,18 @@ Only the newest version is fixed. There are no security releases of older ones.
   give nothing; a pod is given no token and no API to ask. `privileged`, the host's
   namespaces, `hostPath` and added capabilities have no field in kith, and an object
   that asks for one is refused by its name. Of a body in protobuf 50,000 fields are read.
+- **`kubectl exec`, `cp` and `port-forward` are one right, `exec`, on the Workload or Job that
+  owns the pod.** `get` alone reads a pod and is refused all three. A `port-forward` reaches
+  any port of the pod, whatever listens there and whatever a NetworkPolicy says: a policy holds
+  a pod's own packets going out, and this is a connection into it from its node, so it asks no
+  policy; the right to `exec` is the right to reach the pod's ports. The right is asked again
+  for each new connection of a session (a binding taken away refuses the next, and ends none
+  that is open). A replica on another node is reached by one route, `/v1/pod-hop`, which only a
+  control node may send (a worker is refused, not asked) and which carries the caller's name
+  with the sender's signature: the node that runs the replica checks the signature, the named
+  caller and the `exec` right on that node, from its own copy of the Roles, before it enters
+  the pod or opens a connection. A pod not yet made on its node is refused, never answered by
+  the host's own ports.
 - **What a resource makes for itself is asked for with it.** Whoever writes a CronJob
   must be allowed to write a Job, and whoever writes a claim that says `provision`
   (every PersistentVolumeClaim does, unless it names no storage class) a Volume.
