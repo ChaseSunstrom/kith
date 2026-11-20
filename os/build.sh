@@ -504,8 +504,14 @@ assemble() { # DIR
             "$efi/linuxx64.efi.stub" "$w/kith-$slot.efi"
         touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-$slot.efi"
     done
-    # The installer's: slot a's, told to install and not to serve (crates/kithd/src/install.rs).
-    printf '%s kith.install' "$(cat "$w/cmdline-a")" >"$w/cmdline-install"
+    # The installer's: slot a's, told to install and not to serve (crates/kithd/src/install.rs),
+    # with its root and verity tree under labels of their own. The kernel takes the first
+    # partition with a label, and a disk that already has kith OS has a root-a: the stick's
+    # hash on that disk's root is a panic (T-1064).
+    sed 's/PARTLABEL=root-a/PARTLABEL=install-root/g; s/PARTLABEL=verity-a/PARTLABEL=install-verity/g' \
+        "$w/cmdline-a" | tr -d '\n' >"$w/cmdline-install"
+    printf ' kith.install' >>"$w/cmdline-install"
+    grep -q 'PARTLABEL=install-root PARTLABEL=install-verity' "$w/cmdline-install" || die "the installer's command line names the disk's root"
     objcopy \
         --add-section .osrel="$w/osrel" --change-section-vma .osrel=0x14dfc0000 \
         --add-section .cmdline="$w/cmdline-install" --change-section-vma .cmdline=0x14dfd0000 \
@@ -578,8 +584,8 @@ assemble() { # DIR
     d=$w/repart-install.d
     mkdir "$d"
     part 10-esp esp esp 64M "CopyBlocks=$w/esp-install.img"
-    part 20-root-a root-x86-64 root-a "$rootsz" "CopyBlocks=$w/root.squashfs"
-    part 30-verity-a root-x86-64-verity verity-a "$veritysz" "CopyBlocks=$w/root.verity"
+    part 20-root-a root-x86-64 install-root "$rootsz" "CopyBlocks=$w/root.squashfs"
+    part 30-verity-a root-x86-64-verity install-verity "$veritysz" "CopyBlocks=$w/root.verity"
     part 50-payload linux-generic payload "$(($(stat -c %s "$w/kith-os.raw") / 1048576 + 1))M" "CopyBlocks=$w/kith-os.raw"
     systemd-repart --empty=create --size=auto --dry-run=no --seed="$seed" --definitions="$d" "$w/kith-os-installer.raw" >"$w/repart-install.log" 2>&1 \
         || { cat "$w/repart-install.log" >&2; die "systemd-repart failed (the installer)"; }

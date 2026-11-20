@@ -95,6 +95,14 @@
         # shellcheck disable=SC2046
         vm install-alpha $(drive alpha.stick) $(drive alpha.disk)
         installed install-alpha vdb
+        # A machine whose disk already has kith OS, that disk before the stick: the kernel takes
+        # the first partition with a label, so the installer's root has its own (install-root),
+        # not the disk's root-a; it starts from the stick and installs on that disk (T-1064).
+        cp "$work/alpha.disk" "$work/old.disk"
+        # shellcheck disable=SC2046
+        vm reinstall $(drive old.disk) $(drive alpha.stick)
+        installed reinstall vda
+        rm -f "$work/old.disk"
         # shellcheck disable=SC2046
         vm alpha $(drive alpha.disk) $(lan 1)
         hears alpha 'kithd: init: alpha is up'

@@ -390,7 +390,9 @@ machine (the test attaches files as disks to VMs): that is your decision, machin
 
 Write `kith-os-installer.raw` to a USB stick (`dd if=kith-os-installer.raw of=/dev/sdX`), or
 attach it to a VM as its first disk, and start the machine from it (UEFI). It is kith OS started
-with `kith.install`: it serves nothing, and asks on the screen and the serial line alike:
+with `kith.install`: it serves nothing, and asks on the screen and the serial line alike. Its
+root and verity tree are labelled `install-root` and `install-verity`, not `root-a`, so it starts
+from the stick on a machine whose disk already has kith OS, and installs over it:
 
 ```
 This machine's disks:

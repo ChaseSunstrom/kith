@@ -160,7 +160,7 @@ spec:
 sh ci/vm.sh --test install             # the installer in QEMU, onto disks that are files
 </code></pre>
 <p><strong>The installer erases the disk it is given.</strong> Nothing in this repository starts it on a real machine (the test attaches files as disks to VMs): that is your decision, machine by machine.</p>
-<p>Write <code>kith-os-installer.raw</code> to a USB stick (<code>dd if=kith-os-installer.raw of=/dev/sdX</code>), or attach it to a VM as its first disk, and start the machine from it (UEFI). It is kith OS started with <code>kith.install</code>: it serves nothing, and asks on the screen and the serial line alike:</p>
+<p>Write <code>kith-os-installer.raw</code> to a USB stick (<code>dd if=kith-os-installer.raw of=/dev/sdX</code>), or attach it to a VM as its first disk, and start the machine from it (UEFI). It is kith OS started with <code>kith.install</code>: it serves nothing, and asks on the screen and the serial line alike. Its root and verity tree are labelled <code>install-root</code> and <code>install-verity</code>, not <code>root-a</code>, so it starts from the stick on a machine whose disk already has kith OS, and installs over it:</p>
 <pre><code>This machine's disks:
   nvme0n1 (256.1 GB, Samsung SSD 970, serial S4EWNX0R123456)
   sda (2000.4 GB, WDC WD20EZRZ, serial WD-WCC4M1234567)
