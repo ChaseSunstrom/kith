@@ -237,7 +237,14 @@ impl Steps for System {
         umount2("/.old", MntFlags::MNT_DETACH).map_err(|e| said("umount")(&e))?;
         std::fs::remove_dir("/.old").map_err(|e| said("the old root")(&e))?;
         let ro = MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | flags;
-        mount(none, "/", none, ro, none).map_err(|e| said("read only")(&e))
+        mount(none, "/", none, ro, none).map_err(|e| said("read only")(&e))?;
+        let seen = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| said("mountinfo")(&e))?;
+        match lacking(&seen, keep, &["nosuid", "nodev", "noexec"]) {
+            None => Ok(()),
+            Some(line) => Err(format!(
+                "at the end the state directory's mount is not nosuid,nodev,noexec: {line}"
+            )),
+        }
     }
 
     fn ids(&mut self, uid: u32, gid: u32) -> Result<(), String> {
