@@ -233,37 +233,8 @@ pub fn draw_question(frame: &mut Frame, stops: &[&str], current: usize, question
         frame.text(MARGIN, y, scale, &line, SITE_TEXT);
         y += 10 * scale;
     }
-    let last = FIRST_STOP_Y + STOP_GAP * stops.len().saturating_sub(1);
-    frame.rect(
-        RAIL_X + (STOP - STROKE) / 2,
-        FIRST_STOP_Y,
-        STROKE,
-        last - FIRST_STOP_Y,
-        SITE_HAIR,
-    );
-    for (i, label) in stops.iter().enumerate() {
-        let centre = FIRST_STOP_Y + STOP_GAP * i;
-        let top = centre - STOP / 2;
-        let (fill, text) = match i.cmp(&current) {
-            std::cmp::Ordering::Less => (SITE_TEXT, SITE_DIM),
-            std::cmp::Ordering::Equal => (SITE_ACCENT, SITE_TEXT),
-            std::cmp::Ordering::Greater => (SITE_BG, SITE_DIM),
-        };
-        frame.rect(RAIL_X, top, STOP, STOP, fill);
-        if i > current {
-            frame.rect(RAIL_X, top, STOP, STROKE, SITE_HAIR);
-            frame.rect(RAIL_X, top + STOP - STROKE, STOP, STROKE, SITE_HAIR);
-            frame.rect(RAIL_X, top, STROKE, STOP, SITE_HAIR);
-            frame.rect(RAIL_X + STOP - STROKE, top, STROKE, STOP, SITE_HAIR);
-        }
-        frame.text(
-            RAIL_X + 2 * STOP,
-            centre - 7 * LABEL_SCALE / 2,
-            LABEL_SCALE,
-            label,
-            text,
-        );
-    }
+    let rail: Vec<(&str, &str)> = stops.iter().map(|&label| (label, "")).collect();
+    draw_rail(frame, &rail, current);
     frame.text(
         MARGIN,
         frame.height.saturating_sub(MARGIN),
@@ -271,6 +242,118 @@ pub fn draw_question(frame: &mut Frame, stops: &[&str], current: usize, question
         footer,
         SITE_DIM,
     );
+}
+
+/// The rail's stops of an install that has its answers (the question rail's words, then the
+/// write and the key): `done` of them are done, as the install goes.
+pub const PROGRESS: [&str; 8] = [
+    "Answers",
+    "Disk",
+    "Name",
+    "Address",
+    "Join",
+    "Encryption",
+    "Writing",
+    "Key",
+];
+
+/// Where the progress screens' words and bar sit: the sentence under the title, the bar under
+/// that (the rail starts below them).
+const LINE_Y: usize = 104;
+const BAR_Y: usize = 156;
+const BAR_H: usize = 14;
+
+/// The middle of stop `i` of `count` on a picture `height` tall: `STOP_GAP` apart, closer
+/// where that many would run off a short screen.
+fn stop_centre(height: usize, count: usize, i: usize) -> usize {
+    let room = height.saturating_sub(MARGIN + FIRST_STOP_Y + STOP);
+    FIRST_STOP_Y + STOP_GAP.min(room / count.saturating_sub(1).max(1)) * i
+}
+
+/// The rail: the line down the stops, and each stop with its label and its detail (what was
+/// answered). Before `current` a stop is done (ink, with a tick), at it the accent, after it
+/// outlined. `current == stops.len()` is all done.
+fn draw_rail(frame: &mut Frame, stops: &[(&str, &str)], current: usize) {
+    let (height, count) = (frame.height, stops.len());
+    let centre = |i: usize| stop_centre(height, count, i);
+    let last = centre(stops.len().saturating_sub(1));
+    frame.rect(
+        RAIL_X + (STOP - STROKE) / 2,
+        FIRST_STOP_Y,
+        STROKE,
+        last - FIRST_STOP_Y,
+        SITE_HAIR,
+    );
+    for (i, (label, detail)) in stops.iter().enumerate() {
+        let top = centre(i) - STOP / 2;
+        let (fill, text) = match i.cmp(&current) {
+            std::cmp::Ordering::Less => (SITE_TEXT, SITE_TEXT),
+            std::cmp::Ordering::Equal => (SITE_ACCENT, SITE_TEXT),
+            std::cmp::Ordering::Greater => (SITE_BG, SITE_DIM),
+        };
+        frame.rect(RAIL_X, top, STOP, STOP, fill);
+        if i < current {
+            // (The tick: two strokes of 3-pixel dots, in paper.)
+            for (x, y) in [(4, 9), (6, 11), (8, 13), (10, 11), (12, 9), (14, 7)] {
+                frame.rect(RAIL_X + x, top + y, 3, 3, SITE_BG);
+            }
+        }
+        if i > current {
+            frame.rect(RAIL_X, top, STOP, STROKE, SITE_HAIR);
+            frame.rect(RAIL_X, top + STOP - STROKE, STOP, STROKE, SITE_HAIR);
+            frame.rect(RAIL_X, top, STROKE, STOP, SITE_HAIR);
+            frame.rect(RAIL_X + STOP - STROKE, top, STROKE, STOP, SITE_HAIR);
+        }
+        let y = centre(i) - 7 * LABEL_SCALE / 2;
+        let end = frame.text(RAIL_X + 2 * STOP, y, LABEL_SCALE, label, text);
+        if !detail.is_empty() && i <= current {
+            frame.text(end + 3 * 6 * LABEL_SCALE, y, LABEL_SCALE, detail, SITE_DIM);
+        }
+    }
+}
+
+/// Draw an install that is under way: `title`, a sentence `line` under it (two lines at most),
+/// the bar when `bar` is `Some(percent)`, the rail of `stops` (label and detail) with `done` of
+/// them done, and `footer` at the foot. Only the colours of the site's tokens are used.
+pub fn draw_progress(
+    frame: &mut Frame,
+    stops: &[(&str, &str)],
+    done: usize,
+    bar: Option<u64>,
+    title: &str,
+    line: &str,
+    footer: &str,
+) {
+    frame.rect(0, 0, frame.width, frame.height, SITE_BG);
+    let mut y = MARGIN;
+    for (piece, scale) in layout(title, frame.width) {
+        frame.text(MARGIN, y, scale, &piece, SITE_TEXT);
+        y += 10 * scale;
+    }
+    let room = frame.width.saturating_sub(2 * MARGIN);
+    for (n, piece) in wrap(line, room / (6 * LABEL_SCALE)).iter().take(2).enumerate() {
+        frame.text(MARGIN, LINE_Y + n * 10 * LABEL_SCALE, LABEL_SCALE, piece, SITE_DIM);
+    }
+    if let Some(percent) = bar {
+        let percent = percent.min(100);
+        frame.rect(MARGIN, BAR_Y, room, BAR_H, SITE_HAIR);
+        frame.rect(MARGIN, BAR_Y, room * percent as usize / 100, BAR_H, SITE_ACCENT);
+        let said = format!("{percent}%");
+        frame.text(MARGIN, BAR_Y + BAR_H + 10, LABEL_SCALE, &said, SITE_TEXT);
+    }
+    draw_rail(frame, stops, done);
+    frame.text(
+        MARGIN,
+        frame.height.saturating_sub(MARGIN),
+        LABEL_SCALE,
+        footer,
+        SITE_DIM,
+    );
+}
+
+/// Draw the end of an install: `title` and `text` over the rail with every stop done.
+pub fn draw_end(frame: &mut Frame, stops: &[(&str, &str)], title: &str, text: &str) {
+    draw_progress(frame, stops, stops.len(), None, title, text, "");
 }
 
 /// Show the picture `shown`, wait for a key (`wait_for_key`), then show it cleared, whatever
@@ -303,7 +386,13 @@ pub struct Device {
     tty: Option<File>,
     geometry: Geometry,
     order: Order,
+    /// The kernel's console log level before the picture, put back when it is dropped.
+    loglevel: Option<String>,
 }
+
+/// The kernel's console log levels (`console_loglevel`, then three more), and the first of
+/// them as one the picture needs: only emergencies reach the console.
+const LOGLEVEL: &str = "/proc/sys/kernel/printk";
 
 /// The framebuffer, when there is one this installer draws on.
 pub fn open() -> Option<Device> {
@@ -319,11 +408,17 @@ pub fn open() -> Option<Device> {
         .open("/dev/tty0")
         .ok()
         .filter(|tty| kith_dm_sys::set_graphics(tty, true).is_ok());
+    // (The graphics mode keeps the kernel's text off the picture on the screen; the level keeps it
+    // off a console that is drawn on another way. A machine that lets neither be set is drawn on.)
+    let loglevel = std::fs::read_to_string(LOGLEVEL)
+        .ok()
+        .filter(|_| std::fs::write(LOGLEVEL, "1").is_ok());
     Some(Device {
         file,
         tty,
         geometry,
         order: Order { red, green, blue },
+        loglevel,
     })
 }
 
@@ -351,6 +446,9 @@ impl Drop for Device {
             // come back with the text.)
             let _ = tty.write_all(b"\x1b[H\x1b[2J\x1b[3J");
             let _ = kith_dm_sys::set_graphics(tty, false);
+        }
+        if let Some(levels) = &self.loglevel {
+            let _ = std::fs::write(LOGLEVEL, levels.trim());
         }
     }
 }
@@ -580,6 +678,111 @@ mod tests {
         let question = "Install kith OS on which disk?\nvda 2 GB\n\nvdb 4 GB";
         let lines: Vec<String> = layout(question, 800).into_iter().map(|(line, _)| line).collect();
         assert_eq!(lines, ["Install kith OS on which disk?", "vda 2 GB", "", "vdb 4 GB"]);
+    }
+
+    fn steps() -> Vec<(&'static str, &'static str)> {
+        PROGRESS.iter().map(|&label| (label, "detail")).collect()
+    }
+
+    /// The pixel at the middle of the left edge of stop `i`'s square.
+    fn stop_edge(frame: &Frame, i: usize) -> [u8; 3] {
+        frame.pixel(RAIL_X + 1, stop_centre(frame.height, PROGRESS.len(), i))
+    }
+
+    #[test]
+    fn fb_progress_marks_the_stops_done_current_and_to_come() {
+        let mut frame = screen(3200, RGB);
+        draw_progress(&mut frame, &steps(), 3, None, "Writing", "Do not power off.", "");
+        for i in 0..PROGRESS.len() {
+            let want = match i.cmp(&3) {
+                std::cmp::Ordering::Less => site("text"),
+                std::cmp::Ordering::Equal => site("accent"),
+                std::cmp::Ordering::Greater => site("hair"),
+            };
+            assert_eq!(stop_edge(&frame, i), want, "stop {i}");
+        }
+        // A done stop carries a tick in paper; one to come is outlined and empty inside.
+        let top = |i: usize| stop_centre(frame.height, PROGRESS.len(), i) - STOP / 2;
+        assert_eq!(frame.pixel(RAIL_X + 5, top(0) + 10), site("bg"), "stop 0 has no tick");
+        assert_eq!(frame.pixel(RAIL_X + 10, top(5) + 10), site("bg"));
+        let last = stop_centre(frame.height, PROGRESS.len(), PROGRESS.len() - 1);
+        assert!(
+            last + STOP / 2 < frame.height - MARGIN,
+            "the rail fits an 800x600 screen"
+        );
+    }
+
+    #[test]
+    fn fb_progress_bar_width_follows_the_percent() {
+        let width = 800 - 2 * MARGIN;
+        let accent_in_bar = |percent: u64| {
+            let mut frame = screen(3200, RGB);
+            draw_progress(&mut frame, &steps(), 6, Some(percent), "Writing", "", "");
+            (0..800)
+                .filter(|&x| frame.pixel(x, BAR_Y + BAR_H / 2) == site("accent"))
+                .count()
+        };
+        assert_eq!(accent_in_bar(0), 0);
+        assert_eq!(accent_in_bar(10), width / 10);
+        assert_eq!(accent_in_bar(37), width * 37 / 100, "finer than tenths");
+        assert_eq!(accent_in_bar(100), width);
+        assert_eq!(accent_in_bar(250), width, "more than all is all");
+        let mut none = screen(3200, RGB);
+        draw_progress(&mut none, &steps(), 6, None, "Writing", "", "");
+        assert!(
+            (0..800).all(|x| none.pixel(x, BAR_Y + BAR_H / 2) == site("bg")),
+            "no bar where there is no progress"
+        );
+    }
+
+    #[test]
+    fn fb_end_screen_has_its_text_and_every_stop_done() {
+        let mut frame = screen(3200, RGB);
+        let text = "Powering off. Take the installer out, then start this machine from its disk.";
+        draw_end(&mut frame, &steps(), "kith OS is installed", text);
+        let mut title = screen(3200, RGB);
+        title.rect(0, 0, 800, 600, site("bg"));
+        title.text(MARGIN, MARGIN, QUESTION_SCALE, "kith OS is installed", site("text"));
+        for y in MARGIN..MARGIN + 7 * QUESTION_SCALE {
+            for x in 0..800 {
+                assert_eq!(frame.pixel(x, y), title.pixel(x, y), "title pixel {x},{y}");
+            }
+        }
+        let mut line = screen(3200, RGB);
+        line.rect(0, 0, 800, 600, site("bg"));
+        let room = (800 - 2 * MARGIN) / (6 * LABEL_SCALE);
+        for (n, piece) in wrap(text, room).iter().enumerate() {
+            line.text(MARGIN, LINE_Y + n * 10 * LABEL_SCALE, LABEL_SCALE, piece, site("dim"));
+        }
+        for y in LINE_Y..LINE_Y + 2 * 10 * LABEL_SCALE {
+            for x in 0..800 {
+                assert_eq!(frame.pixel(x, y), line.pixel(x, y), "end text pixel {x},{y}");
+            }
+        }
+        assert!(accent_rows(&frame).is_empty(), "nothing is current at the end");
+        for i in 0..PROGRESS.len() {
+            assert_eq!(stop_edge(&frame, i), site("text"), "stop {i} is done");
+        }
+    }
+
+    #[test]
+    fn fb_progress_and_end_screens_use_only_the_sites_colours() {
+        let tokens = site_colours();
+        let mut frame = screen(3200, BGR);
+        draw_progress(
+            &mut frame,
+            &steps(),
+            6,
+            Some(42),
+            "Writing",
+            "Writing kith OS to vdb.",
+            "Wait.",
+        );
+        let mut end = screen(3200, BGR);
+        draw_end(&mut end, &steps(), "kith OS is installed", "Powering off.");
+        for p in pixels(&frame).into_iter().chain(pixels(&end)) {
+            assert!(tokens.contains(&p), "{p:?} is not a colour of docs/site.css's :root");
+        }
     }
 
     #[test]

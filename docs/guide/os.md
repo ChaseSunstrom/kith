@@ -434,10 +434,17 @@ another size, or a disk named by serial that now gives another, writes nothing; 
 name not typed twice the same. It then copies kith OS to
 the disk, reads it back to check, and powers off: take the stick out and start it.
 
-On a screen with 32 bits a pixel (the console's framebuffer), each question is also drawn in the
-look of the [installer's page](../install.html): the install's steps as stops on a rail, the one
-being asked in blue, on paper. The answers are still typed, one line each, as above, and the text
-stays on the serial line. An encrypted install's recovery key is shown on the screen too. When the
+On a screen with 32 bits a pixel (the console's framebuffer), the whole install is drawn in the
+look of the [installer's page](../install.html), whatever the answers' source (typed, a file on the
+stick, a URL, or the network): each question, then the steps answered as stops on a rail, done one
+by one with what was answered at each (never the join token), the disk's write as a bar that moves
+with each percent (a sealed state's step after it), and an end screen that says the machine is
+powering off (take the installer out, then start it from its disk), held a few seconds before it
+does. Paper, the site's colours and font, the stop being worked at in blue. The kernel's own
+messages are kept off the picture while it is drawn (the console's log level is turned down, and put
+back when the picture is handed back), and a failure is written as text where it can be read. With
+no such screen the install is text only, as before. The answers are still typed, one line each, as
+above, and the text stays on the serial line. An encrypted install's recovery key is shown on the screen too. When the
 answers were typed, that screen holds until a key is pressed, or for five minutes, then clears; an
 install that was given its answers (from a file, a URL, or the network) does not stop for it. The
 picture is cleared from the text console when the installer hands the screen back. The key is

@@ -1,5 +1,5 @@
 # shellcheck shell=sh
-# shellcheck disable=SC2154 # (names the driver and its parts share)
+# shellcheck disable=SC2154,SC2034 # (names the driver and its parts share)
 # shellcheck disable=SC2015 # (as the script had them before it was cut)
 # Sourced by ci/vm.sh for --test netboot and crypt: it runs inside the driver's shell, with its
 # variables and functions; not a script to run alone.
@@ -66,7 +66,15 @@
                     -netdev "socket,id=n,connect=127.0.0.1:$((port + 8))" -device "virtio-net-pci,netdev=n,mac=$mac${2-,bootindex=1}"
             }
             blank beta
+            # (Its answers are the node's: no one is asked, and the install is drawn all the same:
+            # shown part-way and done, with no kernel text, as from a stick.)
+            [ "$test" != netboot ] || monitor=unix:$work/install-beta.mon,server=on,wait=off
             beta install-beta
+            monitor=
+            if [ "$test" = netboot ]; then
+                shot install-beta mid 'kithd: install: kith OS is on'
+                shot install-beta end 'kithd: init: restarting'
+            fi
             wait "$vm" || fail "the machine started from the network did not install and start again"
             grep -aqF 'kithd: install: kith OS is on vda' "$work/install-beta.log" || fail "the machine started from the network did not install"
             hears alpha "kithd: netboot: $mac has the installer"
