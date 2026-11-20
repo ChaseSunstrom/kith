@@ -282,7 +282,7 @@ port 80 redirects. The ports need CAP_NET_BIND_SERVICE.
   PEM): apply your own, or start with `--acme` (`--acme URL` for another directory; the flag
   accepts its terms) to get and renew one from Let's Encrypt. Point the host's DNS at the
   ingress nodes first, and give `--acme` to every control node that may lead (the leader orders
-  for ingress workers). `kith get service/NAME -o yaml` shows `tls`; a failure is retried an
+  for ingress workers; under `spec.signing: required` a control node that does not lead orders only once the admin has set `spec.ingress: true` on its Node). `kith get service/NAME -o yaml` shows `tls`; a failure is retried an
   hour later. Keys, and the ACME account's (`Secret/kith-system/acme-account`), are Secrets in
   the store.
 - **Bytes as they are:** TLS ends at the ingress and nothing is added; NetworkPolicy sees the

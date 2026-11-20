@@ -271,6 +271,34 @@ fn bind(store: &Store, vols: &BTreeMap<String, Vol>) -> Bound {
 /// On a Volume: it was made for the claim of its name (one that says `provision`).
 pub const MADE_FOR_CLAIM: &str = "kith.dev/made-for-claim";
 
+/// The Volume [`provision`] makes for `claim` on `node`: all of it, so `own_writes::made` holds
+/// the leader's signed write to exactly this (a claim's namespace and name are its own).
+pub fn made_for(claim: &Resource, node: &str) -> Resource {
+    let mut spec = serde_json::json!({ "node": node, "path": "data", "size": claim.spec["size"] });
+    if claim.spec["shared"] == true {
+        spec["shared"] = true.into();
+    }
+    let mut annotations = BTreeMap::from([(MADE_FOR_CLAIM.into(), "true".into())]);
+    if claim.metadata.annotations.get(RECLAIM).is_some_and(|v| v == RETAIN) {
+        annotations.insert(RECLAIM.into(), RETAIN.into());
+    }
+    let key = claim.key();
+    let (namespace, name) = parts(&key);
+    Resource {
+        api_version: kith_api::API_VERSION.into(),
+        kind: "Volume".into(),
+        metadata: kith_api::Metadata {
+            name: name.into(),
+            namespace: Some(namespace.into()),
+            labels: BTreeMap::new(),
+            annotations,
+            revision: Some(0),
+        },
+        spec,
+        status: None,
+    }
+}
+
 /// What the claims that say `provision` ask for: a Volume to make for each that is bound to
 /// none and has none of its name, on the node with the fewest Volumes (of those `ready`
 /// whose labels the claim selects); and the Volumes made so whose claim is gone, to remove.
@@ -308,27 +336,7 @@ pub fn provision(store: &Store, ready: &dyn Fn(&str) -> bool) -> (Vec<Resource>,
             .min_by_key(|(name, (count, _))| (*count, **name));
         let Some((node, (count, _))) = fewest else { continue };
         *count += 1;
-        let mut spec = serde_json::json!({ "node": node, "path": "data", "size": claim.spec["size"] });
-        if claim.spec["shared"] == true {
-            spec["shared"] = true.into();
-        }
-        let mut annotations = BTreeMap::from([(MADE_FOR_CLAIM.into(), "true".into())]);
-        if claim.metadata.annotations.get(RECLAIM).is_some_and(|v| v == RETAIN) {
-            annotations.insert(RECLAIM.into(), RETAIN.into());
-        }
-        make.push(Resource {
-            api_version: kith_api::API_VERSION.into(),
-            kind: "Volume".into(),
-            metadata: kith_api::Metadata {
-                name: name.into(),
-                namespace: Some(namespace.into()),
-                labels: BTreeMap::new(),
-                annotations,
-                revision: Some(0),
-            },
-            spec,
-            status: None,
-        });
+        make.push(made_for(claim, node));
     }
     // What a claim says of keeping its data is said on its Volume, for the day the claim is gone
     // (and again when it says it later, or no longer).
