@@ -4453,11 +4453,11 @@ mod tests {
     #[test]
     fn a_node_workload_or_a_node_alone_runs_no_volumes_mount_and_says_why() {
         let node_workload = volume_gate("NodeWorkload", true, true, true);
-        assert_eq!(node_workload.0, false);
+        assert!(!node_workload.0);
         assert!(node_workload.1.unwrap().contains("NodeWorkload cannot mount volumes"));
         // (Alone: no name in a cluster, and the scheduler has put nothing anywhere.)
         let alone = volume_gate("Workload", true, false, false);
-        assert_eq!(alone.0, false);
+        assert!(!alone.0);
         assert!(alone.1.unwrap().contains("need a node with a name in a cluster"));
         // Not placed yet: waits, with nothing to say (the scheduler says why).
         assert_eq!(volume_gate("Workload", true, false, true), (false, None));
