@@ -57,6 +57,7 @@ Beside them, DIR/kith-os.update: what a running node is given to become this ver
 (it writes it into its other slot). KITH_OS_VERSION names the version built (default:
 the workspace's). KITH_RELEASE_KEY (hex keys, commas between) are the keys its nodes take
 releases from (/etc/kith/release-keys); without, a node takes the first release's key.
+KITH_OS_BIN is a folder with the kithd and kith to put in it (default: what ci/musl.sh builds).
 
   --out DIR   where the image and the pieces it is made of go: a directory this
               made before, or an empty one (it is emptied first)
@@ -469,7 +470,9 @@ if [ -n "$modules" ]; then
 fi
 fetch "$ca_url" "$ca_sha256" "$cache/cacert-$ca_date.pem"
 exec 9>&-
-bin=$(sh "$root/ci/musl.sh")
+# (KITH_OS_BIN: a folder with kithd and kith to build from, where they are not ci/musl.sh's:
+# ci/vm/handover.sh makes a release whose kithd alone differs.)
+bin=${KITH_OS_BIN:-$(sh "$root/ci/musl.sh")}
 # (KITH_OS_VERSION: the name of what is built, where it is not the workspace's version.)
 version=${KITH_OS_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -n 1)}
 case $version in '' | *[!0-9A-Za-z.+-]*) die "a version is letters, digits, dots, + and -: not '$version'" ;; esac
