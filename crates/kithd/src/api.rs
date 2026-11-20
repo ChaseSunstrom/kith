@@ -168,16 +168,37 @@ pub(crate) fn place_of(key: &str) -> (String, Option<String>) {
     }
 }
 
-/// A right asked for: to do a verb to a kind, in a namespace (or in none).
-pub(crate) type Right = (Verb, String, Option<String>);
+/// The resource name a key ends in: `Kind/namespace/name` or `Kind/name`. A key of any other
+/// shape names none (what a Role rule that lists names does not cover).
+pub(crate) fn name_of(key: &str) -> Option<String> {
+    let parts: Vec<&str> = key.split('/').collect();
+    (2..=3)
+        .contains(&parts.len())
+        .then(|| parts[parts.len() - 1].to_string())
+}
+
+/// A right asked for: to do a verb to a kind, in a namespace (or in none), to the resource
+/// called so (`None`: one that is not said, which a rule that lists names does not cover).
+pub(crate) type Right = (Verb, String, Option<String>, Option<String>);
+
+/// `verb` to the resource at `key`, as a [`Right`].
+pub(crate) fn right_of(verb: Verb, key: &str) -> Right {
+    let (kind, namespace) = place_of(key);
+    (verb, kind, namespace, name_of(key))
+}
 
 /// What writing `resources` takes: the right to apply each, and to whatever each reaches
 /// into besides itself. The API asks it of whoever applies them, and the Release and Source
 /// controllers of whoever applied the Release or Source that renders them.
 pub(crate) fn takes(store: &Store, resources: &[Resource]) -> Vec<Right> {
-    let applied = resources
-        .iter()
-        .map(|resource| (Verb::Apply, resource.kind.clone(), place(store, resource)));
+    let applied = resources.iter().map(|resource| {
+        (
+            Verb::Apply,
+            resource.kind.clone(),
+            place(store, resource),
+            Some(resource.metadata.name.clone()),
+        )
+    });
     applied.chain(beyond(store, resources)).collect()
 }
 
@@ -187,7 +208,7 @@ fn beyond(store: &Store, resources: &[Resource]) -> Vec<Right> {
     // one must be allowed to write a Volume there.
     let asks = |resource: &&Resource| resource.kind == "VolumeClaim" && resource.spec["provision"] == true;
     let made = resources.iter().filter(asks);
-    let made = made.map(|resource| (Verb::Apply, "Volume".to_string(), place(store, resource)));
+    let made = made.map(|resource| (Verb::Apply, "Volume".to_string(), place(store, resource), None));
     let written: Vec<_> = resources
         .iter()
         .map(|resource| (resource.kind.clone(), place(store, resource)))
@@ -197,7 +218,7 @@ fn beyond(store: &Store, resources: &[Resource]) -> Vec<Right> {
     let loose = resources
         .iter()
         .filter(|resource| unconfined(resource))
-        .map(|_| (Verb::Apply, "Unconfined".to_string(), None));
+        .map(|_| (Verb::Apply, "Unconfined".to_string(), None, None));
     made.chain(reached(&written)).chain(loose).collect()
 }
 
@@ -237,7 +258,7 @@ fn reached(written: &[(String, Option<String>)]) -> Vec<Right> {
         };
         rights.extend(
             into.iter()
-                .map(|(verb, into)| (verb.clone(), into.to_string(), place.clone())),
+                .map(|(verb, into)| (verb.clone(), into.to_string(), place.clone(), None)),
         );
     }
     rights
@@ -254,9 +275,16 @@ pub(crate) fn permit(
     allowed(shared, caller, |store| {
         let targets = targets(store).into_iter();
         targets
-            .map(|(kind, namespace)| (verb.clone(), kind, namespace))
+            .map(|(kind, namespace)| (verb.clone(), kind, namespace, None))
             .collect()
     })
+}
+
+/// [`permit`] for `verb` to the one resource at `key`: its name is asked too, so a Role rule
+/// that lists names covers it only if it lists this one. (Asked before the store is read: a
+/// refusal is the same whether the resource is there or not.)
+pub(crate) fn permit_key(shared: &Shared, caller: &Caller, verb: Verb, key: &str) -> Result<(), ApiError> {
+    allowed(shared, caller, |_| vec![right_of(verb, key)])
 }
 
 /// A refusal, with the reason, unless `caller` has each of `rights`. The refusal goes in
@@ -266,17 +294,18 @@ fn allowed(shared: &Shared, caller: &Caller, rights: impl FnOnce(&Store) -> Vec<
         let state = shared.store.lock().expect("a handler panicked holding the store");
         let grants = Grants::of(caller, &state.store);
         let mut rights = rights(&state.store).into_iter();
-        rights.find(|(verb, kind, namespace)| !grants.may(verb, kind, namespace.as_deref()))
+        rights.find(|(verb, kind, namespace, name)| !grants.may(verb, kind, namespace.as_deref(), name.as_deref()))
     };
-    let Some((verb, kind, namespace)) = refused else {
+    let Some((verb, kind, namespace, name)) = refused else {
         return Ok(());
     };
     let verb = word(&verb);
     let place = namespace.map_or(String::new(), |namespace| format!(" in namespace {namespace}"));
-    let why = format!("{caller} may not {verb} {kind}{place}: no Role bound to it allows that");
+    let called = name.map_or(String::new(), |name| format!(" {name}"));
+    let why = format!("{caller} may not {verb} {kind}{called}{place}: no Role bound to it allows that");
     shared
         .audit
-        .record(caller, &verb, vec![format!("{kind}{place}")], Err(why.clone()));
+        .record(caller, &verb, vec![format!("{kind}{called}{place}")], Err(why.clone()));
     Err(ApiError::Refused(why))
 }
 
@@ -303,7 +332,13 @@ fn seen<'a>(
     kind: Option<&'a str>,
 ) -> impl Iterator<Item = &'a Resource> {
     let grants = Grants::of(caller, store);
-    let may = move |resource: &&Resource| grants.may(&verb, &resource.kind, resource.metadata.namespace.as_deref());
+    let may = move |resource: &&Resource| {
+        let (namespace, name) = (
+            resource.metadata.namespace.as_deref(),
+            Some(resource.metadata.name.as_str()),
+        );
+        grants.may(&verb, &resource.kind, namespace, name)
+    };
     store.list(kind).filter(may)
 }
 
@@ -346,7 +381,7 @@ fn back_takes(store: &Store, key: &str, to: u64) -> Vec<Right> {
         Some(was) => takes(store, std::slice::from_ref(&was.resource)),
         None => {
             let (kind, namespace) = place_of(key);
-            let mut asks = vec![(Verb::Apply, kind.clone(), namespace.clone())];
+            let mut asks = vec![right_of(Verb::Apply, key)];
             asks.extend(reached(&[(kind, namespace)]));
             asks
         }
@@ -369,10 +404,7 @@ pub(crate) fn refused(store: &Store, caller: &Caller, command: &Command) -> Opti
     let asks = match command {
         Command::Apply { resources, .. } => takes(store, resources),
         Command::Rollback { key, to, .. } => back_takes(store, key, *to),
-        Command::Delete { key } => {
-            let (kind, namespace) = place_of(key);
-            vec![(Verb::Delete, kind, namespace)]
-        }
+        Command::Delete { key } => vec![right_of(Verb::Delete, key)],
         _ => {
             return Some(format!(
                 "{caller} may not write this to the store: it is not an apply, a delete or a rollback"
@@ -380,13 +412,14 @@ pub(crate) fn refused(store: &Store, caller: &Caller, command: &Command) -> Opti
         }
     };
     let grants = Grants::of(caller, store);
-    let (verb, kind, namespace) = asks
+    let (verb, kind, namespace, name) = asks
         .into_iter()
-        .find(|(verb, kind, namespace)| !grants.may(verb, kind, namespace.as_deref()))?;
+        .find(|(verb, kind, namespace, name)| !grants.may(verb, kind, namespace.as_deref(), name.as_deref()))?;
     let place = namespace.map_or(String::new(), |namespace| format!(" in namespace {namespace}"));
+    let called = name.map_or(String::new(), |name| format!(" {name}"));
     let verb = word(&verb);
     Some(format!(
-        "{caller} may not {verb} {kind}{place} (decided again as the write was put in the log): no Role bound to it allows that now"
+        "{caller} may not {verb} {kind}{called}{place} (decided again as the write was put in the log): no Role bound to it allows that now"
     ))
 }
 
@@ -470,8 +503,8 @@ fn veiled(shared: &Shared, caller: &Caller, mut changes: Vec<Change>) -> Vec<Cha
     let state = shared.store.lock().expect("a handler panicked holding the store");
     let grants = Grants::of(caller, &state.store);
     for change in &mut changes {
-        let (kind, namespace) = place_of(&change.after.key());
-        if !grants.may(&Verb::Get, &kind, namespace.as_deref()) {
+        let (_, kind, namespace, name) = right_of(Verb::Get, &change.after.key());
+        if !grants.may(&Verb::Get, &kind, namespace.as_deref(), name.as_deref()) {
             change.before = None;
         }
     }
@@ -567,7 +600,7 @@ async fn drain_plan(
         let lines = crate::sched::drain_lines(store, &seen, grace, &name);
         let may = |line: &serde_json::Value| {
             let kind = line["kind"].as_str().unwrap_or_default();
-            grants.may(&Verb::Get, kind, line["namespace"].as_str())
+            grants.may(&Verb::Get, kind, line["namespace"].as_str(), None)
         };
         Ok(lines.into_iter().filter(may).collect())
     })
@@ -675,7 +708,7 @@ async fn get_one(
     Extension(caller): Extension<Caller>,
     Path(key): Path<String>,
 ) -> Reply<Resource> {
-    permit(&shared, &caller, Verb::Get, |_| vec![place_of(&key)])?;
+    permit_key(&shared, &caller, Verb::Get, &key)?;
     read(&shared, |store| store.get(&key).cloned().ok_or(Error::NotFound(key)))
 }
 
@@ -689,7 +722,7 @@ async fn delete(
 
 /// Delete the resource at `key` as `caller`, if it may: what `DELETE /v1/resources` does.
 pub(crate) async fn deleted(shared: &Arc<Shared>, caller: &Caller, key: String) -> Result<Resource, ApiError> {
-    permit(shared, caller, Verb::Delete, |_| vec![place_of(&key)])?;
+    permit_key(shared, caller, Verb::Delete, &key)?;
     if let Some(node) = key.strip_prefix("Node/") {
         let Json(()) = read(shared, |store| {
             access::control_stays(store, &[(node, None)]).map_err(Error::Invalid)
@@ -706,7 +739,7 @@ async fn history(
     Extension(caller): Extension<Caller>,
     Path(key): Path<String>,
 ) -> Reply<Vec<Revision>> {
-    permit(&shared, &caller, Verb::Get, |_| vec![place_of(&key)])?;
+    permit_key(&shared, &caller, Verb::Get, &key)?;
     read(&shared, |store| store.history(&key).map(<[Revision]>::to_vec))
 }
 
@@ -811,7 +844,7 @@ async fn logs(
     Query(options): Query<LogOptions>,
 ) -> Reply<serde_json::Value> {
     // What a unit wrote is read by who may read the resource that runs it.
-    permit(&shared, &caller, Verb::Get, |_| vec![place_of(&key)])?;
+    permit_key(&shared, &caller, Verb::Get, &key)?;
     output(&shared, &caller, &key, &options).await
 }
 
@@ -905,7 +938,7 @@ pub(crate) async fn restart_replica(
     here: bool,
 ) -> Reply<serde_json::Value> {
     // Who may apply the Workload may restart its replicas: get alone reads them (see `logs`).
-    permit(shared, caller, Verb::Apply, |_| vec![place_of(key)])?;
+    permit_key(shared, caller, Verb::Apply, key)?;
     if !key.starts_with("Workload/") {
         return Err(ApiError::Refused(format!(
             "{key}: only a Workload's replicas are restarted"
@@ -1240,6 +1273,139 @@ spec: {size: 1Gi}
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A Role rule that lists `names` (the right to ConfigMaps called `canary`): apply, get,
+    /// history, delete and going back reach that one and no other; list and watch show only it;
+    /// and a refusal reads the same for a name that is there and one that is not (no oracle).
+    #[tokio::test]
+    async fn rule_names_list_and_oracle() {
+        let dir = std::env::temp_dir().join(format!("kithd-rule-names-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let one = |name: &str, kind: &str| {
+            let text =
+                format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{name: {name}}}\nspec: {{data: {{}}}}\n");
+            kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap()
+        };
+        let roles = "
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: canary-only}
+spec: {rules: [{kinds: [ConfigMap], verbs: [apply, get, list, watch, delete], names: [canary]}]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: bot-canary-only}
+spec: {role: canary-only, subjects: [bot]}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: bot}
+spec: {}
+";
+        for resource in kith_api::Resource::from_source(roles).unwrap() {
+            let resource = resource.unwrap();
+            applied(&shared, &Caller::Admin, vec![resource]).await.ok().unwrap();
+        }
+        for name in ["canary", "stable"] {
+            applied(&shared, &Caller::Admin, vec![one(name, "ConfigMap")])
+                .await
+                .ok()
+                .unwrap();
+        }
+        let bot = Caller::Identity("bot".into());
+        // What a refusal says, with the name taken out: it must not vary with what is stored.
+        let said = |result: Result<(), ApiError>, name: &str| match result {
+            Err(ApiError::Refused(why)) => Some(why.replace(name, "NAME")),
+            _ => None,
+        };
+
+        // List and watch: the one it is named for, and nothing else (of the kind or another).
+        let names = |verb: Verb| -> Vec<String> {
+            let state = shared.store.lock().unwrap();
+            let mut seen: Vec<String> = seen(&state.store, &bot, verb, None).map(Resource::key).collect();
+            seen.sort();
+            seen
+        };
+        assert_eq!(names(Verb::List), ["ConfigMap/default/canary"]);
+        assert_eq!(names(Verb::Watch), ["ConfigMap/default/canary"]);
+        assert!(sight(&shared, &bot, Verb::List, Some("ConfigMap")).is_ok());
+        assert!(sight(&shared, &bot, Verb::List, Some("Secret")).is_err());
+
+        // Get and history: the same refusal for a name that is stored and one that is not.
+        for verb in [Verb::Get, Verb::Delete] {
+            let ask = |name: &str| permit_key(&shared, &bot, verb.clone(), &format!("ConfigMap/default/{name}"));
+            assert!(ask("canary").is_ok());
+            let here = said(ask("stable"), "stable").expect("a name left out is refused");
+            let gone = said(ask("ghost"), "ghost").expect("a name left out is refused");
+            assert_eq!(
+                here, gone,
+                "the refusal does not tell a stored name from one that is not"
+            );
+            // Another kind, another namespace, a key of no name, a wildcard.
+            assert!(permit_key(&shared, &bot, verb.clone(), "Secret/default/canary").is_err());
+            assert!(
+                permit_key(&shared, &bot, verb.clone(), "ConfigMap/canary").is_ok(),
+                "a key of one part names it"
+            );
+            assert!(permit_key(&shared, &bot, verb.clone(), "ConfigMap/default/*").is_err());
+            assert!(permit_key(&shared, &bot, verb.clone(), "ConfigMap/default/canary/more").is_err());
+        }
+
+        // Apply: a create of a name not listed is refused as an update of one is, and changes nothing.
+        let create = applied(&shared, &bot, vec![one("ghost", "ConfigMap")]).await;
+        let update = applied(&shared, &bot, vec![one("stable", "ConfigMap")]).await;
+        let (create, update) = (create.err().unwrap(), update.err().unwrap());
+        let (ApiError::Refused(create), ApiError::Refused(update)) = (create, update) else {
+            panic!("a name left out is refused")
+        };
+        assert_eq!(create.replace("ghost", "NAME"), update.replace("stable", "NAME"));
+        // Listed with an unlisted one in the body: all refused.
+        let both = vec![one("canary", "ConfigMap"), one("stable", "ConfigMap")];
+        assert!(applied(&shared, &bot, both).await.is_err());
+        assert!(
+            shared
+                .store
+                .lock()
+                .unwrap()
+                .store
+                .get("ConfigMap/default/ghost")
+                .is_none()
+        );
+        let revision = |key: &str| shared.store.lock().unwrap().store.get(key).unwrap().metadata.revision;
+        assert_eq!(revision("ConfigMap/default/stable"), Some(1));
+        assert_eq!(
+            revision("ConfigMap/default/canary"),
+            Some(1),
+            "the body was refused whole"
+        );
+        let mut changed = one("canary", "ConfigMap");
+        changed.spec = serde_json::json!({"data": {"v": "2"}});
+        applied(&shared, &bot, vec![changed]).await.ok().unwrap();
+        assert_eq!(revision("ConfigMap/default/canary"), Some(2));
+        assert!(applied(&shared, &bot, vec![one("canary", "Secret")]).await.is_err());
+
+        // Going back: of the named one it goes; of another it does not.
+        let key = "ConfigMap/default/stable";
+        assert!(rolled_back(&shared, &bot, key.into(), 1, None).await.is_err());
+        assert!(
+            rolled_back(&shared, &bot, "ConfigMap/default/canary".into(), 1, None)
+                .await
+                .is_ok()
+        );
+
+        // Delete: the unlisted one stays; the listed one goes.
+        assert!(deleted(&shared, &bot, key.into()).await.is_err());
+        assert!(shared.store.lock().unwrap().store.get(key).is_some());
+        assert!(deleted(&shared, &bot, "ConfigMap/default/canary".into()).await.is_ok());
+
+        // And where the leader decides (the log's own check) the name is asked too.
+        let state = shared.store.lock().unwrap();
+        let delete = |key: &str| Command::Delete { key: key.into() };
+        assert!(refused(&state.store, &bot, &delete(key)).is_some_and(|why| why.contains("stable")));
+        assert_eq!(refused(&state.store, &bot, &delete("ConfigMap/default/canary")), None);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A template that sets a container's seccomp unconfined, or names the calls its filter
     /// allows, takes the right to apply Unconfined (in no namespace): a Workload, a Job, a
     /// NodeWorkload, or the Job of a CronJob. One that keeps its filter takes nothing of it.
@@ -1260,7 +1426,7 @@ spec: {size: 1Gi}
                  spec: {{template: {{containers: [{{name: a, image: x{seccomp}}}]}}}}\n"
             )
         };
-        let unconfined = (Verb::Apply, "Unconfined".to_string(), None);
+        let unconfined = (Verb::Apply, "Unconfined".to_string(), None, None);
         let state = shared.store.lock().unwrap();
         let takes_of = |text: &str| takes(&state.store, &one(text));
         for kind in ["Workload", "Job", "NodeWorkload"] {
