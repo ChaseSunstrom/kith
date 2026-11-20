@@ -509,7 +509,7 @@ impl Keys {
 
     /// The keys this node takes releases from, and whose they are: `given`, `kept`,
     /// `image`, or `none` (no keys: the first release's is taken).
-    fn mine(&self) -> Result<(Vec<String>, &'static str), String> {
+    pub(crate) fn mine(&self) -> Result<(Vec<String>, &'static str), String> {
         if !self.given.is_empty() {
             return Ok((self.given.iter().map(|key| key.trim().to_string()).collect(), "given"));
         }

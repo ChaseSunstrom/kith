@@ -511,6 +511,11 @@ erase. `--disk only` (the default) installs on a machine's one disk and refuses 
 several; `--disk nvme0n1` names it. Netboot turns itself off after `--minutes` (30; at most 60),
 when the node restarts, or with `--off`.
 
+The machine is installed with this node's release keys (as the node holds them when netboot is
+turned on) and `--lan-releases`, if the node has them: it takes kith OS releases from the same
+keys, not from the first release's. The answers hold 8 keys at most: a node with more, or with
+keys it cannot read, does not turn netboot on and says which.
+
 The node must be the one that started the cluster (it holds the CA, which makes the join tokens)
 and run with `--listen`. An Identity that may apply Nodes, Roles and RoleBindings sends the same
 over TLS (`GET` says where it stands, `DELETE` turns it off):

@@ -1086,6 +1086,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             }
             eprintln!("kithd: node {} serving other nodes on {address}", cluster.me.name);
             let _ = netboot::PORT.set(address.port());
+            let _ = netboot::RELEASES.set((args.release_key.clone(), state.clone(), args.lan_releases));
             if args.admit_deleted_nodes {
                 eprintln!("kithd: --admit-deleted-nodes: a deleted node's certificate is still taken here");
                 cluster::ADMIT_DELETED.store(true, std::sync::atomic::Ordering::Relaxed);
