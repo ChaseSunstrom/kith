@@ -10,6 +10,10 @@ use std::sync::{Arc, mpsc};
 
 #[test]
 fn a_create_is_not_robbed_of_its_process_by_the_reaper() {
+    if !kith_runtime::has_delegated_cgroup() {
+        eprintln!("skipped: no delegated cgroup here");
+        return;
+    }
     const THREADS: usize = 8;
     const EACH: usize = 6;
     let root = std::env::temp_dir().join(format!("kith-create-reap-{}", std::process::id()));
