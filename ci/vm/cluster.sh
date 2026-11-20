@@ -17,6 +17,11 @@
         if [ "$test" = pods ] || [ "$test" = policy ]; then
             bwrap=$(command -v bwrap) || skip "no bwrap (bubblewrap) to start a sandbox inside a container with"
         fi
+        if [ "$test" = nested ]; then
+            for tool in bwrap unshare bash ldd; do
+                command -v "$tool" >/dev/null 2>&1 || skip "no $tool for the second runtime inside a container"
+            done
+        fi
         if [ "$test" = tunnel ]; then
             # (The provider's: this machine's ip and wg, run there; and keys made by wg here.)
             for tool in ip wg cpio ldd socat; do
@@ -41,9 +46,9 @@
         [ "$test" != home ] || { more='--mesh --ingress' others='2 3 4' nodes=four four=',[^,? ]+'; }
         # (access: the nodes run the image tests.sh built with the forge feature.)
         [ "$test" != access ] || base=$osdir
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ]; then
         others=2 more=--mesh project=''
-        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] || others=''
+        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != nested ] || others=''
         # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
         # as a node's state from before had none: kithd counts what their pods write.)
         [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
@@ -84,7 +89,11 @@
                 # as one that names a user who is not root, and as two that say what to start
                 # (an image nothing more is said of, as a chart has one). (share: what a
                 # container's ids are, and what it sees of files.)
-                rustc --edition 2024 -O -C panic=abort --target x86_64-unknown-linux-musl -o "$work/pod" "$root/ci/pod.rs" >&2
+                # (nested: pod without its symbols, 0.8 MB and not 5, for the state partition's 32 MB.)
+                symbols=''
+                [ "$test" != nested ] || symbols='-C strip=symbols'
+                # shellcheck disable=SC2086 # (one option or none)
+                rustc --edition 2024 -O -C panic=abort $symbols --target x86_64-unknown-linux-musl -o "$work/pod" "$root/ci/pod.rs" >&2
                 digest=$(printf pod | sha256sum | cut -d ' ' -f 1)
                 image=$work/seed/runtime/images/$digest
                 mkdir -p "$image/rootfs/bin"
@@ -106,6 +115,43 @@
                     head -c 1048576 /dev/urandom >"$image/rootfs/data/small"
                     head -c 1048576 /dev/urandom >"$image/rootfs/data/other"
                     echo leaf >"$image/rootfs/tree/leaf"
+                fi
+                if [ "$test" = nested ]; then
+                    # And an image that holds a second runtime and kithd in agent mode (ci/vm/nested.sh):
+                    # this machine's bash, bubblewrap and the tools the probe asks of them, with what they
+                    # are linked to; kithd, kith and pod, static; the probe and the inner Job; and, in
+                    # /seed/runtime, pod as an image for the inner kithd to run. For a user who is not root,
+                    # as a sandbox is (the pods image above). (Bubblewrap and not runc: the state partition
+                    # is 32 MB as built, and runc with kithd is more than it holds. Kith and pod are the
+                    # first images' own, linked and not copied, for the same reason.)
+                    digest=$(printf nested | sha256sum | cut -d ' ' -f 1)
+                    image=$work/seed/runtime/images/$digest
+                    mkdir -p "$image/rootfs/bin" "$image/rootfs/seed/runtime/refs"
+                    cp "$(sh "$root/ci/musl.sh")/kithd" "$image/rootfs/bin/kithd"
+                    for tool in kith pod; do
+                        ln "$work/seed/runtime/images/$(printf %s "$tool" | sha256sum | cut -d ' ' -f 1)/rootfs/bin/$tool" "$image/rootfs/bin/$tool"
+                    done
+                    : >"$work/linked"
+                    for tool in bash bwrap unshare timeout seq id rmdir grep tail tr cp mkdir sleep; do
+                        path=$(command -v "$tool") || fail "no $tool to put in the image of the nested test"
+                        cp -L "$path" "$image/rootfs/bin/$tool"
+                        ldd "$path" | awk '$2 == "=>" && $3 ~ /^\// { print ($1 ~ /^\// ? $1 : $3), $3 } $1 ~ /^\// && $2 != "=>" { print $1, $1 }' >>"$work/linked"
+                    done
+                    ln "$image/rootfs/bin/bash" "$image/rootfs/bin/sh"
+                    sort -u "$work/linked" | while read -r to from; do
+                        mkdir -p "$image/rootfs${to%/*}"
+                        cp -L "$from" "$image/rootfs$to"
+                    done
+                    cp "$root/ci/vm/nested-probe.sh" "$image/rootfs/probe.sh"
+                    cp "$root/ci/vm/nested-job.json" "$image/rootfs/inner-job.json"
+                    inner=$image/rootfs/seed/runtime
+                    mkdir -p "$inner/images/$(printf pod | sha256sum | cut -d ' ' -f 1)/rootfs/bin"
+                    ln "$image/rootfs/bin/pod" "$inner/images/$(printf pod | sha256sum | cut -d ' ' -f 1)/rootfs/bin/pod"
+                    echo '{}' >"$inner/images/$(printf pod | sha256sum | cut -d ' ' -f 1)/config.json"
+                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$(printf pod | sha256sum | cut -d ' ' -f 1)" >"$inner/refs/kith.test%2fpod:1"
+                    echo '{}' >"$image/config.json"
+                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fnested:1"
+                    touch -d '+1 day' "$work"/seed/runtime/images/*/config.json "$inner"/images/*/config.json
                 fi
                 if [ "$test" = pods ] || [ "$test" = policy ]; then
                     # And bubblewrap as this machine has it, with what it is linked to, beside
@@ -145,7 +191,7 @@
             # (quota: room for what its pods write. pods: room above its reserve, which its
             # full pod crosses on purpose.)
             case $test${KITH_E2E:-} in
-                pods1 | kube1 | quota*) truncate -s 2G "$1" ;;
+                pods1 | kube1 | quota* | nested*) truncate -s 2G "$1" ;;
                 pods) truncate -s 512M "$1" ;;
             esac
         }
@@ -367,6 +413,9 @@ EOF
         fi
         if [ "$test" = outlive ]; then
             . "$root/ci/vm/outlive.sh"
+        fi
+        if [ "$test" = nested ]; then
+            . "$root/ci/vm/nested.sh"
         fi
         if [ "$test" = compose ]; then
             . "$root/ci/vm/compose.sh"
