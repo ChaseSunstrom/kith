@@ -67,7 +67,9 @@ KITHD_IDLE_RSS = 9 * MB
 # RAISE, kith 3.02 to 3.03 (T-1107): main 7b895da2 builds kith at 3,163,480 B in one folder and
 # 3,167,576 B (877 B over 3.02) in another; T-1016's kith adds a 4 KiB page, so train AY's merged
 # tree is over 3.02 in every folder.
-SIZE_BUDGETS = {"kith": int(3.03 * MB), "kith-remote": int(3.64 * MB), "kithd": int(KITHD_SIZE * MB)}
+# RAISE, kith-remote 3.64 to 3.66 (T-0990): kith package push|render and lint parse a kithVersion
+# range with the semver crate, new to the kith binaries (3.65 MB measured on fa6816d6 merged in).
+SIZE_BUDGETS = {"kith": int(3.03 * MB), "kith-remote": int(3.66 * MB), "kithd": int(KITHD_SIZE * MB)}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
@@ -86,7 +88,9 @@ TIME_BUDGETS = {
     # RAISED 10 -> 20 ms (T-1096): under a 25+ load it read 16.1 and 18.0 ms and refused closes and prechecks;
     # bring it back to 10 ms once the trains are done and the host is quiet.
     "a status change reaching a second kithd": 0.020,
-    "one DNS answer from kithd": 0.007,
+    # RAISED 7 -> 15 ms (T-1175): under a 20+ load it read 12.3 ms and refused closes; bring it back
+    # to 7 ms once the trains are done and the host is quiet.
+    "one DNS answer from kithd": 0.015,
 }
 # A local image (no registry): a rootfs holding the static kithd, which runs until stopped.
 IMAGE = "local.test/timing:1"

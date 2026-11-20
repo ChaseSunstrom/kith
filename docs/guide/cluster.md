@@ -270,6 +270,23 @@ ready replica in turn, wherever it runs: kithd relays it, over the mesh if neede
 replica's port on `127.0.0.1` (or `::1`). TCP only; a named `targetPort` is a container port of
 that name. A kithd restart drops the connections through it.
 
+A Service also has an IPv4 address, `status.addressV4`, for a client with no IPv6: the leader gives
+it the first free address of the Service range (`--service-range ADDRESS/BITS` or
+`KITH_SERVICE_RANGE`, default `100.87.0.0/16`; give every node the same one), and the Service's name
+answers it as an A record beside the AAAA. kithd holds it on the loopback as a /32 and relays a
+connection to it as it does one to the mesh address. The range is
+refused if it overlaps the pod range, the people ranges or a network a link of the node holds (a
+default that overlaps is dropped with a warning: that node serves no IPv4 for Services and answers
+no A record, the others do). The default `100.87.0.0/16` is inside `100.64.0.0/10`, the shared
+(CGNAT) range Tailscale gives its addresses from: that check sees only the addresses the node holds
+when kithd starts, so a Tailscale or a link that comes up later, or on another node, is not
+caught. Where such a network is in use, name another range on every node. The next Service gets
+the free address after the highest in use, wrapping at the range's end: the address of a deleted
+Service is free again at once only if it was the highest, and otherwise after the allocation wraps.
+A pod reaches a Service only at its address and a port kithd listens on there (a TCP listener of
+the host on a Service's address at any other port is not open to pods, nor is a Service's port that
+a host listener on every address already holds: kithd cannot listen there).
+
 A Service with `headless: true` (`clusterIP: None` in Kubernetes) has no address of its own: its
 name answers the addresses of its ready replicas, and it cannot be `expose`d. Each ready replica
 is also named `NAME-N.SERVICE.NAMESPACE.svc.cluster.local` (a StatefulSet's pod names) under every
@@ -488,6 +505,12 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
   cordoned until undrain. A rolling upgrade from an older kithd meets a cordon with no record: a
   drain that joins it records itself as the owner, so once the update ends, undrain leaves the node
   cordoned, and `kith node uncordon` lifts it.
+- An `UpdatePlan` with `drain: true` does this for each node it picks (see [what an update
+  does](os.md#rolling-a-release-through-the-cluster)): it drains the node, restarts it once each replica the
+  plan says moves runs on another node (a replica that stays holds nothing), and lifts the drain
+  when the node is done, the plan is paused or changed, its OSRelease is gone, or the node leaves
+  its selector. It waits at most `drainSeconds` (300 unless said, 3600 at most). It lifts only a
+  drain it put on: yours, put on first, stays until you undrain.
 
 ### Checkpointing a long GPU Job
 

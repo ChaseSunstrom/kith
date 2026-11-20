@@ -29,7 +29,7 @@ mod encrypted;
 mod exits;
 #[allow(
     dead_code,
-    reason = "the CTAP2 client's wire half (T-0966): nothing calls it until the record slice (docs/adr-fido2.md section 6); its tests run"
+    reason = "the CTAP2 client's wire half (T-0966): crypt.rs calls get_assertion; the rest of the client that nothing calls yet waits for the rest of docs/adr-fido2.md section 6"
 )]
 mod fido2;
 // A software security key: in unit tests and in the `fido2-test` build, in no release
@@ -120,6 +120,9 @@ struct Args {
     /// The IPv4 network this node's pods get their addresses from (/8 to /24; refused if an address of this node, a LAN or a tailnet, is in it)
     #[arg(long, env = "KITH_POD_RANGE", value_name = "ADDR/BITS", default_value_t = kith_mesh::pod::Range::default())]
     pod_range: kith_mesh::pod::Range,
+    /// The IPv4 network the Services' addresses come from (the same on every node; refused if it overlaps --pod-range, the people's 100.89.0.0/16 or a network this node has; the default, if it overlaps one, turns Service IPv4 off for this node) [default: 100.87.0.0/16]
+    #[arg(long, env = "KITH_SERVICE_RANGE", value_name = "ADDR/BITS")]
+    service_range: Option<kith_mesh::pod::Range>,
     /// Serve the API to other nodes on this address (TLS); the first start makes this node a cluster of one
     #[arg(long, env = "KITH_LISTEN", value_name = "ADDR:PORT")]
     listen: Option<std::net::SocketAddr>,
@@ -413,13 +416,9 @@ fn main() -> ExitCode {
         &mut std::io::stderr(),
         b"kithd: built with forge: POST /v1/forge appends unchecked entries; never ship this\n",
     );
-    // The same for the software security key (the VM test, T-0955, looks for the line); started as
-    // `kithd fido2-authenticator` it then answers on /dev/uhid and never returns.
+    // The same for the software security key (the VM test, T-0973, looks for the line).
     #[cfg(feature = "fido2-test")]
-    {
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), fido2_test::STARTUP_LINE);
-        fido2_test::shim();
-    }
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), fido2_test::STARTUP_LINE);
     // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
     if std::process::id() == 1 {
         keeper::keep();
@@ -439,6 +438,13 @@ fn main() -> ExitCode {
         }
     }
     let mut boot = kept.map(|(start, _)| init::early(start > 1));
+    // The VM test of the client against the stand-in (ci/vm/fido2.sh): `fido2-test` among the
+    // kernel's bare words, handed to the first process, in a fido2-test build alone. It ends in a
+    // power off.
+    #[cfg(feature = "fido2-test")]
+    if first && std::env::args().skip(1).any(|a| a == "fido2-test") {
+        fido2_test::vm_test();
+    }
     if let Some(source) = boot.as_mut().and_then(|boot| boot.install.take()) {
         installer(boot.expect("there is one"), source);
     }
@@ -887,6 +893,14 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             format_args!("kithd: WARNING: {clash} (going on: pods may not reach, or be reached from, that network)\n"),
         );
     }
+    // The Services' IPv4 range: an explicit one that clashes refuses; the default that clashes is
+    // left off for this node (said once), and kithd starts without Service IPv4 here.
+    let (service_range, off) =
+        services::v4::choose(args.service_range, |range| range.service_clash_in_use(&args.pod_range))?;
+    if let Some(off) = off {
+        let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("kithd: WARNING: {off}\n"));
+    }
+    pods::set_service_range(service_range);
     // --people: neither the pods' range nor a network of this node may overlap 100.89.0.0/16
     // (docs/adr-people.md, Review 4). The range is a flag, so it refuses; a lease that lands in
     // the people's range is only said where a refusal would restart the machine (as above).
@@ -1560,6 +1574,25 @@ mod tests {
         assert!(super::clash_refuses(named, false));
         assert!(!super::clash_refuses(named, true), "as init it would loop the reboot");
         assert!(!super::clash_refuses(default, false) && !super::clash_refuses(default, true));
+    }
+
+    #[test]
+    fn service_range_is_the_default_or_a_network_the_node_names() {
+        use clap::Parser;
+        let parse = |args: &[&str]| super::Args::try_parse_from(["kithd"].into_iter().chain(args.iter().copied()));
+        assert!(
+            parse(&[]).unwrap().service_range.is_none(),
+            "the default is chosen at start"
+        );
+        assert_eq!(
+            parse(&["--service-range", "10.99.0.0/16"])
+                .unwrap()
+                .service_range
+                .unwrap()
+                .to_string(),
+            "10.99.0.0/16"
+        );
+        assert!(parse(&["--service-range", "127.0.0.0/16"]).is_err(), "loopback");
     }
 
     #[test]
