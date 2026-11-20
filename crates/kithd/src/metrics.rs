@@ -40,11 +40,13 @@ const ASK_FOR: Duration = Duration::from_secs(3);
 const MAX_ANSWER: usize = 4 << 20;
 
 /// What a ring keeps for one slot: the sum of the samples in it and how many (a 5 min slot is
-/// the mean of what 10 s samples fell in it).
+/// the mean of what 10 s samples fell in it). A value that is NaN is a value not known: it is
+/// not summed, and `got` counts each value's samples apart from the others'.
 #[derive(Clone, Copy)]
 struct Cell<const K: usize> {
     slot: u64,
     n: u32,
+    got: [u32; K],
     sum: [f64; K],
 }
 
@@ -52,6 +54,7 @@ impl<const K: usize> Cell<K> {
     const EMPTY: Self = Cell {
         slot: 0,
         n: 0,
+        got: [0; K],
         sum: [0.0; K],
     };
 }
@@ -75,27 +78,27 @@ impl<const K: usize, const N: usize> Ring<K, N> {
         let slot = at / self.step;
         let cell = &mut self.cells[(slot % N as u64) as usize];
         if cell.n == 0 || cell.slot != slot {
-            *cell = Cell {
-                slot,
-                n: 0,
-                sum: [0.0; K],
-            };
+            *cell = Cell { slot, ..Cell::EMPTY };
         }
         cell.n += 1;
-        for (sum, value) in cell.sum.iter_mut().zip(values) {
-            *sum += value;
+        for (i, value) in values.into_iter().enumerate() {
+            if !value.is_nan() {
+                cell.sum[i] += value;
+                cell.got[i] += 1;
+            }
         }
     }
 
     /// The `points` slots that end with the one `end` is in, oldest first; `None` for a slot
-    /// nobody wrote (or one a newer slot took the place of, or one before the epoch).
+    /// nobody wrote (or one a newer slot took the place of, or one before the epoch). A value of
+    /// a slot that no sample had is NaN.
     fn series(&self, end: u64, points: usize) -> Vec<Option<[f64; K]>> {
         let last = end / self.step;
         (0..points)
             .map(|i| {
                 let slot = last.checked_sub((points - 1 - i) as u64)?;
                 let cell = &self.cells[(slot % N as u64) as usize];
-                (cell.n > 0 && cell.slot == slot).then(|| cell.sum.map(|sum| sum / f64::from(cell.n)))
+                (cell.n > 0 && cell.slot == slot).then(|| std::array::from_fn(|i| cell.sum[i] / f64::from(cell.got[i])))
             })
             .collect()
     }
@@ -144,9 +147,14 @@ impl Rings {
         self.coarse.add(at, values);
     }
 
-    fn work(&mut self, at: u64, key: &str, values: [f64; 2]) {
+    /// Forget the Workloads not seen for `KEEP_WORKLOAD` as of `at` (once a tick, whether or not
+    /// any was seen in it).
+    fn purge(&mut self, at: u64) {
         self.work
             .retain(|_, work| at.saturating_sub(work.last) <= KEEP_WORKLOAD);
+    }
+
+    fn work(&mut self, at: u64, key: &str, values: [f64; 2]) {
         if !self.work.contains_key(key) && self.work.len() >= MAX_WORKLOADS {
             return;
         }
@@ -209,7 +217,10 @@ impl Rings {
 fn column<const K: usize>(rows: &[Option<[f64; K]>], i: usize, places: i32) -> Vec<Option<f64>> {
     let scale = 10f64.powi(places);
     rows.iter()
-        .map(|row| row.map(|values| (values[i] * scale).round() / scale))
+        .map(|row| {
+            let value = row.map(|values| values[i]).filter(|value| !value.is_nan());
+            value.map(|value| (value * scale).round() / scale)
+        })
         .collect()
 }
 
@@ -295,15 +306,27 @@ impl Local {
         });
     }
 
-    /// Whether it is what was asked for: `points` in each series, and no more Workloads than a
-    /// node keeps (what another node sent is not taken on trust for its size).
+    /// Only the Workloads `known` says exist (by `NS/NAME`): what another node says of a name this
+    /// cluster has no Workload of is not shown.
+    fn keep_known(&mut self, known: impl Fn(&str) -> bool) {
+        self.workloads.retain(|key, _| known(key));
+    }
+
+    /// Whether it is what was asked for: `points` in each series, no more Workloads than a node
+    /// keeps, and each named `NS/NAME` (what another node sent is not taken on trust for its size
+    /// or its names: an `@` in one would pass for the `NS/NAME@NODE` of another's).
     fn fits(&self, points: usize) -> bool {
+        let named = |key: &str| {
+            key.split_once('/')
+                .is_some_and(|(namespace, name)| !namespace.is_empty() && !name.is_empty() && !name.contains('/'))
+                && !key.contains('@')
+        };
         self.node.columns().iter().all(|column| column.len() == points)
             && self.workloads.len() <= MAX_WORKLOADS
             && self
                 .workloads
-                .values()
-                .all(|w| w.cpu.len() == points && w.mem.len() == points)
+                .iter()
+                .all(|(key, w)| named(key) && w.cpu.len() == points && w.mem.len() == points)
     }
 }
 
@@ -366,7 +389,21 @@ fn now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
+/// Every Node but `me`, with where to ask it (none while it has no address: it is shown as
+/// missing, not left out as though it were not there).
+fn peers_of<'a>(
+    nodes: impl Iterator<Item = &'a kith_api::Resource>,
+    me: &str,
+) -> Vec<(String, Option<crate::view::Upstream>)> {
+    nodes
+        .filter(|node| node.metadata.name != me)
+        .map(|node| (node.metadata.name.clone(), crate::view::Upstream::of(node)))
+        .collect()
+}
+
 /// `GET /v1/metrics`: every node's series.
+// ponytail: not cached, and one call to each peer per request; if many viewers poll, a 2 to 5 s
+// cache of the merged answer per (range, grants) is the fix.
 pub async fn serve(
     State(shared): State<std::sync::Arc<Shared>>,
     Extension(caller): Extension<Caller>,
@@ -378,19 +415,17 @@ pub async fn serve(
     let end = now() / step * step;
     let me = shared.members.me().to_string();
     let mine = rings().local(&me, step, points, end);
-    let peers: Vec<(String, crate::view::Upstream)> = {
+    let peers = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
-        let nodes = state.store.list(Some("Node"));
-        let nodes = nodes.filter_map(|node| Some((node.metadata.name.clone(), crate::view::Upstream::of(node)?)));
-        nodes.filter(|(name, _)| *name != me).collect()
+        peers_of(state.store.list(Some("Node")), &me)
     };
     let query = format!("range={range}&end={end}");
     let asked = peers.into_iter().map(|(name, there)| {
         let (shared, query) = (shared.clone(), query.clone());
         async move {
-            let local = match &shared.cluster {
-                Some(cluster) => ask(cluster, &there, &query).await.filter(|local| local.fits(points)),
-                None => None,
+            let local = match (&shared.cluster, there) {
+                (Some(cluster), Some(there)) => ask(cluster, &there, &query).await.filter(|local| local.fits(points)),
+                _ => None,
             };
             (name, local)
         }
@@ -398,11 +433,17 @@ pub async fn serve(
     let mut all = futures_util::future::join_all(asked).await;
     all.push((me, Some(mine)));
     // (Whoever may list Nodes sees every node's series, but a Workload's only in a namespace it
-    // may read; the asked node decides, as the nodes' own answers are for the cluster.)
+    // may read, and of another node's only one this cluster has; the asked node decides, as the
+    // nodes' own answers are for the cluster.)
     {
         let state = shared.store.lock().expect("a handler panicked holding the store");
         let grants = crate::access::Grants::of(&caller, &state.store);
-        for local in all.iter_mut().filter_map(|(_, local)| local.as_mut()) {
+        let known = |key: &str| state.store.get(&format!("Workload/{key}")).is_some();
+        for (name, local) in &mut all {
+            let Some(local) = local else { continue };
+            if name != shared.members.me() {
+                local.keep_known(known);
+            }
             local.keep_readable(&grants);
         }
     }
@@ -494,21 +535,28 @@ fn parse_diskstats(text: &str, whole: impl Fn(&str) -> bool) -> (u64, u64) {
     (read, written)
 }
 
-/// `/proc/net/dev`: the bytes received and sent since boot by every interface but `lo`.
-fn parse_net(text: &str) -> (u64, u64) {
-    let (mut rx, mut tx) = (0, 0u64);
+/// An interface's bytes received and sent since it came.
+type Nics = BTreeMap<String, (u64, u64)>;
+
+/// `/proc/net/dev`: the bytes received and sent since each interface but `lo` came (kept apart:
+/// containers' veths come and go, and a sum would fall and jump with them).
+fn parse_nics(text: &str) -> Nics {
+    let mut nics = Nics::new();
     for line in text.lines() {
         let Some((name, counters)) = line.split_once(':') else {
             continue;
         };
         let fields: Vec<&str> = counters.split_whitespace().collect();
-        if name.trim() == "lo" || fields.len() < 9 {
+        let name = name.trim();
+        if name == "lo" || fields.len() < 9 {
             continue;
         }
-        rx += fields[0].parse::<u64>().unwrap_or(0);
-        tx += fields[8].parse::<u64>().unwrap_or(0);
+        let (Ok(rx), Ok(tx)) = (fields[0].parse(), fields[8].parse()) else {
+            continue;
+        };
+        nics.insert(name.to_string(), (rx, tx));
     }
-    (rx, tx)
+    nics
 }
 
 /// `/proc/loadavg`: the load of the last minute.
@@ -535,8 +583,7 @@ struct Reading {
     mem_used: u64,
     read: u64,
     write: u64,
-    rx: u64,
-    tx: u64,
+    nics: Nics,
     load1: f64,
 }
 
@@ -551,7 +598,6 @@ fn sample(
     let (busy, total, cpus) = parse_stat(stat)?;
     let (mem_total, mem_used) = parse_meminfo(meminfo)?;
     let (read, write) = parse_diskstats(diskstats, whole);
-    let (rx, tx) = parse_net(net);
     Some(Reading {
         busy,
         total,
@@ -560,14 +606,15 @@ fn sample(
         mem_used,
         read,
         write,
-        rx,
-        tx,
+        nics: parse_nics(net),
         load1: parse_load(loadavg)?,
     })
 }
 
 /// The CPU busy fraction and the rates (bytes per second) between two readings `secs` apart:
-/// cpu, disk read, disk write, rx, tx. A counter that went back is a rate of nothing.
+/// cpu, disk read, disk write, rx, tx. A counter that went back is a rate of nothing; the network's
+/// are the sum of each interface's own, and an interface that is not in both readings, or whose
+/// counters went back (it came again), is left out of it.
 fn rates(before: &Reading, now: &Reading, secs: f64) -> [f64; 5] {
     if secs <= 0.0 {
         return [0.0; 5];
@@ -579,26 +626,34 @@ fn rates(before: &Reading, now: &Reading, secs: f64) -> [f64; 5] {
         (now.busy.saturating_sub(before.busy) as f64 / ticks as f64).clamp(0.0, 1.0)
     };
     let rate = |before: u64, now: u64| now.saturating_sub(before) as f64 / secs;
+    let (mut rx, mut tx) = (0, 0u64);
+    for (name, (now_rx, now_tx)) in &now.nics {
+        if let Some((was_rx, was_tx)) = before.nics.get(name)
+            && now_rx >= was_rx
+            && now_tx >= was_tx
+        {
+            rx += now_rx - was_rx;
+            tx += now_tx - was_tx;
+        }
+    }
     [
         cpu,
         rate(before.read, now.read),
         rate(before.write, now.write),
-        rate(before.rx, now.rx),
-        rate(before.tx, now.tx),
+        rx as f64 / secs,
+        tx as f64 / secs,
     ]
 }
 
-/// The Workload a unit's cgroup directory (`kith-w_NS_NAME_REPLICA_UNIT`) is a unit of, as
-/// `NS/NAME`. (`_` is in no resource name, so it splits the parts; a Job's or a NodeWorkload's
-/// units have another letter and are not graphed.)
+/// The Workload a unit's cgroup directory (`kith-` and the unit's id) is a unit of, as `NS/NAME`
+/// (the controller says how its ids are made, so what reads them is not a copy of it).
 fn unit_workload(dir: &str) -> Option<String> {
-    let mut parts = dir.strip_prefix("kith-w_")?.splitn(3, '_');
-    let (namespace, name, _rest) = (parts.next()?, parts.next()?, parts.next()?);
-    Some(format!("{namespace}/{name}"))
+    crate::controller::workload_of_unit(dir.strip_prefix("kith-")?)
 }
 
-/// Per unit cgroup directory name: the microseconds of CPU it has used and the bytes of memory.
-type Units = BTreeMap<String, (u64, u64)>;
+/// Per unit cgroup directory name: the microseconds of CPU it has used and the bytes of memory
+/// (`None` where the cgroup does not say, a controller being off).
+type Units = BTreeMap<String, (u64, Option<u64>)>;
 
 /// The units of Workloads in the cgroup directory `dir` (none where it is not there).
 fn read_units(dir: &Path) -> Units {
@@ -614,7 +669,7 @@ fn read_units(dir: &Path) -> Units {
         let read = |file: &str| std::fs::read_to_string(entry.path().join(file)).ok();
         let usage = read("cpu.stat").as_deref().and_then(parse_usage);
         let memory = read("memory.current").and_then(|text| text.trim().parse().ok());
-        if let (Some(usage), Some(memory)) = (usage, memory) {
+        if let Some(usage) = usage {
             units.insert(name, (usage, memory));
         }
     }
@@ -622,7 +677,8 @@ fn read_units(dir: &Path) -> Units {
 }
 
 /// Each Workload's CPU in cores (over `secs`) and memory in bytes, its units' summed: a unit that
-/// was not there before has memory and no CPU yet.
+/// was not there before has memory and no CPU yet, and the memory of a Workload none of whose units
+/// says is NaN (not known).
 fn per_workload(before: &Units, now: &Units, secs: f64) -> BTreeMap<String, [f64; 2]> {
     let mut by: BTreeMap<String, [f64; 2]> = BTreeMap::new();
     for (name, (usage, memory)) in now {
@@ -631,32 +687,21 @@ fn per_workload(before: &Units, now: &Units, secs: f64) -> BTreeMap<String, [f64
             Some((was, _)) if secs > 0.0 => usage.saturating_sub(*was) as f64 / (secs * 1e6),
             _ => 0.0,
         };
-        let sum = by.entry(key).or_default();
+        let sum = by.entry(key).or_insert([0.0, f64::NAN]);
         sum[0] += cores;
-        sum[1] += *memory as f64;
+        if let Some(memory) = memory {
+            sum[1] = if sum[1].is_nan() { 0.0 } else { sum[1] } + *memory as f64;
+        }
     }
     by
-}
-
-/// The cgroup directory kith's units are in: `/kith` as root, otherwise next to our own, in
-/// what systemd delegated to this user (as the runtime puts them).
-fn units_dir() -> Option<PathBuf> {
-    let parent = if nix::unistd::getuid().is_root() {
-        "/kith".to_string()
-    } else {
-        let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-        let own = own.lines().find_map(|line| line.strip_prefix("0::"))?;
-        let parent = Path::new(own).parent().filter(|parent| *parent != Path::new("/"))?;
-        parent.display().to_string()
-    };
-    Some(Path::new("/sys/fs/cgroup").join(parent.trim_start_matches('/')))
 }
 
 /// Everything the sampler reads at one moment.
 struct Collected {
     when: Instant,
     reading: Option<Reading>,
-    disk: (u64, u64),
+    /// The state disk's bytes used and its size; `None` where `statvfs` failed.
+    disk: Option<(u64, u64)>,
     units: Units,
 }
 
@@ -672,7 +717,7 @@ fn collect(state: &Path, units: Option<&Path>) -> Collected {
         &text("/proc/loadavg"),
         whole,
     );
-    let disk = nix::sys::statvfs::statvfs(state).map_or((0, 0), |disk| {
+    let disk = nix::sys::statvfs::statvfs(state).ok().map(|disk| {
         let size = disk.fragment_size();
         (
             disk.blocks().saturating_sub(disk.blocks_free()) * size,
@@ -692,18 +737,13 @@ fn feed(rings: &mut Rings, at: u64, before: &Collected, now: &Collected) {
     let secs = now.when.saturating_duration_since(before.when).as_secs_f64();
     if let (Some(was), Some(is)) = (&before.reading, &now.reading) {
         let [cpu, read, write, rx, tx] = rates(was, is, secs);
-        let values = [
-            cpu,
-            is.mem_used as f64,
-            now.disk.0 as f64,
-            read,
-            write,
-            rx,
-            tx,
-            is.load1,
-        ];
-        rings.node(at, values, is.cpus, is.mem_total, now.disk.1);
+        // (A disk that could not be read is a gap, and its size is what it was.)
+        let used = now.disk.map_or(f64::NAN, |(used, _)| used as f64);
+        let values = [cpu, is.mem_used as f64, used, read, write, rx, tx, is.load1];
+        let size = now.disk.map_or(rings.disk_total, |(_, size)| size);
+        rings.node(at, values, is.cpus, is.mem_total, size);
     }
+    rings.purge(at);
     for (key, values) in per_workload(&before.units, &now.units, secs) {
         rings.work(at, &key, values);
     }
@@ -712,7 +752,8 @@ fn feed(rings: &mut Rings, at: u64, before: &Collected, now: &Collected) {
 /// Samples this node every 10 s, on the clock's tens of seconds (so that the nodes' points fall
 /// in the same slots), until `stopping`.
 pub async fn run(state: PathBuf, mut stopping: watch::Receiver<bool>) {
-    let units = units_dir();
+    // (Where the runtime puts units' cgroups: ask it, not a copy of its rule.)
+    let units = kith_runtime::units_cgroup_dir();
     let once = || {
         let (state, units) = (state.clone(), units.clone());
         async move {
@@ -776,7 +817,11 @@ mod tests {
             parse_diskstats(DISKSTATS, whole),
             ((2000 + 800) * 512, (4000 + 1600) * 512)
         );
-        assert_eq!(parse_net(NET), (5100, 7200));
+        // (Per interface, `lo` apart: a sum would fall when one went and jump when one came.)
+        assert_eq!(
+            parse_nics(NET),
+            BTreeMap::from([("eth0".to_string(), (5000, 7000)), ("wlan0".to_string(), (100, 200))])
+        );
         assert_eq!(parse_load(LOAD), Some(0.52));
         assert_eq!(
             parse_usage("usage_usec 5000000\nuser_usec 3000000\nsystem_usec 2000000\n"),
@@ -789,7 +834,7 @@ mod tests {
         assert_eq!(parse_load("x"), None);
         assert_eq!(parse_usage("user_usec 1\n"), None);
         assert_eq!(parse_diskstats("garbage\n 1 2 sda\n", |_| true), (0, 0));
-        assert_eq!(parse_net("no colon here\n"), (0, 0));
+        assert!(parse_nics("no colon here\n").is_empty());
     }
 
     #[test]
@@ -801,6 +846,12 @@ mod tests {
         assert_eq!(
             unit_workload("kith-w_shop_api_12b_sidecar").as_deref(),
             Some("shop/api")
+        );
+        // It is the controller's own ids it reads (a pod's id, and a unit in it), not a copy of their shape.
+        let pod = crate::controller::pod_of("Workload/default/web.v2", 3);
+        assert_eq!(
+            unit_workload(&format!("kith-{pod}_main")).as_deref(),
+            Some("default/web.v2")
         );
         // A Job, a NodeWorkload, the runtime's own probe and any other name are no Workload's.
         for no in [
@@ -817,21 +868,46 @@ mod tests {
 
     #[test]
     fn metrics_rates_come_from_two_readings() {
-        let reading = |stat, read: u64, write: u64, rx: u64, tx: u64| {
+        let reading = |stat, read: u64, write: u64, nics: &[(&str, u64, u64)]| {
             let mut r = sample(stat, MEMINFO, DISKSTATS, NET, LOAD, whole).unwrap();
-            (r.read, r.write, r.rx, r.tx) = (read, write, rx, tx);
+            (r.read, r.write) = (read, write);
+            r.nics = nics
+                .iter()
+                .map(|(name, rx, tx)| (name.to_string(), (*rx, *tx)))
+                .collect();
             r
         };
         let (a, b) = (
-            reading(STAT, 1000, 2000, 10_000, 20_000),
-            reading(STAT_LATER, 6000, 3000, 10_500, 19_000),
+            reading(STAT, 1000, 2000, &[("eth0", 10_000, 20_000), ("wlan0", 500, 500)]),
+            reading(STAT_LATER, 6000, 3000, &[("eth0", 10_500, 19_000), ("wlan0", 600, 800)]),
         );
         let [cpu, read, write, rx, tx] = rates(&a, &b, 10.0);
-        // 80 busy of 200 ticks; bytes over ten seconds; a counter that went back (a reboot, an
-        // interface that came again) is no negative rate.
-        assert_eq!((cpu, read, write, rx, tx), (0.4, 500.0, 100.0, 50.0, 0.0));
+        // 80 busy of 200 ticks; bytes over ten seconds; an interface whose counter went back (it
+        // came again) is no negative rate, and no rate at all: wlan0's alone is counted.
+        assert_eq!((cpu, read, write, rx, tx), (0.4, 500.0, 100.0, 10.0, 30.0));
         assert_eq!(rates(&a, &a, 10.0)[0], 0.0, "no ticks between is no division by zero");
         assert_eq!(rates(&a, &b, 0.0), [0.0; 5], "no time between is no rate");
+    }
+
+    #[test]
+    fn metrics_net_rate_ignores_an_interface_that_came_or_went() {
+        let reading = |nics: &[(&str, u64, u64)]| {
+            let mut r = sample(STAT, MEMINFO, DISKSTATS, NET, LOAD, whole).unwrap();
+            r.nics = nics
+                .iter()
+                .map(|(name, rx, tx)| (name.to_string(), (*rx, *tx)))
+                .collect();
+            r
+        };
+        // A veth that was there is gone (its bytes were in the sum), and a tap that was not is
+        // there with a lifetime of bytes: the rate is eth0's alone, not 0 and not a spike.
+        let before = reading(&[("eth0", 1000, 2000), ("veth1", 5_000_000, 5_000_000)]);
+        let after = reading(&[("eth0", 1500, 2100), ("tap2", 9_000_000_000, 9_000_000_000)]);
+        let [_, _, _, rx, tx] = rates(&before, &after, 10.0);
+        assert_eq!((rx, tx), (50.0, 10.0));
+        // Nothing in common is a rate of nothing.
+        let [_, _, _, rx, tx] = rates(&reading(&[("a", 1, 1)]), &reading(&[("b", 9, 9)]), 10.0);
+        assert_eq!((rx, tx), (0.0, 0.0));
     }
 
     #[test]
@@ -855,19 +931,30 @@ mod tests {
         std::fs::create_dir_all(dir.join("kith-j_default_job_0_main")).unwrap();
         std::fs::create_dir_all(dir.join("kith-w_default_gone_0_main")).unwrap();
         std::fs::write(dir.join("kith-w_default_afile"), "x").unwrap();
+        // A unit with CPU and no `memory.current` (a controller that is off) is kept, its memory unknown.
+        std::fs::create_dir_all(dir.join("kith-w_shop_nomem_0_main")).unwrap();
+        std::fs::write(dir.join("kith-w_shop_nomem_0_main/cpu.stat"), "usage_usec 1000000\n").unwrap();
         let before = read_units(&dir);
-        assert_eq!(before.len(), 3, "{before:?}");
+        assert_eq!(before.len(), 4, "{before:?}");
+        assert_eq!(before["kith-w_shop_nomem_0_main"], (1_000_000, None));
         std::fs::write(dir.join("kith-w_default_web_0_a/cpu.stat"), "usage_usec 6000000\n").unwrap();
         let after = read_units(&dir);
         // web: 2 s of CPU in 10 s from one unit, the other unchanged; memory is the sum; a unit
         // new since has memory and no CPU yet.
         let mut later = after.clone();
-        later.insert("kith-w_shop_new_0_main".into(), (9, 3));
+        later.insert("kith-w_shop_new_0_main".into(), (9, Some(3)));
+        later.insert("kith-w_shop_nomem_0_main".into(), (3_000_000, None));
         let by = per_workload(&before, &later, 10.0);
         assert_eq!(by["default/web"], [0.2, 150.0]);
         assert_eq!(by["shop/db"], [0.0, 7.0]);
         assert_eq!(by["shop/new"], [0.0, 3.0]);
-        assert_eq!(by.len(), 3);
+        // Its CPU is there (0.2 cores), its memory is not known: NaN, which a ring skips and a series shows null.
+        assert_eq!(by["shop/nomem"][0], 0.2);
+        assert!(by["shop/nomem"][1].is_nan());
+        // Another unit of it that has memory is what its memory is.
+        later.insert("kith-w_shop_nomem_0_b".into(), (0, Some(40)));
+        assert_eq!(per_workload(&before, &later, 10.0)["shop/nomem"][1], 40.0);
+        assert_eq!(by.len(), 4);
         assert!(read_units(&dir.join("nothing here")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -925,6 +1012,7 @@ mod tests {
         // A workload not seen for an hour is forgotten, and no more than MAX_WORKLOADS are kept.
         let mut rings = Rings::new();
         rings.work(1000, "a/old", [1.0, 1.0]);
+        rings.purge(1000 + KEEP_WORKLOAD + 10);
         rings.work(1000 + KEEP_WORKLOAD + 10, "a/new", [1.0, 1.0]);
         assert_eq!(rings.work.keys().collect::<Vec<_>>(), ["a/new"]);
         for i in 0..MAX_WORKLOADS + 20 {
@@ -1086,6 +1174,122 @@ mod tests {
         assert!(sent["node"].get("missing").is_none());
         let back: Local = serde_json::from_value(sent).unwrap();
         assert_eq!(back, local);
-        let _ = BTreeMap::<String, u8>::new();
+    }
+
+    fn collected(when: Instant, units: Units, disk: Option<(u64, u64)>) -> Collected {
+        Collected {
+            when,
+            reading: sample(STAT, MEMINFO, DISKSTATS, NET, LOAD, whole),
+            disk,
+            units,
+        }
+    }
+
+    #[test]
+    fn metrics_feed_forgets_a_deleted_workload_even_where_none_runs() {
+        // The node's last Workload was deleted: no unit is read, and what it left is still purged.
+        let mut rings = Rings::new();
+        rings.work(1000, "a/gone", [1.0, 1.0]);
+        let idle = collected(Instant::now(), Units::new(), Some((1, 2)));
+        feed(&mut rings, 1000 + KEEP_WORKLOAD + 10, &idle, &idle);
+        assert!(rings.work.is_empty());
+        // And within the hour it is kept.
+        rings.work(1000, "a/kept", [1.0, 1.0]);
+        feed(&mut rings, 1000 + KEEP_WORKLOAD, &idle, &idle);
+        assert_eq!(rings.work.len(), 1);
+    }
+
+    #[test]
+    fn metrics_a_failed_disk_read_is_a_gap_not_a_full_disk_of_nothing() {
+        let t = Instant::now();
+        let first = collected(t, Units::new(), Some((50, 100)));
+        let mut rings = Rings::new();
+        feed(
+            &mut rings,
+            1000,
+            &first,
+            &collected(t + Duration::from_secs(10), Units::new(), Some((50, 100))),
+        );
+        feed(
+            &mut rings,
+            1010,
+            &first,
+            &collected(t + Duration::from_secs(10), Units::new(), None),
+        );
+        let Local { node, .. } = rings.local("n", 10, 2, 1010);
+        assert_eq!(node.disk, [Some(50.0), None]);
+        assert_eq!(node.load1, [Some(0.52), Some(0.52)], "the rest of the point is there");
+        assert_eq!(node.disk_total, 100, "the size it had is not zeroed");
+    }
+
+    #[test]
+    fn metrics_a_value_that_is_not_known_is_null_and_the_rest_of_the_point_stays() {
+        let mut ring = Ring::<2, 3>::new(300);
+        ring.add(0, [1.0, f64::NAN]);
+        ring.add(10, [3.0, 5.0]);
+        ring.add(300, [7.0, f64::NAN]);
+        let rows = ring.series(300, 2);
+        assert_eq!(column(&rows, 0, 3), [Some(2.0), Some(7.0)]);
+        assert_eq!(
+            column(&rows, 1, 3),
+            [Some(5.0), None],
+            "a mean of the samples that had one"
+        );
+    }
+
+    #[test]
+    fn metrics_nodes_to_ask_are_every_other_and_one_with_no_address_is_missing() {
+        let node = |name: &str, status: serde_json::Value| -> kith_api::Resource {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kith.dev/v1", "kind": "Node", "metadata": { "name": name },
+                "spec": {}, "status": status,
+            }))
+            .unwrap()
+        };
+        let nodes = [
+            node("alpha", serde_json::json!({ "address": "127.0.0.1:1" })),
+            node("beta", serde_json::json!({ "address": "127.0.0.1:2" })),
+            node("gamma", serde_json::Value::Null),
+        ];
+        let peers = peers_of(nodes.iter(), "alpha");
+        let names: Vec<&str> = peers.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["beta", "gamma"]);
+        assert_eq!(
+            peers[0].1.as_ref().map(|there| there.address.as_str()),
+            Some("127.0.0.1:2")
+        );
+        assert!(
+            peers[1].1.is_none(),
+            "no address: asked of nobody, and shown as missing"
+        );
+        let mut all: Vec<(String, Option<Local>)> = peers.into_iter().map(|(name, _)| (name, None)).collect();
+        all.push(("alpha".into(), Some(fed().local("alpha", 10, 3, 1040))));
+        let answer = merge("15m", 10, 3, 1040, all);
+        assert_eq!(answer["nodes"]["gamma"]["missing"], true);
+        assert_eq!(answer["nodes"]["beta"]["missing"], true);
+    }
+
+    #[test]
+    fn metrics_what_a_peer_sends_must_be_the_shape_asked_and_of_workloads_that_exist() {
+        let local = fed().local("alpha", 10, 3, 1040);
+        assert!(local.fits(3));
+        let with = |key: &str| {
+            let mut local = local.clone();
+            local
+                .workloads
+                .insert(key.into(), local.workloads["default/web"].clone());
+            local
+        };
+        assert!(with("shop/db").fits(3));
+        // A key that is not `NS/NAME`, or that has an `@` (which would pass for another node's
+        // `NS/NAME@NODE`), is no Workload's.
+        for bad in ["", "web", "/web", "shop/", "a/b/c", "shop/db@beta", "@x/y"] {
+            assert!(!with(bad).fits(3), "{bad:?}");
+        }
+        // Only the Workloads this cluster has are kept of what a peer says.
+        let mut peer = with("shop/ghost");
+        let known = |key: &str| key == "default/web";
+        peer.keep_known(known);
+        assert_eq!(peer.workloads.keys().collect::<Vec<_>>(), ["default/web"]);
     }
 }
