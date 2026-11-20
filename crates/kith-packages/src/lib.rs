@@ -462,6 +462,13 @@ impl Package {
             let version = &self.meta.version;
             wrong.push(format!("package.yaml: version `{version}` is not like 1.2.3"));
         }
+        if let Some(asked) = &self.meta.kith_version {
+            if semver::VersionReq::parse(asked).is_err() {
+                wrong.push(format!(
+                    "package.yaml: kithVersion `{asked}` is not a version range like >=1.2"
+                ));
+            }
+        }
         let name = json!({ "apiVersion": "kith.dev/v1", "kind": "Package", "metadata": { "name": self.meta.name }, "spec": { "version": "0.0.0" } });
         let named = serde_json::from_value::<Resource>(name).map_err(|e| e.to_string());
         if let Err(e) = named.and_then(Resource::validated) {

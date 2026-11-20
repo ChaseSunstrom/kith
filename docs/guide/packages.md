@@ -19,7 +19,7 @@ kith package render packages/web --name shop -n store --set replicas=3 -f mine.y
 kith package render packages/web --name shop | kith apply -f -
 ```
 
-- `kithVersion` is a semver range (`>=1.2`) of the kith versions the package supports. A Release
+- `kithVersion` is a semver range in Cargo's syntax (`>=1.2`, `>=1, <3`, `^1.2`; not npm's `||`) of the kith versions the package supports. A Release
   of a package the running kithd does not fit is in state `error`, saying both versions, and
   installs nothing; with none, any kithd will do. `kith package push` and `render` warn when
   the `kith` itself does not fit, and go on.
