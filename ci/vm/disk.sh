@@ -139,11 +139,15 @@ listed
 [ "$(of "$known")" = "known mounted $id" ] || fail "the added disk is not listed as mounted: $(of "$known")"
 call POST /v1/disks/n1 "$work/add-known.json" || fail "no answer to adding the disk twice"
 [ "$code" = 409 ] || fail "the disk was added a second time ($code: $(cat "$work/answer"))"
-# Each verb left its entry in the audit log (who, what, and whether it was done).
+grep -aqF 'already added' "$work/answer" || fail "a disk added again is not told it is added already (it is mapped, and not \"held by something else\"): $(cat "$work/answer")"
+# Each verb left its entry in the audit log (who, what, and whether it was done), the add one when
+# it began as well, and the add sent to another node's name its refusal.
 call GET '/v1/audit?tail=100' || fail "the audit log could not be read"
 [ "$code" = 200 ] || fail "the audit log could not be read ($code)"
-grep -aqF 'disk add --quick' "$work/answer" || fail "the add left no entry in the audit log: $(cat "$work/answer")"
+grep -aqF 'disk add --quick started' "$work/answer" || fail "the add left no entry in the audit log when it began: $(cat "$work/answer")"
+grep -aqF 'disk add --quick"' "$work/answer" || fail "the add left no entry in the audit log: $(cat "$work/answer")"
 grep -aqF "Disk/$id" "$work/answer" || fail "the audit log does not name the disk added"
+grep -aqF 'Node/n2' "$work/answer" || fail "the add sent to another node left no entry in the audit log"
 
 # Restarted: nobody asks again; the scan at start finds the header and the key and mounts it.
 stop_node n1
@@ -170,6 +174,7 @@ call DELETE "/v1/disks/n1/$id" || fail "no answer to removing the disk twice"
 [ "$code" = 409 ] || fail "a disk removed was removed a second time ($code: $(cat "$work/answer"))"
 call GET '/v1/audit?tail=100' || fail "the audit log could not be read"
 grep -aqF 'disk remove' "$work/answer" || fail "the remove left no entry in the audit log"
+grep -aqF "Serial/$known" "$work/answer" || fail "the remove's entry in the audit log does not name the disk's serial"
 stop_node n1b
 node n1c
 hears n1c 'kithd: data disks: known: none; unknown: '

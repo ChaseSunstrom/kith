@@ -1883,8 +1883,15 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     }
                 }
                 DiskCommand::Remove { node, id } => {
-                    let _: serde_json::Value = request(&kithd, "DELETE", &format!("/v1/disks/{node}/{id}"), b"")?;
-                    println!("{node}: disk {id} is no longer a data disk: its header is zeroed and its key forgotten");
+                    let said: serde_json::Value = request(&kithd, "DELETE", &format!("/v1/disks/{node}/{id}"), b"")?;
+                    match said["absent"].as_bool() {
+                        Some(true) => println!(
+                            "{node}: disk {id} was not in the machine: it is no longer a data disk, its key is forgotten and nothing could be zeroed"
+                        ),
+                        _ => println!(
+                            "{node}: disk {id} is no longer a data disk: its header is zeroed and its key forgotten"
+                        ),
+                    }
                 }
                 DiskCommand::List { node } => {
                     let said: serde_json::Value = request(&kithd, "GET", &format!("/v1/disks/{node}"), b"")?;

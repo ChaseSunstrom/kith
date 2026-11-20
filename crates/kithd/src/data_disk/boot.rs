@@ -259,6 +259,8 @@ pub async fn run(state: PathBuf) {
     if !crate::init::is_init() {
         return;
     }
+    // (A disk verb and this scan would race for the mappings and the state's `disks/`.)
+    let _turn = super::verbs::wait().await;
     let (verity, ours, state_disk) = crate::init::whose_disks();
     let disks = offered(verity, ours.as_deref(), state_disk.as_deref());
     let mut tasks = tokio::task::JoinSet::new();

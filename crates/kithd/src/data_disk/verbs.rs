@@ -29,7 +29,7 @@ use axum::{Extension, Json};
 use kith_api::kinds::Verb;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::Arc;
 
 /// The name of the mapping the state of an encrypted node is open under (`crypt.rs`).
 const STATE_MAPPING: &str = "kith-state";
@@ -77,16 +77,23 @@ fn said(error: AddError, disk: &Disk, wipe: bool) -> String {
             disk.name
         ),
         AddError::Refused(why) => format!("{}: {why}", disk.name),
-        AddError::Added => format!(
-            "{} is this node's disk already: kith node disk list shows it",
-            disk.name
-        ),
+        AddError::Added => already(disk),
         AddError::Half(why) => format!(
             "an add of {} began and did not finish ({why}): add it again with --wipe to start over",
             disk.name
         ),
-        AddError::Failed(why) => format!("{}: {why}", disk.name),
+        AddError::Failed(why) => format!(
+            "{}: {why}. Add it again; if that fails too, kith node disk list shows what the node sees of it, and its cable and the disk itself are the next to look at",
+            disk.name
+        ),
     }
+}
+
+fn already(disk: &Disk) -> String {
+    format!(
+        "{} is already added as this node's disk: kith node disk list shows it",
+        disk.name
+    )
 }
 
 /// Add the disk of `serial` as this node's: refused when the state is not `encrypted`, when no
@@ -107,6 +114,10 @@ pub fn add<'a, D: Dev, M: Mapper>(
         return Err("this node's state is not encrypted, and a data disk's key is kept in the state: with the state in the clear, the key would sit beside the data it protects. Install the node with encrypt: true first".into());
     }
     let disk = pick(disks, serial)?;
+    // (Asked first: a disk added is mapped, and taking it would be refused as held by another.)
+    if super::entry_of(state, &disk.serial, true).is_some() {
+        return Err(already(disk));
+    }
     let (dev, mut mapper) = take(disk)?;
     let id =
         super::add(state, &dev, root, &disk.serial, (wipe, quick), &mut mapper).map_err(|e| said(e, disk, wipe))?;
@@ -115,29 +126,34 @@ pub fn add<'a, D: Dev, M: Mapper>(
 
 /// Remove the disk `id` (32 hex digits, as `list` shows): the disk it was added as is found by the
 /// serial the state kept, among `disks` (this machine's, a stick and the system's own left out by
-/// the caller), and the core's checks follow ([`super::remove`]). Returns the id and the disk.
+/// the caller), and the core's checks follow ([`super::remove`]). Returns the id and the disk. A
+/// disk that is not among `disks` (unplugged, dead) cannot be zeroed, and it is not kept for ever
+/// in the state: its entry and key are forgotten, and no disk comes back (`take` is not called).
 pub fn remove<'a, D: Dev, M: Mapper>(
     state: &Path,
     disks: &'a [Disk],
     id: &str,
     take: impl FnOnce(&Disk, &Id) -> Result<(D, M), String>,
-) -> Result<(Id, &'a Disk), String> {
+) -> Result<(Id, Option<&'a Disk>), String> {
     let id = hex_id(id).ok_or("a disk's id is 32 lower-case hex digits: kith node disk list shows them")?;
     let entry = read_entry(&dir_of(state, &id)).ok_or("this node has no such disk")?;
     let found = || disks.iter().filter(|disk| disk.serial == entry.serial);
     let disk = match (found().next(), found().nth(1)) {
         (Some(disk), None) => disk,
         (None, _) => {
-            return Err(format!(
-                "the disk with serial {} is not in this machine, or is not one a data disk may be: remove it where it is",
-                entry.serial
-            ));
+            // (A disk unplugged while mounted leaves its mount point busy: that stops the forget
+            // before any key is erased, and the next start, with no mount, lets a second remove end it.)
+            super::forget(state, &id).map_err(|e| {
+                format!("forgetting the key of a disk that is not there: {e}. Restart the node, then remove it again")
+            })?;
+            return Ok((id, None));
         }
         (Some(_), Some(_)) => return Err(format!("more than one disk has the serial {}", entry.serial)),
     };
     let (dev, mut mapper) = take(disk, &id)?;
-    super::remove(state, &dev, &id, &entry.serial, &mut mapper)?;
-    Ok((id, disk))
+    let next = ". kith node disk list shows the disk's state: remove it again once that is put right";
+    super::remove(state, &dev, &id, &entry.serial, &mut mapper).map_err(|e| format!("{e}{next}"))?;
+    Ok((id, Some(disk)))
 }
 
 /// What the disks offered show of this node: the known (`mounted` is what asks whether kithd has
@@ -174,16 +190,20 @@ pub fn list<D: Dev>(
     boot::status(&seen, &boot::missing(state, &ids))
 }
 
-/// One disk verb at a time. A `list` does not take it: it only reads.
-static BUSY: Mutex<()> = Mutex::new(());
+/// One disk verb at a time, and not with the scan at start ([`boot::run`] waits its turn). A `list`
+/// does not take it: it only reads.
+static BUSY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn one() -> Result<std::sync::MutexGuard<'static, ()>, String> {
-    match BUSY.try_lock() {
-        Ok(guard) => Ok(guard),
-        // (Nothing it guards can be left half-made.)
-        Err(TryLockError::Poisoned(e)) => Ok(e.into_inner()),
-        Err(TryLockError::WouldBlock) => Err("another disk verb is running: wait for it".into()),
-    }
+type Turn = tokio::sync::MutexGuard<'static, ()>;
+
+fn one() -> Result<Turn, String> {
+    BUSY.try_lock()
+        .map_err(|_| "another disk verb is running (or the disks are being looked at at start): wait for it".into())
+}
+
+/// The scan at start's turn: it waits for a verb that is running, and a verb asked while it runs is told so.
+pub async fn wait() -> Turn {
+    BUSY.lock().await
 }
 
 /// The machine, as `init` finds it: the disks that may be offered, with what the core needs.
@@ -271,8 +291,12 @@ fn real_add(state: &Path, given: &Given) -> Result<Added, String> {
         (given.wipe, given.quick),
         |disk| {
             let (dev, mapper) = real(disk, None)?;
-            dev.unheld()
-                .map_err(|e| format!("{} is held by something else (mounted, mapped or open): {e}", disk.name))?;
+            dev.unheld().map_err(|e| {
+                format!(
+                    "{} is held by something else (mounted, mapped or open): {e}. Let it go, or take the disk out, and add it again",
+                    disk.name
+                )
+            })?;
             Ok((dev, mapper))
         },
     )?;
@@ -299,15 +323,24 @@ fn open_now(state: &Path, id: &Id, disk: &Disk, mapper: &mut Real) -> Result<(),
 }
 
 /// The remove on this machine: [`remove`], with the mount let go of first, then forgotten here.
-fn real_remove(state: &Path, id: &str) -> Result<Id, String> {
+/// The answer is the id and whether the disk was not there (only its entry and key were forgotten).
+fn real_remove(state: &Path, id: &str) -> Result<(Id, bool), String> {
     let _one = one()?;
     let machine = Machine::find();
     let disks = machine.offered();
     let (id, disk) = remove(state, &disks, id, |disk, id| {
         real(disk, Some(dir_of(state, id).join("data")))
     })?;
-    boot::forget_open(&disk.name);
-    Ok(id)
+    if let Some(disk) = disk {
+        boot::forget_open(&disk.name);
+    }
+    Ok((id, disk.is_none()))
+}
+
+/// The serial the node kept for the disk `typed` (an id), if it is one and the node has it.
+fn serial_of(state: &Path, typed: &str) -> Option<String> {
+    let id = hex_id(typed)?;
+    read_entry(&dir_of(state, &id)).map(|entry| entry.serial)
 }
 
 fn real_list(state: &Path) -> Value {
@@ -333,9 +366,11 @@ pub struct Given {
 /// Who may ask, for which node, on what machine: the state's directory, or the refusal to send.
 /// A NodeKey's right is the one needed (as for the node's passphrase): the disk's key is the
 /// node's. With a cluster, a disk is added by the node it is in: asking another is refused here
-/// (the verb is not forwarded). With no cluster there is one node, whatever it is called.
+/// (the verb is not forwarded; the refusal is written to the audit log as `name`). With no cluster
+/// there is one node, whatever it is called. The right asked is `verb` on a NodeKey: an add applies
+/// one, a remove deletes one, a list gets them.
 #[allow(clippy::result_large_err)] // the refusal is the answer itself, built once and returned
-fn gate(shared: &Shared, caller: &Caller, node: &str, verb: Verb) -> Result<PathBuf, Response> {
+fn gate(shared: &Shared, caller: &Caller, node: &str, (verb, name): (Verb, &str)) -> Result<PathBuf, Response> {
     crate::api::permit(shared, caller, verb, |_| vec![("NodeKey".to_string(), None)])
         .map_err(IntoResponse::into_response)?;
     if let Some(cluster) = &shared.cluster
@@ -345,6 +380,7 @@ fn gate(shared: &Shared, caller: &Caller, node: &str, verb: Verb) -> Result<Path
             "a disk is added to the node it is in: ask {node} at its own API address (this node is {})",
             cluster.me.name
         );
+        audit::misdirected(&shared.audit, caller, name, node, why.clone());
         return Err(refuse(StatusCode::CONFLICT, why).into_response());
     }
     if !crate::init::is_init() {
@@ -369,13 +405,14 @@ pub async fn add_one(
     Named(node): Named<String>,
     Json(given): Json<Given>,
 ) -> Response {
-    let state = match gate(&shared, &caller, &node, Verb::Apply) {
+    let state = match gate(&shared, &caller, &node, (Verb::Apply, "disk add")) {
         Ok(state) => state,
         Err(refused) => return refused,
     };
     let task = tokio::spawn(async move {
         let flags = (given.wipe, given.quick);
         let serial = given.serial.clone();
+        audit::adding(&shared.audit, &caller, &serial, flags);
         let done = tokio::task::spawn_blocking(move || real_add(&state, &given))
             .await
             .unwrap_or_else(|e| Err(format!("the add stopped: {e}")));
@@ -401,12 +438,14 @@ pub async fn remove_one(
     Extension(caller): Extension<Caller>,
     Named((node, id)): Named<(String, String)>,
 ) -> Response {
-    let state = match gate(&shared, &caller, &node, Verb::Apply) {
+    let state = match gate(&shared, &caller, &node, (Verb::Delete, "disk remove")) {
         Ok(state) => state,
         Err(refused) => return refused,
     };
     let task = tokio::spawn(async move {
         let typed = id.clone();
+        let serial = serial_of(&state, &typed);
+        audit::removing(&shared.audit, &caller, &typed, serial.as_deref());
         let done = tokio::task::spawn_blocking(move || real_remove(&state, &id))
             .await
             .unwrap_or_else(|e| Err(format!("the remove stopped: {e}")));
@@ -414,12 +453,15 @@ pub async fn remove_one(
             &shared.audit,
             &caller,
             &typed,
+            serial.as_deref(),
             done.as_ref().map(drop).map_err(String::clone),
         );
         done
     });
     match task.await {
-        Ok(Ok(id)) => Json(json!({ "id": crate::pki::hex(&id), "removed": true })).into_response(),
+        Ok(Ok((id, absent))) => {
+            Json(json!({ "id": crate::pki::hex(&id), "removed": true, "absent": absent })).into_response()
+        }
         Ok(Err(why)) => refuse(StatusCode::CONFLICT, why).into_response(),
         Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("the remove stopped: {e}")).into_response(),
     }
@@ -431,7 +473,7 @@ pub async fn list_all(
     Extension(caller): Extension<Caller>,
     Named(node): Named<String>,
 ) -> Response {
-    let state = match gate(&shared, &caller, &node, Verb::Get) {
+    let state = match gate(&shared, &caller, &node, (Verb::Get, "disk list")) {
         Ok(state) => state,
         Err(refused) => return refused,
     };
@@ -498,7 +540,7 @@ mod tests {
         assert_eq!(shown["unknown"], json!([]));
 
         let (gone, at) = remove(&state, &disks, &crate::pki::hex(&id), |_, _| Ok(again(&file))).unwrap();
-        assert_eq!((gone, at.name.as_str()), (id, "sdb"));
+        assert_eq!((gone, at.unwrap().name.as_str()), (id, "sdb"));
         assert!(room(&file).iter().all(|&byte| byte == 0), "its header is zeroed");
         assert!(ids(&state).is_empty(), "its key and entry are forgotten");
 
@@ -682,11 +724,61 @@ mod tests {
         assert!(refused(&disks, "not an id", None).contains("32 lower-case hex"));
         assert!(refused(&disks, &hex.to_uppercase(), None).contains("32 lower-case hex"));
         assert!(refused(&disks, &"0".repeat(32), None).contains("no such disk"));
-        assert!(refused(&disks[..1], &hex, None).contains("not in this machine"));
         assert!(refused(&disks, &hex, Some("unmap")).contains("in use"));
         // Each left it whole: the header, the key and the entry.
         assert_eq!(parse(&room(&file)), Ok(id));
         assert!(read_entry(&dir_of(&state, &id)).unwrap().ready && read_key(&dir_of(&state, &id)).is_some());
+    }
+
+    /// A disk that is gone (unplugged, dead) cannot be zeroed: the remove forgets what the node kept
+    /// of it, so the entry and the key are not left for good, and says the disk was not there.
+    #[test]
+    fn a_remove_of_a_disk_that_is_not_there_forgets_its_entry_and_key() {
+        let (_dir, file, state) = rig("verbs-remove-gone");
+        let disks = machine();
+        let id = add(&state, true, &disks, Some(&root("sda")), "S1", (false, false), |_| {
+            Ok(again(&file))
+        })
+        .unwrap()
+        .0;
+        let took = |_: &Disk, _: &Id| -> Result<(Fake, Map), String> { panic!("a disk that is not there was taken") };
+        let (gone, at) = remove(&state, &disks[..1], &crate::pki::hex(&id), took).unwrap();
+        assert_eq!((gone, at.is_none()), (id, true));
+        assert!(ids(&state).is_empty(), "its key and entry are forgotten");
+        // (A second remove finds nothing: it is done.)
+        let again_ = remove(&state, &disks[..1], &crate::pki::hex(&id), took).unwrap_err();
+        assert!(again_.contains("no such disk"), "{again_}");
+    }
+
+    /// A disk this node has added, added again: told so before the disk is touched (taken it
+    /// would be held by the mapping, and the owner would be told it is "held by something else").
+    #[test]
+    fn an_add_of_a_disk_that_is_already_added_says_so_before_the_disk_is_taken() {
+        let (_dir, file, state) = rig("verbs-added");
+        let disks = machine();
+        add(&state, true, &disks, Some(&root("sda")), "S1", (false, false), |_| {
+            Ok(again(&file))
+        })
+        .unwrap();
+        let took = |_: &Disk| -> Result<(Fake, Map), String> { panic!("the disk was taken") };
+        let why = add(&state, true, &disks, Some(&root("sda")), "S1", (true, false), took).unwrap_err();
+        assert!(
+            why.contains("already added") && why.contains("kith node disk list"),
+            "{why}"
+        );
+    }
+
+    /// Each way an add can end without the disk added tells the owner what to do next.
+    #[test]
+    fn a_failed_add_names_what_to_do_next() {
+        let d = disk("sdb", "S1");
+        let failed = said(AddError::Failed("the disk did not answer".into()), &d, false);
+        assert!(
+            failed.contains("Add it again") && failed.contains("kith node disk list") && failed.contains("cable"),
+            "{failed}"
+        );
+        assert!(said(AddError::Half("x".into()), &d, false).contains("--wipe"));
+        assert!(said(AddError::Added, &d, false).contains("already added"));
     }
 
     #[test]
@@ -712,6 +804,7 @@ mod tests {
     fn the_sockets_admin_may_apply_a_node_key_with_no_cluster() {
         let grants = crate::access::Grants::of(&Caller::Admin, &kith_api::store::Store::default());
         assert!(grants.may(&Verb::Apply, "NodeKey", None) && grants.may(&Verb::Get, "NodeKey", None));
+        assert!(grants.may(&Verb::Delete, "NodeKey", None), "a remove is a delete");
         // (Someone else is not: no Identity is no right.)
         let nobody = crate::access::Grants::of(&Caller::Identity("nobody".into()), &kith_api::store::Store::default());
         assert!(!nobody.may(&Verb::Apply, "NodeKey", None));

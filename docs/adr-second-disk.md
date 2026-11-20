@@ -321,6 +321,19 @@ with the earlier wording that put the seed in T-0957 and the boot in T-0958: thi
 - **A removed disk's old key** may survive in the state's free space, journal or an SSD's
   remapped blocks (section 2): remove is as strong as the state's erasure, and the strong way is
   a duress or a discard.
+- **Known limits of the verbs (T-0975)**:
+  - The disk is read through its path (`/dev/<name>`) and written through it again: a disk
+    pulled and another put in its name between the two is written. The check is of the 4 KiB
+    read, not of the handle written to; closing it takes one handle through read, check and write
+    (`seed.rs`, `write_first`). The window is the time of the core's own checks, and the verbs
+    run one at a time.
+  - A `remove` of a disk that is not in the machine (unplugged, dead) forgets its entry and key:
+    nothing could be zeroed, and the entry is not kept for ever. The disk, put back, keeps a header the node
+    no longer knows and has no key: its data is unreadable, as a remove makes it. One unplugged
+    while mounted keeps its mount point busy; the remove says so, and a restart lets a second end it.
+  - The audit log has a `started` entry for an add and a remove when it begins, and the ending
+    entry after: a cut machine leaves the first alone. A refusal is written as the verb that was
+    asked; a remove needs the right to `delete` a NodeKey, an add to `apply` one, a list to `get`.
 - **Unverified here**: `O_EXCL` refusing a block device that a device-mapper mapping holds,
   on the kernel kith OS ships (it does on mainline for a mounted or held device; the test of
   step 2 is the check).
