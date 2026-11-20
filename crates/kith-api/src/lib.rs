@@ -303,15 +303,28 @@ pub fn check_name(name: &str) -> Result<(), String> {
 }
 
 impl Resource {
-    /// The address on the LAN that a Node's peers reach it at: the host of `status.address`, which the
-    /// control node that admitted it saw. None for a roaming Node (its address is on the mesh) and for
-    /// one not admitted yet, and for an address that is no place on a LAN (this machine's own, or
-    /// none). An IPv4 address that was seen in IPv6's clothes is given as the IPv4 one it is.
+    /// Every address a Node says it has, the LAN one first: `status.lan` (kept by the leader once
+    /// it has moved `status.address` onto the mesh) and then `status.address`. Whoever must know
+    /// a node's LAN address (a fetch it may not make, a mesh peer's endpoint, an NFS client) reads
+    /// this, not `status.address` alone, which is an IPv6 address on the mesh for a moved node.
+    pub fn node_addresses(&self) -> impl Iterator<Item = &str> {
+        let status = self.status.as_ref();
+        ["lan", "address"]
+            .into_iter()
+            .filter_map(move |key| status?[key].as_str())
+    }
+
+    /// The address on the LAN that a Node's peers reach it at: the host of `status.lan` once the
+    /// leader has moved `status.address` to the node's mesh address (it keeps the one it saw there),
+    /// else of `status.address`, which the control node that admitted it saw. None for a roaming
+    /// Node (its address is on the mesh) and for one not admitted yet, and for an address that is no
+    /// place on a LAN (this machine's own, or none). An IPv4 address that was seen in IPv6's clothes
+    /// is given as the IPv4 one it is.
     pub fn lan_address(&self) -> Option<std::net::IpAddr> {
         if self.spec["roaming"] == true {
             return None;
         }
-        let address = self.status.as_ref()?["address"].as_str()?;
+        let address = self.node_addresses().next()?;
         let at = address.parse::<std::net::SocketAddr>().ok()?.ip().to_canonical();
         (!at.is_loopback() && !at.is_unspecified()).then_some(at)
     }
