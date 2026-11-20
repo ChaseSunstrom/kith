@@ -87,12 +87,14 @@ impl Wire {
         }
     }
 
-    /// No more to send: the peer's reads end, and ours go on.
+    /// No more to send: the peer's reads end, and ours go on. A TLS link is only flushed, not
+    /// half-closed: its close_notify and FIN read to kithd as the client gone, and it hangs up
+    /// before it has answered.
     pub fn shutdown_write(&self) -> io::Result<()> {
         match self {
             Wire::Socket(socket) => socket.shutdown(Shutdown::Write),
             #[cfg(feature = "remote")]
-            Wire::Node(node) => node.finish(),
+            Wire::Node(node) => node.flush(),
         }
     }
 
@@ -263,12 +265,6 @@ impl Node {
 
     fn flush(&self) -> io::Result<()> {
         self.step(|link| link.send())
-    }
-
-    fn finish(&self) -> io::Result<()> {
-        self.lock().tls.conn.send_close_notify();
-        self.flush()?;
-        self.closer.shutdown(Shutdown::Write)
     }
 }
 
