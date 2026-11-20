@@ -12,7 +12,8 @@
 //! it still has one time), whose time outweighs a server that is over two seconds from it.
 //! The operator's server is followed alone, by any step. Before the clock was ever set (it reads
 //! before `FLOOR_US`) the first answer is enough; after, a network's word alone moves it by ten
-//! seconds in all (`ONE_SOURCE_US`), and more takes a second source to agree (see `ask`). While the clock is
+//! seconds in all (`ONE_SOURCE_US`), and more takes the leader to agree (the servers of one
+//! network do not vouch for each other: see `ask`). While the clock is
 //! unset, `/v1/clock` answers 503: a node that reads 1970 is no one's time. What it found is
 //! in this Node's status as `clock`: `{server, offsetMs, delayMs, stepped, checked}`, or
 //! `{error, checked}` where no one answered.
@@ -42,7 +43,7 @@ const STEP_OVER_US: i64 = 2_000_000;
 /// Two sources say the same time when their offsets are this near (see `ask`).
 const AGREE_US: i64 = 1_000_000;
 /// What one source that is not the operator's may step a set clock by, all steps together, until
-/// a second source agrees (a clock without a battery drifts by seconds in days; a spoofed
+/// the leader agrees (a clock without a battery drifts by seconds in days; a spoofed
 /// server must not walk it by sub-hour steps, repeated).
 const ONE_SOURCE_US: i64 = 10_000_000;
 /// 2026-01-01: a clock before it was never set (a machine that starts in 1970), one after it
@@ -332,10 +333,10 @@ fn nothing(why: &str, at: i64) -> Value {
 ///   from it, and when no server answered;
 /// - else the first server's. Time from a network is unsigned: once the clock was set (`synced`:
 ///   by a check, or before kithd started), one source alone may step it only within a budget
-///   (`ONE_SOURCE_US`, all its steps together, `spent` of it used since a step a second source
-///   agreed with, or the leader or the operator's server made); past that a second source (another
-///   server, or the leader) within a second of the same time is needed, and otherwise it is said
-///   in the status and not followed. The server the operator `told` is followed alone (that is
+///   (`ONE_SOURCE_US`, all its steps together, `spent` of it used since a step the leader
+///   agreed with, or the leader or the operator's server made); past that the leader within a
+///   second of the same time is needed (servers a network named do not count: one lease, or one
+///   rogue DHCP server, names them all), and otherwise it is said in the status and not followed. The server the operator `told` is followed alone (that is
 ///   the operator's word). Before the clock was ever set, the first server answers.
 async fn ask(
     servers: &[SocketAddr],
@@ -374,12 +375,11 @@ async fn ask(
     let Some((server, sample)) = chosen else {
         return nothing(&format!("no time server answered ({})", why.join("; ")), now_us());
     };
-    let agrees = found
+    // (Only the leader corroborates: the servers of a network all come from one lease, and a
+    // rogue DHCP server names as many as it likes.)
+    let agrees = leader
         .iter()
-        .filter(|(other, _)| *other != server)
-        .map(|(_, s)| s)
-        .chain(leader.iter().map(|(_, s)| s))
-        .any(|s| (s.offset_us - sample.offset_us).abs() <= AGREE_US);
+        .any(|(_, s)| (s.offset_us - sample.offset_us).abs() <= AGREE_US);
     let off = sample.offset_us.abs();
     let corroborated = !synced || trusted || told || agrees;
     let step = if off <= STEP_OVER_US {
@@ -405,15 +405,23 @@ pub fn status() -> Value {
     STATUS.lock().expect("nothing panics holding the status").clone()
 }
 
+/// Whether the clock was set before kithd started (it reads after the floor); and `serve` says
+/// nothing until it is.
+fn begin_at(now: i64) -> bool {
+    let synced = now > FLOOR_US;
+    UNSET.store(!synced, Ordering::Relaxed);
+    synced
+}
+
 /// Keep the clock as long as kithd runs: once the network has said something (or a while
 /// after, for one that says nothing: the cluster's leader may), then about every hour.
 pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     let kept = async {
+        // (Decided before the wait: a 1970 clock is not served for ten seconds.)
+        let mut synced = begin_at(now_us());
         let _ = tokio::time::timeout(Duration::from_secs(10), LEARNED.notified()).await;
         let mut said = String::new();
-        let mut synced = now_us() > FLOOR_US;
         let mut spent = 0;
-        UNSET.store(!synced, Ordering::Relaxed);
         loop {
             let (servers, told) = {
                 let sources = SOURCES.lock().expect("nothing panics holding the sources");
@@ -427,11 +435,8 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 synced = true;
                 UNSET.store(false, Ordering::Relaxed);
             }
-            let again = if now["error"].is_null() || now["stepped"] == true {
-                EVERY
-            } else {
-                RETRY
-            };
+            // (A server that answered and was not followed is asked again in an hour, not a minute.)
+            let again = if now["server"].is_string() { EVERY } else { RETRY };
             // (Said in the log when it changes, so an hour of the same does not fill it.)
             let line = match (now["error"].as_str(), now["server"].as_str()) {
                 (Some(why), _) => format!("kithd: clock: {why}"),
@@ -800,10 +805,10 @@ mod tests {
         // Two that disagree (a second at another time): refused.
         let (to, _) = after_first_sync(&[28_800_000_000, -3_600_000_000], None).await;
         assert_eq!(to, None);
-        // Two that agree to within a second: stepped.
+        // Two a network named that agree (one lease, one rogue DHCP server can name both): refused.
         let (to, said) = after_first_sync(&[28_800_000_000, 28_800_400_000], None).await;
-        assert!(to.is_some_and(|to| (to - 28_800_000_000).abs() < 200_000), "{to:?}");
-        assert_eq!(said["stepped"], true);
+        assert_eq!(to, None);
+        assert_eq!(said["stepped"], false);
         // A server and a leader that agree: stepped. Under two seconds: left alone either way.
         let (to, _) = after_first_sync(&[-5_000_000], Some(-5_200_000)).await;
         assert!(to.is_some());
@@ -867,8 +872,10 @@ mod tests {
             stepped.push(after_sync(&[step], None, false, &mut spent).await.0.is_some());
         }
         assert_eq!(stepped, [true, true, false]);
-        // A second source that agrees steps it, and gives the budget back.
+        // Two servers of a lease that agree give nothing back; the leader that agrees does.
         let (to, _) = after_sync(&[4_000_000, 4_200_000], None, false, &mut spent).await;
+        assert_eq!(to, None);
+        let (to, _) = after_sync(&[4_000_000], Some(4_200_000), false, &mut spent).await;
         assert!(to.is_some());
         assert_eq!(spent, 0);
         let (to, _) = after_sync(&[4_000_000], None, false, &mut spent).await;
@@ -884,6 +891,12 @@ mod tests {
 
     #[tokio::test]
     async fn clock_serves_no_time_until_it_has_been_set() {
+        // Decided at the start of `run`, before it waits for the network: a clock in 1970 is
+        // not served, one after the floor is.
+        assert!(!begin_at(0));
+        assert_eq!(serve().await.err(), Some(axum::http::StatusCode::SERVICE_UNAVAILABLE));
+        assert!(begin_at(FLOOR_US + 1));
+        assert!(serve().await.is_ok());
         UNSET.store(true, Ordering::Relaxed);
         assert_eq!(serve().await.err(), Some(axum::http::StatusCode::SERVICE_UNAVAILABLE));
         UNSET.store(false, Ordering::Relaxed);
