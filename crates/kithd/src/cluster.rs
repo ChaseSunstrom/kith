@@ -637,9 +637,16 @@ async fn standing(State(shared): State<Arc<Shared>>, Query(asked): Query<Standin
 }
 
 /// What a worker (`spec.trust`) is refused among the nodes' routes: the second hop of
-/// `kith run`, and Raft's own messages, which only one that votes or leads sends.
-const CONTROL_ONLY: [&str; 4] = ["/v1/raft/append", "/v1/raft/vote", "/v1/raft/snapshot", RUN_HOP];
+/// `kith run`, the one hop for a pod (`kubectl exec`, `cp` and `port-forward`) and Raft's own messages, which only one that votes or leads sends.
+const CONTROL_ONLY: [&str; 5] = [
+    "/v1/raft/append",
+    "/v1/raft/vote",
+    "/v1/raft/snapshot",
+    RUN_HOP,
+    POD_HOP,
+];
 const RUN_HOP: &str = "/v1/run-hop";
+pub(crate) const POD_HOP: &str = "/v1/pod-hop";
 
 /// Whether the Node `name` votes in the membership this node has. Raft's messages are taken
 /// from a worker for as long as it does (it hands its vote over itself, `raft::next_change`):
@@ -685,7 +692,7 @@ async fn members_only(
         Some(pki::Subject::Node(name, ..)) if let_in => {
             // A worker does not vote, is not followed, and its word for who asked is not taken.
             let worker = CONTROL_ONLY.contains(&path) && crate::access::worker(&shared, name);
-            if worker && (path == RUN_HOP || !votes(&shared, name)) {
+            if worker && (path == RUN_HOP || path == POD_HOP || !votes(&shared, name)) {
                 let why = format!("node {name} is a worker: only a control node sends this");
                 if shared.audit.stranger() {
                     let who = crate::access::Caller::Node(name.clone());
@@ -752,6 +759,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
     // (The second hop of `kith run`: the caller was checked on the first node.)
     let hop = Router::new()
         .route("/v1/run-hop", post(api::run::hop))
+        .route(POD_HOP, post(crate::pod_exec::hop))
         .route("/v1/raft/stands", get(standing))
         .route("/v1/clock", get(crate::clock::serve))
         .route("/v1/view", get(crate::view::serve))
