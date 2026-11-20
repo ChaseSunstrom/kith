@@ -525,6 +525,33 @@ fn package_render_and_lint() {
     assert!(code == 2 && err.contains("nowhere: no package.yaml"), "{err}");
 }
 
+/// A package for a newer kith than this one is warned of, by push and by render, and
+/// still goes through: the cluster's kithd is what refuses it (T-0990).
+#[test]
+fn package_kith_version_warns_when_this_kith_does_not_fit() {
+    let sandbox = Sandbox::new("package-kith-version");
+    for (asked, warned) in [(">=99", true), (">=0.1", false)] {
+        let dir = format!("pkg{warned}");
+        std::fs::create_dir_all(sandbox.0.join(&dir).join("templates")).unwrap();
+        sandbox.write(
+            &format!("{dir}/package.yaml"),
+            &format!("name: late\nversion: 1.0.0\nkithVersion: '{asked}'\n"),
+        );
+        sandbox.write(
+            &format!("{dir}/templates/map.yaml"),
+            "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: late }\nspec: { data: { a: b } }\n",
+        );
+        let path = sandbox.0.join(&dir);
+        let path = path.to_str().unwrap();
+        for args in [["package", "render", path], ["package", "push", path]] {
+            let (code, _, err) = sandbox.kith(&args);
+            assert_eq!(code, 0, "{asked} {args:?}: {err}");
+            let said = err.contains("warning: late 1.0.0 needs kith >=99, and this kith is ");
+            assert_eq!(said, warned, "{asked} {args:?}: {err}");
+        }
+    }
+}
+
 const K8S: &str = "\
 apiVersion: apps/v1
 kind: Deployment

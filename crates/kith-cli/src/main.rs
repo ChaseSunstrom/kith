@@ -621,6 +621,16 @@ fn fail<T>(e: impl std::fmt::Display) -> Result<T, String> {
     Err(format!("error: {e}"))
 }
 
+/// Load the package in `dir`; say, and go on, when its `kithVersion` is not this kith's
+/// (the cluster's kithd is what refuses to install it, T-0990).
+fn load_package(dir: &Path) -> Result<kith_packages::Package, String> {
+    let package = kith_packages::Package::load(dir).or_else(fail)?;
+    if let Some(why) = package.meta.kith_mismatch(env!("CARGO_PKG_VERSION")) {
+        eprintln!("warning: {why}");
+    }
+    Ok(package)
+}
+
 /// Where the resources live: kithd behind its socket, or a store file used directly.
 enum Backend {
     Daemon(Kithd),
@@ -1934,7 +1944,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     set,
                 },
         } => {
-            let package = kith_packages::Package::load(&dir).or_else(fail)?;
+            let package = load_package(&dir)?;
             let mut layers = Vec::new();
             for path in &values {
                 let source = std::fs::read_to_string(path).or_else(|e| fail(format!("{}: {e}", path.display())))?;
@@ -1968,7 +1978,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::Package {
             command: PackageCommand::Push { dir, to, key },
         } => {
-            let package = kith_packages::Package::load(&dir).or_else(fail)?;
+            let package = load_package(&dir)?;
             let wrong = package.lint();
             if !wrong.is_empty() {
                 return fail(wrong.join("\n"));

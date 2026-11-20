@@ -157,6 +157,23 @@ fn template_error(error: &minijinja::Error) -> String {
     said
 }
 
+impl Meta {
+    /// Why the kith `running` is not one this package supports (its `kithVersion`, a
+    /// semver range), or None when it is, or when the package asks for none. A
+    /// pre-release kith counts as its release: `>=1.2` holds for `1.2.0-rc1`.
+    pub fn kith_mismatch(&self, running: &str) -> Option<String> {
+        let asked = self.kith_version.as_deref()?;
+        let mut running_version = semver::Version::parse(running).ok()?;
+        running_version.pre = semver::Prerelease::EMPTY;
+        let said = |why: &str| format!("{} {} {why}, and this kith is {running}", self.name, self.version);
+        match semver::VersionReq::parse(asked) {
+            Ok(range) if range.matches(&running_version) => None,
+            Ok(_) => Some(said(&format!("needs kith {asked}"))),
+            Err(_) => Some(said(&format!("has a kithVersion `{asked}` that is no version range"))),
+        }
+    }
+}
+
 impl Package {
     /// A package from its files, by path from its directory.
     pub fn from_files(mut files: BTreeMap<String, String>) -> Fallible<Package> {

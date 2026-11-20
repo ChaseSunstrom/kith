@@ -19,6 +19,10 @@ kith package render packages/web --name shop -n store --set replicas=3 -f mine.y
 kith package render packages/web --name shop | kith apply -f -
 ```
 
+- `kithVersion` is a semver range (`>=1.2`) of the kith versions the package supports. A Release
+  of a package the running kithd does not fit is in state `error`, saying both versions, and
+  installs nothing; with none, any kithd will do. `kith package push` and `render` warn when
+  the `kith` itself does not fit, and go on.
 - Templates are Jinja ([minijinja](https://docs.rs/minijinja)). They see `values` (the defaults,
   then each `-f` file, then each `--set`, merged by key), `release.name`, `release.namespace`,
   `package.name`, `package.version`, `name` (the release's resource name: `shop-web`) and
