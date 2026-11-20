@@ -45,7 +45,7 @@ pub fn link(number: u16) -> String {
     format!("kpx{number}")
 }
 
-fn table(number: u16) -> u32 {
+pub fn table(number: u16) -> u32 {
     0x6b78_0000 | u32::from(number)
 }
 
@@ -234,8 +234,12 @@ fn people_dump() -> Result<Vec<RuleMessage>> {
         .collect())
 }
 
-/// What kwg0 has of the people's rules, as (priority, IPv6, source): for the tests and the check.
-pub fn people_rules() -> Result<Vec<(u32, bool, Option<Ipv4Addr>)>> {
+/// One of the people's rules as the kernel has it: (priority, IPv6, source, table), the table being
+/// none for the rule that sends nowhere.
+pub type PeopleRule = (u32, bool, Option<Ipv4Addr>, Option<u32>);
+
+/// What kwg0 has of the people's rules: for the tests and the check.
+pub fn people_rules() -> Result<Vec<PeopleRule>> {
     let mut seen = Vec::new();
     for rule in people_dump()? {
         let priority = rule.attributes.iter().find_map(|a| match a {
@@ -246,23 +250,36 @@ pub fn people_rules() -> Result<Vec<(u32, bool, Option<Ipv4Addr>)>> {
             RuleAttribute::Source(IpAddr::V4(from)) => Some(*from),
             _ => None,
         });
+        let table = rule.attributes.iter().find_map(|a| match a {
+            RuleAttribute::Table(table) => Some(*table),
+            _ => None,
+        });
+        // (The kernel says table 0 of the rule that sends nowhere: it has none.)
+        let table = table.filter(|_| priority != Some(PEOPLE_NOWHERE));
         let v6 = rule.header.family == AddressFamily::Inet6;
         // (Only a rule that is the whole rule counts: one by kwg0 at 9010 with another table, or
         // without the suppress, is not the people's.)
         seen.extend(
             priority
-                .filter(|&priority| is_whole(&rule, v6, priority, source))
-                .map(|priority| (priority, v6, source)),
+                .filter(|&priority| is_whole(&rule, v6, priority, source, table))
+                .map(|priority| (priority, v6, source, table)),
         );
     }
     seen.sort();
     Ok(seen)
 }
 
-/// Is `rule` the people's rule at `priority` (of `v6`, from `source`) with all of what it is made
-/// of: its action, its lengths, its table and its suppress? (The kernel adds attributes of its own.)
-fn is_whole(rule: &RuleMessage, v6: bool, priority: u32, source: Option<Ipv4Addr>) -> bool {
-    let want = people_rule(v6, priority, source, (priority != PEOPLE_NOWHERE).then_some(254)).message();
+/// Is `rule` the people's rule at `priority` (of `v6`, from `source`, to `table`: none for the last
+/// rule) with all of what it is made of: its action, its lengths, its table and its suppress? (The
+/// kernel adds attributes of its own.) At 9010 the table is the main one, whatever `table` says.
+fn is_whole(rule: &RuleMessage, v6: bool, priority: u32, source: Option<Ipv4Addr>, table: Option<u32>) -> bool {
+    let table = match priority {
+        PEOPLE_MAIN => Some(254),
+        PEOPLE_NOWHERE => None,
+        _ if table.is_some() => table,
+        _ => return false,
+    };
+    let want = people_rule(v6, priority, source, table).message();
     rule.header.action == want.header.action
         && rule.header.src_len == want.header.src_len
         && rule.header.dst_len == want.header.dst_len
@@ -278,7 +295,7 @@ pub fn people_hold() -> Result<()> {
     }
     for rule in people_dump()? {
         let v6 = rule.header.family == AddressFamily::Inet6;
-        if !is_whole(&rule, v6, PEOPLE_NOWHERE, None) {
+        if !is_whole(&rule, v6, PEOPLE_NOWHERE, None, None) {
             delete(rule)?;
         }
     }
@@ -288,10 +305,10 @@ pub fn people_hold() -> Result<()> {
     Ok(())
 }
 
-/// A person's IPv4 `from` by the whole main table (its default route too): made, or with `!there`
-/// taken away.
-pub fn people_internet(from: Ipv4Addr, there: bool) -> Result<()> {
-    people_rule(false, PEOPLE_INTERNET, Some(from), Some(254)).set(there)
+/// A person's IPv4 `from` by the whole of `table` (254, the main one with its default route, or an
+/// Exit's [`table`]): made, or with `!there` taken away (by the table it was made with).
+pub fn people_internet(from: Ipv4Addr, table: u32, there: bool) -> Result<()> {
+    people_rule(false, PEOPLE_INTERNET, Some(from), Some(table)).set(there)
 }
 
 /// Take all of the people's rules away.
@@ -558,10 +575,10 @@ mod tests {
             return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh people_rules");
         }
         let right = vec![
-            (PEOPLE_MAIN, false, None),
-            (PEOPLE_MAIN, true, None),
-            (PEOPLE_NOWHERE, false, None),
-            (PEOPLE_NOWHERE, true, None),
+            (PEOPLE_MAIN, false, None, Some(254)),
+            (PEOPLE_MAIN, true, None, Some(254)),
+            (PEOPLE_NOWHERE, false, None, None),
+            (PEOPLE_NOWHERE, true, None, None),
         ];
         people_release().unwrap();
         people_hold().unwrap();
@@ -581,6 +598,19 @@ mod tests {
         people_hold().unwrap();
         assert_eq!(people_rules().unwrap(), right);
         assert_eq!(people_dump().unwrap().len(), 4, "the others are gone");
+
+        // A person's rule 9011 is to the table it was made with: the main one or an Exit's.
+        let phone: Ipv4Addr = "100.89.0.2".parse().unwrap();
+        people_internet(phone, 254, true).unwrap();
+        people_internet(phone, table(7), true).unwrap();
+        let mut both = right.clone();
+        both.push((PEOPLE_INTERNET, false, Some(phone), Some(254)));
+        both.push((PEOPLE_INTERNET, false, Some(phone), Some(table(7))));
+        both.sort();
+        assert_eq!(people_rules().unwrap(), both);
+        people_internet(phone, 254, false).unwrap();
+        people_internet(phone, table(7), false).unwrap();
+        assert_eq!(people_rules().unwrap(), right);
         people_release().unwrap();
     }
 

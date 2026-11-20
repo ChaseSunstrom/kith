@@ -2000,9 +2000,17 @@ fn an_exit_and_a_published_port_are_checked() {
     };
     let exit = "{ node: n1, secret: vpn, namespaces: [media], dns: [10.2.0.1] }";
     read("Exit", exit).unwrap();
+    // (Levels of the people, with or without namespaces.)
+    read("Exit", "{ node: n1, secret: vpn, levels: [family] }").unwrap();
+    read(
+        "Exit",
+        "{ node: n1, secret: vpn, namespaces: [media], levels: [family] }",
+    )
+    .unwrap();
     assert!(!kind("Exit").unwrap().namespaced);
     for (bad, why) in [
         ("{ node: n1, secret: vpn, namespaces: [] }", "namespaces: at least one"),
+        ("{ node: n1, secret: vpn, levels: [Family] }", "levels: invalid name"),
         (
             "{ node: n1, secret: vpn, namespaces: [Media] }",
             "namespaces: invalid name",
