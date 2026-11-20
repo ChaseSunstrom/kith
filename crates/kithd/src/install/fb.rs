@@ -24,6 +24,7 @@ const STOP: usize = 20;
 const STROKE: usize = 3;
 const FIRST_STOP_Y: usize = 240;
 const STOP_GAP: usize = 56;
+const MIN_GAP: usize = STOP + 8;
 const QUESTION_SCALE: usize = 3;
 const LABEL_SCALE: usize = 2;
 /// A glyph's rows (the font's `[u8; 9]`): `CAP_H` down to the baseline, then two below it for
@@ -206,6 +207,11 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 /// question's own lines are kept, and each is wrapped at the question's size; a line with a
 /// word too long for that (a recovery key) is drawn smaller, whole.
 fn layout(question: &str, width: usize) -> Vec<(String, usize)> {
+    layout_at(question, width, QUESTION_SCALE)
+}
+
+/// `layout` with the question's size `top` (a smaller one when the text is long).
+fn layout_at(question: &str, width: usize, top: usize) -> Vec<(String, usize)> {
     let room = width.saturating_sub(2 * MARGIN);
     let mut lines = Vec::new();
     for source in question.split('\n') {
@@ -214,10 +220,10 @@ fn layout(question: &str, width: usize) -> Vec<(String, usize)> {
             .map(|word| word.chars().count())
             .max()
             .unwrap_or(0);
-        let scale = if longest <= room / (6 * QUESTION_SCALE) {
-            QUESTION_SCALE
+        let scale = if longest <= room / (6 * top) {
+            top
         } else {
-            LABEL_SCALE
+            LABEL_SCALE.min(top)
         };
         let pieces = wrap(source, room / (6 * scale));
         if pieces.is_empty() {
@@ -230,16 +236,33 @@ fn layout(question: &str, width: usize) -> Vec<(String, usize)> {
 
 /// Draw the install question `question` with the rail of `stops`, `current` being the stop
 /// it belongs to: the stops before it in ink, it in the accent, the ones after it outlined,
-/// and `footer` at the foot. Only the colours of the site's tokens are used.
+/// and `footer` at the foot. Only the colours of the site's tokens are used. The rail starts
+/// below the text (at `FIRST_STOP_Y`, or lower for a long question); a long question is set in
+/// a smaller size until the rail fits under it, and with none that fits (a screen too short
+/// for the text even at the smallest size) the rail is left out, not drawn over the text.
 pub fn draw_question(frame: &mut Frame, stops: &[&str], current: usize, question: &str, footer: &str) {
     frame.rect(0, 0, frame.width, frame.height, SITE_BG);
+    let mut chosen = None;
+    for top in [QUESTION_SCALE, LABEL_SCALE, 1] {
+        let lines = layout_at(question, frame.width, top);
+        let bottom = MARGIN + lines.iter().map(|(_, scale)| LINE_H * scale).sum::<usize>();
+        let first = FIRST_STOP_Y.max(bottom + STOP + STOP / 2);
+        let fits = rail_gap(frame.height, stops.len(), first) >= MIN_GAP;
+        chosen = Some((lines, first, fits));
+        if fits {
+            break;
+        }
+    }
+    let (lines, first, fits) = chosen.expect("a size was tried");
     let mut y = MARGIN;
-    for (line, scale) in layout(question, frame.width) {
+    for (line, scale) in lines {
         frame.text(MARGIN, y, scale, &line, SITE_TEXT);
         y += LINE_H * scale;
     }
-    let rail: Vec<(&str, &str)> = stops.iter().map(|&label| (label, "")).collect();
-    draw_rail(frame, &rail, current);
+    if fits {
+        let rail: Vec<(&str, &str)> = stops.iter().map(|&label| (label, "")).collect();
+        draw_rail(frame, &rail, current, first);
+    }
     frame.text(
         MARGIN,
         frame.height.saturating_sub(MARGIN),
@@ -268,27 +291,27 @@ const LINE_Y: usize = 104;
 const BAR_Y: usize = 156;
 const BAR_H: usize = 14;
 
-/// The middle of stop `i` of `count` on a picture `height` tall: `STOP_GAP` apart, closer
-/// where that many would run off a short screen.
-fn stop_centre(height: usize, count: usize, i: usize) -> usize {
-    let room = height.saturating_sub(MARGIN + FIRST_STOP_Y + STOP);
-    FIRST_STOP_Y + STOP_GAP.min(room / count.saturating_sub(1).max(1)) * i
+/// The distance between stops of `count` on a picture `height` tall, the first at `first`:
+/// `STOP_GAP`, closer where that many would run off a short screen. Under `MIN_GAP` the stops
+/// crowd each other, and the rail is not drawn there.
+fn rail_gap(height: usize, count: usize, first: usize) -> usize {
+    let room = height.saturating_sub(MARGIN + first + STOP);
+    STOP_GAP.min(room / count.saturating_sub(1).max(1))
 }
 
-/// The rail: the line down the stops, and each stop with its label and its detail (what was
-/// answered). Before `current` a stop is done (ink, with a tick), at it the accent, after it
-/// outlined. `current == stops.len()` is all done.
-fn draw_rail(frame: &mut Frame, stops: &[(&str, &str)], current: usize) {
+/// The middle of stop `i` of `count` on a picture `height` tall, the first at `first`.
+fn stop_centre(height: usize, count: usize, first: usize, i: usize) -> usize {
+    first + rail_gap(height, count, first) * i
+}
+
+/// The rail: the line down the stops from the first at `first`, and each stop with its label
+/// and its detail (what was answered). Before `current` a stop is done (ink, with a tick), at
+/// it the accent, after it outlined. `current == stops.len()` is all done.
+fn draw_rail(frame: &mut Frame, stops: &[(&str, &str)], current: usize, first: usize) {
     let (height, count) = (frame.height, stops.len());
-    let centre = |i: usize| stop_centre(height, count, i);
+    let centre = |i: usize| stop_centre(height, count, first, i);
     let last = centre(stops.len().saturating_sub(1));
-    frame.rect(
-        RAIL_X + (STOP - STROKE) / 2,
-        FIRST_STOP_Y,
-        STROKE,
-        last - FIRST_STOP_Y,
-        SITE_HAIR,
-    );
+    frame.rect(RAIL_X + (STOP - STROKE) / 2, first, STROKE, last - first, SITE_HAIR);
     for (i, (label, detail)) in stops.iter().enumerate() {
         let top = centre(i) - STOP / 2;
         let (fill, text) = match i.cmp(&current) {
@@ -346,7 +369,7 @@ pub fn draw_progress(
         let said = format!("{percent}%");
         frame.text(MARGIN, BAR_Y + BAR_H + 10, LABEL_SCALE, &said, SITE_TEXT);
     }
-    draw_rail(frame, stops, done);
+    draw_rail(frame, stops, done, FIRST_STOP_Y);
     frame.text(
         MARGIN,
         frame.height.saturating_sub(MARGIN),
@@ -691,7 +714,7 @@ mod tests {
 
     /// The pixel at the middle of the left edge of stop `i`'s square.
     fn stop_edge(frame: &Frame, i: usize) -> [u8; 3] {
-        frame.pixel(RAIL_X + 1, stop_centre(frame.height, PROGRESS.len(), i))
+        frame.pixel(RAIL_X + 1, stop_centre(frame.height, PROGRESS.len(), FIRST_STOP_Y, i))
     }
 
     #[test]
@@ -707,10 +730,10 @@ mod tests {
             assert_eq!(stop_edge(&frame, i), want, "stop {i}");
         }
         // A done stop carries a tick in paper; one to come is outlined and empty inside.
-        let top = |i: usize| stop_centre(frame.height, PROGRESS.len(), i) - STOP / 2;
+        let top = |i: usize| stop_centre(frame.height, PROGRESS.len(), FIRST_STOP_Y, i) - STOP / 2;
         assert_eq!(frame.pixel(RAIL_X + 5, top(0) + 10), site("bg"), "stop 0 has no tick");
         assert_eq!(frame.pixel(RAIL_X + 10, top(5) + 10), site("bg"));
-        let last = stop_centre(frame.height, PROGRESS.len(), PROGRESS.len() - 1);
+        let last = stop_centre(frame.height, PROGRESS.len(), FIRST_STOP_Y, PROGRESS.len() - 1);
         assert!(
             last + STOP / 2 < frame.height - MARGIN,
             "the rail fits an 800x600 screen"
@@ -831,6 +854,71 @@ mod tests {
                 "a glyph without a tail has ink below the baseline at scale {scale}"
             );
         }
+    }
+
+    /// The interview's disk question for `n` disks, as install.rs words it.
+    fn disk_question(n: usize) -> String {
+        let listed: String = (0..n)
+            .map(|i| format!("  nvme{i}n1 (500.1 GB, Samsung SSD 970 EVO Plus, serial S4EW000{i})\n"))
+            .collect();
+        format!("This machine's disks:\n{listed}Install kith OS on which (its name, or serial:X)?")
+    }
+
+    #[test]
+    fn fb_a_long_question_never_runs_into_the_rail_or_off_the_screen() {
+        let ink = [site("text"), site("accent"), site("hair")];
+        // 1400: room for the question at its full size (3); 600: the screen of the VM tests,
+        // where it is set smaller; 300: too short for the rail at any size, so it is left out.
+        for height in [1400, 600, 300] {
+            let mut frame = Frame::new(
+                Geometry {
+                    width: 800,
+                    height,
+                    stride: 3200,
+                },
+                RGB,
+            );
+            draw_question(&mut frame, &STOPS, 0, &disk_question(8), ANSWER);
+            let top = (0..height).find(|&y| (0..800).any(|x| frame.pixel(x, y) == site("accent")));
+            match top {
+                // Rail: its first stop (the accent) is under the last line of text, a stop's
+                // height clear of it, and no text ink is in the rail's column from there on.
+                Some(top) => {
+                    let text_bottom = (0..top)
+                        .rev()
+                        .find(|&y| (0..800).any(|x| frame.pixel(x, y) == site("text")))
+                        .expect("the question is drawn above the rail");
+                    assert!(
+                        top > text_bottom + STOP / 2,
+                        "{height}: the rail starts at {top}, text ends {text_bottom}"
+                    );
+                    assert!(
+                        !has_ink_of(&frame, RAIL_X, top, STOP, height - top, site("text")),
+                        "{height}: text ink in the rail's column"
+                    );
+                    let last = stop_centre(height, STOPS.len(), top + STOP / 2, STOPS.len() - 1);
+                    assert!(
+                        last + STOP / 2 <= height - MARGIN,
+                        "{height}: the rail runs past the footer"
+                    );
+                }
+                None => assert_eq!(height, 300, "{height}: the rail is dropped only where it cannot fit"),
+            }
+            // Nothing but the footer (dim) is in the bottom margin, and no ink of the rail or text.
+            for y in height.saturating_sub(MARGIN)..height {
+                for x in 0..800 {
+                    assert!(
+                        height == 300 || !ink.contains(&frame.pixel(x, y)),
+                        "{height}: ink at {x},{y} in the bottom margin"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether any pixel of the box (x, y, w, h) on `frame` is `colour`.
+    fn has_ink_of(frame: &Frame, x: usize, y: usize, w: usize, h: usize, colour: [u8; 3]) -> bool {
+        (y..y + h).any(|row| (x..x + w).any(|column| frame.pixel(column, row) == colour))
     }
 
     #[test]
