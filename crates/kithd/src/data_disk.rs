@@ -9,9 +9,13 @@
 //!
 //! The add's order of writes ([`add`]), what a disk is to this node ([`standing`], [`off_ours`])
 //! and the remove ([`remove`]) are here too; the mapping step is the [`Mapper`] trait, so a file
-//! and a fake show every cut of the order. The real mapper, the mount and the verbs are T-0958's.
-// (Nothing calls this yet: T-0958 is the slice that calls it and removes this.)
+//! and a fake show every cut of the order. The real mapper and the mount are [`seed`], the task
+//! that mounts the known disks after the state opens is [`boot`]; the verbs are T-0958's.
+// (The add and the remove are called by the verbs, the second half of T-0958: not yet.)
 #![allow(dead_code)]
+
+pub mod boot;
+pub mod seed;
 
 use ring::digest;
 use std::fs::File;
@@ -393,7 +397,7 @@ fn serial_ok(serial: &str) -> bool {
 /// the header last, the entry `ready`. The disk's first 4 KiB stay zero until the header. A disk
 /// that holds the header of this add (its id a `pending` entry of this `serial`) is resumed: it
 /// is mapped with the kept key and, if its file system answers, marked `ready`. `serial` is the
-/// one typed and matched with the disk's by the caller (the code that runs this, T-0972: no
+/// one typed and matched with the disk's by the caller (the code that runs this, the verbs of T-0958: no
 /// `Dev` reports a serial, so it is not checked here). An unknown disk is not written unless
 /// `wipe` is said and what refuses it is [`Refused::wipeable`]. Leaves the mapping open.
 pub fn add<D: Dev>(
@@ -537,7 +541,7 @@ fn pending_of(state: &Path, serial: &str) -> Option<Id> {
 /// while in use, before anything is written), then its header's 4 KiB zeroed, then its key
 /// overwritten and its directory removed. A disk that is neither that header nor zero is not
 /// written, and a second call finishes a cut one (a zero header, an entry still there). As for
-/// [`add`], the caller (T-0972) matches `serial` with the disk's own; here it is the entry's.
+/// [`add`], the caller (the verbs) matches `serial` with the disk's own; here it is the entry's.
 pub fn remove<D: Dev>(state: &Path, disk: &D, id: &Id, serial: &str, mapper: &mut impl Mapper) -> Result<(), String> {
     let entry = read_entry(&dir_of(state, id)).ok_or("this node has no such disk")?;
     if entry.serial != serial {
