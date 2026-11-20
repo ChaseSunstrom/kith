@@ -1,0 +1,1025 @@
+//! Usage metrics for the web UI's graphs: each node samples itself every 10 s (CPU, memory, the
+//! state disk, its read and write rates, network rates, load) and the cgroup of each unit of a
+//! Workload on it (CPU cores, memory), into rings in memory only: 10 s points for an hour and
+//! 5 min points for a day. Nothing is written to the store and nothing goes over Raft.
+//!
+//! `GET /v1/metrics?range=15m|1h|6h|24h` answers every node's series: this node's own, and each
+//! other node's asked over node-to-node mTLS (`/v1/node-metrics`, members only) with a short
+//! deadline, one that does not answer being `missing` and the answer still coming. The arrays are
+//! oldest first, each aligned to `end - step * (len - 1 - i)`, `null` where nothing was sampled.
+//!
+//! The rings are arrays addressed by time (a slot is the unix time over the step), so the oldest
+//! point is overwritten by the one a ring-length later, a gap is a slot nobody wrote, and series
+//! of different nodes line up without either knowing the other's clock beyond the step.
+
+use crate::Shared;
+use crate::access::Caller;
+use crate::api::{ApiError, Reply, permit};
+use axum::extract::{Query, State};
+use axum::{Extension, Json};
+use kith_api::kinds::Verb;
+use kith_api::store::Error;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
+
+/// A point every 10 s for an hour, and every 5 min for a day.
+const FINE: u64 = 10;
+const FINE_N: usize = 360;
+const COARSE: u64 = 300;
+const COARSE_N: usize = 288;
+/// A Workload not seen for this long is forgotten with its history, and no more than
+/// `MAX_WORKLOADS` are kept (what a node runs is far fewer: this is a ceiling for memory).
+const KEEP_WORKLOAD: u64 = 3600;
+const MAX_WORKLOADS: usize = 512;
+/// How long another node is given to answer, and the most it may send.
+const ASK_FOR: Duration = Duration::from_secs(3);
+const MAX_ANSWER: usize = 4 << 20;
+
+/// What a ring keeps for one slot: the sum of the samples in it and how many (a 5 min slot is
+/// the mean of what 10 s samples fell in it).
+#[derive(Clone, Copy)]
+struct Cell<const K: usize> {
+    slot: u64,
+    n: u32,
+    sum: [f64; K],
+}
+
+impl<const K: usize> Cell<K> {
+    const EMPTY: Self = Cell {
+        slot: 0,
+        n: 0,
+        sum: [0.0; K],
+    };
+}
+
+/// `N` slots of `step` seconds, each of `K` values.
+struct Ring<const K: usize, const N: usize> {
+    step: u64,
+    cells: [Cell<K>; N],
+}
+
+impl<const K: usize, const N: usize> Ring<K, N> {
+    const fn new(step: u64) -> Self {
+        Ring {
+            step,
+            cells: [Cell::EMPTY; N],
+        }
+    }
+
+    /// Put the sample taken at unix time `at` in its slot, over what an older slot left there.
+    fn add(&mut self, at: u64, values: [f64; K]) {
+        let slot = at / self.step;
+        let cell = &mut self.cells[(slot % N as u64) as usize];
+        if cell.n == 0 || cell.slot != slot {
+            *cell = Cell {
+                slot,
+                n: 0,
+                sum: [0.0; K],
+            };
+        }
+        cell.n += 1;
+        for (sum, value) in cell.sum.iter_mut().zip(values) {
+            *sum += value;
+        }
+    }
+
+    /// The `points` slots that end with the one `end` is in, oldest first; `None` for a slot
+    /// nobody wrote (or one a newer slot took the place of, or one before the epoch).
+    fn series(&self, end: u64, points: usize) -> Vec<Option<[f64; K]>> {
+        let last = end / self.step;
+        (0..points)
+            .map(|i| {
+                let slot = last.checked_sub((points - 1 - i) as u64)?;
+                let cell = &self.cells[(slot % N as u64) as usize];
+                (cell.n > 0 && cell.slot == slot).then(|| cell.sum.map(|sum| sum / f64::from(cell.n)))
+            })
+            .collect()
+    }
+}
+
+/// One Workload's two rings: CPU in cores and memory in bytes.
+struct Work {
+    last: u64,
+    fine: Ring<2, FINE_N>,
+    coarse: Ring<2, COARSE_N>,
+}
+
+/// Everything this node has sampled.
+struct Rings {
+    cpus: u32,
+    mem_total: u64,
+    disk_total: u64,
+    /// cpu (0 to 1), mem, disk, disk read, disk write, rx, tx (bytes, and per second), load1.
+    fine: Ring<8, FINE_N>,
+    coarse: Ring<8, COARSE_N>,
+    work: BTreeMap<String, Box<Work>>,
+}
+
+/// (A static, so that the sampler and the handlers meet without a field in `Shared`.)
+static RINGS: Mutex<Rings> = Mutex::new(Rings::new());
+
+fn rings() -> std::sync::MutexGuard<'static, Rings> {
+    RINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Rings {
+    const fn new() -> Self {
+        Rings {
+            cpus: 0,
+            mem_total: 0,
+            disk_total: 0,
+            fine: Ring::new(FINE),
+            coarse: Ring::new(COARSE),
+            work: BTreeMap::new(),
+        }
+    }
+
+    fn node(&mut self, at: u64, values: [f64; 8], cpus: u32, mem_total: u64, disk_total: u64) {
+        (self.cpus, self.mem_total, self.disk_total) = (cpus, mem_total, disk_total);
+        self.fine.add(at, values);
+        self.coarse.add(at, values);
+    }
+
+    fn work(&mut self, at: u64, key: &str, values: [f64; 2]) {
+        self.work
+            .retain(|_, work| at.saturating_sub(work.last) <= KEEP_WORKLOAD);
+        if !self.work.contains_key(key) && self.work.len() >= MAX_WORKLOADS {
+            return;
+        }
+        let work = self.work.entry(key.to_string()).or_insert_with(|| {
+            Box::new(Work {
+                last: at,
+                fine: Ring::new(FINE),
+                coarse: Ring::new(COARSE),
+            })
+        });
+        work.last = at;
+        work.fine.add(at, values);
+        work.coarse.add(at, values);
+    }
+
+    /// This node's series, `points` of `step` ending at `end`, for the node `me`.
+    fn local(&self, me: &str, step: u64, points: usize, end: u64) -> Local {
+        let fine = step == FINE;
+        let rows = if fine {
+            self.fine.series(end, points)
+        } else {
+            self.coarse.series(end, points)
+        };
+        let node = NodeSeries {
+            cpu: column(&rows, 0, 3),
+            cpus: self.cpus,
+            mem: column(&rows, 1, 0),
+            mem_total: self.mem_total,
+            disk: column(&rows, 2, 0),
+            disk_total: self.disk_total,
+            disk_read: column(&rows, 3, 0),
+            disk_write: column(&rows, 4, 0),
+            rx: column(&rows, 5, 0),
+            tx: column(&rows, 6, 0),
+            load1: column(&rows, 7, 3),
+            missing: false,
+        };
+        let workloads = self
+            .work
+            .iter()
+            .map(|(key, work)| {
+                let rows = if fine {
+                    work.fine.series(end, points)
+                } else {
+                    work.coarse.series(end, points)
+                };
+                let series = WorkSeries {
+                    node: me.to_string(),
+                    cpu: column(&rows, 0, 3),
+                    mem: column(&rows, 1, 0),
+                };
+                (key.clone(), series)
+            })
+            .collect();
+        Local { node, workloads }
+    }
+}
+
+/// Value `i` of each row, to `places` decimals (a JSON number is as short as it can be).
+fn column<const K: usize>(rows: &[Option<[f64; K]>], i: usize, places: i32) -> Vec<Option<f64>> {
+    let scale = 10f64.powi(places);
+    rows.iter()
+        .map(|row| row.map(|values| (values[i] * scale).round() / scale))
+        .collect()
+}
+
+fn no(value: &bool) -> bool {
+    !*value
+}
+
+/// One node's series, as `GET /v1/metrics` has them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeSeries {
+    cpu: Vec<Option<f64>>,
+    cpus: u32,
+    mem: Vec<Option<f64>>,
+    mem_total: u64,
+    disk: Vec<Option<f64>>,
+    disk_total: u64,
+    disk_read: Vec<Option<f64>>,
+    disk_write: Vec<Option<f64>>,
+    rx: Vec<Option<f64>>,
+    tx: Vec<Option<f64>>,
+    load1: Vec<Option<f64>>,
+    #[serde(default, skip_serializing_if = "no")]
+    missing: bool,
+}
+
+impl NodeSeries {
+    /// A node that did not answer: the whole shape, of nothing.
+    fn missing(points: usize) -> Self {
+        let nulls = vec![None; points];
+        NodeSeries {
+            cpu: nulls.clone(),
+            mem: nulls.clone(),
+            disk: nulls.clone(),
+            disk_read: nulls.clone(),
+            disk_write: nulls.clone(),
+            rx: nulls.clone(),
+            tx: nulls.clone(),
+            load1: nulls,
+            missing: true,
+            ..NodeSeries::default()
+        }
+    }
+
+    fn columns(&self) -> [&Vec<Option<f64>>; 8] {
+        [
+            &self.cpu,
+            &self.mem,
+            &self.disk,
+            &self.disk_read,
+            &self.disk_write,
+            &self.rx,
+            &self.tx,
+            &self.load1,
+        ]
+    }
+}
+
+/// One Workload's series on the node it runs on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct WorkSeries {
+    node: String,
+    cpu: Vec<Option<f64>>,
+    mem: Vec<Option<f64>>,
+}
+
+/// What one node says of itself (and what it sends another that asks).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Local {
+    node: NodeSeries,
+    workloads: BTreeMap<String, WorkSeries>,
+}
+
+impl Local {
+    /// Whether it is what was asked for: `points` in each series, and no more Workloads than a
+    /// node keeps (what another node sent is not taken on trust for its size).
+    fn fits(&self, points: usize) -> bool {
+        self.node.columns().iter().all(|column| column.len() == points)
+            && self.workloads.len() <= MAX_WORKLOADS
+            && self
+                .workloads
+                .values()
+                .all(|w| w.cpu.len() == points && w.mem.len() == points)
+    }
+}
+
+/// The step and number of points of a range.
+fn span(range: &str) -> Option<(u64, usize)> {
+    match range {
+        "15m" => Some((FINE, 90)),
+        "1h" => Some((FINE, FINE_N)),
+        "6h" => Some((COARSE, 72)),
+        "24h" => Some((COARSE, COARSE_N)),
+        _ => None,
+    }
+}
+
+/// The answer: each node's series by name (a node that did not answer is `missing`), and each
+/// Workload's by `NS/NAME`. A Workload that runs on more than one node has the first node's (by
+/// name) under `NS/NAME` and each other's under `NS/NAME@NODE`.
+fn merge(
+    range: &str,
+    step: u64,
+    points: usize,
+    end: u64,
+    mut locals: Vec<(String, Option<Local>)>,
+) -> serde_json::Value {
+    locals.sort_by(|a, b| a.0.cmp(&b.0));
+    let (mut nodes, mut workloads) = (BTreeMap::new(), BTreeMap::new());
+    for (name, local) in locals {
+        let Some(Local { node, workloads: work }) = local else {
+            nodes.insert(name, NodeSeries::missing(points));
+            continue;
+        };
+        for (key, mut series) in work {
+            series.node.clone_from(&name);
+            let key = if workloads.contains_key(&key) {
+                format!("{key}@{name}")
+            } else {
+                key
+            };
+            workloads.insert(key, series);
+        }
+        nodes.insert(name, node);
+    }
+    serde_json::json!({ "range": range, "step": step, "end": end, "nodes": nodes, "workloads": workloads })
+}
+
+#[derive(Deserialize)]
+pub struct Options {
+    range: Option<String>,
+    /// Only for another node: the end the asking node answers with, so the series line up.
+    end: Option<u64>,
+}
+
+fn invalid(range: &str) -> ApiError {
+    ApiError::Store(Error::Invalid(format!("range {range:?}: it is 15m, 1h, 6h or 24h")))
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// `GET /v1/metrics`: every node's series.
+pub async fn serve(
+    State(shared): State<std::sync::Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Query(options): Query<Options>,
+) -> Reply<serde_json::Value> {
+    permit(&shared, &caller, Verb::List, |_| vec![("Node".into(), None)])?;
+    let range = options.range.as_deref().unwrap_or("1h");
+    let (step, points) = span(range).ok_or_else(|| invalid(range))?;
+    let end = now() / step * step;
+    let me = shared.members.me().to_string();
+    let mine = rings().local(&me, step, points, end);
+    let peers: Vec<(String, crate::view::Upstream)> = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let nodes = state.store.list(Some("Node"));
+        let nodes = nodes.filter_map(|node| Some((node.metadata.name.clone(), crate::view::Upstream::of(node)?)));
+        nodes.filter(|(name, _)| *name != me).collect()
+    };
+    let query = format!("range={range}&end={end}");
+    let asked = peers.into_iter().map(|(name, there)| {
+        let (shared, query) = (shared.clone(), query.clone());
+        async move {
+            let local = match &shared.cluster {
+                Some(cluster) => ask(cluster, &there, &query).await.filter(|local| local.fits(points)),
+                None => None,
+            };
+            (name, local)
+        }
+    });
+    let mut all = futures_util::future::join_all(asked).await;
+    all.push((me, Some(mine)));
+    Ok(Json(merge(range, step, points, end, all)))
+}
+
+/// What the node `there` says of itself, or nothing: it did not answer in time, or what it sent
+/// is no answer (too big, not JSON).
+async fn ask(cluster: &crate::cluster::Cluster, there: &crate::view::Upstream, query: &str) -> Option<Local> {
+    let client = cluster.to(there).ok()?;
+    let url = format!("https://{}/v1/node-metrics?{query}", there.address);
+    let mut answer = client
+        .get(url)
+        .timeout(ASK_FOR)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let mut body = Vec::new();
+    while let Some(chunk) = answer.chunk().await.ok()? {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_ANSWER {
+            return None;
+        }
+    }
+    let mut local: Local = serde_json::from_slice(&body).ok()?;
+    // (Whatever it says of itself, it is not missing, and its Workloads run on it.)
+    local.node.missing = false;
+    Some(local)
+}
+
+/// `GET /v1/node-metrics`, members only: this node's own series, for the node that was asked for
+/// all (which has checked who asked it).
+pub async fn node(State(shared): State<std::sync::Arc<Shared>>, Query(options): Query<Options>) -> Reply<Local> {
+    let range = options.range.as_deref().unwrap_or("1h");
+    let (step, points) = span(range).ok_or_else(|| invalid(range))?;
+    let end = options.end.unwrap_or_else(now) / step * step;
+    Ok(Json(rings().local(shared.members.me(), step, points, end)))
+}
+
+// What the sampler reads. Each parser takes the text of a file, so that a fixture tests it.
+
+/// `/proc/stat`: the CPUs' busy and total ticks (all of the first line's but guest, which the user's
+/// ticks hold already), and how many CPUs there are.
+fn parse_stat(text: &str) -> Option<(u64, u64, u32)> {
+    let mut lines = text.lines();
+    let ticks: Vec<u64> = lines
+        .next()?
+        .strip_prefix("cpu ")?
+        .split_whitespace()
+        .take(8)
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let [_, _, _, idle, ..] = ticks[..] else { return None };
+    let total: u64 = ticks.iter().sum();
+    let waiting = idle + ticks.get(4).copied().unwrap_or(0);
+    let cpus = lines.filter(|line| line.starts_with("cpu")).count();
+    Some((total.saturating_sub(waiting), total, cpus.max(1) as u32))
+}
+
+/// `/proc/meminfo`: the bytes of memory there are, and the bytes in use (not what is available).
+fn parse_meminfo(text: &str) -> Option<(u64, u64)> {
+    let kb = |name: &str| -> Option<u64> {
+        let line = text.lines().find_map(|line| line.strip_prefix(name))?;
+        line.trim_start_matches(':').split_whitespace().next()?.parse().ok()
+    };
+    let (total, available) = (kb("MemTotal")?, kb("MemAvailable")?);
+    Some((total * 1024, total.saturating_sub(available) * 1024))
+}
+
+/// `/proc/diskstats`: the bytes read and written since boot by the disks `whole` says are (a
+/// partition is its disk's, and a loop, ram, md or dm device sits on another or is not one).
+fn parse_diskstats(text: &str, whole: impl Fn(&str) -> bool) -> (u64, u64) {
+    let (mut read, mut written) = (0, 0u64);
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [_, _, name, _, _, sectors_read, _, _, _, sectors_written, ..] = fields[..] else {
+            continue;
+        };
+        let virtual_ = ["loop", "ram", "dm-", "md", "zram", "sr"];
+        if virtual_.iter().any(|prefix| name.starts_with(prefix)) || !whole(name) {
+            continue;
+        }
+        read += sectors_read.parse::<u64>().unwrap_or(0) * 512;
+        written += sectors_written.parse::<u64>().unwrap_or(0) * 512;
+    }
+    (read, written)
+}
+
+/// `/proc/net/dev`: the bytes received and sent since boot by every interface but `lo`.
+fn parse_net(text: &str) -> (u64, u64) {
+    let (mut rx, mut tx) = (0, 0u64);
+    for line in text.lines() {
+        let Some((name, counters)) = line.split_once(':') else {
+            continue;
+        };
+        let fields: Vec<&str> = counters.split_whitespace().collect();
+        if name.trim() == "lo" || fields.len() < 9 {
+            continue;
+        }
+        rx += fields[0].parse::<u64>().unwrap_or(0);
+        tx += fields[8].parse::<u64>().unwrap_or(0);
+    }
+    (rx, tx)
+}
+
+/// `/proc/loadavg`: the load of the last minute.
+fn parse_load(text: &str) -> Option<f64> {
+    text.split_whitespace().next()?.parse().ok()
+}
+
+/// A cgroup's `cpu.stat`: the microseconds of CPU it has used.
+fn parse_usage(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("usage_usec "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// What a node's files said at one time.
+#[derive(Clone, Debug)]
+struct Reading {
+    busy: u64,
+    total: u64,
+    cpus: u32,
+    mem_total: u64,
+    mem_used: u64,
+    read: u64,
+    write: u64,
+    rx: u64,
+    tx: u64,
+    load1: f64,
+}
+
+fn sample(
+    stat: &str,
+    meminfo: &str,
+    diskstats: &str,
+    net: &str,
+    loadavg: &str,
+    whole: impl Fn(&str) -> bool,
+) -> Option<Reading> {
+    let (busy, total, cpus) = parse_stat(stat)?;
+    let (mem_total, mem_used) = parse_meminfo(meminfo)?;
+    let (read, write) = parse_diskstats(diskstats, whole);
+    let (rx, tx) = parse_net(net);
+    Some(Reading {
+        busy,
+        total,
+        cpus,
+        mem_total,
+        mem_used,
+        read,
+        write,
+        rx,
+        tx,
+        load1: parse_load(loadavg)?,
+    })
+}
+
+/// The CPU busy fraction and the rates (bytes per second) between two readings `secs` apart:
+/// cpu, disk read, disk write, rx, tx. A counter that went back is a rate of nothing.
+fn rates(before: &Reading, now: &Reading, secs: f64) -> [f64; 5] {
+    if secs <= 0.0 {
+        return [0.0; 5];
+    }
+    let ticks = now.total.saturating_sub(before.total);
+    let cpu = if ticks == 0 {
+        0.0
+    } else {
+        (now.busy.saturating_sub(before.busy) as f64 / ticks as f64).clamp(0.0, 1.0)
+    };
+    let rate = |before: u64, now: u64| now.saturating_sub(before) as f64 / secs;
+    [
+        cpu,
+        rate(before.read, now.read),
+        rate(before.write, now.write),
+        rate(before.rx, now.rx),
+        rate(before.tx, now.tx),
+    ]
+}
+
+/// The Workload a unit's cgroup directory (`kith-w_NS_NAME_REPLICA_UNIT`) is a unit of, as
+/// `NS/NAME`. (`_` is in no resource name, so it splits the parts; a Job's or a NodeWorkload's
+/// units have another letter and are not graphed.)
+fn unit_workload(dir: &str) -> Option<String> {
+    let mut parts = dir.strip_prefix("kith-w_")?.splitn(3, '_');
+    let (namespace, name, _rest) = (parts.next()?, parts.next()?, parts.next()?);
+    Some(format!("{namespace}/{name}"))
+}
+
+/// Per unit cgroup directory name: the microseconds of CPU it has used and the bytes of memory.
+type Units = BTreeMap<String, (u64, u64)>;
+
+/// The units of Workloads in the cgroup directory `dir` (none where it is not there).
+fn read_units(dir: &Path) -> Units {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Units::new();
+    };
+    let mut units = Units::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if unit_workload(&name).is_none() || units.len() >= 4 * MAX_WORKLOADS {
+            continue;
+        }
+        let read = |file: &str| std::fs::read_to_string(entry.path().join(file)).ok();
+        let usage = read("cpu.stat").as_deref().and_then(parse_usage);
+        let memory = read("memory.current").and_then(|text| text.trim().parse().ok());
+        if let (Some(usage), Some(memory)) = (usage, memory) {
+            units.insert(name, (usage, memory));
+        }
+    }
+    units
+}
+
+/// Each Workload's CPU in cores (over `secs`) and memory in bytes, its units' summed: a unit that
+/// was not there before has memory and no CPU yet.
+fn per_workload(before: &Units, now: &Units, secs: f64) -> BTreeMap<String, [f64; 2]> {
+    let mut by: BTreeMap<String, [f64; 2]> = BTreeMap::new();
+    for (name, (usage, memory)) in now {
+        let Some(key) = unit_workload(name) else { continue };
+        let cores = match before.get(name) {
+            Some((was, _)) if secs > 0.0 => usage.saturating_sub(*was) as f64 / (secs * 1e6),
+            _ => 0.0,
+        };
+        let sum = by.entry(key).or_default();
+        sum[0] += cores;
+        sum[1] += *memory as f64;
+    }
+    by
+}
+
+/// The cgroup directory kith's units are in: `/kith` as root, otherwise next to our own, in
+/// what systemd delegated to this user (as the runtime puts them).
+fn units_dir() -> Option<PathBuf> {
+    let parent = if nix::unistd::getuid().is_root() {
+        "/kith".to_string()
+    } else {
+        let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let own = own.lines().find_map(|line| line.strip_prefix("0::"))?;
+        let parent = Path::new(own).parent().filter(|parent| *parent != Path::new("/"))?;
+        parent.display().to_string()
+    };
+    Some(Path::new("/sys/fs/cgroup").join(parent.trim_start_matches('/')))
+}
+
+/// Everything the sampler reads at one moment.
+struct Collected {
+    when: Instant,
+    reading: Option<Reading>,
+    disk: (u64, u64),
+    units: Units,
+}
+
+fn collect(state: &Path, units: Option<&Path>) -> Collected {
+    let text = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+    // (A partition has no entry in /sys/block: the whole disk is counted, not both.)
+    let whole = |name: &str| Path::new("/sys/block").join(name).exists();
+    let reading = sample(
+        &text("/proc/stat"),
+        &text("/proc/meminfo"),
+        &text("/proc/diskstats"),
+        &text("/proc/net/dev"),
+        &text("/proc/loadavg"),
+        whole,
+    );
+    let disk = nix::sys::statvfs::statvfs(state).map_or((0, 0), |disk| {
+        let size = disk.fragment_size();
+        (
+            disk.blocks().saturating_sub(disk.blocks_free()) * size,
+            disk.blocks() * size,
+        )
+    });
+    Collected {
+        when: Instant::now(),
+        reading,
+        disk,
+        units: units.map(read_units).unwrap_or_default(),
+    }
+}
+
+/// Put what changed between two collections in the rings, as of `at`.
+fn feed(rings: &mut Rings, at: u64, before: &Collected, now: &Collected) {
+    let secs = now.when.saturating_duration_since(before.when).as_secs_f64();
+    if let (Some(was), Some(is)) = (&before.reading, &now.reading) {
+        let [cpu, read, write, rx, tx] = rates(was, is, secs);
+        let values = [
+            cpu,
+            is.mem_used as f64,
+            now.disk.0 as f64,
+            read,
+            write,
+            rx,
+            tx,
+            is.load1,
+        ];
+        rings.node(at, values, is.cpus, is.mem_total, now.disk.1);
+    }
+    for (key, values) in per_workload(&before.units, &now.units, secs) {
+        rings.work(at, &key, values);
+    }
+}
+
+/// Samples this node every 10 s, on the clock's tens of seconds (so that the nodes' points fall
+/// in the same slots), until `stopping`.
+pub async fn run(state: PathBuf, mut stopping: watch::Receiver<bool>) {
+    let units = units_dir();
+    let once = || {
+        let (state, units) = (state.clone(), units.clone());
+        async move {
+            tokio::task::spawn_blocking(move || collect(&state, units.as_deref()))
+                .await
+                .ok()
+        }
+    };
+    // (A first reading now, so that the first point is one tick away, not two.)
+    let mut before = once().await;
+    loop {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        let wait = Duration::from_millis(FINE * 1000 - millis % (FINE * 1000));
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            _ = stopping.changed() => return,
+        }
+        let Some(now) = once().await else { continue };
+        // (The nearest ten, not the floor: a clock a little behind the timer is the same slot.)
+        let at = (now_ms() + FINE * 500) / (FINE * 1000) * FINE;
+        if let Some(before) = &before {
+            feed(&mut rings(), at, before, &now);
+        }
+        before = Some(now);
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STAT: &str =
+        "cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 50 0 25 400 25 0 0 0 0 0\ncpu1 50 0 25 400 25 0 0 0 0 0\nintr 1 2 3\n";
+    const STAT_LATER: &str =
+        "cpu  160 0 70 900 70 0 0 0 0 0\ncpu0 80 0 35 450 35 0 0 0 0 0\ncpu1 80 0 35 450 35 0 0 0 0 0\n";
+    const MEMINFO: &str =
+        "MemTotal:       16000000 kB\nMemFree:         1000000 kB\nMemAvailable:    4000000 kB\nBuffers: 5 kB\n";
+    const DISKSTATS: &str = "   8       0 sda 100 0 2000 50 200 0 4000 80 0 100 130\n   8       1 sda1 90 0 1800 40 190 0 3900 70 0 90 110\n   7       0 loop0 5 0 40 1 0 0 0 0 0 1 1\n 259       0 nvme0n1 10 0 800 5 20 0 1600 9 0 10 14\n 259       1 nvme0n1p1 10 0 800 5 20 0 1600 9 0 10 14\n 253       0 dm-0 10 0 999 5 20 0 999 9 0 10 14\n";
+    const NET: &str = "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    lo: 1000 10 0 0 0 0 0 0 1000 10 0 0 0 0 0 0\n  eth0:5000 50 0 0 0 0 0 0 7000 70 0 0 0 0 0 0\n wlan0: 100 1 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n";
+    const LOAD: &str = "0.52 0.40 0.30 1/200 12345\n";
+
+    /// What `/sys/block` says: whole disks only, a partition has no entry there.
+    fn whole(name: &str) -> bool {
+        matches!(name, "sda" | "loop0" | "nvme0n1" | "dm-0")
+    }
+
+    #[test]
+    fn metrics_parsers_read_the_proc_files() {
+        assert_eq!(parse_stat(STAT), Some((150, 1000, 2)));
+        assert_eq!(parse_meminfo(MEMINFO), Some((16_000_000 * 1024, 12_000_000 * 1024)));
+        // (sda and nvme0n1 whole; not their partitions, not loop or dm, which sit on a disk or are not one.)
+        assert_eq!(
+            parse_diskstats(DISKSTATS, whole),
+            ((2000 + 800) * 512, (4000 + 1600) * 512)
+        );
+        assert_eq!(parse_net(NET), (5100, 7200));
+        assert_eq!(parse_load(LOAD), Some(0.52));
+        assert_eq!(
+            parse_usage("usage_usec 5000000\nuser_usec 3000000\nsystem_usec 2000000\n"),
+            Some(5_000_000)
+        );
+        // A file that is not what it should be gives nothing, and never a panic.
+        assert_eq!(parse_stat(""), None);
+        assert_eq!(parse_stat("cpu  a b c\n"), None);
+        assert_eq!(parse_meminfo("MemTotal: x kB\n"), None);
+        assert_eq!(parse_load("x"), None);
+        assert_eq!(parse_usage("user_usec 1\n"), None);
+        assert_eq!(parse_diskstats("garbage\n 1 2 sda\n", |_| true), (0, 0));
+        assert_eq!(parse_net("no colon here\n"), (0, 0));
+    }
+
+    #[test]
+    fn metrics_unit_names_say_their_workload() {
+        assert_eq!(
+            unit_workload("kith-w_default_web_0_main").as_deref(),
+            Some("default/web")
+        );
+        assert_eq!(
+            unit_workload("kith-w_shop_api_12b_sidecar").as_deref(),
+            Some("shop/api")
+        );
+        // A Job, a NodeWorkload, the runtime's own probe and any other name are no Workload's.
+        for no in [
+            "kith-j_default_job_0_main",
+            "kith-n_default_x_0_main",
+            "kith-probe-12",
+            "kith-w_default",
+            "web",
+            "",
+        ] {
+            assert_eq!(unit_workload(no), None, "{no}");
+        }
+    }
+
+    #[test]
+    fn metrics_rates_come_from_two_readings() {
+        let reading = |stat, read: u64, write: u64, rx: u64, tx: u64| {
+            let mut r = sample(stat, MEMINFO, DISKSTATS, NET, LOAD, whole).unwrap();
+            (r.read, r.write, r.rx, r.tx) = (read, write, rx, tx);
+            r
+        };
+        let (a, b) = (
+            reading(STAT, 1000, 2000, 10_000, 20_000),
+            reading(STAT_LATER, 6000, 3000, 10_500, 19_000),
+        );
+        let [cpu, read, write, rx, tx] = rates(&a, &b, 10.0);
+        // 80 busy of 200 ticks; bytes over ten seconds; a counter that went back (a reboot, an
+        // interface that came again) is no negative rate.
+        assert_eq!((cpu, read, write, rx, tx), (0.4, 500.0, 100.0, 50.0, 0.0));
+        assert_eq!(rates(&a, &a, 10.0)[0], 0.0, "no ticks between is no division by zero");
+        assert_eq!(rates(&a, &b, 0.0), [0.0; 5], "no time between is no rate");
+    }
+
+    #[test]
+    fn metrics_units_are_read_from_their_cgroups() {
+        let dir = std::env::temp_dir().join(format!("kithd-metrics-units-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (unit, usec, mem) in [
+            ("kith-w_default_web_0_a", 4_000_000, 100),
+            ("kith-w_default_web_0_b", 1_000_000, 50),
+            ("kith-w_shop_db_0_main", 0, 7),
+        ] {
+            std::fs::create_dir_all(dir.join(unit)).unwrap();
+            std::fs::write(
+                dir.join(unit).join("cpu.stat"),
+                format!("usage_usec {usec}\nuser_usec 1\n"),
+            )
+            .unwrap();
+            std::fs::write(dir.join(unit).join("memory.current"), format!("{mem}\n")).unwrap();
+        }
+        // Not a unit of a Workload, or one whose files are not there (it is gone, or not a cgroup).
+        std::fs::create_dir_all(dir.join("kith-j_default_job_0_main")).unwrap();
+        std::fs::create_dir_all(dir.join("kith-w_default_gone_0_main")).unwrap();
+        std::fs::write(dir.join("kith-w_default_afile"), "x").unwrap();
+        let before = read_units(&dir);
+        assert_eq!(before.len(), 3, "{before:?}");
+        std::fs::write(dir.join("kith-w_default_web_0_a/cpu.stat"), "usage_usec 6000000\n").unwrap();
+        let after = read_units(&dir);
+        // web: 2 s of CPU in 10 s from one unit, the other unchanged; memory is the sum; a unit
+        // new since has memory and no CPU yet.
+        let mut later = after.clone();
+        later.insert("kith-w_shop_new_0_main".into(), (9, 3));
+        let by = per_workload(&before, &later, 10.0);
+        assert_eq!(by["default/web"], [0.2, 150.0]);
+        assert_eq!(by["shop/db"], [0.0, 7.0]);
+        assert_eq!(by["shop/new"], [0.0, 3.0]);
+        assert_eq!(by.len(), 3);
+        assert!(read_units(&dir.join("nothing here")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metrics_ring_drops_the_oldest_and_shows_gaps() {
+        let mut ring = Ring::<1, 4>::new(10);
+        for (at, v) in [(0, 1.0), (10, 2.0), (20, 3.0), (30, 4.0)] {
+            ring.add(at, [v]);
+        }
+        let all = |ring: &Ring<1, 4>, end| {
+            ring.series(end, 4)
+                .into_iter()
+                .map(|p| p.map(|[v]| v))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(all(&ring, 30), [Some(1.0), Some(2.0), Some(3.0), Some(4.0)]);
+        // A fifth slot takes the place of the first: the ring is as big as it was.
+        ring.add(40, [5.0]);
+        assert_eq!(all(&ring, 40), [Some(2.0), Some(3.0), Some(4.0), Some(5.0)]);
+        // Asked as of the past: the slot that was taken over is null, not the other's value, and a
+        // time before the epoch is null too.
+        assert_eq!(all(&ring, 20), [None, None, Some(2.0), Some(3.0)]);
+        // A slot nobody sampled is a gap, and a time not yet reached is too.
+        let mut gappy = Ring::<1, 4>::new(10);
+        gappy.add(0, [1.0]);
+        gappy.add(30, [4.0]);
+        assert_eq!(all(&gappy, 30), [Some(1.0), None, None, Some(4.0)]);
+        assert_eq!(all(&gappy, 50), [None, Some(4.0), None, None]);
+    }
+
+    #[test]
+    fn metrics_coarse_slots_average_their_samples() {
+        let mut ring = Ring::<2, 3>::new(300);
+        ring.add(0, [1.0, 10.0]);
+        ring.add(10, [3.0, 30.0]);
+        ring.add(290, [5.0, 50.0]);
+        ring.add(300, [100.0, 0.0]);
+        let rows = ring.series(300, 2);
+        assert_eq!(rows, [Some([3.0, 30.0]), Some([100.0, 0.0])]);
+    }
+
+    #[test]
+    fn metrics_memory_is_bounded() {
+        // The rings are arrays: a day of samples is as big as a minute of them.
+        let mut rings = Rings::new();
+        for at in (0..200_000u64).step_by(10) {
+            rings.node(at, [0.5; 8], 4, 1 << 30, 1 << 40);
+        }
+        let held = |cells: &[Cell<8>]| cells.iter().filter(|cell| cell.n > 0).count();
+        assert_eq!((held(&rings.fine.cells), held(&rings.coarse.cells)), (360, 288));
+        // (And the two are what an hour and a day are: 10 s and 5 min points.)
+        assert_eq!((rings.fine.step * 360, rings.coarse.step * 288), (3600, 86_400));
+        assert!(std::mem::size_of::<Ring<8, 360>>() + std::mem::size_of::<Ring<8, 288>>() < 100 << 10);
+        // A workload not seen for an hour is forgotten, and no more than MAX_WORKLOADS are kept.
+        let mut rings = Rings::new();
+        rings.work(1000, "a/old", [1.0, 1.0]);
+        rings.work(1000 + KEEP_WORKLOAD + 10, "a/new", [1.0, 1.0]);
+        assert_eq!(rings.work.keys().collect::<Vec<_>>(), ["a/new"]);
+        for i in 0..MAX_WORKLOADS + 20 {
+            rings.work(9000, &format!("a/w{i}"), [1.0, 1.0]);
+        }
+        assert_eq!(rings.work.len(), MAX_WORKLOADS);
+    }
+
+    #[test]
+    fn metrics_ranges_are_four() {
+        assert_eq!(span("15m"), Some((10, 90)));
+        assert_eq!(span("1h"), Some((10, 360)));
+        assert_eq!(span("6h"), Some((300, 72)));
+        assert_eq!(span("24h"), Some((300, 288)));
+        for no in ["", "2d", "1H", "15", "-1h"] {
+            assert_eq!(span(no), None, "{no}");
+        }
+    }
+
+    fn fed() -> Rings {
+        let mut rings = Rings::new();
+        // Ten-second samples at 1000..=1040: slot 100 to 104.
+        for (i, at) in (1000..=1040).step_by(10).enumerate() {
+            let i = i as f64;
+            rings.node(
+                at,
+                [0.1 * i, 1000.0 + i, 5000.0, 10.0, 20.0, 30.0, 40.0, 0.5],
+                4,
+                2000,
+                9000,
+            );
+            rings.work(at, "default/web", [i / 10.0, 100.0 * i]);
+        }
+        rings
+    }
+
+    #[test]
+    fn metrics_series_of_a_node_is_aligned_to_the_end_oldest_first() {
+        let Local { node, workloads: work } = fed().local("alpha", 10, 5, 1040);
+        assert_eq!(node.cpus, 4);
+        assert_eq!((node.mem_total, node.disk_total), (2000, 9000));
+        // Five points ending at 1040: 1000, 1010, 1020, 1030, 1040.
+        assert_eq!(node.cpu, [Some(0.0), Some(0.1), Some(0.2), Some(0.3), Some(0.4)]);
+        assert_eq!(
+            node.mem,
+            [Some(1000.0), Some(1001.0), Some(1002.0), Some(1003.0), Some(1004.0)]
+        );
+        assert_eq!(node.disk_read, [Some(10.0); 5]);
+        assert_eq!(node.tx, [Some(40.0); 5]);
+        assert_eq!(node.load1, [Some(0.5); 5]);
+        assert!(!node.missing);
+        assert_eq!(work["default/web"].node, "alpha");
+        assert_eq!(
+            work["default/web"].mem,
+            [Some(0.0), Some(100.0), Some(200.0), Some(300.0), Some(400.0)]
+        );
+        // Two slots ahead of what was sampled, and two behind: nulls at the ends, never a shifted series.
+        let Local { node, .. } = fed().local("alpha", 10, 5, 1060);
+        assert_eq!(node.cpu, [Some(0.2), Some(0.3), Some(0.4), None, None]);
+        let Local { node, .. } = fed().local("alpha", 10, 7, 1040);
+        assert_eq!(node.cpu[..2], [None, None]);
+        assert_eq!(node.cpu[2], Some(0.0));
+    }
+
+    #[test]
+    fn metrics_series_merge_marks_a_silent_node_and_keeps_every_workload() {
+        let local = |name: &str| fed().local(name, 10, 3, 1040);
+        let answer = merge(
+            "15m",
+            10,
+            3,
+            1040,
+            vec![
+                ("a".into(), Some(local("a"))),
+                ("b".into(), None),
+                ("c".into(), Some(local("c"))),
+            ],
+        );
+        assert_eq!(answer["range"], "15m");
+        assert_eq!(
+            (answer["step"].as_u64(), answer["end"].as_u64()),
+            (Some(10), Some(1040))
+        );
+        let nodes = answer["nodes"].as_object().unwrap();
+        assert_eq!(nodes.keys().collect::<Vec<_>>(), ["a", "b", "c"]);
+        // The silent one has the whole shape, empty, so a page that reads it has nothing to special-case.
+        let b = &answer["nodes"]["b"];
+        assert_eq!(b["missing"], true);
+        for field in ["cpu", "mem", "disk", "diskRead", "diskWrite", "rx", "tx", "load1"] {
+            assert_eq!(b[field], serde_json::json!([null, null, null]), "{field}");
+        }
+        assert_eq!(
+            (b["cpus"].as_u64(), b["memTotal"].as_u64(), b["diskTotal"].as_u64()),
+            (Some(0), Some(0), Some(0))
+        );
+        assert!(answer["nodes"]["a"].get("missing").is_none());
+        assert_eq!(answer["nodes"]["a"]["cpu"], serde_json::json!([0.2, 0.3, 0.4]));
+        assert_eq!(answer["nodes"]["a"]["memTotal"], 2000);
+        // One Workload on two nodes: the first node (by name) has `NS/NAME`, the other `NS/NAME@NODE`.
+        let work = answer["workloads"].as_object().unwrap();
+        assert_eq!(work.keys().collect::<Vec<_>>(), ["default/web", "default/web@c"]);
+        assert_eq!(work["default/web"]["node"], "a");
+        assert_eq!(work["default/web@c"]["node"], "c");
+        assert_eq!(work["default/web"]["mem"], serde_json::json!([200.0, 300.0, 400.0]));
+    }
+
+    #[test]
+    fn metrics_series_answer_round_trips_between_nodes() {
+        // What a peer sends is what the asking node reads back.
+        let local = fed().local("alpha", 10, 5, 1040);
+        let sent = serde_json::to_value(&local).unwrap();
+        assert_eq!(sent["node"]["memTotal"], 2000);
+        assert!(sent["node"].get("missing").is_none());
+        let back: Local = serde_json::from_value(sent).unwrap();
+        assert_eq!(back, local);
+        let _ = BTreeMap::<String, u8>::new();
+    }
+}
