@@ -9,7 +9,9 @@
 //! ConfigMap `kith-system/kith-values`, the same in the release's namespace, the
 //! release's own.
 //
-// ponytail: no hooks, no values per node; a version is one version, not a range.
+// ponytail: hooks run on install and upgrade only (no delete hooks, weights or delete policies:
+// a hook Job is kept until its version or spec changes, or the Release goes); no values per
+// node; a version is one version, not a range.
 // A render is remembered by the revisions of what went in, so every Release is looked at
 // on every change to the store but rendered once. `lookup(kind, namespace, name)` in a
 // template reads the live spec (an empty map when there is none) of a resource in the
@@ -23,6 +25,7 @@ use kith_api::kinds::{ConfigMapSpec, ReleaseSpec};
 use kith_api::store::Store;
 use kith_packages::Package;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +37,14 @@ pub const OWNER: &str = "kith.dev/owned-by";
 /// written by the API server (a client's word for it is replaced) and, on what a Source
 /// makes, the Source's own. What it renders is made with that one's rights.
 pub const WRITER: &str = "kith.dev/written-by";
+/// The annotation on a Job a package renders that makes it a hook: `pre-install`,
+/// `post-install`, `pre-upgrade` or `post-upgrade`. A hook is applied at its point and the
+/// Release waits for it to succeed; it is not one of the Release's recorded resources.
+pub const HOOK: &str = "kith.dev/hook";
+/// The annotation on a hook Job kithd applied: the version and the hook as rendered when it
+/// ran. A Job with another is of an older version or spec, and is deleted before the new one.
+const RAN: &str = "kith.dev/hook-ran";
+const POINTS: [&str; 4] = ["pre-install", "post-install", "pre-upgrade", "post-upgrade"];
 /// The annotation beside [`WRITER`] when that is an Identity: the print of its `publicKey`
 /// (`pki::key_print`) when it applied. An Identity made again under the name has another
 /// key, so what the old one applied is not acted on as the new one. None for the local socket.
@@ -267,7 +278,15 @@ pub fn fits(asked: Option<&str>, version: &str) -> bool {
 /// Repository it names, if it names one), the one it has installed, or the newest when
 /// it has none or `follow`s the newest (`autoUpgrade`; an upgrade's preview follows too).
 /// `1.0.0-rc1` is older than `1.0.0`.
-fn package<'a>(store: &'a Store, release: &Resource, spec: &ReleaseSpec, follow: bool) -> Result<&'a Resource, String> {
+/// With `pin` (the version a rolled-back spec had, [`pinned`]), that one and no other, and
+/// an error when it is gone: a rollback never moves to a version it did not have.
+fn package<'a>(
+    store: &'a Store,
+    release: &Resource,
+    spec: &ReleaseSpec,
+    follow: bool,
+    pin: Option<&str>,
+) -> Result<&'a Resource, String> {
     let (name, asked) = (&spec.package.name, spec.package.version.as_deref());
     let version = |package: &Resource| package.spec["version"].as_str().unwrap_or_default().to_string();
     let from = spec
@@ -281,8 +300,13 @@ fn package<'a>(store: &'a Store, release: &Resource, spec: &ReleaseSpec, follow:
             && fits(asked, &version(package))
     };
     let installed = release.status.as_ref().and_then(|status| status["version"].as_str());
-    let kept = installed.filter(|_| !follow);
+    let kept = pin.or(installed.filter(|_| !follow));
     let kept = kept.and_then(|installed| store.get(&format!("Package/{name}-{installed}")));
+    if let Some(pin) = pin {
+        return kept
+            .filter(fitting)
+            .ok_or(format!("there is no Package {name} {pin}, the version this spec installed before: push it again, or change the spec to follow the newest"));
+    }
     let newest = || {
         let packages = store.list(Some("Package")).filter(fitting);
         packages.max_by_key(|package| semver::Version::parse(&version(package)).ok())
@@ -328,7 +352,15 @@ fn inputs<'a>(
     preview: bool,
 ) -> Result<(Inputs, &'a Resource, Vec<Value>), String> {
     let spec: ReleaseSpec = serde_json::from_value(release.spec.clone()).map_err(|e| e.to_string())?;
-    let package = package(store, release, &spec, preview || spec.auto_upgrade == Some(true))?;
+    // (An upgrade's preview is what moving would do: it is not held back.)
+    let pin = pinned(store, release).filter(|_| !preview);
+    let package = package(
+        store,
+        release,
+        &spec,
+        preview || spec.auto_upgrade == Some(true),
+        pin.as_deref(),
+    )?;
     let (cluster, everywhere) = shared_values(store, "ConfigMap/kith-system/kith-values")?;
     let (local, here) = shared_values(store, &format!("ConfigMap/{}/{SHARED}", namespace(release)))?;
     let inputs = Inputs {
@@ -749,7 +781,12 @@ fn upgrade_of<'a>(
         Err(error) => json!({ "version": version, "error": error }),
         Ok(upgraded) => {
             let keyed = |output: &'a Output| -> BTreeMap<String, &'a Resource> {
-                output.resources.iter().map(|r| (r.key(), r)).collect()
+                output
+                    .resources
+                    .iter()
+                    .filter(|r| !is_hook(r))
+                    .map(|r| (r.key(), r))
+                    .collect()
             };
             let (had, next) = (keyed(installed), keyed(upgraded));
             let apply: Vec<&String> = next
@@ -781,6 +818,39 @@ fn history_of(release: &Resource, version: &str, now: u64) -> Option<Value> {
     seen.push(json!({ "version": version, "revision": release.metadata.revision, "at": now }));
     seen.drain(..seen.len().saturating_sub(HISTORY));
     Some(Value::Array(seen))
+}
+
+/// The version a Release that follows the newest (`autoUpgrade`) is held to, when its spec is
+/// again what it was before: the spec is compared with the revisions before the run of equal
+/// ones it is in (a metadata edit is not a return), newest first, and the version is the last
+/// `history` entry at or before the revision found. None when there is none, or the history
+/// no longer reaches back so far. (One that stays on its version keeps it already, and turning
+/// `autoUpgrade` off to freeze it must not bring back an older one.)
+fn pinned(store: &Store, release: &Resource) -> Option<String> {
+    if release.spec["autoUpgrade"] != true {
+        return None;
+    }
+    let seen = release.status.as_ref()?["history"].as_array()?;
+    let revisions = store.history(&release.key()).ok()?.iter().rev();
+    let mut earlier = revisions.skip_while(|revision| revision.resource.spec == release.spec);
+    earlier
+        .find(|revision| revision.resource.spec == release.spec)
+        .and_then(|revision| {
+            let at = revision.resource.metadata.revision?;
+            let entry = seen
+                .iter()
+                .rev()
+                .find(|entry| entry["revision"].as_u64().is_some_and(|r| r <= at));
+            // (Installing the oldest entry's version drops it from the ten: the pin it made, said in
+            // the status, is the version then.)
+            let status = release.status.as_ref()?;
+            let held = (status["pinned"] == true).then(|| &status["version"]);
+            entry
+                .map(|entry| &entry["version"])
+                .or(held)?
+                .as_str()
+                .map(str::to_string)
+        })
 }
 
 /// Compare `resources` with the store for the owner `key`. Nothing of someone else's
@@ -827,6 +897,64 @@ pub fn reconcile(
     Ok(done)
 }
 
+fn is_hook(resource: &Resource) -> bool {
+    resource.metadata.annotations.contains_key(HOOK)
+}
+
+/// What the hooks at one point ask of the store: Jobs to apply, old ones to delete first, and
+/// the key of the first Job still to be waited for, and why one failed.
+#[derive(Default)]
+struct Gate {
+    apply: Vec<Resource>,
+    delete: Vec<String>,
+    waiting: Option<String>,
+    failed: Option<String>,
+}
+
+/// The hooks of `release` at `point`, at `version`: a Job there is not run again while the version
+/// and its spec are as it ran for; one for another is deleted (the new one is applied once it
+/// is gone, the next pass). Err when one is a Job that is there and not the release's; a failed
+/// one is `failed` (the caller says when).
+fn gate(store: &Store, release: &str, version: &str, hooks: &[&Resource], point: &str) -> Result<Gate, String> {
+    let mut gate = Gate::default();
+    for hook in hooks
+        .iter()
+        .filter(|hook| hook.metadata.annotations.get(HOOK).is_some_and(|at| at == point))
+    {
+        let at = hook.key();
+        let ran = crate::pki::hex(&Sha256::digest(format!("{version} {}", hook.spec)));
+        let Some(live) = store.get(&at) else {
+            let mut hook = (*hook).clone();
+            hook.metadata.annotations.insert(RAN.into(), ran);
+            gate.apply.push(hook);
+            gate.waiting.get_or_insert(at);
+            continue;
+        };
+        if owner(live) != Some(release) {
+            return Err(format!("{at} is there already and is not {release}'s"));
+        }
+        if live.metadata.annotations.get(RAN) != Some(&ran) {
+            gate.delete.push(at.clone());
+        } else {
+            let status = live.status.as_ref();
+            match status.and_then(|status| status["state"].as_str()) {
+                Some("succeeded") => continue,
+                Some("failed") => {
+                    let said = status
+                        .and_then(|status| status["message"].as_str())
+                        .map_or(String::new(), |m| format!(": {m}"));
+                    gate.failed
+                        .get_or_insert(format!("the hook {at} failed{said}; delete it to run it again"));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        gate.waiting.get_or_insert(at);
+    }
+    Ok(gate)
+}
+
 /// What the store needs done for its Releases, given the renders there are and the upgrades
 /// previewed; `now` (unix seconds) is when a version newly installed is written down.
 fn plan(store: &Store, renders: &Renders, upgrades: &Renders, newer: &Newer, now: u64) -> Plan {
@@ -843,17 +971,63 @@ fn plan(store: &Store, renders: &Renders, upgrades: &Renders, newer: &Newer, now
         };
         let live = release.status.as_ref();
         let done = output.and_then(|output| {
-            let done = reconcile(store, &key, &recorded(release), &output.resources, true)?;
+            let hooks: Vec<&Resource> = output.resources.iter().filter(|r| is_hook(r)).collect();
+            fn point(hook: &Resource) -> &str {
+                hook.metadata.annotations.get(HOOK).map_or("", String::as_str)
+            }
+            if let Some(odd) = hooks
+                .iter()
+                .find(|hook| hook.kind != "Job" || !POINTS.contains(&point(hook)))
+            {
+                return Err(format!(
+                    "{} is annotated {HOOK}: {}, but only a Job can be a hook, at one of {}",
+                    odd.key(),
+                    point(odd),
+                    POINTS.join(", ")
+                ));
+            }
+            let rest: Vec<Resource> = output.resources.iter().filter(|r| !is_hook(r)).cloned().collect();
+            let mut done = reconcile(store, &key, &recorded(release), &rest, true)?;
+            // A hook Job this render no longer names (one of another version) goes, so that coming
+            // back to that version runs it again.
+            let stale: Vec<String> = store
+                .list(Some("Job"))
+                .filter(|job| is_hook(job) && owner(job) == Some(key.as_str()))
+                .map(Resource::key)
+                .filter(|at| !hooks.iter().any(|hook| hook.key() == *at))
+                .collect();
+            done.delete.extend(stale.iter().cloned());
+            // Install when nothing was installed (or it is the first version still); else an upgrade.
+            // The pre hooks go before the rest is moved to this version, the post hooks after.
+            let installed = live.and_then(|status| status["version"].as_str());
+            let seen = live.and_then(|status| status["history"].as_array()).map_or(0, Vec::len);
+            let event = match installed {
+                Some(version) if version != output.version => "upgrade",
+                _ if seen > 1 => "upgrade",
+                _ => "install",
+            };
+            let mut before = match installed == Some(&output.version) {
+                true => Gate::default(),
+                false => gate(store, &key, &output.version, &hooks, &format!("pre-{event}"))?,
+            };
+            // (Both points are asked before anything is applied: a Job that is not the release's is its error at once.)
+            let after = gate(store, &key, &output.version, &hooks, &format!("post-{event}"))?;
+            if let Some(why) = before.failed.take() {
+                return Err(why);
+            }
+            before.delete.extend(stale);
+            let mut gone = done.delete.clone();
+            gone.extend(before.delete.iter().chain(&after.delete).cloned());
             // (Asked on every pass: a writer that loses a right is told at once.)
-            writer_may(store, release, &output.resources, &done.delete)?;
+            writer_may(store, release, &output.resources, &gone)?;
             // And of whoever pushed the Package it came from: no more than its pusher, besides
             // the Release's writer. One the Repository the Release names supplied has none: that
             // Repository's key (or, with none, its address) is its trust. Any other, annotated
             // or not, is asked of its writer, and refused when none is written down.
             if let Some(package) = package.filter(|package| !fetched(store, release, package)) {
-                writer_may(store, package, &output.resources, &done.delete)?;
+                writer_may(store, package, &output.resources, &gone)?;
             }
-            Ok((output, done))
+            Ok((output, done, before, after))
         });
         let mut step = Step {
             release: key.clone(),
@@ -862,8 +1036,34 @@ fn plan(store: &Store, renders: &Renders, upgrades: &Renders, newer: &Newer, now
             status: None,
         };
         let status = match done {
-            Ok((output, done)) => {
+            // The pre hooks are still to succeed: only they are made, and the rest waits (what was
+            // installed before stays as it is, as for an error).
+            Ok((
+                _,
+                _,
+                Gate {
+                    apply,
+                    delete,
+                    waiting: Some(job),
+                    ..
+                },
+                _,
+            )) => {
+                (step.apply, step.delete) = (apply, delete);
+                json!({
+                    "state": "hooks", "message": format!("waiting for {job}"),
+                    "observedRevision": release.metadata.revision, "pinned": pinned(store, release).is_some(),
+                })
+            }
+            Ok((output, done, _, after)) => {
+                // The post hooks are made once the rest is there (and waited for from the start).
+                let there = done.apply.is_empty() && done.delete.is_empty();
                 (step.apply, step.delete) = (done.apply, done.delete);
+                if there {
+                    step.apply.extend(after.apply);
+                    step.delete.extend(after.delete);
+                }
+                let (waiting, broken) = (after.waiting, after.failed.filter(|_| there));
                 // (Following the newest from a Repository its writer may not fetch from: said on
                 // every pass, or it would be said only once a Package is missing.)
                 let following = release.spec["autoUpgrade"] == true && release.spec["package"]["repo"].is_string();
@@ -872,6 +1072,7 @@ fn plan(store: &Store, renders: &Renders, upgrades: &Renders, newer: &Newer, now
                 let mut status = json!({
                     "state": "installed", "message": message, "version": output.version,
                     "resources": done.kept, "notes": output.notes, "observedRevision": release.metadata.revision,
+                    "pinned": pinned(store, release).is_some(),
                 });
                 // (Left out when not known yet or unchanged: the status is written when a field differs.)
                 if let Some(pending) = upgrade_of(store, release, &output, upgrades, newer) {
@@ -880,10 +1081,19 @@ fn plan(store: &Store, renders: &Renders, upgrades: &Renders, newer: &Newer, now
                 if let Some(history) = history_of(release, &output.version, now) {
                     status["history"] = history;
                 }
+                if let Some(why) = broken {
+                    (status["state"], status["message"]) = (json!("error"), json!(why));
+                } else if let Some(job) = waiting {
+                    (status["state"], status["message"]) = (json!("hooks"), json!(format!("waiting for {job}")));
+                }
                 status
             }
             // (What was installed before stays as it is.)
-            Err(e) => failed(&e, release.metadata.revision),
+            // (And whether it is pinned: a patch merges, so it would else keep the last pass's.)
+            Err(e) => json!({
+                "state": "error", "message": e, "observedRevision": release.metadata.revision,
+                "pinned": pinned(store, release).is_some(),
+            }),
         };
         let Value::Object(status) = status else {
             unreachable!("an object")
@@ -1699,6 +1909,163 @@ mod tests {
         assert_eq!(settle_at(&mut store, &mut renders, &mut upgrades, 80), 0);
     }
 
+    /// A Release whose spec is again what an earlier revision held (a `kith rollback`) goes
+    /// back to the version it had then, even following the newest; what a later version made
+    /// is pruned, a spec that matches no earlier one follows again, and a Package that is gone
+    /// is an error that tears nothing down.
+    #[test]
+    fn a_rollback_brings_back_the_version_it_installed() {
+        let (mut store, mut renders, mut upgrades) = (Store::default(), Renders::new(), Renders::new());
+        let revision = |store: &Store| store.get(SELF).unwrap().metadata.revision.unwrap();
+        let mut at = 100;
+        let mut settled = |store: &mut Store| {
+            at += 100;
+            settle_at(store, &mut renders, &mut upgrades, at);
+            assert_eq!(settle_at(store, &mut renders, &mut upgrades, at + 1), 0);
+        };
+        let plain = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }} }\n\
+                     spec: { data: { colour: {{ values.colour }} } }\n";
+        store.apply(package("1.0.0", &[("map.yaml", plain)])).unwrap();
+        apply(&mut store, RELEASE);
+        settled(&mut store);
+        let first = revision(&store);
+        // An edit, then 2.0.0 (which makes an extra map) comes and is followed.
+        apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: blue"));
+        settled(&mut store);
+        store.apply(package("2.0.0", &[("map.yaml", MAP)])).unwrap();
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "2.0.0");
+        assert!(store.get("ConfigMap/shop/mine-maps-extra").is_some());
+        // Rolled back to the first revision: 1.0.0 again, the extra map pruned.
+        store.rollback(SELF, first).unwrap();
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
+        assert!(store.get("ConfigMap/shop/mine-maps-extra").is_none());
+        // A newer Package does not move it.
+        store.apply(package("3.0.0", &[("map.yaml", MAP)])).unwrap();
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
+        assert_eq!(status_of(&store)["pinned"], true);
+        // A spec equal to no earlier revision follows again.
+        apply(
+            &mut store,
+            &RELEASE.replace("extra: true", "extra: true, colour: green"),
+        );
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "3.0.0");
+        assert_eq!(status_of(&store)["pinned"], false);
+        assert!(store.get("ConfigMap/shop/mine-maps-extra").is_some());
+        // Back again with 1.0.0 gone: an error, and nothing is torn down.
+        store.rollback(SELF, first).unwrap();
+        store.delete("Package/maps-1.0.0").unwrap();
+        settled(&mut store);
+        let status = status_of(&store);
+        assert_eq!(status["state"], "error");
+        let message = status["message"].as_str().unwrap();
+        assert!(
+            message.contains("no Package maps 1.0.0") && message.contains("push it again"),
+            "{message}"
+        );
+        // (Said in the error too: a patch merges, so it would else keep the last pass's.)
+        assert_eq!(status["pinned"], true);
+        assert!(store.get("ConfigMap/shop/mine-maps-extra").is_some());
+        assert!(store.get("ConfigMap/shop/mine-maps").is_some());
+    }
+
+    /// A rollback to the oldest version the history remembers stays: installing it pushes the
+    /// eleventh entry and drops the one the pin was read from.
+    #[test]
+    fn a_rollback_to_the_oldest_remembered_version_stays() {
+        let (mut store, mut renders, mut upgrades) = (Store::default(), Renders::new(), Renders::new());
+        let mut at = 100;
+        let mut settled = |store: &mut Store| {
+            at += 100;
+            settle_at(store, &mut renders, &mut upgrades, at);
+            assert_eq!(settle_at(store, &mut renders, &mut upgrades, at + 1), 0);
+        };
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, RELEASE);
+        settled(&mut store);
+        let first = store.get(SELF).unwrap().metadata.revision.unwrap();
+        apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: blue"));
+        for major in 2..=10 {
+            store
+                .apply(package(&format!("{major}.0.0"), &[("map.yaml", MAP)]))
+                .unwrap();
+            settled(&mut store);
+        }
+        assert_eq!(status_of(&store)["history"].as_array().unwrap().len(), 10);
+        store.rollback(SELF, first).unwrap();
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
+        assert_eq!(status_of(&store)["pinned"], true);
+        // (Still, with the entry it came from gone, and after one more pass.)
+        settled(&mut store);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
+        assert_eq!(status_of(&store)["history"].as_array().unwrap().len(), 10);
+    }
+
+    /// An edit back to an earlier spec pins like a rollback, whatever it was made by: the
+    /// toggle of `autoUpgrade` off and on again does; a change to the metadata alone is not
+    /// one; and a Release that does not follow is never pinned.
+    #[test]
+    fn an_edit_back_to_an_earlier_spec_pins_and_a_new_field_follows() {
+        let (mut store, mut renders, mut upgrades) = (Store::default(), Renders::new(), Renders::new());
+        let mut at = 100;
+        let mut settled = |store: &mut Store| {
+            at += 100;
+            settle_at(store, &mut renders, &mut upgrades, at);
+            assert_eq!(settle_at(store, &mut renders, &mut upgrades, at + 1), 0);
+        };
+        let version = |store: &Store| status_of(store)["version"].clone();
+        let pinned = |store: &Store| status_of(store)["pinned"].clone();
+        let push = |store: &mut Store, version: &str| store.apply(package(version, &[("map.yaml", MAP)])).unwrap();
+        push(&mut store, "1.0.0");
+        apply(&mut store, RELEASE);
+        settled(&mut store);
+        push(&mut store, "2.0.0");
+        settled(&mut store);
+        // A freeze (autoUpgrade off) stays; on again it is the first spec: pinned, not following.
+        apply(&mut store, &RELEASE.replace("autoUpgrade: true", "autoUpgrade: false"));
+        push(&mut store, "3.0.0");
+        settled(&mut store);
+        assert_eq!((version(&store), pinned(&store)), (json!("2.0.0"), json!(false)));
+        apply(&mut store, RELEASE);
+        push(&mut store, "4.0.0");
+        settled(&mut store);
+        assert_eq!((version(&store), pinned(&store)), (json!("2.0.0"), json!(true)));
+        // Any field that is new follows again.
+        apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: blue"));
+        settled(&mut store);
+        assert_eq!((version(&store), pinned(&store)), (json!("4.0.0"), json!(false)));
+        // A change to the annotations alone is not a return to anything.
+        let noted = RELEASE.replace("extra: true", "extra: true, colour: blue");
+        apply(
+            &mut store,
+            &noted.replace("'local socket' }", "'local socket', note: x }"),
+        );
+        push(&mut store, "5.0.0");
+        settled(&mut store);
+        assert_eq!((version(&store), pinned(&store)), (json!("5.0.0"), json!(false)));
+    }
+
+    #[test]
+    fn a_release_that_stays_is_never_pinned() {
+        let (mut store, mut renders, mut upgrades) = (Store::default(), Renders::new(), Renders::new());
+        let stays = RELEASE.replace("autoUpgrade: true", "autoUpgrade: false");
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, &stays);
+        settle_at(&mut store, &mut renders, &mut upgrades, 10);
+        let first = store.get(SELF).unwrap().metadata.revision.unwrap();
+        apply(&mut store, &stays.replace("extra: true", "extra: false"));
+        settle_at(&mut store, &mut renders, &mut upgrades, 20);
+        store.apply(package("2.0.0", &[("map.yaml", MAP)])).unwrap();
+        store.rollback(SELF, first).unwrap();
+        settle_at(&mut store, &mut renders, &mut upgrades, 30);
+        assert_eq!(status_of(&store)["pinned"], false);
+        assert_eq!(status_of(&store)["version"], "1.0.0");
+    }
+
     /// `status.history` has one entry per version installed (newest last, the last ten), so
     /// writing it never makes another turn.
     #[test]
@@ -1751,8 +2118,9 @@ mod tests {
         );
         assert_eq!(entries.as_array().unwrap().len(), 3);
 
-        // Eleven more installs keep the last ten.
-        apply(&mut store, RELEASE);
+        // Eleven more installs keep the last ten. (A spec that is new: one equal to an earlier
+        // one is a rollback, and holds its version.)
+        apply(&mut store, &RELEASE.replace("extra: true", "extra: true, colour: teal"));
         for minor in 3..=13 {
             store
                 .apply(package(&format!("{minor}.0.0"), &[("map.yaml", MAP)]))
@@ -2525,5 +2893,268 @@ mod tests {
             .find(|resource| resource.metadata.name == "mine-maps-peek");
         assert_eq!(peek.unwrap().spec["data"]["peer"], "a");
         assert!(output.looked.contains("ConfigMap/shop/upstream"));
+    }
+
+    /// A package of one ConfigMap and a hook Job for each point; a Job's command says the colour.
+    fn hooked(version: &str) -> Resource {
+        let job = |point: &str| {
+            format!(
+                "---\napiVersion: kith.dev/v1\nkind: Job\nmetadata: {{ name: {{{{ name }}}}-{point}, annotations: {{ 'kith.dev/hook': {point} }} }}\n\
+                 spec: {{ template: {{ exec: [{{ name: run, command: ['{{{{ values.colour }}}}'] }}] }} }}\n"
+            )
+        };
+        let jobs: Vec<String> = ["pre-install", "post-install", "pre-upgrade", "post-upgrade"]
+            .map(job)
+            .into();
+        package(version, &[("map.yaml", &format!("{MAP}{}", jobs.concat()))])
+    }
+
+    /// What a node would write when a Job ends.
+    fn end(store: &mut Store, job: &str, state: &str) {
+        let fields = json!({ "state": state }).as_object().unwrap().clone();
+        let statuses = vec![(format!("Job/shop/mine-maps-{job}"), fields)];
+        kith_store::run(store, kith_store::Command::Patch { statuses }).unwrap();
+    }
+
+    fn jobs(store: &Store) -> Vec<String> {
+        store.list(Some("Job")).map(|job| job.metadata.name.clone()).collect()
+    }
+
+    fn maps(store: &Store) -> usize {
+        store.list(Some("ConfigMap")).count()
+    }
+
+    /// A pre hook runs alone and the rest waits for it; a post hook runs once the rest is there
+    /// and the Release is installed when it has succeeded.
+    #[test]
+    fn hooks_install_runs_pre_then_the_rest_then_post() {
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        store.apply(hooked("1.0.0")).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        assert_eq!(
+            (jobs(&store), maps(&store)),
+            (vec!["mine-maps-pre-install".to_string()], 0)
+        );
+        let said = status_of(&store);
+        assert_eq!(said["state"], "hooks");
+        assert!(
+            said["message"]
+                .as_str()
+                .unwrap()
+                .contains("Job/shop/mine-maps-pre-install")
+        );
+        // (Running is not done: it still waits.)
+        end(&mut store, "pre-install", "running");
+        settle(&mut store, &mut renders);
+        assert_eq!(maps(&store), 0);
+        end(&mut store, "pre-install", "succeeded");
+        settle(&mut store, &mut renders);
+        assert_eq!(maps(&store), 2);
+        assert_eq!(jobs(&store), ["mine-maps-post-install", "mine-maps-pre-install"]);
+        assert_eq!(status_of(&store)["state"], "hooks");
+        end(&mut store, "post-install", "succeeded");
+        settle(&mut store, &mut renders);
+        let said = status_of(&store);
+        assert_eq!(
+            (&said["state"], &said["version"], &said["message"]),
+            (&json!("installed"), &json!("1.0.0"), &Value::Null)
+        );
+        // A hook is not one of the release's resources, so it is not pruned as one.
+        assert_eq!(
+            said["resources"],
+            json!(["ConfigMap/shop/mine-maps", "ConfigMap/shop/mine-maps-extra"])
+        );
+        // The same again runs nothing again.
+        let before: Vec<_> = store.list(Some("Job")).map(|job| job.metadata.revision).collect();
+        assert_eq!(settle(&mut store, &mut renders), 0);
+        let after: Vec<_> = store.list(Some("Job")).map(|job| job.metadata.revision).collect();
+        assert_eq!(before, after);
+        // The Release goes, and its hook Jobs with it.
+        store.delete("Release/shop/mine").unwrap();
+        settle(&mut store, &mut renders);
+        assert_eq!((jobs(&store), maps(&store)), (Vec::<String>::new(), 0));
+    }
+
+    /// A hook that fails leaves the Release in error naming the Job, and nothing else is made.
+    #[test]
+    fn hooks_a_failed_hook_stops_the_release_and_changes_nothing() {
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        store.apply(hooked("1.0.0")).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        end(&mut store, "pre-install", "failed");
+        settle(&mut store, &mut renders);
+        let said = status_of(&store);
+        assert_eq!(said["state"], "error");
+        assert!(
+            said["message"]
+                .as_str()
+                .unwrap()
+                .contains("Job/shop/mine-maps-pre-install")
+        );
+        assert!(said["message"].as_str().unwrap().contains("delete it to run it again"));
+        assert_eq!((jobs(&store).len(), maps(&store)), (1, 0));
+        assert_eq!(said["version"], Value::Null);
+        // One that fails after: the rest is there, and the Release says so.
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        store.apply(hooked("1.0.0")).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        end(&mut store, "pre-install", "succeeded");
+        settle(&mut store, &mut renders);
+        end(&mut store, "post-install", "failed");
+        settle(&mut store, &mut renders);
+        let said = status_of(&store);
+        assert_eq!((&said["state"], maps(&store)), (&json!("error"), 2));
+        assert!(
+            said["message"]
+                .as_str()
+                .unwrap()
+                .contains("Job/shop/mine-maps-post-install")
+        );
+    }
+
+    /// An upgrade runs the upgrade hooks, not the install ones; a hook as it was is not run
+    /// again, and one for a new version is, the old Job deleted first.
+    #[test]
+    fn hooks_upgrade_runs_its_own_and_reruns_only_what_changed() {
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        store.apply(hooked("1.0.0")).unwrap();
+        apply(&mut store, RELEASE);
+        for job in ["pre-install", "post-install"] {
+            settle(&mut store, &mut renders);
+            end(&mut store, job, "succeeded");
+        }
+        settle(&mut store, &mut renders);
+        assert_eq!(status_of(&store)["state"], "installed");
+        store.apply(hooked("1.1.0")).unwrap();
+        settle(&mut store, &mut renders);
+        assert_eq!(status_of(&store)["state"], "hooks");
+        assert_eq!(
+            jobs(&store),
+            [
+                "mine-maps-post-install",
+                "mine-maps-pre-install",
+                "mine-maps-pre-upgrade"
+            ]
+        );
+        end(&mut store, "pre-upgrade", "succeeded");
+        settle(&mut store, &mut renders);
+        assert_eq!(status_of(&store)["version"], "1.1.0");
+        assert_eq!(jobs(&store).last().unwrap(), "mine-maps-pre-upgrade");
+        assert!(jobs(&store).contains(&"mine-maps-post-upgrade".to_string()));
+        end(&mut store, "post-upgrade", "succeeded");
+        settle(&mut store, &mut renders);
+        assert_eq!(status_of(&store)["state"], "installed");
+        let revisions =
+            |store: &Store| -> Vec<_> { store.list(Some("Job")).map(|job| job.metadata.revision).collect() };
+        let before = revisions(&store);
+        assert_eq!(settle(&mut store, &mut renders), 0);
+        assert_eq!(before, revisions(&store), "nothing run again");
+        // A new version: the hooks that run for it are made again, from nothing.
+        store.apply(hooked("1.2.0")).unwrap();
+        settle(&mut store, &mut renders);
+        let job = store.get("Job/shop/mine-maps-pre-upgrade").unwrap();
+        assert_eq!(job.status, None, "the old Job is gone and this is a new one");
+        assert_eq!((status_of(&store)["state"].clone(), maps(&store)), (json!("hooks"), 2));
+        assert_eq!(status_of(&store)["version"], "1.1.0");
+    }
+
+    /// A hook of another kind, or at a point there is none of, is an error; so is a Job there
+    /// already that is not the Release's.
+    #[test]
+    fn hooks_a_mistake_in_one_is_the_releases_error() {
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        let odd = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: x, annotations: { 'kith.dev/hook': pre-install } }\nspec: { data: {} }\n";
+        store.apply(package("1.0.0", &[("odd.yaml", odd)])).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        let said = status_of(&store);
+        assert_eq!(said["state"], "error");
+        assert!(said["message"].as_str().unwrap().contains("only a Job"));
+        let wrong = odd
+            .replace("ConfigMap", "Job")
+            .replace("pre-install", "sometimes")
+            .replace("data: {}", "template: { exec: [{ name: a, command: ['true'] }] }");
+        store.apply(package("1.0.1", &[("odd.yaml", &wrong)])).unwrap();
+        settle(&mut store, &mut renders);
+        assert!(status_of(&store)["message"].as_str().unwrap().contains("sometimes"));
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        apply(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Job\nmetadata: { name: mine-maps-pre-install, namespace: shop }\nspec: { template: { exec: [{ name: a, command: ['true'] }] } }\n",
+        );
+        store.apply(hooked("1.0.0")).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        assert!(
+            status_of(&store)["message"]
+                .as_str()
+                .unwrap()
+                .contains("not Release/shop/mine's")
+        );
+        assert_eq!(maps(&store), 0);
+        // One at the post point is asked at once too: no pre Job is made first.
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        apply(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Job\nmetadata: { name: mine-maps-post-install, namespace: shop }\nspec: { template: { exec: [{ name: a, command: ['true'] }] } }\n",
+        );
+        store.apply(hooked("1.0.0")).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        assert!(
+            status_of(&store)["message"]
+                .as_str()
+                .unwrap()
+                .contains("not Release/shop/mine's")
+        );
+        assert_eq!(
+            (jobs(&store), maps(&store)),
+            (vec!["mine-maps-post-install".to_string()], 0)
+        );
+    }
+
+    /// A hook Job the render of the version now there no longer names is deleted, so a way
+    /// back to the version that had it (A, B, A, B) runs it again.
+    #[test]
+    fn hooks_one_the_render_no_longer_names_goes_so_coming_back_runs_it_again() {
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        let job = "---\napiVersion: kith.dev/v1\nkind: Job\nmetadata: { name: {{ name }}-pre-upgrade, annotations: { 'kith.dev/hook': pre-upgrade } }\n\
+                   spec: { template: { exec: [{ name: run, command: ['migrate'] }] } }\n";
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        store
+            .apply(package("1.1.0", &[("map.yaml", &format!("{MAP}{job}"))]))
+            .unwrap();
+        let at = |version: &str| {
+            RELEASE
+                .replace("autoUpgrade: true", "autoUpgrade: false")
+                .replace("name: maps }", &format!("name: maps, version: '={version}' }}"))
+        };
+        apply(&mut store, &at("1.0.0"));
+        settle(&mut store, &mut renders);
+        apply(&mut store, &at("1.1.0"));
+        settle(&mut store, &mut renders);
+        end(&mut store, "pre-upgrade", "succeeded");
+        settle(&mut store, &mut renders);
+        assert_eq!(
+            (status_of(&store)["version"].clone(), jobs(&store)),
+            (json!("1.1.0"), vec!["mine-maps-pre-upgrade".to_string()])
+        );
+        apply(&mut store, &at("1.0.0"));
+        settle(&mut store, &mut renders);
+        assert_eq!(
+            (status_of(&store)["version"].clone(), jobs(&store)),
+            (json!("1.0.0"), Vec::<String>::new())
+        );
+        apply(&mut store, &at("1.1.0"));
+        settle(&mut store, &mut renders);
+        assert_eq!(status_of(&store)["state"], "hooks");
+        assert_eq!(
+            store.get("Job/shop/mine-maps-pre-upgrade").unwrap().status,
+            None,
+            "made again"
+        );
     }
 }

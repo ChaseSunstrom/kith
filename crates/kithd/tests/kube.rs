@@ -1033,6 +1033,79 @@ fn workflows_json_patch_sees_what_kubectl_sees() {
     assert_eq!(cluster.got(&["deployment", "api"])["spec"]["replicas"], 3);
 }
 
+/// `kubectl rollout history` and `undo` of a Deployment: the kept revisions are ReplicaSets
+/// to read, and an undo is kith's own rollback to the revision that held that template.
+#[test]
+fn workflows_rollout_history_and_undo() {
+    let Some(cluster) = Cluster::start("kube-rollout") else {
+        return;
+    };
+    cluster.write("api.yaml", BARE);
+    cluster.ok(&["apply", "-f", "api.yaml"]);
+    // Two more templates, each a revision (a template annotation is what `rollout restart` sets).
+    for step in ["two", "three"] {
+        let patch = format!(r#"{{"spec":{{"template":{{"metadata":{{"annotations":{{"step":"{step}"}}}}}}}}}}"#);
+        cluster.ok(&["patch", "deployment", "api", "-p", patch.as_str()]);
+    }
+    let step = || {
+        let live = cluster.got(&["deployment", "api"]);
+        live["spec"]["template"]["metadata"]["annotations"]["step"]
+            .as_str()
+            .unwrap_or("none")
+            .to_string()
+    };
+    let revisions = || -> Vec<String> {
+        let history = cluster.ok(&["rollout", "history", "deployment/api"]);
+        let rows = history.lines().filter_map(|line| line.split_whitespace().next());
+        rows.filter(|row| row.parse::<u64>().is_ok())
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(revisions(), ["1", "2", "3"]);
+    // One revision: its pod template.
+    let one = cluster.ok(&["rollout", "history", "deployment/api", "--revision=2"]);
+    says(&one, &["deployment.apps/api with revision #2", "step: two"]);
+    // The ReplicaSets are the same, read: a write or a delete is refused, and says so.
+    let sets = cluster.got(&["rs", "-l", "app=api"]);
+    assert_eq!(sets["items"].as_array().unwrap().len(), 3, "{sets}");
+    let name = sets["items"][0]["metadata"]["name"].as_str().unwrap().to_string();
+    cluster.refused(&["delete", "rs", name.as_str()], &["read only"]);
+    cluster.refused(&["scale", "rs", name.as_str(), "--replicas=2"], &["read only"]);
+    cluster.refused(
+        &["patch", "rs", name.as_str(), "-p", r#"{"spec":{"replicas":2}}"#],
+        &["read only"],
+    );
+    // `apply` left its annotation: the undo's patch empties them, and is still taken for an undo.
+    let notes = cluster.got(&["deployment", "api"]);
+    let last = &notes["metadata"]["annotations"]["kubectl.kubernetes.io/last-applied-configuration"];
+    assert!(last.is_string(), "{notes}");
+    // Undo to a revision: the Deployment has that template again, as a new revision.
+    says(
+        &cluster.ok(&["rollout", "undo", "deployment/api", "--to-revision=2"]),
+        &["deployment.apps/api rolled back"],
+    );
+    assert_eq!(step(), "two");
+    assert_eq!(revisions(), ["1", "3", "4"], "the template of 2 is revision 4 now");
+    assert_eq!(cluster.held("workload/api")["metadata"]["revision"], 4);
+    // Undo with none named: the one before the live one (3).
+    says(
+        &cluster.ok(&["rollout", "undo", "deployment/api"]),
+        &["deployment.apps/api rolled back"],
+    );
+    assert_eq!(step(), "three");
+    assert_eq!(revisions(), ["1", "4", "5"]);
+    // To the live template is nothing to do, and kubectl says so; to one never kept, it fails.
+    says(
+        &cluster.ok(&["rollout", "undo", "deployment/api", "--to-revision=5"]),
+        &["skipped rollback"],
+    );
+    assert_eq!(cluster.held("workload/api")["metadata"]["revision"], 5);
+    cluster.refused(
+        &["rollout", "undo", "deployment/api", "--to-revision=9"],
+        &["unable to find specified revision"],
+    );
+}
+
 #[test]
 fn workflows_helm() {
     for (n, helm) in helms().iter().enumerate() {
