@@ -90,6 +90,9 @@
     if [ "$test" = disk ]; then
         . "$root/ci/vm/disk.sh"
     fi
+    if [ "$test" = encrypt ]; then
+        . "$root/ci/vm/encrypt.sh"
+    fi
     if [ "$test" = fido2 ]; then
         . "$root/ci/vm/fido2.sh"
     fi
