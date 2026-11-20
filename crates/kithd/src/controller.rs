@@ -2463,10 +2463,6 @@ impl Controller {
             let Some(live) = file_store.store.get(&key).map(|live| live.status.as_ref()) else {
                 continue;
             };
-            // (`asleep` is the leader's word and a report replaces the status it is in.)
-            if live.is_some_and(|live| live["asleep"] == true) {
-                status["asleep"] = json!(true);
-            }
             // What runs elsewhere is for its node to say; this one only takes back what it said.
             let said = ours.contains(&key).then_some(status);
             let units = live.and_then(|status| status["containers"].as_array());

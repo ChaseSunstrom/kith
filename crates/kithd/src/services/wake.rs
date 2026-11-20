@@ -11,6 +11,7 @@
 // counts as seen to within `TICK`. A Workload with a Service that has no `scaleToZero` never sleeps.
 
 use super::{Proxy, Table, behind, v4};
+use kith_api::Resource;
 use kith_api::kinds::{Protocol, ServiceSpec, every};
 use kith_api::store::Store;
 use serde_json::{Map, Value, json};
@@ -26,10 +27,12 @@ use tokio::sync::{Notify, watch};
 const HELD: usize = 256;
 /// How often a node says what it met, and so how much later than `idle` the leader acts.
 const TICK: u64 = 10;
-/// A `wake` this old, or older, is a connection that ended or a node that is gone.
-const FRESH: u64 = 30;
-/// How far ahead of the leader's clock a node's word is believed.
+/// How far a node's clock may be from the leader's: ahead, its word is believed up to this far;
+/// behind, its `wake` is believed for this long more.
 const SKEW: u64 = 60;
+/// A `wake` this old, or older, by the node's clock, is a connection that ended or a node that is
+/// gone (it is said every `TICK` while held: this is the `SKEW` the docs promise, and some more).
+const FRESH: u64 = SKEW + 30;
 /// How often a held connection looks for a replica.
 const POLL: Duration = Duration::from_millis(250);
 
@@ -39,9 +42,23 @@ pub(super) fn unix() -> u64 {
     now.map_or(0, |now| now.as_secs())
 }
 
+/// What a port of a Service that may sleep is: the Service (its key), its `start`, and the Workloads
+/// behind it, each with the port a connection goes to.
+pub(super) type Ports = BTreeMap<(IpAddr, u16), (String, Duration, Vec<(String, u16)>)>;
+
+/// May a connection from the kithd of `node` reach one of `behind` (where a NetworkPolicy keeps
+/// it out, it neither wakes the Workload nor keeps it awake)? The same check the node that has
+/// the replica makes ([`super::admits`]).
+pub(super) fn admitted(store: &Store, prefix: Ipv6Addr, node: &str, behind: &[(String, u16)]) -> bool {
+    let from = IpAddr::from(kith_mesh::node_address(prefix, node));
+    behind
+        .iter()
+        .any(|(workload, port)| super::admits(store, workload, Some(node), from, *port))
+}
+
 /// The ports of `table` that are a TCP port of a Service with `scaleToZero`, with the Service
 /// (its key) and its `start`: where a connection may find the Workload asleep.
-pub(super) fn ports(store: &Store, prefix: Ipv6Addr, table: &Table) -> BTreeMap<(IpAddr, u16), (String, Duration)> {
+pub(super) fn ports(store: &Store, prefix: Ipv6Addr, table: &Table) -> Ports {
     let mut found = BTreeMap::new();
     for service in store.list(Some("Service")) {
         let Ok(spec) = serde_json::from_value::<ServiceSpec>(service.spec.clone()) else {
@@ -50,6 +67,7 @@ pub(super) fn ports(store: &Store, prefix: Ipv6Addr, table: &Table) -> BTreeMap<
         let Some(start) = spec.scale_to_zero.as_ref().and_then(|zero| every(&zero.start)) else {
             continue;
         };
+        let workloads = behind(store, service, &spec);
         let address = IpAddr::from(kith_mesh::service_address(
             prefix,
             &super::namespace(service),
@@ -63,7 +81,10 @@ pub(super) fn ports(store: &Store, prefix: Ipv6Addr, table: &Table) -> BTreeMap<
         {
             let key = (at, port.port);
             if port.protocol != Some(Protocol::Udp) && table.contains_key(&key) {
-                found.insert(key, (service.key(), Duration::from_secs(start)));
+                let targets = workloads
+                    .iter()
+                    .filter_map(|workload| Some((workload.key(), super::target_of(port, workload)?)));
+                found.insert(key, (service.key(), Duration::from_secs(start), targets.collect()));
             }
         }
     }
@@ -94,7 +115,7 @@ struct Service {
 #[derive(Default)]
 struct Inner {
     /// What each address and port of a Service with `scaleToZero` is: the Service, and its `start`.
-    ports: BTreeMap<(IpAddr, u16), (String, Duration)>,
+    ports: Ports,
     services: BTreeMap<String, Service>,
 }
 
@@ -128,6 +149,8 @@ impl Drop for Met<'_> {
 pub(super) enum Closed {
     Full(String),
     Late(String, Duration),
+    /// The client hung up while it waited.
+    Gone,
 }
 
 impl std::fmt::Display for Closed {
@@ -135,6 +158,7 @@ impl std::fmt::Display for Closed {
         match self {
             Closed::Full(service) => write!(f, "{HELD} connections already wait for {service} to start"),
             Closed::Late(service, start) => write!(f, "{service} did not start within {}s", start.as_secs()),
+            Closed::Gone => write!(f, "the client hung up"),
         }
     }
 }
@@ -153,11 +177,11 @@ impl Drop for Held<'_> {
 
 impl Naps {
     /// What the Services that may sleep are now; the others are forgotten.
-    pub(super) fn set(&self, ports: BTreeMap<(IpAddr, u16), (String, Duration)>) {
+    pub(super) fn set(&self, ports: Ports) {
         let mut inner = self.inner.lock().expect("nothing panics holding the naps");
         inner
             .services
-            .retain(|name, _| ports.values().any(|(of, _)| of == name));
+            .retain(|name, _| ports.values().any(|(of, ..)| of == name));
         inner.ports = ports;
     }
 
@@ -170,10 +194,19 @@ impl Naps {
             .contains_key(key)
     }
 
-    /// A connection to `key` at `now`: `Some` if its Service may sleep.
-    pub(super) fn meet(&self, key: (IpAddr, u16), now: u64) -> Option<Met<'_>> {
+    /// A connection to `key` at `now`: `Some` if its Service may sleep and `admits` the
+    /// Workloads behind it ([`admitted`]): one that is refused is not met, so it counts for nothing.
+    pub(super) fn meet(
+        &self,
+        key: (IpAddr, u16),
+        now: u64,
+        admits: impl Fn(&[(String, u16)]) -> bool,
+    ) -> Option<Met<'_>> {
         let mut inner = self.inner.lock().expect("nothing panics holding the naps");
-        let (service, start) = inner.ports.get(&key)?.clone();
+        let (service, start, behind) = inner.ports.get(&key)?.clone();
+        if !admits(&behind) {
+            return None;
+        }
         let met = inner.services.entry(service.clone()).or_default();
         (met.open, met.seen) = (met.open + 1, now);
         Some(Met {
@@ -210,20 +243,41 @@ impl Naps {
 }
 
 /// Wait for `view` to say a replica is there, for the time the Service allows: the connection
-/// `met` is held while a replica starts. Waiting is polled (a replica takes seconds to start).
-pub(super) async fn hold(met: &Met<'_>, view: impl Fn() -> bool) -> Result<(), Closed> {
+/// `met` is held while a replica starts, or until `gone` is done (the client hung up: its place, and
+/// the Workload's wake, are let go at once). Waiting is polled (a replica takes seconds to start).
+pub(super) async fn hold(met: &Met<'_>, view: impl Fn() -> bool, gone: impl Future<Output = ()>) -> Result<(), Closed> {
     let Some(_place) = met.naps.hold(&met.service) else {
         return Err(Closed::Full(met.service.clone()));
     };
     let deadline = tokio::time::Instant::now() + met.start;
-    while !view() {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if left.is_zero() {
-            return Err(Closed::Late(met.service.clone(), met.start));
+    let wait = async {
+        while !view() {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err(Closed::Late(met.service.clone(), met.start));
+            }
+            tokio::time::sleep(POLL.min(left)).await;
         }
-        tokio::time::sleep(POLL.min(left)).await;
+        Ok(())
+    };
+    tokio::select! {
+        held = wait => held,
+        () = gone => Err(Closed::Gone),
     }
-    Ok(())
+}
+
+/// Done once `client` has hung up (or failed). What it says while it waits stays unread for [`serve`](super::Proxy).
+pub(super) async fn hung_up(client: &tokio::net::TcpStream) {
+    loop {
+        if client.readable().await.is_err() {
+            return;
+        }
+        if !matches!(client.peek(&mut [0]).await, Ok(1..)) {
+            return;
+        }
+        // (It said something: it is waiting still, and `readable` would be ready at once.)
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// Say why a held connection is closed (it may be heard or not).
@@ -236,8 +290,19 @@ pub(super) async fn close(client: &mut tokio::net::TcpStream, why: &Closed) {
 /// what its Services' connections say. `since` is when this node first saw each Workload awake (or
 /// woke it): a Workload sleeps `idle` after the later of that and the last connection to its
 /// Services, and `TICK` more, for what a node has not said yet.
-pub(super) fn decide(store: &Store, now: u64, since: &mut BTreeMap<String, u64>) -> Vec<(String, Map<String, Value>)> {
+///
+/// A node's word of a Service counts only where its kithd could have connected to the Workloads
+/// behind it ([`admitted`]): a node a NetworkPolicy keeps out cannot keep one awake or wake it, and a
+/// key that is no Service behind a Workload is never read.
+pub(super) fn decide(
+    store: &Store,
+    prefix: Ipv6Addr,
+    now: u64,
+    since: &mut BTreeMap<String, u64>,
+) -> Vec<(String, Map<String, Value>)> {
     let mut services: BTreeMap<String, Vec<(String, Option<u64>)>> = BTreeMap::new();
+    // Each Service's Workloads with the ports a connection goes to.
+    let mut targets: BTreeMap<String, Vec<(String, u16)>> = BTreeMap::new();
     if store.list(Some("Service")).any(|s| s.spec.get("scaleToZero").is_some()) {
         for service in store.list(Some("Service")) {
             let Ok(spec) = serde_json::from_value::<ServiceSpec>(service.spec.clone()) else {
@@ -245,15 +310,25 @@ pub(super) fn decide(store: &Store, now: u64, since: &mut BTreeMap<String, u64>)
             };
             let idle = spec.scale_to_zero.as_ref().and_then(|zero| every(&zero.idle));
             let named = (service.key(), idle);
-            for workload in behind(store, service, &spec) {
+            let workloads = behind(store, service, &spec);
+            let mut reached = Vec::new();
+            for workload in &workloads {
                 services.entry(workload.key()).or_default().push(named.clone());
+                let targets = spec.ports.iter().filter_map(|port| super::target_of(port, workload));
+                reached.extend(targets.map(|target| (workload.key(), target)));
             }
+            targets.insert(service.key(), reached);
         }
     }
-    let nodes: Vec<&Value> = store.list(Some("Node")).filter_map(|n| n.status.as_ref()).collect();
+    let nodes: Vec<&Resource> = store.list(Some("Node")).collect();
     let said = |field: &str, service: &str| {
-        let ats = nodes.iter().filter_map(|status| status[field][service].as_u64());
-        ats.filter(|at| *at <= now + SKEW).collect::<Vec<_>>()
+        let ats = nodes.iter().filter_map(|node| {
+            let at = node.status.as_ref()?[field][service]
+                .as_u64()
+                .filter(|at| *at <= now + SKEW)?;
+            admitted(store, prefix, &node.metadata.name, targets.get(service)?).then_some(at)
+        });
+        ats.collect::<Vec<_>>()
     };
     let mut writes = Vec::new();
     for workload in store.list(Some("Workload")) {
@@ -270,7 +345,8 @@ pub(super) fn decide(store: &Store, now: u64, since: &mut BTreeMap<String, u64>)
                 .any(|(name, _)| said("wake", name).iter().any(|at| now.saturating_sub(*at) <= FRESH));
             let last = behind.iter().flat_map(|(name, _)| said("seen", name)).max();
             let idle = behind.iter().filter_map(|(_, idle)| *idle).max().unwrap_or(0);
-            let quiet = now > last.unwrap_or(0).max(since.get(&key).copied().unwrap_or(now)) + idle + TICK;
+            let from = last.unwrap_or(0).max(since.get(&key).copied().unwrap_or(now));
+            let quiet = now > from.saturating_add(idle).saturating_add(TICK);
             !wake && (asleep || quiet)
         };
         match want {
@@ -320,7 +396,7 @@ pub(super) async fn run(proxy: Arc<Proxy>, mut stopping: watch::Receiver<bool>) 
         if leads {
             let writes = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
-                decide(&state.store, now, &mut since)
+                decide(&state.store, proxy.prefix, now, &mut since)
             };
             if !writes.is_empty()
                 && let Err(e) = shared.write_here(kith_store::Command::Patch { statuses: writes }).await
@@ -395,7 +471,7 @@ spec:
     }
 
     fn writes(store: &Store, now: u64, since: &mut BTreeMap<String, u64>) -> Vec<(String, bool)> {
-        let writes = decide(store, now, since);
+        let writes = decide(store, prefix(), now, since);
         writes
             .into_iter()
             .map(|(key, fields)| (key, fields["asleep"] == true))
@@ -403,6 +479,10 @@ spec:
     }
 
     const WEB_KEY: &str = "Workload/default/web";
+
+    fn prefix() -> Ipv6Addr {
+        kith_mesh::prefix(b"test")
+    }
 
     #[test]
     fn scale_to_zero_sleeps_once_no_node_has_seen_a_connection_for_idle() {
@@ -530,11 +610,111 @@ spec:
         assert_eq!(writes(&store, 9000, &mut BTreeMap::new()), []);
     }
 
+    /// The Workload `web` lets in only the kithd of `n2`.
+    fn guarded() -> Store {
+        let mut store = store(ZERO);
+        let policy = "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: { name: p }\nspec:\n  \
+                      selector: { app: web }\n  ingress: [{ action: allow, peers: [{ node: n2 }] }]\n  egress: []\n";
+        store
+            .apply(Resource::from_source(policy).unwrap().remove(0).unwrap())
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn scale_to_zero_a_client_the_policy_refuses_neither_wakes_nor_counts() {
+        let (store, prefix) = (guarded(), prefix());
+        let store = &store;
+        let key = (IpAddr::from(kith_mesh::service_address(prefix, "default", "web")), 80);
+        let naps = Naps::default();
+        naps.set(ports(store, prefix, &Table::from([(key, Vec::new())])));
+        let from = |node: &'static str| move |behind: &[(String, u16)]| admitted(store, prefix, node, behind);
+        // On n1, whose connections the policy refuses: not met, so not seen, not held, not woken.
+        assert!(naps.meet(key, 1000, from("n1")).is_none());
+        let (seen, wake) = naps.say(2000);
+        assert!(seen.is_empty() && wake.is_empty(), "{seen:?} {wake:?}");
+        // On n2, it is met.
+        let met = naps.meet(key, 1000, from("n2"));
+        assert!(met.is_some());
+        assert_eq!(naps.say(2000).0["Service/default/web"], 2000);
+    }
+
+    #[test]
+    fn scale_to_zero_counts_a_nodes_word_only_where_the_policy_lets_its_kithd_connect() {
+        let mut store = guarded();
+        asleep(&mut store, true);
+        // n1 (kept out) says it holds a connection: nothing wakes. n2 (let in) says it: it wakes.
+        said(&mut store, &[("n1", "wake", 9000), ("n1", "seen", 9000)]);
+        assert_eq!(writes(&store, 9000, &mut BTreeMap::new()), []);
+        said(&mut store, &[("n2", "wake", 9000)]);
+        assert_eq!(writes(&store, 9000, &mut BTreeMap::new()), [(WEB_KEY.into(), false)]);
+        // Awake, n1 keeps saying it met connections: it does not keep the Workload awake.
+        let mut store = guarded();
+        said(&mut store, &[("n1", "seen", 8000 + 299)]);
+        let mut since = BTreeMap::from([(WEB_KEY.to_string(), 1000)]);
+        assert_eq!(
+            writes(&store, 8000 + 300 + TICK + 1, &mut since),
+            [(WEB_KEY.into(), true)]
+        );
+        said(&mut store, &[("n2", "seen", 8000 + 299)]);
+        assert_eq!(writes(&store, 8000 + 300 + TICK + 1, &mut since), []);
+    }
+
+    #[test]
+    fn scale_to_zero_an_idle_that_overflows_never_sleeps_the_workload() {
+        // (The API refuses one now: it is written as an older version left it.)
+        let mut store = store(ZERO);
+        let mut service = store.get("Service/default/web").unwrap().clone();
+        service.spec["scaleToZero"]["idle"] = json!("213503982334601d");
+        store.put(service);
+        assert_eq!(writes(&store, 100_000, &mut BTreeMap::new()), []);
+    }
+
+    /// A client connected to a listener here, and the listener's side of it.
+    async fn connected() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap());
+        let (client, served) = tokio::join!(client, listener.accept());
+        (client.unwrap(), served.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn held_connection_is_let_go_when_the_client_hangs_up() {
+        let (client, served) = connected().await;
+        let (naps, key) = naps();
+        let met = naps.meet(key, 1000, |_| true).unwrap();
+        let waiting = hold(&met, || false, hung_up(&served));
+        let hangs_up = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(naps.say(2000).1["Service/default/web"], 2000, "held while it waits");
+            drop(client);
+        };
+        let (held, ()) = tokio::join!(tokio::time::timeout(Duration::from_secs(5), waiting), hangs_up);
+        // (Not the 30 s of `start`: the place and the wake are gone with the client.)
+        assert_eq!(held.expect("not waiting out `start`"), Err(Closed::Gone));
+        assert!(naps.say(2000).1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn held_connection_that_says_something_is_waiting_still() {
+        let (mut client, served) = connected().await;
+        client.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+        let waiting = tokio::time::timeout(Duration::from_millis(600), hung_up(&served));
+        assert!(waiting.await.is_err(), "what it said is not a hang up");
+    }
+
     fn naps() -> (Naps, (IpAddr, u16)) {
         let key = (IpAddr::from([127, 0, 0, 1]), 80);
         let naps = Naps::default();
         let start = Duration::from_secs(30);
-        naps.set(BTreeMap::from([(key, ("Service/default/web".to_string(), start))]));
+        naps.set(BTreeMap::from([(
+            key,
+            (
+                "Service/default/web".to_string(),
+                start,
+                vec![(WEB_KEY.to_string(), 8080)],
+            ),
+        )]));
         (naps, key)
     }
 
@@ -542,8 +722,8 @@ spec:
     async fn held_connection_goes_on_once_a_replica_is_ready() {
         let (naps, key) = naps();
         let ready = AtomicBool::new(false);
-        let met = naps.meet(key, 1000).unwrap();
-        let waiting = hold(&met, || ready.load(Ordering::Relaxed));
+        let met = naps.meet(key, 1000, |_| true).unwrap();
+        let waiting = hold(&met, || ready.load(Ordering::Relaxed), std::future::pending());
         let started = async {
             tokio::time::sleep(Duration::from_secs(12)).await;
             // While it waits the node says it holds one (for the leader to wake the Workload).
@@ -560,9 +740,9 @@ spec:
     #[tokio::test(start_paused = true)]
     async fn held_connection_gives_up_past_the_start_deadline_and_says_why() {
         let (naps, key) = naps();
-        let met = naps.meet(key, 1000).unwrap();
+        let met = naps.meet(key, 1000, |_| true).unwrap();
         let before = tokio::time::Instant::now();
-        let closed = hold(&met, || false).await.unwrap_err();
+        let closed = hold(&met, || false, std::future::pending()).await.unwrap_err();
         assert_eq!(before.elapsed(), Duration::from_secs(30));
         assert_eq!(closed.to_string(), "Service/default/web did not start within 30s");
         assert!(naps.say(2000).1.is_empty());
@@ -573,17 +753,19 @@ spec:
         let (naps, key) = naps();
         let (ready, met) = (
             AtomicBool::new(false),
-            (0..HELD + 1).map(|_| naps.meet(key, 1).unwrap()).collect::<Vec<_>>(),
+            (0..HELD + 1)
+                .map(|_| naps.meet(key, 1, |_| true).unwrap())
+                .collect::<Vec<_>>(),
         );
         let held = met
             .iter()
             .take(HELD)
-            .map(|met| hold(met, || ready.load(Ordering::Relaxed)));
+            .map(|met| hold(met, || ready.load(Ordering::Relaxed), std::future::pending()));
         let held = futures_util::future::join_all(held);
         let over = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             // The 257th is closed at once, with the reason; the others wait.
-            let closed = hold(&met[HELD], || false).await.unwrap_err();
+            let closed = hold(&met[HELD], || false, std::future::pending()).await.unwrap_err();
             assert_eq!(closed, Closed::Full("Service/default/web".into()));
             assert!(closed.to_string().starts_with("256 connections"));
             ready.store(true, Ordering::Relaxed);
@@ -591,14 +773,14 @@ spec:
         let (held, ()) = tokio::join!(held, over);
         assert!(held.iter().all(Result::is_ok));
         // The places are given back: one more is held again.
-        assert_eq!(hold(&met[HELD], || true).await, Ok(()));
+        assert_eq!(hold(&met[HELD], || true, std::future::pending()).await, Ok(()));
     }
 
     #[tokio::test(start_paused = true)]
     async fn held_connection_is_met_only_at_a_service_that_may_sleep() {
         let (naps, key) = naps();
-        assert!(naps.meet((key.0, 81), 1).is_none());
-        let met = naps.meet(key, 7);
+        assert!(naps.meet((key.0, 81), 1, |_| true).is_none());
+        let met = naps.meet(key, 7, |_| true);
         assert!(met.is_some() && naps.has(&key));
         drop(met);
         // Ended: seen no longer moves with the clock.
@@ -632,7 +814,8 @@ spec:
         table.insert((at, 81), Vec::new());
         let found = ports(&store, prefix, &table);
         assert_eq!(found.keys().collect::<Vec<_>>(), [&(at, 80)]);
-        assert_eq!(found[&(at, 80)], (service.key(), Duration::from_secs(30)));
+        let behind = vec![(WEB_KEY.to_string(), 8080)];
+        assert_eq!(found[&(at, 80)], (service.key(), Duration::from_secs(30), behind));
         // Off: no port.
         assert!(ports(&self::store(""), prefix, &table).is_empty());
     }

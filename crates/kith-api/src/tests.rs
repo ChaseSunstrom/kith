@@ -832,7 +832,13 @@ fn scale_to_zero_is_checked_at_apply() {
         ))
     };
     with("{ idle: 5m, start: 30s }", "").unwrap();
+    // The ends of what is allowed: `idle` 30 s to 30 days, `start` up to 10 minutes.
+    with("{ idle: 30s, start: 10m }", "").unwrap();
+    with("{ idle: 30d, start: 1s }", "").unwrap();
     for bad in [
+        "{ idle: 29s, start: 30s }",
+        "{ idle: 31d, start: 30s }",
+        "{ idle: 213503982334601d, start: 30s }",
         "{ idle: 0s, start: 30s }",
         "{ idle: soon, start: 30s }",
         "{ idle: 5m, start: 0s }",

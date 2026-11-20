@@ -556,12 +556,8 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
                 "notes",
             ],
         )?,
-        _ => only(key, &said, &["replicas", "containers", "notes", "asleep"])?,
-    }
-    // (`asleep` is the leader's word (T-1210), and a report replaces the status it is in: a node
-    // says it again only as it is now.)
-    if said.contains_key("asleep") && live.status.as_ref().is_none_or(|status| status["asleep"] != true) {
-        return Err(refused(key, "`asleep` is not a worker's to write"));
+        // (Not `asleep`: the leader's word (T-1210), which a report keeps as the store has it.)
+        _ => only(key, &said, &["replicas", "containers", "notes"])?,
     }
     // (A NodeWorkload's copies too: the scheduler gives each node it selects a number.)
     let placed = live.status.as_ref().and_then(|status| status["nodes"].as_object());
@@ -1389,20 +1385,23 @@ spec: { volume: there, every: 1d }
         assert!(try_as(&store, "a", report_of("a", "Job/default/once", said)).is_ok());
     }
 
-    /// `asleep` is the leader's word (T-1210): a report carries it again only where the store has it.
+    /// `asleep` is the leader's word (T-1210): no report carries it, and none that leaves it out or
+    /// says otherwise changes what the store has (`kith_store::reported` keeps it).
     #[test]
-    fn a_report_carries_asleep_only_as_the_store_has_it() {
+    fn a_report_cannot_set_or_clear_asleep() {
         let mut store = store();
-        let said = json!({ "containers": [], "asleep": true });
-        let report = |store: &Store| try_as(store, "w", report_of("w", "Workload/default/web", said.clone()));
-        assert!(report(&store).unwrap_err().contains("asleep"));
-        store
-            .set_status(
-                "Workload/default/web",
-                Some(json!({ "nodes": { "0": "w" }, "asleep": true })),
-            )
-            .unwrap();
-        assert_eq!(reported(report(&store).unwrap()).unwrap()["asleep"], true);
+        let report = |store: &Store, said: Value| try_as(store, "w", report_of("w", "Workload/default/web", said));
+        for asleep in [json!(true), json!(false), json!("yes")] {
+            let said = json!({ "containers": [], "asleep": asleep });
+            assert!(report(&store, said).unwrap_err().contains("asleep"), "{asleep}");
+        }
+        for was in [true, false] {
+            let status = json!({ "nodes": { "0": "w" }, "asleep": was });
+            store.set_status("Workload/default/web", Some(status)).unwrap();
+            let taken = reported(report(&store, json!({ "containers": [] })).unwrap()).unwrap();
+            let live = store.get("Workload/default/web").unwrap().status.clone();
+            assert_eq!(kith_store::reported(live, "w", Some(taken))["asleep"], was);
+        }
     }
 
     #[test]

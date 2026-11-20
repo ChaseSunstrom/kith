@@ -335,12 +335,14 @@ egress rules, which decide where a pod may connect, are below.
 ### Scale to zero: a Service that lets its Workload sleep
 
 A Service may opt in with `spec.scaleToZero: { idle: 15m, start: 60s }` (both durations like
-`90s` or `30m`; `start` at most `10m`; unset means off). Its Workload then sleeps after no
+`90s` or `30m`; `idle` from `30s` to `30d`, `start` at most `10m`; unset means off). Its Workload then sleeps after no
 connection to the Service for `idle`: no replica runs, `status.asleep` is `true`, and
 `spec.replicas` stays as it is (sleep is state, not a spec edit, so `kith apply` of the same file
 changes nothing). The first connection to a sleeping Service is held by the kithd it reached
 while a replica starts, up to `start`, then passed on as any other; at the deadline, or when 256
-connections to that Service already wait, the connection is closed after one line saying why.
+connections to that Service already wait, the connection is closed after one line saying why. A
+client that hangs up while it waits gives up its place and its wake. Only a client the Workload's
+NetworkPolicies let in counts as a connection or wakes anything; a refused one is closed at once.
 
 - **TCP only.** Only a TCP connection to the Service's address wakes it. A datagram wakes
   nothing, so a Service with a `udp` port is refused when applied, and so is a headless one (no
@@ -350,8 +352,13 @@ connections to that Service already wait, the connection is closed after one lin
   connection to (`seen`, now while one is open) and which it holds one for (`wake`); the node
   that leads the store reads them. The idle time is therefore right to within about ten seconds
   (the sleep comes `idle` plus ten seconds after the last connection), and the nodes' clocks are
-  taken to agree to within a minute. A node that is down stops saying, so its old word does not
+  taken to agree to within a minute (a word dated further ahead than that is ignored, one older
+  than a minute and a half is stale). A node that is down stops saying, so its old word does not
   keep a Workload awake.
+- **Who can say it.** A node can only keep awake or wake the Services whose Workloads its
+  NetworkPolicies let it connect to, those it serves or relays for (a Workload with no policy lets
+  every node in). Its word about any other Service is not read. `status.asleep` is the leader's
+  alone: a worker's report cannot set, clear or flip it.
 - **Kernel path.** A Service that may sleep is passed by kithd, not by the kernel's connect
   hook (the kernel would not count the connection), so it does not have the same-node fast path.
 - A Workload that was never seen idle is counted from when the leader first saw it awake, so a

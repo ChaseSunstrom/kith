@@ -234,6 +234,23 @@ fn open_keys(
     listening.keys().copied().filter(|key| Some(*key) != relay).collect()
 }
 
+/// The port of `workload` a connection to the Service port `port` goes to.
+fn target_of(port: &kith_api::kinds::ServicePort, workload: &Resource) -> Option<u16> {
+    match &port.target_port {
+        None => Some(port.port),
+        Some(PortRef::Number(number)) => Some(*number),
+        // A port by name: the container port of that name.
+        Some(PortRef::Name(name)) => {
+            let spec = serde_json::from_value::<WorkloadSpec>(workload.spec.clone()).ok();
+            let containers = spec.into_iter().flat_map(|spec| spec.template.containers);
+            let mut ports = containers.flat_map(|container| container.ports);
+            ports
+                .find(|port| port.name.as_ref() == Some(name))
+                .map(|port| port.port)
+        }
+    }
+}
+
 /// What every Service listens on, and where its connections go: on its IPv6 address, and on its
 /// IPv4 one (`status.addressV4`) where `services` (this node's range for them) holds it and no
 /// Service before it (by key) has it.
@@ -263,19 +280,7 @@ fn table(store: &Store, prefix: Ipv6Addr, services: Option<Range>) -> Table {
             }
             let mut found = Vec::new();
             for workload in &workloads {
-                let target = match &port.target_port {
-                    None => Some(port.port),
-                    Some(PortRef::Number(number)) => Some(*number),
-                    // A port by name: the container port of that name.
-                    Some(PortRef::Name(name)) => {
-                        let spec = serde_json::from_value::<WorkloadSpec>(workload.spec.clone()).ok();
-                        let containers = spec.into_iter().flat_map(|spec| spec.template.containers);
-                        let mut ports = containers.flat_map(|container| container.ports);
-                        ports
-                            .find(|port| port.name.as_ref() == Some(name))
-                            .map(|port| port.port)
-                    }
-                };
+                let target = target_of(port, workload);
                 let pod = workload.spec["template"]["pod"] == true;
                 let nodes = ready_on(workload).into_iter();
                 found.extend(target.into_iter().flat_map(|target| {
@@ -787,10 +792,17 @@ impl Proxy {
         let mut backends = backends_of();
         // A Service that may sleep (T-1210) counts the connection, and holds one that finds no
         // replica while the Workload wakes: until one is ready, or the Service's `start` is up.
-        let met = self.naps.meet(key, wake::unix());
+        // (Only a client the Workload's NetworkPolicies let in: the others are not activity.)
+        let met = {
+            let state = self.shared.store.lock().expect("nothing panics holding the store");
+            let admits = |behind: &[_]| wake::admitted(&state.store, self.prefix, self.me(), behind);
+            self.naps.meet(key, wake::unix(), admits)
+        };
         if let Some(met) = met.as_ref().filter(|_| backends.is_empty()) {
-            if let Err(closed) = wake::hold(met, || !backends_of().is_empty()).await {
-                return wake::close(&mut client, &closed).await;
+            match wake::hold(met, || !backends_of().is_empty(), wake::hung_up(&client)).await {
+                Ok(()) => {}
+                Err(wake::Closed::Gone) => return,
+                Err(closed) => return wake::close(&mut client, &closed).await,
             }
             backends = backends_of();
         }

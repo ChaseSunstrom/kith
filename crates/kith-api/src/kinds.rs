@@ -780,8 +780,9 @@ spec! {
     }
 
     pub struct ScaleToZero {
-        /// How long without a connection before it sleeps: `90s`, `30m`, `24h`. Nodes'
-        /// clocks are taken to agree, and it is counted to within about ten seconds.
+        /// How long without a connection before it sleeps, from `30s` to `30d`: `90s`, `30m`,
+        /// `24h`. Nodes' clocks are taken to agree within a minute, and it is counted to
+        /// within about ten seconds.
         pub idle: String,
         /// How long a first connection is held for a replica to start (at most `10m`),
         /// before it is closed with the reason.
@@ -2626,9 +2627,11 @@ impl Spec for ServiceSpec {
         }
         if let Some(zero) = &self.scale_to_zero {
             let (idle, start) = (every(&zero.idle), every(&zero.start));
-            if idle.is_none() || start.is_none_or(|s| s > 600) {
+            // (A node says what it met every 10 s or so: less than 30 s would put to sleep what is in use.)
+            if idle.is_none_or(|s| !(30..=30 * 86400).contains(&s)) || start.is_none_or(|s| s > 600) {
                 return Err(
-                    "scaleToZero: `idle` and `start` are durations like `90s` or `30m`, `start` at most `10m`".into(),
+                    "scaleToZero: `idle` and `start` are durations like `90s` or `30m`, `idle` from `30s` to `30d`, `start` at most `10m`"
+                        .into(),
                 );
             }
             if self.headless == Some(true) {
