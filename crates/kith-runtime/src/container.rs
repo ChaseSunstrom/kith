@@ -1125,13 +1125,16 @@ pub fn tune(cgroup: &Path, guaranteed: Option<u64>, cpu_millis: Option<u64>, idl
     });
     let mut files = vec![
         ("memory.min", guaranteed.unwrap_or(0).to_string()),
-        ("cpu.weight", weight.to_string()),
         ("io.weight", format!("default {weight}")),
         ("cpu.max", format!("{cpu} 100000")),
     ];
     if let Some(idle) = idle {
+        // No cpu.weight: the kernel gives an idle group the minimum itself, and refuses (EINVAL)
+        // every write of it once cpu.idle is 1, which a second tune of the same unit would hit.
         files.push(("cpu.idle", "1".into()));
         files.extend(idle.memory_high.map(|bytes| ("memory.high", bytes.to_string())));
+    } else {
+        files.push(("cpu.weight", weight.to_string()));
     }
     let write = |(file, value): &(&str, String)| {
         let done = fs::write(cgroup.join(file), value);
@@ -2582,6 +2585,8 @@ mod tests {
             assert!(!cgroup.join(file).exists(), "{file} written for a normal unit");
         }
         assert_eq!(read("io.weight"), "default 100");
+        // An idle group refuses every write of cpu.weight (EINVAL), so an idle unit is never written it.
+        fs::remove_file(cgroup.join("cpu.weight")).unwrap();
         // Idle, with a memory amount: reclaimed from at that amount.
         assert!(
             tune(
@@ -2603,6 +2608,9 @@ mod tests {
         assert!(tune(&cgroup, None, None, Some(Idle { memory_high: None })).is_empty());
         assert!(!cgroup.join("memory.high").exists());
         assert_eq!((read("cpu.idle"), read("io.weight")), ("1".into(), "default 1".into()));
+        // Tuned again (a seat's change): still no cpu.weight.
+        assert!(tune(&cgroup, Some(1 << 20), Some(500), Some(Idle { memory_high: None })).is_empty());
+        assert!(!cgroup.join("cpu.weight").exists());
         let _ = fs::remove_dir_all(cgroup);
     }
 
