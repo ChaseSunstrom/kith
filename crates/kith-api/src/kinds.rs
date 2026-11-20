@@ -57,6 +57,11 @@ spec! {
         pub authority: Vec<String>,
         /// The log's public key, PEM (ECDSA P-256).
         pub log: String,
+        /// The root certificates (PEM, 1 to 4) of the timestamp authority whose RFC 3161 timestamp
+        /// says when the signature was made. Without it a signature logged to Rekor v2 (which
+        /// has no promise of its own) is refused, and with it every signature needs the timestamp.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tsa: Option<Vec<String>>,
     }
 }
 
@@ -198,7 +203,8 @@ spec! {
         /// Kept and not acted on: an update is an `OSRelease`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub update_policy: Option<UpdatePolicy>,
-        /// Kept and not acted on: the mesh is set by kithd's flags.
+        /// The mesh switch (`enabled`, `port`): acted on by every node started without `--mesh`.
+        /// The rest of it is kept and not acted on: the mesh's addresses come from the CA.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub mesh: Option<MeshSpec>,
         /// Cluster-wide package values. Kept and not acted on: a package takes its own.
@@ -260,8 +266,15 @@ spec! {
         /// IPv6 ULA prefix for mesh addresses.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub cidr: Option<String>,
+        /// The switch: `true` and every node of the cluster that was not started with `--mesh`
+        /// brings the WireGuard mesh up (on `port`, 51820 without); off or left out, it does not.
+        /// A kith OS node takes it with no reinstall. The rest of this kind is kept and not
+        /// acted on.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub enabled: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub ipv4: Option<bool>,
+        /// The UDP port of the mesh's interface, with `enabled`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub port: Option<u16>,
     }
@@ -399,6 +412,10 @@ spec! {
         /// Hold this replica back (a sliver of one CPU) while a seat of its node is busy.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub yield_to: Option<YieldTo>,
+        /// `idle` makes this replica's units take only the node's spare CPU and disk (and their
+        /// memory is reclaimed first); `normal`, the default, changes nothing.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub priority: Option<Priority>,
         /// Run each replica as Kubernetes runs a pod: its containers share a network of
         /// their own (any port is theirs, `localhost` is each other, and the replica has
         /// an address on the mesh), each may write its root file system unless it says
@@ -417,6 +434,11 @@ spec! {
         #[serde(default, skip_serializing_if = "Labels::is_empty")]
         pub annotations: Labels,
     }
+
+    /// How a replica's units share the node. `idle`: CPU and disk only when nothing else wants
+    /// them (`cpu.idle`, the lowest `io.weight`), and memory reclaimed from them first
+    /// (`memory.high` at the unit's memory amount, if it has one).
+    pub enum Priority { Normal, Idle }
 
     pub struct YieldTo {
         /// Name of the `Seat`.
@@ -1287,8 +1309,14 @@ spec! {
         pub max_unavailable: Option<u32>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub windows: Vec<String>,
+        /// Drain each node before it restarts (`kith node drain`): what can move runs
+        /// elsewhere first.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub drain: Option<bool>,
+        /// How long a drain waits for what moves to run elsewhere before the node restarts
+        /// anyway. Defaults to 300; at most 3600.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub drain_seconds: Option<u32>,
         /// Hold back nodes with an active seat until it is idle.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub wait_for_idle_seats: Option<bool>,
@@ -1466,6 +1494,14 @@ fn not_keys(signers: &[Signer]) -> Option<String> {
         } else if !p256(&identity.log) {
             Some(format!(
                 "signedBy: the identity `{who}`'s log is not an ECDSA P-256 public key"
+            ))
+        } else if identity
+            .tsa
+            .as_ref()
+            .is_some_and(|tsa| tsa.is_empty() || tsa.len() > 4 || !tsa.iter().all(cert))
+        {
+            Some(format!(
+                "signedBy: the identity `{who}` gives its tsa as 1 to 4 PEM certificates of at most 8 KiB"
             ))
         } else {
             None

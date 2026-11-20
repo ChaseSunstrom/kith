@@ -1102,27 +1102,152 @@ pub mod cbc {
     }
 }
 
-/// PIN protocol 1 for `hmac-secret` (docs/adr-fido2.md section 1): an ECDH P-256 agreement
-/// with the key's agreement key, the shared secret as SHA-256 of the x coordinate, a zero IV,
-/// and the first 16 bytes of an HMAC-SHA-256 as the salt's authentication. The key's agreement
-/// key is untrusted bytes: it is checked before ring sees it, and ring checks the point.
-/// Protocol 2 (a 64-byte secret, a random IV) is not here: the ADR requires it before a release.
+/// PIN/UV auth protocols 1 and 2 for `hmac-secret` (docs/adr-fido2.md section 1): an ECDH
+/// P-256 agreement with the key's agreement key, then, by protocol:
+/// - 1: the shared secret is SHA-256 of the x coordinate and is both keys, the IV is zero, and
+///   the salt's authentication is the first 16 bytes of an HMAC-SHA-256;
+/// - 2 (CTAP2.1): HKDF-SHA-256 (32 zero bytes of salt) over the x coordinate gives an HMAC key
+///   ("CTAP2 HMAC key") and an AES key ("CTAP2 AES key"), 32 bytes each; a random 16-byte IV
+///   leads every ciphertext, and the authentication is the whole 32-byte HMAC-SHA-256.
+///
+/// The key's agreement key is untrusted bytes: it is checked before ring sees it, and ring
+/// checks the point. The shared secret and both keys are wiped when dropped.
 pub mod hmac {
     use super::{
         cbc,
         cbor::{Value, uint},
     };
-    use ring::{agreement, digest, hmac as ring_hmac, rand};
+    use ring::{agreement, digest, hkdf, hmac as ring_hmac, rand, rand::SecureRandom};
     use zeroize::Zeroizing;
 
     /// A salt, and so the secret it gives, is 32 bytes (one salt of the two `hmac-secret` takes).
     pub const SALT: usize = 32;
 
-    /// The protocol 1 key from the x coordinate of the ECDH point.
-    pub fn derive(x: &[u8]) -> Zeroizing<[u8; 32]> {
-        let mut key = Zeroizing::new([0u8; 32]);
-        key.copy_from_slice(digest::digest(&digest::SHA256, x).as_ref());
-        key
+    /// Which PIN/UV auth protocol an exchange speaks.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Protocol {
+        One,
+        Two,
+    }
+
+    impl Protocol {
+        /// Its number on the wire.
+        pub fn number(self) -> u64 {
+            match self {
+                Protocol::One => 1,
+                Protocol::Two => 2,
+            }
+        }
+
+        /// The protocol for a key's getInfo `pinUvAuthProtocols`: 2 if it is listed, else 1.
+        pub fn choose(listed: &[Value]) -> Result<Protocol, String> {
+            if listed.contains(&uint(2)) {
+                Ok(Protocol::Two)
+            } else if listed.contains(&uint(1)) {
+                Ok(Protocol::One)
+            } else {
+                Err("the key lists neither pinUvAuthProtocols 1 nor 2".into())
+            }
+        }
+
+        /// What `n` bytes of an `hmac-secret` answer must be (one IV block more under 2).
+        fn sealed_len(self, n: usize) -> usize {
+            match self {
+                Protocol::One => n,
+                Protocol::Two => n + cbc::BLOCK,
+            }
+        }
+    }
+
+    /// `OKM` of `out.len()` bytes: HKDF-SHA-256 (RFC 5869) of `ikm`.
+    pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) -> Result<(), String> {
+        struct Len(usize);
+        impl hkdf::KeyType for Len {
+            fn len(&self) -> usize {
+                self.0
+            }
+        }
+        let fail = |_| "HKDF-SHA-256 refused its length".to_string();
+        hkdf::Salt::new(hkdf::HKDF_SHA256, salt)
+            .extract(ikm)
+            .expand(&[info], Len(out.len()))
+            .map_err(fail)?
+            .fill(out)
+            .map_err(fail)
+    }
+
+    /// What a protocol makes of the x coordinate of the ECDH point: the HMAC key and the AES
+    /// key (the same 32 bytes under protocol 1), and the protocol's way of sealing and signing.
+    pub struct Keys {
+        pub(crate) protocol: Protocol,
+        pub(crate) mac: Zeroizing<[u8; 32]>,
+        pub(crate) aes: Zeroizing<[u8; 32]>,
+    }
+
+    impl Keys {
+        pub fn derive(protocol: Protocol, x: &[u8]) -> Result<Keys, String> {
+            let (mut mac, mut aes) = (Zeroizing::new([0u8; 32]), Zeroizing::new([0u8; 32]));
+            match protocol {
+                Protocol::One => {
+                    mac.copy_from_slice(digest::digest(&digest::SHA256, x).as_ref());
+                    aes.copy_from_slice(&mac[..]);
+                }
+                Protocol::Two => {
+                    hkdf_sha256(&[0; 32], x, b"CTAP2 HMAC key", &mut mac[..])?;
+                    hkdf_sha256(&[0; 32], x, b"CTAP2 AES key", &mut aes[..])?;
+                }
+            }
+            Ok(Keys { protocol, mac, aes })
+        }
+
+        /// The authentication of `data`: 16 bytes under protocol 1, 32 under protocol 2.
+        pub fn authenticate(&self, data: &[u8]) -> Vec<u8> {
+            let tag = ring_hmac::sign(&ring_hmac::Key::new(ring_hmac::HMAC_SHA256, &self.mac[..]), data);
+            let keep = match self.protocol {
+                Protocol::One => 16,
+                Protocol::Two => 32,
+            };
+            tag.as_ref()[..keep].to_vec()
+        }
+
+        /// `plain` (whole blocks) encrypted: with a zero IV under protocol 1, and under
+        /// protocol 2 with a random one that leads the ciphertext.
+        pub fn encrypt(&self, plain: &[u8]) -> Result<Vec<u8>, String> {
+            let mut iv = [0u8; cbc::BLOCK];
+            if self.protocol == Protocol::Two {
+                rand::SystemRandom::new()
+                    .fill(&mut iv)
+                    .map_err(|_| "no random bytes for an IV")?;
+            }
+            self.encrypt_with(&iv, plain)
+        }
+
+        /// [`Keys::encrypt`] with the IV given. Protocol 1 has no IV on the wire and IGNORES `iv`
+        /// (it uses zeros), so only protocol 2's vectors can pin one.
+        pub(crate) fn encrypt_with(&self, iv: &[u8; cbc::BLOCK], plain: &[u8]) -> Result<Vec<u8>, String> {
+            match self.protocol {
+                Protocol::One => cbc::run(&self.aes, &[0; cbc::BLOCK], plain, true),
+                Protocol::Two => {
+                    let mut out = iv.to_vec();
+                    out.extend(cbc::run(&self.aes, iv, plain, true)?);
+                    Ok(out)
+                }
+            }
+        }
+
+        /// What [`Keys::encrypt`] made, back to the plaintext (wiped when dropped).
+        pub fn decrypt(&self, enc: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+            let plain = match self.protocol {
+                Protocol::One => cbc::run(&self.aes, &[0; cbc::BLOCK], enc, false),
+                Protocol::Two => {
+                    let (iv, body) = enc
+                        .split_first_chunk::<{ cbc::BLOCK }>()
+                        .ok_or_else(|| format!("{} bytes of ciphertext: its IV is cut short", enc.len()))?;
+                    cbc::run(&self.aes, iv, body, false)
+                }
+            };
+            plain.map(Zeroizing::new)
+        }
     }
 
     /// The first 16 bytes of the HMAC-SHA-256 of `data`.
@@ -1166,15 +1291,15 @@ pub mod hmac {
         Ok(out)
     }
 
-    /// An agreement made with a key's agreement key: the shared secret, and our public key
-    /// to send with it. The private half is gone once the secret is derived.
+    /// An agreement made with a key's agreement key: the keys of the protocol, and our public
+    /// key to send with them. The private half is gone once the keys are derived.
     pub struct Session {
-        secret: Zeroizing<[u8; 32]>,
+        pub(crate) keys: Keys,
         key: Value,
     }
 
     impl Session {
-        pub fn agree(peer: &Value) -> Result<Session, String> {
+        pub fn agree(protocol: Protocol, peer: &Value) -> Result<Session, String> {
             let peer = point(peer)?;
             let rng = rand::SystemRandom::new();
             let mine = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng)
@@ -1186,36 +1311,42 @@ pub mod hmac {
             if public.len() != 65 {
                 return Err("an agreement key of an unexpected size".into());
             }
-            let secret = agreement::agree_ephemeral(
+            let keys = agreement::agree_ephemeral(
                 mine,
                 &agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, &peer[..]),
-                derive,
+                |x| Keys::derive(protocol, x),
             )
-            .map_err(|_| "the key's agreement key is not a point on P-256")?;
+            .map_err(|_| "the key's agreement key is not a point on P-256")??;
             Ok(Session {
-                secret,
+                keys,
                 key: cose(&public[1..33], &public[33..]),
             })
         }
 
         /// The `hmac-secret` input of getAssertion for `salt`: our key (1), the salt
-        /// encrypted (2) and its authentication (3).
+        /// encrypted (2), its authentication (3) and, for protocol 2 only, the protocol (4):
+        /// absent means 1 in CTAP, and a key that lists only 1 may refuse a key it does not know.
         pub fn request(&self, salt: &[u8; SALT]) -> Result<Value, String> {
-            let enc = cbc::run(&self.secret, &[0; cbc::BLOCK], salt, true)?;
-            let auth = mac16(&self.secret[..], &enc);
-            Ok(Value::Map(vec![
+            let enc = self.keys.encrypt(salt)?;
+            let auth = self.keys.authenticate(&enc);
+            let mut map = vec![
                 (uint(1), self.key.clone()),
                 (uint(2), Value::Bytes(enc)),
-                (uint(3), Value::Bytes(auth.to_vec())),
-            ]))
+                (uint(3), Value::Bytes(auth)),
+            ];
+            if self.keys.protocol == Protocol::Two {
+                map.push((uint(4), uint(self.keys.protocol.number())));
+            }
+            Ok(Value::Map(map))
         }
 
         /// The secret out of the encrypted answer in the assertion's extensions.
         pub fn reply(&self, enc: &[u8]) -> Result<Zeroizing<[u8; SALT]>, String> {
-            if enc.len() != SALT {
-                return Err(format!("an hmac-secret answer of {} bytes: {SALT} expected", enc.len()));
+            let want = self.keys.protocol.sealed_len(SALT);
+            if enc.len() != want {
+                return Err(format!("an hmac-secret answer of {} bytes: {want} expected", enc.len()));
             }
-            let plain = Zeroizing::new(cbc::run(&self.secret, &[0; cbc::BLOCK], enc, false)?);
+            let plain = self.keys.decrypt(enc)?;
             let mut out = Zeroizing::new([0u8; SALT]);
             out.copy_from_slice(&plain);
             Ok(out)
@@ -1232,7 +1363,7 @@ pub mod hmac {
         const GY: &str = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
 
         /// What a key does with our public key: its own agreement key, then the secret.
-        fn key_side() -> (Value, impl FnOnce(&Value) -> Zeroizing<[u8; 32]>) {
+        fn key_side(protocol: Protocol) -> (Value, impl FnOnce(&Value) -> Keys) {
             let rng = rand::SystemRandom::new();
             let k = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng).unwrap();
             let p = k.compute_public_key().unwrap();
@@ -1242,20 +1373,20 @@ pub mod hmac {
                 agreement::agree_ephemeral(
                     k,
                     &agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, &ours[..]),
-                    derive,
+                    |x| Keys::derive(protocol, x),
                 )
+                .unwrap()
                 .unwrap()
             })
         }
 
         #[test]
-        fn the_shared_secret_is_sha256_of_the_x_coordinate() {
+        fn the_protocol_1_secret_is_sha256_of_the_x_coordinate_and_is_both_keys() {
             // sha256sum of the bytes 00 01 .. 1f
             let x: Vec<u8> = (0..32).collect();
-            assert_eq!(
-                derive(&x)[..],
-                hex("630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd")[..]
-            );
+            let k = Keys::derive(Protocol::One, &x).unwrap();
+            let want = hex("630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd");
+            assert_eq!((k.mac[..].to_vec(), k.aes[..].to_vec()), (want.clone(), want));
         }
 
         /// RFC 4231, test cases 1 and 2 (HMAC-SHA-256), cut to the 16 bytes protocol 1 keeps.
@@ -1275,13 +1406,19 @@ pub mod hmac {
         fn both_sides_of_the_agreement_reach_the_same_secret() {
             let (gx, gy) = (hex(GX), hex(GY));
             // the generator is a good peer; its agreement works and gives our key to send
-            let s = Session::agree(&cose(&gx, &gy)).unwrap();
+            let s = Session::agree(Protocol::One, &cose(&gx, &gy)).unwrap();
             let p = point(&s.key).unwrap();
             assert_eq!(p[0], 4);
-            // a key with an agreement key of its own: both ends derive one secret
-            let (theirs, key_secret) = key_side();
-            let s = Session::agree(&theirs).unwrap();
-            assert_eq!(s.secret[..], key_secret(&s.key)[..]);
+            // a key with an agreement key of its own: both ends derive the same keys
+            for protocol in [Protocol::One, Protocol::Two] {
+                let (theirs, key_keys) = key_side(protocol);
+                let s = Session::agree(protocol, &theirs).unwrap();
+                let k = key_keys(&s.key);
+                assert_eq!(
+                    (s.keys.mac[..].to_vec(), s.keys.aes[..].to_vec()),
+                    (k.mac[..].to_vec(), k.aes[..].to_vec())
+                );
+            }
         }
 
         /// Limit: the request and the reply are checked against this module's own reading of
@@ -1292,31 +1429,51 @@ pub mod hmac {
         #[test]
         fn the_request_carries_our_key_the_encrypted_salt_and_its_authentication() {
             let (gx, gy) = (hex(GX), hex(GY));
-            let s = Session::agree(&cose(&gx, &gy)).unwrap();
-            let salt = [0x5a; SALT];
-            let req = s.request(&salt).unwrap();
-            let Some(Value::Bytes(enc)) = req.get(&uint(2)) else {
-                panic!("no salt")
-            };
-            assert_eq!(enc.len(), 32);
-            assert_ne!(enc[..], salt[..], "the salt does not travel plain");
-            assert_eq!(cbc::run(&s.secret, &[0; 16], enc, false).unwrap(), salt);
-            assert_eq!(
-                req.get(&uint(3)),
-                Some(&Value::Bytes(mac16(&s.secret[..], enc).to_vec()))
-            );
-            assert_eq!(req.get(&uint(1)), Some(&s.key));
-            // the answer is the secret, encrypted the same way, and comes back as it was
-            let secret = [0x77u8; 32];
-            let sealed = cbc::run(&s.secret, &[0; 16], &secret, true).unwrap();
-            assert_eq!(s.reply(&sealed).unwrap()[..], secret[..]);
+            for (protocol, iv, auth_len) in [(Protocol::One, 0, 16), (Protocol::Two, 16, 32)] {
+                let s = Session::agree(protocol, &cose(&gx, &gy)).unwrap();
+                let salt = [0x5a; SALT];
+                let req = s.request(&salt).unwrap();
+                let Some(Value::Bytes(enc)) = req.get(&uint(2)) else {
+                    panic!("no salt")
+                };
+                assert_eq!(enc.len(), iv + 32);
+                assert_ne!(enc[iv..], salt[..], "the salt does not travel plain");
+                assert_eq!(s.keys.decrypt(enc).unwrap()[..], salt[..]);
+                let Some(Value::Bytes(auth)) = req.get(&uint(3)) else {
+                    panic!("no authentication")
+                };
+                assert_eq!(auth.len(), auth_len);
+                assert_eq!(
+                    auth[..],
+                    ring_hmac::sign(&ring_hmac::Key::new(ring_hmac::HMAC_SHA256, &s.keys.mac[..]), enc).as_ref()
+                        [..auth_len]
+                );
+                assert_eq!(req.get(&uint(1)), Some(&s.key));
+                // protocol 2 names itself; protocol 1 is the default and sends no key 4
+                let named = (protocol == Protocol::Two).then(|| uint(2));
+                assert_eq!(
+                    req.get(&uint(4)),
+                    named.as_ref(),
+                    "{protocol:?}: the protocol travels as 2 or not at all"
+                );
+                // the answer is the secret, encrypted the same way, and comes back as it was
+                let secret = [0x77u8; 32];
+                let sealed = s.keys.encrypt(&secret).unwrap();
+                assert_eq!(s.reply(&sealed).unwrap()[..], secret[..]);
+            }
         }
 
         #[test]
         fn an_answer_of_the_wrong_size_is_refused() {
-            let s = Session::agree(&cose(&hex(GX), &hex(GY))).unwrap();
-            for len in [0, 15, 16, 31, 33, 48, 64] {
-                assert!(s.reply(&vec![1; len]).unwrap_err().contains("32 expected"), "len {len}");
+            for (protocol, want) in [(Protocol::One, 32), (Protocol::Two, 48)] {
+                let s = Session::agree(protocol, &cose(&hex(GX), &hex(GY))).unwrap();
+                for len in [0, 1, 15, 16, 31, 32, 33, 47, 48, 49, 64, 65] {
+                    if len != want {
+                        let e = s.reply(&vec![1; len]).unwrap_err();
+                        assert!(e.contains(&format!("{want} expected")), "{protocol:?} len {len}: {e}");
+                    }
+                }
+                assert!(s.reply(&vec![1; want]).is_ok(), "{protocol:?}");
             }
         }
 
@@ -1324,7 +1481,7 @@ pub mod hmac {
         fn an_agreement_key_that_is_not_p256_or_not_a_point_is_refused() {
             let (gx, gy) = (hex(GX), hex(GY));
             let good = cose(&gx, &gy);
-            assert!(Session::agree(&good).is_ok());
+            assert!(Session::agree(Protocol::Two, &good).is_ok());
             let with = |n: i64, v: Value| {
                 let Value::Map(m) = cose(&gx, &gy) else { panic!() };
                 Value::Map(
@@ -1347,9 +1504,212 @@ pub mod hmac {
                 (Value::Map(vec![]), "EC2"),
                 (uint(1), "EC2"),
             ] {
-                assert!(Session::agree(&bad).err().unwrap().contains(why), "{bad:?}");
+                assert!(
+                    Session::agree(Protocol::Two, &bad).err().unwrap().contains(why),
+                    "{bad:?}"
+                );
             }
         }
+    }
+}
+
+/// Protocol 2's pieces on vectors: HKDF-SHA-256 on RFC 5869, the CBC loop on NIST's (in
+/// `cbc`), and the CTAP2.1 derivation and layout (IV first, a 32-byte HMAC) on numbers computed
+/// outside Rust (Python's hmac and hashlib for HKDF and HMAC, the openssl tool for AES-256-CBC).
+#[cfg(test)]
+mod proto2 {
+    use super::hex;
+    use super::hmac::{Keys, Protocol, hkdf_sha256};
+
+    fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+        let mut out = vec![0; len];
+        hkdf_sha256(salt, ikm, info, &mut out).unwrap();
+        out
+    }
+
+    /// RFC 5869, appendix A.1 and A.3.
+    #[test]
+    fn hkdf_sha256_on_the_rfc_5869_vectors() {
+        let ikm = [0x0b; 22];
+        let (salt, info): (Vec<u8>, Vec<u8>) = ((0..13).collect(), (0xf0..=0xf9).collect());
+        assert_eq!(
+            hkdf(&salt, &ikm, &info, 42),
+            hex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+        );
+        let none = hex("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8");
+        assert_eq!(hkdf(&[], &ikm, &[], 42), none, "no salt");
+        assert_eq!(
+            hkdf(&[0; 32], &ikm, &[], 42),
+            none,
+            "no salt is HashLen zeros (RFC 5869, 2.2)"
+        );
+    }
+
+    #[test]
+    fn hkdf_refuses_more_than_255_blocks_and_gives_nothing_for_it() {
+        let mut out = vec![0; 255 * 32 + 1];
+        assert!(hkdf_sha256(&[0; 32], &[1; 32], b"", &mut out).is_err());
+        assert!(out.iter().all(|b| *b == 0));
+    }
+
+    const X: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+    #[test]
+    fn the_two_keys_come_from_the_ctap2_info_strings() {
+        let k = Keys::derive(Protocol::Two, &hex(X)).unwrap();
+        assert_eq!(
+            k.mac[..],
+            hex("a689b3b92a6ebab91192408da9c4f05c674a2bc5f938d613077716c719a8df39")[..]
+        );
+        assert_eq!(
+            k.aes[..],
+            hex("0f6ff2ef211829c11638ef2893ea02edf195658c0572393e7680d93bc2b58d44")[..]
+        );
+    }
+
+    #[test]
+    fn the_salt_is_the_iv_then_aes_256_cbc_and_is_authenticated_by_the_whole_hmac() {
+        let k = Keys::derive(Protocol::Two, &hex(X)).unwrap();
+        let iv: [u8; 16] = hex("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf").try_into().unwrap();
+        let enc = k.encrypt_with(&iv, &[0x5a; 32]).unwrap();
+        let want =
+            hex("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf70ca78cb03b46f22437b1d1c32d7546ee68d44f0807147758ea845b38f9837ff");
+        assert_eq!(enc, want);
+        assert_eq!(
+            k.authenticate(&enc),
+            hex("6549060efa2b01cc6bead68be3a6696cd4a69715b64c00da13ab6ff4f6186e7b"),
+            "32 bytes, not 16"
+        );
+        assert_eq!(k.decrypt(&want).unwrap()[..], [0x5a; 32][..]);
+    }
+
+    #[test]
+    fn each_encryption_has_a_fresh_iv_and_decrypts_back() {
+        let k = Keys::derive(Protocol::Two, &hex(X)).unwrap();
+        let (a, b) = (k.encrypt(&[7; 32]).unwrap(), k.encrypt(&[7; 32]).unwrap());
+        assert_eq!((a.len(), b.len()), (48, 48));
+        assert_ne!(a[..16], b[..16], "a random IV each time");
+        assert_ne!(a[16..], b[16..]);
+        for sealed in [a, b] {
+            assert_eq!(k.decrypt(&sealed).unwrap()[..], [7; 32][..]);
+        }
+    }
+
+    #[test]
+    fn a_ciphertext_without_an_iv_or_whole_blocks_is_refused_and_never_panics() {
+        let k = Keys::derive(Protocol::Two, &hex(X)).unwrap();
+        // 16 is an IV and no blocks; but for 32 (an IV and a block) each length is no IV or a cut block
+        for len in (0..=47).filter(|n| *n != 32) {
+            assert!(k.decrypt(&vec![9; len]).is_err(), "len {len}");
+        }
+        assert!(k.decrypt(&[9; 32]).is_ok(), "an IV and one block");
+        assert!(k.encrypt(&[1; 31]).is_err());
+        assert!(k.encrypt(&[]).is_err());
+    }
+
+    #[test]
+    fn protocol_1_keeps_its_16_byte_hmac_and_zero_iv_with_no_prefix() {
+        let k = Keys::derive(Protocol::One, &hex(X)).unwrap();
+        let enc = k.encrypt(&[0x5a; 32]).unwrap();
+        assert_eq!(enc.len(), 32);
+        assert_eq!(enc, k.encrypt(&[0x5a; 32]).unwrap(), "a fixed IV: the same twice");
+        assert_eq!(k.authenticate(&enc).len(), 16);
+        assert_eq!(k.decrypt(&enc).unwrap()[..], [0x5a; 32][..]);
+        // and protocol 2's keys are not protocol 1's
+        let two = Keys::derive(Protocol::Two, &hex(X)).unwrap();
+        assert_ne!(two.mac[..], k.mac[..]);
+        assert_ne!(two.mac[..], two.aes[..]);
+    }
+}
+
+/// Choosing the protocol from getInfo and speaking it, against the stand-in.
+#[cfg(test)]
+mod choose {
+    use super::cbor::{Value, uint};
+    use super::flow;
+    use super::frame;
+    use super::hmac::Protocol;
+    use crate::fido2_test::auth::Key;
+
+    #[test]
+    fn two_if_listed_else_one_and_neither_is_refused_naming_pin_uv_auth_protocols() {
+        let list = |l: &[u64]| l.iter().map(|n| uint(*n)).collect::<Vec<_>>();
+        for (listed, want) in [
+            (&[1][..], Protocol::One),
+            (&[2], Protocol::Two),
+            (&[1, 2], Protocol::Two),
+            (&[2, 1], Protocol::Two),
+            (&[3, 1], Protocol::One),
+            (&[3, 2, 4], Protocol::Two),
+        ] {
+            assert_eq!(Protocol::choose(&list(listed)).unwrap(), want, "{listed:?}");
+        }
+        for none in [&[][..], &[0], &[3], &[3, 4]] {
+            let e = Protocol::choose(&list(none)).unwrap_err();
+            assert!(e.contains("pinUvAuthProtocols"), "{e}");
+        }
+        // text that looks like a number is not a number
+        assert!(Protocol::choose(&[Value::text("2")]).is_err());
+    }
+
+    fn with(protocols: &[u64]) -> (Key, u32) {
+        let mut key = Key::new();
+        key.protocols = protocols.to_vec();
+        let cid = frame::init(&mut key, *b"01234567").unwrap().cid;
+        (key, cid)
+    }
+
+    /// What a request's `pinUvAuthProtocol` said: clientPIN's (1), then hmac-secret's (4, if any).
+    fn spoken(key: &Key) -> (Option<Value>, Option<Value>) {
+        let pin = key
+            .seen
+            .iter()
+            .find(|(cmd, _)| *cmd == 0x06)
+            .and_then(|(_, p)| p.get(&uint(1)).cloned());
+        let ext = key.seen.iter().find(|(cmd, _)| *cmd == 0x02).and_then(|(_, p)| {
+            p.get(&uint(4))?
+                .get(&Value::text("hmac-secret"))?
+                .get(&uint(4))
+                .cloned()
+        });
+        (pin, ext)
+    }
+
+    #[test]
+    fn the_stand_in_answers_both_protocols_and_the_client_speaks_the_one_it_chose() {
+        for (listed, spoke) in [(&[1][..], 1), (&[2], 2), (&[1, 2], 2), (&[2, 1], 2)] {
+            let (mut key, cid) = with(listed);
+            let id = flow::make_credential(&mut key, cid, "kith.local", &[]).unwrap();
+            let salt = [0x42; 32];
+            let secret = flow::get_assertion(&mut key, cid, "kith.local", &id, &salt).unwrap();
+            assert_eq!(secret[..], key.expected(&id, &salt)[..], "{listed:?}");
+            // clientPIN names the protocol always; hmac-secret only for 2 (absent is 1)
+            let ext = (spoke == 2).then(|| uint(2));
+            assert_eq!(spoken(&key), (Some(uint(spoke)), ext), "{listed:?}");
+        }
+    }
+
+    #[test]
+    fn a_key_that_lists_neither_is_refused_before_anything_but_getinfo_is_asked() {
+        for listed in [&[][..], &[3]] {
+            let (mut key, cid) = with(listed);
+            let e = flow::make_credential(&mut key, cid, "kith.local", &[]).unwrap_err();
+            assert!(e.contains("pinUvAuthProtocols"), "{e}");
+            let e = flow::get_assertion(&mut key, cid, "kith.local", &[1; 40], &[0; 32]).unwrap_err();
+            assert!(e.contains("pinUvAuthProtocols"), "{e}");
+            assert!(key.seen.iter().all(|(cmd, _)| *cmd == 0x04), "{listed:?}");
+        }
+    }
+
+    #[test]
+    fn the_stand_in_refuses_a_protocol_it_does_not_list_or_one_the_agreement_was_not_made_for() {
+        // a key that lists only 1 answers a protocol 2 key agreement with INVALID_PARAMETER
+        let (mut key, cid) = with(&[1]);
+        let ask = Value::Map(vec![(uint(1), uint(2)), (uint(2), uint(2))]);
+        let mut req = vec![0x06];
+        req.extend(super::cbor::encode(&ask));
+        let e = frame::cbor_request(&mut key, cid, &req).unwrap_err();
+        assert!(e.contains("INVALID_PARAMETER"), "{e}");
     }
 }
 
@@ -1362,7 +1722,7 @@ pub mod hmac {
 pub mod flow {
     use super::cbor::{self, Value, uint};
     use super::frame::{self, Device};
-    use super::hmac::{self, Session};
+    use super::hmac::{self, Protocol, Session};
     use ring::{digest, rand::SecureRandom, rand::SystemRandom};
     use zeroize::Zeroizing;
 
@@ -1402,23 +1762,25 @@ pub mod flow {
         ])
     }
 
-    /// The key must have `hmac-secret` and PIN protocol 1: this client speaks nothing else.
-    pub fn check_key(dev: &mut dyn Device, cid: u32) -> Result<(), String> {
+    /// The key must have `hmac-secret` and list PIN/UV protocol 1 or 2; the protocol to speak
+    /// is 2 if it is listed, else 1.
+    pub fn check_key(dev: &mut dyn Device, cid: u32) -> Result<Protocol, String> {
         let info = call(dev, cid, GET_INFO, None)?;
         match info.get(&uint(2)) {
             Some(Value::Array(ext)) if ext.contains(&Value::text("hmac-secret")) => {}
             _ => return Err("the key does not list the hmac-secret extension".into()),
         }
         match info.get(&uint(6)) {
-            Some(Value::Array(p)) if p.contains(&uint(1)) => Ok(()),
-            _ => Err("the key does not list pinUvAuthProtocols 1: protocol 2 alone is not supported yet".into()),
+            Some(Value::Array(p)) => Protocol::choose(p),
+            _ => Err("the key lists no pinUvAuthProtocols".into()),
         }
     }
 
-    fn key_agreement(dev: &mut dyn Device, cid: u32) -> Result<Session, String> {
-        let request = Value::Map(vec![(uint(1), uint(1)), (uint(2), uint(2))]); // protocol 1, getKeyAgreement
+    fn key_agreement(dev: &mut dyn Device, cid: u32, protocol: Protocol) -> Result<Session, String> {
+        // the chosen protocol, getKeyAgreement
+        let request = Value::Map(vec![(uint(1), uint(protocol.number())), (uint(2), uint(2))]);
         let answer = call(dev, cid, CLIENT_PIN, Some(&request))?;
-        Session::agree(answer.get(&uint(1)).ok_or("the key sent no agreement key")?)
+        Session::agree(protocol, answer.get(&uint(1)).ok_or("the key sent no agreement key")?)
     }
 
     /// authData after its head, once its relying party hash and the `need`ed flags check out.
@@ -1513,8 +1875,8 @@ pub mod flow {
         if credential.is_empty() || credential.len() > MAX_CREDENTIAL_ID {
             return Err(format!("a credential id of {} bytes", credential.len()));
         }
-        check_key(dev, cid)?;
-        let session = key_agreement(dev, cid)?;
+        let protocol = check_key(dev, cid)?;
+        let session = key_agreement(dev, cid, protocol)?;
         let request = Value::Map(vec![
             (uint(1), Value::text(rp_id)),
             (uint(2), Value::Bytes(random_32()?.to_vec())),
@@ -1604,7 +1966,7 @@ pub mod flow {
         }
 
         #[test]
-        fn a_key_without_hmac_secret_or_protocol_1_is_refused_before_anything_is_made() {
+        fn a_key_without_hmac_secret_or_a_protocol_is_refused_before_anything_is_made() {
             let mut key = Key::new();
             key.extensions = vec!["credProtect"];
             let cid = open(&mut key);
@@ -1614,7 +1976,7 @@ pub mod flow {
                     .contains("hmac-secret")
             );
             let mut key = Key::new();
-            key.protocols = vec![2];
+            key.protocols = vec![3];
             let cid = open(&mut key);
             assert!(
                 make_credential(&mut key, cid, RP, &[])
