@@ -2319,7 +2319,14 @@ impl Controller {
                         .iter()
                         .filter(|(r, _)| *r == slot.replica && me.is_some())
                         .map(|(_, said)| said.as_str());
-                    let message: Vec<&str> = slot.message.as_deref().into_iter().chain(said).collect();
+                    let cannot = slot.probes.as_ref().and_then(|p| p.why());
+                    let message: Vec<&str> = slot
+                        .message
+                        .as_deref()
+                        .into_iter()
+                        .chain(cannot.as_deref())
+                        .chain(said)
+                        .collect();
                     if !message.is_empty() {
                         c["message"] = json!(message.join("; "));
                     }

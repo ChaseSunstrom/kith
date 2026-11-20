@@ -1037,13 +1037,18 @@ impl Entered {
         self.pid.as_raw()
     }
 
-    /// Ends it (its own process: what it started in turn is the container's to end). Nothing is
-    /// signalled once `wait` has taken its status: the pid may be another process's by then.
+    /// Ends it, and what it started in its process group (libcontainer makes the tenant a session
+    /// leader, so `sh -c 'sleep 30; true'` loses its sleep too: a probe that times out must not leave
+    /// one running per attempt). Nothing is signalled once `wait` has taken its status: the pid may
+    /// be another process's by then.
     // ponytail: a pid reused between the check and the signal is not guarded; the window is the
-    // two instructions, and the pid space has to wrap in it.
+    // two instructions, and the pid space has to wrap in it. What left the group (a job-control
+    // shell's `set -m`, a double fork with setsid) is not ended: the container's to end.
     pub fn kill(&self) {
         if !self.reaped.load(Ordering::SeqCst) {
-            let _ = nix::sys::signal::kill(self.pid, nix::sys::signal::Signal::SIGKILL);
+            let sigkill = nix::sys::signal::Signal::SIGKILL;
+            let _ = nix::sys::signal::kill(Pid::from_raw(-self.pid.as_raw()), sigkill);
+            let _ = nix::sys::signal::kill(self.pid, sigkill);
         }
     }
 
@@ -1328,8 +1333,13 @@ pub fn spawn_awaited<C>(
 /// exit status belongs to [`Handle::try_wait`], so call this after trying those.
 pub fn reap_orphans(mains: &[i32]) {
     use nix::sys::wait::{Id, WaitPidFlag, waitid};
-    // (Held throughout: nothing is started and taken from its starter in between.)
-    let awaited = AWAITED.lock().expect("nothing panics holding the list");
+    // (Held throughout: nothing is started and taken from its starter in between. A start holds it
+    // while its helper answers, up to HELPER_DEADLINE: a sweep that finds it taken is left to the next
+    // call rather than blocking the caller, the controller's tick, for that long.)
+    let awaited = match AWAITED.try_lock() {
+        Err(std::sync::TryLockError::WouldBlock) => return,
+        held => held.expect("nothing panics holding the list"),
+    };
     // WNOWAIT looks without taking, so a handle's status is never taken from it.
     let peek = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
     while let Ok(Some(pid)) = waitid(Id::All, peek).map(|status| status.pid()) {
@@ -3693,6 +3703,41 @@ mod tests {
             }
             ended()
         });
+        // One killed takes what it started with it: `sh -c 'sleep 300; true'` has a sleep to end too.
+        let tree = enter(
+            &state,
+            "enter1",
+            &["/bin/sh".into(), "-c".into(), "sleep 300; true".into()],
+        )
+        .map(|entered| {
+            let ppid = |pid: i32| {
+                let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                stat.rsplit(')').next()?.split_whitespace().nth(1)?.parse::<i32>().ok()
+            };
+            let ended = |pid: i32| match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+                Err(_) => true,
+            };
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut child = None;
+            while child.is_none() && std::time::Instant::now() < until {
+                child = fs::read_dir("/proc")
+                    .unwrap()
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+                    .find(|p| ppid(*p) == Some(entered.pid()));
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            entered.kill();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while child.is_some_and(|c| !ended(c)) && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            child.is_some_and(ended)
+        });
         let _ = handle.kill();
         // (A process that failed to start is left a zombie in the container's pid namespace, which
         // its init waits for before it ends: kithd's reaper takes it, here the test does.)
@@ -3714,6 +3759,7 @@ mod tests {
             dropped.unwrap(),
             "a process dropped with no one to wait for it is ended"
         );
+        assert!(tree.unwrap(), "a process killed takes its children with it");
         assert_eq!(tenant, init, "the tenant has its init's user, capabilities and filter");
         assert!(
             init.iter().any(|l| l.starts_with("Seccomp:") && l.ends_with('2')),

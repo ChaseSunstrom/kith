@@ -289,7 +289,6 @@ EOF
             # Deleted, nothing of it is left: not the volume made for the claim either.
             must 'kubectl delete of the manifests' k delete -f "$root/ci/kube"
             must 'kubectl delete of what was made by hand' k delete deployment,service made
-            must 'kubectl delete of the gated Deployment' k delete deployment gate
             must 'kubectl delete of the Jobs made by hand' k delete job again ask-made
             must 'kubectl delete of the claims' k delete pvc data-db-0 data-ring-0 data-ring-2
             left() {

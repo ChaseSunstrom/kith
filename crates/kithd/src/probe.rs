@@ -7,7 +7,8 @@
 
 use crate::Shared;
 use kith_api::kinds::{Container, PortRef, Probe};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, watch};
@@ -24,7 +25,15 @@ pub struct Health {
 /// The probing of one container. Dropping it stops the probing.
 pub struct Probes {
     pub health: watch::Receiver<Health>,
+    /// Why an exec probe cannot run (its command could not be started in the container), for the status.
+    why: Arc<Mutex<Option<String>>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+impl Probes {
+    pub fn why(&self) -> Option<String> {
+        self.why.lock().expect("nothing panics holding it").clone()
+    }
 }
 
 impl Drop for Probes {
@@ -116,7 +125,8 @@ pub fn start(shared: Arc<Shared>, container: &Container, unit: &str, pod: Option
         live: true,
         ready: readiness.is_none(),
     });
-    let exec = enter_unit(unit.to_string());
+    let why = Arc::new(Mutex::new(None));
+    let exec = enter_unit(unit.to_string(), why.clone(), shared.changed.clone());
     let task = tokio::spawn(async move {
         // ponytail: liveness only counts once it has passed, so a container that never
         // listens is never restarted for it (it is never ready either, if it has a readiness
@@ -130,7 +140,7 @@ pub fn start(shared: Arc<Shared>, container: &Container, unit: &str, pod: Option
         });
         tokio::join!(live, ready);
     });
-    Some(Probes { health, task })
+    Some(Probes { health, why, task })
 }
 
 /// A probe stand-in for a test: no probe runs, `Health` is what it is told.
@@ -140,17 +150,30 @@ pub fn held(health: Health) -> (Probes, watch::Sender<Health>) {
     (
         Probes {
             health,
+            why: Arc::default(),
             task: tokio::spawn(async {}),
         },
         tx,
     )
 }
 
-/// Runs commands in the container `unit` of this node, as `kubectl exec` does.
-fn enter_unit(unit: String) -> Exec {
+/// Runs commands in the container `unit` of this node, as `kubectl exec` does. When it cannot enter
+/// it says why, once per change: on stderr, in `why` (the status carries it) and by poking `poke`.
+fn enter_unit(unit: String, why: Arc<Mutex<Option<String>>>, poke: Arc<Notify>) -> Exec {
     Arc::new(move |argv, timeout| {
         let begun = std::time::Instant::now();
-        let Ok(mut entered) = crate::root_part::enter(&unit, argv) else {
+        let entered = crate::root_part::enter(&unit, argv);
+        let said = entered
+            .as_ref()
+            .err()
+            .map(|e| format!("exec probe: cannot run in the container: {e}"));
+        if std::mem::replace(&mut *why.lock().expect("nothing panics holding it"), said.clone()) != said {
+            if let Some(said) = &said {
+                eprintln!("kithd: {unit}: {said}");
+            }
+            poke.notify_one();
+        }
+        let Ok(mut entered) = entered else {
             return false;
         };
         // Nothing is read from it, and nothing is typed: it sees the end of its input. (Its output is held
@@ -162,6 +185,15 @@ fn enter_unit(unit: String) -> Exec {
         let left = timeout.saturating_sub(begun.elapsed());
         within(left, move || entered.kill(), move || ended.wait().ok())
     })
+}
+
+/// Sets the flag again when dropped (a panicking probe too).
+struct Idle(Arc<AtomicBool>);
+
+impl Drop for Idle {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Waits for `wait` (a process's exit code) for `timeout`: true if it is 0. Past it `kill` ends the
@@ -196,8 +228,9 @@ async fn watch_one(
         return;
     };
     let (mut failures, mut passed_once, began) = (0, false, tokio::time::Instant::now());
+    let idle = Arc::new(AtomicBool::new(true));
     loop {
-        let ok = tokio::time::timeout(check.timeout, probe(at, exec, &check))
+        let ok = tokio::time::timeout(check.timeout, probe(at, exec, &check, &idle))
             .await
             .unwrap_or(false);
         failures = if ok { 0 } else { failures + 1 };
@@ -225,14 +258,22 @@ async fn watch_one(
 }
 
 /// One attempt: can the port be connected to, and for http, is the answer 2xx or 3xx? For exec, does
-/// the command exit 0 in time?
-async fn probe(at: Option<(&Shared, &str)>, exec: &Exec, check: &Check) -> bool {
+/// the command exit 0 in time? `idle`: false while an earlier attempt of this probe still runs on its
+/// thread (the caller's timeout drops this future, not the thread): that tick fails without another
+/// thread, so a command that cannot be entered or ended does not pile them up.
+async fn probe(at: Option<(&Shared, &str)>, exec: &Exec, check: &Check, idle: &Arc<AtomicBool>) -> bool {
     if let Some(argv) = &check.exec {
+        if !idle.swap(false, Ordering::SeqCst) {
+            return false;
+        }
         // (Off the runtime's threads: it forks and waits. The timeout is its own: it kills the process.)
-        let (run, argv, timeout) = (exec.clone(), argv.clone(), check.timeout);
-        return tokio::task::spawn_blocking(move || run(&argv, timeout))
-            .await
-            .unwrap_or(false);
+        let (run, argv, timeout, idle) = (exec.clone(), argv.clone(), check.timeout, idle.clone());
+        return tokio::task::spawn_blocking(move || {
+            let _idle = Idle(idle);
+            run(&argv, timeout)
+        })
+        .await
+        .unwrap_or(false);
     }
     // Listeners on either loopback address count: the machine's, or the container's pod's.
     let Ok(mut stream) = crate::pods::connect(at, check.port).await else {
@@ -405,6 +446,49 @@ mod tests {
         }
     }
 
+    /// A command that stays past its timeout (here one that is not even ended in time) is not run again
+    /// beside itself: the ticks in between fail without taking another thread.
+    #[tokio::test]
+    async fn exec_probe_is_not_run_again_while_an_attempt_is_still_running() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = runs.clone();
+        let stuck: Exec = Arc::new(move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(3000));
+            true
+        });
+        let (tx, health) = watch::channel(Health {
+            live: true,
+            ready: false,
+        });
+        let changed = Notify::new();
+        let check = exec_check(&["x"], 1);
+        let watching = watch_one(None, &stuck, Some(check), &tx, &changed, false, |health, ok| {
+            health.ready = ok
+        });
+        tokio::select! {
+            _ = watching => unreachable!(),
+            _ = tokio::time::sleep(Duration::from_millis(2500)) => {}
+        }
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "one attempt per stuck probe, not one per tick"
+        );
+        assert!(!health.borrow().ready);
+    }
+
+    /// A unit that cannot be entered fails the probe and says why, for the status.
+    #[tokio::test]
+    async fn exec_probe_says_why_it_cannot_enter() {
+        let (why, poke) = (Arc::new(Mutex::new(None)), Arc::new(Notify::new()));
+        let enter = enter_unit("no-such-unit".into(), why.clone(), poke.clone());
+        assert!(!enter(&["true".to_string()], Duration::from_secs(1)));
+        let said = why.lock().unwrap().clone().expect("it said why");
+        assert!(said.contains("no-such-unit"), "{said}");
+        within_secs(1, poke.notified()).await;
+    }
+
     #[test]
     fn checks_resolve_ports_and_refuse_what_cannot_run() {
         let c = container(serde_json::json!({
@@ -474,12 +558,12 @@ mod tests {
             threshold: 1,
             start: None,
         };
-        let exec = host();
-        assert!(probe(None, exec, &check(port, None)).await);
-        assert!(probe(None, exec, &check(port, Some("/ok"))).await);
-        assert!(!probe(None, exec, &check(port, Some("/broken"))).await);
+        let (exec, idle) = (host(), Arc::new(AtomicBool::new(true)));
+        assert!(probe(None, exec, &check(port, None), &idle).await);
+        assert!(probe(None, exec, &check(port, Some("/ok")), &idle).await);
+        assert!(!probe(None, exec, &check(port, Some("/broken")), &idle).await);
         // Nothing listens on port 1.
-        assert!(!probe(None, exec, &check(1, None)).await);
+        assert!(!probe(None, exec, &check(1, None), &idle).await);
     }
 
     #[tokio::test]
