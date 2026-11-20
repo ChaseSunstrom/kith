@@ -650,6 +650,16 @@ fn fail<T>(e: impl std::fmt::Display) -> Result<T, String> {
     Err(format!("error: {e}"))
 }
 
+/// Load the package in `dir`; say, and go on, when its `kithVersion` is not this kith's
+/// (the cluster's kithd is what refuses to install it, T-0990).
+fn load_package(dir: &Path) -> Result<kith_packages::Package, String> {
+    let package = kith_packages::Package::load(dir).or_else(fail)?;
+    if let Some(why) = package.meta.kith_mismatch(env!("CARGO_PKG_VERSION")) {
+        eprintln!("warning: {why}");
+    }
+    Ok(package)
+}
+
 /// Where the resources live: kithd behind its socket, or a store file used directly.
 enum Backend {
     Daemon(Kithd),
@@ -1991,7 +2001,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     set,
                 },
         } => {
-            let package = kith_packages::Package::load(&dir).or_else(fail)?;
+            let package = load_package(&dir)?;
             let mut layers = Vec::new();
             for path in &values {
                 let source = std::fs::read_to_string(path).or_else(|e| fail(format!("{}: {e}", path.display())))?;
@@ -2025,7 +2035,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::Package {
             command: PackageCommand::Push { dir, to, key },
         } => {
-            let package = kith_packages::Package::load(&dir).or_else(fail)?;
+            let package = load_package(&dir)?;
             let wrong = package.lint();
             if !wrong.is_empty() {
                 return fail(wrong.join("\n"));
@@ -2305,7 +2315,8 @@ fn status_summary(resource: &Resource) -> String {
             (Some(state), Some(why), _) if state != "succeeded" => format!("{state}: {}", clean(why)),
             // A Node: its address, which is its LAN address unless it roams (then a mesh address), and what it serves.
             (Some(state), _, Some(address)) if resource.kind == "Node" => {
-                let mesh = if resource.spec["roaming"] == true {
+                // (A node the leader has moved onto the mesh keeps its LAN address in `status.lan`.)
+                let mesh = if resource.spec["roaming"] == true || status["lan"].is_string() {
                     " (mesh)"
                 } else {
                     ""
@@ -2682,6 +2693,16 @@ mod drain_tests {
         );
         assert_eq!(lan.lan_address().map(|ip| ip.to_string()).as_deref(), Some("192.0.2.7"));
         assert_eq!(table_row(&lan)[4], "ready at 192.0.2.7:7443; serves dns 53, ingress");
+        // Moved onto the mesh by the leader: its LAN address is the one it was moved from.
+        let moved = node(
+            json!({}),
+            json!({ "address": "[fd00::7]:7443", "lan": "192.0.2.7:7443", "state": "ready" }),
+        );
+        assert_eq!(
+            moved.lan_address().map(|ip| ip.to_string()).as_deref(),
+            Some("192.0.2.7")
+        );
+        assert_eq!(table_row(&moved)[4], "ready at [fd00::7]:7443 (mesh)");
         let roaming = node(
             json!({ "roaming": true }),
             json!({ "address": "10.8.0.4:7443", "state": "ready" }),

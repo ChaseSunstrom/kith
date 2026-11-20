@@ -79,6 +79,21 @@ the plan allowed 0.3 ms).
 - Each node gets a stable IPv6 address derived from the CA and its name; `kith get node/NAME -o
   yaml` shows it and the public key (`mesh`), `kith node status` the peers and their last
   handshakes. The private key stays in `<state>/pki`.
+- Raft and the node API ride the mesh for LAN-joined nodes too. A node with `--mesh` listens on
+  every address (`[::]:7443`, when `bindv6only` is 0 and `--listen` is not given), says so
+  (`status.mesh.api`), and once the leader has a handshake with it from the last three minutes
+  the leader records its address as the mesh one (derived from the CA and the name, never the
+  node's own claim); the LAN address it joined at stays in `status.lan`, where the tunnel's
+  endpoint and ingress DNS still read it. It only answers IPv4, loopback and its own mesh
+  address on that socket, not another IPv6 address of the machine. A node left out of this (no
+  `--mesh`, or listening on one address) stays at its LAN address, and so does a worker; a node
+  with no mesh key does not hold the others back, but the leader stays on the LAN while a control
+  node has none.
+- The move is reversible: when a moved node stops saying it serves the API on the mesh (it
+  restarted without `--mesh`, or with a `--listen` of its own), or the leader's handshake with it
+  is more than six minutes old (or missing, once the leader has been looking for six minutes),
+  the leader puts the LAN address back in `status.address` and drops `status.lan`. It is
+  moved again only on a fresh handshake.
 - A peer silent for three minutes is reached through a node with the `edge` role until it
   answers again. The edge machine must forward (`net.ipv6.conf.all.forwarding=1`; kithd warns
   but leaves it alone) and sees what it passes on.
@@ -430,9 +445,8 @@ kithd logs when it starts or stops resolving, not on each try.
 
 ### Not yet
 
-- Non-roaming nodes talk at their plain addresses, not over the mesh; workloads have no mesh
-  addresses (Services do); two nodes behind NATs that give a port per address meet only
-  through an edge node.
+- Workloads have no mesh addresses (Services do); two nodes behind NATs that give a port per
+  address meet only through an edge node.
 - A changed Workload's replicas on different nodes are replaced all at once (one at a time on
   one node; a NodeWorkload always all at once). Replicas on an unreachable node count as ready
   until `--lost-after`; a roaming node's, indefinitely.
@@ -468,6 +482,12 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
   cordoned until undrain. A rolling upgrade from an older kithd meets a cordon with no record: a
   drain that joins it records itself as the owner, so once the update ends, undrain leaves the node
   cordoned, and `kith node uncordon` lifts it.
+- An `UpdatePlan` with `drain: true` does this for each node it picks (see [what an update
+  does](os.md#rolling-a-release-through-the-cluster)): it drains the node, restarts it once each replica the
+  plan says moves runs on another node (a replica that stays holds nothing), and lifts the drain
+  when the node is done, the plan is paused or changed, its OSRelease is gone, or the node leaves
+  its selector. It waits at most `drainSeconds` (300 unless said, 3600 at most). It lifts only a
+  drain it put on: yours, put on first, stays until you undrain.
 
 ### Checkpointing a long GPU Job
 
@@ -608,7 +628,7 @@ Every node started with `--dns` answers the same names.
   out.
 - **Who serves:** a node's `status.serves` says its `dns` port and `ingress: true`, from its own
   flags (cleared by a restart without them). Its LAN address is the one it was admitted from
-  (`status.address`); NAT, a moved node or `127.0.0.1` do not count. A roaming node has its mesh
+  (`status.address`, or `status.lan` once the leader has moved that to the mesh); NAT, a moved node or `127.0.0.1` do not count. A roaming node has its mesh
   address. `kith get node` shows both.
 
 **Block lists** answer names as not there, for `clients` (none: everyone):

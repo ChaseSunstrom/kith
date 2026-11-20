@@ -257,15 +257,17 @@ Only the newest version is fixed. There are no security releases of older ones.
   each other port its 2, and a connection past that is ended at once. A new UDP sender
   past that takes the place of the one of its port heard from longest ago. A pod publishes
   8 ports at most and a node 64, so the relays hold at most 448 files. kithd raises its
-  soft limit of open files to the hard one at start, 65536 at most, and leaves the hard
-  limit as it is: on kith OS it is the first process, started with the kernel's 1024
-  soft and 4096 hard, so it runs with 4096; on a host under systemd (524288 hard
-  here) it runs with 65536. Its listeners, API and ingress (1024 connections, two files
-  each, so 2048) take of it too, with the relays 448 and 64 guests of the API: about 2700
-  at most, under 4096. The raised limit is passed on to what kithd starts, a pod's
-  processes included (no per-container limit is set): a program there that uses
-  select() with an FD_SETSIZE bitmap can be handed a file at or above 1024, so it must
-  lower its own limit (a per-container limit is a possible follow-up). A port another
+  soft limit of open files to the hard one at start, 65536 at most, and as root first
+  raises the hard limit to 524288 (no more than the kernel's fs.nr_open, never lower than
+  it was): on kith OS it is the first process, started with the kernel's 1024 soft and
+  4096 hard, so it runs with 65536 soft and 524288 hard. Its listeners, API and ingress
+  (1024 connections, two files each, so 2048) take of it too, with the relays 448 and 64
+  guests of the API: about 2700 at most. Every container it starts gets soft 1024 and
+  hard kithd's own (524288), as containerd gives, so an app can raise its own soft limit
+  and a program that sizes a select() bitmap from the soft limit is not handed a file at
+  or above 1024; an exec unit, a plain process of the node, inherits kithd's 65536 soft.
+  There is no per-container limit in the spec: a container's open files are bounded only
+  by its memory limit and the node's fs.file-max. A port another
   namespace's Workload or Job publishes is refused when written, and so is a pod through
   an Exit that does not list its namespace: both are asked of every writer (a person's
   apply, a Release, a Source, kithd's own controllers), where the write goes into the
@@ -848,7 +850,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - the log's inclusion proof and the certificate's own log proof (its SCT) are not
     checked: offline, with no witness, they add nothing the log's promise does not;
   - a log of Rekor v2 (an inclusion proof and a time from a timestamp authority, no
-    promise) is not read: such a signature is refused, naming it;
+    promise) is taken only under an identity that names the authority's root as `tsa`
+    (its RFC 3161 timestamp then says when); without `tsa` such a signature is refused,
+    naming the field. The log's inclusion proof is still not read, so a signature timed
+    this way was not shown to be in any log;
   - an attestation (an in-toto statement of another kind) is never taken as a signature.
 - **A node's WireGuard key is replaced on its own Node's word, and never leaves it with no key.**
   `spec.mesh.rotate` (a name; nothing rotates by itself or on a timer) makes the node write a

@@ -2514,6 +2514,16 @@
         "log": {
           "type": "string",
           "description": "The log's public key, PEM (ECDSA P-256)."
+        },
+        "tsa": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "The root certificates (PEM, 1 to 4) of the timestamp authority whose RFC 3161 timestamp\nsays when the signature was made. Without it a signature logged to Rekor v2 (which\nhas no promise of its own) is refused, and with it every signature needs the timestamp."
         }
       },
       "required": [
@@ -4142,7 +4152,17 @@
           "type": [
             "boolean",
             "null"
-          ]
+          ],
+          "description": "Drain each node before it restarts (`kith node drain`): what can move runs\nelsewhere first."
+        },
+        "drainSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How long a drain waits for what moves to run elsewhere before the node restarts\nanyway. Defaults to 300; at most 3600."
         },
         "waitForIdleSeats": {
           "type": [

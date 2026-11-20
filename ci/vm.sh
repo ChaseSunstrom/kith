@@ -9,6 +9,7 @@
 #   sh ci/vm.sh --test init     kithd as the first process: up, serving, restarts when told
 #   sh ci/vm.sh --test image    kith OS's disk image (os/build.sh), booted under UEFI on a longer disk
 #   sh ci/vm.sh --test update   that image updating itself, and going back when it must
+#   sh ci/vm.sh --test clock    the node's clock started hours off, stepped to an SNTP server's time
 #   sh ci/vm.sh --test disk     a disk file made a data disk and mounted, another left alone
 #   sh ci/vm.sh --test rollout  three nodes of it taking a release, one at a time
 #   sh ci/vm.sh --test install  the installer, onto virtual disks, and what it installed
@@ -45,6 +46,8 @@
 #                               turn, that starts a second runtime (bubblewrap) and kithd in agent mode and
 #                               says what refused each and the guest kernel's settings; the rows go to
 #                               $KITH_NESTED_OUT (ci/stress.sh --nested keeps them in ci/stress.txt)
+#   sh ci/vm.sh --test nofile   one node: a container's open-file limit is soft 1024 and hard 524288
+#                               (a Job of the test pod; KITH_E2E=1 also a busybox Job's ulimit -Sn, -Hn)
 #   sh ci/vm.sh --test quota    one node whose state disk keeps project quotas: a pod's storage limit
 #                               holds at the write, in its root and its scratch, however it tries past it
 #   sh ci/vm.sh --test kube     two nodes: the real kubectl and helm against them, with manifests written
@@ -60,6 +63,9 @@
 #                               RoleBinding was deleted is refused where the log is kept; and
 #                               three entries a forging leader appends (bare, a changed body,
 #                               a replayed nonce) are refused at apply by every node
+#   sh ci/vm.sh --test fido2    the client of kithd against a software security key (the fido2-test
+#                               build) through the kernel's uhid and hidraw: the hmac-secret each seed
+#                               says it must be, another seed another secret, a withheld touch timing out
 #   sh ci/vm.sh --test policy   two nodes whose policy turns off exec units, VM paths and /v1/run: kithd
 #                               cut its bounding set, and a pod that is root, a container with no filter
 #                               and a sandbox inside a container still run
@@ -98,6 +104,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    (refused), a good one (it restarts into its other slot, marks it
                    good, and is the same node), then one whose root is broken (three
                    tries, and it is back on the slot that worked); same needs
+  --test clock     instead: the node's clock starts six hours off (QEMU -rtc base=), an SNTP
+                   server on the host's loopback answers (ci/vm/sntp_standin.py), and the
+                   node, told of it by kith.ntp=10.0.2.2:PORT, steps its clock to its time;
+                   same needs as image, and python3
   --test modules   instead: the 'all' image (its drivers are modules, signed with the key of its
                    build): kithd loads the driver of an HDA controller at start, and of a USB
                    audio device the monitor adds later, in the same boot; the same spec built
@@ -203,6 +213,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    each starts a user namespace, bubblewrap and kithd in agent mode, and
                    says what refused it, the guest kernel's settings and the smallest opening
                    that let it run. It changes no default (KITH_NESTED_OUT: where the rows go)
+  --test nofile    instead: one node on the mesh with ci/pod.rs as a container image: a Job
+                   there reads its open-file limits (/proc/self/limits). Expected: soft
+                   1024 and hard 524288, so an app can raise its own, as under containerd.
+                   KITH_E2E=1 also a Job of busybox, whose ulimit -Sn and -Hn say the same
   --test outlive   instead: one node on the mesh with ci/pod.rs as an image and on its
                    disk: kithd killed (SIGKILL) under a pod of two containers, an exec
                    unit and a Job; the machine stays up, kithd serves again within
@@ -290,6 +304,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    seconds are printed), and two cards are never heard answering at
                    once, not when the stopped one goes on again; needs socat and
                    python3 as --test chaos does
+  --test fido2     instead: the image of a kithd built with the cargo feature fido2-test
+                   (and a kernel with /dev/uhid), one machine: it makes three software
+                   security keys on uhid in turn and runs the client against each through
+                   hidraw (makeCredential, getAssertion, a known salt). Expected: each
+                   hmac-secret is what its seed says (computed again here in Python), seeds 1
+                   and 2 differ, seed 3's withheld touch is given up on and its given touch
+                   answered; a disk file only, no real key; needs OVMF, socat, python3
   --test access    instead: three nodes as for rollout, and the cluster's admin
                    writing through n2 and n3 by a RoleBinding that is deleted through
                    n1, once while n2 is cut off from the others. Expected: no write
@@ -367,7 +388,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | nested | alone | disk) ;; *) echo "vm.sh: --test knows: init, image, update, modules, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, nested" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | nested | nofile | alone | disk | clock | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, nested, nofile, fido2" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1

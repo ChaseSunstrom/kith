@@ -114,14 +114,15 @@ pub(crate) async fn signer(
 
 /// Whether `signed` is by one of `identities`: the first that it is by, or why not (in `found`).
 fn by_identity(
-    signed: &crate::keyless::Signed,
+    signed: &mut crate::keyless::Signed,
     digest: &str,
     identities: &[(&Key, &crate::keyless::Identity)],
     found: &mut Vec<String>,
     kept: &str,
 ) -> Option<String> {
     for (key, identity) in identities {
-        match crate::keyless::check(signed, digest, identity) {
+        // (Each identity's own `tsa` times the bundle, if it names one.)
+        match crate::keyless::verify(signed, digest, identity) {
             Ok(()) => return Some(key.id.clone()),
             Err(why) => found.push(format!("{kept}: {why}")),
         }
@@ -178,8 +179,8 @@ async fn referred(
         }
         let bytes = &into.get_ref()[..into.position() as usize];
         match crate::keyless::bundle(bytes) {
-            Ok(signed) => {
-                if let Some(by) = by_identity(&signed, digest, identities, found, "a bundle among its referrers") {
+            Ok(mut signed) => {
+                if let Some(by) = by_identity(&mut signed, digest, identities, found, "a bundle among its referrers") {
                     return Some(by);
                 }
             }
@@ -247,8 +248,8 @@ async fn look(
                 }
                 let kept = "a signature there made without a kept key";
                 match crate::keyless::tagged(text, signature, cert, note(PROMISE).map(String::as_str)) {
-                    Ok(signed) => {
-                        if let Some(by) = by_identity(&signed, digest, &identities, found, kept) {
+                    Ok(mut signed) => {
+                        if let Some(by) = by_identity(&mut signed, digest, &identities, found, kept) {
                             return Ok(Some(by));
                         }
                     }

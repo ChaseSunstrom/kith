@@ -87,6 +87,9 @@ type Log = Arc<Mutex<Vec<String>>>;
 /// and keeps what the client sends), or nothing at all, and no more connections.
 enum Reply {
     Json(&'static str),
+    /// A JSON body from a kithd that takes a client's close_notify, before it has answered, as the
+    /// client being gone: it hangs up with no answer (as the real one does).
+    Page(&'static str),
     Tunnel,
     /// A reply with no length, cut off after its first bytes and dropped with no close_notify.
     Cut,
@@ -163,7 +166,19 @@ fn start(
             };
             let who = tls.conn.peer_certificates().is_some();
             seen.lock().unwrap().push(format!("{line} cert={who} body={body}"));
-            match answer(&line, &body) {
+            let reply = match answer(&line, &body) {
+                Reply::Page(json) => {
+                    // Quiet for the length of a nap means the client is waiting; a close_notify (0) means it left.
+                    tls.sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+                    if tls.read(&mut [0u8; 1]).is_ok_and(|n| n == 0) {
+                        seen.lock().unwrap().push("hung up on close_notify".into());
+                        continue;
+                    }
+                    Reply::Json(json)
+                }
+                other => other,
+            };
+            match reply {
                 Reply::Json(json) => {
                     let head = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -190,6 +205,7 @@ fn start(
                     let _ = tls.flush();
                 }
                 Reply::Stop => break,
+                Reply::Page(_) => unreachable!("turned into Json above"),
             }
         }
     });
@@ -197,7 +213,7 @@ fn start(
 }
 
 /// A kithd that answers a request with the 101 alone, before it has read the request's body,
-/// and then reads that body to its end. The client must send a large body while kithd is silent.
+/// and then reads that body (its Content-Length). The client must send a large body while kithd is silent.
 fn start_upload(cluster: &Ca, node: &(rcgen::Certificate, KeyPair)) -> (SocketAddr, Log) {
     let config = server_config(cluster, node);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -208,14 +224,15 @@ fn start_upload(cluster: &Ca, node: &(rcgen::Certificate, KeyPair)) -> (SocketAd
         for tcp in listener.incoming().flatten() {
             tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
             let mut tls = StreamOwned::new(ServerConnection::new(config.clone()).unwrap(), tcp);
-            let Some((line, _)) = read_head(&mut tls) else {
+            let Some((line, length)) = read_head(&mut tls) else {
                 continue;
             };
             let _ =
                 tls.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: kith-run\r\n\r\n");
             let _ = tls.flush();
-            let mut body = Vec::new();
-            let _ = tls.read_to_end(&mut body);
+            // The body is as long as its Content-Length says: kith does not close TLS to end it.
+            let mut body = vec![0; length];
+            let _ = tls.read_exact(&mut body);
             seen.lock().unwrap().push(format!("{line} uploaded={}", body.len()));
         }
     });
@@ -459,6 +476,37 @@ fn remote_tls_ui_carries_a_101_tunnel() {
 }
 
 #[test]
+fn remote_tls_ui_answers_a_get_from_a_node_that_hangs_up_on_close_notify() {
+    let cluster = ca("kith test cluster");
+    let node = node_cert(&cluster, &["kith", "node1.node.kith"]);
+    let page = "<html>the page</html>";
+    let (server, log) = start(&cluster, &node, move |_, _| Reply::Page(page));
+    let identity = identity_dir("ui-page", &cluster);
+    let (mut ui, port, secret) = spawn_ui(server, &identity);
+
+    let mut browser = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    browser.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        browser,
+        "GET /{secret}/ui/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: */*\r\n\r\n"
+    )
+    .unwrap();
+    let mut reply = Vec::new();
+    let read = browser.read_to_end(&mut reply);
+    ui.kill().unwrap();
+    ui.wait().unwrap();
+
+    let reply = String::from_utf8_lossy(&reply).into_owned();
+    let seen = log.lock().unwrap().clone();
+    assert!(
+        read.is_ok() && reply.starts_with("HTTP/1.1 200 "),
+        "{reply:?} {read:?} {seen:?}"
+    );
+    assert!(reply.ends_with(page), "{reply}");
+    assert!(!seen.iter().any(|l| l.starts_with("hung up")), "{seen:?}");
+}
+
+#[test]
 fn remote_tls_ui_sends_a_large_body_after_a_bare_101() {
     let cluster = ca("kith test cluster");
     let node = node_cert(&cluster, &["kith", "node1.node.kith"]);
@@ -490,7 +538,7 @@ fn remote_tls_ui_sends_a_large_body_after_a_bare_101() {
         reply.extend_from_slice(&buf[..n]);
     }
     let reply = String::from_utf8_lossy(&reply).into_owned();
-    // kithd reads the body to its end, which comes once kith has sent all of it and shut its side.
+    // kithd has the body once kith has sent all of it.
     let deadline = Instant::now() + Duration::from_secs(20);
     let seen = loop {
         let seen = log.lock().unwrap().clone();

@@ -15,6 +15,7 @@ mod backups;
 mod blobs;
 mod blocklist;
 mod claims;
+mod clock;
 mod cluster;
 mod controller;
 mod controllers;
@@ -28,7 +29,7 @@ mod encrypted;
 mod exits;
 #[allow(
     dead_code,
-    reason = "the CTAP2 client's wire half (T-0966): nothing calls it until the record slice (docs/adr-fido2.md section 6); its tests run"
+    reason = "the CTAP2 client's wire half (T-0966): crypt.rs calls get_assertion; the rest of the client that nothing calls yet waits for the rest of docs/adr-fido2.md section 6"
 )]
 mod fido2;
 // A software security key: in unit tests and in the `fido2-test` build, in no release
@@ -331,8 +332,18 @@ fn nofile_soft(soft: u64, hard: u64) -> u64 {
     hard.min(NOFILE_WANTED).max(soft).min(hard)
 }
 
-/// Raise the soft limit of open files ([`nofile_soft`]); the hard one is not touched. A
-/// failure leaves the limit as it was and is only said.
+/// The hard limit of open files kithd asks for as root, which every container it starts
+/// gets as its own hard limit (as containerd's 524288), so an app can raise its soft one.
+const NOFILE_HARD_WANTED: u64 = 524288;
+
+/// The hard limit to set: [`NOFILE_HARD_WANTED`], but no more than the kernel's `fs.nr_open`
+/// (it refuses a higher one), and never less than now.
+fn nofile_hard(hard: u64, nr_open: u64) -> u64 {
+    hard.max(NOFILE_HARD_WANTED.min(nr_open))
+}
+
+/// Raise the hard limit of open files as root ([`nofile_hard`]) and the soft one
+/// ([`nofile_soft`]). A failure leaves the limit as it was and is only said.
 fn raise_nofile() {
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
     let said = |e: &dyn std::fmt::Display| {
@@ -344,11 +355,29 @@ fn raise_nofile() {
     };
     match getrlimit(Resource::RLIMIT_NOFILE) {
         Ok((soft, hard)) => {
-            let want = nofile_soft(soft, hard);
-            if want != soft
-                && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, want, hard)
+            // (Only root may raise the hard limit; the kernel's cap is fs.nr_open.)
+            let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .unwrap_or(0);
+            let top = if nix::unistd::getuid().is_root() {
+                nofile_hard(hard, nr_open)
+            } else {
+                hard
+            };
+            if nr_open == 0 && nix::unistd::getuid().is_root() {
+                said(&"/proc/sys/fs/nr_open is not readable, so the hard limit is not raised");
+            }
+            let want = nofile_soft(soft, top);
+            if (want, top) != (soft, hard)
+                && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, want, top)
             {
                 said(&e);
+                // (A root without CAP_SYS_RESOURCE may not raise the hard limit, but may the soft one.)
+                let soft_only = nofile_soft(soft, hard);
+                if top != hard && soft_only != soft {
+                    let _ = setrlimit(Resource::RLIMIT_NOFILE, soft_only, hard);
+                }
             }
         }
         Err(e) => said(&e),
@@ -378,13 +407,9 @@ fn main() -> ExitCode {
         &mut std::io::stderr(),
         b"kithd: built with forge: POST /v1/forge appends unchecked entries; never ship this\n",
     );
-    // The same for the software security key (the VM test, T-0955, looks for the line); started as
-    // `kithd fido2-authenticator` it then answers on /dev/uhid and never returns.
+    // The same for the software security key (the VM test, T-0973, looks for the line).
     #[cfg(feature = "fido2-test")]
-    {
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), fido2_test::STARTUP_LINE);
-        fido2_test::shim();
-    }
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), fido2_test::STARTUP_LINE);
     // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
     if std::process::id() == 1 {
         keeper::keep();
@@ -404,6 +429,13 @@ fn main() -> ExitCode {
         }
     }
     let mut boot = kept.map(|(start, _)| init::early(start > 1));
+    // The VM test of the client against the stand-in (ci/vm/fido2.sh): `fido2-test` among the
+    // kernel's bare words, handed to the first process, in a fido2-test build alone. It ends in a
+    // power off.
+    #[cfg(feature = "fido2-test")]
+    if first && std::env::args().skip(1).any(|a| a == "fido2-test") {
+        fido2_test::vm_test();
+    }
     if let Some(source) = boot.as_mut().and_then(|boot| boot.install.take()) {
         installer(boot.expect("there is one"), source);
     }
@@ -546,8 +578,11 @@ async fn membership(
     }
     // (A node that roams is called at its mesh address, which is an IPv6 one.)
     // It joined as one if it was told whom to call first; that file stays.
+    // So is one with a mesh that joined over the LAN: it is called there once the mesh is up, and
+    // still on the LAN (an IPv6 socket takes both, unless the machine's `bindv6only` says not).
     let roams = args.roaming || mesh::first_peers(&dir.join("mesh.key")).exists();
-    let anywhere: std::net::IpAddr = if roams {
+    let takes_both = || std::fs::read_to_string("/proc/sys/net/ipv6/bindv6only").is_ok_and(|on| on.trim() == "0");
+    let anywhere: std::net::IpAddr = if roams || args.mesh.is_some() && takes_both() {
         std::net::Ipv6Addr::UNSPECIFIED.into()
     } else {
         std::net::Ipv4Addr::UNSPECIFIED.into()
@@ -1079,13 +1114,17 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 cluster::offer_claim(&shared);
             }
             eprintln!("kithd: node {} serving other nodes on {address}", cluster.me.name);
+            let on_mesh = address.is_ipv6() && address.ip().is_unspecified();
+            cluster::SERVES_MESH.store(on_mesh, std::sync::atomic::Ordering::Relaxed);
             let _ = netboot::PORT.set(address.port());
             let _ = netboot::RELEASES.set((args.release_key.clone(), state.clone(), args.lan_releases));
             if args.admit_deleted_nodes {
                 eprintln!("kithd: --admit-deleted-nodes: a deleted node's certificate is still taken here");
                 cluster::ADMIT_DELETED.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            let listener = cluster::listen(tcp, pki::server_config(&cluster.me)?).map_err(|e| fail("listening", &e))?;
+            let mesh_me = kith_mesh::node_address(mesh::prefix(&cluster.me.ca), &cluster.me.name);
+            let listener = cluster::listen_on(tcp, pki::server_config(&cluster.me)?, Some(mesh_me))
+                .map_err(|e| fail("listening", &e))?;
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();
             let served = axum::serve(listener, app).with_graceful_shutdown(async move { drop(stop.changed().await) });
@@ -1255,7 +1294,13 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         ];
         let saying = async {
             let format = raft::tend_format(shared.clone(), stopping.clone());
-            tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format);
+            // (Only a machine's first process keeps its clock: on another system something else does.)
+            let clock = async {
+                if init::is_init() {
+                    clock::run(shared.clone(), stopping.clone()).await;
+                }
+            };
+            tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format, clock);
         };
         let house = home::run(shared.clone(), stopping.clone());
         let (served, nodes, (), (), (), (), (), (), (), (), _) = tokio::join!(
@@ -1314,6 +1359,9 @@ async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, m
     let node = format!("Node/{}", cluster.me.name);
     let mut generation = shared.generation.subscribe();
     loop {
+        // (What the clock found is said too, and it changes by itself: `clock::CHANGED` wakes this.)
+        let mut mine = mine.clone();
+        mine.push(("clock", clock::status()));
         // (Not known until the store has this node: asked again when the store changes.)
         let says = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -1344,7 +1392,10 @@ async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, m
             if wrote {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             } else {
-                let _ = generation.changed().await;
+                tokio::select! {
+                    _ = generation.changed() => {}
+                    () = clock::CHANGED.notified() => {}
+                }
             }
         };
         tokio::select! {
@@ -1365,6 +1416,28 @@ mod tests {
         assert_eq!(nofile_soft(100_000, 524288), 100_000);
         assert_eq!(nofile_soft(1024, u64::MAX), 65536);
         assert_eq!(nofile_soft(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn nofile_hard_is_524288_capped_at_nr_open_and_never_lowered() {
+        use super::nofile_hard;
+        assert_eq!(nofile_hard(1024, 1048576), 524288);
+        assert_eq!(nofile_hard(4096, 1048576), 524288);
+        assert_eq!(nofile_hard(1024, 100_000), 100_000);
+        assert_eq!(nofile_hard(1024, 512), 1024);
+        assert_eq!(nofile_hard(1_000_000, 1048576), 1_000_000);
+        assert_eq!(nofile_hard(u64::MAX, 1048576), u64::MAX);
+        // the soft one kithd keeps, with that hard limit: 65536
+        assert_eq!(super::nofile_soft(1024, nofile_hard(1024, 1048576)), 65536);
+    }
+
+    #[test]
+    fn nofile_container_gets_soft_1024_and_hard_of_kithd_never_soft_above_hard() {
+        use kith_runtime::container_nofile;
+        assert_eq!(container_nofile(524288), (1024, 524288));
+        assert_eq!(container_nofile(1024), (1024, 1024));
+        assert_eq!(container_nofile(512), (512, 512));
+        assert_eq!(container_nofile(u64::MAX), (1024, u64::MAX));
     }
 
     #[test]

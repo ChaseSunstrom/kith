@@ -15,6 +15,21 @@ As process 1, kithd:
   six digits of its first network card's address;
 - brings every card up and asks for an address (DHCP, renewed). Where there is none, say
   `kith.ip=10.0.0.5/24,10.0.0.1` (address, gateway) and `kith.dns=9.9.9.9`;
+- keeps the time: a machine has no clock battery to trust, so after the network is up kithd asks
+  an SNTP server for the time at start and every hour, and sets the clock when it is more than
+  two seconds off. The server is the one you name, `kith.ntp=ADDRESS[:PORT]` (the only one asked
+  when set: what a network says is whatever a machine on it sent); where none is named, the one
+  DHCP names (option 42), then the gateway. The cluster's leader (a worker asks its control node)
+  is asked too, over the cluster's own TLS, and its time wins over a server over two seconds
+  from it. The server you name is followed alone, whatever the step. Before the clock was ever
+  set (it reads before 2026) the first answer is enough; after that a network's word alone moves
+  it by ten seconds in all (its steps together, until the leader agrees), and more needs the
+  leader within a second of the same time (servers a network names do not vouch for each
+  other), or it is left and the status says so; a node that runs alone for long should set
+  `kith.ntp`. A node whose clock is not yet set answers its peers' time
+  question with a 503. Each Node's status says its `clock`: the server, the offset and whether it
+  stepped it. A node under the `hardened` policy does not set its clock: its status says the
+  offset and the refusal;
 - reads its own arguments after ` -- ` on the command line: `console=ttyS0 kith.hostname=alpha
   -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443`;
 - collects orphaned processes and says what it says on every console the kernel has;
@@ -291,7 +306,8 @@ spec:
   selector: { ring: stable }       # nodes with these labels; without it, every node
   maxUnavailable: 2                # how many at a time (1 unless said)
   windows: ["Sat,Sun 02:00-05:00"] # UTC; `23:00-04:00` is every night; none: any time
-  drain: true                      # place no new workloads on a node while it updates
+  drain: true                      # drain each node (`kith node drain`) before it restarts
+  drainSeconds: 300                # how long to wait for what moves to run elsewhere (300 unless said; 3600 at most)
 ```
 
 The signature is over the update's header, which names the SHA-256 of every piece, so a node
@@ -303,8 +319,17 @@ The header also carries a `kithd` object: the digests of kithd, of the boot file
 hash, and of the root but for kithd and its os-release. It is signed with the rest. Before it writes,
 a node reads it against the header kept for the system it runs, and works out whether only kithd
 differs (the kernel and the rest of the root are the same) or the update is a full one. A header
-without it, or no kept header, is a full update. Nothing is done with a kithd-only answer yet: the
-update is still a full one.
+without it, or no kept header, is a full update, and the log says which part differed.
+
+Where only kithd differs, the node does not restart. It writes the other slot as ever, mounts its
+root for a moment, and copies the new kithd out of it into `/run/kith/bin`, a tmpfs of its own that
+is root-only and mounted exec, nosuid and nodev (`/run` stays noexec). It stages the file only if its
+SHA-256 is the signed digest. Then kithd ends with a hand-over, and the machine's first process starts
+the staged kithd. Every container keeps running and the new kithd takes them back by their record, as
+at any restart of kithd. A staged kithd that fails within a minute is given up for the one that was
+running; that end counts toward the ten failures in a minute, a hand-over does not. The root still
+says the old version (it is read-only), so the node says the new one from a note in `/run` that holds
+only for the kithd it names: a reboot starts the slot that was written, which has the new release whole.
 
 **Which keys a node takes.** Its own only, whatever key an OSRelease names. Give them before the
 first release:
@@ -392,8 +417,8 @@ plan's status says where the rollout is:
 
 ```
 status:
-  phase: Progressing      # or Done, Waiting (outside its windows, no such release), Paused
-  nodes: { n2: done, n3: updating }
+  phase: Progressing      # or Draining, Done, Waiting (outside its windows, no such release), Paused
+  nodes: { n2: done, n3: updating, n4: draining }
 ```
 
 `Paused`, with a `reason`, means a node did not take the release: it refused the file, or the
@@ -401,8 +426,21 @@ boot loader gave up after three tries and it is back on its old system (`os.fail
 Node's status). Nobody else is given that release until the OSRelease is changed or the plan
 names another, and then it starts over. `paused: true` stops it by hand (a node already told to
 go finishes). While a voting node is away no other is restarted. A node told to update that says
-nothing for fifteen minutes counts as failed. `drain` moves nothing already running;
-`waitForIdleSeats` does nothing yet.
+nothing for fifteen minutes counts as failed. `waitForIdleSeats` does nothing yet.
+
+With `drain: true` a node picked is drained as `kith node drain` does it: it is cordoned, the
+`kith.dev/drain` taint goes on, and what the drain plan says can move starts elsewhere. The plan
+says `Draining` (and which node, and how many replicas it waits for) and tells the node to restart only
+once each of those is running on another node, or none moves. A replica the plan says stays (pinned
+to the node, one a node selector puts on every node, a Job) holds nothing. A node whose replicas
+never start elsewhere is let go after `drainSeconds` (300 unless said, and at most 3600), and the
+plan's `reason` says how many. The plan never names a replica (it is read by whoever may read UpdatePlans, and a
+replica's name belongs to its namespace): `kith node drain NODE --dry-run` names the ones you
+may read. When the node is done, or the plan is paused, changed or no longer drains, or its
+OSRelease is deleted (or `release` names one that does not exist), or the node no longer matches
+the `selector` (a label removed, say), the update's drain is lifted; a drain or cordon you put on
+the node first is left as it was. A lift that did not take is asked for again until the node shows
+no drain.
 
 ### Installing on a machine
 
@@ -438,10 +476,17 @@ another size, or a disk named by serial that now gives another, writes nothing; 
 name not typed twice the same. It then copies kith OS to
 the disk, reads it back to check, and powers off: take the stick out and start it.
 
-On a screen with 32 bits a pixel (the console's framebuffer), each question is also drawn in the
-look of the [installer's page](../install.html): the install's steps as stops on a rail, the one
-being asked in blue, on paper. The answers are still typed, one line each, as above, and the text
-stays on the serial line. An encrypted install's recovery key is shown on the screen too. When the
+On a screen with 32 bits a pixel (the console's framebuffer), the whole install is drawn in the
+look of the [installer's page](../install.html), whatever the answers' source (typed, a file on the
+stick, a URL, or the network): each question, then the steps answered as stops on a rail, done one
+by one with what was answered at each (never the join token), the disk's write as a bar that moves
+with each percent (a sealed state's step after it), and an end screen that says the machine is
+powering off (take the installer out, then start it from its disk), held a few seconds before it
+does. Paper, the site's colours and font, the stop being worked at in blue. The kernel's own
+messages are kept off the picture while it is drawn (the console's log level is turned down, and put
+back when the picture is handed back), and a failure is written as text where it can be read. With
+no such screen the install is text only, as before. The answers are still typed, one line each, as
+above, and the text stays on the serial line. An encrypted install's recovery key is shown on the screen too. When the
 answers were typed, that screen holds until a key is pressed, or for five minutes, then clears; an
 install that was given its answers (from a file, a URL, or the network) does not stop for it. The
 picture is cleared from the text console when the installer hands the screen back. The key is
@@ -461,6 +506,7 @@ disk: "serial:S4EWNX0R123456"  # or nvme0n1, or `only`: the one disk of a machin
 hostname: alpha
 ip: 10.0.0.5/24,10.0.0.1      # without it the network is asked (DHCP)
 dns: 10.0.0.1
+ntp: 10.0.0.1                 # a time server, ADDRESS or ADDRESS:PORT; the only one asked when set, and followed alone; without it DHCP's (four at most), then the gateway
 join:                         # without it the node starts a new cluster
   address: 10.0.0.7:7443
   token: $TOKEN
