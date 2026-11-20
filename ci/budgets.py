@@ -69,7 +69,9 @@ KITHD_IDLE_RSS = 9 * MB
 # tree is over 3.02 in every folder.
 # RAISE, kith-remote 3.64 to 3.66 (T-0990): kith package push|render and lint parse a kithVersion
 # range with the semver crate, new to the kith binaries (3.65 MB measured on fa6816d6 merged in).
-SIZE_BUDGETS = {"kith": int(3.03 * MB), "kith-remote": int(3.66 * MB), "kithd": int(KITHD_SIZE * MB)}
+# RAISED, kith 3.03 to 3.04 (T-1187): main 5326ba9f with T-1113 merged builds kith at 3,179,864 B
+# (2.6 KB over 3.03), and with T-0976 and T-1076 too at 3,183,960 B; T-0269 brings it back down.
+SIZE_BUDGETS = {"kith": int(3.04 * MB), "kith-remote": int(3.66 * MB), "kithd": int(KITHD_SIZE * MB)}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
