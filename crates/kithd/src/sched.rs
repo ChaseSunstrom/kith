@@ -717,6 +717,54 @@ spec:
     }
 
     #[test]
+    fn a_workload_that_mounts_volumes_is_placed_by_them_and_a_bad_mount_waits_saying_why() {
+        let node = |name: &str| {
+            format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{}}\n---\n")
+        };
+        let workload = |name: &str, volume: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {{ name: {name} }}\nspec:\n  template:\n    containers: [{{ name: run, image: img, volumeMounts: [{{ volume: {volume}, path: /d }}] }}]\n---\n"
+            )
+        };
+        let volume =
+            "apiVersion: kith.dev/v1\nkind: Volume\nmetadata: { name: data }\nspec: { node: b, path: d }\n---\n";
+        let claim = "apiVersion: kith.dev/v1\nkind: VolumeClaim\nmetadata: { name: want }\nspec: { size: 1Gi, selector: { zone: nowhere } }\n---\n";
+        let cluster = [
+            node("a"),
+            node("b"),
+            volume.into(),
+            claim.into(),
+            workload("db", "data"),
+        ]
+        .concat()
+            + &workload("lost", "nowhere")
+            + &workload("claimed", "want");
+        let mut store = Store::default();
+        for resource in Resource::from_source(cluster.trim_end_matches("---\n")).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let (fields, _) = plan(&store, &there, Duration::from_secs(300));
+        let of = |name: &str| -> Value {
+            let found = fields
+                .iter()
+                .find(|(key, _)| key == &format!("Workload/default/{name}"));
+            found.unwrap().1.clone().into()
+        };
+        // Both nodes are free, and the Volume is on b: that is where it goes.
+        assert_eq!(of("db")["nodes"], json!({ "0": "b" }));
+        // A mount of no Volume or claim, and of a claim bound to none, wait and say which.
+        assert_eq!(of("lost")["nodes"], Value::Null);
+        assert!(
+            of("lost")["unschedulable"]["0"].as_str().unwrap().contains("nowhere"),
+            "{:?}",
+            of("lost")
+        );
+        let said = of("claimed")["unschedulable"]["0"].as_str().unwrap().to_string();
+        assert!(said.contains("VolumeClaim want"), "{said}");
+    }
+
+    #[test]
     fn a_replica_whose_volume_is_on_a_node_that_is_not_ready_or_not_there_waits() {
         // Replica 0's Volume is on a (ready), 1's on b (not ready), 2's on `gone` (no Node).
         // None of them is started on an empty Volume on a.

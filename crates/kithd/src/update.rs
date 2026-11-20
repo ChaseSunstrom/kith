@@ -496,20 +496,19 @@ impl Keys {
     /// How the update with header `block` is taken, against the system in `slot` that runs the
     /// image `running`: kithd alone only when the header kept for that system is its own
     /// (`signed_system`) and says the kernel and the rest of the root are the same. A missing,
-    /// unsigned, stale or older-style kept header is a full update.
-    pub fn way(&self, slot: char, running: &[u8], block: &[u8]) -> crate::os::Way {
-        let kept = self
+    /// unsigned, stale or older-style kept header is a full update. Says why it is a full
+    /// update where it is. (`Keys::way`, in the tests at the foot of this file, is the same as a `Way`.)
+    pub fn kithd_only(&self, slot: char, running: &[u8], block: &[u8]) -> Result<(), String> {
+        let (_, _, kept) = self
             .signed_system(slot, running)
-            .and_then(|()| crate::os::kept_signed(&self.state, slot));
-        match kept {
-            Ok((_, _, kept)) => crate::os::way(block, &kept),
-            Err(_) => crate::os::Way::Full,
-        }
+            .and_then(|()| crate::os::kept_signed(&self.state, slot))
+            .map_err(|e| format!("the running system's own release is not proven: {e}"))?;
+        crate::os::why_full(block, &kept).map_or(Ok(()), |why| Err(why.to_string()))
     }
 
     /// The keys this node takes releases from, and whose they are: `given`, `kept`,
     /// `image`, or `none` (no keys: the first release's is taken).
-    fn mine(&self) -> Result<(Vec<String>, &'static str), String> {
+    pub(crate) fn mine(&self) -> Result<(Vec<String>, &'static str), String> {
         if !self.given.is_empty() {
             return Ok((self.given.iter().map(|key| key.trim().to_string()).collect(), "given"));
         }
@@ -776,10 +775,156 @@ fn raise(file: &Path, version: &str) -> Result<(), String> {
     }
 }
 
+/// What a kithd-only hand-over leaves for the kithd it starts (tmpfs: a reboot clears it, and
+/// then the slot that boots has the new release whole): the version, a space, and the sha256
+/// of the kithd that is that release's.
+const HANDED_OVER: &str = "/run/kith/handed-over";
+/// Where the new slot's root is mounted, for as long as the kithd in it is copied out.
+const NEW_ROOT: &str = "/run/kith/new-root";
+/// The most a staged kithd may be (its place is a 64 MB tmpfs: init.rs `mounts`).
+const STAGE_MOST: u64 = 48 << 20;
+
+/// Stages the kithd at `from` in `dir` (the root-only tmpfs of init.rs `mounts`): only a file whose
+/// sha256 is `digest` (the signed header's), taken whole into memory so what is checked is what is
+/// written, to a file of its own that only its owner may run, put in place by a rename (a kithd
+/// that runs from the old one is not written into). `dir` must be there and be nobody else's
+/// to use. Says the file staged.
+fn stage(from: &Path, digest: &str, dir: &Path) -> Result<PathBuf, String> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let place = std::fs::metadata(dir).map_err(|e| format!("the place for a staged kithd ({}): {e}", dir.display()))?;
+    if !place.is_dir() || place.mode() & 0o077 != 0 || place.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(format!(
+            "{} is not a directory only this node may use: no kithd is staged there",
+            dir.display()
+        ));
+    }
+    let (new, file) = (dir.join("kithd.new"), dir.join("kithd"));
+    let _ = std::fs::remove_file(&new);
+    // Streamed: each chunk goes through the hasher and into `kithd.new` (at most STAGE_MOST of
+    // them), and the file is put in place only when the digest comes out as the signed one.
+    let wrote = (|| -> Result<(), String> {
+        let mut src = std::fs::File::open(from)
+            .map_err(|e| format!("reading the new kithd ({}): {e}", from.display()))?
+            .take(STAGE_MOST + 1);
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&new)
+            .map_err(|e| format!("staging the new kithd in {}: {e}", dir.display()))?;
+        let (mut hash, mut buf, mut size) = (ring::digest::Context::new(&ring::digest::SHA256), [0u8; 65536], 0u64);
+        loop {
+            let n = src
+                .read(&mut buf)
+                .map_err(|e| format!("reading the new kithd ({}): {e}", from.display()))?;
+            if n == 0 {
+                break;
+            }
+            size += n as u64;
+            if size > STAGE_MOST {
+                return Err(format!(
+                    "the new kithd ({}) is larger than {STAGE_MOST} bytes",
+                    from.display()
+                ));
+            }
+            hash.update(&buf[..n]);
+            out.write_all(&buf[..n])
+                .map_err(|e| format!("staging the new kithd in {}: {e}", dir.display()))?;
+        }
+        let got = crate::pki::hex(hash.finish().as_ref());
+        if !got.eq_ignore_ascii_case(digest) {
+            return Err(format!(
+                "the new kithd's sha256 is {got}, and the release's signed header names {digest}"
+            ));
+        }
+        out.sync_all()
+            .and_then(|()| std::fs::rename(&new, &file))
+            .map_err(|e| format!("staging the new kithd in {}: {e}", dir.display()))
+    })();
+    if let Err(e) = wrote {
+        let _ = std::fs::remove_file(&new);
+        return Err(e);
+    }
+    Ok(file)
+}
+
+/// Stages the kithd of the release just written into slot `into`, as `digest` (the signed header's)
+/// has it: the slot's root is mounted read-only for as long as `/sbin/init` is read from it.
+fn stage_release(into: char, digest: &str) -> Result<PathBuf, String> {
+    use nix::mount::{MntFlags, MsFlags, mount, umount2};
+    let device =
+        crate::init::labelled(&format!("root-{into}")).ok_or(format!("no partition is labelled root-{into}"))?;
+    let at = Path::new(NEW_ROOT);
+    std::fs::create_dir_all(at).map_err(|e| format!("making {NEW_ROOT}: {e}"))?;
+    let flags = MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+    mount(Some(&device), at, Some("squashfs"), flags, None::<&str>)
+        .map_err(|e| format!("mounting {}: {e}", device.display()))?;
+    let staged = stage(&at.join("sbin/init"), digest, Path::new(crate::keeper::STAGED_DIR));
+    // (Detached: a umount that fails with EBUSY must not leave the next hand-over's mount to fail.)
+    if let Err(e) = umount2(at, MntFlags::MNT_DETACH) {
+        eprintln!("kithd: update: unmounting {NEW_ROOT}: {e}");
+    }
+    staged
+}
+
+/// Writes down that the kithd that is the sha256 `digest` is `version`'s (see [`effective`]),
+/// the node running `running` now: only a newer version is one a hand-over moves to.
+fn hand_over(record: &Path, running: &str, version: &str, digest: &str) -> Result<(), String> {
+    if version.is_empty() || version.contains(char::is_whitespace) || !before(running, version) {
+        return Err(format!(
+            "kith OS {version:?} is not a version a hand-over from {running} can write down"
+        ));
+    }
+    crate::pki::write_whole(record, format!("{version} {digest}\n").as_bytes())
+        .map_err(|e| format!("keeping a note of the hand-over ({}): {e}", record.display()))
+}
+
+/// What the hand-over note in `record` says: the version it names, if that is newer than
+/// `os_release`, and whether `exe`'s sha256 is the kithd it names (so it is this one that runs).
+fn handed_over(os_release: &str, record: &Path, exe: &Path) -> Option<(String, bool)> {
+    let handed = std::fs::read_to_string(record).ok()?;
+    let (version, digest) = handed.trim().split_once(' ')?;
+    if !before(os_release, version) {
+        return None;
+    }
+    let runs = std::fs::read(exe).map(|bytes| crate::os::sha256(&bytes));
+    Some((
+        version.to_string(),
+        runs.is_ok_and(|runs| runs.eq_ignore_ascii_case(digest)),
+    ))
+}
+
+/// The version this node runs: `os_release`'s (the root is read-only, and a kithd-only
+/// hand-over leaves it as it was), or the newer one a hand-over wrote in `record`, but only for
+/// the kithd it names (`exe`'s sha256): a keeper that fell back to its own kithd runs the old
+/// release again, and a reboot has the new root, whose os-release says so.
+fn effective(os_release: String, record: &Path, exe: &Path) -> String {
+    match handed_over(&os_release, record, exe) {
+        Some((version, true)) => version,
+        _ => os_release,
+    }
+}
+
+/// A hand-over whose kithd is not the one that runs (it crashed, and the keeper went back to
+/// this one) is a try that failed: written as `Tried`, so [`node`] does not fetch and hand over
+/// to that version again at every poll.
+fn forgo_failed_hand_over(state: &Path, os_release: &str, record: &Path, exe: &Path) {
+    let Some((version, false)) = handed_over(os_release, record, exe) else {
+        return;
+    };
+    let tried = Tried {
+        version,
+        why: "the kithd handed over to failed".into(),
+    };
+    if let Err(e) = crate::pki::write_whole(&self::tried(state), &serde_json::to_vec(&tried).expect("text")) {
+        eprintln!("kithd: update: noting the failed hand-over: {e}");
+    }
+}
+
 /// The client an update is fetched with: `host`'s vetted addresses are the ones connected
 /// to, through no proxy (which would look the name up again itself), and no redirect is
-/// followed (the address is the release's, and the release is what was applied: nowhere
-/// else).
+/// followed by it (a redirect's target is vetted, and gets a client of its own: [`get`]).
 fn client(host: &str, addresses: &[std::net::SocketAddr]) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .resolve_to_addrs(host, addresses)
@@ -829,6 +974,99 @@ async fn pinned(url: &reqwest::Url, lan: bool) -> Result<(String, Vec<std::net::
     }
 }
 
+/// Redirects an image's address may lead through before it answers.
+const HOPS: usize = 5;
+
+/// `url` as an error may say it: with no user or password, and no query (often a signature).
+fn shown(url: &reqwest::Url) -> reqwest::Url {
+    let mut url = url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    // (Only a URL that cannot have a host refuses these, and none here is one.)
+    url.set_username("").ok();
+    url.set_password(None).ok();
+    url
+}
+
+/// The longest [`pinned`] may take: a name that is not answered is not waited for.
+const VET: Duration = Duration::from_secs(30);
+
+/// The longest the image's address takes to answer, through its redirects (what it sends
+/// after the answer starts is the body's: each read of it has its own limit, `client`).
+const ANSWER: Duration = Duration::from_secs(300);
+
+/// Where a redirect from `from` goes, by its `Location`: an address of its own (a relative
+/// one is read against `from`), with no user or password in it, and not a lower scheme.
+/// What it is vetted as is for [`get`].
+fn hop(from: &reqwest::Url, location: Option<&reqwest::header::HeaderValue>) -> Result<reqwest::Url, String> {
+    let refused = |why: &str| format!("fetching {}: its redirect {why}", shown(from));
+    let location = location.ok_or_else(|| refused("names no Location"))?;
+    if location.len() > 2048 {
+        return Err(refused("has a Location over 2048 bytes"));
+    }
+    let location = location
+        .to_str()
+        .map_err(|_| refused("has a Location that is not text"))?;
+    // (Read against the address with no user or password: none is carried to another.)
+    let mut to = shown(from)
+        .join(location)
+        .map_err(|e| refused(&format!("has a Location that is no address ({e})")))?;
+    to.set_fragment(None);
+    if !to.username().is_empty() || to.password().is_some() {
+        return Err(refused(
+            "names a userinfo (a user or password in the address): none is sent",
+        ));
+    }
+    match (from.scheme(), to.scheme()) {
+        ("https", "https") | ("http", _) => Ok(to),
+        (from, to) => Err(refused(&format!("goes from {from} to {to}: a scheme is not lowered"))),
+    }
+}
+
+/// The answer of the image at `url`, after at most [`HOPS`] redirects. Each address, the first
+/// and every redirect's, is vetted by [`pinned`] and fetched from through a client of its own
+/// holding the addresses vetted (a client that followed would look the name up again): so
+/// an address that the first may not be is not a redirect's either. Says the address it
+/// came from too, for what is said of the body. All of it takes [`ANSWER`] at most.
+async fn get(first: reqwest::Url, lan: bool) -> Result<(reqwest::Response, reqwest::Url), String> {
+    let at = shown(&first);
+    let all = tokio::time::timeout(ANSWER, hops(first, lan));
+    all.await
+        .map_err(|_| format!("fetching {at}: no answer in {} seconds", ANSWER.as_secs()))?
+}
+
+async fn hops(first: reqwest::Url, lan: bool) -> Result<(reqwest::Response, reqwest::Url), String> {
+    let (mut url, mut seen) = (first.clone(), vec![first]);
+    loop {
+        let at = shown(&url);
+        let vetted = tokio::time::timeout(VET, pinned(&at, lan));
+        let vetted = vetted
+            .await
+            .map_err(|_| format!("looking up {at}: no answer in {} seconds", VET.as_secs()));
+        let (host, addresses) = vetted?.map_err(|why| match seen.len() {
+            1 => why,
+            _ => format!("after a redirect, {why}"),
+        })?;
+        let failed = |e: reqwest::Error| format!("fetching {at}: {}", e.without_url());
+        let response = client(&host, &addresses)?.get(url.clone()).send().await;
+        let response = response.and_then(|r| r.error_for_status()).map_err(failed)?;
+        if !response.status().is_redirection() {
+            return match response.status().is_success() {
+                true => Ok((response, url)),
+                false => Err(format!("fetching {at}: it answers {}", response.status())),
+            };
+        }
+        if seen.len() > HOPS {
+            return Err(format!("fetching {at}: more than {HOPS} redirects: the hop limit"));
+        }
+        url = hop(&url, response.headers().get(reqwest::header::LOCATION))?;
+        if seen.contains(&url) {
+            return Err(format!("fetching {at}: its redirects loop (to {})", shown(&url)));
+        }
+        seen.push(url.clone());
+    }
+}
+
 /// The update file at `url`, into this node's other slot, if it is the release's: signed
 /// by its key, and the version it says. Not from this node or its own networks (their
 /// private ranges only with `lan`, `--lan-releases`): an OSRelease is written by whoever
@@ -843,29 +1081,17 @@ async fn fetch(
     runs: &str,
     back: bool,
     lan: bool,
-) -> Result<String, String> {
+) -> Result<(String, Option<String>), String> {
     let text = |field: &str| release[field].as_str().map(str::to_string);
     let (signature, public) = (text("signature"), text("publicKey"));
     above(&keys.floor, &wanted)?;
     let first = keys.refused(public.as_deref())?;
     let ahead = keys.seals_ahead(public.as_deref(), back);
     let (kept, runs, keys, release) = (keys.kept.clone(), runs.to_string(), keys.clone(), release.clone());
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("the release's image, {url}: {e}"))?;
-    let (host, addresses) = pinned(&parsed, lan).await?;
-    let client = client(&host, &addresses)?;
-    let failed = |e: reqwest::Error| format!("fetching {url}: {e}");
-    let mut response = client
-        .get(parsed)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(failed)?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "fetching {url}: it answers {}, and a redirect is not followed",
-            response.status()
-        ));
-    }
+    // (Said without the address: it may hold a password or a signed query.)
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("the release's image address: {e}"))?;
+    let (mut response, came_from) = get(parsed, lan).await?;
+    let failed = |e: reqwest::Error| format!("fetching {}: {}", shown(&came_from), e.without_url());
     // What arrives is written as it arrives: an update is tens of megabytes, a node may
     // have little memory, and the writer checks every piece against the signed header.
     let (send, mut pieces) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -884,7 +1110,11 @@ async fn fetch(
             Ok(some)
         }
     }
+    // The signed digest of the new kithd, when the header says kithd alone differs.
+    let only = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let said = only.clone();
     let writer = tokio::task::spawn_blocking(move || {
+        let only = said;
         let running = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
         let public = public.clone();
         let signed = crate::os::signed(signature.as_deref(), public.as_deref());
@@ -901,11 +1131,16 @@ async fn fetch(
                         let keep = crate::pki::write_whole(&kept, keys.first_kept(public).as_bytes());
                         keep.map_err(|e| format!("keeping the release's key ({}): {e}", kept.display()))?;
                     }
-                    // (Decided here, before a slot is written: the handover is not built yet,
-                    // so what is done is the full update either way.)
+                    // (Decided here, before a slot is written, on the signed header: the slot is
+                    // written whichever way it is, and a reboot into it is the way back.)
                     let running_image = crate::os::running_image_here(slot).unwrap_or_default();
-                    if keys.way(slot, &running_image, header) == crate::os::Way::KithdOnly {
-                        eprintln!("kithd: update: {version} differs from this system in kithd alone");
+                    match keys.kithd_only(slot, &running_image, header) {
+                        Ok(()) => {
+                            eprintln!("kithd: update: {version} differs from this system in kithd alone");
+                            *only.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                crate::os::digests(header).map(|[kithd, ..]| kithd);
+                        }
+                        Err(why) => eprintln!("kithd: update: {version} is a full update (a restart): {why}"),
                     }
                     keys.pend(&release, version, header, &runs)?;
                     // (The header is kept for the slot it writes, with its signature: check 3 of
@@ -960,7 +1195,8 @@ async fn fetch(
                 Some(Err(why)) => eprintln!("kithd: update: no key is sealed ahead for {version}: {why}"),
                 None => {}
             }
-            Ok(version)
+            let only = only.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            Ok((version, only))
         }
         (Ok((None, _)), _) => Err("that release is what this node runs already, under another version".into()),
         (Err(_), Some(cut)) => Err(cut),
@@ -981,9 +1217,15 @@ pub async fn node(
         let _ = MESH.set(crate::mesh::prefix(&cluster.me.ca));
     }
     let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let version = std::fs::read_to_string("/etc/os-release")
+    // (After a kithd-only hand-over the root still says the old version: see `effective`.)
+    let os_release = std::fs::read_to_string("/etc/os-release")
         .ok()
         .and_then(|text| version_in(&text));
+    let (record, exe) = (Path::new(HANDED_OVER), Path::new("/proc/self/exe"));
+    if let Some(os_release) = &os_release {
+        forgo_failed_hand_over(&state, os_release, record, exe);
+    }
+    let version = os_release.map(|version| effective(version, record, exe));
     let (Some(slot), Some(version), Some(cluster)) = (crate::init::options(&line).0.slot, version, &shared.cluster)
     else {
         return;
@@ -1021,6 +1263,10 @@ pub async fn node(
         let mut said = report(&state, &version, slot, keys.whose());
         said["storage"] = json!(storage);
         said["wants"] = json!(wants);
+        // The data disks it looked at at the start (none before it has, and on a node that is not init).
+        if let Some(disks) = crate::data_disk::boot::said() {
+            said["disks"] = disks;
+        }
         // What the store has of this node, and a plan that says it is this node's turn.
         let (known, turn, named, back) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -1079,6 +1325,30 @@ pub async fn node(
                 Err(e) => Err(format!("keeping a note of the update: {e}")),
             };
             match wrote {
+                // (Kithd alone differs, and this kithd has a keeper to start the next: it is
+                // staged and started with no unit stopped. Else, or if that fails, the restart.)
+                Ok((_, Some(kithd))) if crate::keeper::kept().is_some() => {
+                    let staged = stage_release(crate::os::other(slot), &kithd)
+                        .and_then(|_| hand_over(Path::new(HANDED_OVER), &version, &wanted, &kithd));
+                    match staged {
+                        Ok(()) => {
+                            eprintln!(
+                                "kithd: kith OS {wanted} differs in kithd alone: handing over to the kithd staged"
+                            );
+                            // (The keeper counts a kithd that ends sooner than this as a failure.)
+                            tokio::time::sleep(crate::keeper::HANDOVER_AFTER + Duration::from_secs(1)).await;
+                            // (Set only now: a power-button stop during the wait is not a hand-over.)
+                            crate::init::HANDING_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
+                            shared.stop.send_replace(true);
+                            return;
+                        }
+                        Err(why) => {
+                            eprintln!("kithd: no hand-over to kith OS {wanted} ({why}): restarting into it instead");
+                            shared.stop.send_replace(true);
+                            return;
+                        }
+                    }
+                }
                 Ok(_) => {
                     eprintln!("kithd: kith OS {wanted} is in the other slot: restarting into it");
                     shared.stop.send_replace(true);
@@ -1699,34 +1969,300 @@ mod tests {
         assert!(before("0.0.0-next", "0.0.1") && before("1.0", "1.1-rc1"));
     }
 
-    #[tokio::test]
-    async fn no_redirect_is_followed_for_an_update() {
+    /// A server on `listener` (an unbounded number of asks) that logs each request's path
+    /// and answers it with what `answer` says for that path.
+    fn serving(
+        listener: tokio::net::TcpListener,
+        answer: impl Fn(&str) -> String + 'static,
+    ) -> std::rc::Rc<std::cell::RefCell<Vec<String>>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let dir = scratch("redirect");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let to = elsewhere.local_addr().unwrap();
-        let url = format!("http://{}/kith-os.update", listener.local_addr().unwrap());
-        let answering = tokio::spawn(async move {
-            let (mut asked, _) = listener.accept().await.unwrap();
-            let _ = asked.read(&mut [0; 1024]).await;
-            let moved = format!("HTTP/1.1 302 Found\r\nLocation: http://{to}/x\r\nContent-Length: 0\r\n\r\n");
-            asked.write_all(moved.as_bytes()).await.unwrap();
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = log.clone();
+        // (Local to this test's thread, where the loopback-is-outside switch is too.)
+        tokio::task::spawn_local(async move {
+            loop {
+                let (mut asked, _) = listener.accept().await.unwrap();
+                let mut line = [0; 4096];
+                let got = asked.read(&mut line).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&line[..got]).to_string();
+                let path = text.split_whitespace().nth(1).unwrap_or_default().to_string();
+                let said = answer(&path);
+                seen.borrow_mut().push(path);
+                let _ = asked.write_all(said.as_bytes()).await;
+            }
         });
+        log
+    }
+
+    fn moved(to: &str) -> String {
+        format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    const IMAGE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd";
+
+    /// `fetch` as a node with `lan` does it, from a server that stands for one elsewhere
+    /// (this thread takes loopback for outside). The image never gets further than the
+    /// writer, which finds no slot here: that is what "followed to the image" says.
+    async fn fetched(url: &str, lan: bool) -> Result<String, String> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let keys = Keys::new(vec!["aa11".into()], &scratch("redirect"));
         let release = json!({ "publicKey": "aa11", "signature": "00" });
-        let keys = Keys::new(Vec::new(), &dir);
-        // (This thread takes loopback for outside: it stands for a release server elsewhere.)
         crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
-        let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, false).await;
+        let said = fetch(url, "2".into(), &release, 'a', &keys, "1", true, lan).await;
         crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
-        let said = said.unwrap_err();
-        assert!(said.contains("302") && said.contains("redirect"), "{said}");
-        answering.await.unwrap();
-        let asked = tokio::time::timeout(Duration::from_millis(200), elsewhere.accept()).await;
-        assert!(asked.is_err(), "the redirect was followed");
         // (And a key is kept only once it has signed the update asked for.)
         assert!(!keys.kept.exists());
+        said.map(|(text, _)| text)
+    }
+
+    /// Runs `test` where [`serving`] can spawn.
+    async fn locally<F: std::future::Future<Output = ()>>(test: F) {
+        tokio::task::LocalSet::new().run_until(test).await;
+    }
+
+    const NO_SLOT: &str = "no partition is labelled";
+
+    #[tokio::test]
+    async fn redirect_is_followed_to_the_image() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let log = serving(listener, move |path| match path {
+                "/kith-os.update" => moved("/second"),
+                "/second" => moved(&format!("http://{at}/image")),
+                _ => IMAGE.to_string(),
+            });
+            let said = fetched(&format!("http://{at}/kith-os.update"), false).await;
+            assert!(said.unwrap_err().contains(NO_SLOT));
+            assert_eq!(*log.borrow(), ["/kith-os.update", "/second", "/image"]);
+        })
+        .await;
+    }
+
+    /// GitHub's way: the file's address answers 302 to another host's, with a signed query.
+    #[tokio::test]
+    async fn redirect_to_another_host_with_a_query() {
+        locally(async {
+            let (first, second) = (
+                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            );
+            let (a, b) = (first.local_addr().unwrap(), second.local_addr().unwrap());
+            let to = format!("http://localhost:{}/asset/1?sig=ab%2Bc&exp=9", b.port());
+            let one = serving(first, move |_| moved(&to));
+            let two = serving(second, |_| IMAGE.to_string());
+            let said = fetched(&format!("http://{a}/releases/download/v1/kith-os.update"), false).await;
+            assert!(said.unwrap_err().contains(NO_SLOT));
+            assert_eq!(*one.borrow(), ["/releases/download/v1/kith-os.update"]);
+            // (The query goes to the second host as it was written.)
+            assert_eq!(*two.borrow(), ["/asset/1?sig=ab%2Bc&exp=9"]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn redirect_five_hops_are_followed_and_the_sixth_is_refused() {
+        locally(async {
+            for (hops, followed) in [(5, true), (6, false)] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let at = listener.local_addr().unwrap();
+                let log = serving(listener, move |path| {
+                    match path.trim_start_matches('/').parse::<usize>() {
+                        Ok(n) if n < hops => moved(&format!("/{}", n + 1)),
+                        _ => IMAGE.to_string(),
+                    }
+                });
+                // (Every answer, but the last, is a redirect to the next number.)
+                let said = fetched(&format!("http://{at}/0"), false).await.unwrap_err();
+                match followed {
+                    true => assert!(said.contains(NO_SLOT), "{said}"),
+                    false => assert!(said.contains("5 redirects") && said.contains("hop"), "{said}"),
+                }
+                // (Six asks either way: the sixth redirect is refused, not asked for.)
+                assert_eq!(log.borrow().len(), 6, "{:?}", log.borrow());
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn redirect_loop_is_refused() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let log = serving(listener, |path| moved(if path == "/a" { "/b#again" } else { "/a" }));
+            let said = fetched(&format!("http://{at}/a"), false).await.unwrap_err();
+            assert!(said.contains("loop"), "{said}");
+            assert_eq!(*log.borrow(), ["/a", "/b"]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn redirect_with_userinfo_or_no_location_is_refused() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let none = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let log = serving(listener, move |path| match path {
+                "/user" => moved(&format!("http://me:secret@{at}/image")),
+                "/name" => moved(&format!("http://me@{at}/image")),
+                "/none" => none.to_string(),
+                _ => IMAGE.to_string(),
+            });
+            for (path, words) in [("/user", "userinfo"), ("/name", "userinfo"), ("/none", "no Location")] {
+                let said = fetched(&format!("http://{at}{path}"), false).await.unwrap_err();
+                assert!(said.contains(words) && !said.contains("secret"), "{said}");
+            }
+            assert_eq!(*log.borrow(), ["/user", "/name", "/none"], "nothing was followed");
+        })
+        .await;
+    }
+
+    /// What an error says of an address is the address with no user, password, query or
+    /// fragment: a signed query and a password are secrets, and a status shows the error.
+    #[tokio::test]
+    async fn redirect_errors_say_no_userinfo_and_no_query() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let log = serving(listener, move |path| match path.split('?').next().unwrap() {
+                "/gone" => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                _ => moved("/gone?sig=secret"),
+            });
+            for path in ["/gone?sig=secret#secret", "/moved?sig=secret"] {
+                let said = fetched(&format!("http://me:hunter2@{at}{path}"), false)
+                    .await
+                    .unwrap_err();
+                assert!(said.contains("404") && said.contains(&at.to_string()), "{said}");
+                assert!(!said.contains("hunter2") && !said.contains("secret"), "{said}");
+            }
+            assert_eq!(log.borrow().len(), 3);
+        })
+        .await;
+    }
+
+    /// What a redirect may name is what the first address may: http or https, outside this
+    /// node, however it is written (a scheme-less `//host`, an IPv4 in an IPv6 address).
+    #[tokio::test]
+    async fn os_image_redirect_to_another_scheme_or_a_loopback_in_disguise_is_refused() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let log = serving(listener, |path| {
+                crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
+                moved(&path.trim_start_matches('/').replace("%2F", "/"))
+            });
+            for (target, words) in [
+                ("ftp:%2F%2Fx.example%2Fa", "fetched over http or https"),
+                ("file:%2F%2F%2Fx", "fetched over http or https"),
+                ("http:%2F%2F[::ffff:127.0.0.1]%2Fa", "not fetched from this node"),
+                ("%2F%2F127.0.0.1%2Fa", "not fetched from this node"),
+            ] {
+                let said = fetched(&format!("http://{at}/{target}"), false).await.unwrap_err();
+                assert!(
+                    said.starts_with("after a redirect, ") && said.contains(words),
+                    "{target}: {said}"
+                );
+            }
+            assert_eq!(log.borrow().len(), 4, "only the first address was asked");
+        })
+        .await;
+    }
+
+    /// Where a redirect goes is decided apart from the network: a scheme is never lowered.
+    #[test]
+    fn redirect_hop_never_lowers_the_scheme_and_reads_the_location_whole() {
+        let value = |text: &str| reqwest::header::HeaderValue::from_str(text).unwrap();
+        let at = |from: &str, location: &str| hop(&reqwest::Url::parse(from).unwrap(), Some(&value(location)));
+        let said = at("https://a.example/x", "http://b.example/y").unwrap_err();
+        assert!(said.contains("https") && said.contains("http"), "{said}");
+        assert!(at("https://a.example/x", "//b.example/y").unwrap().as_str() == "https://b.example/y");
+        assert_eq!(
+            at("http://a.example/x/y", "https://b.example/z?q=1#f")
+                .unwrap()
+                .as_str(),
+            "https://b.example/z?q=1"
+        );
+        assert_eq!(
+            at("http://a.example/x/y", "z").unwrap().as_str(),
+            "http://a.example/x/z"
+        );
+        assert!(at("https://a.example/x", "ftp://b.example/y").is_err());
+        let long = format!("/{}", "a".repeat(2048));
+        assert!(at("http://a.example/", &long).unwrap_err().contains("2048"));
+        assert!(hop(&reqwest::Url::parse("http://a.example/").unwrap(), None).is_err());
+    }
+
+    /// Each hop is vetted as the first address is: the redirect's target is named in the
+    /// refusal (and its query, which may be a signature, is not).
+    #[tokio::test]
+    async fn os_image_redirect_to_loopback_or_a_private_range_is_refused_with_lan_off() {
+        locally(async {
+            let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (a, b) = (first.local_addr().unwrap(), second.local_addr().unwrap());
+            let one = serving(first, move |path| {
+                // (The first answer is from "outside"; what it names is looked at as itself.)
+                crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
+                moved(&match path {
+                    "/loopback" => format!("http://{b}/x?sig=secret"),
+                    _ => "http://10.254.253.252/x?sig=secret".into(),
+                })
+            });
+            let two = serving(second, |_| IMAGE.to_string());
+            for (path, target, words) in [
+                ("/loopback", format!("{b}"), "not fetched from this node"),
+                ("/private", "10.254.253.252".into(), "--lan-releases"),
+            ] {
+                let said = fetched(&format!("http://{a}{path}"), false).await.unwrap_err();
+                assert!(said.contains(&target) && said.contains(words), "{said}");
+                assert!(said.contains("redirect") && !said.contains("secret"), "{said}");
+            }
+            // And with the LAN allowed, loopback is this node still.
+            let said = fetched(&format!("http://{a}/loopback"), true).await.unwrap_err();
+            assert!(said.contains("not fetched from this node"), "{said}");
+            assert!(two.borrow().is_empty(), "nothing was asked of it");
+            assert_eq!(one.borrow().len(), 3);
+        })
+        .await;
+    }
+
+    /// With `--lan-releases` a private range is followed to (the connection is tried: there
+    /// is no such host here, so it is not answered), but never the cluster's own mesh.
+    #[tokio::test]
+    async fn os_image_redirect_to_a_private_range_is_followed_with_lan_on_but_not_the_mesh() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let mesh = *MESH.get_or_init(|| kith_mesh::prefix(b"a cluster"));
+            let pod = kith_mesh::node_net(mesh, "n2");
+            let log = serving(listener, move |path| {
+                moved(&match path {
+                    "/mesh" => format!("http://[{pod}]/x"),
+                    _ => "http://10.254.253.252/x".into(),
+                })
+            });
+            let said = fetched(&format!("http://{at}/mesh"), true).await.unwrap_err();
+            assert!(said.contains("cluster's own mesh"), "{said}");
+            let tried = tokio::time::timeout(Duration::from_secs(2), fetched(&format!("http://{at}/lan"), true)).await;
+            crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
+            match tried {
+                // (No route, or refused: said of the address, never of the vetting.)
+                Ok(said) => {
+                    let said = said.unwrap_err();
+                    assert!(
+                        said.contains("10.254.253.252") && !said.contains("not fetched from"),
+                        "{said}"
+                    );
+                }
+                // (Or the connection is still being made, as on a host that routes it: the
+                // vetting passed, and the redirect was served once, as the log says.)
+                Err(_) => assert_eq!(log.borrow().iter().filter(|p| *p == "/lan").count(), 1),
+            }
+            assert_eq!(*log.borrow(), ["/mesh", "/lan"]);
+        })
+        .await;
     }
 
     fn plan(spec: Value, status: Option<&Decided>) -> Resource {
@@ -2197,5 +2733,168 @@ mod kithd_vouched {
         let (forge, _) = pair();
         crate::os::keep_signed(&keys.state, 'b', Some(&forge(&now)), Some(&public), &now).unwrap();
         assert_eq!(keys.way('b', IMAGE, &next), Way::Full);
+    }
+
+    #[test]
+    fn says_why_it_is_a_full_update() {
+        let now = block("1", Some([&digest('a'), &digest('b'), &digest('c')]));
+        let (keys, _) = node("kithd-vouched-why", &now);
+        let same = block("2", Some([&digest('f'), &digest('b'), &digest('c')]));
+        let kernel = block("2", Some([&digest('f'), &digest('d'), &digest('c')]));
+        let rest = block("2", Some([&digest('f'), &digest('b'), &digest('e')]));
+        assert_eq!(keys.kithd_only('b', IMAGE, &same), Ok(()));
+        assert!(keys.kithd_only('b', IMAGE, &kernel).unwrap_err().contains("kernel"));
+        assert!(
+            keys.kithd_only('b', IMAGE, &rest)
+                .unwrap_err()
+                .contains("rest of the root")
+        );
+        assert!(
+            keys.kithd_only('b', IMAGE, &block("2", None))
+                .unwrap_err()
+                .contains("no kithd object")
+        );
+        // (The running system's own release is not proven: no header kept for that slot.)
+        assert!(keys.kithd_only('a', IMAGE, &same).unwrap_err().contains("not proven"));
+    }
+}
+
+/// Staging a kithd (T-0709): the new kithd is put in a root-only place of its own, and only
+/// after its sha256 is the one the signed header names.
+#[cfg(test)]
+mod stage {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const KITHD: &[u8] = b"#!/bin/sh\nexit 0\n";
+
+    /// A staging folder (mode 0700, as the mount is) and a file holding `KITHD` beside it.
+    fn folders(name: &str) -> (PathBuf, PathBuf) {
+        let root = tests::scratch(&format!("stage-{name}"));
+        let (dir, from) = (root.join("bin"), root.join("sbin-init"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&from, KITHD).unwrap();
+        (dir, from)
+    }
+
+    fn sum(bytes: &[u8]) -> String {
+        crate::os::sha256(bytes)
+    }
+
+    #[test]
+    fn refuses_a_binary_whose_sha256_differs_from_the_signed_digest_and_leaves_the_mount_root_only() {
+        let (dir, from) = folders("differs");
+        // An older staged file stays what it was (it may be the one that runs).
+        std::fs::write(dir.join("kithd"), b"older").unwrap();
+        let why = stage(&from, &sum(b"another kithd"), &dir).unwrap_err();
+        assert!(why.contains("sha256"), "{why}");
+        assert_eq!(std::fs::read(dir.join("kithd")).unwrap(), b"older");
+        assert!(!dir.join("kithd.new").exists(), "no half-staged file is left");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "still root-only");
+    }
+
+    #[test]
+    fn stages_what_the_digest_names_as_an_executable_only_its_owner_has() {
+        let (dir, from) = folders("matches");
+        std::fs::write(dir.join("kithd"), b"older").unwrap();
+        // (Upper case, as a header may write it.)
+        let staged = stage(&from, &sum(KITHD).to_ascii_uppercase(), &dir).unwrap();
+        assert_eq!(staged, dir.join("kithd"));
+        assert_eq!(std::fs::read(&staged).unwrap(), KITHD);
+        assert_eq!(std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(!dir.join("kithd.new").exists());
+        // Twice: the same file again.
+        stage(&from, &sum(KITHD), &dir).unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), KITHD);
+    }
+
+    #[test]
+    fn refuses_a_place_that_others_could_write_or_that_is_not_there() {
+        let (dir, from) = folders("open");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let why = stage(&from, &sum(KITHD), &dir).unwrap_err();
+        assert!(why.contains("only"), "{why}");
+        assert!(!dir.join("kithd").exists());
+        assert!(stage(&from, &sum(KITHD), &dir.join("nowhere")).is_err());
+        let (dir, _) = folders("no-file");
+        assert!(stage(&dir.join("not-there"), &sum(KITHD), &dir).is_err());
+    }
+
+    #[test]
+    fn a_hand_over_counts_for_the_kithd_it_names_and_for_no_other() {
+        let root = tests::scratch("stage-effective");
+        let (record, exe) = (root.join("handed-over"), root.join("exe"));
+        std::fs::write(&exe, KITHD).unwrap();
+        let says = |os: &str| effective(os.to_string(), &record, &exe);
+        // No record: what the system says.
+        assert_eq!(says("1.0"), "1.0");
+        hand_over(&record, "1.0", "1.1", &sum(KITHD)).unwrap();
+        assert_eq!(says("1.0"), "1.1");
+        // The system itself has caught up (a reboot into the new slot): its own word.
+        assert_eq!(says("1.1"), "1.1");
+        assert_eq!(says("1.2"), "1.2");
+        // Not the kithd that runs (the keeper fell back to its own): the system's.
+        std::fs::write(&exe, b"the old kithd").unwrap();
+        assert_eq!(says("1.0"), "1.0");
+        // A record that is not what was written.
+        std::fs::write(&record, "nonsense").unwrap();
+        assert_eq!(says("1.0"), "1.0");
+        // A version that could not be read back is not recorded.
+        assert!(hand_over(&record, "1.0", "1.1 x", &sum(KITHD)).is_err());
+        // Nor is a version that is not newer than the one that runs.
+        std::fs::remove_file(&record).unwrap();
+        assert!(hand_over(&record, "1.1", "1.1", &sum(KITHD)).is_err());
+        assert!(hand_over(&record, "1.1", "1.0", &sum(KITHD)).is_err());
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn a_kithd_handed_over_to_that_was_not_the_one_that_runs_is_noted_as_a_try_that_failed() {
+        let root = tests::scratch("stage-failed");
+        let (record, exe, state) = (root.join("handed-over"), root.join("exe"), root.join("state"));
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(&exe, KITHD).unwrap();
+        hand_over(&record, "1.0", "1.1", &sum(KITHD)).unwrap();
+        // The staged kithd runs: nothing failed.
+        forgo_failed_hand_over(&state, "1.0", &record, &exe);
+        assert!(!tried(&state).exists());
+        // It crashed and the keeper went back to the old one: 1.1 is a try that failed.
+        std::fs::write(&exe, b"the old kithd").unwrap();
+        forgo_failed_hand_over(&state, "1.0", &record, &exe);
+        let said = report(&state, "1.0", 'a', "");
+        assert_eq!(said["failed"], "1.1");
+        assert!(
+            said["why"].as_str().unwrap().contains("handed over to failed"),
+            "{said}"
+        );
+        // A system that has caught up (a reboot into the new slot) has nothing to note.
+        std::fs::remove_file(tried(&state)).unwrap();
+        forgo_failed_hand_over(&state, "1.1", &record, &exe);
+        assert!(!tried(&state).exists());
+    }
+
+    #[test]
+    fn refuses_a_file_larger_than_most_and_leaves_nothing_staged() {
+        let (dir, from) = folders("large");
+        let big = vec![7u8; STAGE_MOST as usize + 1];
+        std::fs::write(&from, &big).unwrap();
+        let why = stage(&from, &sum(&big), &dir).unwrap_err();
+        assert!(why.contains("larger"), "{why}");
+        assert!(!dir.join("kithd").exists() && !dir.join("kithd.new").exists());
+    }
+}
+
+/// (Here, at the foot, so that `#[cfg(test)]` comes after the code the cluster's `pinned_peer`
+/// test counts clients in: it reads each file up to the first one.)
+#[cfg(test)]
+impl Keys {
+    /// [`Keys::kithd_only`] as a [`crate::os::Way`].
+    pub fn way(&self, slot: char, running: &[u8], block: &[u8]) -> crate::os::Way {
+        match self.kithd_only(slot, running, block) {
+            Ok(()) => crate::os::Way::KithdOnly,
+            Err(_) => crate::os::Way::Full,
+        }
     }
 }

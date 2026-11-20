@@ -273,6 +273,12 @@ impl Device {
             .collect())
     }
 
+    /// The interface's private key replaced, in place: its peers stay, and its sessions are
+    /// made again (the kernel expires them, so each peer is shaken hands with anew, by this key).
+    pub fn set_private_key(&mut self, key: &Key) -> Result<()> {
+        self.set(vec![WireguardAttribute::PrivateKey(*key)])
+    }
+
     /// The public key that goes with the private one.
     pub fn public_key(&mut self) -> Result<Key> {
         let key = self.get()?.into_iter().find_map(|attribute| match attribute {

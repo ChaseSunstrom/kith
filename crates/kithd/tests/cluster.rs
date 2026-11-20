@@ -3341,6 +3341,69 @@ fn roaming_node_is_sent_the_store_over_the_mesh() {
     assert_ne!(alpha.kith(&["get", "node/twin"]).0, 0);
 }
 
+/// A node that joined over the LAN (no mesh in its join) and has the mesh on, serving on every
+/// address: once it says its key the leader records it at its mesh address (its LAN one kept
+/// beside), and the store goes on coming to it, now over the mesh.
+#[test]
+fn mesh_address_of_a_lan_joined_node() {
+    // (Straight to stderr: the test harness keeps what eprintln! says of a test that passes.)
+    let skip = |why: &str| {
+        use std::io::Write;
+        drop(writeln!(
+            std::io::stderr(),
+            "SKIP mesh_address_of_a_lan_joined_node: {why}"
+        ));
+    };
+    if std::env::var_os("KITH_E2E").is_none() {
+        return skip("set KITH_E2E=1");
+    }
+    if std::env::var_os("KITH_IN_NAMESPACE").is_none() {
+        let unshare = |args: &[&str]| Command::new("unshare").arg("-Urn").args(args).status();
+        if !unshare(&["true"]).is_ok_and(|status| status.success()) {
+            return skip("no unprivileged user namespaces here (unshare -Urn)");
+        }
+        let me = std::env::current_exe().unwrap();
+        // (10.9.0.1 is the LAN here: the root part will not call a peer at a loopback address.)
+        let again = "ip link set lo up && ip addr add 10.9.0.1/32 dev lo && KITH_IN_NAMESPACE=1 exec \"$0\" --exact mesh_address_of_a_lan_joined_node --nocapture";
+        let status = unshare(&["sh", "-c", again, me.to_str().unwrap()]).unwrap();
+        assert!(status.success(), "the test failed inside its namespace");
+        return;
+    }
+    let ports = (free_port().to_string(), free_port().to_string());
+    let mesh = ["--mesh", &ports.0, "--mesh-interface", "kith-alpha"];
+    let alpha = Node::start_in(None, "10.9.0.1", free_port(), "mesh-lan", "alpha", &mesh);
+    wait_for("alpha to lead", || alpha.kith(&["get", "node"]).0 == 0);
+    let token = alpha.ok(&["node", "token"]);
+    // (No --roaming: it joins as a LAN node, calling alpha on its LAN address.)
+    let join = ["--join", &alpha.address(), "--token", token.trim()];
+    let mesh = ["--mesh", &ports.1, "--mesh-interface", "kith-beta"];
+    let beta = Node::start_in(None, "[::]", free_port(), "mesh-lan", "beta", &[join, mesh].concat());
+    let node =
+        || -> serde_json::Value { serde_json::from_str(&alpha.ok(&["get", "node/beta", "-o", "json"])).unwrap() };
+    let lan = format!("10.9.0.1:{}", beta.port);
+    assert_eq!(node()["status"]["address"], lan.as_str(), "it joined over the LAN");
+    wait_for("beta to be recorded at its mesh address", || {
+        node()["status"]["address"]
+            .as_str()
+            .is_some_and(|at| at.starts_with("[fd"))
+    });
+    let node = node();
+    let at = node["status"]["address"].as_str().unwrap();
+    assert!(at.ends_with(&format!("]:{}", beta.port)), "{at}");
+    assert_eq!(node["status"]["lan"], lan.as_str(), "{node}");
+    assert_eq!(node["status"]["mesh"]["api"], true, "{node}");
+    // The store comes to it there: a change made on alpha arrives, and the mesh stays up.
+    let made = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: over-mesh }\nspec: { data: { a: b } }\n";
+    std::fs::write(alpha.dir.join("over-mesh.yaml"), made).unwrap();
+    alpha.ok(&["apply", "-f", "over-mesh.yaml"]);
+    wait_for("the change to reach beta", || {
+        beta.kith(&["get", "configmap/over-mesh"]).0 == 0
+    });
+    let status = alpha.ok(&["node", "status"]);
+    let line = status.lines().find(|line| line.starts_with("mesh:      beta at fd"));
+    assert!(line.is_some_and(|line| line.contains(", handshake ")), "{status}");
+}
+
 /// Two nodes with the mesh on, in a network namespace of their own (this test runs itself
 /// again inside one, where it may make interfaces): each learns the other's key from the
 /// store, they shake hands, and a node that stops takes its interface with it.
@@ -3403,6 +3466,127 @@ fn nodes_mesh() {
     assert!(there("kith-beta") && there("kith-alpha"));
     beta.stop();
     assert!(!there("kith-beta") && there("kith-alpha"));
+}
+
+/// A node rotates its mesh key (`spec.mesh.rotate` on its Node, T-1017): it makes a new key
+/// beside the old, publishes the new public key as `next`, and its peer installs it as a peer
+/// of its own at once. The node switches its interface to the new key only when the peer has
+/// said so, and writes the new key over the old only once the two have shaken hands on it. Then
+/// the cluster's Node says the new key, the peer has it and not the old, and the key file is the
+/// new one (0600). (Runs in the rig's namespaces, a node in each, as the mesh does not call a
+/// peer at a loopback address; the failures, where the old key stays, are `mesh.rs`'s own tests.)
+#[test]
+fn mesh_key_rotates() {
+    use base64::Engine;
+    use std::os::unix::fs::PermissionsExt;
+    if !in_rig("mesh_key_rotates") {
+        return;
+    }
+    // `wg` is how the kernel is asked what a node's interface is: the test is of what it holds.
+    let wg = |node: &str, args: &[&str]| -> Option<String> {
+        let out = Command::new("ip")
+            .args(["netns", "exec", node, "wg"])
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    if Command::new("wg").arg("--version").output().is_err() {
+        return eprintln!("skipped: no wg to ask the kernel with");
+    }
+    let rig = Rig::new(&[("alpha", false), ("beta", false)]);
+    let base64 = |hex: &str| {
+        let bytes: Vec<u8> = (0..hex.len() / 2)
+            .map(|at| u8::from_str_radix(&hex[2 * at..2 * at + 2], 16).unwrap())
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    };
+    let test = "meshrotate";
+    let alpha = rig.start(
+        test,
+        "alpha",
+        None,
+        &["--mesh", "51820", "--mesh-interface", "kith-alpha"],
+    );
+    wait_for("alpha to lead", || alpha.kith(&["get", "node"]).0 == 0);
+    let mesh = ["--mesh", "51820", "--mesh-interface", "kith-beta"];
+    let mut beta = rig.start(test, "beta", Some(&alpha), &mesh);
+    let said = |name: &str| -> serde_json::Value {
+        let node = alpha.ok(&["get", &format!("node/{name}"), "-o", "json"]);
+        serde_json::from_str::<serde_json::Value>(&node).unwrap()
+    };
+    let peers = || wg("alpha", &["show", "kith-alpha", "peers"]).unwrap_or_default();
+    let shook = |node: &Node, other: &str| {
+        let status = node.ok(&["node", "status"]);
+        let line = status
+            .lines()
+            .find(|line| line.starts_with(&format!("mesh:      {other} at fd")));
+        line.is_some_and(|line| line.contains(", handshake ") && !line.contains("edge node"))
+    };
+    wait_for("the two to shake hands", || {
+        shook(&alpha, "beta") && shook(&beta, "alpha")
+    });
+    let old = said("beta")["status"]["mesh"]["key"].as_str().unwrap().to_string();
+    let file = beta.dir.join("state/pki/mesh.key");
+    let old_private = std::fs::read_to_string(&file).unwrap();
+    assert!(peers().contains(&base64(&old)), "alpha does not have beta's key");
+
+    // Rotate: the Node's spec says so (fetched, changed, applied).
+    let mut node = said("beta");
+    node["spec"]["mesh"] = serde_json::json!({ "rotate": "first" });
+    std::fs::write(alpha.dir.join("node.json"), node.to_string()).unwrap();
+    alpha.ok(&["apply", "-f", "node.json"]);
+    // (A handshake is asked for by the keepalive, every 25 seconds: more than a minute is waited.)
+    let deadline = Instant::now() + deadline_for(Duration::from_secs(150));
+    let new = loop {
+        let mesh = said("beta")["status"]["mesh"].clone();
+        if mesh["rotated"] == "first" {
+            break mesh["key"].as_str().unwrap().to_string();
+        }
+        assert!(Instant::now() < deadline, "beta did not finish rotating: {mesh}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_ne!(new, old, "the key said is still the old one");
+    assert!(said("beta")["status"]["mesh"]["next"].is_null(), "{}", said("beta"));
+
+    // The file is the new key, whole and for the node alone, and nothing is left beside it.
+    let private = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        private.len() == 64 && private != old_private,
+        "the key file was not replaced"
+    );
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    for left in ["mesh.next", "mesh.new"] {
+        assert!(
+            !beta.dir.join("state/pki").join(left).exists(),
+            "{left} was left behind"
+        );
+    }
+    // The interface runs on it, and the cluster has its public key, and never the private one.
+    let held = wg("beta", &["show", "kith-beta", "public-key"]).unwrap();
+    assert_eq!(held.trim(), base64(&new));
+    assert!(!alpha.ok(&["get", "node", "-o", "json"]).contains(&private));
+    // The peer holds the new key and not the old, and has shaken hands on it.
+    let at_alpha = peers();
+    assert!(
+        at_alpha.contains(&base64(&new)) && !at_alpha.contains(&base64(&old)),
+        "{at_alpha}"
+    );
+    wait_for("alpha to have shaken hands on the new key", || {
+        let shaken = wg("alpha", &["show", "kith-alpha", "latest-handshakes"]).unwrap_or_default();
+        let line = shaken.lines().find(|line| line.starts_with(&base64(&new)));
+        line.is_some_and(|line| line.split_whitespace().nth(1).is_some_and(|at| at != "0"))
+    });
+    wait_for("the two to be reaching each other", || {
+        shook(&alpha, "beta") && shook(&beta, "alpha")
+    });
+    // Said once, it is done once: beta goes on with the key it has.
+    std::thread::sleep(Duration::from_secs(12));
+    assert_eq!(said("beta")["status"]["mesh"]["key"], new.as_str());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), private);
+    beta.stop();
 }
 
 // The rig: a network namespace for each node, and the namespace the test itself runs in

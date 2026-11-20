@@ -24,10 +24,27 @@
     wait "$vm" 2>/dev/null || true
     echo "vm.sh: ok: kithd loaded snd_hda_intel at start and snd_usb_audio for a device added after, in the same boot"
 
+    # NVIDIA's open modules, built out of tree in the same build: each is signed (the tail
+    # of a signed module is the mark), the alias of an NVIDIA card (vendor 10DE) names nvidia,
+    # and no key is left in the modules or in their /lib/modules index.
+    real=${KITH_OS_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/kith-os}
+    for n in nvidia nvidia-modeset nvidia-uvm nvidia-drm; do
+        found=$(find "$real" -path '*/mods/*' -name "$n.ko")
+        [ -n "$found" ] || fail "no $n.ko in the kernel's modules: the NVIDIA modules were not built"
+        for m in $found; do
+            tail -c 28 "$m" | grep -aq '^~Module signature appended~$' || fail "$m is not signed"
+        done
+    done
+    for d in "$real"/kernel-*/mods/lib/modules/*; do
+        [ -d "$d" ] || continue
+        grep -q '^alias pci:v000010DE.* nvidia$' "$d/modules.alias" || fail "$d/modules.alias has no alias of an NVIDIA card for nvidia"
+        ! grep -rlaE -e '-----BEGIN [A-Z ]*PRIVATE KEY' "$d" || fail "a private key is in $d"
+    done
+    echo "vm.sh: ok: nvidia, nvidia-modeset, nvidia-uvm and nvidia-drm signed, nvidia aliased to NVIDIA's cards, no key left"
+
     # The same spec, built from a cache of its own: the kernel and its modules copied (the
     # real cache is read only through its links), one byte of snd-usb-audio changed after it
     # was signed.
-    real=${KITH_OS_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/kith-os}
     cache=$work/cache
     mkdir -p "$cache"
     for f in "$real"/*; do

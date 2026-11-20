@@ -91,6 +91,13 @@ pub fn exec_shim() {
     std::process::exit(127);
 }
 
+/// A container's open-file limits given kithd's hard one: soft 1024, as containerd gives (most
+/// programs size their tables from the soft limit), and hard kithd's own so an app can raise
+/// its soft one; the soft one is never above the hard one.
+pub fn container_nofile(hard: u64) -> (u64, u64) {
+    (hard.min(1024), hard)
+}
+
 pub struct Runtime {
     root: PathBuf,
     cgroup_parent: String,
@@ -446,6 +453,15 @@ pub struct Mount {
     pub part: Option<String>,
 }
 
+/// A unit an earlier kithd left running, found by [`Runtime::cleanup_but`]: its cgroup still has
+/// processes, so it keeps its id and its device nodes (`devices`: none for an exec unit) until
+/// they are gone. `handle` deletes it once they are.
+pub struct Left {
+    pub id: String,
+    pub devices: Vec<PathBuf>,
+    pub handle: Handle,
+}
+
 /// A created container or exec unit. Dropping it does not stop it; call [`Handle::delete`].
 pub struct Handle {
     /// `None` for an exec unit.
@@ -509,10 +525,12 @@ impl Runtime {
     /// e.g. after a crash. Returns how many were removed.
     pub fn cleanup(&self) -> Result<usize> {
         self.sweep_left(Path::new("/sys/fs/cgroup"), &BTreeSet::new())
+            .map(|(removed, _)| removed)
     }
 
-    /// [`Runtime::cleanup`], but the units of `kept` (taken back by [`Runtime::adopt`]) stay.
-    pub fn cleanup_but(&self, kept: &BTreeSet<String>) -> Result<usize> {
+    /// [`Runtime::cleanup`], but the units of `kept` (taken back by [`Runtime::adopt`]) stay. Gives
+    /// back, beside the count, each unit kept because its cgroup still has processes.
+    pub fn cleanup_but(&self, kept: &BTreeSet<String>) -> Result<(usize, Vec<Left>)> {
         self.sweep_left(Path::new("/sys/fs/cgroup"), kept)
     }
 
@@ -577,10 +595,7 @@ impl Runtime {
                 gone();
                 continue;
             }
-            let (state, bundle) = (
-                self.root.join("state").join(&id),
-                self.root.join("containers").join(&id),
-            );
+            let (state, bundle) = (self.root.join("state").join(&id), self.bundle_of(&id));
             // An exec unit's state is an empty directory, its marker (see `exec`); a container
             // whose state does not load is not taken.
             let container = match state.join("state.json").exists() {
@@ -632,10 +647,20 @@ impl Runtime {
         stopped
     }
 
+    /// What the unit `id` leaves to delete: its bundle, or for an exec unit (it has none) its
+    /// marker in `state` (see `exec`).
+    fn bundle_of(&self, id: &str) -> PathBuf {
+        let bundle = self.root.join("containers").join(id);
+        match bundle.exists() {
+            true => bundle,
+            false => self.root.join("state").join(id),
+        }
+    }
+
     /// [`Runtime::cleanup`], with the cgroups asked about under `sys`. What is left is each id
     /// with state, and each bundle with none: a container being made when kithd stopped, whose
     /// config.json may be empty after a power cut (and so give no range: see `take_range`).
-    fn sweep_left(&self, sys: &Path, kept: &BTreeSet<String>) -> Result<usize> {
+    fn sweep_left(&self, sys: &Path, kept: &BTreeSet<String>) -> Result<(usize, Vec<Left>)> {
         let (states, bundles) = (self.root.join("state"), self.root.join("containers"));
         let mut left = BTreeSet::new();
         for dir in [&states, &bundles] {
@@ -643,7 +668,7 @@ impl Runtime {
                 left.insert(entry.file_name());
             }
         }
-        let mut removed = 0;
+        let (mut removed, mut stuck) = (0, Vec::new());
         for name in left.into_iter().filter(|name| !kept.contains(&*name.to_string_lossy())) {
             let state = states.join(&name);
             let cgroup = format!("{}/kith-{}", self.cgroup_parent, name.to_string_lossy());
@@ -662,8 +687,32 @@ impl Runtime {
                 let _ = manager(&cgroup).remove();
             });
             removed += usize::from(swept);
+            if swept {
+                continue;
+            }
+            // Kept: the handle lets kithd delete it once its processes are gone, and the device
+            // nodes its bundle gave it say what it may still hold open.
+            let bundle = self.bundle_of(&name.to_string_lossy());
+            let spec = Spec::load(bundle.join("config.json")).ok();
+            let devices = spec.as_ref().and_then(|spec| spec.linux().as_ref()?.devices().as_ref());
+            stuck.push(Left {
+                id: name.to_string_lossy().into_owned(),
+                devices: devices.into_iter().flatten().map(|node| node.path().clone()).collect(),
+                handle: Handle {
+                    container: Container::load(state).ok(),
+                    go: None,
+                    // (Not its main's: that is not known, and nothing is waited for or signalled by it.)
+                    pid: Pid::from_raw(0),
+                    reaped: true,
+                    bundle,
+                    cgroup: path,
+                    range: None,
+                    adopted: None,
+                    note: None,
+                },
+            });
         }
-        Ok(removed)
+        Ok((removed, stuck))
     }
 
     /// Create the container `id`: namespaces and cgroup are set up and the
@@ -1466,7 +1515,20 @@ fn cgroup_parent() -> Result<String> {
         return Ok("/kith".into());
     }
     let own = fs::read_to_string("/proc/self/cgroup").ctx("reading /proc/self/cgroup")?;
-    let own = own.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("/");
+    parent_of_own(&own)
+}
+
+/// Whether [`Runtime::new`] can find a cgroup to put containers in here (the same question as
+/// `cgroup_parent`, so a test that needs one can skip where it has none, as in a kith Job).
+#[doc(hidden)]
+pub fn has_delegated_cgroup() -> bool {
+    cgroup_parent().is_ok()
+}
+
+/// The delegated parent of the cgroup `/proc/self/cgroup` (`proc`) names: its parent, unless that is
+/// the root, which no user was given.
+fn parent_of_own(proc: &str) -> Result<String> {
+    let own = proc.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("/");
     match Path::new(own).parent() {
         Some(parent) if parent != Path::new("/") => Ok(parent.display().to_string()),
         _ => err("no delegated cgroup: run kith inside a systemd user session or scope"),
@@ -1950,6 +2012,25 @@ fn spec_shifted(
             .into(),
     );
     process.set_terminal(Some(false));
+    // The open-file limit: the spec's default is 1024 soft and hard, which an app cannot raise.
+    let (soft, hard) = match nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE) {
+        Ok((_, hard)) => {
+            // (The kernel refuses a hard limit above fs.nr_open: an unlimited one is capped to it.)
+            let cap = fs::read_to_string("/proc/sys/fs/nr_open")
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            container_nofile(hard.min(cap))
+        }
+        Err(_) => (1024, 1024),
+    };
+    process.set_rlimits(Some(vec![
+        oci_spec::runtime::PosixRlimitBuilder::default()
+            .typ(oci_spec::runtime::PosixRlimitType::RlimitNofile)
+            .soft(soft)
+            .hard(hard)
+            .build()?,
+    ]));
     let root = uid.is_root();
     if root {
         // (Its group said once more as the whole list of its groups: with no list,
@@ -2244,6 +2325,35 @@ mod tests {
 
     /// A create a runner's cgroup refuses (no pids limit) is a skip the CI log shows, not a silent
     /// pass: the line is a GitHub `::warning` annotation, written past the test harness's capture.
+    /// Where a test needs a cgroup to put containers in and there is none (a kith Job has no delegated
+    /// one), it says so and returns: `false` means skip.
+    fn delegated_or_skip() -> bool {
+        let has = has_delegated_cgroup();
+        if !has {
+            report_skip("skipped: no delegated cgroup here");
+        }
+        has
+    }
+
+    /// A root has `/kith`; a user has the parent of its own cgroup unless that is the root: a path
+    /// directly under the root, or the root itself, is no delegation and is an error, not a panic.
+    #[test]
+    fn cgroup_parent_is_none_without_a_delegated_one() {
+        assert_eq!(
+            parent_of_own("0::/user.slice/user-1000.slice/session-1.scope\n").unwrap(),
+            "/user.slice/user-1000.slice"
+        );
+        // (A hybrid host: v1 lines first, then the v2 one.)
+        assert_eq!(
+            parent_of_own("1:name=x:/a/b\n0::/user.slice/a.slice/b.scope\n").unwrap(),
+            "/user.slice/a.slice"
+        );
+        for no in ["0::/\n", "0::/kith-job\n", "", "1:name=x:/a/b\n"] {
+            let said = parent_of_own(no).unwrap_err().to_string();
+            assert!(said.contains("no delegated cgroup"), "{no:?}: {said}");
+        }
+    }
+
     #[test]
     fn pids_limit_skip_is_reported_only_for_a_cgroup_refusal() {
         let line = cgroup_skip("failed to create: cgroup error: no pids").expect("a cgroup refusal skips");
@@ -2319,6 +2429,16 @@ mod tests {
 
         let made = spec(&"x".repeat(100), &image, &unit(Some(500)), "/kith/a", Path::new("/b")).unwrap();
         assert_eq!(made.hostname().as_ref().unwrap().len(), 63);
+        // (The open-file limit: soft 1024 and kithd's hard one, never the spec's 1024 and 1024.)
+        let (_, hard) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
+        let process = made.process().as_ref().unwrap();
+        let limits = process.rlimits().as_ref().unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(
+            (limits[0].soft(), limits[0].hard()),
+            container_nofile(hard),
+            "a container's open-file limits"
+        );
         let linux = made.linux().as_ref().unwrap();
         let namespaces = linux.namespaces().as_ref().unwrap();
         assert!(
@@ -3132,6 +3252,9 @@ mod tests {
     /// in the log its init process wrote, which the unit's failure must carry.
     #[test]
     fn create_error_names_what_failed_beneath() {
+        if !delegated_or_skip() {
+            return;
+        }
         let root = std::env::temp_dir().join(format!("kith-create-error-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let runtime = Runtime::new(root.join("runtime")).unwrap();
@@ -3173,6 +3296,9 @@ mod tests {
     /// of them says so within the watchdog.
     #[test]
     fn create_from_many_threads() {
+        if !delegated_or_skip() {
+            return;
+        }
         const THREADS: usize = 8;
         const EACH: usize = 6;
         let root = std::env::temp_dir().join(format!("kith-create-threads-{}", std::process::id()));
@@ -3237,6 +3363,9 @@ mod tests {
     /// own status, which the program keeps when it execs.)
     #[test]
     fn container_starts_with_no_signal_blocked() {
+        if !delegated_or_skip() {
+            return;
+        }
         let root = std::env::temp_dir().join(format!("kith-sigblk-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let runtime = Runtime::new(root.join("runtime")).unwrap();
@@ -3338,7 +3467,7 @@ mod tests {
     /// this host's hardened kernel does; on one that allows it, it checks the overlay is what is made.)
     #[test]
     fn a_rootless_writable_root_is_read_only_only_where_the_kernel_refuses_overlay() {
-        if nix::unistd::getuid().is_root() {
+        if nix::unistd::getuid().is_root() || !delegated_or_skip() {
             return;
         }
         let root = std::env::temp_dir().join(format!("kith-overlay-refused-{}", std::process::id()));
@@ -3790,7 +3919,7 @@ mod tests {
             clear_kept(&state.join("clear"), &bundles.join("clear"), &cgroup, || {}).unwrap();
         });
         freed("clean", &|| {
-            assert_eq!(runtime.sweep_left(&root.join("sys"), &BTreeSet::new()).unwrap(), 1)
+            assert_eq!(runtime.sweep_left(&root.join("sys"), &BTreeSet::new()).unwrap().0, 1)
         });
         // And a range whose bundle stays (a unit with processes left) is not.
         let kept = make("kept");
@@ -3893,7 +4022,7 @@ mod tests {
         fs::write(running.join("cgroup.events"), "populated 1\n").unwrap();
         assert!(take_range(&root.join("containers"), "x").is_err());
         assert_eq!(
-            runtime.sweep_left(&sys, &BTreeSet::new()).unwrap(),
+            runtime.sweep_left(&sys, &BTreeSet::new()).unwrap().0,
             1,
             "only what was removed is counted"
         );
@@ -3902,6 +4031,95 @@ mod tests {
             root.join("containers/running").exists(),
             "its cgroup has processes: kept"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A unit left behind whose cgroup still has processes is given back, with the device nodes
+    /// its bundle gave it and a handle that deletes it once they are gone (an earlier kithd's
+    /// stuck unit holds its id and its devices till then); one that is gone is not.
+    #[test]
+    fn sweep_keeps_a_unit_with_processes_and_the_devices_it_had() {
+        let _taking = RANGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("kith-left-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let parent = format!("/kith-test-left-{}", std::process::id());
+        let runtime = Runtime {
+            root: root.clone(),
+            cgroup_parent: parent.clone(),
+            images: ImageStore::new(root.join("images")).unwrap(),
+            shim: "/proc/self/exe".into(),
+            records: None,
+            overlay_refused: AtomicBool::new(false),
+        };
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let gpu = Unit {
+            devices: vec!["/dev/null".into()],
+            ..Unit::default()
+        };
+        fs::create_dir_all(root.join("state")).unwrap();
+        for name in ["stuck", "gone"] {
+            let bundle = root.join("containers").join(name);
+            fs::create_dir_all(&bundle).unwrap();
+            let made = spec(name, &image, &gpu, &format!("/kith/{name}"), &bundle).unwrap();
+            made.save(bundle.join("config.json")).unwrap();
+        }
+        let sys = root.join("sys");
+        let cgroup = |name: &str| sys.join(parent.trim_start_matches('/')).join(format!("kith-{name}"));
+        fs::create_dir_all(cgroup("stuck")).unwrap();
+        fs::write(cgroup("stuck").join("cgroup.events"), "populated 1\n").unwrap();
+        let (removed, left) = runtime.sweep_left(&sys, &BTreeSet::new()).unwrap();
+        assert_eq!(removed, 1, "only what was removed is counted");
+        let [kept] = &left[..] else {
+            panic!("one unit kept, got {}", left.len())
+        };
+        assert_eq!(kept.id, "stuck");
+        assert_eq!(kept.devices, vec![PathBuf::from("/dev/null")]);
+        assert_eq!(kept.handle.cgroup, cgroup("stuck"));
+        assert!(!root.join("containers/gone").exists());
+        // A removal that fails while it has processes gives the handle back, bundle kept; once
+        // they are gone the handle deletes it, and its bundle with it.
+        let [kept] = <[Left; 1]>::try_from(left).ok().unwrap();
+        let Err(Undeleted { handle: Some(busy), .. }) = kept.handle.finish(err("busy")) else {
+            panic!("populated: the handle comes back")
+        };
+        assert!(root.join("containers/stuck").exists());
+        fs::write(cgroup("stuck").join("cgroup.events"), "populated 0\n").unwrap();
+        assert!(busy.delete().is_ok());
+        assert!(!root.join("containers/stuck").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An exec unit's marker is its bundle (`state/<id>`, no `containers/<id>`): a kept one's
+    /// handle deletes that, not a bundle it never had.
+    #[test]
+    fn sweep_keeps_an_exec_unit_and_deletes_its_marker() {
+        let _taking = RANGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("kith-left-exec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let parent = format!("/kith-test-left-exec-{}", std::process::id());
+        let runtime = Runtime {
+            root: root.clone(),
+            cgroup_parent: parent.clone(),
+            images: ImageStore::new(root.join("images")).unwrap(),
+            shim: "/proc/self/exe".into(),
+            records: None,
+            overlay_refused: AtomicBool::new(false),
+        };
+        fs::create_dir_all(root.join("state/job")).unwrap();
+        fs::create_dir_all(root.join("containers")).unwrap();
+        let sys = root.join("sys");
+        let cgroup = sys.join(parent.trim_start_matches('/')).join("kith-job");
+        fs::create_dir_all(&cgroup).unwrap();
+        fs::write(cgroup.join("cgroup.events"), "populated 1\n").unwrap();
+        let (_, left) = runtime.sweep_left(&sys, &BTreeSet::new()).unwrap();
+        let [kept] = <[Left; 1]>::try_from(left).ok().unwrap();
+        assert!(kept.devices.is_empty());
+        fs::write(cgroup.join("cgroup.events"), "populated 0\n").unwrap();
+        assert!(kept.handle.delete().is_ok(), "the marker is there to remove");
+        assert!(!root.join("state/job").exists());
         let _ = fs::remove_dir_all(&root);
     }
 }

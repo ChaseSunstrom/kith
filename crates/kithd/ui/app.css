@@ -18,6 +18,13 @@
   --warn: #8f5f00;
   --bad: #c23030;
   --on-accent: #ffffff;
+  /* A node's line in the overview's panels, in the order of their names: blue first, never green. */
+  --s1: #2f5fe0;
+  --s2: #c75000;
+  --s3: #7a3fd1;
+  --s4: #b8326e;
+  --s5: #007c9e;
+  --s6: #8b5a2b;
   --stroke: 3px;
   --unit: 4px;
   --rail: 27px;
@@ -50,6 +57,12 @@
     --warn: #f2b84b;
     --bad: #ff7a7a;
     --on-accent: #0d1017;
+    --s1: #5b8cff;
+    --s2: #ff9a4d;
+    --s3: #b48cff;
+    --s4: #ff7ab0;
+    --s5: #44c2e0;
+    --s6: #d6a676;
   }
 }
 
@@ -94,7 +107,7 @@ pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-siz
 .mark .ring { fill: none; stroke: var(--accent); stroke-width: 1.5; animation: ring var(--breath) ease-out infinite; }
 .who { font-size: var(--small); color: var(--dim); }
 .who:empty { display: none; }
-#generation { font-size: var(--small); }
+#updated { font-size: var(--small); }
 /* The link to kithd is a stop too: filled when live, amber while it waits, a broken ring when lost. */
 .link { display: inline-flex; align-items: center; gap: calc(var(--unit) * 2); font-size: var(--small); font-weight: 700; }
 .link::before { content: ""; width: 14px; height: 14px; border: var(--stroke) solid currentColor; border-radius: 50%; }
@@ -105,22 +118,24 @@ pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-siz
 .link.bad { color: var(--bad); }
 .link.bad::before { border-width: 2px; border-style: dashed; }
 
-/* The board: 01 down the side, 02 across the top, 03 and 04 side by side. A part hangs
-   from a rule; nothing is boxed. */
-.board {
+/* The page: the line of stops down the side, and beside it one view at a time (the overview,
+   what was done, a kind's board, install). A part hangs from a rule; nothing is boxed. */
+.shell {
   flex: 1;
   min-height: 0;
   display: grid;
-  gap: calc(var(--unit) * 7) calc(var(--unit) * 9);
-  padding: 0 calc(var(--unit) * 5) calc(var(--unit) * 5);
-  grid-template-columns: 224px minmax(0, 1fr) minmax(0, 1.25fr);
-  grid-template-rows: auto minmax(0, 1fr);
-  grid-template-areas: "kinds pulse pulse" "kinds list detail";
+  grid-template-columns: 224px minmax(0, 1fr);
+  gap: calc(var(--unit) * 9);
+  padding-left: calc(var(--unit) * 5);
 }
-.kinds { grid-area: kinds; }
-.pulse { grid-area: pulse; }
-.list { grid-area: list; }
-.detail { grid-area: detail; }
+/* A kind's board: its list and the one open, side by side. */
+.board {
+  min-height: 0;
+  display: grid;
+  gap: calc(var(--unit) * 9);
+  padding: 0 calc(var(--unit) * 5) calc(var(--unit) * 5) 0;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+}
 .panel {
   min-width: 0;
   min-height: 0;
@@ -142,23 +157,24 @@ pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-siz
 #pane, #dialog-body { padding: var(--unit); margin: calc(var(--unit) * -1); }
 @media (max-width: 900px) {
   body { height: auto; }
-  .bar, .board { padding-left: calc(var(--unit) * 3); padding-right: calc(var(--unit) * 3); }
-  .board { display: flex; flex-direction: column; }
-  .kinds .scroll { max-height: 30vh; }
+  .bar, .shell { padding-left: calc(var(--unit) * 3); padding-right: calc(var(--unit) * 3); }
+  .shell, .board { display: flex; flex-direction: column; gap: calc(var(--unit) * 7); }
+  .board { padding-right: 0; }
+  .kinds .scroll { max-height: min(30vh, 16rem); }
   .scroll { overflow: visible; }
-  .list .scroll, .kinds .scroll, .diff, .logs { overflow: auto; }
-  #generation { display: none; }
+  .list .scroll, .kinds .scroll, .low .scroll, .diff, .logs { overflow: auto; }
+  #updated { display: none; }
 }
 
 /* 01: the line from the mark, a stop for every kind. A ring where the cluster has some of
    that kind, a tick where it has none, the blue stop where you are. */
 .kinds { position: relative; border-top: 0; padding-top: 0; animation: none; }
 .kinds::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: var(--stroke); background: var(--text); }
-.kinds > h2 { padding-left: var(--rail); }
-.kinds > .scroll { padding: 0 var(--unit) var(--unit) var(--rail); }
-.kinds > h2 { padding-top: calc(var(--unit) * 3); }
+.kinds > .scroll { padding: calc(var(--unit) * 2) var(--unit) var(--unit) var(--rail); }
+/* (The overview and what was done are the line's two ends, heavier than the kinds between.) */
+.kinds a.top { font-weight: 700; min-height: 36px; }
+.kinds a.top:last-child { margin-top: calc(var(--unit) * 3); }
 .kinds h3 { font-size: var(--small); font-weight: 400; color: var(--dim); margin: calc(var(--unit) * 3) 0 var(--unit); }
-.kinds h3:first-child { margin-top: 0; }
 .kinds a {
   position: relative;
   display: flex;
@@ -212,6 +228,97 @@ pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-siz
 .lamp.ok { fill: var(--accent); stroke: var(--accent); animation: beat var(--breath) ease-in-out infinite; animation-delay: calc(var(--step, 0) * -0.33s); }
 .lamp.wait { stroke: var(--warn); animation: wait var(--blink) ease-in-out infinite; }
 .lamp.bad { stroke: var(--bad); stroke-width: 2; stroke-dasharray: 3 2.5; }
+
+/* The overview: tiles across the top, then the panels, a line per node in its own colour
+   (--s1 to --s6, in the order of their names; --dim past the sixth), then the busiest
+   Workloads and what was done. A panel hangs from an ink rule like every part; one crosshair
+   runs through all of them. */
+.dash { min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: calc(var(--unit) * 7); padding: 0 calc(var(--unit) * 5) calc(var(--unit) * 8) 0; scrollbar-width: thin; scrollbar-color: var(--hair) transparent; }
+.dash-head { display: flex; align-items: center; flex-wrap: wrap; gap: calc(var(--unit) * 2) calc(var(--unit) * 3); padding-top: calc(var(--unit) * 3); border-top: var(--stroke) solid var(--text); animation: rise var(--enter) var(--ease) both; }
+.dash-head h2 { font-size: var(--large); font-weight: 800; letter-spacing: -0.02em; }
+.dash-head .dim { font-size: var(--small); }
+.ranges { display: flex; }
+.ranges .range { min-height: 30px; padding: 0 calc(var(--unit) * 3); border-width: 2px; font-size: var(--small); }
+.ranges .range + .range { margin-left: -2px; }
+button.range[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); position: relative; }
+.s0 { --hue: var(--dim); }
+.s1 { --hue: var(--s1); }
+.s2 { --hue: var(--s2); }
+.s3 { --hue: var(--s3); }
+.s4 { --hue: var(--s4); }
+.s5 { --hue: var(--s5); }
+.s6 { --hue: var(--s6); }
+
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: calc(var(--unit) * 7) calc(var(--unit) * 9); }
+.tile { display: flex; flex-direction: column; gap: var(--unit); min-width: 0; padding-top: calc(var(--unit) * 3); border-top: var(--stroke) solid var(--text); animation: rise var(--enter) var(--ease) both; }
+.tile:nth-child(2) { animation-delay: var(--step); }
+.tile:nth-child(3) { animation-delay: calc(var(--step) * 2); }
+.tile:nth-child(4) { animation-delay: calc(var(--step) * 3); }
+.tile h3 { font-size: var(--small); font-weight: 400; color: var(--dim); }
+.tile .value { font-size: 28px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.15; }
+.tile .dim { font-size: var(--small); overflow-wrap: anywhere; }
+.spark { display: block; width: 100%; height: 32px; margin-top: auto; overflow: visible; }
+.spark-line { fill: none; stroke: var(--hue, var(--accent)); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.stops { display: flex; flex-wrap: wrap; gap: 5px; margin-top: auto; padding: 4px 0; }
+.stops .stop { width: 12px; height: 12px; border: var(--stroke) solid var(--text); border-radius: 50%; }
+.stops .stop.ok { border-color: var(--accent); background: var(--accent); }
+.stops .stop.wait { border-color: var(--warn); animation: blink var(--blink) ease-in-out infinite; }
+.stops .stop.bad { border: 2px dashed var(--bad); }
+.stops .stop.none { border-color: var(--dim); }
+
+.charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: calc(var(--unit) * 7) calc(var(--unit) * 9); }
+.charts > .empty { grid-column: 1 / -1; padding-top: calc(var(--unit) * 3); border-top: 1px solid var(--hair); }
+.chart-panel { position: relative; display: flex; flex-direction: column; gap: calc(var(--unit) * 2); min-width: 0; padding-top: calc(var(--unit) * 3); border-top: var(--stroke) solid var(--text); animation: rise var(--enter) var(--ease) both; }
+.chart-panel:nth-child(2) { animation-delay: var(--step); }
+.chart-panel:nth-child(3) { animation-delay: calc(var(--step) * 2); }
+.chart-panel:nth-child(n + 4) { animation-delay: calc(var(--step) * 3); }
+.chart-panel h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--unit) calc(var(--unit) * 3); font-size: var(--base); font-weight: 800; }
+.chart-panel .key { display: inline-flex; gap: calc(var(--unit) * 4); margin-left: auto; font-size: var(--small); font-weight: 400; color: var(--dim); }
+.chart-panel .key > span { display: inline-flex; align-items: center; gap: calc(var(--unit) * 1.5); }
+.chart { display: block; width: 100%; height: 180px; overflow: visible; touch-action: pan-y; cursor: crosshair; }
+.chart .grid { stroke: var(--hair); stroke-width: 1; }
+.chart .grid.base { stroke: var(--text); stroke-width: 2; }
+.chart .tick { fill: var(--dim); font: 400 12px var(--sans); paint-order: stroke; stroke: var(--bg); stroke-width: 4px; stroke-linejoin: round; }
+.series { fill: none; stroke: var(--hue); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
+.series.second { stroke-width: 2; stroke-dasharray: 1 5; }
+.now { fill: var(--hue); stroke: var(--bg); stroke-width: 2; transform-box: fill-box; transform-origin: center; }
+.now.live { animation: beat var(--breath) ease-in-out infinite; }
+.cross { stroke: var(--text); stroke-width: 1.5; stroke-dasharray: 3 3; }
+.at { fill: var(--bg); stroke: var(--hue); stroke-width: 3; }
+.tip { position: absolute; top: 56px; z-index: 2; margin: 0 14px; display: grid; gap: 2px; padding: calc(var(--unit) * 2) calc(var(--unit) * 3); background: var(--bg); border: 2px solid var(--text); font-size: var(--small); white-space: nowrap; pointer-events: none; }
+.tip .row { display: flex; align-items: center; gap: calc(var(--unit) * 2); }
+.tip .name { flex: 1; font-weight: 700; }
+.legend { display: flex; flex-wrap: wrap; gap: var(--unit) calc(var(--unit) * 5); font-size: var(--small); }
+.legend li { display: flex; align-items: center; gap: calc(var(--unit) * 1.5); }
+.legend .name { font-weight: 700; }
+.legend .value { color: var(--dim); white-space: pre; }
+.legend .missing { color: var(--dim); }
+.legend .missing .name { font-weight: 400; }
+.swatch { flex: none; display: inline-block; width: 14px; height: var(--stroke); background: var(--hue, var(--text)); }
+.swatch.second { height: 0; background: none; border-top: var(--stroke) dotted var(--hue, var(--text)); }
+.missing .swatch { width: 12px; height: 12px; background: none; border: 2px dashed var(--bad); border-radius: 50%; }
+
+.low { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: calc(var(--unit) * 7) calc(var(--unit) * 9); }
+.low .panel:nth-child(2) { animation-delay: var(--step); }
+.more { margin-left: auto; font-size: var(--small); font-weight: 700; color: var(--accent-text); text-decoration: none; }
+.more:hover { text-decoration: underline; }
+.busiest .spark.small { width: 96px; height: 20px; margin: 0; }
+.busiest .spark-line { stroke: var(--hue, var(--text)); stroke-width: 2; }
+.busiest .node { display: inline-flex; align-items: center; gap: calc(var(--unit) * 1.5); margin-right: calc(var(--unit) * 3); font-family: var(--sans); }
+.events { display: flex; flex-direction: column; padding: 0; list-style: none; }
+.events li { display: grid; grid-template-columns: 10ch minmax(0, 1fr); gap: calc(var(--unit) * 3); padding: calc(var(--unit) * 2) 0 calc(var(--unit) * 2) calc(var(--unit) * 3); border-bottom: 1px solid var(--hair); border-left: var(--stroke) solid transparent; font-size: var(--small); animation: arrive var(--arrive) var(--ease) both; }
+.events li:first-child { border-top: 1px solid var(--text); }
+.events li.dim { display: block; }
+.events time { color: var(--dim); }
+.events .said { overflow-wrap: anywhere; }
+.events .what { font-family: var(--mono); }
+.events li.refused { border-left-color: var(--bad); }
+.events .error { color: var(--bad); }
+@media (max-width: 900px) {
+  .dash { overflow: visible; padding-right: 0; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .low { grid-template-columns: minmax(0, 1fr); }
+}
 
 @keyframes draw { from { stroke-dashoffset: 40; } }
 @keyframes pop { from { transform: scale(0); } }
@@ -361,7 +468,7 @@ dialog::backdrop { background: color-mix(in srgb, var(--bg) 84%, transparent); }
 .navlink { display: inline-block; min-height: 24px; padding-block: 4px; font-size: var(--small); font-weight: 700; text-decoration: none; border-bottom: var(--stroke) solid transparent; transition: color var(--quick), border-color var(--quick); }
 .navlink:hover { color: var(--accent-text); }
 .navlink[aria-current] { border-bottom-color: var(--accent); }
-.install { flex: 1; min-height: 0; overflow: auto; padding: 0 calc(var(--unit) * 5) calc(var(--unit) * 8); scrollbar-width: thin; scrollbar-color: var(--hair) transparent; }
+.install { min-height: 0; overflow: auto; padding: 0 calc(var(--unit) * 5) calc(var(--unit) * 8) 0; scrollbar-width: thin; scrollbar-color: var(--hair) transparent; }
 .install > * { max-width: 88ch; }
 .install .intro { display: flex; flex-direction: column; gap: calc(var(--unit) * 2); padding-top: calc(var(--unit) * 3); border-top: var(--stroke) solid var(--text); animation: rise var(--enter) var(--ease) both; }
 .install .intro h2 { font-size: var(--large); font-weight: 800; letter-spacing: -0.02em; }
@@ -397,7 +504,7 @@ dialog::backdrop { background: color-mix(in srgb, var(--bg) 84%, transparent); }
 .peer p { margin: 0; }
 .peer .warning { padding-left: calc(var(--unit) * 3); border-left: var(--stroke) solid var(--warn); font-weight: 700; }
 @media (max-width: 900px) {
-  .install { padding-left: calc(var(--unit) * 3); padding-right: calc(var(--unit) * 3); overflow: visible; }
+  .install { padding-right: 0; overflow: visible; }
   .install .field { grid-template-columns: minmax(0, 1fr); }
   .install .hint { grid-column: 1; }
   .peer .field { grid-template-columns: minmax(0, 1fr); }

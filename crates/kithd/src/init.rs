@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set when kithd was told to stop with SIGTERM: the machine is to power off, not restart.
 pub static POWER_OFF: AtomicBool = AtomicBool::new(false);
+/// Set by an update that staged a kithd for the keeper to start (update.rs `node`): this kithd's
+/// end is a hand-over (keeper.rs `HANDOVER`), not a restart of the machine.
+pub static HANDING_OVER: AtomicBool = AtomicBool::new(false);
 
 /// Woken when the power button is pressed: to be waited for beside SIGTERM, which it is.
 pub static BUTTON: tokio::sync::Notify = tokio::sync::Notify::const_new();
@@ -215,6 +218,19 @@ fn root_slave(slaves: &std::path::Path) -> Option<std::path::PathBuf> {
 pub fn booted() -> Option<String> {
     let under = root_slave(std::path::Path::new(ROOT_SLAVES))?;
     disk(&under)?.into_string().ok()
+}
+
+/// What `data_disk::off_ours` is given: whether the root is a verity device, the disk it is read
+/// from, and the disk of the partition labelled `state` (read the way `labelled` finds it).
+pub fn whose_disks() -> (bool, Option<String>, Option<String>) {
+    let verity = std::path::Path::new(ROOT_SLAVES)
+        .parent()
+        .is_some_and(std::path::Path::exists);
+    let state = labelled("state").and_then(|device| {
+        let seen = std::path::Path::new("/sys/class/block").join(device.file_name()?);
+        disk(&seen)?.into_string().ok()
+    });
+    (verity, booted(), state)
 }
 
 fn static_ip(value: &str) -> Option<(Ipv4Addr, u8, Option<Ipv4Addr>)> {
@@ -722,7 +738,7 @@ fn mounted(path: &str) -> bool {
 /// What the first process mounts: (kind, where, flags, options). Nothing runs a program
 /// from /dev/shm, /run or /tmp (a container's image and volumes under /run are mounts of
 /// their own, with their own flags), so none may.
-fn mounts() -> [(&'static str, &'static str, MsFlags, &'static str); 8] {
+fn mounts() -> [(&'static str, &'static str, MsFlags, &'static str); 9] {
     let quiet = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
     [
         ("proc", "/proc", quiet, ""),
@@ -736,9 +752,51 @@ fn mounts() -> [(&'static str, &'static str, MsFlags, &'static str); 8] {
         ),
         ("tmpfs", "/dev/shm", quiet, "mode=1777"),
         ("tmpfs", "/run", quiet, "mode=0755"),
+        // A kithd staged for a hand-over (update.rs `stage`) runs from here, the one place under /run
+        // that may run a program: exec, and root's alone (no setuid file, no device, no other user).
+        (
+            "tmpfs",
+            crate::keeper::STAGED_DIR,
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            "mode=0700,size=64m",
+        ),
         ("tmpfs", "/tmp", quiet, "mode=1777"),
         ("cgroup2", "/sys/fs/cgroup", quiet, ""),
     ]
+}
+
+#[cfg(test)]
+mod mounts {
+    use super::*;
+
+    fn find(at: &str) -> (MsFlags, &'static str) {
+        let (_, _, flags, data) = super::mounts()
+            .into_iter()
+            .find(|(_, there, _, _)| *there == at)
+            .unwrap();
+        (flags, data)
+    }
+
+    /// /run/kith/bin is mounted exec (no noexec), nosuid, nodev and root-only, after /run, which
+    /// stays noexec with everything else that is writable.
+    #[test]
+    fn the_staged_kithd_has_its_own_exec_nosuid_nodev_root_only_tmpfs_and_run_stays_noexec() {
+        let (flags, data) = find("/run/kith/bin");
+        assert!(flags.contains(MsFlags::MS_NOSUID | MsFlags::MS_NODEV), "{flags:?}");
+        assert!(!flags.contains(MsFlags::MS_NOEXEC), "{flags:?}");
+        assert!(data.split(',').any(|o| o == "mode=0700"), "{data}");
+        assert!(data.split(',').any(|o| o.starts_with("size=")), "bounded: {data}");
+        let all = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+        for at in ["/run", "/tmp", "/dev/shm"] {
+            assert!(find(at).0.contains(all), "{at} must stay noexec");
+        }
+        let order: Vec<_> = super::mounts().iter().map(|m| m.1).collect();
+        let at = |p| order.iter().position(|x| *x == p).unwrap();
+        assert!(
+            at("/run") < at("/run/kith/bin"),
+            "mounted on /run, so after it: {order:?}"
+        );
+    }
 }
 
 /// The first things, before anything else of kithd runs. Each is tried and said if it
@@ -928,6 +986,12 @@ pub fn hear_term() {
 /// After a failure it restarts, once the reason has had time to be read on a console. A
 /// start that fails again waits longer, the count being on the ESP (see `os::wait`).
 pub fn end(failed: bool) -> ! {
+    // A kithd-only update (update.rs): the keeper starts the kithd it staged, and nothing is
+    // stopped or unmounted: units and the state stay as they are, as at any restart of kithd.
+    if HANDING_OVER.load(Ordering::Relaxed) && !failed && !POWER_OFF.load(Ordering::Relaxed) {
+        eprintln!("kithd: init: handing over");
+        std::process::exit(crate::keeper::HANDOVER);
+    }
     if failed {
         // (With no ESP to count on, this is the first wait.)
         let counted = std::fs::read_to_string("/proc/cmdline").is_ok_and(|line| counted(&line));
@@ -955,8 +1019,9 @@ pub fn end(failed: bool) -> ! {
     // Written out, then let go of: by now kithd has closed what it had open there. (If
     // not, as after a panic, the file system's journal is what keeps it whole.)
     nix::unistd::sync();
-    // (What is mounted from a file of the state, first.)
+    // (What is mounted from a file of the state, first, and the data disks: both are under it.)
     crate::encrypted::close(std::path::Path::new(STATE));
+    crate::data_disk::boot::close();
     // (EINVAL: nothing is mounted there, as in the installer.)
     if let Err(e) = nix::mount::umount(STATE).or_else(|e| if e == nix::errno::Errno::EINVAL { Ok(()) } else { Err(e) })
     {

@@ -26,9 +26,17 @@
 # the kernel killed for memory, and kithd's last lines. A size that fails before any reading
 # says `no readings: STEP`, the step being what compare.sh's fail named. The exit status is then 1.
 # Exit 77: this machine cannot run it (no KVM, no QEMU, ...).
+#
+#   sh ci/stress.sh --nested [--out FILE]
+#
+# Containers inside containers: one node (ci/vm.sh --test nested; not the compare script), a
+# container with kith's defaults that starts a second runtime (bubblewrap) and kithd in agent mode,
+# then the same with each opening in turn. One `nested NAME | ...` row each, appended to
+# ci/stress.txt: what the container is, the guest kernel's settings, and what refused what; and
+# a last row, the smallest opening that let kithd's own container run. No default is changed.
 set -eu
 
-sizes=100 memory=2048 nodes=3 out='' system=kith
+sizes=100 memory=2048 nodes=3 out='' system=kith nested=''
 while [ $# -gt 0 ]; do
     case $1 in
     --sizes | --memory | --nodes | --out | --system)
@@ -36,7 +44,8 @@ while [ $# -gt 0 ]; do
         case $1 in --sizes) sizes=$2 ;; --memory) memory=$2 ;; --nodes) nodes=$2 ;; --out) out=$2 ;; --system) system=$2 ;; esac
         shift 2
         ;;
-    --help | -h) sed -n '2,27p' "$0"; exit 0 ;;
+    --nested) nested=1; shift ;;
+    --help | -h) sed -n '2,36p' "$0"; exit 0 ;;
     *) sed -n '2,3p' "$0" >&2; exit 2 ;;
     esac
 done
@@ -55,6 +64,18 @@ trap 'exit 143' TERM
 trap 'rm -rf "$work"' EXIT
 
 [ -s "$out" ] || python3 "$adapter" header >"$out"
+
+if [ -n "$nested" ]; then
+    status=0
+    KITH_NESTED_OUT=$work/nested sh "$root/ci/vm.sh" --test nested --time 3000 || status=$?
+    [ "$status" -ne 77 ] || exit 77
+    # (vm.sh skips with status 0: no rows at all means it could not run here.)
+    [ "$status" -ne 0 ] || [ -s "$work/nested" ] || exit 77
+    # (Whatever rows the run made are kept, a failed run's too: a refusal is the finding.)
+    [ ! -s "$work/nested" ] || tr -cd '[:print:]\n' <"$work/nested" >>"$out"
+    cat "$work/nested" 2>/dev/null || true
+    exit "$status"
+fi
 
 KITH_COMPARE_MEM=$memory KITH_COMPARE_SETTLE=0 KITH_COMPARE_ONLY=stress KITH_COMPARE_RAW=$work/raw
 KITH_COMPARE_WORKLOADS=$adapter KITH_COMPARE_RESTART=1 STRESS_NODES=$nodes

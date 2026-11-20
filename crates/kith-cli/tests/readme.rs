@@ -267,6 +267,29 @@ fn readme_says_what_a_deleted_claim_takes_with_it_and_how_to_retain() {
     );
 }
 
+/// T-0031: how a laptop reaches a remote cluster by a context, the file it is kept in, and that
+/// renewing and revoking a node's certificate is not part of it (T-1014).
+#[test]
+fn readme_and_access_say_how_a_context_reaches_a_remote_cluster() {
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let access = flat(DOCS.iter().find(|(path, _)| path.ends_with("access.md")).unwrap().1);
+    for said in [
+        "kith context add lab --server HOST:PORT --identity ~/alice",
+        "kith context use lab",
+        "kith --context other get",
+        "KITH_CONTEXT",
+        "~/.config/kith/contexts.yaml",
+        "mode 0600 in a 0700 directory",
+        "A flag given as well wins over the entry",
+        "Renewal and revocation of a node's own certificate is not here",
+        "is T-1014",
+    ] {
+        assert!(access.contains(said), "access.md no longer says {said:?}");
+    }
+    let front = flat(DOCS[0].1);
+    assert!(front.contains("kith context add") && front.contains("access.md#contexts-a-name-for-a-cluster"));
+}
+
 /// Who has a host two Services name is said in both documents: the one made first, a
 /// delete gives it up, a Namespace's hosts keep it for good, and what the update is.
 #[test]
@@ -489,7 +512,8 @@ fn readme_carries_the_stress_rows() {
     let stress = std::fs::read_to_string(root().join("ci/stress.txt")).expect("ci/stress.txt");
     let rows: Vec<&str> = stress
         .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        // (the `nested` rows are not load rows: README's containers-in-containers section carries them)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("nested "))
         .collect();
     assert!(!rows.is_empty(), "ci/stress.txt has no rows");
     let readme = DOCS[0].1;
@@ -723,6 +747,26 @@ fn readme_shows_the_install_pin_and_the_review_says_m2_is_fixed() {
     assert!(
         m2.contains("fixed: ") && m2.contains("(T-0648)"),
         "docs/security-review-2.md does not say M2 is fixed (T-0648):\n{m2}"
+    );
+}
+
+/// `kubectl run` and `helm test` make a bare Pod and `kubectl delete pod` deletes it: the guide
+/// says so, and no longer lists `kubectl run` among what is not answered.
+#[test]
+fn the_guide_says_a_bare_pod_is_run_and_deleted() {
+    for said in [
+        "`run NAME --image=IMAGE`",
+        "A bare pod is deleted, not restarted",
+        "`test` (a chart's test hook is a bare Pod",
+    ] {
+        assert!(
+            README.contains(said),
+            "docs/guide/kubernetes.md no longer says {said:?}"
+        );
+    }
+    assert!(
+        !README.contains("`kubectl run` (a pod alone)"),
+        "kubectl run is still among what is not answered"
     );
 }
 

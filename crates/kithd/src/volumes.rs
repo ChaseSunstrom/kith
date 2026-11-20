@@ -12,6 +12,7 @@
 use kith_api::kinds::{VolumeClaimSpec, VolumeSpec};
 use kith_api::{Resource, store::Store};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -190,6 +191,9 @@ fn volumes(store: &Store) -> BTreeMap<String, Vol> {
     store.list(Some("Volume")).map(read).collect()
 }
 
+/// A Node's labels.
+type Labels = BTreeMap<String, String>;
+
 /// What each claim is bound to (a Volume's name, or why it is bound to none), and for each
 /// bound Volume the claim that has it.
 type Bound = (BTreeMap<String, Result<String, String>>, BTreeMap<String, String>);
@@ -198,6 +202,18 @@ type Bound = (BTreeMap<String, Result<String, String>>, BTreeMap<String, String>
 /// Volume (by key) of its namespace that no claim has, that is not refused, is at least as big,
 /// is on a node with the labels it selects, and is `shared` when it asks for that.
 fn bind(store: &Store, vols: &BTreeMap<String, Vol>) -> Bound {
+    let labels = |node: &str| {
+        store
+            .get(&format!("Node/{node}"))
+            .map(|node| node.metadata.labels.clone())
+    };
+    bind_with(store, vols, &labels)
+}
+
+/// [`bind`], with the labels of a Node asked of `labels`: once per Node in the call, however
+/// many claims and Volumes are paired.
+fn bind_with(store: &Store, vols: &BTreeMap<String, Vol>, labels: &dyn Fn(&str) -> Option<Labels>) -> Bound {
+    let asked: RefCell<BTreeMap<String, Option<Labels>>> = RefCell::default();
     let mut claims: Vec<&Resource> = store.list(Some("VolumeClaim")).collect();
     claims.sort_by_key(|claim| claim.key());
     let (mut bound, mut taken) = (BTreeMap::new(), BTreeMap::new());
@@ -231,14 +247,16 @@ fn bind(store: &Store, vols: &BTreeMap<String, Vol>) -> Bound {
             }
         };
         let (want, shared) = (spec.size.value(), spec.shared == Some(true));
-        let labels = |node: &str| {
-            store
-                .get(&format!("Node/{node}"))
-                .map(|node| node.metadata.labels.clone())
-        };
         // (A Volume on a node that is not there fits nothing: its claim could never run.)
-        let on_node =
-            |node: &str| labels(node).is_some_and(|have| spec.selector.iter().all(|(k, v)| have.get(k) == Some(v)));
+        let on_node = |node: &str| {
+            let mut asked = asked.borrow_mut();
+            if !asked.contains_key(node) {
+                asked.insert(node.to_string(), labels(node));
+            }
+            asked[node]
+                .as_ref()
+                .is_some_and(|have| spec.selector.iter().all(|(k, v)| have.get(k) == Some(v)))
+        };
         let prefix = format!("Volume/{namespace}/");
         let fits = |(volume_key, vol): &(&String, &Vol)| {
             vol.refused.is_none()
@@ -539,7 +557,7 @@ pub fn resolve(store: &Store) -> Volumes {
         let copies = was
             .into_iter()
             .flatten()
-            .filter(|(field, _)| crate::replicas::FIELDS.contains(&field.as_str()));
+            .filter(|(field, value)| crate::replicas::is_copy_field(field) && !value.is_null());
         let copies: serde_json::Map<String, Value> =
             copies.map(|(field, value)| (field.clone(), value.clone())).collect();
         // (Without replicas any more, only where it is, while that is not where `node` says.)
@@ -559,9 +577,22 @@ pub fn resolve(store: &Store) -> Volumes {
         found.status.insert(key.clone(), status);
     }
     for (key, outcome) in &bound {
+        // A Volume of the claim's own name is what a mount of the name comes to ([`volume_of`]),
+        // not this claim's: said in the claim, unless the claim is bound to that very Volume.
+        let (namespace, name) = parts(key);
+        let takes = vols.contains_key(&format!("Volume/{namespace}/{name}")) && *outcome != Ok(name.to_string());
+        let note = takes.then(|| {
+            format!(
+                "Volume {name} has this claim's name: a workload's mount of {name} is that Volume, not this claim's (rename the claim or the Volume)"
+            )
+        });
         let status = match outcome {
-            Ok(volume) => json!({ "volume": volume }),
+            Ok(volume) => match note {
+                Some(message) => json!({ "volume": volume, "message": message }),
+                None => json!({ "volume": volume }),
+            },
             Err(message) => {
+                let message = &note.map_or(message.clone(), |note| format!("{message}; {note}"));
                 // (What it was bound to stays written: that is what keeps it from another.)
                 let recorded = store
                     .get(key)
@@ -1246,6 +1277,101 @@ spec: { node: a, path: tiny, size: 1Gi }
         // (It is shared, so it pins the workload to no node; its data is on b.)
         let slow = &held.volumes["slow"];
         assert_eq!((held.node, slow.name.as_str(), slow.node.as_str()), (None, "slow", "b"));
+    }
+
+    #[test]
+    fn a_volume_that_takes_over_a_claims_name_says_so_in_the_claim() {
+        let source = [
+            res(
+                "VolumeClaim",
+                "default",
+                "slow",
+                "{ size: 1Gi, selector: { disk: ssd } }",
+            ),
+            res("VolumeClaim", "default", "huge", "{ size: 10Ti }"),
+            res(
+                "VolumeClaim",
+                "default",
+                "fast",
+                "{ size: 1Gi, selector: { disk: ssd } }",
+            ),
+            res(
+                "VolumeClaim",
+                "default",
+                "mid",
+                "{ size: 1Gi, selector: { disk: ssd } }",
+            ),
+            res("Volume", "default", "huge", "{ node: a, path: huge, size: 1Ki }"),
+            res("Volume", "default", "extra", "{ node: a, path: extra, size: 1Gi }"),
+            workload("default", "app", &["slow"]),
+        ]
+        .concat();
+        let mut store = store(&source);
+        settle(&mut store);
+        // The claim `slow` binds `tiny` (`extra` is `fast`'s, `fast` is `mid`'s); the workload that
+        // mounts `slow` gets the Volume `slow`, and the claim names it.
+        let said = status(&store, "VolumeClaim/default/slow");
+        assert_eq!(said["volume"], "tiny");
+        let note = said["message"].as_str().unwrap();
+        assert!(note.contains("Volume slow"), "{note}");
+        // One that binds nothing says what it needs, and the Volume of its name too.
+        let said = status(&store, "VolumeClaim/default/huge");
+        let note = said["message"].as_str().unwrap();
+        assert!(
+            note.contains("no free Volume") && note.contains("Volume huge"),
+            "{note}"
+        );
+        // `fast` the claim takes `extra` (the first that fits), and says `fast` the Volume is another's.
+        let said = status(&store, "VolumeClaim/default/fast");
+        assert_eq!(said["volume"], "extra");
+        assert!(said["message"].as_str().unwrap().contains("Volume fast"), "{said}");
+        // A claim with no Volume of its name has no note.
+        assert_eq!(status(&store, "VolumeClaim/default/mid"), json!({ "volume": "fast" }));
+    }
+
+    #[test]
+    fn bind_reads_each_nodes_labels_once_however_many_claims_and_volumes() {
+        let claims: String = (0..200)
+            .map(|n| {
+                res(
+                    "VolumeClaim",
+                    "default",
+                    &format!("c{n}"),
+                    "{ size: 1Gi, selector: { disk: nvme } }",
+                )
+            })
+            .collect();
+        let vols: String = (0..20)
+            .map(|n| {
+                res(
+                    "Volume",
+                    "default",
+                    &format!("v{n}"),
+                    &format!("{{ node: a, path: v{n}, size: 1Mi }}"),
+                )
+            })
+            .chain((0..20).map(|n| {
+                res(
+                    "Volume",
+                    "default",
+                    &format!("w{n}"),
+                    &format!("{{ node: b, path: w{n} }}"),
+                )
+            }))
+            .collect();
+        let store = store(&format!("{claims}{vols}"));
+        let asked = std::cell::Cell::new(0);
+        let labels = |node: &str| {
+            asked.set(asked.get() + 1);
+            store
+                .get(&format!("Node/{node}"))
+                .map(|node| node.metadata.labels.clone())
+        };
+        let (bound, _) = bind_with(&store, &volumes(&store), &labels);
+        // (No node is `nvme`, so every claim is paired with every Volume that is big enough.)
+        assert!(bound.values().all(Result::is_err), "{bound:?}");
+        // The nodes a, b and the one the CLUSTER's Volumes name (a, b): two Nodes, asked once each.
+        assert_eq!(asked.get(), 2);
     }
 
     #[test]

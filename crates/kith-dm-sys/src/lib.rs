@@ -157,6 +157,17 @@ pub fn grow(mounted: &Path, blocks: u64) -> Result<()> {
     ioctl(&File::open(mounted)?, 0x4008_6610, &mut blocks.to_ne_bytes()).map(drop)
 }
 
+/// Discard `length` bytes of the block device `disk` from `start` (both whole 512-byte
+/// sectors): what `blkdiscard` asks. What it held reads as zeros or as it was, as the device
+/// says; a device that cannot discard answers EOPNOTSUPP.
+pub fn discard(disk: &File, start: u64, length: u64) -> Result<()> {
+    // BLKDISCARD: _IO(0x12, 119), its argument a `uint64_t[2]`: where, and how long.
+    let mut range = [0u8; 16];
+    range[..8].copy_from_slice(&start.to_ne_bytes());
+    range[8..].copy_from_slice(&length.to_ne_bytes());
+    ioctl(disk, 0x1277, &mut range).map(drop)
+}
+
 /// `struct fsxattr`: flags, two sizes, the project (12 bytes in), one more size.
 const FSXATTR: usize = 28;
 /// FS_XFLAG_PROJINHERIT: what is made in a directory is of its project.

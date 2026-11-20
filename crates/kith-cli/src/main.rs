@@ -11,6 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod context;
 mod import;
 mod remote;
 mod signing;
@@ -48,6 +49,9 @@ struct Cli {
     /// The identity directory to show the node: its ca.crt, and NAME.crt with NAME.key
     #[arg(long, env = "KITH_IDENTITY", global = true, value_name = "DIR")]
     identity: Option<PathBuf>,
+    /// Take --server and --identity from this entry of `kith context ls` (a flag still wins)
+    #[arg(long, env = "KITH_CONTEXT", global = true, value_name = "NAME")]
+    context: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -164,6 +168,11 @@ enum Command {
         #[command(subcommand)]
         command: PeerCommand,
     },
+    /// Contexts: names for a remote kithd and the identity that calls it
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
     /// Identities: who may call the API over the network, as their Roles allow
     Identity {
         #[command(subcommand)]
@@ -257,6 +266,26 @@ enum AdminCommand {
     /// Set the Cluster's spec.adminKey from a passphrase typed now (kept nowhere): the key
     /// that signs writes under `spec.signing: required`, the same one each time it is typed
     Key,
+}
+
+#[derive(Subcommand)]
+enum ContextCommand {
+    /// Keep NAME as a kithd's address and an identity directory; a second add of a name replaces it
+    Add {
+        name: String,
+        /// The node's --listen address
+        #[arg(long, value_name = "HOST:PORT")]
+        server: String,
+        /// The directory `kith identity cert` wrote: ca.crt, NAME.crt and NAME.key
+        #[arg(long, value_name = "DIR")]
+        identity: PathBuf,
+    },
+    /// Make NAME the context kith uses when none is named
+    Use { name: String },
+    /// List the contexts, the current one starred
+    Ls,
+    /// Forget NAME
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -1147,29 +1176,57 @@ fn raw(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, 
 
 fn run(cli: Cli) -> Result<ExitCode, String> {
     let timeout = std::time::Duration::from_secs(cli.timeout);
-    let backend = || match (
-        &cli.store,
-        &cli.server,
-        cli.socket.clone().or_else(kith_api::default_socket),
-    ) {
-        (Some(path), _, _) => Ok(Backend::Local(path.clone())),
-        (None, Some(server), _) => match &cli.identity {
-            Some(identity) => Ok(Backend::Daemon(Kithd {
-                route: Route::Node {
-                    server: server.clone(),
-                    identity: identity.clone(),
-                },
+    let backend = || {
+        // A named context always counts; the file's current one only when no flag says where kithd is.
+        let wanted = cli.context.is_some() || (cli.store.is_none() && cli.server.is_none() && cli.socket.is_none());
+        let chosen = match (wanted, cli.context.is_some()) {
+            (true, true) => context::pick(&context::file()?, cli.context.as_deref())?,
+            // (The file's own current context is not asked for: one that cannot be read is said, and kith goes on without it.)
+            (true, false) => context::file()
+                .and_then(|file| context::pick(&file, None))
+                .unwrap_or_else(|e| {
+                    eprintln!("kith: {e} (going on without a context)");
+                    None
+                }),
+            (false, _) => None,
+        };
+        // (An explicit --socket is not sent to a context's server.)
+        let chosen = chosen.filter(|_| cli.socket.is_none());
+        if let (Some(c), None) = (&chosen, &cli.context) {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("kith: using the current context's server {}", c.server));
+        }
+        let server = cli.server.clone().or_else(|| chosen.as_ref().map(|c| c.server.clone()));
+        let identity = cli.identity.clone().or_else(|| chosen.map(|c| c.identity));
+        match (&cli.store, server, cli.socket.clone().or_else(kith_api::default_socket)) {
+            (Some(path), _, _) => Ok(Backend::Local(path.clone())),
+            (None, Some(server), _) => match identity {
+                Some(identity) => Ok(Backend::Daemon(Kithd {
+                    route: Route::Node { server, identity },
+                    timeout,
+                })),
+                None => fail("--server needs --identity DIR: the identity kithd is to see (kith identity makes one)"),
+            },
+            (None, None, Some(socket)) => Ok(Backend::Daemon(Kithd {
+                route: Route::Socket(socket),
                 timeout,
             })),
-            None => fail("--server needs --identity DIR: the identity kithd is to see (kith identity makes one)"),
-        },
-        (None, None, Some(socket)) => Ok(Backend::Daemon(Kithd {
-            route: Route::Socket(socket),
-            timeout,
-        })),
-        (None, None, None) => fail("no kithd socket: set --socket or --server, or --store for a store file"),
+            (None, None, None) => {
+                fail("no kithd socket: set --socket, --server or --context, or --store for a store file")
+            }
+        }
     };
     match cli.command {
+        Command::Context { command } => {
+            let file = context::file()?;
+            match command {
+                ContextCommand::Add { name, server, identity } => context::add(&file, &name, &server, &identity)?,
+                ContextCommand::Use { name } => context::use_(&file, &name)?,
+                ContextCommand::Rm { name } => context::rm(&file, &name)?,
+                ContextCommand::Ls => print!("{}", context::ls(&file)?),
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         Command::Import { command } => return import::run(command),
         Command::Lint { files } => {
             let n = load(&files)?.len();
@@ -2248,7 +2305,8 @@ fn status_summary(resource: &Resource) -> String {
             (Some(state), Some(why), _) if state != "succeeded" => format!("{state}: {}", clean(why)),
             // A Node: its address, which is its LAN address unless it roams (then a mesh address), and what it serves.
             (Some(state), _, Some(address)) if resource.kind == "Node" => {
-                let mesh = if resource.spec["roaming"] == true {
+                // (A node the leader has moved onto the mesh keeps its LAN address in `status.lan`.)
+                let mesh = if resource.spec["roaming"] == true || status["lan"].is_string() {
                     " (mesh)"
                 } else {
                     ""
@@ -2625,6 +2683,16 @@ mod drain_tests {
         );
         assert_eq!(lan.lan_address().map(|ip| ip.to_string()).as_deref(), Some("192.0.2.7"));
         assert_eq!(table_row(&lan)[4], "ready at 192.0.2.7:7443; serves dns 53, ingress");
+        // Moved onto the mesh by the leader: its LAN address is the one it was moved from.
+        let moved = node(
+            json!({}),
+            json!({ "address": "[fd00::7]:7443", "lan": "192.0.2.7:7443", "state": "ready" }),
+        );
+        assert_eq!(
+            moved.lan_address().map(|ip| ip.to_string()).as_deref(),
+            Some("192.0.2.7")
+        );
+        assert_eq!(table_row(&moved)[4], "ready at [fd00::7]:7443 (mesh)");
         let roaming = node(
             json!({ "roaming": true }),
             json!({ "address": "10.8.0.4:7443", "state": "ready" }),
@@ -2664,6 +2732,18 @@ mod drain_tests {
         // What a node writes there cannot drive the terminal.
         let held = json!({ "home": { "holder": "n\u{1b}[2J", "since": "now" } });
         assert!(!table_row(&cluster(home, Some(held)))[4].contains('\u{1b}'));
+    }
+
+    #[test]
+    fn features_spec_writes_all_for_a_node_that_wants_all() {
+        use super::features_spec;
+        use kith_api::Resource;
+        let node = json!({
+            "apiVersion": "kith.dev/v1", "kind": "Node", "metadata": { "name": "gtx" },
+            "spec": {}, "status": { "os": { "wants": ["all"] } },
+        });
+        let spec = features_spec(&serde_json::from_value::<Resource>(node).unwrap()).unwrap();
+        assert!(spec.ends_with("features: [all]\n"), "{spec}");
     }
 
     #[test]

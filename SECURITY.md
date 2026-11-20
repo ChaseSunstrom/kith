@@ -257,15 +257,17 @@ Only the newest version is fixed. There are no security releases of older ones.
   each other port its 2, and a connection past that is ended at once. A new UDP sender
   past that takes the place of the one of its port heard from longest ago. A pod publishes
   8 ports at most and a node 64, so the relays hold at most 448 files. kithd raises its
-  soft limit of open files to the hard one at start, 65536 at most, and leaves the hard
-  limit as it is: on kith OS it is the first process, started with the kernel's 1024
-  soft and 4096 hard, so it runs with 4096; on a host under systemd (524288 hard
-  here) it runs with 65536. Its listeners, API and ingress (1024 connections, two files
-  each, so 2048) take of it too, with the relays 448 and 64 guests of the API: about 2700
-  at most, under 4096. The raised limit is passed on to what kithd starts, a pod's
-  processes included (no per-container limit is set): a program there that uses
-  select() with an FD_SETSIZE bitmap can be handed a file at or above 1024, so it must
-  lower its own limit (a per-container limit is a possible follow-up). A port another
+  soft limit of open files to the hard one at start, 65536 at most, and as root first
+  raises the hard limit to 524288 (no more than the kernel's fs.nr_open, never lower than
+  it was): on kith OS it is the first process, started with the kernel's 1024 soft and
+  4096 hard, so it runs with 65536 soft and 524288 hard. Its listeners, API and ingress
+  (1024 connections, two files each, so 2048) take of it too, with the relays 448 and 64
+  guests of the API: about 2700 at most. Every container it starts gets soft 1024 and
+  hard kithd's own (524288), as containerd gives, so an app can raise its own soft limit
+  and a program that sizes a select() bitmap from the soft limit is not handed a file at
+  or above 1024; an exec unit, a plain process of the node, inherits kithd's 65536 soft.
+  There is no per-container limit in the spec: a container's open files are bounded only
+  by its memory limit and the node's fs.file-max. A port another
   namespace's Workload or Job publishes is refused when written, and so is a pod through
   an Exit that does not list its namespace: both are asked of every writer (a person's
   apply, a Release, a Source, kithd's own controllers), where the write goes into the
@@ -463,6 +465,16 @@ Only the newest version is fixed. There are no security releases of older ones.
   their owners and setuid bits.
 - **An encrypted disk or Volume** cannot be read by whoever takes it out of its machine:
   the key is with the other nodes.
+
+## Running a runtime inside a container
+
+`sh ci/stress.sh --nested` ran, on one kith OS machine in a VM, a second runtime (bubblewrap) and kithd in agent mode inside a kith container, with the defaults and with each opening in turn; the rows are the `nested` lines of ci/stress.txt. No default was changed. In three groups:
+
+- **What works inside a container with the defaults.** kithd in agent mode starts and serves its socket; plain processes run. A user namespace, a second runtime's sandbox and a second kithd's containers do not.
+- **What needs which opening.** A user namespace of its own is refused by kith's seccomp filter (clone and unshare with namespace flags), not by the guest kernel (`max_user_namespaces` 1816, no sysctl that restricts it; with the filter off, `unshare` works). bubblewrap is also refused by the capability kept in the bounding set. `userNamespaces: true` on the container is the smallest opening, of the four tried, that let it run: the bounding set is empty and the filter lets those calls through, with the cost "What is not defended" gives for it (more of the kernel to get wrong). `seccomp: {unconfined: true}` alone lets `unshare` through but not bubblewrap.
+- **What is not recommended.** `runAsUser: 0` for nesting: the filter still refuses, and the container is more privileged for nothing. Unconfined seccomp to get a runtime inside a container: it takes off the whole filter for a few calls. A second kithd that is meant to run workloads inside a container: under the openings tried its containers did not run (under four of the five it stopped at the cgroup check, so what comes after is untested), because the cgroup2 mount inside a container is read-only and the container's cgroup is the root of its namespace ("no delegated cgroup"). That is kith's mount; a writable, delegated cgroup subtree would be a new opening, a way for a container to make cgroups on the node, and it is not offered.
+
+The nested kithd shares the node's network, so its registry port meets the node's.
 
 ## What splitting kithd in two would and would not change
 
@@ -840,6 +852,22 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - a log of Rekor v2 (an inclusion proof and a time from a timestamp authority, no
     promise) is not read: such a signature is refused, naming it;
   - an attestation (an in-toto statement of another kind) is never taken as a signature.
+- **A node's WireGuard key is replaced on its own Node's word, and never leaves it with no key.**
+  `spec.mesh.rotate` (a name; nothing rotates by itself or on a timer) makes the node write a
+  new key beside the old (`mesh.next`, mode 0600, written whole and synced, then renamed: half a
+  key file is never there) and say its public half. Each peer it reaches holds that key as a
+  standby peer with no addresses until a handshake on it, so a key nobody holds is no route for
+  anyone's traffic. The node switches its interface only when every such peer has said it holds
+  the new key, and writes it over the old one only when every one has shaken hands since the
+  switch (and the interface runs on it). After two minutes in either wait it goes back to the old
+  key and says `failed`; a node with no peer reached is refused. A node that says another's key
+  or next key is refused at the write (and ignored by the readers), as for `key`; the root
+  part's `MeshKey` steps are for the mesh's interface only and one at a time (the `meshing`
+  lock). What it does not do: it is no answer to a key that is already stolen while the node
+  runs on it (the thief holds the old key until the commit and the peers drop it; the switch is
+  the cut-off), the pause until the next handshake is up to half a minute, and a crash between
+  the rename and the status leaves the node on the new key saying the old one until its next
+  pass, which it corrects.
 - **A control node that is taken is the cluster taken, until its Node is deleted.** It has the
   whole store, every Secret in it, and a node's rights (a worker has less: below). `kith delete node/NAME` ends
   what it can ask for: each node looks a node certificate's name up in its own copy of
@@ -905,7 +933,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     against that node's own store: what it says of the replicas the scheduler gave it
     (how many are ready is counted again; a unit's address has to be in the worker's
     own part of the mesh), `os`, `mesh`, `serves`, `thumbprint` and `alone` in its own
-    Node's status (not a mesh key another Node says, which would cut both off; a thumbprint
+    Node's status (not a mesh key another Node says, nor a `next` one, which would cut both off; a thumbprint
     in a thumbprint's shape; `alone` null, or the times it ran alone and its risks), its own NodeKey once, the Devices
     and Seats whose `spec.node` is the worker (under a name that starts with the
     worker's own, with the labels discovery writes and no other, the node and the
@@ -1293,7 +1321,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   none says so at every start and in its Node's `status.os.releaseKeys` (`none`), and
   one whose keys cannot be read says so and takes no release. An OSRelease's image is
   fetched only from an address that is not the node's own or on its networks, checked
-  and then held for the connection (no proxy, no redirect); `--lan-releases` lets the
+  and then held for the connection (no proxy). A redirect is followed, one hop at a time,
+  up to 5 hops, to an address vetted the same way and held the same way (a release
+  hosted on GitHub answers 302 to another host); https is never lowered to http, a
+  repeated address or one with a user or password is refused, and the refusal's words
+  leave out the redirect's query (it may be a signature). `--lan-releases` lets the
   networks' private ranges through, never the node itself, the cluster's mesh, loopback
   or link-local. With that flag, whoever may write an OSRelease has each node send one
   request to any host of those ranges, at any port and path, and sees in the plan's
