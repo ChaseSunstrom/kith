@@ -469,7 +469,13 @@ Only the newest version is fixed. There are no security releases of older ones.
 Design in `docs/adr-privilege.md` (T-0334). Built today: the node's own policy and the
 typed request list's seam (`crates/kithd/src/root_part.rs`, for listeners, pods and the mesh), in one
 process. There is no second process yet, so everything below is what the split is for,
-not what a node has.
+not what a node has. The confinement the serving part will take is built (T-0811,
+`crates/kithd/src/confine.rs`: its own mount namespace holding only its state directory, a user
+and group that are not 0, no capability in any set, `no_new_privs`, a seccomp allow-list last) and
+held to what it says by `sh ci/vm.sh --test privilege`, but not yet applied to the serving part, which
+is a thread of the root part's process; `--split` is off by default, and until the two are processes a node
+has none of it. The filter can be left out alone (`--no-filter`, on the probe only today, for a call
+the list lacks); without it a hole in the serving part has every system call its user may make.
 
 **What the split does not change.** The part that reads the network still reads the
 store: every Secret of every namespace, and on a node that holds it the cluster's CA key.

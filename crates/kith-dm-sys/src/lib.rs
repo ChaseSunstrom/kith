@@ -520,6 +520,7 @@ pub fn send_fds(socket: BorrowedFd, bytes: &[u8], fds: &[BorrowedFd]) -> Result<
             std::ptr::copy_nonoverlapping(raw.as_ptr().cast::<u8>(), libc::CMSG_DATA(cmsg), data as usize);
         }
     }
+    let began = std::time::Instant::now();
     loop {
         // SAFETY: `header` points at `iov` (the bytes) and `control`, alive for the call, which
         // only reads them.
@@ -528,12 +529,17 @@ pub fn send_fds(socket: BorrowedFd, bytes: &[u8], fds: &[BorrowedFd]) -> Result<
             n if n as usize == bytes.len() => return Ok(()),
             n if n >= 0 => return Err(Error::other("a message sent in part")),
             _ => match Error::last_os_error() {
-                e if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // (A signal restarts the socket's timeout: the retries are bounded as a whole.)
+                e if e.kind() == std::io::ErrorKind::Interrupted && began.elapsed() < EINTR_LIMIT => continue,
+                e if e.kind() == std::io::ErrorKind::Interrupted => return Err(std::io::ErrorKind::TimedOut.into()),
                 e => return Err(e),
             },
         }
     }
 }
+
+/// How long a send or a receive on a socket goes on being started again after a signal.
+const EINTR_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One message of `socket` read into `buf`, and the descriptors that came with it (at most
 /// `most`, itself at most [`MOST_FDS`]; close-on-exec): how many bytes, and the descriptors. Zero
@@ -555,6 +561,7 @@ pub fn recv_fds(socket: BorrowedFd, buf: &mut [u8], most: usize) -> Result<(usiz
     header.msg_iovlen = 1;
     header.msg_control = control.as_mut_ptr().cast();
     header.msg_controllen = space as _;
+    let began = std::time::Instant::now();
     let got = loop {
         // SAFETY: `header` points at `iov` (`buf`) and `control`, alive and writable for the call,
         // which writes no more than their lengths.
@@ -563,7 +570,8 @@ pub fn recv_fds(socket: BorrowedFd, buf: &mut [u8], most: usize) -> Result<(usiz
             break got as usize;
         }
         match Error::last_os_error() {
-            e if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            e if e.kind() == std::io::ErrorKind::Interrupted && began.elapsed() < EINTR_LIMIT => continue,
+            e if e.kind() == std::io::ErrorKind::Interrupted => return Err(std::io::ErrorKind::TimedOut.into()),
             e => return Err(e),
         }
     };
@@ -640,6 +648,292 @@ pub fn capset(sets: [u64; 3]) -> Result<()> {
         0 => Ok(()),
         _ => Err(Error::last_os_error()),
     }
+}
+
+/// `setresgid(2)` of the process: real, effective and saved group id, as [`setresuid`].
+pub fn setresgid(real: Option<u32>, effective: Option<u32>, saved: Option<u32>) -> Result<()> {
+    let id = |id: Option<u32>| id.unwrap_or(u32::MAX);
+    // SAFETY: setresgid takes three ids by value; u32::MAX is "unchanged".
+    match unsafe { libc::setresgid(id(real), id(effective), id(saved)) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// `setgroups(2)` to none: the supplementary groups of the process emptied. Needs CAP_SETGID.
+pub fn drop_groups() -> Result<()> {
+    // SAFETY: a count of 0 reads no memory.
+    match unsafe { libc::setgroups(0, std::ptr::null()) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// `prctl(PR_SET_KEEPCAPS)`: the calling thread keeps its permitted capabilities through a
+/// change of its user ids from 0 (until the next `execve`).
+pub fn keep_caps(on: bool) -> Result<()> {
+    // SAFETY: PR_SET_KEEPCAPS takes its flag by value and reads no memory.
+    match unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, libc::c_ulong::from(on), 0, 0, 0) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// `prctl(PR_CAP_AMBIENT_CLEAR_ALL)`: the ambient set of the calling thread emptied.
+pub fn ambient_clear() -> Result<()> {
+    // SAFETY: the operation takes no memory.
+    match unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+            0,
+            0,
+            0,
+        )
+    } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// `unshare(CLONE_NEWNS)`: the calling thread is in a mount namespace of its own, a copy of the one
+/// it was in. Needs CAP_SYS_ADMIN. A thread made before keeps the old one.
+pub fn unshare_mounts() -> Result<()> {
+    // SAFETY: unshare takes its flags by value.
+    match unsafe { libc::unshare(libc::CLONE_NEWNS) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// The calls a confined serving part makes (a network server's: sockets, files it already has the
+/// right to, memory, threads, time, and what the C library and the runtime take). Everything else,
+/// the ones that change the machine (mount, setuid, ptrace, module and device calls, the key
+/// ring, bpf, `open_by_handle_at` ...), is refused.
+fn serving_calls() -> Vec<i64> {
+    #[allow(unused_mut)]
+    let mut calls = vec![
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_readv,
+        libc::SYS_writev,
+        libc::SYS_pread64,
+        libc::SYS_pwrite64,
+        libc::SYS_close,
+        libc::SYS_close_range,
+        libc::SYS_openat,
+        libc::SYS_newfstatat,
+        libc::SYS_fstat,
+        libc::SYS_statx,
+        libc::SYS_lseek,
+        libc::SYS_fcntl,
+        libc::SYS_flock,
+        libc::SYS_fsync,
+        libc::SYS_fdatasync,
+        libc::SYS_ftruncate,
+        libc::SYS_fallocate,
+        libc::SYS_getdents64,
+        libc::SYS_readlinkat,
+        libc::SYS_unlinkat,
+        libc::SYS_renameat,
+        libc::SYS_renameat2,
+        libc::SYS_mkdirat,
+        libc::SYS_fchmod,
+        libc::SYS_fchmodat,
+        libc::SYS_fchown,
+        libc::SYS_fchownat,
+        libc::SYS_faccessat,
+        libc::SYS_faccessat2,
+        libc::SYS_linkat,
+        libc::SYS_symlinkat,
+        libc::SYS_utimensat,
+        libc::SYS_statfs,
+        libc::SYS_fstatfs,
+        libc::SYS_getcwd,
+        libc::SYS_chdir,
+        libc::SYS_fchdir,
+        libc::SYS_dup,
+        libc::SYS_dup3,
+        libc::SYS_pipe2,
+        libc::SYS_ioctl,
+        libc::SYS_umask,
+        libc::SYS_sync,
+        libc::SYS_syncfs,
+        libc::SYS_copy_file_range,
+        libc::SYS_sendfile,
+        libc::SYS_splice,
+        libc::SYS_eventfd2,
+        libc::SYS_epoll_create1,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_pwait,
+        libc::SYS_ppoll,
+        libc::SYS_pselect6,
+        libc::SYS_inotify_init1,
+        libc::SYS_inotify_add_watch,
+        libc::SYS_inotify_rm_watch,
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+        libc::SYS_connect,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+        libc::SYS_sendto,
+        libc::SYS_recvfrom,
+        libc::SYS_sendmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_sendmmsg,
+        libc::SYS_recvmmsg,
+        libc::SYS_setsockopt,
+        libc::SYS_getsockopt,
+        libc::SYS_shutdown,
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_mprotect,
+        libc::SYS_mremap,
+        libc::SYS_madvise,
+        libc::SYS_brk,
+        libc::SYS_mlock,
+        libc::SYS_munlock,
+        libc::SYS_membarrier,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack,
+        libc::SYS_kill,
+        libc::SYS_tgkill,
+        libc::SYS_clone,
+        libc::SYS_clone3,
+        libc::SYS_execve,
+        libc::SYS_wait4,
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+        libc::SYS_futex,
+        libc::SYS_set_robust_list,
+        libc::SYS_get_robust_list,
+        libc::SYS_set_tid_address,
+        libc::SYS_sched_yield,
+        libc::SYS_sched_getaffinity,
+        libc::SYS_sched_setaffinity,
+        libc::SYS_nanosleep,
+        libc::SYS_clock_nanosleep,
+        libc::SYS_clock_gettime,
+        libc::SYS_clock_getres,
+        libc::SYS_gettimeofday,
+        libc::SYS_getpid,
+        libc::SYS_getppid,
+        libc::SYS_gettid,
+        libc::SYS_getuid,
+        libc::SYS_geteuid,
+        libc::SYS_getgid,
+        libc::SYS_getegid,
+        libc::SYS_getgroups,
+        libc::SYS_getresuid,
+        libc::SYS_getresgid,
+        libc::SYS_capget,
+        libc::SYS_prctl,
+        libc::SYS_prlimit64,
+        libc::SYS_getrlimit,
+        libc::SYS_getrusage,
+        libc::SYS_uname,
+        libc::SYS_sysinfo,
+        libc::SYS_getrandom,
+        libc::SYS_rseq,
+        libc::SYS_timerfd_create,
+        libc::SYS_timerfd_settime,
+        libc::SYS_timerfd_gettime,
+        libc::SYS_pidfd_open,
+        libc::SYS_pidfd_send_signal,
+        libc::SYS_seccomp,
+        libc::SYS_restart_syscall,
+        libc::SYS_setitimer,
+    ];
+    // (The older calls the C library still makes where the architecture has them.)
+    #[cfg(target_arch = "x86_64")]
+    calls.extend([
+        libc::SYS_open,
+        libc::SYS_stat,
+        libc::SYS_lstat,
+        libc::SYS_access,
+        libc::SYS_pipe,
+        libc::SYS_poll,
+        libc::SYS_epoll_wait,
+        libc::SYS_epoll_create,
+        libc::SYS_readlink,
+        libc::SYS_unlink,
+        libc::SYS_rename,
+        libc::SYS_mkdir,
+        libc::SYS_rmdir,
+        libc::SYS_dup2,
+        libc::SYS_chmod,
+        libc::SYS_inotify_init,
+        libc::SYS_eventfd,
+        libc::SYS_getdents,
+        libc::SYS_time,
+        libc::SYS_select,
+        libc::SYS_fork,
+        libc::SYS_vfork,
+        libc::SYS_pause,
+        libc::SYS_alarm,
+        libc::SYS_creat,
+        libc::SYS_chown,
+        libc::SYS_lchown,
+        libc::SYS_link,
+        libc::SYS_symlink,
+        libc::SYS_utimes,
+        libc::SYS_futimesat,
+        libc::SYS_getpgrp,
+        libc::SYS_truncate,
+        libc::SYS_arch_prctl,
+    ]);
+    calls
+}
+
+/// A seccomp filter for the calling process (and every thread of it): the calls in `allowed` pass,
+/// every other answers `EPERM`, and the calls of another architecture's numbering are killed.
+/// Needs `no_new_privs` (or CAP_SYS_ADMIN) first, and cannot be undone.
+pub fn seccomp_allow(allowed: &[i64]) -> Result<()> {
+    let mut program = allow_program(allowed);
+    let fprog = libc::sock_fprog {
+        len: u16::try_from(program.len()).map_err(|_| Error::other("the filter is longer than a filter can be"))?,
+        filter: program.as_mut_ptr(),
+    };
+    // SAFETY: SECCOMP_SET_MODE_FILTER (1) with the TSYNC flag (1) reads the `sock_fprog` and the
+    // `len` instructions it points to, both alive for the call; the kernel copies them.
+    match unsafe { libc::syscall(libc::SYS_seccomp, 1, 1, &raw const fprog) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// [`seccomp_allow`] for what a serving part makes (see `serving_calls`).
+pub fn seccomp_serving() -> Result<()> {
+    seccomp_allow(&serving_calls())
+}
+
+/// The classic BPF program of [`seccomp_allow`]: the architecture checked, then for each call a
+/// compare and an allow (a jump of two instructions at most: BPF's are eight bits), then `EPERM`.
+fn allow_program(allowed: &[i64]) -> Vec<libc::sock_filter> {
+    let arch = if cfg!(target_arch = "x86_64") {
+        0xC000_003E
+    } else {
+        0xC000_00B7
+    }; // AUDIT_ARCH_X86_64 / _AARCH64
+    let op = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
+    let mut program = vec![
+        op(0x20, 0, 0, 4),           // A = the architecture
+        op(0x15, 1, 0, arch),        // ours: over the kill
+        op(0x06, 0, 0, 0x8000_0000), // not ours: kill the process
+        op(0x20, 0, 0, 0),           // A = the call's number
+    ];
+    for call in allowed {
+        program.push(op(0x15, 0, 1, *call as u32)); // this one: the allow after it; else over it
+        program.push(op(0x06, 0, 0, 0x7fff_0000));
+    }
+    program.push(op(0x06, 0, 0, 0x0005_0000 | libc::EPERM as u32));
+    program
 }
 
 /// A version 3 `__user_cap_header_struct` (the calling thread: pid 0) and room for its two

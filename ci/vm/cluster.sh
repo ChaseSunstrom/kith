@@ -35,9 +35,9 @@
         seed() { :; }
         # (access: the nodes run the image tests.sh built with the forge feature.)
         [ "$test" != access ] || base=$osdir
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = privilege ]; then
         others=2 more=--mesh project=''
-        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] || others=''
+        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != privilege ] || others=''
         # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
         # as a node's state from before had none: kithd counts what their pods write.)
         [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
@@ -63,6 +63,8 @@
         # (policy: no way left to be root with all of the kernel's capabilities, so kithd gives up the rest.
         # QEMU reads a comma in -smbios as the end of a value, so each one here is doubled.)
         [ "$test" != policy ] || more='--mesh --node-policy no-exec-units,,no-vm-paths,,no-run'
+        # (privilege: the root part and the serving part split, and the serving part's confinement held to what it says.)
+        [ "$test" != privilege ] || more='--mesh --split'
         # A container image the nodes have without asking anybody (they reach no registry
         # here): kith itself, put where a node keeps an image it has pulled, in a state
         # partition made again with that in it.
@@ -85,7 +87,7 @@
                 cp "$work/pod" "$image/rootfs/bin/pod"
                 echo '{}' >"$image/config.json"
                 # (outlive: pod on the node's own disk as well, for its exec units.)
-                [ "$test" != outlive ] || { mkdir -p "$work/seed/tools" && cp "$work/pod" "$work/seed/tools/pod"; }
+                { [ "$test" != outlive ] && [ "$test" != privilege ]; } || { mkdir -p "$work/seed/tools" && cp "$work/pod" "$work/seed/tools/pod"; }
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:user"
                 for tag in serve again; do
@@ -349,6 +351,9 @@ EOF
         fi
         if [ "$test" = outlive ]; then
             . "$root/ci/vm/outlive.sh"
+        fi
+        if [ "$test" = privilege ]; then
+            . "$root/ci/vm/privilege.sh"
         fi
         if [ "$test" = compose ]; then
             . "$root/ci/vm/compose.sh"

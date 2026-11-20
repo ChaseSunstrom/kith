@@ -202,8 +202,8 @@ serves one end with the node's `Direct` (`root_part::serve_split`); `Direct::new
 the other end (a `Socket`, which is a `Root`), so a request that needs no handle crosses it, and
 every check and every count is the root part's, once (a `Book` is shared, so there is no second
 count). The controller's own `Create`, `Start`, `Kill` and the rest of a unit's verbs stay local until
-T-0811 moves the unit's handle to the other process. Nothing is confined yet: no uid or
-capability drop, no `no_new_privs`, no filter, no tied lives (T-0811).
+T-0811 moves the unit's handle to the other process. Confinement is built (see "Built so far
+(confined)") but is not applied to the serving part yet, which is still a thread of the root part's process.
 
 - **Wrappers.** `kith-dm-sys` is the one crate with the unsafe code: `socketpair`, `send_fds`
   and `recv_fds` (`SCM_RIGHTS`; `MSG_NOSIGNAL`; descriptors arrive close-on-exec; a message or a
@@ -235,13 +235,40 @@ capability drop, no `no_new_privs`, no filter, no tied lives (T-0811).
 
 **Not done, said here**: a single worker serializes the requests, and a long one (an unpack) holds the
 rest behind it, up to their deadline (T-0812 measures it before it is changed); a caller waiting for the
-lock has no deadline of its own; `send_fds` and `recv_fds` take up a call a signal cut short
-(`EINTR`) but wait the socket's whole timeout again, rather than what was left of it (kithd takes few
-signals; an absolute deadline is T-0811's, with the worker thread's restart); more than 253 layers cannot be sent in one `Unpack` though the
+lock waits as long as its call may (T-0811: it gives up at its own deadline, and the call is made on the
+calling thread, so an async caller is held for that long at most; `spawn_blocking` at each caller is not
+done); `send_fds` and `recv_fds` take up a call a signal cut short (`EINTR`) for 60 s at most
+altogether (T-0811); more than 253 layers cannot be sent in one `Unpack` though the
 limit on layers is 256; a caller that gives up after a `Create` leaves the unit held by the root
-part, to be taken by `Adopt` or deleted; a layer that is a FIFO is refused; the serving thread is
-not started again if the peer ends (the root part is a thread of kithd until T-0811 makes it a
-process, so the two end together).
+part, to be taken by `Adopt` or deleted; a layer that is a FIFO is refused; the root part's thread is
+not started again if it ends: kithd ends with it (T-0811), for the keeper to start both again.
+
+## Built so far (confined)
+
+T-0811, `crates/kithd/src/confine.rs` and the wrappers in `kith-dm-sys`. `confine::serving` takes
+the steps in this order, after the listeners and the store are open (a failed step ends it, and the
+part serves nothing): its own mount namespace holding only its state directory (and `/proc`,
+unrecursive), a user and group that are not 0 and no other group (`setgroups`, `setresgid`,
+`setresuid`, with `PR_SET_KEEPCAPS` so what the next step drops is still held), no capability in
+any set (effective raised from permitted, the bounding set dropped one by one, ambient cleared,
+`capset` to nothing, then read back and refused if anything is left), `no_new_privs`, and last a
+seccomp filter: an allow-list by call number, `EPERM` for the rest, and the process killed on a
+foreign architecture. `Plan::filter` off leaves the filter out and nothing else (the filter is the
+step most likely to meet a call the list lacks); it is `--no-filter` on the probe, and no kithd
+flag until the serving part is a process. `kithd confine-probe DIR` does the same steps on
+itself and reports its own `/proc` status and mountinfo and what it tried and was refused (setuid,
+a capability, the node's disk, a mount, a call outside the filter), and `sh ci/vm.sh --test
+privilege` holds the node to it, then kills kithd under a pod.
+
+**Not done, said here** (the first is the reason `--split` stays off): confinement is per thread
+(capabilities, the bounding set, the mount namespace, `no_new_privs`) or per process (ids, the
+filter with `TSYNC`), so it cannot be applied to the serving part while the root part is a thread of
+the same process: it would confine both. The serving part has to be a process of its own, the root
+part the one that keeps the runtime, the `Book` and the units' handles (the controller's `Handle`s
+and `Direct::units` are in process today). Until then the tied lives are the thread model's: the
+root part's thread ends, kithd ends. The families that still need what the filter and the dropped
+capabilities take away (the BPF service table, OS update, encrypted state, share and loop mounts,
+people peers) are not moved.
 
 ## The requests
 

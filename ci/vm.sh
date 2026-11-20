@@ -37,6 +37,9 @@
 #                               (eight, the media stack's shape) imported with kith import compose, applied,
 #                               ready, each asked for by its compose name; KITH_E2E=1 also runs media.yml
 #                               under docker compose up on an Alpine machine, timed beside kith's
+#   sh ci/vm.sh --test privilege one node with --split: the confined serving process's status and mounts
+#                               read, its tries at setuid, a capability, the node's disk and a mount
+#                               refused; kithd killed under a pod: started again, the pod goes on
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
 #                               kills in a minute restart the machine
@@ -187,6 +190,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    not know to an outside resolver (ci/outside-dns.py, on this machine); a pod
                    on the first finds outside.example.test through both. KITH_POD_NOUPSTREAM=1
                    starts neither with an upstream: the control, where the name is not found
+  --test privilege instead: one node on the mesh with --split: `kithd confine-probe` (as an exec
+                   unit) confines itself as the serving part does and says its status, its mounts and
+                   what it tried and was refused, with the filter and with --no-filter; then kithd
+                   killed under a pod: started again, the pod the same process
   --test outlive   instead: one node on the mesh with ci/pod.rs as an image and on its
                    disk: kithd killed (SIGKILL) under a pod of two containers, an exec
                    unit and a Job; the machine stays up, kithd serves again within
@@ -348,7 +355,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | alone) ;; *) echo "vm.sh: --test knows: init, image, update, modules, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | privilege | alone) ;; *) echo "vm.sh: --test knows: init, image, update, modules, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, privilege" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1

@@ -153,6 +153,13 @@ with classes named, only Devices the node listed itself). `no-` before a word tu
 are read left to right. On kith OS they go at the end of what the config partition says (` --
 --node-policy hardened`); elsewhere `KITH_NODE_POLICY` does too.
 
+`kithd --split` (or `KITH_SPLIT`, off by default) puts what needs root behind a typed request list
+and a socket, and holds the part that reads the network to a confinement of its own: its state
+directory alone in its mount namespace, a user that is not root, no capability, `no_new_privs` and
+a system call filter. It is not complete:
+until the two parts are processes the confinement is built and tested but not applied, and a node
+that runs `--split` has the socket and no more. `docs/adr-privilege.md` says what is done.
+
 `hardened` also stops NodeWorkloads (DaemonSets): turn `host-users` back on to run them. A
 container given a Device, or a mount on a file system that cannot be id-mapped, keeps the node's
 users too, whatever `host-users` says.

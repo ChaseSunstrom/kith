@@ -4428,6 +4428,24 @@ mod tests {
     }
 
     #[test]
+    fn root_part_socket_a_call_waits_no_longer_than_its_deadline_for_one_in_flight() {
+        let (book, _) = book("socket-stuck");
+        let root = Direct::with(Nobody, &book);
+        over_socket(&root, &Limits::default(), |mut socket| {
+            socket.deadline = Duration::from_millis(100);
+            let stuck = socket.stuck();
+            let started = Instant::now();
+            let why = socket.request(ask("127.0.0.1", 0, Proto::Tcp)).unwrap_err();
+            assert!(why.contains("in time"), "{why}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+            drop(stuck);
+            // The lock is let go: the next call is answered.
+            let tcp = socket_of(socket.request(ask("127.0.0.1", 0, Proto::Tcp)));
+            assert!(TcpListener::from(tcp).local_addr().is_ok());
+        });
+    }
+
+    #[test]
     fn root_part_socket_refuses_a_request_over_the_limit_before_sending_it() {
         let (book, _) = book("socket-long");
         let root = Direct::with(Nobody, &book);
