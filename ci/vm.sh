@@ -11,6 +11,7 @@
 #   sh ci/vm.sh --test update   that image updating itself, and going back when it must
 #   sh ci/vm.sh --test clock    the node's clock started hours off, stepped to an SNTP server's time
 #   sh ci/vm.sh --test disk     a disk file made a data disk and mounted, another left alone
+#   sh ci/vm.sh --test encrypt  a plain node's disk file encrypted in place at its start, cut mid-pass, resumed
 #   sh ci/vm.sh --test rollout  three nodes of it taking a release, one at a time
 #   sh ci/vm.sh --test install  the installer, onto virtual disks, and what it installed
 #   sh ci/vm.sh --test vps      the installer started from memory, as os/vps.sh starts it
@@ -123,6 +124,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    grown to the disk, the mount after the state opens), one nobody added.
                    Expected: the first mounted, again at the next start from its key; the
                    second listed as left alone and unchanged byte for byte; same needs as image
+  --test encrypt   instead: a plain node's disk file given a lock record and a marker, and its
+                   state encrypted in place at the next start (docs/adr-encrypt-in-place.md); the
+                   first such start is cut mid-pass (the monitor's quit) and the next resumes it.
+                   Expected: the same node, a state the host cannot read, the marker gone, and no
+                   pass at a third start; same needs as image, and od
   --test rollout   instead: three nodes on a network of their own, claimed and joined
                    over TLS, their image built with a release key; a first release by
                    another key (refused), one with another file's signature (refused), a signed
@@ -405,7 +411,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | nested | nofile | alone | disk | clock | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, nested, nofile, fido2" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | nested | nofile | alone | disk | clock | encrypt | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, encrypt, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, nested, nofile, fido2" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1

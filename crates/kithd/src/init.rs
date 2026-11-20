@@ -514,6 +514,73 @@ fn widen() {
     }
 }
 
+/// Whether this start has an encrypted node's state to open (and so a pass to finish first): not
+/// the installer's, and not a kithd started again over a state the one before mounted. One started
+/// again with the state NOT mounted is the one that follows a kithd that died before it was.
+fn opens_sealed(installing: bool, again: bool, state_mounted: bool) -> bool {
+    !installing && !(again && state_mounted)
+}
+
+/// Encrypt the state partition in place if the node's config partition says it is due (a marker,
+/// or a pass the last start did not finish: in_place.rs), under the key the lock record holds,
+/// through the mapping `kith-inplace`. After `widen` and before the state is mounted or opened:
+/// the state is opened under the same key at the end of this start, as an encrypted node's.
+/// An error is a state that is not a plain file system any more or not yet: the caller stops.
+fn encrypt_in_place(config: &std::path::Path, record: &crate::crypt::Record) -> Result<(), String> {
+    use crate::in_place::{self, Outcome, Point};
+    use std::io::Seek;
+    let io = |what: &'static str| move |e: std::io::Error| format!("{what}: {e}");
+    let rw = |path: &std::path::Path| std::fs::File::options().read(true).write(true).open(path);
+    let config = rw(config).map_err(io("opening the config partition"))?;
+    let due = in_place::marked(&config).and_then(|marked| Ok(marked || in_place::begun(&config)?));
+    if !due.map_err(io("reading the encryption marker"))? {
+        return Ok(());
+    }
+    let device = labelled("state").ok_or("an encryption in place is due, and no partition is labelled state")?;
+    let part = rw(&device).map_err(io("opening the state partition"))?;
+    let total = (&part)
+        .seek(std::io::SeekFrom::End(0))
+        .map_err(io("measuring the state partition"))?;
+    let chunks = total.div_ceil(in_place::CHUNK as u64);
+    let from = in_place::progress(&config).map_err(io("reading the journal"))?;
+    match from {
+        Some((done, _)) => eprintln!("kithd: init: encrypting the state in place, resumed at chunk {done} of {chunks}"),
+        None => eprintln!("kithd: init: encrypting the state in place: {chunks} chunks of 256 KiB"),
+    }
+    // (The mapping is the whole partition, as the one that opens the state is: what is written
+    // through it here is what that one reads.)
+    let open = |key: &[u8; 64], run: &mut dyn FnMut(&dyn in_place::Disk) -> std::io::Result<()>| {
+        // (One a kithd that died mid-pass left: the pass is resumed from the journal, not the mapping.
+        // None is the usual answer, and is not an error.)
+        let _ = kith_dm_sys::remove("kith-inplace");
+        let mapped = kith_dm_sys::crypt("kith-inplace", &device, 0, total / 512, key)?;
+        let through = crate::crypt::opened(&mapped).and_then(|through| run(&through));
+        let closed = crate::crypt::unmap("kith-inplace");
+        through.and(closed)
+    };
+    // (A line every 8 MiB through the mapping: what a console, and the test that cuts the power
+    // at one, sees of a pass.)
+    let mut done = from.map_or(0, |(done, _)| done);
+    let mut hit = |point: Point| {
+        if point == Point::ChunkDone {
+            done += 1;
+            if done % 32 == 0 || done == chunks {
+                eprintln!("kithd: init: encrypting the state in place: {done} of {chunks} chunks");
+            }
+        }
+        Ok(())
+    };
+    let ran = in_place::at_boot(&config, &part, total, record.plain_key(), &open, &mut hit);
+    match ran.map_err(io("encrypting the state in place"))? {
+        Outcome::Encrypted => eprintln!("kithd: init: the state is encrypted in place"),
+        Outcome::Cleaned => {
+            eprintln!("kithd: init: the state was encrypted in place already: its journal is forgotten")
+        }
+        Outcome::Nothing => {}
+    }
+    Ok(())
+}
+
 /// How many blocks the ext4 file system with this superblock has, and how long one is.
 fn ext4_blocks(superblock: &[u8]) -> Option<(u64, u64)> {
     let word = |at: usize| {
@@ -779,6 +846,23 @@ fn mounts() -> [(&'static str, &'static str, MsFlags, &'static str); 9] {
 }
 
 #[cfg(test)]
+mod again {
+    use super::opens_sealed;
+
+    /// A kithd started again before the state was mounted (the one before died mid-pass, or before
+    /// it opened the state) opens the sealed state, so the pass runs first; one started again over
+    /// a mounted state, and the installer, leave it alone.
+    #[test]
+    fn a_kithd_started_again_before_the_state_is_mounted_finishes_the_pass() {
+        assert!(opens_sealed(false, false, false), "the first start");
+        assert!(opens_sealed(false, true, false), "started again, nothing mounted");
+        assert!(!opens_sealed(false, true, true), "started again over a mounted state");
+        assert!(!opens_sealed(true, false, false), "the installer");
+        assert!(!opens_sealed(true, true, false), "the installer, again");
+    }
+}
+
+#[cfg(test)]
 mod mounts {
     use super::*;
 
@@ -872,7 +956,7 @@ pub fn early(again: bool) -> Boot {
     }
     // (An encrypted state waits for its key, and that for the network: see `main`.)
     // (Started again: an encrypted state was opened by the kithd before, and is mounted.)
-    let sealed = labelled("config").filter(|_| !installing && !(again && mounted(STATE)));
+    let sealed = labelled("config").filter(|_| opens_sealed(installing, again, mounted(STATE)));
     let sealed = sealed.and_then(|device| match crate::crypt::Record::read(&device) {
         Ok(record) => Some((record?, device)),
         Err(e) => {
@@ -890,6 +974,17 @@ pub fn early(again: bool) -> Boot {
     }
     if !installing && !again && !options(&line).0.keep {
         widen();
+    }
+    // (A node with a lock record whose state is to be encrypted in place, before that state is
+    // opened under the key the record holds: see `encrypt_in_place`. Also when started again: a
+    // kithd that died mid-pass leaves the pass to this one, and the state is not mounted until
+    // the pass is done, or the node is off.)
+    if let Some((record, config)) = &sealed
+        && let Err(e) = encrypt_in_place(config, record)
+    {
+        eprintln!("kithd: init: {e}: the state is not opened, and its journal is kept");
+        POWER_OFF.store(true, Ordering::Relaxed);
+        end(false)
     }
     if !installing && !again && sealed.is_none() {
         state();
