@@ -489,23 +489,26 @@ mod ntp {
     }
 
     #[test]
-    fn dhcp_ntp_server_choice_is_the_lease_then_the_one_told_then_the_gateway() {
+    fn dhcp_ntp_server_choice_is_the_one_told_and_the_lease_only_where_none_is() {
         let mac = [0x52, 0x54, 0, 1, 2, 3];
         let options = [3, 4, 10, 9, 0, 1, 42, 4, 10, 9, 0, 7];
         let (_, lease) = reply(&offer(mac, &options), 7, mac).unwrap();
         let told = Some("10.9.0.9:5123".parse().unwrap());
         let at = |address: &str| address.parse::<std::net::SocketAddr>().unwrap();
+        // A rogue DHCP server's option 42 does not outrank the operator's word.
         assert_eq!(
             crate::clock::order(&lease.ntp, told, lease.router),
-            [at("10.9.0.7:123"), at("10.9.0.9:5123"), at("10.9.0.1:123")]
+            [at("10.9.0.9:5123")]
         );
-        // A network that names none: the one told, then the gateway; and with neither, none
+        // Nothing told: the lease's server, then the gateway.
+        assert_eq!(
+            crate::clock::order(&lease.ntp, None, lease.router),
+            [at("10.9.0.7:123"), at("10.9.0.1:123")]
+        );
+        // A network that names none, and one told: the one told; with neither, none
         // (the cluster's leader is asked then, as `clock::ask` does).
         let (_, bare) = reply(&offer(mac, &options[..6]), 7, mac).unwrap();
-        assert_eq!(
-            crate::clock::order(&bare.ntp, told, bare.router),
-            [at("10.9.0.9:5123"), at("10.9.0.1:123")]
-        );
+        assert_eq!(crate::clock::order(&bare.ntp, told, bare.router), [at("10.9.0.9:5123")]);
         assert!(crate::clock::order(&bare.ntp, None, None).is_empty());
     }
 

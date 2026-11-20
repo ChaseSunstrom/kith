@@ -4,10 +4,14 @@
 //! from its four time stamps, and the clock stepped with `clock_settime` when it is off by more
 //! than two seconds. Asked again about every hour, never under a minute apart.
 //!
-//! Whose time, in this order: a server the network's DHCP names (option 42), the one on the
-//! kernel command line (`kith.ntp=ADDRESS[:PORT]`) or the installer's `ntp:`, the network's
-//! gateway, and last the cluster's leader (`GET /v1/clock` on the cluster port, a node asking
-//! another: a closed network with one clock in it still has one time). What it found is in this
+//! Whose time: the server the operator told (`kith.ntp=ADDRESS[:PORT]` on the kernel command
+//! line, or the installer's `ntp:`); where none is told, what the network says (a server its
+//! DHCP names by option 42, then its gateway: anyone on the wire can say these, so they are
+//! not asked while the operator's is); and the cluster's leader (`GET /v1/clock` on the
+//! cluster port, a node asking another over mutual TLS: a closed network with one clock in
+//! it still has one time), whose time outweighs a server that is over two seconds from it.
+//! The first time a clock is set one source is enough (a machine that starts in 1970 has
+//! no other way); after that a step takes a second source to agree (see `ask`). What it found is in this
 //! Node's status as `clock`: `{server, offsetMs, delayMs, stepped, checked}`, or `{error,
 //! checked}` where no one answered.
 //!
@@ -31,6 +35,8 @@ use std::sync::Arc;
 /// Off by more than this, the clock is stepped (SNTP's own bound is 128 ms: below two seconds
 /// nothing a node does notices, and a clock that jumps every hour for a few ms is worse).
 const STEP_OVER_US: i64 = 2_000_000;
+/// Two sources say the same time when their offsets are this near (see `ask`).
+const AGREE_US: i64 = 1_000_000;
 /// Between asks: after an answer, and after none (never under a minute).
 const EVERY: Duration = Duration::from_secs(3600);
 const RETRY: Duration = Duration::from_secs(60);
@@ -82,13 +88,16 @@ pub fn told(server: Option<SocketAddr>) {
     SOURCES.lock().expect("nothing panics holding the sources").told = server;
 }
 
-/// Who to ask, in order: the DHCP's, the one told, the gateway (a home router often is one).
+/// Who to ask: the one the operator told, and no other (what the network says, DHCP's option 42
+/// and the gateway it names, is whatever any machine on the wire sent: it is used only where
+/// nothing is told, the DHCP's first, then the gateway, a home router often being one).
 /// No server twice.
 pub(crate) fn order(dhcp: &[Ipv4Addr], told: Option<SocketAddr>, gateway: Option<Ipv4Addr>) -> Vec<SocketAddr> {
     let dhcp = dhcp.iter().map(|ip| SocketAddr::new((*ip).into(), 123));
     let gateway = gateway.map(|ip| SocketAddr::new(ip.into(), 123));
     let mut all: Vec<SocketAddr> = Vec::new();
-    for server in dhcp.chain(told).chain(gateway) {
+    let network = dhcp.chain(gateway).filter(|_| told.is_none());
+    for server in told.into_iter().chain(network) {
         if !all.contains(&server) {
             all.push(server);
         }
@@ -280,35 +289,61 @@ fn nothing(why: &str, at: i64) -> Value {
     json!({ "error": why, "checked": at / 1_000_000 })
 }
 
-/// One check: ask each server in turn, then the leader; step the clock with `set_to` when the
-/// time found is over two seconds from it; and the status that says so.
+/// One check: ask each server, then the leader; step the clock with `set_to` when the time found
+/// is over two seconds from it; and the status that says so. Whose time, when they differ:
+/// - the leader's (a member's, over the cluster's mutual TLS) when a server is over two seconds
+///   from it, and when no server answered;
+/// - else the first server's. Time from a network is unsigned: once the clock has been set
+///   once (`synced`), a step takes a second source (another server, or the leader) within a
+///   second of the same time; one source alone is said in the status and not followed.
 async fn ask(
     servers: &[SocketAddr],
     wait: Duration,
     leader: impl Future<Output = Result<Sample, String>>,
     set_to: impl Fn(i64) -> std::io::Result<()>,
+    synced: bool,
 ) -> Value {
-    let (mut found, mut why) = (None, Vec::new());
+    let (mut found, mut why) = (Vec::new(), Vec::new());
     for server in servers {
         match exchange(*server, wait).await {
-            Ok(sample) => {
-                found = Some((server.to_string(), sample));
-                break;
-            }
+            Ok(sample) => found.push((server.to_string(), sample)),
             Err(e) => why.push(format!("{server}: {e}")),
         }
     }
-    if found.is_none() {
-        match leader.await {
-            Ok(sample) => found = Some(("the cluster's leader".to_string(), sample)),
-            Err(e) => why.push(format!("leader: {e}")),
+    let leader = leader.await.map(|sample| ("the cluster's leader".to_string(), sample));
+    let mut chosen = found.first().cloned();
+    let mut trusted = false;
+    match &leader {
+        Ok((_, l))
+            if chosen
+                .as_ref()
+                .is_none_or(|(_, s)| (s.offset_us - l.offset_us).abs() > STEP_OVER_US) =>
+        {
+            chosen = leader.clone().ok();
+            trusted = true;
         }
+        Err(e) if chosen.is_none() => why.push(format!("leader: {e}")),
+        _ => {}
     }
-    let Some((server, sample)) = found else {
+    let Some((server, sample)) = chosen else {
         return nothing(&format!("no time server answered ({})", why.join("; ")), now_us());
     };
-    let step =
-        (sample.offset_us.abs() > STEP_OVER_US).then(|| set_to(now_us() + sample.offset_us).map_err(|e| e.to_string()));
+    let agrees = found
+        .iter()
+        .filter(|(other, _)| *other != server)
+        .map(|(_, s)| s)
+        .chain(leader.iter().map(|(_, s)| s))
+        .any(|s| (s.offset_us - sample.offset_us).abs() <= AGREE_US);
+    let step = if sample.offset_us.abs() <= STEP_OVER_US {
+        None
+    } else if synced && !trusted && !agrees {
+        Some(Err(format!(
+            "{server} says the clock is {:+.1} s off and no second source agrees",
+            sample.offset_us as f64 / 1e6
+        )))
+    } else {
+        Some(set_to(now_us() + sample.offset_us).map_err(|e| e.to_string()))
+    };
     render(&server, sample, step.as_ref(), now_us())
 }
 
@@ -324,12 +359,14 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     let kept = async {
         let _ = tokio::time::timeout(Duration::from_secs(10), LEARNED.notified()).await;
         let mut said = String::new();
+        let mut synced = false;
         loop {
             let servers = {
                 let sources = SOURCES.lock().expect("nothing panics holding the sources");
                 order(&sources.dhcp, sources.told, sources.gateway)
             };
-            let now = ask(&servers, WAIT, leader_time(&shared), set).await;
+            let now = ask(&servers, WAIT, leader_time(&shared), set, synced).await;
+            synced |= now["error"].is_null() && now["server"].is_string();
             let again = if now["error"].is_null() || now["stepped"] == true {
                 EVERY
             } else {
@@ -508,13 +545,17 @@ mod tests {
     }
 
     #[test]
-    fn clock_servers_are_asked_dhcp_then_told_then_gateway_each_once() {
+    fn clock_servers_are_the_one_told_else_the_networks_each_once() {
         let at = |ip: &str| SocketAddr::new(ip.parse().unwrap(), 123);
         let told: SocketAddr = "10.0.0.9:5123".parse().unwrap();
         let dhcp = [[10, 0, 0, 7].into(), [10, 0, 0, 8].into()];
+        // What the operator told is the only one asked: the network's words are not its to say.
+        assert_eq!(order(&dhcp, Some(told), Some([10, 0, 0, 1].into())), [told]);
+        assert_eq!(order(&[], Some(told), None), [told]);
+        // Nothing told: DHCP's, then the gateway.
         assert_eq!(
-            order(&dhcp, Some(told), Some([10, 0, 0, 1].into())),
-            [at("10.0.0.7"), at("10.0.0.8"), told, at("10.0.0.1")]
+            order(&dhcp, None, Some([10, 0, 0, 1].into())),
+            [at("10.0.0.7"), at("10.0.0.8"), at("10.0.0.1")]
         );
         // The gateway named as a server too: asked once, where DHCP has it.
         assert_eq!(
@@ -557,7 +598,7 @@ mod tests {
         let never = async { Err::<Sample, _>("not asked".to_string()) };
         // Eight hours behind: the clock is set to the server's time.
         let before = now_us();
-        let said = ask(&[fake(28_800_000_000, |_| {}).await], SOON, never, record).await;
+        let said = ask(&[fake(28_800_000_000, |_| {}).await], SOON, never, record, false).await;
         let to = set_to.get().expect("the clock was set");
         assert!((to - before - 28_800_000_000).abs() < 200_000, "{to} from {before}");
         assert_eq!(
@@ -568,12 +609,12 @@ mod tests {
         // Ahead by five seconds: stepped back. Three-quarters of a second: left alone.
         set_to.set(None);
         let never = async { Err::<Sample, _>("not asked".to_string()) };
-        let said = ask(&[fake(-5_000_000, |_| {}).await], SOON, never, record).await;
+        let said = ask(&[fake(-5_000_000, |_| {}).await], SOON, never, record, false).await;
         assert!(set_to.get().is_some_and(|to| to < now_us() - 4_500_000));
         assert_eq!(said["stepped"], true);
         set_to.set(None);
         let never = async { Err::<Sample, _>("not asked".to_string()) };
-        let said = ask(&[fake(750_000, |_| {}).await], SOON, never, record).await;
+        let said = ask(&[fake(750_000, |_| {}).await], SOON, never, record, true).await;
         assert_eq!(set_to.get(), None);
         assert_eq!(said["stepped"], false);
         assert!((said["offsetMs"].as_i64().unwrap() - 750).abs() < 100);
@@ -583,7 +624,7 @@ mod tests {
     async fn clock_a_step_that_is_refused_is_said_with_the_offset_found() {
         let never = async { Err::<Sample, _>("not asked".to_string()) };
         let refuse = |_| Err(std::io::Error::from_raw_os_error(1));
-        let said = ask(&[fake(7_200_000_000, |_| {}).await], SOON, never, refuse).await;
+        let said = ask(&[fake(7_200_000_000, |_| {}).await], SOON, never, refuse, false).await;
         assert_eq!(said["stepped"], false);
         assert!(said["error"].as_str().unwrap().contains("not set"), "{said}");
         assert!((said["offsetMs"].as_i64().unwrap() - 7_200_000).abs() < 200);
@@ -598,7 +639,14 @@ mod tests {
         };
         // The first server is not there: the second's time is taken.
         let leader = async { Err::<Sample, _>("not asked".to_string()) };
-        let said = ask(&[nobody().await, fake(4_000_000, |_| {}).await], SOON, leader, record).await;
+        let said = ask(
+            &[nobody().await, fake(4_000_000, |_| {}).await],
+            SOON,
+            leader,
+            record,
+            false,
+        )
+        .await;
         assert_eq!(said["stepped"], true);
         assert!(said["server"].as_str().unwrap().starts_with("127.0.0.1:"));
         // No server answers: the leader's time is, and said to be.
@@ -608,7 +656,7 @@ mod tests {
                 delay_us: 2_000,
             })
         };
-        let said = ask(&[nobody().await], SOON, leader, record).await;
+        let said = ask(&[nobody().await], SOON, leader, record, true).await;
         assert_eq!(
             (said["server"].as_str(), said["offsetMs"].as_i64()),
             (Some("the cluster's leader"), Some(-9000))
@@ -616,15 +664,80 @@ mod tests {
         assert_eq!(steps.get(), 2);
         // None of them: the status is the reason, and the clock is not touched.
         let leader = async { Err::<Sample, _>("no other node leads".to_string()) };
-        let said = ask(&[nobody().await], SOON, leader, record).await;
+        let said = ask(&[nobody().await], SOON, leader, record, false).await;
         let error = said["error"].as_str().unwrap();
         assert!(
             error.contains("no time server answered") && error.contains("no other node leads"),
             "{said}"
         );
         assert_eq!(steps.get(), 2);
-        let none = ask(&[], SOON, async { Err::<Sample, _>("x".to_string()) }, record).await;
+        let none = ask(&[], SOON, async { Err::<Sample, _>("x".to_string()) }, record, false).await;
         assert!(none["error"].as_str().unwrap().contains("(leader: x)"), "{none}");
+    }
+
+    /// `ask` once the clock has been set, with servers at these skews and a leader at `leader`
+    /// (microseconds ahead; none: not in a cluster): what it stepped to (the offset), and the status.
+    async fn after_first_sync(skews: &[i64], leader: Option<i64>) -> (Option<i64>, Value) {
+        let set_to = std::cell::Cell::new(None);
+        let record = |us: i64| {
+            set_to.set(Some(us));
+            Ok(())
+        };
+        let mut servers = Vec::new();
+        for skew in skews {
+            servers.push(fake(*skew, |_| {}).await);
+        }
+        let leader = async move {
+            leader
+                .map(|offset_us| Sample {
+                    offset_us,
+                    delay_us: 1_000,
+                })
+                .ok_or("not in a cluster".to_string())
+        };
+        let before = now_us();
+        let said = ask(&servers, SOON, leader, record, true).await;
+        (set_to.get().map(|to| to - before), said)
+    }
+
+    #[tokio::test]
+    async fn clock_after_the_first_sync_one_source_alone_does_not_step_it_hours() {
+        // A rogue server alone: refused, and the status says why, with the offset it found.
+        let (to, said) = after_first_sync(&[28_800_000_000], None).await;
+        assert_eq!(to, None);
+        assert_eq!(said["stepped"], false);
+        assert!(
+            said["error"].as_str().unwrap().contains("no second source agrees"),
+            "{said}"
+        );
+        assert!((said["offsetMs"].as_i64().unwrap() - 28_800_000).abs() < 200);
+        // Two that disagree (a second at another time): refused.
+        let (to, _) = after_first_sync(&[28_800_000_000, -3_600_000_000], None).await;
+        assert_eq!(to, None);
+        // Two that agree to within a second: stepped.
+        let (to, said) = after_first_sync(&[28_800_000_000, 28_800_400_000], None).await;
+        assert!(to.is_some_and(|to| (to - 28_800_000_000).abs() < 200_000), "{to:?}");
+        assert_eq!(said["stepped"], true);
+        // A server and a leader that agree: stepped. Under two seconds: left alone either way.
+        let (to, _) = after_first_sync(&[-5_000_000], Some(-5_200_000)).await;
+        assert!(to.is_some());
+        let (to, said) = after_first_sync(&[900_000], None).await;
+        assert_eq!((to, said["stepped"].clone()), (None, false.into()));
+        // The first sync, with one source and no other: still stepped (it has no other way).
+        let (to, _) = after_first_sync(&[], Some(7_200_000_000)).await;
+        assert!(to.is_some(), "the leader's own time is followed");
+    }
+
+    #[tokio::test]
+    async fn clock_the_leaders_time_wins_over_a_server_that_disagrees() {
+        // The server says eight hours, the leader says the clock is right: nothing is stepped.
+        let (to, said) = after_first_sync(&[28_800_000_000], Some(100_000)).await;
+        assert_eq!(to, None);
+        assert_eq!(said["server"], "the cluster's leader");
+        // The server says it is right, the leader says three hours: the leader's time is followed.
+        let (to, said) = after_first_sync(&[0], Some(10_800_000_000)).await;
+        assert!(to.is_some_and(|to| (to - 10_800_000_000).abs() < 200_000), "{to:?}");
+        assert_eq!(said["server"], "the cluster's leader");
     }
 }
 
