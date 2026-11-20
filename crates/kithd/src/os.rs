@@ -74,7 +74,9 @@ pub fn digests(block: &[u8]) -> Option<[String; 3]> {
     Some([get("sha256")?, get("kernel")?, get("rest")?])
 }
 
-/// How an update is taken.
+/// How an update is taken. (The code asks [`why_full`] and `Keys::kithd_only` for the reason; this
+/// names the answer for the tests of slice 1.)
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Way {
     /// Only kithd differs from the running system: the kernel and the rest of the root are the same.
@@ -87,12 +89,22 @@ pub enum Way {
 /// runs (kept: [`keep_signed`]; the caller has shown it is the system's own). Kithd alone only
 /// when both say what they are made of and the kernel and the rest of the root are the same;
 /// on any doubt, in full.
+#[cfg(test)]
 pub fn way(new: &[u8], running: &[u8]) -> Way {
+    match why_full(new, running) {
+        None => Way::KithdOnly,
+        Some(_) => Way::Full,
+    }
+}
+
+/// Why [`way`] is [`Way::Full`] (for the log): `None` where it is kithd alone.
+pub fn why_full(new: &[u8], running: &[u8]) -> Option<&'static str> {
     match (digests(new), digests(running)) {
-        (Some([_, kernel, rest]), Some([_, kernel_now, rest_now])) if kernel == kernel_now && rest == rest_now => {
-            Way::KithdOnly
-        }
-        _ => Way::Full,
+        (None, _) => Some("the update's header does not say what it is made of (no kithd object)"),
+        (_, None) => Some("the header kept for the running system does not say what it is made of"),
+        (Some([_, kernel, _]), Some([_, kernel_now, _])) if kernel != kernel_now => Some("the kernel image differs"),
+        (Some([_, _, rest]), Some([_, _, rest_now])) if rest != rest_now => Some("the rest of the root differs"),
+        _ => None,
     }
 }
 
@@ -527,7 +539,7 @@ fn boots(esp: &Path, running: char, into: char, block: &[u8]) -> Result<Boots, S
     Ok(Boots { running, new })
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub fn sha256(bytes: &[u8]) -> String {
     crate::pki::hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
