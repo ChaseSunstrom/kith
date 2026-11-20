@@ -132,7 +132,7 @@ fn decide(
     headers: &HeaderMap,
     upgrade: Option<OnUpgrade>,
 ) -> Result<Response, No> {
-    let (holder, key, replica) = pod_access(call, namespace, pod)?;
+    let (holder, key, replica) = pod_access(call, namespace, pod, false)?;
     if holder == "NodeWorkload" {
         let why = "port-forward does not reach a NodeWorkload's unit, which runs on the host";
         return Err(status(StatusCode::NOT_IMPLEMENTED, "NotImplemented", why.into()));

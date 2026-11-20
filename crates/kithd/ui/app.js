@@ -7,6 +7,7 @@
 import { at, blank, diffLines, entriesCheck, health, keyOf, lamps, resourceOf, shape, summary, written } from './forms.js';
 import { installPart } from './install.js';
 import { dashPart } from './dash.js';
+import { PROTOCOL, shellPart, socketUrl } from './shell.js';
 
 const $ = (id) => document.getElementById(id);
 const PROPERTIES = new Set(['value', 'checked', 'disabled', 'hidden', 'open', 'readOnly', 'selected']);
@@ -662,6 +663,10 @@ const TABS = [
   ['status', 'Status', () => state.key !== '+'],
   ['history', 'History', () => state.key !== '+'],
   ['logs', 'Logs', () => lamps(live(state.key) ?? {}).length > 0],
+  // (A shell takes the Exec right on what runs the pod, and on Node besides for a NodeWorkload; kithd asks it again.)
+  ['terminal', 'Terminal', () => ['Workload', 'Job', 'NodeWorkload'].includes(state.kind) && may('exec') && (state.kind !== 'NodeWorkload' || may('exec', kindNamed('Node'))) && lamps(live(state.key) ?? {}).length > 0],
+  // (The files of a Volume take the Apply right on both the Volume and the Workload, as `kith volume cp` does.)
+  ['files', 'Files', () => ['Workload', 'Volume'].includes(state.kind) && state.key !== '+' && may('apply', kindNamed('Volume')) && may('apply', kindNamed('Workload'))],
 ];
 
 /** Go to another tab. Between the form and the YAML, what was edited goes along (kithd converts). */
@@ -688,6 +693,7 @@ async function show(tab) {
 
 function drawDetail() {
   const turn = ++paneTurn;
+  shell.end();
   const [pane, tabs] = [$('pane'), $('tabs')];
   const editing = ['form', 'yaml'].includes(state.tab);
   $('detail-key').textContent = state.key === '+' ? `new ${state.kind}` : (state.key ?? 'Resource');
@@ -715,6 +721,8 @@ function drawDetail() {
   if (state.tab === 'form') fill(formPane());
   else if (state.tab === 'yaml') fill(yamlPane());
   else if (state.tab === 'logs') fill(logsPane());
+  else if (state.tab === 'terminal') fill(shell.terminalPane(live(state.key)));
+  else if (state.tab === 'files') fill(shell.filesPane(live(state.key)));
   else (state.tab === 'status' ? statusPane() : historyPane()).then(fill, failed);
   stale();
   check();
@@ -761,6 +769,7 @@ async function route() {
   // kinds: the board is out of sight while one is in. A draft on the board waits there.)
   const view = ['', 'events', 'install'].includes(name) ? name || 'dash' : 'board';
   state.view = view;
+  if (view !== 'board') shell.end();
   install.show(view === 'install');
   $('dash').hidden = view !== 'dash';
   $('events').hidden = view !== 'events';
@@ -845,6 +854,24 @@ async function watch() {
 }
 
 const install = installPart({ $, h, api, ask, toast, say, state, may: (verb, kind) => may(verb, kindNamed(kind)) });
+/** A file's bytes, as kithd sends them (an error carries what kithd said). */
+async function blob(what) {
+  const asked = await fetch(`../v1/${what}`);
+  if (asked.ok) return asked.blob();
+  const text = await asked.text();
+  let said = text;
+  try { said = JSON.parse(text).error; } catch { /* not JSON: as it is */ }
+  throw new Error(said || `${asked.status} ${asked.statusText}`);
+}
+
+/** Hand a file to the browser to save. */
+function save(file, name) {
+  const link = h('a', { href: URL.createObjectURL(file), download: name });
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+}
+
+const shell = shellPart({ h, api, ask, toast, blob, save, socket: (to) => new WebSocket(socketUrl(to, document.baseURI), PROTOCOL) });
 const dash = dashPart({ $, h, api, state, still: () => matchMedia('(prefers-reduced-motion: reduce)').matches });
 $('filter').addEventListener('input', (event) => {
   state.filter = event.target.value;

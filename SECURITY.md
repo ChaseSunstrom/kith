@@ -314,6 +314,14 @@ Only the newest version is fixed. There are no security releases of older ones.
   caller and the `exec` right on that node, from its own copy of the Roles, before it enters
   the pod or opens a connection. A pod not yet made on its node is refused, never answered by
   the host's own ports.
+- **The web UI's Terminal tab is `kubectl exec` over a WebSocket, `GET /v1/exec/NAMESPACE/POD`,
+  and asks the same.** The `exec` right on the owning Workload or Job (and on `Node` for a
+  NodeWorkload) is asked before anything of the request is read, again on the replica's node
+  through `/v1/pod-hop`, and an unknown pod is 404 and a refusal 403 as for `kubectl`. A browser
+  opens it only from the UI's own origin (an `Origin` that is the page's scheme and `Host`, and
+  no cross-site `Sec-Fetch-Site`): a page of another site is refused. The Files tab lists a
+  Volume with the handles of `volume put` and `get`, so a link is never followed out of it,
+  and asks `apply` on `Volume` and `Workload`.
 - **What a resource makes for itself is asked for with it.** Whoever writes a CronJob
   must be allowed to write a Job, and whoever writes a claim that says `provision`
   (every PersistentVolumeClaim does, unless it names no storage class) a Volume.

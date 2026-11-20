@@ -2206,7 +2206,7 @@ async fn serve(
         }
         ("GET" | "POST", Some(name), Some(verb @ ("exec" | "attach"))) if kind.kind == "Pod" => {
             let upgrade = parts.extensions.get::<OnUpgrade>().cloned();
-            pod_stream(&call, verb, namespace.unwrap_or_default(), name, &parts, upgrade).await?
+            pod_stream(&call, verb, namespace.unwrap_or_default(), name, &parts, upgrade, false).await?
         }
         ("GET" | "POST", Some(name), Some("portforward")) if kind.kind == "Pod" => {
             let upgrade = parts.extensions.get::<OnUpgrade>().cloned();
@@ -3256,7 +3256,7 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
         let why = format!("{asked}: a unit's output is kept as it was written, all its runs in one file and not when");
         return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why));
     }
-    let (key, replica) = held_owner(call, namespace, pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
+    let (key, replica) = held_owner(call, namespace, pod, false).ok_or_else(|| not_found(&KINDS[0], pod))?;
     // What a unit wrote is read by who may read the resource that runs it.
     let holder = key.split('/').next().unwrap_or_default().to_string();
     let place = vec![(holder, Some(namespace.to_string()))];
@@ -3293,14 +3293,15 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
 
 /// The resource that runs `pod` in `namespace` and the replica the pod is, if the store holds
 /// that resource: what the pod's name says, checked against what is there.
-fn held_owner(call: &Call, namespace: &str, pod: &str) -> Option<(String, u32)> {
+/// (`any`, for the UI's terminal: what `kith apply` made is held too, not only what the Kubernetes API sent.)
+fn held_owner(call: &Call, namespace: &str, pod: &str, any: bool) -> Option<(String, u32)> {
     let (holder, owner, replica) = pod_owner(pod)?;
     let state = call.shared.store.lock().expect("a handler panicked holding the store");
     let key = format!("{holder}/{namespace}/{owner}");
     state
         .store
         .get(&key)
-        .is_some_and(|held| raw(held).is_some())
+        .is_some_and(|held| any || raw(held).is_some())
         .then_some((key, replica))
 }
 
@@ -3317,8 +3318,9 @@ async fn pod_stream(
     pod: &str,
     parts: &Parts,
     upgrade: Option<OnUpgrade>,
+    ui: bool,
 ) -> Result<Response, No> {
-    let decided = pod_decision(call, verb, namespace, pod, parts, upgrade).await;
+    let decided = pod_decision(call, verb, namespace, pod, parts, upgrade, ui).await;
     let outcome = decided.as_ref().map(|_| ()).map_err(|no| no.why.clone());
     call.shared
         .audit
@@ -3326,9 +3328,56 @@ async fn pod_stream(
     decided
 }
 
+/// Why an upgrade's Origin is refused. kubectl sends none, so on the Kubernetes route any is a browser's and
+/// refused. The UI's own route (`ui`) takes one only from the UI's own page: its authority is the one the
+/// page was reached by (`Host`; the scheme is `https` direct and `http` behind `kith ui`'s loopback port),
+/// and a browser that says `Sec-Fetch-Site` says `same-origin`. A page of another site, or of another port
+/// of this host, is refused: it would otherwise hold a shell with the certificate the browser holds.
+fn foreign_origin(headers: &axum::http::HeaderMap, ui: bool) -> Option<&'static str> {
+    let origin = headers.get(header::ORIGIN)?;
+    if !ui {
+        return Some("an upgrade that carries an Origin is refused: kubectl sends none");
+    }
+    let host = headers.get(header::HOST).and_then(|host| host.to_str().ok());
+    let host = host.filter(|host| !host.is_empty());
+    let own = origin.to_str().ok().is_some_and(|origin| {
+        let authority = origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"));
+        authority.is_some() && authority == host
+    });
+    let site = headers.get("sec-fetch-site").map(|site| site.as_bytes());
+    (!own || site.is_some_and(|site| site != b"same-origin"))
+        .then_some("a shell is opened from the UI's own page only: this one's Origin is another's")
+}
+
+/// The UI's terminal: the same exec as `kubectl exec` (`GET /v1/exec/NAMESPACE/POD?command=...&tty=true`),
+/// under the caller's own Exec right and no other, with the Origin of the UI's own page let through.
+pub async fn ui_exec(
+    State(shared): State<Arc<Shared>>,
+    Route((namespace, pod)): Route<(String, String)>,
+    mut parts: Parts,
+) -> Response {
+    let Some(caller) = parts.extensions.get::<Caller>().cloned() else {
+        let why = "who asks is not known".to_string();
+        return status(StatusCode::UNAUTHORIZED, "Unauthorized", why).into_response();
+    };
+    let upgrade = parts.extensions.remove::<OnUpgrade>();
+    let call = Call {
+        shared,
+        caller,
+        certificate: parts.extensions.get::<Certificate>().cloned(),
+        asked: Asked::default(),
+        table: false,
+    };
+    pod_stream(&call, "exec", &namespace, &pod, &parts, upgrade, true)
+        .await
+        .unwrap_or_else(No::into_response)
+}
+
 /// The Exec right on what runs `pod` (and on `Node` for a NodeWorkload's, which runs on the host), then the
 /// pod itself: the kind that holds it, its owner's key and its replica. Nothing of the request is read before.
-fn pod_access(call: &Call, namespace: &str, pod: &str) -> Result<(&'static str, String, u32), No> {
+fn pod_access(call: &Call, namespace: &str, pod: &str, ui: bool) -> Result<(&'static str, String, u32), No> {
     // (What the pod's name says is enough to ask: a caller without the right is refused whether or not the pod is there.)
     let (holder, _, _) = pod_owner(pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
     let place = vec![(holder.to_string(), Some(namespace.to_string()))];
@@ -3338,7 +3387,7 @@ fn pod_access(call: &Call, namespace: &str, pod: &str) -> Result<(&'static str, 
         let node = vec![("Node".to_string(), None)];
         api::permit(&call.shared, &call.caller, Verb::Exec, |_| node).map_err(refusal)?;
     }
-    let (key, replica) = held_owner(call, namespace, pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
+    let (key, replica) = held_owner(call, namespace, pod, ui).ok_or_else(|| not_found(&KINDS[0], pod))?;
     Ok((holder, key, replica))
 }
 
@@ -3349,16 +3398,17 @@ async fn pod_decision(
     pod: &str,
     parts: &Parts,
     upgrade: Option<OnUpgrade>,
+    ui: bool,
 ) -> Result<Response, No> {
     let (method, headers, query) = (
         parts.method.as_str(),
         &parts.headers,
         parts.uri.query().unwrap_or_default(),
     );
-    pod_access(call, namespace, pod)?;
-    // kubectl sends no Origin: one is a browser's, and a browser is not let upgrade to a shell.
-    if headers.contains_key(header::ORIGIN) {
-        let why = "an upgrade that carries an Origin is refused: kubectl sends none";
+    pod_access(call, namespace, pod, ui)?;
+    // kubectl sends no Origin: one is a browser's, and a browser is not let upgrade to a shell,
+    // unless it is the UI's route and the page is the UI's own.
+    if let Some(why) = foreign_origin(headers, ui) {
         return Err(status(StatusCode::FORBIDDEN, "Forbidden", why.into()));
     }
     let said = |name| {
@@ -3420,6 +3470,39 @@ mod tests {
             let _ = there.send(());
             let _ = go.await;
         }
+    }
+
+    /// The UI's terminal takes an upgrade from its own page only (an Origin that is the Host it was sent to, and no
+    /// browser word of another site); the Kubernetes route takes no Origin at all.
+    #[test]
+    fn foreign_origin_lets_only_the_uis_own_page_open_a_shell() {
+        let ask = |pairs: &[(&'static str, &str)], ui: bool| {
+            let mut headers = axum::http::HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(*name, value.parse().unwrap());
+            }
+            foreign_origin(&headers, ui).is_some()
+        };
+        let own = [("host", "kith:7443"), ("origin", "https://kith:7443")];
+        assert!(!ask(&[("host", "kith:7443")], true), "no Origin: not a browser");
+        assert!(!ask(&own, true));
+        assert!(
+            !ask(&[("host", "127.0.0.1:9"), ("origin", "http://127.0.0.1:9")], true),
+            "the forwarder's"
+        );
+        assert!(!ask(&[own[0], own[1], ("sec-fetch-site", "same-origin")], true));
+        for (why, pairs) in [
+            ("another site", vec![own[0], ("origin", "https://evil.example")]),
+            ("another port", vec![own[0], ("origin", "https://kith:1")]),
+            ("opaque", vec![own[0], ("origin", "null")]),
+            ("no Host", vec![own[1]]),
+            ("cross-site", vec![own[0], own[1], ("sec-fetch-site", "cross-site")]),
+            ("same-site", vec![own[0], own[1], ("sec-fetch-site", "same-site")]),
+        ] {
+            assert!(ask(&pairs, true), "{why}");
+        }
+        assert!(ask(&own, false), "the Kubernetes route refuses any Origin");
+        assert!(!ask(&[own[0]], false));
     }
 
     /// A status is kithd's own word for what runs: a client's PUT or PATCH of it is refused

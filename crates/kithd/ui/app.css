@@ -432,6 +432,11 @@ abbr { color: var(--accent-text); text-decoration: none; margin-left: 2px; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .logs-box { display: flex; flex-direction: column; gap: calc(var(--unit) * 2); height: 100%; }
 .logs { flex: 1; min-height: 30vh; overflow: auto; background: var(--sunken); padding: calc(var(--unit) * 3); }
+/* The Terminal's line and the Files tab: a command to type, and a directory to walk. */
+.line { font-family: var(--mono); font-size: var(--small); width: 100%; }
+.files-box { display: flex; flex-direction: column; gap: calc(var(--unit) * 3); }
+.files table { width: 100%; }
+button.link { background: none; border: 0; padding: 0; color: inherit; font: inherit; text-decoration: underline; cursor: pointer; }
 
 /* The dialog: the diff, then the yes. A sheet of the same paper in an ink frame. */
 dialog {

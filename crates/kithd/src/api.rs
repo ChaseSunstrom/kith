@@ -70,6 +70,8 @@ pub fn router(shared: Arc<Shared>) -> Router {
             "/v1/volumes/{namespace}/{name}/files",
             get(crate::volume_files::get).put(crate::volume_files::put),
         )
+        .route("/v1/volumes/{namespace}/{name}/ls", get(crate::volume_files::ls))
+        .route("/v1/exec/{namespace}/{pod}", get(crate::kube::ui_exec))
         .route("/v1/packages/push", post(push))
         .route("/v1/packages/pull", post(pull))
         .route("/v1/audit", get(audit))

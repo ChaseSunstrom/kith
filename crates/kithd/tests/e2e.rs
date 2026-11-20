@@ -2674,7 +2674,8 @@ fn fetch_within(within: Duration, args: &[&str]) -> (u16, String, String) {
             .args(args)
             .output()
             .unwrap();
-        let out = String::from_utf8(out.stdout).unwrap();
+        // (Lossy: a WebSocket's frames after the head are bytes.)
+        let out = String::from_utf8_lossy(&out.stdout).into_owned();
         let (head, body) = out.split_once("\r\n\r\n").unwrap_or_default();
         let status = head.split(' ').nth(1).and_then(|status| status.parse().ok());
         if let Some(status) = status {
@@ -2912,6 +2913,262 @@ fn web_ui_is_served_and_asks_as_its_caller() {
     for (status, _, body) in refusals {
         assert_eq!(status, 403, "{body}");
     }
+    forwarder.kill().unwrap();
+    forwarder.wait().unwrap();
+}
+
+/// The UI's terminal is `GET /v1/exec/NAMESPACE/POD`, a WebSocket of the same exec `kubectl exec` makes: the Exec
+/// right on the Workload (and on `Node` for a NodeWorkload's pod) is asked before the request is read, so a caller
+/// without it is 403 whatever it sends and whether or not the pod is there, and one with it is 404 for a pod that is
+/// not and 101 for one that is. The UI's own page may open it (its Origin is the page's own); any other page may not.
+#[test]
+fn ui_exec_asks_the_exec_right_first_and_takes_only_the_uis_own_origin() {
+    let port = free_port();
+    let listen: &'static str = Box::leak(format!("127.0.0.1:{port}").into_boxed_str());
+    let args: &'static [&'static str] = Box::leak(Box::new(["--name", "alpha", "--listen", listen]));
+    let daemon = Daemon::start_with("ui_exec", args);
+    daemon.apply(
+        "apiVersion: kith.dev/v1
+kind: Role
+metadata: { name: runner }
+spec:
+  rules:
+    - kinds: [Workload]
+      verbs: [get, exec]
+      namespaces: [default]
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: { name: reader }
+spec:
+  rules:
+    - kinds: [Workload]
+      verbs: [get, list, watch]
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: { name: runner-runs }
+spec: { role: runner, subjects: [runner] }
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: { name: reader-reads }
+spec: { role: reader, subjects: [reader] }
+",
+    );
+    daemon.apply(&exec("Workload", "web", "sleep 300", "  replicas: 1\n"));
+    for who in ["runner", "reader", "nobody"] {
+        daemon.ok(&["identity", "cert", who, "--out", "."]);
+    }
+    let resolve = format!("kith:{port}:127.0.0.1");
+    let ca = daemon.dir.join("ca.crt");
+    let upgrade = [
+        "Connection: Upgrade",
+        "Upgrade: websocket",
+        "Sec-WebSocket-Version: 13",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+        "Sec-WebSocket-Protocol: v4.channel.k8s.io",
+    ];
+    // As `who` (none: no certificate), the upgrade `upgrading` of it (or a plain GET), with `more` headers.
+    let ask = |who: Option<&str>, pod: &str, upgrading: bool, more: &[&str]| {
+        let url = format!("https://kith:{port}/v1/exec/default/{pod}?command=sh&stdin=true&stdout=true&stderr=true");
+        let mut args = vec![
+            "--http1.1",
+            "--max-time",
+            "3",
+            "--cacert",
+            ca.to_str().unwrap(),
+            "--resolve",
+            &resolve,
+        ];
+        let cert = who.map(|who| {
+            (
+                daemon.dir.join(format!("{who}.crt")),
+                daemon.dir.join(format!("{who}.key")),
+            )
+        });
+        if let Some((cert, key)) = &cert {
+            args.extend(["--cert", cert.to_str().unwrap(), "--key", key.to_str().unwrap()]);
+        }
+        for header in upgrade.iter().filter(|_| upgrading).chain(more) {
+            args.extend(["-H", header]);
+        }
+        args.push(&url);
+        fetch(&args)
+    };
+    wait_for("the TLS port to answer", || {
+        fetch(&[
+            "--cacert",
+            ca.to_str().unwrap(),
+            "--resolve",
+            &resolve,
+            &format!("https://kith:{port}/v1/ca"),
+        ])
+        .0 == 200
+    });
+    let status = |who: &str, pod: &str, upgrading: bool, more: &[&str]| ask(Some(who), pod, upgrading, more).0;
+
+    // Without the right: 403 before the request is read (a plain GET and an upgrade alike), for a pod that is
+    // there and one that is not; a NodeWorkload's pod takes the right on Node too, which the runner has not.
+    for who in ["reader", "nobody"] {
+        for pod in ["web-0", "web-j0", "nosuch-0"] {
+            for upgrading in [false, true] {
+                let (code, _, body) = ask(Some(who), pod, upgrading, &[]);
+                assert_eq!(code, 403, "{who} {pod} {upgrading}: {body}");
+                assert!(
+                    body.contains("Forbidden") && body.contains("may not exec"),
+                    "{who}: {body}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        status("runner", "agent-n0", true, &[]),
+        403,
+        "a NodeWorkload's pod takes Exec on Node"
+    );
+    assert_eq!(ask(None, "web-0", true, &[]).0, 401, "no certificate");
+    // With it: a pod the store does not hold is 404 (as it is for kubectl), a pod it holds is the upgrade.
+    assert_eq!(
+        status("runner", "nosuch-j0", true, &[]),
+        403,
+        "a Job's pod takes Exec on Job, which the runner has not"
+    );
+    for pod in ["nosuch-0", "web"] {
+        let (code, _, body) = ask(Some("runner"), pod, true, &[]);
+        assert!(code == 404 && body.contains("NotFound"), "{pod}: {code} {body}");
+    }
+    assert_eq!(
+        status("runner", "web-0", false, &[]),
+        400,
+        "the pod is there: a plain GET is not an upgrade"
+    );
+    let (code, head, _) = ask(Some("runner"), "web-0", true, &[]);
+    assert!(
+        code == 101 && head.contains("sec-websocket-protocol: v4.channel.k8s.io"),
+        "{code} {head}"
+    );
+
+    // The page's own origin, with what a browser says of itself: the shell opens. A foreign page's: 403.
+    let own = format!("Origin: https://kith:{port}");
+    assert_eq!(status("runner", "web-0", true, &[&own]), 101);
+    assert_eq!(
+        status("runner", "web-0", true, &[&own, "Sec-Fetch-Site: same-origin"]),
+        101
+    );
+    for (more, why) in [
+        (vec!["Origin: https://evil.example"], "another site"),
+        (vec!["Origin: https://kith:1"], "another port of this host"),
+        (vec!["Origin: http://evil.example"], "a plain-http page of another site"),
+        (vec!["Origin: null"], "an opaque origin"),
+        (
+            vec![own.as_str(), "Sec-Fetch-Site: cross-site"],
+            "the browser says it is cross-site",
+        ),
+        (
+            vec![own.as_str(), "Sec-Fetch-Site: same-site"],
+            "the browser says it is only same-site",
+        ),
+    ] {
+        let (code, _, body) = ask(Some("runner"), "web-0", true, &more);
+        assert!(code == 403 && body.contains("Forbidden"), "{why}: {code} {body}");
+    }
+    // (The right is asked before the Origin: a caller who may not is told so, whatever page it comes from.)
+    assert_eq!(status("reader", "web-0", true, &["Origin: https://evil.example"]), 403);
+    // The Kubernetes route keeps its rule: kubectl sends no Origin, so any is refused there, the UI's own too.
+    let (code, _, body) = fetch(&[
+        "--http1.1",
+        "--max-time",
+        "3",
+        "--cacert",
+        ca.to_str().unwrap(),
+        "--resolve",
+        &resolve,
+        "--cert",
+        daemon.dir.join("runner.crt").to_str().unwrap(),
+        "--key",
+        daemon.dir.join("runner.key").to_str().unwrap(),
+        "-H",
+        &own,
+        &format!("https://kith:{port}/api/v1/namespaces/default/pods/web-0/exec?command=sh"),
+    ]);
+    assert!(code != 101, "{code} {body}");
+
+    // Each decision is in the audit log, as a refusal or as ok.
+    let audit = daemon.ok(&["audit", "--tail", "200"]);
+    let of = |who: &str, ok: bool| {
+        audit.lines().any(|line| {
+            line.contains("pod default/web-0")
+                && line.split_whitespace().nth(1) == Some(who)
+                && line.ends_with(" ok") == ok
+        })
+    };
+    assert!(of("runner", true) && of("reader", false), "{audit}");
+}
+
+/// Through `kith ui` (a loopback port, the UI's own origin there is `http://127.0.0.1:PORT`) the terminal's WebSocket
+/// is passed on and stays open both ways; the pod here runs nothing (a test is not root), so what comes back is
+/// the Status that says so, in the frames of the stream, as far as a shell would send its output.
+#[test]
+fn ui_exec_goes_through_the_forwarder_for_the_uis_own_origin_only() {
+    let daemon = Daemon::start("ui_exec_forwarded");
+    daemon.apply(&exec("Workload", "web", "sleep 300", "  replicas: 1\n"));
+    let mut forwarder = Command::new(&daemon.kith)
+        .args(["ui"])
+        .current_dir(&daemon.dir)
+        .env("KITH_SOCKET", "kithd.sock")
+        .env_remove("KITH_STORE")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut address = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(forwarder.stdout.take().unwrap()),
+        &mut address,
+    )
+    .unwrap();
+    let address = address.trim().strip_suffix("/ui/").expect("the address of the page");
+    let (origin, secret) = address.rsplit_once('/').unwrap();
+    let host = origin.strip_prefix("http://").unwrap();
+    let open = |origin: &str, path: &str| {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(host).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let head = format!(
+            "GET /{secret}{path} HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: v4.channel.k8s.io\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        let mut got = Vec::new();
+        let mut some = [0u8; 4096];
+        // (Until it ends, or nothing more comes: the stream is the server's to close.)
+        while let Ok(n) = stream.read(&mut some) {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&some[..n]);
+        }
+        String::from_utf8_lossy(&got).into_owned()
+    };
+    let path = "/v1/exec/default/web-0?command=sh&stdin=true&stdout=true&stderr=true";
+    let said = open(origin, path);
+    assert!(said.starts_with("HTTP/1.1 101"), "{said}");
+    assert!(
+        said.to_lowercase()
+            .contains("sec-websocket-protocol: v4.channel.k8s.io"),
+        "{said}"
+    );
+    // After the head: the frames of the stream, which carry what the session says of the pod.
+    let frames = said.split_once("\r\n\r\n").unwrap().1;
+    assert!(
+        frames.contains("w_default_web_0_main"),
+        "the session answered on the stream: {said:?}"
+    );
+    // Another page's origin never reaches kithd; a pod it does not hold is the 404 of kubectl exec.
+    assert!(open("http://evil.example", path).starts_with("HTTP/1.1 403"));
+    let said = open(origin, "/v1/exec/default/nosuch-0?command=sh");
+    assert!(said.starts_with("HTTP/1.1 404"), "{said}");
     forwarder.kill().unwrap();
     forwarder.wait().unwrap();
 }
