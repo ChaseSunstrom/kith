@@ -228,7 +228,7 @@ fn address_value(pair: Option<(Ipv4Addr, Ipv6Addr)>) -> Value {
 
 /// Has a store applied its leader's log? One that has not is planned from statuses it lacks, and
 /// would overwrite the ones a leader before it gave.
-fn caught_up(last_log: Option<u64>, applied: Option<u64>) -> bool {
+pub(crate) fn caught_up(last_log: Option<u64>, applied: Option<u64>) -> bool {
     last_log.is_none_or(|last| applied.is_some_and(|index| index >= last))
 }
 

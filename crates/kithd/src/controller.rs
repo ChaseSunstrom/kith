@@ -132,6 +132,8 @@ struct Slot {
     /// What its cgroup was last told for its node's seats (memory guaranteed, CPU limit), if
     /// anything; none again each time it starts.
     tuned: Option<(Option<u64>, Option<u64>)>,
+    /// Its template says `priority: idle` (T-1118): its cgroup is told so once it runs.
+    idle: bool,
     handle: Option<Handle>,
     state: &'static str,
     restarts: u32,
@@ -887,6 +889,15 @@ fn id_prefix(kind: &str, namespace: &str, name: &str) -> String {
         _ => "w",
     };
     format!("{kind}_{namespace}_{name}_")
+}
+
+/// The Workload (`NS/NAME`) the unit with id `id` (`w_NS_NAME_REPLICA_UNIT`) is a unit of: what
+/// [`id_prefix`] made, read back. None for a Job's or a NodeWorkload's unit, and for what is no
+/// unit id.
+pub fn workload_of_unit(id: &str) -> Option<String> {
+    let mut parts = id.splitn(4, '_');
+    let (_, namespace, name, rest) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    (!rest.is_empty() && id.starts_with(&id_prefix("Workload", namespace, name))).then(|| format!("{namespace}/{name}"))
 }
 
 /// The id of the pod that replica `replica` of the resource with the store key `owner` is,
@@ -1653,6 +1664,7 @@ impl Controller {
                             tried: None,
                             accounted: false,
                             tuned: None,
+                            idle: template.priority == Some(kith_api::kinds::Priority::Idle),
                             handle: None,
                             state: "pending",
                             restarts: 0,
@@ -1831,6 +1843,7 @@ impl Controller {
                 || new.exit != slot.exit
                 || new.notes != slot.notes
                 || new.policy != slot.policy
+                || new.idle != slot.idle
                 || devices
                 || new.dmem != slot.dmem
                 || new.seat != slot.seat
@@ -2286,7 +2299,7 @@ impl Controller {
                 continue;
             };
             let asked = tunes.get(&slot.owner).copied();
-            if asked.is_none() && slot.tuned.is_none() {
+            if asked.is_none() && slot.tuned.is_none() && !slot.idle {
                 continue;
             }
             let (guaranteed, held_back) = asked.unwrap_or_default();
@@ -2303,7 +2316,11 @@ impl Controller {
                 own
             };
             if slot.tuned != Some((guaranteed, cpu)) {
-                match Direct::units().tune(handle, id, guaranteed, cpu) {
+                let memory = resources.as_ref().and_then(|r| r.memory.as_ref());
+                let idle = slot.idle.then(|| kith_runtime::Idle {
+                    memory_high: memory.map(|q| q.value() as u64),
+                });
+                match Direct::units().tune(handle, id, guaranteed, cpu, idle) {
                     Ok(refused) => {
                         for refused in refused {
                             eprintln!("kithd: {id}: its seat's arrangement is not all in place: {refused}");
@@ -3186,6 +3203,14 @@ fn node_root_refusal(said: String) -> String {
     }
 }
 
+/// A volume directory as the runtime is given it: the path it was taken at (what names it in a
+/// message) and the descriptor it is held by, which the runtime's mount, give and bind all go
+/// through, and the path never again.
+fn held_volume(volume: crate::volumes::VolumeDir) -> (PathBuf, Option<kith_runtime::Held>) {
+    let (fd, real) = volume.into_parts();
+    (real, Some(kith_runtime::Held::new(fd)))
+}
+
 /// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
 async fn start(
     shared: &Shared,
@@ -3216,6 +3241,8 @@ async fn start(
         // A NodeWorkload is the node's own: it keeps the node's users.
         host_users: slot.owner.starts_with("NodeWorkload/"),
         project,
+        // ("Kind/namespace/name": the share of the root part's descriptors a give is held to.)
+        namespace: slot.owner.split('/').nth(1).unwrap_or_default().into(),
         ..Unit::default()
     };
     // The volumes' directories are made here, on the node, under the state directory (the
@@ -3224,20 +3251,26 @@ async fn start(
     let state = logs.parent().unwrap_or(logs);
     for (dir, at, read_only) in &slot.volumes {
         // (Only a shared volume of another node ever gets here: `volumes::mounts`.)
-        let host = match mesh.filter(|(_, me)| *me != dir.node) {
-            Some((prefix, me)) => crate::share::mount(state, dir, prefix, me).await,
-            // (It makes the directory, and may ask the root part: blocking file I/O, not on the runtime.)
+        let taken = match mesh.filter(|(_, me)| *me != dir.node) {
+            // (Another node's is a mount of this one's own making, a path no tenant writes.)
+            Some((prefix, me)) => crate::share::mount(state, dir, prefix, me)
+                .await
+                .map(|host| (host, None)),
+            // The descriptor goes with the path it was taken at: the runtime mounts, gives and
+            // binds from it, and never opens that path again (T-1113). (It makes the directory,
+            // and may ask the root part: blocking file I/O, not on the runtime.)
             None => {
                 let (state, dir) = (state.to_path_buf(), dir.clone());
-                tokio::task::spawn_blocking(move || crate::root_part::volume(&state, &dir))
+                tokio::task::spawn_blocking(move || crate::root_part::volume(&state, &dir).map(held_volume))
                     .await
                     .map_err(|e| e.to_string())
                     .and_then(|made| made)
             }
         };
-        let host = host.map_err(|e| format!("volume {}: {e}", dir.name))?;
+        let (host, held) = taken.map_err(|e| format!("volume {}: {e}", dir.name))?;
         unit.mounts.push(kith_runtime::Mount {
             host,
+            held,
             container: at.clone(),
             read_only: *read_only,
             // (Not a directory of the host's that an admin named: that one is theirs. Nor
@@ -3270,6 +3303,7 @@ async fn start(
             };
             unit.mounts.push(kith_runtime::Mount {
                 host,
+                held: None,
                 container: mount.path.clone(),
                 // (A map's files are kithd's to write, never the container's.)
                 read_only: mount.read_only == Some(true) || mount.scratch.is_none(),
@@ -3297,6 +3331,7 @@ async fn start(
             let host = crate::workload_identity::files(shared, &pod, container, &identity).await?;
             unit.mounts.push(kith_runtime::Mount {
                 host,
+                held: None,
                 container: crate::workload_identity::MOUNTED_AT.into(),
                 read_only: true,
                 // (Made the container's user's: its mode lets nobody else read them.)
@@ -3314,6 +3349,7 @@ async fn start(
         made.map_err(|e| format!("seat {seat}: {e}"))?;
         unit.mounts.push(kith_runtime::Mount {
             host,
+            held: None,
             container: "/run/seat".into(),
             read_only: *client,
             give: !*client,
@@ -3356,6 +3392,7 @@ async fn start(
             for (file, at) in given.files.into_iter().zip(["/etc/resolv.conf", "/etc/hosts"]) {
                 unit.mounts.push(kith_runtime::Mount {
                     host: file,
+                    held: None,
                     container: at.into(),
                     read_only: true,
                     give: false,
@@ -3915,6 +3952,7 @@ mod tests {
             tried: None,
             accounted: false,
             tuned: None,
+            idle: false,
             handle: None,
             state: "pending",
             restarts: 0,
@@ -4476,6 +4514,7 @@ mod tests {
             read_only: false,
             give: false,
             part: None,
+            held: None,
         };
         for over in ["/etc", "/etc/", "//etc"] {
             let why = hides_resolv(&[at("/data"), at(over)]).unwrap_or_else(|| panic!("{over}"));
@@ -4534,6 +4573,30 @@ mod tests {
         assert!(wait_for_storage(Vec::new(), Duration::from_millis(50)).await.is_empty());
     }
 
+    /// The runtime is handed the descriptor a volume directory is held by, and the path it was
+    /// taken at only as a name: the held directory is the one the path named when it was taken,
+    /// whatever the path names after (T-1113).
+    #[test]
+    fn a_volume_dir_goes_to_the_runtime_as_its_held_descriptor() {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!("kith-held-volume-{}", std::process::id()));
+        let (dir, away) = (root.join("data"), root.join("away"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&away).unwrap();
+        let fd = std::os::fd::OwnedFd::from(std::fs::File::open(&dir).unwrap());
+        let (host, held) = held_volume(crate::volumes::VolumeDir::from_parts(fd, dir.clone()));
+        assert_eq!(host, dir);
+        let held = held.expect("a volume dir is held by its descriptor");
+        // The path is swapped for a link to somewhere else: the descriptor is still the directory.
+        let before = std::fs::metadata(&dir).unwrap();
+        std::fs::rename(&dir, root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&away, &dir).unwrap();
+        let got = std::fs::metadata(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&held.fd()))).unwrap();
+        assert_eq!((got.dev(), got.ino()), (before.dev(), before.ino()));
+        assert_ne!(got.ino(), std::fs::metadata(&dir).unwrap().ino());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A Volume made for a claim that is gone has its directory removed by its own node once no
     /// unit mounts it, and only then is the Volume deleted; one a unit mounts waits.
     #[test]
@@ -4564,7 +4627,7 @@ spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volum
         let state = state.canonicalize().unwrap();
         let dir = crate::volumes::dir(&store, "default", "db").unwrap();
         let root = crate::volumes::host_dir(&state, &dir).unwrap();
-        std::fs::write(root.join("file"), "x").unwrap();
+        std::fs::write(root.held().join("file"), "x").unwrap();
         let data = state.join("volumes/default/db");
         // Not on another node, and not while a unit mounts it.
         let held = |store: &kith_api::store::Store| mounting(&crate::volumes::mounts(store, "a"));

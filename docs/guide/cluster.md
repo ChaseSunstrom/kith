@@ -76,6 +76,12 @@ the plan allowed 0.3 ms).
 - Without `--mesh` (kith OS's default) a Service still answers the pods of the node it is on:
   kithd puts the Service's address on the loopback, and its status says the address and
   backends as ever. Other nodes' replicas are out of reach, as no mesh carries them.
+- A cluster turns the mesh on for kith OS nodes with no reinstall: `spec.mesh: { enabled: true }`
+  (`port:` is the UDP port, 51820 without) on its `Cluster`. Every node started without `--mesh`,
+  the members already running included, brings `kith0` up within seconds, and takes it down
+  again, and goes back to loopback Services, when the switch is removed or set to `false`.
+  Nothing restarts. A node started with `--mesh` keeps it whatever the Cluster says. Off is the
+  default. At install, `mesh: true` in the answers starts a node with it on.
 - Each node gets a stable IPv6 address derived from the CA and its name; `kith get node/NAME -o
   yaml` shows it and the public key (`mesh`), `kith node status` the peers and their last
   handshakes. The private key stays in `<state>/pki`.
@@ -264,6 +270,23 @@ ready replica in turn, wherever it runs: kithd relays it, over the mesh if neede
 replica's port on `127.0.0.1` (or `::1`). TCP only; a named `targetPort` is a container port of
 that name. A kithd restart drops the connections through it.
 
+A Service also has an IPv4 address, `status.addressV4`, for a client with no IPv6: the leader gives
+it the first free address of the Service range (`--service-range ADDRESS/BITS` or
+`KITH_SERVICE_RANGE`, default `100.87.0.0/16`; give every node the same one), and the Service's name
+answers it as an A record beside the AAAA. kithd holds it on the loopback as a /32 and relays a
+connection to it as it does one to the mesh address. The range is
+refused if it overlaps the pod range, the people ranges or a network a link of the node holds (a
+default that overlaps is dropped with a warning: that node serves no IPv4 for Services and answers
+no A record, the others do). The default `100.87.0.0/16` is inside `100.64.0.0/10`, the shared
+(CGNAT) range Tailscale gives its addresses from: that check sees only the addresses the node holds
+when kithd starts, so a Tailscale or a link that comes up later, or on another node, is not
+caught. Where such a network is in use, name another range on every node. The next Service gets
+the free address after the highest in use, wrapping at the range's end: the address of a deleted
+Service is free again at once only if it was the highest, and otherwise after the allocation wraps.
+A pod reaches a Service only at its address and a port kithd listens on there (a TCP listener of
+the host on a Service's address at any other port is not open to pods, nor is a Service's port that
+a host listener on every address already holds: kithd cannot listen there).
+
 A Service with `headless: true` (`clusterIP: None` in Kubernetes) has no address of its own: its
 name answers the addresses of its ready replicas, and it cannot be `expose`d. Each ready replica
 is also named `NAME-N.SERVICE.NAMESPACE.svc.cluster.local` (a StatefulSet's pod names) under every
@@ -442,6 +465,19 @@ lands on the new holder, as the address moved with it. A name in `endpoint` is l
 the mesh's loop, never holding it: until the first answer the holder is called where it was, the
 answer is kept and looked up again each minute (each half minute while it does not resolve), and
 kithd logs when it starts or stops resolving, not on each try.
+
+### Usage over time
+
+Each kithd samples its machine every 10 seconds (CPU, memory, the disk under `--state`, disk
+and network rates, load) and each unit of a Workload's replicas (CPU cores from its cgroup's
+`cpu.stat`, memory from `memory.current`), and keeps an hour of 10-second points and a day of
+5-minute points in memory: a restart starts them empty, and nothing goes through Raft or to
+disk. A Workload not seen for an hour is forgotten with its history, and at most 512 are kept.
+
+`GET /v1/metrics?range=15m|1h|6h|24h` on any node answers for all of them: the other nodes'
+series are asked over the node-to-node connection, each given 3 seconds, and one that does not
+answer is `"missing": true` with empty series. A Workload with replicas on several nodes is
+under `NS/NAME` for the first node by name and `NS/NAME@NODE` for each other.
 
 ### Not yet
 

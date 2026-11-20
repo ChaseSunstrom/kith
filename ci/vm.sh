@@ -35,6 +35,8 @@
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network; then on the mesh with
 #                               a second node that opens no links (of before), each sends to the other's
+#   sh ci/vm.sh --test mesh     two nodes started with no --mesh: the Cluster's spec.mesh turns the mesh on
+#                               with no reinstall; a pod on one reaches a Service whose replica is on the other
 #   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) and media.yml
 #                               (eight, the media stack's shape) imported with kith import compose, applied,
 #                               ready, each asked for by its compose name; KITH_E2E=1 also runs media.yml
@@ -236,6 +238,14 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    no `link` and opens none, as a node of before): a pod on each sends
                    through the Service of a pod on the other, both ways. Needs rustc for
                    x86_64-unknown-linux-musl
+  --test mesh      instead: two nodes on disk files started with no --mesh (as kith OS starts),
+                   the second joined to the first: neither brings a mesh up. The Cluster then
+                   says spec.mesh {enabled: true} and both do, with no restart: kith0 up, an
+                   address in the cluster's /48 on each Node, and a Job in a pod on the first
+                   sends through a Service whose only replica is on the second, every byte
+                   back, reaching kithd at the Service's mesh address. The switch set to
+                   false takes each node's mesh status back. Needs rustc for
+                   x86_64-unknown-linux-musl
   --test compose  instead: one node on the mesh, and on this machine `kith import
                    compose` of ci/compose/stack.yml (four services of the test pod,
                    nothing in it left out) and of ci/compose/media.yml (the eight services
@@ -389,7 +399,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | nested | nofile | alone | disk | clock | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, nested, nofile, fido2" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | nested | nofile | alone | disk | clock | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, nested, nofile, fido2" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
