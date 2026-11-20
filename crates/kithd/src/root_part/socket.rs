@@ -356,12 +356,14 @@ impl Root for Socket {
         id: &str,
         guaranteed: Option<u64>,
         cpu_millis: Option<u64>,
+        idle: Option<Idle>,
     ) -> Result<Vec<String>, String> {
         Socket::bound(made, id)?;
         let tune = Request::Tune {
             id: id.into(),
             guaranteed,
             cpu_millis,
+            idle,
         };
         match self.said(Call::Request(tune))? {
             Answer::Notes(notes) => Ok(notes),
@@ -683,8 +685,11 @@ fn unit_or_request<H: Hands>(
         let out = match request {
             Request::Kill { .. } => Out::of(root.kill(&mut made, &id), |()| Answer::Done),
             Request::Tune {
-                guaranteed, cpu_millis, ..
-            } => Out::of(root.tune(&made, &id, guaranteed, cpu_millis), Answer::Notes),
+                guaranteed,
+                cpu_millis,
+                idle,
+                ..
+            } => Out::of(root.tune(&made, &id, guaranteed, cpu_millis, idle), Answer::Notes),
             Request::Plug { device, .. } => Out::of(root.plug(&made, &id, &device), |()| Answer::Done),
             Request::Unplug { device, .. } => Out::of(root.unplug(&made, &id, &device), |()| Answer::Done),
             _ => {

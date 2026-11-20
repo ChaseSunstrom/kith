@@ -1679,7 +1679,14 @@ mod tests {
             Err((Some(made), "not asked".into()))
         }
 
-        fn tune(&self, _: &(), _: &str, _: Option<u64>, _: Option<u64>) -> Result<Vec<String>, String> {
+        fn tune(
+            &self,
+            _: &(),
+            _: &str,
+            _: Option<u64>,
+            _: Option<u64>,
+            _: Option<kith_runtime::Idle>,
+        ) -> Result<Vec<String>, String> {
             Err("not asked".into())
         }
 

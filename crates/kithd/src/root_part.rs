@@ -44,7 +44,7 @@ use socket::{Limits, SPLIT, Socket};
 use crate::pods::{Given, Pods};
 use crate::policy::Policy;
 use crate::volumes::Dir;
-use kith_runtime::{Handle, Image, ImageStore, Mount, Runtime, Unit};
+use kith_runtime::{Handle, Idle, Image, ImageStore, Mount, Runtime, Unit};
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -158,11 +158,14 @@ pub enum Request {
     /// The unit `id` killed if it runs, and its cgroup, state and bundle removed.
     Delete { id: String },
     /// The unit `id`'s cgroup arranged: `guaranteed` bytes of memory not reclaimed from it (none:
-    /// no guarantee) and `cpu_millis` thousandths of a CPU (none: no limit).
+    /// no guarantee) and `cpu_millis` thousandths of a CPU (none: no limit), and in the idle
+    /// class if `idle` says so (T-1118; absent from an older sender's request: not idle).
     Tune {
         id: String,
         guaranteed: Option<u64>,
         cpu_millis: Option<u64>,
+        #[serde(default)]
+        idle: Option<Idle>,
     },
     /// The device node `device` (one a claim granted, of the kind that comes and goes) given to
     /// the unit `id` as it runs, and taken from it again.
@@ -351,11 +354,18 @@ pub fn check(request: &Request) -> Result<(), String> {
             id,
             guaranteed,
             cpu_millis,
+            idle,
         } => {
             label("unit id", id)?;
             match (guaranteed, cpu_millis) {
                 (Some(bytes), _) if *bytes > MOST_GUARANTEED => {
                     Err(format!("{bytes} bytes guaranteed: at most {MOST_GUARANTEED}"))
+                }
+                _ if idle
+                    .and_then(|idle| idle.memory_high)
+                    .is_some_and(|bytes| bytes > MOST_GUARANTEED) =>
+                {
+                    Err(format!("memory.high above {MOST_GUARANTEED} bytes"))
                 }
                 (_, Some(millis)) if *millis > MOST_CPU_MILLIS => {
                     Err(format!("{millis} thousandths of a CPU: at most {MOST_CPU_MILLIS}"))
@@ -933,7 +943,13 @@ pub trait Hands {
     /// Killed if it runs, then removed; one whose processes remain comes back with what refused it.
     fn delete(&self, made: Self::Made) -> Result<(), (Option<Self::Made>, String)>;
     /// What could not be written of the arrangement, in plain words.
-    fn tune(&self, made: &Self::Made, guaranteed: Option<u64>, cpu_millis: Option<u64>) -> Vec<String>;
+    fn tune(
+        &self,
+        made: &Self::Made,
+        guaranteed: Option<u64>,
+        cpu_millis: Option<u64>,
+        idle: Option<Idle>,
+    ) -> Vec<String>;
     fn plug(&self, made: &Self::Made, device: &Path) -> Result<(), String>;
     fn unplug(&self, made: &Self::Made, device: &Path) -> Result<(), String>;
 
@@ -1057,6 +1073,7 @@ pub trait Root {
         id: &str,
         guaranteed: Option<u64>,
         cpu_millis: Option<u64>,
+        idle: Option<Idle>,
     ) -> Result<Vec<String>, String>;
     fn plug(&self, made: &Self::Made, id: &str, device: &Path) -> Result<(), String>;
     fn unplug(&self, made: &Self::Made, id: &str, device: &Path) -> Result<(), String>;
@@ -1118,7 +1135,7 @@ impl Hands for Nobody {
     fn delete(&self, made: ()) -> Result<(), (Option<()>, String)> {
         Err((Some(made), "this root part runs no units".into()))
     }
-    fn tune(&self, _: &(), _: Option<u64>, _: Option<u64>) -> Vec<String> {
+    fn tune(&self, _: &(), _: Option<u64>, _: Option<u64>, _: Option<Idle>) -> Vec<String> {
         vec!["this root part runs no units".into()]
     }
     fn plug(&self, _: &(), _: &Path) -> Result<(), String> {
@@ -1218,8 +1235,8 @@ impl Hands for Today<'_> {
             .map_err(|undeleted| (undeleted.handle.map(|handle| *handle), undeleted.error.to_string()))
     }
 
-    fn tune(&self, made: &Handle, guaranteed: Option<u64>, cpu_millis: Option<u64>) -> Vec<String> {
-        kith_runtime::tune(&made.cgroup, guaranteed, cpu_millis)
+    fn tune(&self, made: &Handle, guaranteed: Option<u64>, cpu_millis: Option<u64>, idle: Option<Idle>) -> Vec<String> {
+        kith_runtime::tune(&made.cgroup, guaranteed, cpu_millis, idle)
     }
 
     fn plug(&self, made: &Handle, device: &Path) -> Result<(), String> {
@@ -1434,6 +1451,7 @@ impl<H: Hands> Root for Direct<'_, H> {
         id: &str,
         guaranteed: Option<u64>,
         cpu_millis: Option<u64>,
+        idle: Option<Idle>,
     ) -> Result<Vec<String>, String> {
         self.unit(
             Kind::Tune,
@@ -1441,10 +1459,11 @@ impl<H: Hands> Root for Direct<'_, H> {
                 id: id.into(),
                 guaranteed,
                 cpu_millis,
+                idle,
             },
         )?;
         self.bound(made, id)?;
-        Ok(self.hands.tune(made, guaranteed, cpu_millis))
+        Ok(self.hands.tune(made, guaranteed, cpu_millis, idle))
     }
 
     fn plug(&self, made: &H::Made, id: &str, device: &Path) -> Result<(), String> {
@@ -2093,7 +2112,7 @@ mod tests {
             }
         }
 
-        fn tune(&self, _: &String, _: Option<u64>, _: Option<u64>) -> Vec<String> {
+        fn tune(&self, _: &String, _: Option<u64>, _: Option<u64>, _: Option<Idle>) -> Vec<String> {
             self.said("tune");
             Vec::new()
         }
@@ -2918,7 +2937,7 @@ mod tests {
             "a refused delete gives the handle back"
         );
         named(why);
-        named(root.tune(&held, unknown, None, None).unwrap_err());
+        named(root.tune(&held, unknown, None, None, None).unwrap_err());
         named(root.plug(&held, unknown, device).unwrap_err());
         named(root.unplug(&held, unknown, device).unwrap_err());
         named(root.request(Request::Usage { pod: "w_a_b_0".into() }).unwrap_err());
@@ -2943,7 +2962,7 @@ mod tests {
         made_one(&root, "w_a_b_1b_c");
         assert!(root.kill(&mut made, "w_a_b_0_c").is_ok());
         assert!(
-            root.tune(&made, "w_a_b_0_c", Some(1 << 20), Some(500))
+            root.tune(&made, "w_a_b_0_c", Some(1 << 20), Some(500), None)
                 .unwrap()
                 .is_empty()
         );
@@ -2983,7 +3002,7 @@ mod tests {
         });
         // The handle of one with the id of another is refused, whatever else holds.
         not(root.kill(&mut a, "w_a_b_1_c").unwrap_err());
-        not(root.tune(&a, "w_a_b_1_c", None, None).unwrap_err());
+        not(root.tune(&a, "w_a_b_1_c", None, None, None).unwrap_err());
         not(root.plug(&a, "w_a_b_1_c", device).unwrap_err());
         not(root.unplug(&a, "w_a_b_1_c", device).unwrap_err());
         let (back, why) = root.delete(a.clone(), "w_a_b_1_c").unwrap_err();
@@ -3081,12 +3100,24 @@ mod tests {
         assert!(plug(INPUT).is_err());
     }
 
+    /// The idle class's memory.high is bounded as a guarantee is, before the root part writes it (T-1118).
+    #[test]
+    fn idle_class_memory_high_out_of_range_is_refused() {
+        let (book, _) = book("tune-idle");
+        let root = Direct::with(Fake::default(), &book).under(policy(""));
+        let made = made_one(&root, "w_a_b_0_c");
+        let idle = |bytes| root.tune(&made, "w_a_b_0_c", None, None, Some(Idle { memory_high: bytes }));
+        assert!(idle(None).is_ok() && idle(Some(MOST_GUARANTEED)).is_ok());
+        assert!(idle(Some(MOST_GUARANTEED + 1)).unwrap_err().contains("memory.high"));
+        assert_eq!(root.hands.reached(), ["create", "tune", "tune"]);
+    }
+
     #[test]
     fn limits_out_of_range_are_refused() {
         let (book, _) = book("tune");
         let root = Direct::with(Fake::default(), &book).under(policy(""));
         let made = made_one(&root, "w_a_b_0_c");
-        let tune = |guaranteed, cpu| root.tune(&made, "w_a_b_0_c", guaranteed, cpu);
+        let tune = |guaranteed, cpu| root.tune(&made, "w_a_b_0_c", guaranteed, cpu, None);
         assert!(tune(None, None).is_ok());
         assert!(tune(Some(MOST_GUARANTEED), Some(MOST_CPU_MILLIS)).is_ok());
         assert!(tune(Some(MOST_GUARANTEED + 1), None).unwrap_err().contains("bytes"));
@@ -3108,6 +3139,7 @@ mod tests {
                 id: "w_a_b_0_c".into(),
                 guaranteed: Some(1),
                 cpu_millis: None,
+                idle: Some(Idle { memory_high: Some(1) }),
             },
             Request::Plug {
                 id: "w_a_b_0_c".into(),
@@ -4414,7 +4446,7 @@ mod tests {
             let made = socket.start(made, id, "ab12").unwrap();
             let mut made = made;
             assert!(socket.kill(&mut made, id).is_ok());
-            assert_eq!(socket.tune(&made, id, Some(1 << 20), Some(500)), Ok(Vec::new()));
+            assert_eq!(socket.tune(&made, id, Some(1 << 20), Some(500), None), Ok(Vec::new()));
             assert!(socket.plug(&made, id, Path::new(INPUT)).is_ok());
             assert!(socket.unplug(&made, id, Path::new(INPUT)).is_ok());
             assert!(matches!(
@@ -4425,7 +4457,7 @@ mod tests {
             let other = Held("w_a_b_1_c".into());
             for why in [
                 socket.kill(&mut other.clone(), id).unwrap_err(),
-                socket.tune(&other, id, None, None).unwrap_err(),
+                socket.tune(&other, id, None, None, None).unwrap_err(),
                 socket.plug(&other, id, Path::new(INPUT)).unwrap_err(),
                 socket.unplug(&other, id, Path::new(INPUT)).unwrap_err(),
                 socket.start(other.clone(), id, "ab12").unwrap_err().1,
