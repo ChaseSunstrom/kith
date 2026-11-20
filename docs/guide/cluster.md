@@ -269,9 +269,16 @@ it the first free address of the Service range (`--service-range ADDRESS/BITS` o
 `KITH_SERVICE_RANGE`, default `100.87.0.0/16`; give every node the same one), and the Service's name
 answers it as an A record beside the AAAA. kithd holds it on the loopback as a /32 and relays a
 connection to it as it does one to the mesh address. The range is
-refused if it overlaps the pod range or the people ranges (a default that overlaps is dropped with
-a warning: that node serves no IPv4 for Services and answers no A record, the others do). The address
-of a deleted Service is free again for the next one.
+refused if it overlaps the pod range, the people ranges or a network a link of the node holds (a
+default that overlaps is dropped with a warning: that node serves no IPv4 for Services and answers
+no A record, the others do). The default `100.87.0.0/16` is inside `100.64.0.0/10`, the shared
+(CGNAT) range Tailscale gives its addresses from: that check sees only the addresses the node holds
+when kithd starts, so a Tailscale or a link that comes up later, or on another node, is not
+caught. Where such a network is in use, name another range on every node. The next Service gets
+the free address after the highest in use, wrapping at the range's end: the address of a deleted
+Service is free again at once only if it was the highest, and otherwise after the allocation wraps.
+A pod reaches a Service only at its address and port (a TCP listener of the host on a Service's
+address at any other port is not open to pods).
 
 A Service with `headless: true` (`clusterIP: None` in Kubernetes) has no address of its own: its
 name answers the addresses of its ready replicas, and it cannot be `expose`d. Each ready replica

@@ -463,9 +463,10 @@ pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>, exit: Option<u16>) 
 /// What comes by each of `pods`' links is passed only from that pod's own addresses; the
 /// caller makes this again whenever the pods change.
 ///
-/// `services`, if the node serves Services' IPv4 addresses, is their range: any pod reaches TCP
-/// there, as it does a Service's IPv6 address.
-pub fn node(range: Range, services: Option<Range>, guarded: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
+/// `services` is the Services' (address, port) pairs this node listens on, IPv4 and IPv6: any
+/// pod reaches TCP at those and nothing else of the node's own (a listener bound to every
+/// address, the Service's address being one of the node's, is not reachable on another port).
+pub fn node(range: Range, services: &[(IpAddr, u16)], guarded: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
     node_with(range, services, guarded, true, mesh, pods)
 }
 
@@ -494,7 +495,7 @@ pub struct Egress {
 
 fn node_with(
     range: Range,
-    services: Option<Range>,
+    services: &[(IpAddr, u16)],
     guarded: bool,
     masquerade: bool,
     mesh: &str,
@@ -659,12 +660,12 @@ pub(crate) fn l4proto(protocol: u8) -> Vec<u8> {
 /// that pod's own IPv4 or IPv6 address, the link's name whole; the rest of `kp*` is dropped.
 /// `in` (what comes to the node): an answer to what the node asked is passed; an exit's pod
 /// (`kpx`) gets nothing more, its DNS and Services among them; any pod gets DNS at the
-/// gateway (UDP and TCP, port 53) and TCP to a Service (IPv6, bytes 6..10 all ff); the rest
-/// is dropped. An answer is the state of a connection seen both ways or made by one, or
+/// gateway (UDP and TCP, port 53) and TCP to a Service, the address and the port both a pair
+/// of `services` (IPv4 or IPv6); the rest is dropped. An answer is the state of a connection seen both ways or made by one, or
 /// IPv6's neighbour discovery (not tracked). A pod with egress rules (see [`Egress`]) jumps
 /// to its own chain from `passed` and, after the first rule, from `in`: so its DNS and
 /// Services are held to its rules too.
-fn pod_guard_rules(range: Range, services: Option<Range>, pods: &[Served]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
+fn pod_guard_rules(range: Range, services: &[(IpAddr, u16)], pods: &[Served]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
     let gateway = range.gateway().octets();
     let dns = |protocol: u8| {
         vec![
@@ -710,23 +711,15 @@ fn pod_guard_rules(range: Range, services: Option<Range>, pods: &[Served]) -> Ve
         ("in", vec![came_by(b"kpx"), verdict(0)]),
         ("in", dns(17)),
         ("in", dns(6)),
-        (
-            "in",
-            vec![
-                came_by(b"kp"),
-                nfproto(10),
-                l4proto(6),
-                at(1, 30, &[0xff; 4]),
-                verdict(1),
-            ],
-        ),
     ]);
-    // A Service's IPv4 address (the range's /32s on the loopback), TCP only, as its IPv6 one.
-    if let Some(services) = services {
-        let (network, bits) = services.network();
+    // A Service's address and port, TCP only, a rule for each: the Services' addresses are the
+    // node's own (on its loopback or its mesh link), so a listener bound to every address is
+    // there at them too, on ports that are no Service's.
+    for (address, port) in services {
+        let bits = if address.is_ipv4() { 32 } else { 128 };
         let mut rule = vec![came_by(b"kp")];
-        rule.extend(towards(network.into(), bits));
-        rule.extend([l4proto(6), verdict(1)]);
+        rule.extend(towards(*address, bits));
+        rule.extend([l4proto(6), at(2, 2, &port.to_be_bytes()), verdict(1)]);
         rules.push(("in", rule));
     }
     rules.push(("in", vec![came_by(b"kp"), verdict(0)]));
@@ -838,7 +831,7 @@ fn egress_rules(pods: &[Served]) -> Vec<(String, Vec<Vec<Vec<u8>>>)> {
 /// comes in from or goes out to a pod's link. Whole, for `pods` as they are now.
 fn nat(
     range: Range,
-    services: Option<Range>,
+    services: &[(IpAddr, u16)],
     guard: bool,
     masquerade: bool,
     mesh: &str,
@@ -1382,7 +1375,7 @@ mod tests {
                 egress: None,
             },
         ];
-        let check: Vec<Vec<u8>> = pod_guard_rules(range, None, &pods)
+        let check: Vec<Vec<u8>> = pod_guard_rules(range, &[], &pods)
             .iter()
             .filter(|(chain, _)| *chain == "check")
             .map(|(_, rule)| rule.concat())
@@ -1408,18 +1401,24 @@ mod tests {
     }
 
     /// What answers the node is passed, an exit's pod gets nothing more, and any pod reaches
-    /// its node only for DNS at the gateway (UDP and TCP, port 53) and TCP to a Service (IPv6
-    /// with bytes 6..10 all ff: the services' /80). The rest of a pod's link is dropped.
+    /// its node only for DNS at the gateway (UDP and TCP, port 53) and TCP to a Service's address
+    /// and port (a rule for each pair, IPv4 or IPv6: not the whole range, which a listener bound
+    /// to every address would answer on any port). The rest of a pod's link is dropped.
     #[test]
     fn pods_reach_only_dns_and_the_services_of_their_node() {
         let range = range("198.18.16.0/20").unwrap();
-        let input: Vec<Vec<u8>> = pod_guard_rules(range, None, &[])
-            .into_iter()
-            .filter(|(chain, _)| *chain == "in")
-            .map(|(_, rule)| rule.concat())
-            .collect();
-        let [answers, exit, dns_udp, dns_tcp, services, rest] = input.as_slice() else {
-            panic!("six rules in in, not {}", input.len())
+        let (v4, v6): (IpAddr, IpAddr) = ("100.87.0.5".parse().unwrap(), "fd00::1:2".parse().unwrap());
+        let input = |services: &[(IpAddr, u16)]| -> Vec<Vec<u8>> {
+            pod_guard_rules(range, services, &[])
+                .into_iter()
+                .filter(|(chain, _)| *chain == "in")
+                .map(|(_, rule)| rule.concat())
+                .collect()
+        };
+        assert_eq!(input(&[]).len(), 5, "no Service, no rule for one");
+        let input = input(&[(v4, 80), (v6, 443)]);
+        let [answers, exit, dns_udp, dns_tcp, v4_rule, v6_rule, rest] = input.as_slice() else {
+            panic!("seven rules in in, not {}", input.len())
         };
         assert_eq!(answers, &[came_by(b"kp"), state(2 | 4 | 64), verdict(1)].concat());
         assert_eq!(
@@ -1433,15 +1432,23 @@ mod tests {
             assert!(contains(dns, &is(&53u16.to_be_bytes())), "port 53");
             assert!(contains(dns, &is(&[protocol])), "UDP or TCP");
         }
-        assert!(services.starts_with(&came_by(b"kp")) && services.ends_with(&verdict(1)));
-        assert!(
-            contains(services, &is(&[0xff; 4])),
-            "a Service's address: bytes 6..10 ff"
-        );
-        assert!(
-            contains(services, &is(&[10])) && contains(services, &is(&[6])),
-            "IPv6 and TCP"
-        );
+        for (rule, family, address, port) in [
+            (v4_rule, 2u8, &[100u8, 87, 0, 5][..], 80u16),
+            (
+                v6_rule,
+                10u8,
+                &"fd00::1:2".parse::<Ipv6Addr>().unwrap().octets()[..],
+                443,
+            ),
+        ] {
+            assert!(rule.starts_with(&came_by(b"kp")) && rule.ends_with(&verdict(1)));
+            assert!(
+                contains(rule, &is(&[family])) && contains(rule, &is(&[6])),
+                "the family, and TCP"
+            );
+            assert!(contains(rule, &is(address)), "the Service's whole address");
+            assert!(contains(rule, &is(&port.to_be_bytes())), "and its port");
+        }
         assert_eq!(rest, &[came_by(b"kp"), verdict(0)].concat(), "and the rest is dropped");
     }
 
@@ -1474,7 +1481,7 @@ mod tests {
             },
         ];
         let pods = [served_with(2, Some(rules)), served_with(3, None)];
-        let all = pod_guard_rules(range, None, &pods);
+        let all = pod_guard_rules(range, &[], &pods);
         let chain = |name: &str| -> Vec<Vec<u8>> {
             let of = all.iter().filter(|(chain, _)| *chain == name);
             of.map(|(_, rule)| rule.concat()).collect()
@@ -1571,7 +1578,7 @@ mod tests {
         };
         let served = [served(12, Some(egress)), served(13, None), served(14, None)];
         // (Without masquerade: a kernel may have none in a namespace.)
-        assert!(node_with(range, None, true, false, "kith0", &served).unwrap());
+        assert!(node_with(range, &[], true, false, "kith0", &served).unwrap());
         let connect = |from: usize, to: IpAddr, port: u16| {
             let to = SocketAddr::from((to, port));
             within(&pods[from].0, || {
@@ -1590,7 +1597,7 @@ mod tests {
         // Others are not held, and the held pod answers what comes to it.
         assert!(connect(1, host(pods[0].3), 80) && connect(1, third, 81));
         // A second time changes nothing.
-        assert!(node_with(range, None, true, false, "kith0", &served).unwrap());
+        assert!(node_with(range, &[], true, false, "kith0", &served).unwrap());
         assert!(connect(0, second, 80) && !connect(0, third, 81));
     }
 
@@ -1609,13 +1616,13 @@ mod tests {
         // (A range that is not the default, and not whole bytes: the masquerade matches its bits.)
         let range = range("198.18.16.0/20").unwrap();
         // (A kernel whose masquerade is a module nobody loaded has none in a namespace.)
-        let masquerade = match node(range, None, false, "kith0", &[]) {
+        let masquerade = match node(range, &[], false, "kith0", &[]) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             guarded => guarded.unwrap(),
         };
         if !masquerade {
             eprintln!("this kernel has no masquerade here: without");
-            assert!(node_with(range, None, false, false, "kith0", &[]).unwrap());
+            assert!(node_with(range, &[], false, false, "kith0", &[]).unwrap());
         }
         let net = crate::node_net(crate::prefix(b"test"), "alpha");
         let pods: Vec<_> = [2, 3]
@@ -1635,7 +1642,9 @@ mod tests {
                 egress: None,
             })
             .into();
-        assert!(node_with(range, None, true, masquerade, "kith0", &served).unwrap());
+        let service = crate::service_address(crate::prefix(b"test"), "default", "web");
+        let services = [(IpAddr::from(service), 80)];
+        assert!(node_with(range, &services, true, masquerade, "kith0", &served).unwrap());
         // Each says who it is to whoever connects, and who that was.
         let serve = |listener: &TcpListener, says: &str| {
             let (mut stream, from) = listener.accept().unwrap();
@@ -1714,9 +1723,11 @@ mod tests {
         // node's (open here, so it is the rule that refuses) does not connect; those do.
         let _open = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 8080)).unwrap();
         let _dns = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 53)).unwrap();
-        let service = crate::service_address(crate::prefix(b"test"), "default", "web");
         address(1, service.into(), 128).unwrap();
         let _services = TcpListener::bind((service, 80)).unwrap();
+        // A listener bound to every address (the Service's is the node's) on a port no Service
+        // has: the Service's address does not reach it.
+        let _every = TcpListener::bind("[::]:8081").unwrap();
         let connect = |pod: usize, to: SocketAddr| {
             within(&pods[pod].0, || TcpStream::connect_timeout(&to, Duration::from_secs(5))).unwrap()
         };
@@ -1726,15 +1737,20 @@ mod tests {
         );
         assert!(connect(0, (range.gateway(), 53).into()).is_ok(), "DNS at the gateway");
         assert!(connect(0, (service, 80).into()).is_ok(), "a Service's address");
+        assert!(
+            connect(0, (service, 8081).into()).is_err(),
+            "a Service's address, a port that is no Service's: dropped"
+        );
         // A second time changes nothing (what the first left is taken away and made again).
-        assert!(node_with(range, None, true, masquerade, "kith0", &served).unwrap());
+        assert!(node_with(range, &services, true, masquerade, "kith0", &served).unwrap());
         assert!(tables().unwrap());
     }
 
     /// A pod whose namespace has IPv6 off (no inet6 address at all) asks its node's resolver at
-    /// the gateway and reaches a Service's IPv4 address (a /32 on the node's loopback in the
-    /// Services' range) by TCP; an address of the loopback outside that range, and the node's
-    /// other ports, it does not (`KITH_E2E=1 unshare -Urn cargo test -p kith-mesh ipv6_off`).
+    /// the gateway and reaches a Service's IPv4 address and port (a /32 on the node's loopback) by
+    /// TCP; another address of the loopback, the node's other ports, and a port that is no
+    /// Service's at the Service's address (a listener bound to every address answers there), it
+    /// does not (`KITH_E2E=1 unshare -Urn cargo test -p kith-mesh ipv6_off`).
     #[test]
     fn a_pod_with_ipv6_off_reaches_the_resolver_and_a_service_by_ipv4() {
         if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
@@ -1743,7 +1759,9 @@ mod tests {
         let _lo = crate::netlink::LO.lock().unwrap_or_else(|e| e.into_inner());
         up(1).unwrap();
         let range = range("198.18.16.0/20").unwrap();
-        let services: Range = "100.87.0.0/16".parse().unwrap();
+        let service = Ipv4Addr::new(100, 87, 0, 5);
+        let elsewhere = Ipv4Addr::new(100, 86, 0, 5);
+        let services = [(IpAddr::from(service), 80)];
         let net = crate::node_net(crate::prefix(b"test"), "alpha");
         let (v4, v6) = addresses(range, Some(net), 20);
         let namespace = make(range, 20, v6, None).unwrap();
@@ -1766,7 +1784,7 @@ mod tests {
             v6,
             ..served_with(20, None)
         }];
-        assert!(node_with(range, Some(services), true, false, "kith0", &served).is_ok());
+        assert!(node_with(range, &services, true, false, "kith0", &served).is_ok());
         let within_pod = |f: fn(Ipv4Addr, Ipv4Addr) -> std::io::Result<String>, to: Ipv4Addr| {
             within(&namespace, move || f(v4, to)).unwrap()
         };
@@ -1793,8 +1811,6 @@ mod tests {
         answering.join().unwrap();
         assert_eq!(said.unwrap(), "question", "the resolver at the gateway answers by IPv4");
         // A Service's IPv4 address: a /32 on the loopback, a listener on it.
-        let service = Ipv4Addr::new(100, 87, 0, 5);
-        let elsewhere = Ipv4Addr::new(100, 86, 0, 5);
         crate::netlink::address4(1, service, 32, None).unwrap();
         crate::netlink::address4(1, elsewhere, 32, None).unwrap();
         let listeners = [service, elsewhere].map(|at| TcpListener::bind((at, 80)).unwrap());
@@ -1812,6 +1828,11 @@ mod tests {
             "an address outside the Services' range is dropped"
         );
         assert!(!connect(range.gateway(), 8080), "so is another port of the node");
+        // `_open` is bound to every address, the Service's among them: its port is no Service's.
+        assert!(
+            !connect(service, 8080),
+            "a Service's address on a port that is no Service's: dropped"
+        );
         drop(listeners);
     }
 }

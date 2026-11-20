@@ -221,6 +221,13 @@ fn ready_on(workload: &Resource) -> Vec<(String, u32)> {
         .collect()
 }
 
+/// The (address, port) pairs the Services listen on here, IPv4 and IPv6: all a pod may reach of the
+/// node's addresses over TCP, besides the resolver (`pods::keep_held` keeps the node's tables in step).
+pub fn open_to_pods(store: &Store, prefix: Option<Ipv6Addr>) -> Vec<(IpAddr, u16)> {
+    let Some(prefix) = prefix else { return Vec::new() };
+    table(store, prefix, crate::pods::service_range()).into_keys().collect()
+}
+
 /// What every Service listens on, and where its connections go: on its IPv6 address, and on its
 /// IPv4 one (`status.addressV4`) where `services` (this node's range for them) holds it and no
 /// Service before it (by key) has it.
@@ -859,13 +866,25 @@ impl Proxy {
     }
 
     /// Is `from` on the mesh, or, of IPv4 (a Service's IPv4 address, which only this machine and its
-    /// pods are sent to), this machine or one of its pods?
+    /// pods are sent to), this machine (the loopback, or a Service address held on it: what a
+    /// process here dials from) or one of its pods? Not any address of the pods' or Services'
+    /// ranges: whoever routes one of those to this machine from a link that is not a pod's
+    /// would pass.
     fn is_ours(&self, from: IpAddr) -> bool {
         match from {
             IpAddr::V6(ip) => kith_mesh::in_mesh(self.prefix, ip),
             IpAddr::V4(ip) => {
-                let ours = |range: Option<Range>| range.is_some_and(|range| range.contains(ip));
-                ip.is_loopback() || ours(Some(crate::pods::range())) || ours(crate::pods::service_range())
+                ip.is_loopback()
+                    || self
+                        .shared
+                        .pods
+                        .lock()
+                        .expect("nothing panics holding the pods")
+                        .serves4(ip)
+                    || {
+                        let table = self.table.lock().expect("nothing panics holding the table");
+                        table.keys().any(|(address, _)| *address == IpAddr::V4(ip))
+                    }
             }
         }
     }
@@ -1373,7 +1392,10 @@ pub async fn run(
         install(&mut kernel, kept, &listening);
         let metrics = shared.raft.metrics().borrow().clone();
         if metrics.current_leader == Some(metrics.id) && !reports.is_empty() {
-            let reported = shared.submit(kith_store::Command::Patch { statuses: reports }).await;
+            // (Never passed on to a new leader: the addresses were planned from this node's view.)
+            let reported = shared
+                .write_here(kith_store::Command::Patch { statuses: reports })
+                .await;
             if let Err(e) = reported {
                 eprintln!("kithd: services: writing their status: {e}");
             }
@@ -1567,7 +1589,7 @@ impl Loopback {
 enum Kernel {
     /// None: kithd passes every connection itself.
     Off,
-    /// What it has, and whether its IPv4 program was refused (then it has none of IPv4 entries, and
+    /// What it has, and whether its IPv4 program was refused (then it has none of IPv4 entries, put again at each round, and
     /// kithd passes the connections to the Services' IPv4 addresses itself).
     Has(u64, Vec<connect::Entry>, bool),
     /// One kithd could not empty: it may pass what kithd no longer knows of.
@@ -1624,10 +1646,9 @@ fn install_with(
         Kernel::Has(netns, last, no4) => (netns, last, no4),
     };
     entries.retain(|entry| {
-        let listened = entry
+        entry
             .elsewhere
-            .is_none_or(|port| listening.contains_key(&(entry.service.0, port)));
-        listened && !(*no4 && entry.service.0.is_ipv4())
+            .is_none_or(|port| listening.contains_key(&(entry.service.0, port)))
     });
     if entries == *last {
         return;
@@ -1651,6 +1672,11 @@ fn install_with(
             }
         };
         return;
+    }
+    // (One refused is put again at each round that has an IPv4 entry, as `last` then lacks them:
+    // the next that is accepted lifts it, and a refusal after that is said again.)
+    if attached.v4.is_ok() {
+        *no4 = false;
     }
     if let Err(e) = attached.v4 {
         if !said_v4 {
@@ -1954,6 +1980,9 @@ spec:
         };
         let wanted = Table::from([((address, 80), to(8080)), ((address, 9000), to(9000))]);
         assert_eq!(table, wanted);
+        // What a pod may reach of the node's own by TCP: those pairs, and nothing with no mesh.
+        assert_eq!(open_to_pods(&store, Some(prefix)), vec![(address, 80), (address, 9000)]);
+        assert_eq!(open_to_pods(&store, None), vec![]);
 
         // The Service's name, where the cluster's names are asked.
         let (zones, _) = crate::dns::zones_of(&store, Some(prefix));
@@ -2544,6 +2573,29 @@ spec:
             dial_to: None,
             shared,
         }
+    }
+
+    /// An IPv4 source is ours when it is the loopback, a Service address held here or a pod made
+    /// here; an address of the pods' or Services' range that is none of those (a source made up on
+    /// another link) is refused.
+    #[tokio::test]
+    async fn an_ipv4_source_in_the_ranges_is_ours_only_when_held_or_a_pod() {
+        let proxy = proxy_of(state_with_web("is-ours-v4").await, 8080, "Workload/default/web", None);
+        let held = Ipv4Addr::new(100, 87, 0, 5);
+        let backend = proxy.table.lock().unwrap().values().next().unwrap().clone();
+        proxy.table.lock().unwrap().insert((IpAddr::V4(held), 80), backend);
+        let ip = |ip: Ipv4Addr| IpAddr::V4(ip);
+        assert!(proxy.is_ours(ip(Ipv4Addr::LOCALHOST)));
+        assert!(proxy.is_ours(ip(held)));
+        assert!(
+            !proxy.is_ours(ip(Ipv4Addr::new(100, 87, 0, 6))),
+            "a Service address nobody holds"
+        );
+        assert!(
+            !proxy.is_ours(ip(crate::pods::range().address(9))),
+            "a pod address no pod has"
+        );
+        assert!(!proxy.is_ours(ip(Ipv4Addr::new(192, 0, 2, 1))));
     }
 
     /// Says `says` to `proxy`'s take over loopback: what take passed on, and what the client heard.
@@ -3784,6 +3836,52 @@ spec:
         assert!(link.is_down() && proxy.linked.lock().unwrap().is_empty());
         assert_eq!(connections.load(Ordering::Relaxed), 1);
     }
+}
+
+/// An IPv4 program the kernel refused is put again at the next round, and said once.
+#[test]
+fn a_refused_ipv4_program_is_put_again_and_said_once() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let entry = |address: IpAddr| connect::Entry {
+        service: (address, 80),
+        here: vec![SocketAddr::new(address, 8080)],
+        all: 1,
+        elsewhere: None,
+    };
+    let entries = vec![entry("100.87.0.1".parse().unwrap()), entry("fd00::1".parse().unwrap())];
+    let no_listeners = BTreeMap::new();
+    let refuse4 = AtomicBool::new(true);
+    let put = |v4: bool, _: &[u8]| -> std::io::Result<()> {
+        if v4 && refuse4.load(Relaxed) {
+            Err(std::io::Error::other("no hook"))
+        } else {
+            Ok(())
+        }
+    };
+    let mut said = Vec::new();
+    let mut kernel = Kernel::Has(1, Vec::new(), false);
+    install_with(&mut kernel, entries.clone(), &no_listeners, &put, &mut |t| said.push(t));
+    install_with(&mut kernel, entries.clone(), &no_listeners, &put, &mut |t| said.push(t));
+    assert_eq!(said.len(), 1, "said once: {said:?}");
+    let Kernel::Has(_, last, no4) = &kernel else {
+        panic!("kernel gone")
+    };
+    assert!(
+        *no4 && last.len() == 1 && last[0].service.0.is_ipv6(),
+        "only IPv6 passed"
+    );
+    // The hook takes it at a later round: both are passed, and a refusal after is said again.
+    refuse4.store(false, Relaxed);
+    install_with(&mut kernel, entries.clone(), &no_listeners, &put, &mut |t| said.push(t));
+    let Kernel::Has(_, last, no4) = &kernel else {
+        panic!("kernel gone")
+    };
+    assert!(!*no4 && *last == entries, "IPv4 passed again");
+    refuse4.store(true, Relaxed);
+    let mut other = entries.clone();
+    other[0].all = 2;
+    install_with(&mut kernel, other, &no_listeners, &put, &mut |t| said.push(t));
+    assert_eq!(said.len(), 2, "said again after it worked: {said:?}");
 }
 
 /// A Service `name` in `namespace`, as an Apply has it.
