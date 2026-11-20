@@ -19,7 +19,7 @@ mod seccomp;
 pub mod signed;
 
 pub use container::{
-    Awaited, Handle, Mount, NODE_ROOT, ROOTS, Runtime, Undeleted, Unit, exec_shim, plugged, reap_orphans,
+    Awaited, Handle, Left, Mount, NODE_ROOT, ROOTS, Runtime, Undeleted, Unit, exec_shim, plugged, reap_orphans,
     spawn_awaited, started, tune,
 };
 pub use image::{Image, ImageStore, Local, PullPolicy, Unpacking, registry, repository, sha256_hex};

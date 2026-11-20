@@ -1,6 +1,6 @@
 # A second disk for a node's data, under the state's key
 
-Status: design, nothing built (T-0863). It decides how a disk other than the one kith OS runs
+Status: built in part: the core on files (T-0957), the real mapping, the seed made with `resize=` and grown at the mount, and the task that mounts the known disks after `STATE_OPEN` (T-0972, with `ci/vm.sh --test disk` on disk files, which uses a build with the cargo feature `disk-test`: the verbs `add`, `remove` and `list` are T-0958's other half and not built). It decides how a disk other than the one kith OS runs
 from holds data, encrypted, and how it is opened, with what kithd does to a disk it does not
 know. Where the code differs from a line here, the code is the word. It builds on
 [adr-unlock.md](adr-unlock.md), which settled how a node's state is opened, and on the ways of
@@ -185,8 +185,8 @@ a node with no cluster, and if it does not, says in the verb's answer that it ca
    (`init.rs:559-584`).
 
 **The seed must reach the disk's size.** The file system the node writes is
-`/usr/share/kith/volume.ext4`, **8 MiB** (`os/build.sh:418`), made with `mkfs.ext4 -b 4096
--N 4096` and no `resize=` (`os/build.sh:419-420`). An ext4 grown online is capped by the group
+`/usr/share/kith/volume.ext4`, **8 MiB** (`os/build.sh:448`), made with `mkfs.ext4 -b 4096
+-N 4096` and no `resize=` (`os/build.sh:449-450`). An ext4 grown online is capped by the group
 descriptor blocks reserved when it was made, by default about 1024 times the original size,
 **about 8 GiB for 8 MiB** (the figure is from ext4's reserved-GDT rule; not measured here), and the
 example disk of this record is 1 TB. So a data disk does not use that seed as it is. **T-0958
@@ -195,7 +195,11 @@ file, `usr/share/kith/data.ext4`, so the Volume's seed and its image bytes stay 
 the cost being the reserved descriptor blocks inside the seed (a seed bigger than 8 MiB;
 measured in the image budget by that task), or makes the file system at add by another means.
 The VM test (section 3) grows a **sparse file of 16 GiB or larger**, over the 8 GiB the 8 MiB
-seed would allow, and says what it measured.
+seed would allow, and says what it measured. **Built (T-0972):** the seed is **64 MiB** (zeros, so
+it squashes to nothing in the root), `-b 4096 -N 4096 -J size=16 -E resize=1073741824` (4 TiB, the
+most a node takes: a bigger disk is refused). The journal is not the default: the grow is one
+transaction that holds the 512 reserved descriptor blocks, jbd2 allows a quarter of the journal,
+and the 4 MiB one of a 16 MiB seed got `ENOSPC` in the VM. The grow is at the mount, not at add.
 
 **Removing**, `kith node disk remove ID`: unmount (refused while in use), `crypt::remove`
 (`lib.rs:321`), then **the header's 4 KiB is zeroed** (the disk is then plainly unknown again, and
@@ -215,10 +219,12 @@ its own, the person who needs more **discards the disk** (`disk remove --discard
 after the header is zeroed), and says so in the answer. Neither is claimed to reach into a
 device that remaps blocks (unverified).
 
-**At boot** a task starts when the state is open (`state_then(&STATE_OPEN, …)`, `init.rs:610-637`)
-and is not on the path of the node's start: it reads the headers, maps and mounts the known
-disks, and fails each on its own (a disk that does not answer within a bounded time is marked
-`unreadable` and the rest go on). A known disk that is not found is "known, not seen": the
+**At boot** a task starts when the state is open (`data_disk::boot::run`, one of the storage
+tasks `main.rs` joins after `init::STATE_OPEN.notify_one()`; only as init) and is not on the path
+of the node's start: it reads the headers, maps and mounts the known disks, and fails each on its
+own (a disk that does not answer within 60 s is marked `unreadable`, its thread is let go of and
+closes what it opens late, and the rest go on). A disk is opened only if its serial is the one its
+entry was made for, and one id is opened once. A known disk that is not found is "known, not seen": the
 entry stays. No hot-plug: only boot and `disk add` look (open, section 6).
 
 ## 3. The VM test, on a disk file
@@ -276,13 +282,14 @@ None of it reaches a real disk, a real TPM or a real key.
 | Task | Slice |
 |---|---|
 | T-0957 | **The core, on files.** The header (written and read back by unit tests on a disk file in a temporary directory), the entry and key under `disks/<id>/`, the signature check, the order of writes of an add with the mapping step behind a trait (a fake in the tests, so a cut at each point is tested, including between the header and `ready`, and the resume), `off_ours` with its three cases (section 2), the refusal of a root disk or a removable one, and the zeroing of the header and the key on remove. No mapping, no boot, no verb. |
-| T-0958 | **The mapping, boot, verbs and the VM test.** What a file cannot show: the real mapping (`kith_dm_sys::crypt` needs root and device-mapper), the overwrite through it, the seed written and grown (made with `-E resize=`, section 2), the mount; the task after `STATE_OPEN` that mounts the known disks and leaves the unknown alone, the node's status line of disks, `kith node disk add`, `remove` and `list` with the audit entries and the no-cluster route, and `ci/vm.sh --test disk` (section 3) on a disk file. |
+| T-0972 | **The mapping and the boot, built.** What a file cannot show: the real mapping (`kith_dm_sys::crypt` needs root and device-mapper), the overwrite through it, the seed written and grown (made with `-E resize=`, section 2), the mount; the task after `STATE_OPEN` that mounts the known disks and leaves the unknown alone, the node's status line of disks (`status.disks`), and `ci/vm.sh --test disk` (section 3) on a disk file, with a build of the cargo feature `disk-test` that adds the disk of a serial named on the kernel command line. |
+| T-0958 | **The verbs.** `kith node disk add`, `remove` and `list` with the audit entries and the no-cluster route, on the core and the mapping above; they replace the `disk-test` hook. |
 
 T-0957's unit tests run on files in a directory, so **they cannot cover the mapping, the mount or
-the grow**; those need root and device-mapper, are **VM-only**, and are covered by T-0958 and
-by nothing before it. T-0957 stands alone (it merges and passes its gates without T-0958, with the
-mapping behind a trait); T-0958 needs it. T-0957 and T-0958 were captured with the earlier wording
-that put the seed in T-0957: this section is the word.
+the grow**; those need root and device-mapper, are **VM-only**, and are covered by T-0972 and
+by nothing before it. T-0957 stands alone (it merges and passes its gates without T-0972, with the
+mapping behind a trait); T-0972 needs it, and T-0958 needs both. T-0957 and T-0958 were captured
+with the earlier wording that put the seed in T-0957 and the boot in T-0958: this section is the word.
 
 ## 5. Rivals, in short
 
