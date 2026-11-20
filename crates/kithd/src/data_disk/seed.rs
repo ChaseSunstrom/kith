@@ -40,7 +40,7 @@ pub fn sectors(bytes: u64) -> Result<u64, String> {
         return Err("it is too small to hold a file system".into());
     }
     if sectors * 512 / BLOCK > CEILING {
-        let tib = CEILING * BLOCK >> 40;
+        let tib = (CEILING * BLOCK) >> 40;
         return Err(format!("it is bigger than the {tib} TiB the seed file system grows to"));
     }
     Ok(sectors)
