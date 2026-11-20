@@ -386,7 +386,7 @@ fn signed(store: &Store, prefix: Ipv6Addr, by: (&str, bool), command: &Command) 
     // Nor one of who joins the mesh and at what level, or of what traffic flows: no Release's or
     // Source's chart needs one signed by a node that a person cannot apply (T-1084).
     let network = |kind: &str| {
-        ["AccessLevel", "RemotePeer", "NetworkPolicy"]
+        ["AccessLevel", "RemotePeer", "NetworkPolicy", "Exit"]
             .iter()
             .any(|of| of.eq_ignore_ascii_case(kind))
     };
@@ -453,6 +453,55 @@ fn writer_of<'a>(store: &'a Store, owner: &str) -> Result<&'a Resource, String> 
     }
 }
 
+/// Is `resource` what the render of its owner `of` may make? The limits the render puts on what
+/// it makes (`releases::render`, `controllers::desired` and `sources`), which `writer_may`
+/// does not ask (an admin's writer may do anything): what is in a namespace, in the owner's own,
+/// no Release, Source or KindDefinition from a Release or a controller (a Source's own limit: no
+/// Source), not the values releases are given, no status. A Source in `kith-system` makes what it
+/// likes, in no namespace too. A controller's own resource may itself be owned (a chain): each
+/// step is held to this, as the controller's answer is where it is proposed.
+fn within(store: &Store, of: &str, resource: &Resource) -> Result<(), String> {
+    if resource.status.is_some() {
+        return Err("a render makes no status".into());
+    }
+    let owner = store.get(of).ok_or_else(|| format!("{of} is not there"))?;
+    let home = owner.metadata.namespace.as_deref();
+    if owner.kind == "Source" && home == Some("kith-system") {
+        return Ok(());
+    }
+    let kind = resource.kind.as_str();
+    let namespaced = match kith_api::kind(kind) {
+        Some(kind) => kind.namespaced,
+        None => store
+            .definition(kind)
+            .is_some_and(|definition| definition.spec["namespaced"] != false),
+    };
+    if !namespaced {
+        return Err(format!(
+            "{of} does not get to make a {kind}: it is in no namespace, and only a Source in kith-system makes one"
+        ));
+    }
+    let kept: &[&str] = if owner.kind == "Source" {
+        &["Source"]
+    } else {
+        &["Release", "Source", "KindDefinition"]
+    };
+    if kept.contains(&kind) {
+        return Err(format!("{of} does not get to make a {kind}"));
+    }
+    if home.is_some() && resource.metadata.namespace.as_deref() != home {
+        return Err(format!(
+            "it is in namespace {:?}: what {of} makes stays in its own, {}",
+            resource.metadata.namespace.as_deref().unwrap_or_default(),
+            home.unwrap_or_default()
+        ));
+    }
+    if owner.kind != "Source" && (kind, resource.metadata.name.as_str()) == ("ConfigMap", crate::releases::SHARED) {
+        return Err(format!("{of} does not get to set the values releases are given"));
+    }
+    Ok(())
+}
+
 /// May the leader write `resource`, which says it is made for `of` (a Release, a Source or a
 /// controller's resource)? As `writer_may` decides it, as it does where the controller proposes it
 /// (so one that has lost its rights writes nothing new): on every node. And not over what is
@@ -472,6 +521,7 @@ fn owned(store: &Store, leads: bool, of: &str, resource: &Resource) -> Result<()
         return Err(not_made(key, format!("it is there, and not what {of} made")));
     }
     let writer = writer_of(store, of).map_err(|why| not_made(&key, why))?;
+    within(store, of, resource).map_err(|why| not_made(&key, why))?;
     // A Release, Source or Package says who wrote it and with what key, and what it renders says
     // what its owner says (`sources`): another would be written as a writer that is not its owner's.
     if matches!(resource.kind.as_str(), "Release" | "Source" | "Package") {
@@ -1946,7 +1996,7 @@ mod tests {
         }
         bob_is(&mut store, 0);
         for resource in kith_api::Resource::from_source(&format!(
-            "apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: repo, namespace: shop, {note} }}\n\
+            "apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: repo, namespace: kith-system, {note} }}\n\
              spec: {{ git: {{ url: 'https://example.org/a.git' }} }}\n"
         ))
         .unwrap()
@@ -1958,7 +2008,13 @@ mod tests {
             let entry = sign(&nodes[0], &id, command).unwrap();
             crate::access_sign::admit(store, &id, &entry, leader)
         };
-        let held = store.get("Source/shop/repo").unwrap().metadata.annotations.clone();
+        // (A Source in kith-system: only one makes a Source.)
+        let held = store
+            .get("Source/kith-system/repo")
+            .unwrap()
+            .metadata
+            .annotations
+            .clone();
         let render = |kind: &str, name: &str, forged: Option<(&str, Option<&str>)>| {
             let spec = match kind {
                 "Source" => serde_json::json!({ "git": { "url": "https://example.org/b.git" } }),
@@ -1969,7 +2025,7 @@ mod tests {
             made.metadata.annotations = held.clone();
             made.metadata
                 .annotations
-                .insert(OWNER.into(), "Source/shop/repo".into());
+                .insert(OWNER.into(), "Source/kith-system/repo".into());
             match forged {
                 Some((note, Some(to))) => made.metadata.annotations.insert(note.into(), to.into()),
                 Some((note, None)) => made.metadata.annotations.remove(note),
@@ -2026,7 +2082,8 @@ mod tests {
         };
         let made = |kind: &str, name: &str| {
             let mut made = named(kind, name, serde_json::json!({ "data": {} }));
-            made.metadata.namespace = (kind != "AccessLevel" && kind != "RemotePeer").then(|| "shop".to_string());
+            made.metadata.namespace =
+                (!["AccessLevel", "RemotePeer", "Exit"].contains(&kind)).then(|| "shop".to_string());
             made.metadata
                 .annotations
                 .insert(OWNER.into(), "Release/shop/mine".into());
@@ -2034,7 +2091,7 @@ mod tests {
         };
         // The control: what the Release may render.
         assert_eq!(admitted(&store, &apply(vec![made("ConfigMap", "c")])), Ok(()));
-        for kind in ["AccessLevel", "RemotePeer", "NetworkPolicy"] {
+        for kind in ["AccessLevel", "RemotePeer", "NetworkPolicy", "Exit"] {
             let held = made(kind, "x");
             let said = admitted(&store, &apply(vec![held.clone()])).unwrap_err();
             assert!(said.contains("only a person signs"), "{kind}: {said}");
@@ -2043,5 +2100,107 @@ mod tests {
             let said = admitted(&store, &Command::Delete { key: held.key() }).unwrap_err();
             assert!(said.contains("only a person signs"), "{kind}: {said}");
         }
+        // Nor does one with no owner at all.
+        let bare = named("Exit", "x", serde_json::json!({}));
+        let said = admitted(&store, &apply(vec![bare])).unwrap_err();
+        assert!(said.contains("only a person signs"), "a bare Exit: {said}");
+    }
+
+    /// What a node signs for an owner stays in what the render of that owner may make, whoever
+    /// wrote the owner (an admin's rights are all, so only the limits are in the way): in the
+    /// owner's own namespace, nothing in no namespace (an Exit, an OSRelease), no Release,
+    /// Source or KindDefinition from a Release or a controller, no status, and not the values
+    /// releases are given; only a Source in kith-system may make what is in no namespace (T-0850).
+    #[test]
+    fn own_writes_signed_owned_writes_keep_to_what_a_render_may_make() {
+        use crate::releases::{OWNER, WRITER};
+        let ca = pki::Ca::create().unwrap();
+        let (mut store, nodes) = required(&ca, &["a"]);
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        let admin = "annotations: { 'kith.dev/written-by': 'local socket' }";
+        for resource in kith_api::Resource::from_source(&format!(
+            "apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: rel, namespace: shop, {admin} }}\n\
+             spec: {{ package: {{ name: maps }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: src, namespace: shop, {admin} }}\n\
+             spec: {{ git: {{ url: 'https://example.org/a.git' }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: sys, namespace: kith-system, {admin} }}\n\
+             spec: {{ git: {{ url: 'https://example.org/b.git' }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: {{ name: gameserver, {admin} }}\n\
+             spec: {{ group: games.example.com, version: v1, kind: GameServer, schema: {{ type: object }} }}\n---\n\
+             apiVersion: games.example.com/v1\nkind: GameServer\nmetadata: {{ name: one, namespace: shop, \
+             annotations: {{ 'kith.dev/written-by': 'local socket', 'kith.dev/owned-by': 'Release/shop/rel' }} }}\n\
+             spec: {{ map: dust }}\n"
+        ))
+        .unwrap()
+        {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let leader = kith_store::node_id("a");
+        let admitted = |command: &Command| {
+            let entry = sign(&nodes[0], &id, command).unwrap();
+            crate::access_sign::admit(&store, &id, &entry, leader)
+        };
+        // `kind` made for `owner`, in `namespace`, named `name`; written as the owner is.
+        let made = |owner: &str, kind: &str, name: &str, namespace: Option<&str>| {
+            let mut made = named(kind, name, serde_json::json!({}));
+            made.metadata.namespace = namespace.map(str::to_string);
+            made.metadata.annotations.insert(OWNER.into(), owner.to_string());
+            if matches!(kind, "Release" | "Source") {
+                made.metadata.annotations.insert(WRITER.into(), "local socket".into());
+            }
+            made
+        };
+        let refused = |owner: &str, kind: &str, name: &str, namespace: Option<&str>, why: &str| {
+            let said = admitted(&apply(vec![made(owner, kind, name, namespace)])).unwrap_err();
+            assert!(said.contains(why), "{owner} {kind} in {namespace:?}: {said}");
+        };
+        let passes = |owner: &str, kind: &str, name: &str, namespace: Option<&str>| {
+            let said = admitted(&apply(vec![made(owner, kind, name, namespace)]));
+            assert_eq!(said, Ok(()), "{owner} {kind} in {namespace:?}");
+        };
+        // A Release's render: what is in its namespace, and a ConfigMap but not the values.
+        let rel = "Release/shop/rel";
+        passes(rel, "ConfigMap", "c", Some("shop"));
+        for kind in ["OSRelease", "UpdatePlan", "Repository", "Node"] {
+            refused(rel, kind, "x", None, "in no namespace");
+        }
+        // (An Exit is one of the mesh's: no node signs it, whoever the owner.)
+        refused(rel, "Exit", "x", None, "only a person signs");
+        refused(rel, "ConfigMap", "c", Some("play"), "stays in");
+        refused(rel, "ConfigMap", "kith-values", Some("shop"), "values releases");
+        refused(rel, "Release", "r2", Some("shop"), "does not get to make a Release");
+        refused(rel, "Source", "s2", Some("shop"), "does not get to make a Source");
+        refused(rel, "KindDefinition", "k", None, "only a person signs");
+        let mut with_status = made(rel, "ConfigMap", "c", Some("shop"));
+        with_status.status = Some(serde_json::json!({ "phase": "Running" }));
+        let said = admitted(&apply(vec![with_status])).unwrap_err();
+        assert!(said.contains("status"), "{said}");
+        // A Source's: what is in its namespace, a Release too; not a Source nor what is in none.
+        let src = "Source/shop/src";
+        passes(src, "ConfigMap", "c", Some("shop"));
+        passes(src, "Release", "r2", Some("shop"));
+        refused(src, "Source", "s2", Some("shop"), "does not get to make a Source");
+        refused(src, "OSRelease", "x", None, "in no namespace");
+        refused(src, "ConfigMap", "c", Some("kith-system"), "stays in");
+        // A Source in kith-system may make anything the render lets it: also what is in none.
+        let sys = "Source/kith-system/sys";
+        passes(sys, "OSRelease", "x", None);
+        passes(sys, "ConfigMap", "c", Some("play"));
+        passes(sys, "Release", "r2", Some("play"));
+        // A controller's: the Release makes the GameServer, whose controller (the KindDefinition's
+        // writer's) makes things in the GameServer's namespace, as the controller does where it
+        // answers (a chain is allowed, and held to the same limits at each step).
+        let one = "GameServer/shop/one";
+        passes(one, "Workload", "w", Some("shop"));
+        refused(one, "Workload", "w", Some("play"), "stays in");
+        refused(one, "OSRelease", "x", None, "in no namespace");
+        refused(one, "Release", "r2", Some("shop"), "does not get to make a Release");
+        refused(one, "KindDefinition", "k", None, "only a person signs");
+        // A mix of one that passes and one that does not is refused whole.
+        let mixed = apply(vec![
+            made(rel, "ConfigMap", "c", Some("shop")),
+            made(rel, "Exit", "x", None),
+        ]);
+        assert!(admitted(&mixed).is_err());
     }
 }

@@ -502,12 +502,22 @@ nodes too, and a replay decides alike.
   its owner says (`kith.dev/written-by`, `kith.dev/written-key`; `sources` copies both onto
   what a Source brings), else a taken leader could name a Release written as the admin and
   then write anything as that Release. The kinds that reach the mesh or the network policy
-  (AccessLevel, RemotePeer, NetworkPolicy) are refused as well, applied or deleted.
+  (AccessLevel, RemotePeer, NetworkPolicy, Exit) are refused as well, applied or deleted.
   Secret and Backup stay: a chart renders both, and the owner's writer must hold them.
-  What I found reading the controller path (T-1084): a Release's render and a wasm
-  controller's answer already refuse every cluster-scoped kind and a Release, a Source or a
-  KindDefinition (`releases::render`, `controllers::desired`), so no Role, RoleBinding,
-  Identity, AccessLevel or RemotePeer is rendered in any mode. What a refusal under
+  The render refuses every cluster-scoped kind and a Release, a Source or a KindDefinition
+  (`releases::render`, `controllers::desired`), and keeps a Release in its namespace; but
+  that is the render's, and a taken leader signs what it likes. So the signed path asks the
+  same itself (`own_writes::within`, after `writer_of`, whoever wrote the owner: an admin's
+  writer may write anything, so `writer_may` alone would let it through): a namespaced kind,
+  in the owner's own namespace, no status, not the values releases are given, and no
+  Release, Source or KindDefinition from a Release or a controller (a Source: no Source).
+  Only a Source in `kith-system` may make what is in no namespace (an OSRelease, an
+  UpdatePlan), as `sources` lets it. A custom-kind owner (a controller) is written by its
+  KindDefinition's writer, as the controller proposes; its own resource may be owned (a
+  Release makes a GameServer, whose controller makes a Workload), and I kept that chain,
+  which is what the controller path does: each step is held to `within` and to that writer,
+  so it cannot leave the namespace nor make a Release, and what it may make is what the
+  KindDefinition's writer may. What a refusal under
   `required` does cost: a Source that brings a KindDefinition (`sources`) and the prune that
   takes one away, the reaper's delete of an orphaned access kind, and a NetworkPolicy a
   Release renders (the only namespaced kind of these). A person applies those, signed,

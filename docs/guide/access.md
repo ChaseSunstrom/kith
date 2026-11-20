@@ -167,10 +167,12 @@ admin's key; or set `spec.signing: open` first, and back after.
 What the cluster writes for itself is signed by the node's own key and held to what it comes
 from: a Release's or a Source's renders, a fetched package, a rolling update's cordon, a
 custom-kind controller's writes, cron's Jobs, the scheduler's Volumes. Each must have its
-owner in the store and stay within the rights of whoever wrote that owner, so a taken control
-node cannot write more than the owner could. A node never signs a change of access (a Role, a
+owner in the store and stay within the rights of whoever wrote that owner and within what its render may make (its own
+namespace, nothing that is in no namespace, no Release, Source or KindDefinition from a Release
+or a controller; a Source in `kith-system` alone may make what is in no namespace), so a taken
+control node cannot write more than the owner could. A node never signs a change of access (a Role, a
 RoleBinding, an Identity, a KindDefinition, the Cluster) nor one of the mesh or the network
-policy (an AccessLevel, a RemotePeer, a NetworkPolicy), so a Source that brings a KindDefinition
+policy (an AccessLevel, a RemotePeer, a NetworkPolicy, an Exit), so a Source that brings a KindDefinition
 or a Release that renders a NetworkPolicy is refused under `required`: apply those yourself,
 signed. A worker node cannot sign, so the spec writes it
 makes for itself (its Devices, Images and Backups) are refused under `required`, and so is a
