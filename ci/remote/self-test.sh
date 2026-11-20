@@ -16,10 +16,11 @@ self_test() {
     echo two >"$t/w/f" && git -C "$t/w" commit -qam two
     git -C "$t/w" remote add origin "file://$t/gh.git" && git -C "$t/w" push -q origin main
     git -C "$t/w" fetch -q origin
-    # (its ci/vm.sh passes alone, skips skipme as ci/vm.sh skips, and fails the rest)
+    # (its ci/vm.sh passes alone, if tar would leave a file's owner be, skips skipme as ci/vm.sh
+    # skips, and fails the rest)
     mkdir "$t/w/ci"
     # shellcheck disable=SC2016 # (the stub's)
-    printf '%s\n' '[ "$1" = --test ] || exit 9' 'case $2 in alone) echo "vm.sh: ok: alone" ;; skipme) echo "skipped: no KVM"; exit 0 ;; *) echo "vm.sh: FAIL: $2"; exit 1 ;; esac' >"$t/w/ci/vm.sh"
+    printf '%s\n' '[ "$1" = --test ] || exit 9' 'case $2 in alone) [ "${TAR_OPTIONS-}" = --no-same-owner ] || { echo "vm.sh: FAIL: tar keeps owners"; exit 1; }; echo "vm.sh: ok: alone" ;; skipme) echo "skipped: no KVM"; exit 0 ;; *) echo "vm.sh: FAIL: $2"; exit 1 ;; esac' >"$t/w/ci/vm.sh"
     echo three >"$t/w/f" && echo x >"$t/w/g" && git -C "$t/w" add g ci && git -C "$t/w" commit -qam three
     c=$(git -C "$t/w" rev-parse HEAD)
     git -C "$t/gh.git" cat-file -e "$c" 2>/dev/null && die "the test's commit is on GitHub"
@@ -188,7 +189,7 @@ EOF
         echo "$rep" | grep -qx "FAILED: $x" || die "the report does not name $x: $rep"
     done
     ! echo "$rep" | grep -q '^FAILED: n1' || die "the test that passed is named failed: $rep"
-    ok "--vm: a skipped test fails the run as a failed one does, named with its node; the tools installed once and kept"
+    ok "--vm: a skipped test fails the run as a failed one does, named with its node; the tools installed once and kept; tar leaves owners be"
     # the local fallback: no KITH_REMOTE, or a cluster that does not answer, runs cargo test with the same args and exit
     cat >"$t/bin/cargo" <<'EOF'
 #!/bin/sh

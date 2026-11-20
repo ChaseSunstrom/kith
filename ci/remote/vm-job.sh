@@ -45,7 +45,9 @@ int ioctl(int fd, unsigned long req, ...) {
 }
 EOF
     cd "$cache/src" || exit 1
-    exec env LD_PRELOAD="$shim" HOME="$work" TMPDIR=/tmp CARGO_HOME="$cache/cargo" CARGO_TARGET_DIR="$cache/target" KITH_OS_CACHE="$cache/os" sh ci/vm.sh --test "$TEST" ;;
+    # (Root here is the Job's user, the one uid this namespace maps: tar, as root, would give a file
+    # its owner in the archive, a uid not mapped, and fail on it. TAR_OPTIONS keeps the files ours.)
+    exec env LD_PRELOAD="$shim" TAR_OPTIONS=--no-same-owner HOME="$work" TMPDIR=/tmp CARGO_HOME="$cache/cargo" CARGO_TARGET_DIR="$cache/target" KITH_OS_CACHE="$cache/os" sh ci/vm.sh --test "$TEST" ;;
 esac
 mkdir -p "$cache" "$work" && exec 9>"$cache/lock" && flock 9 || exit 1
 t0=$(date +%s)
