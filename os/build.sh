@@ -98,12 +98,14 @@ out=$(cd "$out" && pwd)
 # KITHD_FEATURES (ci/musl.sh) builds a kithd with test-only code: only into the folder
 # ci/vm.sh gives that image, so one left in the environment never makes an image that ships.
 # (forge: a route a leader appends an unchecked entry by; fido2-test: a software security key
-# on /dev/uhid, docs/adr-fido2.md section 2.)
+# on /dev/uhid, docs/adr-fido2.md section 2; disk-test: a data disk made at boot from the
+# command line, until the add verb is, docs/adr-second-disk.md.)
 case "${KITHD_FEATURES:-}" in
     '') ;;
     forge) want=$root/target/os-forge ;;
     fido2-test) want=$root/target/os-fido2 ;;
-    *) echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): it knows forge and fido2-test (unset it)" >&2; exit 2 ;;
+    disk-test) want=$root/target/os-disk ;;
+    *) echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): it knows forge, fido2-test and disk-test (unset it)" >&2; exit 2 ;;
 esac
 if [ -n "${KITHD_FEATURES:-}" ] && [ "$out" != "$want" ]; then
     echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): only for --out ${want#"$root"/}, not $out (unset it)" >&2
@@ -446,6 +448,16 @@ assemble() { # DIR
     truncate -s 8M "$r/usr/share/kith/volume.ext4"
     E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -b 4096 -N 4096 -L kith-volume -U "$seed" \
         -E "hash_seed=$seed,root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0" "$r/usr/share/kith/volume.ext4" >&2
+    # The same for a second disk's data (docs/adr-second-disk.md, section 4), with room kept for
+    # the descriptor blocks of a disk of 2^30 blocks (4 TiB): an ext4 grows online only as far
+    # as it reserved, and one made this small reserves little. The grow is one transaction that
+    # holds every reserved descriptor block (512 here), and a journal allows a transaction a
+    # quarter of itself: the default one of a file system this small (4 MiB) is too small for it
+    # (ENOSPC at the grow, seen in a VM), so -J size=16 (4096 blocks). crates/kithd/src/data_disk/seed.rs
+    # pins these parameters (resize= is its CEILING); zeros squash to nothing in the root.
+    truncate -s 64M "$r/usr/share/kith/data.ext4"
+    E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -b 4096 -N 4096 -J size=16 -L kith-data -U "$seed" \
+        -E "hash_seed=$seed,root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0,resize=1073741824" "$r/usr/share/kith/data.ext4" >&2
     msize=0 fsize=0
     if [ -n "$modules" ]; then
         # The modules (signed, with depmod's index and the list of what is built in, so the
