@@ -175,8 +175,9 @@ report() {
 }
 
 # one NODE I N COMMIT BASES ARGS DIR [TEST]: ships the bundle, runs the Job (of VM test TEST, with
-# the node's Device and claim, when named), waits, saves its log.
-one() {
+# the node's Device and claim, when named), waits, saves its log. (A subshell: its names, n and
+# node among them, are not its caller's.)
+one() (
     node=$1 i=$2 n=$3 commit=$4 bases=$5 args=$6 dir=$7 vmtest=${8-}
     echo "$node" >"$dir/$i.node"
     echo "no answer" >"$dir/$i.state"
@@ -215,7 +216,7 @@ one() {
     done
     api "logs/Job/$ns/$name" | jq -r .data >"$dir/$i.log" || true
     api "resources/Job/$ns/$name" -X DELETE >/dev/null || true
-}
+)
 
 # find_nodes: sets creds, addr and port for api, and nodes: the cluster's ready, schedulable
 # nodes, one a line (none when it does not answer).

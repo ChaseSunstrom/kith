@@ -122,17 +122,26 @@ EOF
     jq -s -e 'add | length == 6 and all(if .kind == "Device" then .metadata.labels["kith.dev/namespaces"] == "ci" and .metadata.namespace == null else .metadata.namespace == "ci" end)' "$t/applied" >/dev/null || die "an object applied outside namespace ci: $(cat "$t/applied")"
     ! grep -vE '^(apply|(resources/Job|logs/Job|volumes)/ci/.)' "$t/paths" || die "an API path outside namespace ci"
     ok "every object a run applies (Volume, Job, claim) is in namespace ci; the Device is granted to ci alone"
-    # one test per node at a time, each test once: the cluster's answers and each test's Job stubbed
+    # one test per node at a time, each test once: the cluster's answers stubbed, one as it is (a
+    # Job named ci-NODE-COMMIT-TEST-TIME starts at its apply and ends at its log)
     : >"$t/sched"
     # shellcheck disable=SC2030,SC2034,SC2317 # (the stubs and names are the subshell's)
     rep=$(
         cd "$t/w" || exit 1
-        api() { [ "$1" != resources ] || echo '[{"kind": "Node", "metadata": {"name": "n2"}, "status": {"state": "ready"}}, {"kind": "Node", "metadata": {"name": "n1"}, "status": {"state": "ready"}}]'; }
-        one() {
-            echo "start $1 $8" >>"$t/sched"
-            echo "$1" >"$7/$2.node" && echo succeeded >"$7/$2.state" && echo "SUMMARY exit=0 test=$8" >"$7/$2.log"
-            echo "end $1 $8" >>"$t/sched"
+        api() {
+            case $1 in
+            resources) echo '[{"kind": "Node", "metadata": {"name": "n2"}, "status": {"state": "ready"}}, {"kind": "Node", "metadata": {"name": "n1"}, "status": {"state": "ready"}}]' ;;
+            apply) jq -r '.[] | select(.kind == "Job") | .metadata.name | split("-") | "start \(.[1]) \(.[3])"' >>"$t/sched" ;;
+            volumes/*) cat >/dev/null ;;
+            resources/*) echo '{"status": {"state": "succeeded"}}' ;;
+            logs/*)
+                echo "${1##*/}" | awk -F- '{print "end", $2, $4}' >>"$t/sched"
+                echo "${1##*/}" | awk -F- '{print "{\"data\": \"SUMMARY exit=0 test=" $4 "\"}"}'
+                ;;
+            esac
         }
+        sleep() { :; }
+        timeout=1
         KITH_REMOTE=a:1 KITH_REMOTE_CREDS=$t
         vm a,b,c,d,e HEAD
     ) || die "--vm, every test passing, failed: $rep"
