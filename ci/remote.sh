@@ -143,19 +143,24 @@ one() {
     echo "no answer" >"$dir/$i.state"
     : >"$dir/$i.log"
     name=ci-$(printf %.20s "$node")-$(printf %.8s "$commit")-$(date +%s)
-    volume_json "$node" | api apply -H 'content-type: application/json' --data-binary @- >/dev/null || return 0
+    # (The API answers a refusal with {"error": …} and a status curl does not fail on.)
+    answer="$dir/$i.answer"
+    volume_json "$node" | api apply -H 'content-type: application/json' --data-binary @- >"$answer" 2>&1
+    if grep -qE '"error"|^curl:' "$answer"; then cp "$answer" "$dir/$i.log"; echo "Volume refused" >"$dir/$i.state"; return 0; fi
     if [ -d "$dir/in" ]; then
         tries=0
+        # (A Volume just made takes a moment to be there.)
         until tar -cf - -C "$dir" in | api "volumes/default/ci-$node/files" -m 900 -X PUT \
-            -H 'content-type: application/x-tar' --data-binary @- >/dev/null 2>"$dir/$i.put"; do
+            -H 'content-type: application/x-tar' --data-binary @- >"$answer" 2>&1 && ! grep -qE '"error"|^curl:' "$answer"; do
             tries=$((tries + 1))
-            [ "$tries" -lt 10 ] || { cat "$dir/$i.put" >"$dir/$i.log"; echo "put failed" >"$dir/$i.state"; return 0; }
+            [ "$tries" -lt 10 ] || { cp "$answer" "$dir/$i.log"; echo "bundle put refused" >"$dir/$i.state"; return 0; }
             sleep 3
         done
     fi
     echo "$name" >>"$dir/jobs"
     job_json "$name" "$node" "$i" "$n" "$commit" "$bases" "$args" |
-        api apply -H 'content-type: application/json' --data-binary @- >/dev/null || return 0
+        api apply -H 'content-type: application/json' --data-binary @- >"$answer" 2>&1
+    if grep -qE '"error"|^curl:' "$answer"; then cp "$answer" "$dir/$i.log"; echo "Job refused" >"$dir/$i.state"; return 0; fi
     echo "remote.sh: $node: Job $name" >&2
     state=pending waited=0
     while [ "$state" != succeeded ] && [ "$state" != failed ]; do
