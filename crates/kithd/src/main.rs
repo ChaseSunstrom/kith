@@ -331,8 +331,18 @@ fn nofile_soft(soft: u64, hard: u64) -> u64 {
     hard.min(NOFILE_WANTED).max(soft).min(hard)
 }
 
-/// Raise the soft limit of open files ([`nofile_soft`]); the hard one is not touched. A
-/// failure leaves the limit as it was and is only said.
+/// The hard limit of open files kithd asks for as root, which every container it starts
+/// gets as its own hard limit (as containerd's 524288), so an app can raise its soft one.
+const NOFILE_HARD_WANTED: u64 = 524288;
+
+/// The hard limit to set: [`NOFILE_HARD_WANTED`], but no more than the kernel's `fs.nr_open`
+/// (it refuses a higher one), and never less than now.
+fn nofile_hard(hard: u64, nr_open: u64) -> u64 {
+    hard.max(NOFILE_HARD_WANTED.min(nr_open))
+}
+
+/// Raise the hard limit of open files as root ([`nofile_hard`]) and the soft one
+/// ([`nofile_soft`]). A failure leaves the limit as it was and is only said.
 fn raise_nofile() {
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
     let said = |e: &dyn std::fmt::Display| {
@@ -344,11 +354,29 @@ fn raise_nofile() {
     };
     match getrlimit(Resource::RLIMIT_NOFILE) {
         Ok((soft, hard)) => {
-            let want = nofile_soft(soft, hard);
-            if want != soft
-                && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, want, hard)
+            // (Only root may raise the hard limit; the kernel's cap is fs.nr_open.)
+            let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .unwrap_or(0);
+            let top = if nix::unistd::getuid().is_root() {
+                nofile_hard(hard, nr_open)
+            } else {
+                hard
+            };
+            if nr_open == 0 && nix::unistd::getuid().is_root() {
+                said(&"/proc/sys/fs/nr_open is not readable, so the hard limit is not raised");
+            }
+            let want = nofile_soft(soft, top);
+            if (want, top) != (soft, hard)
+                && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, want, top)
             {
                 said(&e);
+                // (A root without CAP_SYS_RESOURCE may not raise the hard limit, but may the soft one.)
+                let soft_only = nofile_soft(soft, hard);
+                if top != hard && soft_only != soft {
+                    let _ = setrlimit(Resource::RLIMIT_NOFILE, soft_only, hard);
+                }
             }
         }
         Err(e) => said(&e),
@@ -1365,6 +1393,28 @@ mod tests {
         assert_eq!(nofile_soft(100_000, 524288), 100_000);
         assert_eq!(nofile_soft(1024, u64::MAX), 65536);
         assert_eq!(nofile_soft(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn nofile_hard_is_524288_capped_at_nr_open_and_never_lowered() {
+        use super::nofile_hard;
+        assert_eq!(nofile_hard(1024, 1048576), 524288);
+        assert_eq!(nofile_hard(4096, 1048576), 524288);
+        assert_eq!(nofile_hard(1024, 100_000), 100_000);
+        assert_eq!(nofile_hard(1024, 512), 1024);
+        assert_eq!(nofile_hard(1_000_000, 1048576), 1_000_000);
+        assert_eq!(nofile_hard(u64::MAX, 1048576), u64::MAX);
+        // the soft one kithd keeps, with that hard limit: 65536
+        assert_eq!(super::nofile_soft(1024, nofile_hard(1024, 1048576)), 65536);
+    }
+
+    #[test]
+    fn nofile_container_gets_soft_1024_and_hard_of_kithd_never_soft_above_hard() {
+        use kith_runtime::container_nofile;
+        assert_eq!(container_nofile(524288), (1024, 524288));
+        assert_eq!(container_nofile(1024), (1024, 1024));
+        assert_eq!(container_nofile(512), (512, 512));
+        assert_eq!(container_nofile(u64::MAX), (1024, u64::MAX));
     }
 
     #[test]
