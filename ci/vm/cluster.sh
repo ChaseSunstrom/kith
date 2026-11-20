@@ -44,8 +44,9 @@
         # learner, and the cluster says four nodes.)
         nodes=three four=''
         [ "$test" != home ] || { more='--mesh --ingress' others='2 3 4' nodes=four four=',[^,? ]+'; }
-        # (access: the nodes run the image tests.sh built with the forge feature.)
-        [ "$test" != access ] || base=$osdir
+        # (access: the nodes run the image tests.sh built with the forge feature; privilege: with the
+        # confine-probe feature.)
+        { [ "$test" != access ] && [ "$test" != privilege ]; } || base=$osdir
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = privilege ] || [ "$test" = nested ]; then
         others=2 more=--mesh project=''
         [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != privilege ] && [ "$test" != nested ] || others=''
