@@ -463,6 +463,52 @@ pub(crate) fn drain_lines(store: &Store, seen: Seen, grace: Duration, node: &str
     lines
 }
 
+/// What an OS update's drain of `node` waits for: each Workload replica the drain plan says
+/// moves (or that is bound elsewhere already, with its old copy still on `node`), as
+/// `Workload/NAMESPACE/NAME#N`, until every unit of it is ready on another node. A replica that
+/// stays, and a Job, hold nothing.
+pub(crate) fn drain_waits(store: &Store, seen: Seen, grace: Duration, node: &str) -> Vec<String> {
+    let moves = drain_lines(store, seen, grace, node).into_iter();
+    let moves = moves.filter(|line| line["kind"] == "Workload" && line["outcome"] == "moves");
+    let mut held: BTreeSet<(String, u64)> = moves
+        .filter_map(|line| {
+            Some((
+                line["key"].as_str()?.to_string(),
+                line["replica"].as_str()?.parse().ok()?,
+            ))
+        })
+        .collect();
+    for workload in store.list(Some("Workload")) {
+        let units = workload
+            .status
+            .as_ref()
+            .and_then(|status| status["containers"].as_array());
+        let units = units.into_iter().flatten();
+        for unit in units.filter(|unit| unit["node"] == node) {
+            let replica = unit["replica"].as_u64();
+            let bound = replica.and_then(|replica| workload.status.as_ref()?["nodes"][replica.to_string()].as_str());
+            if let (Some(replica), Some(bound)) = (replica, bound)
+                && bound != node
+            {
+                held.insert((workload.key(), replica));
+            }
+        }
+    }
+    held.retain(|(key, replica)| {
+        let status = store.get(key).and_then(|workload| workload.status.as_ref());
+        let units = status.and_then(|status| status["containers"].as_array());
+        let elsewhere: Vec<&Value> = units
+            .into_iter()
+            .flatten()
+            .filter(|unit| unit["replica"].as_u64() == Some(*replica) && unit["node"] != node)
+            .collect();
+        elsewhere.is_empty() || elsewhere.iter().any(|unit| unit["ready"] != true)
+    });
+    held.into_iter()
+        .map(|(key, replica)| format!("{key}#{replica}"))
+        .collect()
+}
+
 /// One line of [`drain_lines`]: what a resource's copy on the drained node does.
 fn line(key: String, replica: Option<&str>, outcome: &str, to: Option<String>, why: String, if_lost: &str) -> Value {
     let parts: Vec<&str> = key.split('/').collect();
@@ -1220,6 +1266,76 @@ spec: { template: { exec: [{ name: run, command: [sleep, inf] }] } }
             None,
             "a running Job is not moved by a drain"
         );
+    }
+
+    /// What an OS update's drain waits for: the replicas the drain plan says move, until each is
+    /// ready on another node. One that stays (pinned, a Job) never holds it.
+    #[test]
+    fn update_drain_moves_what_the_plan_says_moves() {
+        let source = DRAINED.replace(
+            "spec: { unschedulable: true, taints: [{ key: kith.dev/drain, effect: noExecute }] }",
+            "spec: {}",
+        );
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let waits = |store: &Store| drain_waits(store, &there, Duration::from_secs(300), "a");
+        let unit = |replica: u32, node: &str, ready: bool| json!({ "replica": replica, "node": node, "ready": ready });
+        let web =
+            |nodes: Value, units: Vec<Value>| ("Workload/default/web", json!({ "nodes": nodes, "containers": units }));
+        let pinned = (
+            "Workload/default/pinned",
+            json!({ "nodes": { "0": "a" }, "containers": [unit(0, "a", true)] }),
+        );
+        let job = (
+            "Job/default/batch",
+            json!({ "state": "running", "nodes": { "0": "a" } }),
+        );
+        // Both replicas run on a: both move (the pinned one and the Job stay, and hold nothing).
+        let both = [unit(0, "a", true), unit(1, "a", true)];
+        let store = drained_store(
+            &source,
+            &[
+                web(json!({ "0": "a", "1": "a" }), both.to_vec()),
+                pinned.clone(),
+                job.clone(),
+            ],
+        );
+        assert_eq!(waits(&store), ["Workload/default/web#0", "Workload/default/web#1"]);
+        // One is ready on b already (a unit that is not ready does not count).
+        let one = [
+            unit(0, "a", true),
+            unit(0, "b", true),
+            unit(1, "a", true),
+            unit(1, "b", false),
+        ];
+        let store = drained_store(
+            &source,
+            &[
+                web(json!({ "0": "a", "1": "a" }), one.to_vec()),
+                pinned.clone(),
+                job.clone(),
+            ],
+        );
+        assert_eq!(waits(&store), ["Workload/default/web#1"]);
+        // The drain is on and the replicas are bound to b: the old copy on a still counts until
+        // the new one is ready.
+        let rebound = [unit(0, "a", true), unit(0, "b", true), unit(1, "a", true)];
+        let store = drained_store(
+            &source,
+            &[
+                web(json!({ "0": "b", "1": "b" }), rebound.to_vec()),
+                pinned.clone(),
+                job.clone(),
+            ],
+        );
+        assert_eq!(waits(&store), ["Workload/default/web#1"]);
+        // All of them run on b: nothing is waited for, though the pinned replica and the Job
+        // are still on a.
+        let all = [unit(0, "b", true), unit(1, "b", true)];
+        let store = drained_store(
+            &source,
+            &[web(json!({ "0": "b", "1": "b" }), all.to_vec()), pinned, job],
+        );
+        assert!(waits(&store).is_empty(), "{:?}", waits(&store));
     }
 
     #[test]

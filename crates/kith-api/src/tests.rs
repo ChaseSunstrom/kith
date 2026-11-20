@@ -1567,6 +1567,35 @@ fn keyless_identities_in_image_rules_are_checked_when_a_cluster_is_applied() {
     }
 }
 
+/// An identity's optional `tsa` (the timestamp authority's certificates, 1 to 4 PEM): read when
+/// given, shape-checked, and left out of what is stored when it is not (so an older rule is
+/// the same text as before).
+#[test]
+fn an_identity_may_name_its_timestamp_authority() {
+    let cluster = |tsa: &str| {
+        let text = format!(
+            "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec:\n  images:\n  - prefix: ghcr.io\n    signedBy:\n    - issuer: https://issuer.example\n      subject: someone@example.test\n      authority: [\"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n\"]\n      log: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE{}==\n{tsa}",
+            "A".repeat(86)
+        );
+        Resource::from_source(&text)
+            .and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>())
+            .map_err(|e| e.msg)
+    };
+    let cert = "\"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n\"";
+    let stored = |docs: Vec<Resource>| serde_json::to_string(&docs[0]).unwrap();
+    assert!(!stored(cluster("").unwrap()).contains("tsa"));
+    let given = cluster(&format!("      tsa: [{cert}]\n")).unwrap();
+    assert!(stored(given).contains("\"tsa\":[\"-----BEGIN CERTIFICATE"));
+    for (tsa, why) in [
+        ("[]", "tsa"),
+        (&format!("[{}]", [cert; 5].join(", ")), "tsa"),
+        ("[tsa.pem]", "tsa"),
+    ] {
+        let said = cluster(&format!("      tsa: {tsa}\n")).err().unwrap_or_default();
+        assert!(said.contains(why) && said.contains("1 to 4"), "{tsa}: {said}");
+    }
+}
+
 /// The Cluster's rules for whose signatures images are taken by: a prefix that is a registry
 /// or a registry and a path, keys of the shape a template's are, and no more than 32 rules.
 #[test]

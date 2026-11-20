@@ -31,4 +31,12 @@ browser), `ca.crt` trusted, and the name `kith` pointing at a node (a line in `/
 - It asks kithd as you: the same API, rules and audit log as `kith` and `curl`; `POST /v1/diff`
   is the dry run it shows. A field the form cannot draw (a free-form object, `oneOf`) is a JSON
   box; the YAML tab edits anything.
-- Not yet: logging in without a certificate (OIDC), secrets hidden until asked for, metrics.
+- Usage graphs have their data in `GET /v1/metrics?range=15m|1h|6h|24h` (default `1h`): each node's
+  CPU (0 to 1), memory, state disk, disk read and write, network receive and send (bytes per
+  second, every interface but `lo`) and 1-minute load, and each Workload's CPU (cores) and
+  memory, as arrays oldest first (`null` where nothing was sampled), the last point at `end`
+  and `step` seconds apart. It takes the right to list Nodes. A node that does not answer in
+  3 seconds, or has no address yet, is `"missing": true` and the rest comes back. A Workload's series show only for
+  the namespaces you may list or get Workloads in. The page itself that draws them is not here
+  yet.
+- Not yet: logging in without a certificate (OIDC), secrets hidden until asked for.

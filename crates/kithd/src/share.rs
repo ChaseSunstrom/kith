@@ -716,14 +716,20 @@ pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio
             let (mut served, mut not) = (BTreeSet::new(), String::new());
             for dir in &dirs {
                 match crate::volumes::host_dir(&state, dir) {
-                    Ok(made) => drop(served.insert(made)),
+                    Ok(made) => drop(served.insert(made.real().to_path_buf())),
                     Err(e) => not.push_str(&format!("; {}/{} is not served: {e}", dir.namespace, dir.name)),
                 }
             }
             let mut given = BTreeMap::new();
             for (name, dir, lan) in shares.clone() {
                 match crate::volumes::host_dir(&state, &dir) {
-                    Ok(made) => drop(given.insert(name, Lan { dir: made, ..lan })),
+                    Ok(made) => drop(given.insert(
+                        name,
+                        Lan {
+                            dir: made.real().to_path_buf(),
+                            ..lan
+                        },
+                    )),
                     Err(e) => not.push_str(&format!("; the Share {name} is not served: {e}")),
                 }
             }
