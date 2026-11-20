@@ -6,7 +6,7 @@
 # What is in it:
 #   - a kernel built from kernel.org's source at a pinned version and checksum with
 #     os/kernel.config: no modules, no initramfs (but for a spec with the `all` feature:
-#     signed modules and their firmware in the root, see --spec);
+#     signed modules, NVIDIA's open ones among them, and their firmware in the root, see --spec);
 #   - a root file system (squashfs, read-only) holding kithd as /sbin/init, kith, a CA
 #     bundle and empty directories, with a dm-verity hash tree beside it;
 #   - a unified kernel image (systemd's stub, the kernel, and the command line that
@@ -25,6 +25,15 @@ kernel_url=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$kernel_version.ta
 firmware_date=20261019
 firmware_sha256=a10d1ab5baf2c74ba92e8c7cf313e691696c26bddfa6df00db795e48d70cd4ca
 firmware_url=https://cdn.kernel.org/pub/linux/kernel/firmware/linux-firmware-$firmware_date.tar.xz
+# NVIDIA's open GPU kernel modules, for the `all` image only: the source (built out of tree
+# against that kernel's tree and signed with its key) and the release's own .run file, which is
+# only read for the GSP firmware the modules load (nvidia/VERSION/gsp_*.bin: linux-firmware
+# has another layout, for nouveau). Both are the files of this version, by their hashes.
+nvidia_version=595.112.07
+nvidia_sha256=6bf8f19b9d7fa6ca0029100fe09f8a72d413df67e08ad4428b1b358ec10d28c0
+nvidia_url=https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/$nvidia_version.tar.gz
+nvidia_run_sha256=1a38ecd538a2da6232a7330184063af59e9fc946c908cca555bd07909848b9f0
+nvidia_run_url=https://download.nvidia.com/XFree86/Linux-x86_64/$nvidia_version/NVIDIA-Linux-x86_64-$nvidia_version.run
 ca_date=2026-11-05
 ca_sha256=427c064216761a1e72a8b30f0d954d08cb6e4435a82091fb865afd20c8497285
 ca_url=https://curl.se/ca/cacert-$ca_date.pem
@@ -260,12 +269,13 @@ fi
 # (a comment edit must not rebuild a kernel: 2.6 GB of tree and an hour). The firmware is
 # in it by its hash and its CONFIG_EXTRA_FIRMWARE line.
 compiler=$(gcc --version | head -n 1)
-key=$({ echo "$kernel_version $kernel_sha256 $compiler"; [ -z "$firmware" ] || echo "$firmware_sha256"; sed -e '/^# CONFIG_.* is not set$/b' -e '/^[[:space:]]*\(#\|$\)/d' "$kconfig"; } | sha256sum | cut -c 1-16)
+key=$({ echo "$kernel_version $kernel_sha256 $compiler"; [ -z "$firmware" ] || echo "$firmware_sha256"; [ -z "$modules" ] || echo "nvidia $nvidia_sha256 no-peermem"; sed -e '/^# CONFIG_.* is not set$/b' -e '/^[[:space:]]*\(#\|$\)/d' "$kconfig"; } | sha256sum | cut -c 1-16)
 kernel=$cache/kernel-$key/vmlinuz
 mods=$cache/kernel-$key/mods
 if ! [ -r "$kernel" ]; then
     echo "build.sh: building the kernel ($kernel_version): this takes a while, once" >&2
     fetch "$kernel_url" "$kernel_sha256" "$cache/linux-$kernel_version.tar.xz"
+    [ -z "$modules" ] || fetch "$nvidia_url" "$nvidia_sha256" "$cache/nvidia-open-$nvidia_version.tar.gz"
     tree=$cache/kernel-$key/src
     # (A build that was cut short goes on from its tree, which has the mark of a config
     # made; a tree without it is begun again. The modules of an earlier key are not kept.)
@@ -308,6 +318,26 @@ if ! [ -r "$kernel" ]; then
             rel=$(make -s kernelrelease)
             m=$mods.part/lib/modules/$rel
             rm -f "$m/build" "$m/source"
+            # NVIDIA's open modules, out of tree against this tree (nvidia, nvidia-modeset,
+            # nvidia-uvm, nvidia-drm; peermem is not built), installed the same way: signed with
+            # the same key, stripped, into extra/, and depmod runs again so modules.alias and
+            # modules.dep have them. The source is the pinned tarball, in a folder of its own.
+            nv=$cache/kernel-$key/nvidia
+            [ ! -d "$nv" ] || find "$nv" -delete
+            mkdir -p "$nv"
+            tar -xzf "$cache/nvidia-open-$nvidia_version.tar.gz" -C "$nv" --strip-components=1
+            nice -n 10 make -s -C "$nv" SYSSRC="$tree" SYSOUT="$tree" -j"${KITH_OS_JOBS:-$(nproc)}" modules
+            make -s -C "$nv" SYSSRC="$tree" SYSOUT="$tree" modules_install INSTALL_MOD_PATH="$mods.part" INSTALL_MOD_STRIP=1 INSTALL_MOD_DIR=extra
+            find "$nv" -delete
+            # (nvidia-peermem is built where the kernel has InfiniBand: not wanted, and no card's
+            # alias loads it. Gone, and the index made again without it.)
+            rm -f "$m/extra/nvidia-peermem.ko"
+            depmod -b "$mods.part" -a "$rel"
+            for f in nvidia nvidia-modeset nvidia-uvm nvidia-drm; do
+                [ -s "$m/extra/$f.ko" ] || { echo "build.sh: NVIDIA's $f.ko is not in lib/modules/$rel/extra" >&2; exit 1; }
+            done
+            ! grep -q peermem "$m/modules.dep" || { echo "build.sh: modules.dep still names nvidia-peermem" >&2; exit 1; }
+            grep -q '^alias pci:v000010DE.* nvidia$' "$m/modules.alias" || { echo "build.sh: modules.alias has no alias of an NVIDIA card for nvidia" >&2; exit 1; }
             for f in modules.dep modules.alias modules.symbols modules.builtin modules.builtin.modinfo modules.order; do
                 [ -s "$m/$f" ] || { echo "build.sh: modules_install left no $f in lib/modules/$rel" >&2; exit 1; }
             done
@@ -327,6 +357,10 @@ if ! [ -r "$kernel" ]; then
             [ -n "$have" ] && [ -n "$(modinfo -F signer "$sample")" ] || { echo "build.sh: amdgpu.ko has no signer: $(modinfo "$sample" | tail -n 5)" >&2; exit 1; }
             [ "$have" = "$serial" ] || [ "$have" = "$ski" ] ||
                 { echo "build.sh: amdgpu.ko is signed by $have, which is not the kernel's key (serial $serial, id $ski)" >&2; exit 1; }
+            for f in nvidia nvidia-modeset nvidia-uvm nvidia-drm; do
+                [ "$(modinfo -F sig_key "$m/extra/$f.ko" | hexid)" = "$have" ] ||
+                    { echo "build.sh: $f.ko is not signed by the key amdgpu.ko is" >&2; exit 1; }
+            done
             echo "build.sh: $n modules, signed by $(modinfo -F signer "$sample") ($have)"
             # The key is not kept: not in the tree, not in what is installed.
             rm -f certs/signing_key.pem
@@ -378,6 +412,26 @@ if [ -n "$modules" ]; then
             [ -e "$fwall/$name" ] || [ -h "$fwall/$name" ] || { mkdir -p "$fwall/$(dirname "$name")" && ln -s "$target" "$fwall/$name"; }
         done
         : >"$fwall/.kith-links"
+    fi
+    # NVIDIA's GSP firmware, the two files the modules load as nvidia/VERSION/gsp_*.bin: from the
+    # release's .run (423 MB, a shell header and a zstd tar behind it, the line it starts at in
+    # `skip=`), of which only they are kept. The .run is the file pinned above.
+    nvfw=$cache/nvidia-firmware-$nvidia_version
+    if ! [ -e "$nvfw/.kith-done" ]; then
+        echo "build.sh: NVIDIA $nvidia_version's GSP firmware" >&2
+        fetch "$nvidia_run_url" "$nvidia_run_sha256" "$cache/nvidia-$nvidia_version.run"
+        skip=$(sed -n '2,20s/^skip=\([0-9][0-9]*\)$/\1/p' "$cache/nvidia-$nvidia_version.run")
+        [ -n "$skip" ] || die "the .run of NVIDIA $nvidia_version has no skip= line"
+        [ ! -d "$nvfw" ] || find "$nvfw" -delete
+        mkdir -p "$nvfw"
+        # (A pipe: a failed zstd leaves tar a short stream, which it fails on; and the files are checked.)
+        tail -n "+$skip" "$cache/nvidia-$nvidia_version.run" | zstd -dcq | tar -x -C "$nvfw" --wildcards 'firmware/gsp_*.bin'
+        for f in gsp_ga10x gsp_tu10x; do
+            [ -s "$nvfw/firmware/$f.bin" ] || die "the .run of NVIDIA $nvidia_version has no firmware/$f.bin"
+        done
+        # (The .run is 423 MB and is not read again.)
+        find "$cache/nvidia-$nvidia_version.run" -delete
+        : >"$nvfw/.kith-done"
     fi
     # (The tag is the layout of the list: a list made before the links was another.)
     fwlist=$cache/kernel-$key/firmware-$(printf 'links2\n%s\n%s\n' "$firmware_sha256" "$fwextra" | sha256sum | cut -c 1-16).list
@@ -470,6 +524,13 @@ assemble() { # DIR
         (cd "$fwall" && cpio -pd --quiet "$r/lib/firmware") <"$fwlist"
         # (A link whose file the list lacks is not kept.)
         find "$r/lib/firmware" -xtype l -delete
+        # NVIDIA's GSP firmware, where the modules ask for it: nvidia/VERSION/ (VERSION is the
+        # modules' own, which they are built from the source of).
+        mkdir -p "$r/lib/firmware/nvidia/$nvidia_version"
+        cp "$nvfw"/firmware/gsp_*.bin "$r/lib/firmware/nvidia/$nvidia_version/"
+        for f in gsp_ga10x gsp_tu10x; do
+            [ -s "$r/lib/firmware/nvidia/$nvidia_version/$f.bin" ] || die "no NVIDIA $f.bin in the root's /lib/firmware"
+        done
         find "$r/lib" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
         # Not a key anywhere in the root (its CA bundle is a .crt).
         [ -z "$(find "$r" \( -name '*.pem' -o -name 'signing_key*' \))" ] || die "a key is in the root"
