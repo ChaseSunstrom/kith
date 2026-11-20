@@ -47,11 +47,11 @@
         [ "$test" != home ] || { more='--mesh --ingress' others='2 3 4' nodes=four four=',[^,? ]+'; }
         # (access: the nodes run the image tests.sh built with the forge feature.)
         [ "$test" != access ] || base=$osdir
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = access ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = access ]; then
         others=2 more=--mesh project=''
         # (access: three nodes on the mesh, pod's image in each; people on the first, below.)
         [ "$test" != access ] || others='2 3'
-        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != nested ] || others=''
+        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != nested ] && [ "$test" != nofile ] || others=''
         # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
         # as a node's state from before had none: kithd counts what their pods write.)
         [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
@@ -194,7 +194,7 @@
             # (quota: room for what its pods write. pods: room above its reserve, which its
             # full pod crosses on purpose.)
             case $test${KITH_E2E:-} in
-                pods1 | kube1 | quota* | nested*) truncate -s 2G "$1" ;;
+                pods1 | kube1 | quota* | nested* | nofile1) truncate -s 2G "$1" ;;
                 pods) truncate -s 512M "$1" ;;
             esac
         }
@@ -421,6 +421,9 @@ EOF
         fi
         if [ "$test" = nested ]; then
             . "$root/ci/vm/nested.sh"
+        fi
+        if [ "$test" = nofile ]; then
+            . "$root/ci/vm/nofile.sh"
         fi
         if [ "$test" = compose ]; then
             . "$root/ci/vm/compose.sh"

@@ -111,8 +111,9 @@ In detail:
 - L3 The boot loader's editor is not turned off: with Secure Boot off, someone at the
   console can add `kith.update=` (`os/build.sh`, line 235). (Read; queued.)
 - L4 `labelled()` takes any disk when `dm-0` has no slaves (`init.rs:274`). (Read; queued.)
-- L5 `/run`, `/tmp` and `/dev/shm` are mounted without `noexec` (`init.rs:560`). (Read;
-  queued.)
+- L5 `/run`, `/tmp` and `/dev/shm` were mounted without `noexec` (`init.rs:560`). Now they
+  are `noexec` (`init.rs`, `mounts`); the one place a binary runs from is `/run/kith/bin`, a
+  root-only tmpfs of its own (mode 0700, nosuid, nodev) that holds a staged kithd (T-0709).
 - L6 Only the image's length is written, so the rest of a reused disk is not erased
   (`install.rs:338`). (Read; queued.)
 - L7 Until the cluster takes the key over, a sealed install keeps the disk key in the
