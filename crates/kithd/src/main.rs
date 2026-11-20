@@ -46,6 +46,7 @@ mod forge;
 mod gpt;
 mod home;
 mod images;
+mod in_place;
 mod ingress;
 mod init;
 mod install;

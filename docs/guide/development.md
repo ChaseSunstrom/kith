@@ -49,7 +49,9 @@ given), with DIR holding the cluster's `ca.crt` and a client's `root.crt` and `r
 - **The cache.** The same Volume keeps the node's cargo registry, its target folder and the
   checkout, so only what changed builds on a second run. A node whose target folder is over
   `KITH_REMOTE_CACHE_MB` (30000) drops it at the start of a run. The Volume stays; its folder
-  `ci-cache` on the node is what to remove to free the disk.
+  `volumes/ci/ci-NODE` in the node's state is what to remove to free the disk.
+- **The namespace.** CI runs in namespace `ci`, and /dev/kvm is granted only there: every
+  Volume, Job and claim the script applies is in `ci`.
 - **The split.** Each node lists the workspace's tests (`cargo test -- --list`), keeps the names
   whose hash is its place among the nodes' and runs them (`-- --exact NAMES`, `--no-fail-fast`)
   as a user who is not root, in a pod. Every node builds all of it, so a cold node takes as long
@@ -65,6 +67,39 @@ given), with DIR holding the cluster's `ca.crt` and a client's `root.crt` and `r
   GitHub, the merged report and the fallback.
 
 Not yet: a Job has no low priority, so a run uses the nodes' CPUs as any Job does.
+
+The VM tests (`sh ci/vm.sh --test NAME`) can go to the same cluster:
+`KITH_REMOTE=ADDR KITH_REMOTE_CREDS=DIR sh ci/remote.sh --vm TEST[,TEST...] [COMMIT]`.
+
+- **The KVM.** Per node it applies, unchanged on a second run, a Device `ci-kvm-NODE` of the
+  node's /dev/kvm (class `other`), granted to namespace `ci` alone, and a shared DeviceClaim
+  `ci-kvm-NODE` in `ci` that each Job names. The Job is not privileged: it runs as 1000 in a
+  user namespace.
+- **The tools.** The Job copies the image's root into the Volume and installs ci/vm.sh's tools
+  there with apt (its archives and lists in the Volume too), then runs the test chrooted in it,
+  as root of a user namespace of its own. That copy is kept until the image or the list of
+  tools changes. `KITH_OS_CACHE`, cargo's registry and its target folder are in the Volume, so
+  the kernel builds once per node. Two things differ from a machine of your own: a pod's
+  seccomp answers `FS_IOC_SETFLAGS` with "not permitted", which systemd-repart gives up on, so a
+  small preloaded library answers "not supported" as tmpfs would; and tar runs with
+  `--no-same-owner`, as the user namespace maps one uid only.
+- **The split.** The tests are dealt to the nodes in turn, in the order given, and each node
+  runs its own one at a time. One merged report names `FAILED: NODE: TEST` for each failure; a test
+  that ci/vm.sh skips (no KVM, a tool missing) counts as failed, with its reason.
+- **What runs there.** On a cluster of three nodes, 21 of the 29 tests pass: alone, image,
+  update, modules, disk, rollout, install, vps, access, pods, poddns, nested, outlive, services,
+  compose, quota, worker, chaos, home, policy and tunnel (from 30 s warm to 17 minutes for the
+  first kernel and image a node builds). rollout gets the checkout's `kith` built first; kube
+  goes by `sh ci/kube.sh --vm`, which fetches kubectl and helm. The rest, and why:
+  - `init` skips: it boots the host's kernel, and a Job has none in /boot.
+  - `netboot`, `crypt`, `tpm` and `duress`: the machine installed from the network starts
+    again into the firmware's UEFI shell, not its disk. Debian's OVMF has a built-in shell,
+    and that second start gives the disk no boot index.
+  - `blackout`: the guests find no TPM event log
+    (`/sys/kernel/security/tpm0/binary_bios_measurements`) with Debian's OVMF and swtpm, so
+    no node seals its key.
+  - `share` ("the Share mine does not say where it is") and `kube` ("the claim was refused")
+    fail there, on more than one node, and are not explained yet.
 
 Time budgets are medians of five runs on one machine, no VM. `python3 ci/budgets.py --times`
 prints them; `python3 ci/budgets.py` holds each to twice the slowest of three medians on main on
