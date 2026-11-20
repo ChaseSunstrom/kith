@@ -129,6 +129,24 @@ something else, is refused before anything is sent. The identity directory must 
 `NAME.key` and its `NAME.crt`; a key that anyone but its owner can read is refused, and `kith`
 says the `chmod 600` to run. The Roles of the identity decide what it may do, as above.
 
+## Signed writes: `spec.signing: required` and `open`
+
+`spec.signing` on the Cluster is `open` (the default) or `required`. Under `open` a write the
+admin did not sign is kept, as it always was: a `curl`, a `kubectl apply`, a registry push,
+`kith node claim`, a restore. Under `required` every such write that changes a spec is
+refused on every node, when it is applied: an `Apply`, a `Delete`, a rollback or an import
+with no signature. A change of status is not one, and is kept. A refused write changes
+nothing and is audited. To make a change under `required`, sign it as a change with the
+admin's key; or set `spec.signing: open` first, and back after.
+
+What the cluster writes for itself is signed by the node's own key and held to what it comes
+from: a Release's or a Source's renders, a fetched package, a rolling update's cordon, a
+custom-kind controller's writes, cron's Jobs, the scheduler's Volumes. Each must have its
+owner in the store and stay within the rights of whoever wrote that owner, so a taken control
+node cannot write more than the owner could. A worker node cannot sign, so the spec writes it
+makes for itself (its Devices, Images and Backups) are refused under `required`, and so is a
+Blob put through the API.
+
 ## What a node refuses, whatever the cluster says
 
 Some of what the store tells a node to run is the node's own root (an `exec` unit, a root

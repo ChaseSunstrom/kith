@@ -2728,7 +2728,10 @@ impl Controller {
         self.wiping = Some(tokio::spawn(async move {
             let removed = tokio::task::spawn_blocking(move || wipe_all(&state, dirs)).await;
             for key in removed.unwrap_or_default() {
-                if let Err(e) = shared.submit(kith_store::Command::Delete { key: key.clone() }).await {
+                if let Err(e) = shared
+                    .submit_node(kith_store::Command::Delete { key: key.clone() })
+                    .await
+                {
                     eprintln!("kithd: deleting {key} after its data was removed: {e}");
                 }
             }

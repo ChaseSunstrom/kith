@@ -520,7 +520,7 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
         });
         for command in gone.chain(made) {
             let said = match command {
-                Command::Apply { .. } => shared.submit_node(command).await,
+                Command::Apply { .. } | Command::Delete { .. } => shared.submit_node(command).await,
                 _ => shared.submit(command).await,
             };
             if let Err(e) = said {

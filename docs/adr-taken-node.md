@@ -419,7 +419,7 @@ Slice 2 makes the entry mean something:
 - **What slice 2 leaves:**
   - A taken leader can still write any bare `Apply` or `Delete`. Slice 2 stops only
     forged Signed entries. Bare access writes are refused by slice 3 (below); every
-    other bare spec write only with slice 6.
+    other bare spec write by slice 6 (below).
   - A Signed entry's `at` is not compared on `Apply` or `Rollback`: the revision and
     `born` the leader stamps are taken as carried.
   - A header held back can be applied late, past its `expires`, and after a newer one
@@ -479,18 +479,34 @@ nodes too, and a replay decides alike.
   `raft::submit_node`. A bare Patch of a Node's `certificate` or `raftId` is refused at apply
   (`access_sign::bare`), so a taken node cannot take another's identity. Without `required`
   the writes stay bare, as before.
-- **What stays bare, for later slices:** a Release, Source, registry, update or wasm write,
-  and refusing every bare spec write (slice 6). The forge VM test is slice 4; slice 5 adds
-  a bare Node-certificate Patch and a signed scheduler Volume to it.
-- **What it costs:** `kith node claim` (a bare Identity, Role and RoleBinding) and a
-  restore (`Import`) are refused under `required`; sign them as a change, or set `open`
-  first. A rolling upgrade from slice 2 can part: a slice 2 node takes a bare access write
-  at format 4 that a slice 3 node refuses, so update every node before `required`.
-  A Release or Source that renders (or prunes) a Role, RoleBinding, Identity or
-  KindDefinition is a bare write too, so it is refused at apply: its controller proposes
-  nothing under `required` (`releases::refuse_access`) and says so in the Release's or
-  Source's status, once, not in an entry every node audits again each round. Slice 6
-  (T-0850, `writer_may` for a Release and a Source) lifts it.
+- **What stays bare:** a status `Patch`, a `Status`, a `Report`, a snapshot and a
+  membership entry, as before. The forge VM test is slice 4; slice 5 adds a bare
+  Node-certificate Patch and a signed scheduler Volume to it.
+- **Slice 6 (T-0850): the rest of the spec writes.** Under `required` the node's own
+  controllers sign what they derive (`raft::submit_node`, or `raft::as_node` where the write
+  goes through `Shared::write`): a Release's and a Source's renders and prunes, the registry's
+  fetched Package, the update's cordon, a wasm (custom-kind) controller's writes, cron, the
+  device, image and backup records, the NodeKey, a wiped Volume and a node's registration.
+  `own_writes::signed` holds each to its owner at apply, in one place, on every node: it calls
+  `releases::writer_may` for every resource the write touches (the owner is in the store, and
+  the write is within its writer's rights), refuses to overwrite a resource another owner
+  holds, and for a write with no owner falls to the layer 2 `rules`. The table test
+  `own_writes_signed_owned_writes_are_held_to_writer_may_at_apply` names each kind. The
+  same entry is refused on every node, and a replay decides alike. Every other bare
+  `Apply`, `Delete`, `Rollback` and `Import` is refused at apply (`access_sign::bare`,
+  "a bare write that writes a spec is refused under spec.signing: required"); `open`
+  keeps them. The test `signed_required_refuses_every_bare_spec_write_of_every_kind_and_open_keeps_them`
+  covers every kind; the VM test `access` curls a ConfigMap and forges a bare Apply and
+  Delete, and `open` takes the same ones.
+- **What it costs:** `kith node claim` (a bare Identity, Role and RoleBinding), a restore
+  (`Import`), a kubectl or curl apply, a registry push and an API Blob put are refused under
+  `required`; sign them as a change, or set `open` first. A worker node cannot sign, so the
+  spec writes a worker makes for itself (its device, image and backup records) are refused
+  under `required` too. A rolling upgrade from slice 2 can part: a slice 2 node takes a bare
+  access write at format 4 that a slice 3 node refuses, so update every node before
+  `required`. The cordon is checked against the Node as it is (only `unschedulable` and its
+  taint change), not by `writer_may`, because a Node carries no writer. The package-pusher
+  check is made where the leader fetches, not again at apply.
 - **What a taken control node can still do:** a control node the admin set `spec.ingress` on
   (that is how it is let order its own certificates, as a viewed worker is let serve them) can
   still sign a Secret for an exposed host, and the TLS secret that is there (not the account).

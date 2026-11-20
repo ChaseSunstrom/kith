@@ -368,22 +368,155 @@ pub fn admit(
     taken.map_err(|e| e.to_string())
 }
 
-/// What `node`, a control node, may write signed: an Apply of Volumes, Jobs and Secrets that
-/// [`made`] allows; else what it writes as itself bare, but for the blobs it holds (a signed
-/// entry is decided by the store alone: no blob is held) and the register of a Node by its join.
+/// What `node`, a control node, may write signed: an Apply of what [`mine`] says it makes (a
+/// Volume, Job or Secret [`made`] allows; what a Release, Source or controller makes, held to its
+/// owner's writer, [`owned`]; a Package a Repository sent; a Node's [`cordon`]), or a
+/// Delete of what [`takes_away`] allows; else what it writes as itself bare, but for the blobs it
+/// holds (a signed entry is decided by the store alone: no blob is held).
 fn signed(store: &Store, prefix: Ipv6Addr, by: (&str, bool), command: &Command) -> Result<(), String> {
     match command {
-        Command::Apply { resources, .. }
-            if resources
-                .iter()
-                .all(|r| ["Volume", "Job", "Secret"].contains(&r.kind.as_str())) =>
-        {
-            resources
-                .iter()
-                .try_for_each(|resource| made(store, prefix, by, resource))
+        Command::Apply { resources, .. } => {
+            let decided: Vec<_> = resources.iter().map(|r| mine(store, prefix, by, r)).collect();
+            // (A thing refused here is refused whatever the rest: not left to what a node holds.)
+            decided.iter().flatten().cloned().collect::<Result<(), _>>()?;
+            if decided.iter().all(Option::is_some) {
+                return Ok(());
+            }
         }
-        _ => rules(store, Some(prefix), &|_| false, by.0, command.clone()).map(drop),
+        Command::Delete { key } => {
+            if let Some(decided) = takes_away(store, by.1, key) {
+                return decided;
+            }
+        }
+        _ => {}
     }
+    rules(store, Some(prefix), &|_| false, by.0, command.clone()).map(drop)
+}
+
+/// Is `resource` what the leader writes for what it is derived from, and may it? `None`: it is not
+/// of these, and what a node writes as itself decides it.
+fn mine(store: &Store, prefix: Ipv6Addr, by: (&str, bool), resource: &Resource) -> Option<Result<(), String>> {
+    use crate::releases::{REPOSITORY, owner};
+    // (What a CronJob makes is a Job of it: [`made`] holds it to the CronJob, not to a writer.)
+    let of = owner(resource).filter(|of| !of.starts_with("CronJob/"));
+    match (of, resource.kind.as_str()) {
+        (Some(of), _) => Some(owned(store, by.1, of, resource)),
+        (None, "Volume" | "Job" | "Secret") => Some(made(store, prefix, by, resource)),
+        (None, "Package") if resource.metadata.annotations.contains_key(REPOSITORY) => {
+            Some(fetched(store, by.1, resource))
+        }
+        (None, "Node") => cordon(store, by.1, resource),
+        _ => None,
+    }
+}
+
+fn not_made(key: impl std::fmt::Display, why: impl std::fmt::Display) -> String {
+    format!("{key}: {why}")
+}
+
+/// The resource whose writer's rights hold what the owner `owner` makes: a Release's or a Source's
+/// own, or the KindDefinition of a kind a controller makes things of ([`crate::controllers`]).
+fn writer_of<'a>(store: &'a Store, owner: &str) -> Result<&'a Resource, String> {
+    let owner = store.get(owner).ok_or_else(|| format!("{owner} is not there"))?;
+    match owner.kind.as_str() {
+        "Release" | "Source" => Ok(owner),
+        kind => store
+            .definition(kind)
+            .ok_or_else(|| format!("no KindDefinition makes a {kind}")),
+    }
+}
+
+/// May the leader write `resource`, which says it is made for `of` (a Release, a Source or a
+/// controller's resource)? As `writer_may` decides it, as it does where the controller proposes it
+/// (so one that has lost its rights writes nothing new): on every node. And not over what is
+/// another owner's, or no one's.
+fn owned(store: &Store, leads: bool, of: &str, resource: &Resource) -> Result<(), String> {
+    let key = resource.key();
+    if !leads {
+        return Err(not_made(
+            key,
+            "only the leader writes what a Release, a Source or a controller makes",
+        ));
+    }
+    if store
+        .get(&key)
+        .is_some_and(|held| crate::releases::owner(held) != Some(of))
+    {
+        return Err(not_made(key, format!("it is there, and not what {of} made")));
+    }
+    let writer = writer_of(store, of).map_err(|why| not_made(&key, why))?;
+    crate::releases::writer_may(store, writer, std::slice::from_ref(resource), &[])
+}
+
+/// May the leader take away `key`? What a Release, a Source or a controller made, where the writer
+/// of its owner may delete it (the leftovers of an owner that is gone go too: nobody's rights are
+/// left to ask); the Jobs of a CronJob, and a Volume made for a claim that is gone. `None`: none
+/// of these, and what a node writes as itself decides it.
+fn takes_away(store: &Store, leads: bool, key: &str) -> Option<Result<(), String>> {
+    let held = store.get(key)?;
+    let of = crate::releases::owner(held);
+    let for_claim = held.kind == "Volume" && held.metadata.annotations.contains_key(crate::volumes::MADE_FOR_CLAIM);
+    let decided: Result<(), String> = match of {
+        _ if for_claim => match store.get(&key.replacen("Volume", "VolumeClaim", 1)) {
+            None => Ok(()),
+            Some(_) => Err("its claim is there".into()),
+        },
+        Some(of) if of.starts_with("CronJob/") && held.kind == "Job" => Ok(()),
+        // (An owner that is not there leaves no rights to ask; one that is and has no writer, does.)
+        Some(of) if store.get(of).is_none() => Ok(()),
+        Some(of) => {
+            writer_of(store, of).and_then(|writer| crate::releases::writer_may(store, writer, &[], &[key.to_string()]))
+        }
+        None => return None,
+    };
+    Some(match (leads, decided) {
+        (false, _) => Err(not_made(
+            key,
+            "only the leader takes away what Releases, Sources, CronJobs and claims made",
+        )),
+        (true, decided) => decided.map_err(|why| not_made(key, why)),
+    })
+}
+
+/// May the leader write the Package `package`, which says a Repository sent it? One of a
+/// Repository that is there and says what it said when it was fetched (`releases::origin`: its
+/// url and key), for a Release that names that Repository and whose writer may apply Packages
+/// (`releases::supplied`, as the registry asks it before it fetches): a taken leader names no
+/// other, nor stores what no Release wants.
+fn fetched(store: &Store, leads: bool, package: &Resource) -> Result<(), String> {
+    let key = package.key();
+    let said = package.metadata.annotations.get(crate::releases::REPOSITORY);
+    let name = said.and_then(|said| said.split('@').next()).unwrap_or_default();
+    let wanted = |release: &&Resource| {
+        release.spec["package"]["repo"] == name && crate::releases::supplied(store, release).is_ok()
+    };
+    match (leads, crate::releases::origin(store, name)) {
+        (false, _) => Err(not_made(key, "only the leader writes what a Repository sent")),
+        (_, origin) if origin.as_ref() == said && store.list(Some("Release")).any(|r| wanted(&r)) => Ok(()),
+        _ => Err(not_made(
+            key,
+            "no Release of one who may apply Packages asks that Repository for it",
+        )),
+    }
+}
+
+/// May the leader write the Node `node` as an update's cordon of one that is there: its spec the
+/// cordon's, put on or lifted, and nothing else of it? `None`: it is not that (a join's Node is
+/// `admits`' to decide), and what a node writes as itself decides it.
+fn cordon(store: &Store, leads: bool, node: &Resource) -> Option<Result<(), String>> {
+    let key = node.key();
+    let held = store.get(&key)?;
+    let moved = |on| crate::update::cordoned_spec(&held.spec, on);
+    if ![moved(true), moved(false)].contains(&Some(node.spec.clone())) {
+        return None;
+    }
+    let mut was = held.clone();
+    (was.spec, was.status, was.metadata.revision) = (node.spec.clone(), node.status.clone(), node.metadata.revision);
+    Some(match (leads, was == *node) {
+        (false, _) => Err(not_made(key, "only the leader writes a Node's cordon")),
+        (_, false) => Err(not_made(key, "an update writes a Node's cordon and nothing else of it")),
+        _ => Ok(()),
+    })
 }
 
 /// May the control node `by` (its name, and whether it leads) make `resource`? Each is the work of
@@ -1323,5 +1456,163 @@ mod tests {
         assert_eq!(admitted(&nodes[0]), Ok(()));
         assert!(admitted(&nodes[1]).is_err());
         assert!(crate::access_sign::admit(&store, &id, &register, leader).is_err());
+    }
+
+    /// What a Release, a Source, a wasm controller, the registry and an update write, signed by the
+    /// leader, is held at apply to what its owner's writer may (`releases::writer_may`): on every
+    /// node alike, a write of one who has no right is refused, and a node that does not lead
+    /// writes none of it. One table: each kind of owner, what is made, and what is taken away.
+    #[test]
+    fn own_writes_signed_owned_writes_are_held_to_writer_may_at_apply() {
+        use crate::releases::{OWNER, REPOSITORY, bob_is, bobs_note};
+        let ca = pki::Ca::create().unwrap();
+        let (mut store, nodes) = required(&ca, &["a", "b"]);
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        let note = bobs_note(0);
+        fn source(store: &mut Store, yaml: String) {
+            for resource in kith_api::Resource::from_source(&yaml).unwrap() {
+                store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        // bob may apply and delete a ConfigMap in shop and play, a Package anywhere, and nothing else.
+        source(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: bob }\nspec: { rules: [\
+             { kinds: [ConfigMap], verbs: [apply, delete], namespaces: [shop, play] },\
+             { kinds: [Package], verbs: [apply] }] }\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob }\nspec: { role: bob, subjects: [bob] }\n"
+                .into(),
+        );
+        bob_is(&mut store, 0);
+        source(
+            &mut store,
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: mine, namespace: shop, {note} }}\n\
+             spec: {{ package: {{ name: maps, repo: hub }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: nobody, namespace: shop }}\n\
+             spec: {{ package: {{ name: maps, repo: cold }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: repo, namespace: shop, {note} }}\n\
+             spec: {{ git: {{ url: 'https://example.org/a.git' }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: {{ name: gameserver, {note} }}\n\
+             spec: {{ group: games.example.com, version: v1, kind: GameServer, schema: {{ type: object }} }}\n---\n\
+             apiVersion: games.example.com/v1\nkind: GameServer\nmetadata: {{ name: one, namespace: play }}\n\
+             spec: {{ map: dust }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Repository\nmetadata: {{ name: hub }}\n\
+             spec: {{ url: 'https://example.org/r' }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Repository\nmetadata: {{ name: cold }}\n\
+             spec: {{ url: 'https://example.org/c' }}\n"
+            ),
+        );
+        let made = |owner: &str, kind: &str, namespace: &str, name: &str| {
+            let mut made = named(kind, name, serde_json::json!({ "data": {} }));
+            made.metadata.namespace = Some(namespace.into());
+            made.metadata.annotations.insert(OWNER.into(), owner.into());
+            made
+        };
+        let leader = kith_store::node_id("a");
+        let admitted = |store: &Store, me: &pki::Identity, command: &Command| {
+            let entry = sign(me, &id, command).unwrap();
+            crate::access_sign::admit(store, &id, &entry, leader)
+        };
+        let (a, b) = (&nodes[0], &nodes[1]);
+        let owners = [
+            ("Release/shop/mine", "shop"),
+            ("Source/shop/repo", "shop"),
+            ("GameServer/play/one", "play"),
+        ];
+        for (owner, namespace) in owners {
+            // What its writer may make, the leader writes; another control node does not.
+            let config = made(owner, "ConfigMap", namespace, "c");
+            let ok = apply(vec![config.clone()]);
+            assert_eq!(admitted(&store, a, &ok), Ok(()), "{owner}");
+            assert!(admitted(&store, b, &ok).unwrap_err().contains("leader"), "{owner}");
+            // What it may not (no Secret, no Workload, no Role: not even by way of a Release).
+            for kind in ["Secret", "Workload", "Role"] {
+                let said = admitted(&store, a, &apply(vec![made(owner, kind, namespace, "x")])).unwrap_err();
+                assert!(said.contains("bob may not apply"), "{owner} {kind}: {said}");
+            }
+            // All or nothing: one thing it may not spoils the rest.
+            let mixed = apply(vec![config.clone(), made(owner, "Secret", namespace, "x")]);
+            assert!(admitted(&store, a, &mixed).is_err(), "{owner}");
+            // Taking away: of what it made, where its writer may delete; the stray of an owner that
+            // is gone goes too (the leftovers of a Release deleted), and no other is taken.
+            store.apply(config.clone()).unwrap();
+            let delete = |key: &str| Command::Delete { key: key.into() };
+            let key = format!("ConfigMap/{namespace}/c");
+            assert_eq!(admitted(&store, a, &delete(&key)), Ok(()), "{owner}");
+            assert!(admitted(&store, b, &delete(&key)).is_err(), "{owner}");
+            let mut secret = made(owner, "Secret", namespace, "s");
+            secret.metadata.annotations.insert(OWNER.into(), owner.into());
+            store.apply(secret).unwrap();
+            let said = admitted(&store, a, &delete(&format!("Secret/{namespace}/s"))).unwrap_err();
+            assert!(said.contains("bob may not delete Secret"), "{owner}: {said}");
+            // Over another's: a resource that is there and not this owner's is not its to overwrite.
+            let mut other = config.clone();
+            other
+                .metadata
+                .annotations
+                .insert(OWNER.into(), "Release/shop/nobody".into());
+            store.apply(other).unwrap();
+            let said = admitted(&store, a, &ok).unwrap_err();
+            assert!(said.contains("not what"), "{owner}: {said}");
+            store.delete(&key).unwrap();
+            store.delete(&format!("Secret/{namespace}/s")).unwrap();
+        }
+        // An owner with nobody written down as its writer makes nothing; one that is not there either.
+        for owner in ["Release/shop/nobody", "Release/shop/gone"] {
+            let said = admitted(&store, a, &apply(vec![made(owner, "ConfigMap", "shop", "c")])).unwrap_err();
+            assert!(
+                said.contains("nobody is written down") || said.contains("not there"),
+                "{owner}: {said}"
+            );
+        }
+        let stray = made("Release/shop/gone", "ConfigMap", "shop", "old");
+        store.apply(stray.clone()).unwrap();
+        assert_eq!(admitted(&store, a, &Command::Delete { key: stray.key() }), Ok(()));
+        // What the registry fetched: a Package of a Repository that a Release whose writer may apply
+        // Packages names. (One only a Release with nobody written down names, is not fetched.)
+        let origin = crate::releases::origin(&store, "hub").unwrap();
+        let mut package = named(
+            "Package",
+            "maps-1.0.0",
+            serde_json::json!({ "version": "1.0.0", "files": {} }),
+        );
+        package.metadata.namespace = None;
+        package.metadata.annotations.insert(REPOSITORY.into(), origin);
+        let ok = apply(vec![package.clone()]);
+        assert_eq!(admitted(&store, a, &ok), Ok(()));
+        assert!(admitted(&store, b, &ok).is_err());
+        let cold = crate::releases::origin(&store, "cold").unwrap();
+        package.metadata.annotations.insert(REPOSITORY.into(), cold);
+        assert!(
+            admitted(&store, a, &apply(vec![package.clone()])).is_err(),
+            "no Release that may asks for it"
+        );
+        package.metadata.annotations.insert(REPOSITORY.into(), "hub@00".into());
+        assert!(
+            admitted(&store, a, &apply(vec![package.clone()])).is_err(),
+            "not the Repository's own"
+        );
+        package
+            .metadata
+            .annotations
+            .insert(REPOSITORY.into(), "nowhere@00".into());
+        assert!(
+            admitted(&store, a, &apply(vec![package])).is_err(),
+            "no such Repository"
+        );
+        // What an update writes: a Node's cordon and nothing else of it.
+        source(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: w }\nspec: { trust: worker }\n".into(),
+        );
+        let mut node = store.get("Node/w").unwrap().clone();
+        let cordoned = crate::update::cordoned_spec(&node.spec, true).unwrap();
+        node.spec = cordoned;
+        let ok = apply(vec![node.clone()]);
+        assert_eq!(admitted(&store, a, &ok), Ok(()));
+        assert!(admitted(&store, b, &ok).is_err());
+        node.spec["trust"] = "control".into();
+        assert!(admitted(&store, a, &apply(vec![node])).is_err(), "more than a cordon");
     }
 }

@@ -2198,7 +2198,7 @@ pub async fn keep(
             (None, _) => {
                 let resources = vec![to_hold(&cluster.me.name, &id, &record.secret, &opened)];
                 let at = kith_api::store::now();
-                if let Err(e) = shared.submit(Command::Apply { resources, at }).await {
+                if let Err(e) = shared.submit_node(Command::Apply { resources, at }).await {
                     eprintln!("kithd: giving the cluster this node's key to hold: {e}");
                 }
             }
