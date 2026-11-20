@@ -2094,8 +2094,9 @@ fn alone() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// `with_team`, and a Workload `tool` of one exec unit that runs on this host, shown to kubectl as a Deployment
-/// (the images of the others are empty, so their pods are never Running, and kubectl asks no port of a pod that is not).
-fn with_running(test: &str, host: bool) -> Cluster {
+/// (the images of the others are empty, so their pods are never Running, and kubectl asks no port of a pod that is not);
+/// None where this host's cgroup takes no container.
+fn with_running(test: &str, host: bool) -> Option<Cluster> {
     let cluster = with_team_as(test, host);
     let sent = r#"{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"tool","namespace":"team"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"tool"}},"template":{"metadata":{"labels":{"app":"tool"}},"spec":{"containers":[{"name":"main","image":"busybox:1.36"}]}}}}"#;
     let tool = format!(
@@ -2104,10 +2105,22 @@ fn with_running(test: &str, host: bool) -> Cluster {
     );
     cluster.write("tool.yaml", &tool);
     cluster.kith(&["apply", "-f", "tool.yaml"]);
-    eventually("tool-0 to run", 60, || {
-        cluster.held("workload/team/tool")["status"]["containers"][0]["state"] == "running"
-    });
-    cluster
+    // A host whose cgroup takes no container (CI's runner, delegated or not) never runs tool-0: skip, as exec does.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let held = cluster.held("workload/team/tool");
+        if held["status"]["containers"][0]["state"] == "running" {
+            break;
+        }
+        let status = held.to_string();
+        if status.contains("cgroup error") {
+            eprintln!("::warning title=SKIP::SKIP (not a pass): this host's cgroup takes no container");
+            return None;
+        }
+        assert!(Instant::now() < deadline, "tool-0 to run: not within 60 s\n{status}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Some(cluster)
 }
 
 /// A `kubectl port-forward` of `team`'s tool-0, as carol; it ends with this.
@@ -2187,7 +2200,9 @@ fn workflows_kubectl_port_forward_carries_bytes_both_ways() {
         return;
     }
     let _alone = alone();
-    let cluster = with_running("kube-forward-bytes", true);
+    let Some(cluster) = with_running("kube-forward-bytes", true) else {
+        return;
+    };
     let (_forward, local) = forward(&cluster, echo());
     let mut stream = near(local);
     stream.write_all(b"hello").unwrap();
@@ -2217,7 +2232,9 @@ fn workflows_kubectl_port_forward_ends_a_silent_stream_and_bounds_its_streams() 
         return;
     }
     let _alone = alone();
-    let cluster = with_running("kube-forward-bound-streams", true);
+    let Some(cluster) = with_running("kube-forward-bound-streams", true) else {
+        return;
+    };
     let (_forward, local) = forward(&cluster, echo());
     let mut silent = near(local);
     let began = Instant::now();
@@ -2256,7 +2273,9 @@ fn workflows_kubectl_port_forward_does_not_reach_the_host_through_a_pod_that_is_
         return;
     }
     let _alone = alone();
-    let cluster = with_running("kube-forward-not-made", false);
+    let Some(cluster) = with_running("kube-forward-not-made", false) else {
+        return;
+    };
     let (_forward, local) = forward(&cluster, echo());
     let mut stream = near(local);
     let _ = stream.write_all(b"hello");
@@ -2335,7 +2354,9 @@ fn workflows_kubectl_port_forward_asks_the_right_again_for_each_connection() {
         return;
     }
     let _alone = alone();
-    let cluster = with_running("kube-forward-recheck", true);
+    let Some(cluster) = with_running("kube-forward-recheck", true) else {
+        return;
+    };
     let (_forward, local) = forward(&cluster, echo());
     let mut first = near(local);
     first.write_all(b"hello").unwrap();
