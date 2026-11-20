@@ -69,15 +69,10 @@ struct Held {
 /// Seconds a drain waits for what moves, unless the plan says (`drainSeconds`).
 const DRAIN_SECONDS: u64 = 300;
 
-/// The names as one line: the first few, and how many more.
-fn few(names: &[String]) -> String {
-    let more = names.len().saturating_sub(3);
-    let shown = names[..names.len() - more].join(", ");
-    if more == 0 {
-        shown
-    } else {
-        format!("{shown} and {more} more")
-    }
+/// How many replicas, as words. The plan's status says how many, never which: an UpdatePlan is
+/// read by whoever may read UpdatePlans, and a replica's name is its namespace's.
+fn replicas(count: usize) -> String {
+    format!("{count} replica{}", if count == 1 { "" } else { "s" })
 }
 
 /// Lets go of what the plan put on `name`: its cordon, its drain, what it said of it.
@@ -285,9 +280,11 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
         if node.waits.is_empty() || now.saturating_sub(began) >= patience {
             if !node.waits.is_empty() {
                 let why = format!(
-                    "{} was let go after {patience} seconds: {} still not running on another node",
+                    "{} was let go after {patience} seconds: {} still not running on another node \
+                     (`kith node drain {} --dry-run` names those you may read)",
                     node.name,
-                    few(&node.waits)
+                    replicas(node.waits.len()),
+                    node.name
                 );
                 held.gave.insert(node.name.clone(), why);
             }
@@ -370,11 +367,10 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
         .into_iter()
         .filter(|node| states.get(&node.name).is_some_and(|state| state == "draining"))
         .collect();
-    let (phase, why) = if let Some(first) = draining.first() {
-        let waits = if first.waits.is_empty() {
-            "nothing left to move".to_string()
-        } else {
-            format!("waiting for {} to run on another node", few(&first.waits))
+    let (phase, why) = if !draining.is_empty() {
+        let waits = match draining.iter().map(|node| node.waits.len()).sum() {
+            0 => "nothing left to move".to_string(),
+            n => format!("waiting for {} to run on another node", replicas(n)),
         };
         let names: Vec<&str> = draining.iter().map(|node| node.name.as_str()).collect();
         ("Draining", format!("draining {}: {waits}", names.join(", ")))
@@ -2722,11 +2718,24 @@ mod tests {
         };
         let spec = json!({ "drain": true });
         let first = go(&spec, None, &nodes, 0);
-        nodes[0].waits = vec![WEB.into()];
+        // The plan is for anyone who may read UpdatePlans: it says how many wait, never which
+        // (a namespace's names are for those who may read that namespace: `kith node drain`).
+        nodes[0].waits = vec![WEB.into(), "Workload/secret/db#0".into(), "Workload/secret/db#1".into()];
         let waiting = go(&spec, Some(&first), &nodes, 100);
         let reason = waiting.status["reason"].as_str().unwrap();
         assert_eq!(waiting.status["phase"], "Draining");
-        assert!(reason.contains("draining a") && reason.contains(WEB), "{reason}");
+        assert!(
+            reason.contains("draining a") && reason.contains("3 replicas"),
+            "{reason}"
+        );
+        let nameless = |decided: &Decided| {
+            let said = serde_json::to_string(&decided.status).unwrap();
+            assert!(
+                !said.contains("default") && !said.contains("secret") && !said.contains("web"),
+                "{said}"
+            );
+        };
+        nameless(&waiting);
         // Not yet: the default is 300 seconds from when the drain began.
         let late = go(&spec, Some(&waiting), &nodes, 299);
         assert_eq!((told(&late).len(), &late.status["phase"]), (0, &json!("Draining")));
@@ -2738,9 +2747,10 @@ mod tests {
         );
         let reason = gave.status["reason"].as_str().unwrap();
         assert!(
-            reason.contains("a") && reason.contains("300") && reason.contains(WEB),
+            reason.contains("a") && reason.contains("300") && reason.contains("3 replicas"),
             "{reason}"
         );
+        nameless(&gave);
         let after = go(&spec, Some(&gave), &nodes, 400);
         assert_eq!(after.status["reason"], gave.status["reason"]);
         // The plan's own seconds count, and a node that is back is done with the message cleared.

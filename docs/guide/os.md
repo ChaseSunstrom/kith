@@ -430,11 +430,13 @@ nothing for fifteen minutes counts as failed. `waitForIdleSeats` does nothing ye
 
 With `drain: true` a node picked is drained as `kith node drain` does it: it is cordoned, the
 `kith.dev/drain` taint goes on, and what the drain plan says can move starts elsewhere. The plan
-says `Draining` (and which node, and the replicas it waits for) and tells the node to restart only
+says `Draining` (and which node, and how many replicas it waits for) and tells the node to restart only
 once each of those is running on another node, or none moves. A replica the plan says stays (pinned
 to the node, one a node selector puts on every node, a Job) holds nothing. A node whose replicas
 never start elsewhere is let go after `drainSeconds` (300 unless said), and the plan's `reason`
-says which. When the node is done, or the plan is paused, changed or no longer drains, the update's
+says how many. The plan never names a replica (it is read by whoever may read UpdatePlans, and a
+replica's name belongs to its namespace): `kith node drain NODE --dry-run` names the ones you
+may read. When the node is done, or the plan is paused, changed or no longer drains, the update's
 drain is lifted; a drain or cordon you put on the node first is left as it was.
 
 ### Installing on a machine
