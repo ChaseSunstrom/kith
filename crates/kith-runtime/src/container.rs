@@ -1082,6 +1082,11 @@ const SCRATCH: &str = "enter-scratch-";
 /// user (a user namespace refuses them, and the tenant is given its own), and a root path that
 /// is relative to the init's `bundle` made absolute (the copy is kept somewhere else).
 /// Namespaces, capabilities and the seccomp filter are not touched: the tenant joins the init's.
+///
+/// A root under [`STAGE`] (a shifted pod's: mounted in the init's own mount namespace, which the
+/// node never sees) is not a path libcontainer can canonicalize from here, and it fails the
+/// tenant ("oci spec error") before anything runs. The tenant joins the init's mount namespace
+/// and never pivots into the root it is told, so it is told `/`.
 fn scratch_spec(spec: &Spec, bundle: &Path) -> Spec {
     let mut copy = spec.clone();
     if let Some(mut process) = copy.process().clone() {
@@ -1090,13 +1095,28 @@ fn scratch_spec(spec: &Spec, bundle: &Path) -> Spec {
         process.set_user(user);
         copy.set_process(Some(process));
     }
-    if let Some(mut root) = copy.root().clone()
-        && root.path().is_relative()
-    {
-        root.set_path(bundle.join(root.path()));
+    if let Some(mut root) = copy.root().clone() {
+        if root.path().is_relative() {
+            root.set_path(bundle.join(root.path()));
+        }
+        if root.path().starts_with(STAGE) {
+            root.set_path("/".into());
+        }
         copy.set_root(Some(root));
     }
     copy
+}
+
+/// `e` and each error under it, as one line: libcontainer's top errors are a few words ("oci spec
+/// error") and the cause is what says what is wrong.
+fn with_sources(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut cause = e.source();
+    while let Some(inner) = cause {
+        text.push_str(&format!(": {inner}"));
+        cause = inner.source();
+    }
+    text
 }
 
 /// A private copy of an init's state.json and config.json for a tenant's libcontainer to read
@@ -1238,7 +1258,7 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
                     nix::sched::setns(user, nix::sched::CloneFlags::CLONE_NEWUSER)
                         .map_err(|e| format!("joining its user namespace: {e}"))?;
                 }
-                builder.build().map_err(|e| e.to_string())
+                builder.build().map_err(|e| with_sources(&e))
             };
             match logged_build(dispatch, &log, &refused, built) {
                 Ok(pid) => [&[0][..], &pid.as_raw().to_le_bytes()].concat(),
@@ -3751,6 +3771,40 @@ mod tests {
         assert!(a.seccomp().is_some());
         let caps = |spec: &Spec| spec.process().as_ref().unwrap().capabilities().clone();
         assert_eq!(caps(&copy), caps(&init));
+    }
+
+    /// A shifted pod's init has its root at `STAGE/root`, a mount only its own mount namespace has:
+    /// libcontainer's tenant canonicalizes the root of the spec it loads (`canonicalize_rootfs`)
+    /// from the node, and failed on it with "oci spec error". The copy names a root that is there.
+    #[test]
+    fn enter_scratch_spec_has_a_root_the_node_can_canonicalize() {
+        let mut init = init_spec_with_groups();
+        let root = RootBuilder::default()
+            .path(Path::new(STAGE).join("root"))
+            .readonly(true);
+        init.set_root(Some(root.build().unwrap()));
+        let bundle = std::env::temp_dir();
+        assert!(
+            init.clone().canonicalize_rootfs(&bundle).is_err(),
+            "the failure this is for"
+        );
+        let mut copy = scratch_spec(&init, &bundle);
+        copy.canonicalize_rootfs(&bundle).unwrap();
+        assert_eq!(copy.root().as_ref().unwrap().path(), Path::new("/"));
+        assert_eq!(copy.root().as_ref().unwrap().readonly(), Some(true));
+    }
+
+    /// What libcontainer's top error leaves out is said: the cause of an "oci spec error".
+    #[test]
+    fn enter_error_says_its_causes() {
+        let cause = Spec::load(std::env::temp_dir().join("kith-no-such-config.json")).unwrap_err();
+        let top = libcontainer::error::LibcontainerError::from(cause);
+        let said = with_sources(&top);
+        assert!(said.starts_with("oci spec error: "), "{said}");
+        assert!(
+            said.contains("kith-no-such-config.json") || said.to_lowercase().contains("no such file"),
+            "{said}"
+        );
     }
 
     /// The scratch directory is private to this process's user (0700, its own), holds the copied
