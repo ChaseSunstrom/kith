@@ -4,7 +4,7 @@
 //! ```yaml
 //! current-context: lab
 //! contexts:
-//!   lab: { server: "10.0.0.5:7443", identity: /home/me/alice }
+//!   lab: { server: "10.0.0.5:7443", identity: /srv/kith/alice }
 //! ```
 //!
 //! `kith --context lab` (or `KITH_CONTEXT`, or the `current-context` line) means `--server`
