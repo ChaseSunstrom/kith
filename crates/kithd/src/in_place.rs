@@ -10,7 +10,7 @@
 // (Called by init's wiring, T-1137: not yet.)
 #![allow(dead_code)]
 
-use ring::{aead, digest, hkdf};
+use ring::{aead, digest, hkdf, hmac};
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -32,8 +32,8 @@ const MAGIC: &[u8; 16] = b"kith-inplace v1\n";
 const NONCE: usize = aead::NONCE_LEN;
 const TAG: usize = aead::MAX_TAG_LEN;
 /// What a header holds before its sum: the magic, the pass's id, the partition's size, the chunk
-/// size and the chunks done.
-const BODY: usize = 16 + 16 + 8 + 4 + 8;
+/// size, the chunks done, the key's fingerprint and the next chunk's check.
+const BODY: usize = 16 + 16 + 8 + 4 + 8 + 16 + 32;
 
 /// Read, write and sync at an offset: the raw partition, the mapping over it (a write lands
 /// encrypted), and the journal. A short read or write is an error.
@@ -84,16 +84,28 @@ struct Header {
     total: u64,
     chunk: u32,
     done: u64,
+    /// The key's fingerprint: a pass is not gone on with under another key.
+    key: [u8; 16],
+    /// The check of the plain chunk `done` (zeros when all are done): what tells a chunk still
+    /// plain from one part written, when its backup does not open.
+    next: [u8; 32],
 }
 
 impl Header {
+    /// Every chunk is done: the pass's terminal state.
+    fn finished(&self) -> bool {
+        self.done >= self.total.div_ceil(self.chunk.max(1) as u64)
+    }
+
     fn bytes(&self) -> [u8; ROOM] {
         let mut room = [0; ROOM];
         room[..16].copy_from_slice(MAGIC);
         room[16..32].copy_from_slice(&self.id);
         room[32..40].copy_from_slice(&self.total.to_le_bytes());
         room[40..44].copy_from_slice(&self.chunk.to_le_bytes());
-        room[44..BODY].copy_from_slice(&self.done.to_le_bytes());
+        room[44..52].copy_from_slice(&self.done.to_le_bytes());
+        room[52..68].copy_from_slice(&self.key);
+        room[68..BODY].copy_from_slice(&self.next);
         let sum = digest::digest(&digest::SHA256, &room[..BODY]);
         room[BODY..BODY + 32].copy_from_slice(sum.as_ref());
         room
@@ -107,7 +119,9 @@ impl Header {
             id: room[16..32].try_into().expect("16 bytes"),
             total: u64::from_le_bytes(room[32..40].try_into().expect("8 bytes")),
             chunk: u32::from_le_bytes(room[40..44].try_into().expect("4 bytes")),
-            done: u64::from_le_bytes(room[44..BODY].try_into().expect("8 bytes")),
+            done: u64::from_le_bytes(room[44..52].try_into().expect("8 bytes")),
+            key: room[52..68].try_into().expect("16 bytes"),
+            next: room[68..BODY].try_into().expect("32 bytes"),
         })
     }
 }
@@ -138,16 +152,35 @@ fn put(journal: &impl Disk, head: &Header, hit: &mut dyn FnMut(Point) -> io::Res
     hit(Point::HeaderBoth)
 }
 
-/// What a chunk's backup is sealed with: ChaCha20-Poly1305 under a key drawn from the state's.
-struct Sealer(aead::LessSafeKey);
+/// What a chunk's backup is sealed with: ChaCha20-Poly1305 under a key drawn from the state's;
+/// and the checks the header keeps (HMAC under another drawn key: no one without the state's key
+/// can test a guess of a chunk against one).
+struct Sealer {
+    aead: aead::LessSafeKey,
+    check: hmac::Key,
+}
 
 impl Sealer {
     fn new(key: &[u8; 64]) -> Sealer {
         let drawn = hkdf::Salt::new(hkdf::HKDF_SHA256, b"kith-in-place").extract(key);
-        let key = drawn.expand(&[b"backup"], &aead::CHACHA20_POLY1305);
-        Sealer(aead::LessSafeKey::new(aead::UnboundKey::from(
-            key.expect("a key's length"),
-        )))
+        let sealing = drawn.expand(&[b"backup"], &aead::CHACHA20_POLY1305);
+        let check = drawn.expand(&[b"check"], hmac::HMAC_SHA256);
+        Sealer {
+            aead: aead::LessSafeKey::new(aead::UnboundKey::from(sealing.expect("a key's length"))),
+            check: hmac::Key::from(check.expect("a key's length")),
+        }
+    }
+
+    /// What the header keeps of a plain chunk.
+    fn mac(&self, plain: &[u8]) -> [u8; 32] {
+        hmac::sign(&self.check, plain).as_ref().try_into().expect("32 bytes")
+    }
+
+    /// The key's fingerprint (a chunk is a whole number of sectors, so no chunk's check is this).
+    fn fingerprint(&self) -> [u8; 16] {
+        hmac::sign(&self.check, b"key").as_ref()[..16]
+            .try_into()
+            .expect("16 bytes")
     }
 
     /// The pass and the chunk's number are in what the tag covers: a slot from another pass, or
@@ -165,7 +198,7 @@ impl Sealer {
         let mut sealed = Zeroizing::new(plain.to_vec());
         let nonced = aead::Nonce::assume_unique_for_key(nonce);
         let done = self
-            .0
+            .aead
             .seal_in_place_append_tag(nonced, aead::Aad::from(Self::aad(id, chunk)), &mut *sealed);
         done.expect("a chunk is short enough to seal");
         [&nonce[..], &sealed].concat()
@@ -177,7 +210,7 @@ impl Sealer {
         let nonce = aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
         let mut sealed = Zeroizing::new(sealed.to_vec());
         let plain = self
-            .0
+            .aead
             .open_in_place(nonce, aead::Aad::from(Self::aad(id, chunk)), &mut sealed);
         Some(Zeroizing::new(plain.ok()?.to_vec()))
     }
@@ -187,10 +220,10 @@ impl Sealer {
 /// a cut left it. `part` is the raw partition, `mapped` the same partition under `key` (a write
 /// to it lands encrypted), `journal` the config partition.
 ///
-/// A pass already done is done again as a no-op. `hit` is called at each [`Point`]; an error
-/// from it stops the pass there, as a power cut would. The journal says "all done" when this
-/// returns: [`clear`] it once the mapping is the node's state, and not before, for a pass over a
-/// partition with no journal starts over from its first byte.
+/// A pass already finished is a no-op (it writes nothing). `hit` is called at each [`Point`]; an
+/// error from it stops the pass there, as a power cut would. A chunk part written whose backup
+/// does not open is an error naming it, with nothing more written. The journal says "finished"
+/// ([`finished`]) when this returns: [`forget`] it only once the lock record is on the disk.
 pub fn pass(
     part: &impl Disk,
     mapped: &impl Disk,
@@ -206,15 +239,29 @@ pub fn pass(
     }
     let sealer = Sealer::new(key);
     let n = total.div_ceil(chunk as u64);
+    let of = |i: u64| (i * chunk as u64, (total - i * chunk as u64).min(chunk as u64) as usize);
+    // A chunk as the partition has it, with its check.
+    let look = |i: u64| -> io::Result<(Zeroizing<Vec<u8>>, [u8; 32])> {
+        let (at, len) = of(i);
+        let mut plain = Zeroizing::new(vec![0; len]);
+        part.read_at(&mut plain, at)?;
+        let check = sealer.mac(&plain);
+        Ok((plain, check))
+    };
+    let mut carry = None;
     let mut head = match heads(journal)? {
         (None, None, true) => {
+            let first = look(0)?;
             let fresh = Header {
                 id: crate::crypt::random(),
                 total,
                 chunk: chunk as u32,
                 done: 0,
+                key: sealer.fingerprint(),
+                next: first.1,
             };
             put(journal, &fresh, hit)?;
+            carry = Some(first);
             fresh
         }
         (None, None, false) => {
@@ -234,13 +281,15 @@ pub fn pass(
             if head.total != total || head.chunk as usize != chunk || head.done > n {
                 return Err(bad("the journal is of a partition of another size: nothing is written"));
             }
+            if head.key != sealer.fingerprint() {
+                return Err(bad("the journal is of another key: nothing is written"));
+            }
             if (one, two) != (Some(head), Some(head)) {
                 put(journal, &head, hit)?;
             }
             head
         }
     };
-    let of = |i: u64| (i * chunk as u64, (total - i * chunk as u64).min(chunk as u64) as usize);
     // The backup of the chunk the header says is next, if there is one: that chunk may be plain,
     // part written or whole, and this puts it right in all three.
     let mut backup = None;
@@ -254,8 +303,18 @@ pub fn pass(
         let plain = match backup.take() {
             Some(plain) => plain,
             None => {
-                let mut plain = Zeroizing::new(vec![0; len]);
-                part.read_at(&mut plain, at)?;
+                let (plain, check) = match carry.take() {
+                    Some(read) => read,
+                    None => look(head.done)?,
+                };
+                // No backup that opens: the chunk must still be plain, or this is a half written
+                // one with nothing to put it right from, and a backup of it would seal the half.
+                if check != head.next {
+                    return Err(bad(&format!(
+                        "chunk {} is neither plain nor backed up: nothing more is written",
+                        head.done
+                    )));
+                }
                 journal.write_at(&sealer.seal(&head.id, head.done, &plain), SLOT)?;
                 hit(Point::BackupWritten)?;
                 // (The chunk is not written before its backup is on the disk.)
@@ -274,15 +333,42 @@ pub fn pass(
         hit(Point::ChunkDone)?;
         // (The next chunk's backup is not written before both headers say this one is done.)
         head.done += 1;
+        // (The header keeps the check of the chunk it now says is next, read while it is plain.)
+        match head.done < n {
+            true => {
+                let next = look(head.done)?;
+                head.next = next.1;
+                carry = Some(next);
+            }
+            false => head.next = [0; 32],
+        }
         put(journal, &head, hit)?;
     }
-    journal.write_at(&vec![0; SLOT_ROOM], SLOT)?;
-    journal.sync()
+    // The slot empty once the pass is finished, and a finished pass found again writes only if it
+    // is not.
+    let mut slot = vec![0; SLOT_ROOM];
+    journal.read_at(&mut slot, SLOT)?;
+    if slot.iter().any(|&byte| byte != 0) {
+        slot.fill(0);
+        journal.write_at(&slot, SLOT)?;
+        journal.sync()?;
+    }
+    Ok(())
 }
 
-/// The journal emptied, headers and slot: the pass is forgotten. Not before the mapping is the
-/// node's state.
-pub fn clear(journal: &impl Disk) -> io::Result<()> {
+/// Whether the journal holds a pass that is finished: every chunk through the mapping. The
+/// journal keeps it so, and a [`pass`] over it is a no-op, until [`forget`].
+pub fn finished(journal: &impl Disk) -> io::Result<bool> {
+    let (one, two, _) = heads(journal)?;
+    let newest = [one, two].into_iter().flatten().max_by_key(|head| head.done);
+    Ok(newest.is_some_and(|head| head.finished()))
+}
+
+/// The journal emptied, headers and slot: the pass is forgotten, and a [`pass`] after it starts
+/// from the partition's first byte, which is only right over a partition that is still plain.
+/// So not before the node's lock record (T-1137) says the partition is encrypted and is on the
+/// disk: until then "no journal" and "a pass never begun" are the same to this engine.
+pub fn forget(journal: &impl Disk) -> io::Result<()> {
     journal.write_at(&[0; 2 * ROOM], HEAD1)?;
     journal.write_at(&vec![0; SLOT_ROOM], SLOT)?;
     journal.sync()
@@ -571,10 +657,27 @@ mod layout {
             total: 1 << 30,
             chunk: 4096,
             done: 77,
+            key: [3; 16],
+            next: [4; 32],
         };
         let room = head.bytes();
         assert_eq!(Header::parse(&room), Some(head));
-        for at in [0, 16, 31, 33, 41, 45, BODY, BODY + 31, BODY + 32, ROOM - 1] {
+        for at in [
+            0,
+            16,
+            31,
+            33,
+            41,
+            45,
+            52,
+            67,
+            68,
+            99,
+            BODY,
+            BODY + 31,
+            BODY + 32,
+            ROOM - 1,
+        ] {
             let mut torn = room;
             torn[at] ^= 1;
             assert_eq!(Header::parse(&torn), None, "a flipped byte at {at}");
@@ -673,17 +776,63 @@ mod pass {
         assert!(before == (rig.raw.on_disk(), rig.journal.on_disk()));
     }
 
-    /// `clear` empties the headers and the slot, and touches nothing else of the config partition.
+    /// A finished pass stays finished, in the journal, until `forget`: `finished` says so before
+    /// and after a cut at the last header, a pass over it writes not one byte, and `forget`
+    /// empties the headers and the slot and touches nothing else of the config partition.
     #[test]
-    fn clear_empties_the_journal_and_only_it() {
+    fn a_finished_pass_stays_finished_until_forgotten() {
         let rig = Rig::new(SMALL);
         rig.journal.file.write_all_at(&[5; 64], 0).unwrap();
         rig.journal.file.write_all_at(&[6; 64], crate::crypt::AT).unwrap();
+        assert!(!finished(&rig.journal).unwrap(), "a journal with no pass");
+        assert!(rig.cut(Point::ChunkDone, 7));
+        assert!(!finished(&rig.journal).unwrap(), "a pass one chunk short");
         rig.run(&mut |_| Ok(())).unwrap();
-        clear(&rig.journal).unwrap();
+        assert!(finished(&rig.journal).unwrap());
+        let before = (rig.raw.on_disk(), rig.journal.on_disk());
+        rig.run(&mut |_| panic!("a finished pass reaches no point")).unwrap();
+        assert!(
+            before == (rig.raw.on_disk(), rig.journal.on_disk()),
+            "a finished pass wrote"
+        );
+        forget(&rig.journal).unwrap();
         let journal = rig.journal.on_disk();
+        assert!(!finished(&rig.journal).unwrap());
         assert_eq!(heads(&rig.journal).unwrap(), (None, None, true));
         assert!(journal[..64] == [5; 64] && journal[crate::crypt::AT as usize..][..64] == [6; 64]);
+    }
+
+    /// A finished pass cut before its slot was emptied empties it on the next call, and only then
+    /// writes.
+    #[test]
+    fn a_finished_pass_cut_before_its_slot_is_empty_empties_it() {
+        let rig = Rig::new(SMALL);
+        assert!(rig.cut(Point::HeaderBoth, 8));
+        rig.crash(Crash::Lost);
+        assert!(finished(&rig.journal).unwrap());
+        rig.run(&mut |_| Ok(())).unwrap();
+        rig.assert_done("a finished pass with a backup left");
+    }
+
+    /// A journal of another key is not gone on with, and nothing is written.
+    #[test]
+    fn a_journal_of_another_key_stops() {
+        let rig = Rig::new(SMALL);
+        assert!(rig.cut(Point::ChunkDone, 3));
+        let before = (rig.raw.on_disk(), rig.journal.on_disk());
+        let other = pass(
+            &rig.raw,
+            &Xor(&rig.raw),
+            &rig.journal,
+            &[8; 64],
+            (rig.total, rig.chunk),
+            &mut |_| Ok(()),
+        );
+        let why = other.unwrap_err().to_string();
+        assert!(why.contains("another key"), "{why}");
+        assert!(before == (rig.raw.on_disk(), rig.journal.on_disk()));
+        rig.run(&mut |_| Ok(())).unwrap();
+        rig.assert_done("after the refusal");
     }
 }
 
@@ -792,6 +941,35 @@ mod cut {
             rig.journal.file.write_all_at(&[0xff; 100], SLOT + 20).unwrap();
             rig.run(&mut |_| Ok(())).unwrap();
             rig.assert_done(&format!("a torn backup of chunk {k}"));
+        }
+    }
+
+    /// A chunk part written whose backup does not open (a bad sector in the slot, say) is neither
+    /// plain nor backed up: the pass stops at it, names it, and writes nothing, rather than seal
+    /// half of it as if it were plain. Cut before the chunk is written, the same torn slot is no
+    /// matter (the test above).
+    #[test]
+    fn a_part_written_chunk_with_no_backup_stops_and_writes_nothing() {
+        for (point, k) in [
+            (Point::ChunkPart, 0),
+            (Point::ChunkPart, 3),
+            (Point::ChunkPart, 7),
+            (Point::ChunkDone, 4),
+        ] {
+            let rig = Rig::new(SMALL);
+            assert!(rig.cut(point, k));
+            rig.crash(Crash::Kept);
+            rig.journal.file.write_all_at(&[0xff; 100], SLOT + 20).unwrap();
+            let before = (rig.raw.on_disk(), rig.journal.on_disk());
+            let why = rig.run(&mut |_| Ok(())).unwrap_err().to_string();
+            assert!(
+                why.contains(&format!("chunk {k} ")) && why.contains("backed up"),
+                "{point:?} {k}: {why}"
+            );
+            assert!(
+                before == (rig.raw.on_disk(), rig.journal.on_disk()),
+                "{point:?} {k} wrote"
+            );
         }
     }
 
