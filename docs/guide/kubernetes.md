@@ -163,3 +163,17 @@ Moving a guest's data, one guest at a time:
 kith does not need the hypervisor gone first: a kith OS image boots as a guest (UEFI, virtio
 disk and network), the way to try it beside what runs today. It is tested in QEMU, not on
 Proxmox itself: see [As a guest on Proxmox VE](os.md#as-a-guest-on-proxmox-ve).
+
+## The docker command, against kith
+
+The Docker Engine API in front of kith, begun: `kith docker serve [--listen PATH]` makes a socket
+(`docker.sock` beside kithd's, mode 0600 from its first moment; a socket a dead run left is
+replaced, one in use is refused) and the `docker` command talks to it with
+`DOCKER_HOST=unix://PATH`. It is in the `kith-remote` build (cargo feature `docker`), not in the
+default `kith` or in kithd: nothing in the daemon changed.
+
+Today it answers `docker version` and `docker info`, each under any `/v1.40/` to `/v1.47/` prefix
+(a client newer or older is told so with a 400, as dockerd does). Everything else, containers and
+images included, is answered 501 with a JSON `message`, never left waiting; so is a request body
+sent chunked. A container will be a Workload, its ID the SHA-256 of its namespace and name: the
+same on every run.

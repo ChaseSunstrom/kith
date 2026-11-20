@@ -230,6 +230,23 @@ enum Command {
         #[command(subcommand)]
         command: import::Import,
     },
+    /// The Docker Engine API on a socket, so the `docker` command works against kith (cargo feature `docker`)
+    #[cfg(feature = "docker")]
+    Docker {
+        #[command(subcommand)]
+        command: DockerCommand,
+    },
+}
+
+#[cfg(feature = "docker")]
+#[derive(Subcommand)]
+enum DockerCommand {
+    /// Listen until interrupted; then `DOCKER_HOST=unix://PATH docker version`
+    Serve {
+        /// The socket to make, readable by you alone [default: docker.sock beside kithd's socket]
+        #[arg(long, value_name = "PATH")]
+        listen: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1238,6 +1255,23 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             return Ok(ExitCode::SUCCESS);
         }
         Command::Import { command } => return import::run(command),
+        #[cfg(feature = "docker")]
+        Command::Docker {
+            command: DockerCommand::Serve { listen },
+        } => {
+            let path = match listen.or_else(|| kith_api::default_socket().map(|s| s.with_file_name("docker.sock"))) {
+                Some(path) => path,
+                None => return fail("no place for the socket: set --listen PATH"),
+            };
+            let listener = kith_docker::listen(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            eprintln!(
+                "kith: the Docker API is on {}: DOCKER_HOST=unix://{} docker version",
+                path.display(),
+                path.display()
+            );
+            kith_docker::serve(listener);
+            return Ok(ExitCode::SUCCESS);
+        }
         Command::Lint { files } => {
             let n = load(&files)?.len();
             println!("{n} resource{} ok", if n == 1 { "" } else { "s" });

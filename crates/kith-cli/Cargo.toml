@@ -27,8 +27,12 @@ ring = "0.17"
 # The TLS client behind `--server` (cargo feature `remote`, off by default: the default kith links no TLS).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 
+# The Docker Engine API front, `kith docker serve` (crates/kith-docker, T-1205): in the kith-remote build, not the default kith.
+kith-docker = { path = "../kith-docker", optional = true }
+
 [features]
 remote = ["dep:rustls"]
+docker = ["dep:kith-docker"]
 
 [dev-dependencies]
 # The remote tests' own cluster CA and node certificates, as kithd's pki.rs makes them.
