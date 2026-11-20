@@ -396,7 +396,8 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
     waiting.sort_by_key(|node| (node.voter, node.leader, node.name.clone()));
     let voters_up = nodes.iter().filter(|node| node.voter).all(|node| node.up);
     // With `waitForIdleSeats` a node whose seat is busy is not picked, until `idleWaitSeconds` from
-    // when it was first held back (a seat that says idle, or none, ends the wait).
+    // when it was first held back (a seat that says idle, or none, lets it go once it fits, and
+    // does not restart the count while it does not).
     let idle_patience = spec["idleWaitSeconds"]
         .as_u64()
         .unwrap_or(IDLE_SECONDS)
@@ -411,7 +412,9 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
         let busy = node.seat.as_ref().filter(|_| idle_wait);
         // (The count runs while it waits for its turn too.)
         let began = idle_before.get(&node.name).copied().unwrap_or(now);
-        if busy.is_some() {
+        // (Kept while it waits, though its seat says idle for a pass: that does not restart the
+        // count. It ends when the node is picked or leaves the plan.)
+        if busy.is_some() || (idle_wait && idle_before.contains_key(&node.name)) {
             idle.insert(node.name.clone(), began);
         }
         if !(if node.voter { alone && voters_up } else { fits }) {
@@ -430,8 +433,8 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
                 node.name
             );
             held.gave.insert(node.name.clone(), why);
-            idle.remove(&node.name);
         }
+        idle.remove(&node.name);
         since.insert(node.name.clone(), now);
         if spec["drain"].as_bool() == Some(true) {
             // Cordoned and drained, then restarted once what moves is running elsewhere.
@@ -3007,6 +3010,33 @@ mod tests {
         let first = go(&long, None, &nodes, 0);
         assert!(told(&go(&long, Some(&first), &nodes, 86_399)).is_empty());
         assert_eq!(told(&go(&long, Some(&first), &nodes, 86_400)), ["a"]);
+    }
+
+    /// A seat that flaps between busy and idle while its node is not picked does not restart the
+    /// clock: `idleWaitSeconds` counts from the node's first wait (T-1128).
+    #[test]
+    fn update_idle_wait_is_not_reset_by_a_seat_that_flaps() {
+        let go = |last: Option<&Decided>, nodes: &[Node], at: u64| {
+            let spec = json!({ "waitForIdleSeats": true, "idleWaitSeconds": 60 });
+            step(&plan(spec, last), Some(("2", "next@1")), nodes, at)
+        };
+        // (A voter goes only while the other voter is up, so `a` is held back by `b` being down.)
+        let voter = |a: Node| Node { voter: true, ..a };
+        let down = Node {
+            up: false,
+            ..voter(node("b", "1", true))
+        };
+        let busy = vec![voter(seated("a", "active")), down.clone()];
+        let idle = vec![voter(node("a", "1", true)), down];
+        let first = go(None, &busy, 1000);
+        assert!(told(&first).is_empty());
+        let flap = go(Some(&first), &idle, 1030);
+        assert!(told(&flap).is_empty());
+        let again = go(Some(&flap), &busy, 1050);
+        assert!(told(&again).is_empty());
+        // 60 seconds from the first wait, though only 10 from the last time the seat was busy.
+        let up = vec![busy[0].clone(), voter(node("b", "1", true))];
+        assert_eq!(told(&go(Some(&again), &up, 1060)), ["a"]);
     }
 
     /// The wait for a seat counts continuous picking: a pause or a closed window restarts it.
