@@ -5,7 +5,7 @@
 //!
 //! Told on the kernel command line: `kith.hostname=NAME`; `kith.ip=ADDRESS/BITS[,GATEWAY]`
 //! and `kith.dns=ADDRESS` for a machine whose network gives no addresses (without them
-//! every network card asks by DHCP); `kith.update=DISK` for an update to install from a
+//! every network card asks by DHCP); `kith.ntp=ADDRESS[:PORT]` for a time server (see `clock`); `kith.update=DISK` for an update to install from a
 //! disk (see `os`); `kith.grow=off` for a state partition that stays as long as it is on a
 //! longer disk (see `gpt`); and whatever follows ` -- `, which the kernel hands
 //! to its first process as arguments: kithd's own, as in
@@ -108,6 +108,8 @@ pub struct Options {
     /// The first network card's address, how many bits of it are the network's, the way out.
     pub ip: Option<(Ipv4Addr, u8, Option<Ipv4Addr>)>,
     pub dns: Option<IpAddr>,
+    /// A time server to ask (`kith.ntp=ADDRESS[:PORT]`) after the ones the network names (see `clock`).
+    pub ntp: Option<std::net::SocketAddr>,
     /// Which of kith OS's two slots this kernel's root is (the image says, not a person).
     pub slot: Option<char>,
     /// A disk under /dev with an update on it, for the other slot (see `os`).
@@ -132,7 +134,7 @@ pub fn configured(text: &str) -> (String, Vec<String>) {
     let text = format!(" {text} ");
     let (kernel, arguments) = text.split_once(" -- ").unwrap_or((&text, ""));
     let ours = |word: &&str| {
-        ["kith.hostname=", "kith.ip=", "kith.dns="]
+        ["kith.hostname=", "kith.ip=", "kith.dns=", "kith.ntp="]
             .iter()
             .any(|key| word.starts_with(key))
     };
@@ -257,6 +259,9 @@ pub fn options(line: &str) -> (Options, Vec<String>) {
             }
             Some(("kith.ip", value)) if static_ip(value).is_some() => options.ip = static_ip(value),
             Some(("kith.dns", value)) if value.parse::<IpAddr>().is_ok() => options.dns = value.parse().ok(),
+            Some(("kith.ntp", value)) if crate::clock::server(value).is_some() => {
+                options.ntp = crate::clock::server(value)
+            }
             // (The first one: the image's own, which what is typed at a boot menu follows.)
             Some(("kith.slot", "a")) => drop(options.slot.get_or_insert('a')),
             Some(("kith.slot", "b")) => drop(options.slot.get_or_insert('b')),
@@ -621,6 +626,7 @@ impl Boot {
             let told = self.dns;
             let got = move |lease: &crate::dhcp::Lease| {
                 let _ = ADDRESS.set(lease.address);
+                crate::clock::learn(&lease.ntp, lease.router);
                 match told {
                     Some(server) => resolvers(&[server]),
                     None => resolvers(&lease.dns.iter().copied().map(IpAddr::from).collect::<Vec<_>>()),
@@ -668,6 +674,7 @@ fn links(options: &Options) -> Vec<kith_mesh::Card> {
         match kith_mesh::address4(card.index, address, bits, gateway) {
             Ok(()) => {
                 let _ = ADDRESS.set(address);
+                crate::clock::learn(&[], gateway);
                 eprintln!("kithd: init: {} has {address}/{bits}", card.name);
             }
             Err(e) => eprintln!("kithd: init: giving {} {address}/{bits}: {e}", card.name),
@@ -828,6 +835,7 @@ pub fn early(again: bool) -> Boot {
     for word in unknown {
         eprintln!("kithd: init: `{word}` on the kernel command line is not understood");
     }
+    crate::clock::told(options.ntp);
     let name = options
         .hostname
         .clone()
@@ -1152,14 +1160,24 @@ mod tests {
             hostname: Some("alpha".into()),
             ip: Some(([10, 0, 0, 5].into(), 24, Some([10, 0, 0, 1].into()))),
             dns: Some([9, 9, 9, 9].into()),
+            ntp: Some("10.0.0.7:123".parse().unwrap()),
             slot: Some('b'),
             update: Some("sdb".into()),
             install: None,
             keep: false,
         };
-        let line =
-            "quiet kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9 kith.slot=b kith.update=sdb";
+        let line = "quiet kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9 kith.ntp=10.0.0.7 \
+                    kith.slot=b kith.update=sdb";
         assert_eq!(read(line), (named, vec![]));
+        // A time server with a port; and not a name (nothing resolves before the network is up).
+        assert_eq!(
+            read("kith.ntp=10.0.2.2:5123").0.ntp,
+            Some("10.0.2.2:5123".parse().unwrap())
+        );
+        assert_eq!(
+            read("kith.ntp=pool.ntp.org").1,
+            vec!["kith.ntp=pool.ntp.org".to_string()]
+        );
         assert_eq!(read("kith.ip=10.0.0.5/8").0.ip, Some(([10, 0, 0, 5].into(), 8, None)));
         assert_eq!(read("kith.slot=a kith.slot=b").0.slot, Some('a'));
         assert_eq!(

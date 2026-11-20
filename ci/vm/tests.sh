@@ -78,6 +78,9 @@
     if [ "$test" = modules ]; then
         . "$root/ci/vm/modules.sh"
     fi
+    if [ "$test" = clock ]; then
+        . "$root/ci/vm/clock.sh"
+    fi
 
     # (The disk is longer than the image written to it, as a real one is: 40 GB, of which
     # the file holds what is written. Past 32 GB an ext4 as small as the image's has used
