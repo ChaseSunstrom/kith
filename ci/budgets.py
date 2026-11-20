@@ -87,7 +87,8 @@ SIZE_BUDGETS = {"kith": int(3.05 * MB), "kith-remote": int(3.67 * MB), "kithd": 
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
 # Seconds, one per timed path: twice the slowest of three runs (each a median of RUNS) on main on the CI runner
-# (apply 85.3, 88.1, 78.3 ms; status 4.7, 4.8, 4.8 ms; DNS 2.9, 3.1, 3.5 ms), rounded up.
+# (apply 85.3, 88.1, 78.3 ms before T-1207, whose budget is its expected CI median doubled, not
+# yet retaken; status 4.7, 4.8, 4.8 ms; DNS 2.9, 3.1, 3.5 ms), rounded up.
 # A ceiling for a regression, not a claim of speed. None would mean no budget (printed only).
 # Each is scaled by the host's load, measured once before the timed runs: the 1-minute load over
 # the CPU count, at least 1 (printed beside it). A quiet host (CI's runner) holds the budget as
@@ -97,9 +98,11 @@ RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 # gate read medians of 33 ms against 10 ms and 38 ms against 7), and the fastest run waited least.
 # A regression in kith slows every run, the fastest too; CI's quiet runner judges the median.
 TIME_BUDGETS = {
-    # LOWERED 180 -> 80 ms (T-1207): the first image reference parse no longer compiles its regex
-    # on the start's path (40 to 60 ms), 156 -> 64 ms at load 29 here (`--phases` has each phase).
-    "apply to a running container": 0.080,
+    # LOWERED 180 -> 160 ms (T-1207): the first image reference parse starts, on its own thread, at
+    # the apply, not at the start's turn (a 35 ms regex compile): 90.5 -> 83.6 ms on the dev PC at
+    # load 6.3 (`--phases` has each phase). Not three CI medians: twice the CI median expected after
+    # the change (about 81 ms), so retake three on main and tighten it (T-0269).
+    "apply to a running container": 0.160,
     # RAISED 10 -> 20 ms (T-1096): under a 25+ load it read 16.1 and 18.0 ms and refused closes and prechecks;
     # bring it back to 10 ms once the trains are done and the host is quiet.
     "a status change reaching a second kithd": 0.020,
@@ -518,11 +521,11 @@ def build():
 
 
 def main():
-    parser =argparse.ArgumentParser(description="Hold the binaries to their size, memory and time budgets (builds them first).")
+    parser = argparse.ArgumentParser(description="Hold the binaries to their size, memory and time budgets (builds them first).")
     parser.add_argument("--self-test", action="store_true", help="check the checks: with 1-byte and 1 ms budgets every one must fail")
     parser.add_argument("--times", action="store_true", help="print the median times of the timed paths, unjudged, and stop")
     parser.add_argument("--phases", action="store_true", help="where the time of an apply to a running container goes, phase by phase (kithd's KITH_TIMELINE marks), and stop")
-    parser.add_argument("--runs", type=int, default=20, help="with --phases: how many applies to time (default 20)")
+    parser.add_argument("--runs", type=lambda n: max(1, int(n)), default=20, help="with --phases: how many applies to time (default 20, at least 1)")
     parser.add_argument("--bins", help="with --phases: the folder of a kithd and kith already built (default: build them)")
     args = parser.parse_args()
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

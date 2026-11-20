@@ -138,17 +138,23 @@ pub fn sha256_hex(digest: &str) -> Result<&str> {
     }
 }
 
+/// Parse one image reference on a thread of its own, once per process: oci-spec compiles the
+/// regex of a reference at the first it parses, 40 to 60 ms of the first container start
+/// (T-1207). Asked when a resource that runs containers is applied, not at start-up: a kithd
+/// that never runs one keeps the memory (kithd idle is budgeted). A refused thread is no
+/// failure: the first start then pays the compile, as before.
+pub fn warm_reference() {
+    static WARM: std::sync::Once = std::sync::Once::new();
+    WARM.call_once(|| {
+        let _ = std::thread::Builder::new().spawn(|| drop("local.test/warm:1".parse::<Reference>()));
+    });
+}
+
 impl ImageStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<ImageStore> {
         let root = root.into();
         // Errors only if a provider is already installed, which is just as good.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        // oci-spec compiles the regex of an image reference at the first one it parses, 40 to 60 ms
-        // of the first start (T-1207): here, off the thread that will start it, and once.
-        static WARM: std::sync::Once = std::sync::Once::new();
-        WARM.call_once(|| {
-            std::thread::spawn(|| drop("local.test/warm:1".parse::<Reference>()));
-        });
         fs::create_dir_all(root.join("blobs/sha256")).ctx(format!("creating {}", root.display()))?;
         fs::create_dir_all(root.join("images")).ctx(format!("creating {}", root.display()))?;
         fs::create_dir_all(root.join("refs")).ctx(format!("creating {}", root.display()))?;

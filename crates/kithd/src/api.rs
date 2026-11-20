@@ -505,6 +505,12 @@ pub(crate) async fn applied(
     resources: Vec<Resource>,
 ) -> Result<Vec<Change>, ApiError> {
     kith_runtime::timeline::mark("api");
+    if resources
+        .iter()
+        .any(|r| matches!(r.kind.as_str(), "Workload" | "NodeWorkload" | "Job"))
+    {
+        kith_runtime::warm_reference();
+    }
     submitted(&resources)?;
     let resources = stamped_by(shared, caller, resources);
     // Each resource of the body is asked about: one that is not allowed refuses them all.
