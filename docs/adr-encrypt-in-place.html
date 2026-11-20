@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en" data-root="">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Encrypting a node's state in place: the journal and the order of writes: kith</title>
+<meta name="description" content="A node installed without encrypt: true has its state plain on the state partition. To encrypt it with no reinstall, every byte of the partition is read and written back through a dm-crypt mapping of...">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="site.css">
+<link rel="stylesheet" href="docs.css">
+<script src="docs.js" defer></script>
+</head>
+<body>
+<!-- Made by ci/site_docs.py from docs/adr-encrypt-in-place.md: change the markdown, then run it again. -->
+<header class="bar">
+  <a class="brand" href="index.html" aria-label="kith: the front page">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true"><line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/><circle cx="22" cy="14" r="4"/><circle cx="22" cy="50" r="4"/><circle cx="43" cy="19" r="4.5"/><circle cx="43" cy="50" r="4.5"/><circle class="ring" cx="24" cy="37" r="5.5"/><circle class="hub" cx="24" cy="37" r="5.5"/></svg>
+    <b>kith</b>
+  </a>
+  <nav aria-label="Sections">
+    <a href="guide/index.html">Guide</a>
+    <a href="install.html">Install</a>
+    <a class="more" href="guide/index.html#decisions">Decisions</a>
+    <a class="more" href="index.html#numbers">Numbers</a>
+  </nav>
+  <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+</header>
+<div class="doc">
+<aside class="side">
+  <form class="find" role="search" hidden>
+    <label for="q">Search the headings</label>
+    <input id="q" type="search" placeholder="Search the headings" autocomplete="off" spellcheck="false">
+  </form>
+  <ol class="found" aria-live="polite" hidden></ol>
+  <details class="rail" open>
+    <summary>The guide</summary>
+    <nav aria-label="The guide's pages"><ol class="stops"><li><a href="guide/index.html">All the pages</a></li><li><a href="guide/os.html">kith OS</a></li><li><a href="guide/cluster.html">A cluster</a></li><li><a href="guide/workloads.html">What kithd does today</a></li><li><a href="guide/storage.html">Storage</a></li><li><a href="guide/hardware.html">Hardware</a></li><li><a href="guide/packages.html">Packages and Sources</a></li><li><a href="guide/access.html">Access</a></li><li><a href="guide/api.html">Resources and the language</a></li><li><a href="guide/kubernetes.html">Coming from Kubernetes, Helm, Proxmox or compose</a></li><li><a href="guide/ui.html">Web UI</a></li><li><a href="guide/development.html">Working on kith</a></li><li><a href="guide/numbers.html">How the numbers beside k3s were taken</a></li></ol><p class="rail-group">Decisions and reviews</p><ol class="stops"><li class=here><a href="adr-encrypt-in-place.html" aria-current="page">Encrypting a node's state in place: the journal and the order of writes</a><ol class="inner"><li class="h2"><a href="#the-problem">The problem</a></li><li class="h2"><a href="#what-the-engine-is">What the engine is</a></li><li class="h2"><a href="#1-the-layout-of-the-journal">1. The layout of the journal</a></li><li class="h2"><a href="#2-the-order-of-writes">2. The order of writes</a></li><li class="h2"><a href="#3-the-cut-at-every-point">3. The cut, at every point</a></li><li class="h2"><a href="#what-it-does-not-do">What it does not do</a></li></ol></li><li><a href="adr-fido2.html">A FIDO2 key as a way into a node's state</a></li><li><a href="adr-keyless.html">image signatures made without a kept key (T-0463)</a></li><li><a href="adr-people.html">People's devices into the home network: peers, levels and where a level holds</a></li><li><a href="adr-privilege.html">kithd in two parts: what reads the network holds no root</a></li><li><a href="adr-second-disk.html">A second disk for a node's data, under the state's key</a></li><li><a href="adr-taken-node.html">A taken control node is not the cluster taken</a></li><li><a href="adr-unlock.html">The ways into a node's encrypted state, and what each leaves open</a></li><li><a href="adr-workers.html">A worker keeps no Secret that nothing placed on it names</a></li><li><a href="security-review-2.html">Security review 2</a></li></ol></nav>
+  </details>
+</aside>
+<div class="page" role="main">
+<article>
+<h1 id="encrypting-a-nodes-state-in-place-the-journal-and-the-order-of-writes">Encrypting a node's state in place: the journal and the order of writes</h1>
+<p>Status: the engine is built (T-1136, <code>crates/kithd/src/in_place.rs</code>, tested on files with every cut); nothing calls it yet. Its wiring into init is T-1137, the real dm-crypt mapper is the slice after. This record is the part of T-1106 that the cuts depend on. Where the code differs from a line here, the code is the word. It builds on <a href="adr-unlock.html">adr-unlock.md</a> (the lock record, at 512 KiB into the config partition) and on the order of writes of <a href="adr-second-disk.html">adr-second-disk.md</a>.</p>
+<h2 id="the-problem">The problem <a class="anchor" href="#the-problem" aria-label="Link to this section">#</a></h2>
+<p>A node installed without <code>encrypt: true</code> has its state plain on the state partition. To encrypt it with no reinstall, every byte of the partition is read and written back through a dm-crypt mapping of the same partition. That takes minutes to hours, and the power can go at any byte of it. Whatever the moment, the partition must still be readable on the next start: every chunk either plain, or encrypted with the journal saying where the line is. A chunk half plain and half encrypted with no way to say which is the failure this record exists to make impossible.</p>
+<h2 id="what-the-engine-is">What the engine is <a class="anchor" href="#what-the-engine-is" aria-label="Link to this section">#</a></h2>
+<p>A pure pass: no init, no CLI, no dm-crypt call. It is given three things that are all "read, write and sync at an offset" (the <code>Disk</code> trait; a file in the tests):</p>
+<ul><li>the <strong>partition</strong>, raw, where the plain data is read from;</li><li>the <strong>mapping</strong>, the same partition under the key: a write to it lands encrypted on the partition (a fake that XORs in the tests, <code>kith_dm_sys::crypt</code> in the slice that wires it);</li><li>the <strong>journal</strong>, in the config partition, which is not under the key.</li></ul>
+<p>It goes through the partition in chunks of 256 KiB (the last one is what is left), in order. The size of the partition and of the chunk are in the journal and checked at every resume: a partition that grew or shrank is refused, not guessed at.</p>
+<h2 id="1-the-layout-of-the-journal">1. The layout of the journal <a class="anchor" href="#1-the-layout-of-the-journal" aria-label="Link to this section">#</a></h2>
+<p>The config partition is 1 MiB. Its first 64 KiB is the node's config; the lock record is 4 KiB at 512 KiB with a copy after it (<code>crypt::AT</code>). The journal sits between them:</p>
+<pre><code class="language-text">  0 KiB      64 KiB            128 KiB  132 KiB  136 KiB      192 KiB            452 KiB      512 KiB   520 KiB      1 MiB
+  | config   | (free)          | head 1 | head 2 | (free)      | backup slot      | (free)     | lock    | lock copy  | (free)
+</code></pre>
+<ul><li>two <strong>header copies</strong>, 4 KiB each, at 128 KiB and 132 KiB: a magic line, the pass's random id, the partition's size, the chunk size, <code>done</code> (chunks whole at rest) and the SHA-256 of all of that; the rest of the 4 KiB is zero. A header that fails its sum, or has a byte after it, is not taken;</li><li>one <strong>backup slot</strong> at 192 KiB, 256 KiB plus 4 KiB: a random 12-byte nonce, then the plain chunk sealed (ChaCha20-Poly1305) under a key drawn from the state's key with HKDF, with the pass id and the chunk's number as the associated data. The slot is never plain, so nothing plain is left outside the partition. A slot from another pass, or of another chunk, does not open.</li></ul>
+<p>The test <code>in_place::layout</code> holds these ranges apart from each other, from the node's config and from the lock record, and inside 1 MiB.</p>
+<h2 id="2-the-order-of-writes">2. The order of writes <a class="anchor" href="#2-the-order-of-writes" aria-label="Link to this section">#</a></h2>
+<p>At the start (no whole header, the second copy empty): write header 1 with <code>done = 0</code>, sync, write header 2, sync. Nothing of the partition is touched before both are down.</p>
+<p>For each chunk <code>i</code>, with <code>done = i</code>:</p>
+<ol><li>read the plain chunk from the partition;</li><li>seal it into the backup slot, <strong>sync</strong>;</li><li>write it through the mapping, the first half and then the second, <strong>sync</strong>;</li><li>write <code>done = i + 1</code> to header 1, <strong>sync</strong>, then to header 2, <strong>sync</strong>.</li></ol>
+<p>At the end: zero the backup slot, sync. The journal is left saying "all done"; the caller clears it (<code>clear</code>) once the mapping is the node's state.</p>
+<p>Two rules carry everything: the backup of chunk <code>i + 1</code> is not written until both headers say <code>i + 1</code>, and the partition's chunk <code>i</code> is not written until its backup is on the disk. The syncs between the two header copies are there on purpose: with one sync after both, a disk may keep half of each, and both copies are then torn (the sum catches one torn copy, so one must stay whole).</p>
+<h2 id="3-the-cut-at-every-point">3. The cut, at every point <a class="anchor" href="#3-the-cut-at-every-point" aria-label="Link to this section">#</a></h2>
+<p>A resume reads both headers, takes the whole one with the greater <code>done</code> (both whole: the greater; one: that one; neither: see below), writes both again, then looks in the slot for the backup of chunk <code>done</code>. If it opens, the chunk is written again through the mapping from it, whatever state the chunk is in (plain, half, whole: the mapping gives one ciphertext for one plain chunk and one place), and the pass goes on. If it does not open, chunk <code>done</code> was never touched and the pass reads it from the partition as at any chunk.</p>
+<div class="table"><table><thead><tr><th>cut at</th><th>what is on the disk</th><th>resume</th></tr></thead><tbody><tr><td>backup being written</td><td>slot torn or old; header says <code>i</code>; chunk <code>i</code> plain</td><td>slot does not open for <code>i</code>: chunk read as plain, as at any chunk</td></tr><tr><td>backup written, not synced</td><td>the same, or the slot whole</td><td>either as above or from the backup; the same end state</td></tr><tr><td>backup synced</td><td>slot whole; chunk <code>i</code> plain</td><td>written from the backup</td></tr><tr><td>chunk part-written</td><td>first half encrypted, the rest plain</td><td>written whole from the backup</td></tr><tr><td>chunk done, header not</td><td>chunk <code>i</code> encrypted; header says <code>i</code></td><td>written again from the backup, same bytes</td></tr><tr><td>header 1 written</td><td>header 1 says <code>i + 1</code>, header 2 says <code>i</code></td><td>takes <code>i + 1</code>; or, if copy 1 is the torn one, <code>i</code>, and writes chunk <code>i</code> again from the slot, which is still the backup of <code>i</code></td></tr><tr><td>header 2 written, not synced</td><td>as the row above, with copy 2 whole or torn</td><td>as the row above</td></tr><tr><td>both headers</td><td><code>i + 1</code></td><td>the next chunk</td></tr></tbody></table></div>
+<p><strong>Neither header whole.</strong> If header 2 is all zero the pass never got past its first write (header 1 may be torn): it starts. If header 2 holds anything else, the journal is damaged, and the engine stops rather than start again over a partition half encrypted. A header that is whole but says another size or chunk is refused the same way.</p>
+<p><strong>A cut in a resume</strong> is a cut like any other: the resume uses the same writes in the same order. The test cuts a second time at every point of the resume and runs a third.</p>
+<p><strong>What a disk may do that a file does not.</strong> The tests keep a fake whose writes wait until a sync, and at a cut keep none of them, all of them, the first half of each, or the first 64 bytes of each (a header with its new count and its old sum): so a missing sync shows as a failure and not as a pass on a file that wrote everything at once. (With the sync between the two header copies taken out, the last of these ends in "both copies damaged": the test was run so.)</p>
+<h2 id="what-it-does-not-do">What it does not do <a class="anchor" href="#what-it-does-not-do" aria-label="Link to this section">#</a></h2>
+<ul><li>It does not read a chunk twice from the raw partition after the mapping wrote it: a raw read of a partition the mapping wrote may come from a page cache that never saw the write. The caller that verifies does so through the mapping, after dropping the cache.</li><li>A chunk half written whose backup is gone (the slot's own sector failing) is lost; the pass stops rather than seal what is on the partition.</li><li>No online pass: the partition is not mounted while it runs. No decrypt.</li><li>The sealed backup is under the state's key, so it is as strong as the state, and no stronger. A lock record that is erased does not erase a backup left in the journal; the engine zeroes the slot at the end and <code>clear</code> zeroes everything.</li></ul>
+</article>
+<footer class="tail"><nav aria-label="Previous and next pages"><a class="prev" rel="prev" href="guide/numbers.html"><span>Previous</span>How the numbers beside k3s were taken</a><a class="next" rel="next" href="adr-fido2.html"><span>Next</span>A FIDO2 key as a way into a node's state</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/adr-encrypt-in-place.md">docs/adr-encrypt-in-place.md</a>.</p></footer>
+</div>
+</div>
+</body>
+</html>
