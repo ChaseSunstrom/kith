@@ -1295,7 +1295,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   none says so at every start and in its Node's `status.os.releaseKeys` (`none`), and
   one whose keys cannot be read says so and takes no release. An OSRelease's image is
   fetched only from an address that is not the node's own or on its networks, checked
-  and then held for the connection (no proxy, no redirect); `--lan-releases` lets the
+  and then held for the connection (no proxy). A redirect is followed, one hop at a time,
+  up to 5 hops, to an address vetted the same way and held the same way (a release
+  hosted on GitHub answers 302 to another host); https is never lowered to http, a
+  repeated address or one with a user or password is refused, and the refusal's words
+  leave out the redirect's query (it may be a signature). `--lan-releases` lets the
   networks' private ranges through, never the node itself, the cluster's mesh, loopback
   or link-local. With that flag, whoever may write an OSRelease has each node send one
   request to any host of those ranges, at any port and path, and sees in the plan's

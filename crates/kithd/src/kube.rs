@@ -93,6 +93,20 @@ const fn kind(
     }
 }
 
+/// A Pod sent is held as one of these, by what its `restartPolicy` says (not in `KINDS`: a Pod
+/// is found there as what is made up, and this is what a bare one is held as).
+static BARE: [Kind; 2] = [
+    kind("", "pods", "Pod", "po", true, Held::As("Job")),
+    kind("", "pods", "Pod", "po", true, Held::As("Workload")),
+];
+
+/// The row a Pod sent is held as: Job when it is not run again, else a Workload (as Kubernetes
+/// says of a missing `restartPolicy`).
+fn bare(pod: &Value) -> &'static Kind {
+    let held = kith_kube::pod_holder(pod.pointer("/spec/restartPolicy").and_then(Value::as_str));
+    &BARE[usize::from(held != "Job")]
+}
+
 const ACCESS: &str =
     "is kept and gives nothing: who may do what in kith is its own Roles', and a pod has no Kubernetes API to ask";
 const BUDGET: &str = "is kept and not read yet: kith drains a node without asking it";
@@ -301,6 +315,7 @@ fn resources(group: &str) -> Response {
     let mut has = Vec::new();
     for kind in KINDS.iter().filter(|kind| kind.group == group) {
         let verbs: &[&str] = match kind.held {
+            Held::Made if kind.kind == "Pod" => &["create", "get", "list", "watch"],
             Held::Made => &["get", "list", "watch"],
             _ => &["create", "delete", "get", "list", "patch", "update", "watch"],
         };
@@ -528,6 +543,7 @@ fn raw(resource: &Resource) -> Option<(&'static Kind, Value)> {
     };
     let kind = KINDS
         .iter()
+        .chain(&BARE)
         .find(|kind| object["kind"] == kind.kind && holder(kind) == resource.kind)?;
     let data = resource.spec.get("data").and_then(Value::as_object);
     if let (Some(data), Some(object)) = (data, object.as_object_mut()) {
@@ -871,6 +887,13 @@ fn pod_name(holder: &str, owner: &str, replica: u64) -> String {
     format!("{owner}-{mark}{replica}")
 }
 
+/// Whether a Pod named `name` would be a name a Job, a Workload or the pod of one already has.
+fn taken(store: &Store, namespace: Option<&str>, name: &str) -> bool {
+    let namespace = namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE);
+    let held = |holder: &str, name: &str| store.get(&format!("{holder}/{namespace}/{name}")).is_some();
+    held("Job", name) || held("Workload", name) || pod_owner(name).is_some_and(|(holder, owner, _)| held(holder, owner))
+}
+
 /// What a pod's name says: the kind that runs it, that kind's resource's name and the
 /// replica. The one place a pod's name is read, and only what [`pod_name`] makes is read
 /// (so `x-j0` is the Workload `x`'s pod 0 only as `x-j0-0`): anything else is no pod.
@@ -1020,6 +1043,31 @@ fn pods(owner: &Value, resource: &Resource) -> Vec<Value> {
     replicas.into_iter().map(pod).collect()
 }
 
+/// The Pod a Job or a Workload holds that was sent as one (`sent`, served), as it was sent: by
+/// its own name, labels and annotations, and owned by nothing; its status is its run's. One
+/// that has not run yet is Pending (its owner has no units to say so), and of a Job's runs the last is it.
+fn bare_pod(sent: &Value, resource: &Resource) -> Option<Value> {
+    let owner = json!({
+        "kind": resource.kind, "metadata": sent["metadata"],
+        "spec": { "template": { "metadata": { "labels": sent["metadata"]["labels"] }, "spec": sent["spec"] } },
+    });
+    let mut made = pods(&owner, resource);
+    if made.is_empty() {
+        let containers = ["initContainers", "containers"]
+            .into_iter()
+            .flat_map(|list| sent["spec"][list].as_array().into_iter().flatten());
+        let units: Vec<Value> = containers
+            .map(|c| json!({ "name": c["name"], "replica": 0, "state": "pending", "ready": false }))
+            .collect();
+        let mut waiting = resource.clone();
+        waiting.status = Some(json!({ "containers": units }));
+        made = pods(&owner, &waiting);
+    }
+    let mut pod = made.pop()?;
+    pod["metadata"] = sent["metadata"].clone();
+    Some(pod)
+}
+
 /// What a read of the store looks at, and what it did.
 #[derive(Default)]
 struct Look<'a> {
@@ -1099,6 +1147,7 @@ fn made(
         }
         let Some((_, owner)) = served(resource) else { continue };
         match kind.kind {
+            "Pod" if owner["kind"] == "Pod" => found.extend(bare_pod(&owner, resource).map(|pod| (of.clone(), pod))),
             "Pod" => found.extend(pods(&owner, resource).into_iter().map(|pod| (of.clone(), pod))),
             _ if owner["kind"] == "Deployment" => {
                 let before = if may_be_history(&resource.metadata.name, name) {
@@ -2516,6 +2565,13 @@ async fn write(
         let why = "metadata.name: an object needs a name (kith gives none: `generateName` is not done)";
         return Err(invalid(why.into()));
     };
+    // A Pod made is what its restartPolicy says, before anything is asked of the caller or the store.
+    // (Helm 4 sends a test hook's Pod as a server-side apply.)
+    let kind = if kind.kind == "Pod" && matches!(how, How::Create | How::Apply) {
+        bare(&body)
+    } else {
+        kind
+    };
     // Who may not write here is told that, and nothing of what is there; and a change
     // of what is there (a patch is answered with all of it) is for who may read it.
     call.allowed(kind, namespace, Verb::Apply)?;
@@ -2523,6 +2579,13 @@ async fn write(
         call.allowed(kind, namespace, Verb::Get)?;
     }
     let primary = key(kind, namespace, &name);
+    let exists = || {
+        status(
+            StatusCode::CONFLICT,
+            "AlreadyExists",
+            format!("{} \"{name}\" already exists", kind.plural),
+        )
+    };
     // An apply says who applies, as Kubernetes asks; and one to what is there is answered with
     // all of it (merged, and a conflict names whose field it is): for who may read it. Whether
     // it is there is told to who may write (a create says), so asking after that is no leak.
@@ -2553,14 +2616,22 @@ async fn write(
         if there {
             call.allowed(kind, namespace, Verb::Get)?;
         }
+        // (Only a marked bare Pod is a Pod that is there: a Deployment or Job of the name is a name taken.)
+        if there && kind.kind == "Pod" && how == How::Apply {
+            let state = call.shared.store.lock().expect("a handler panicked holding the store");
+            if held_bare(
+                &state.store,
+                Some(namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE)),
+                &name,
+            )
+            .is_some()
+            {
+                let why = format!("Pod/{name}: a Pod that is there is not changed: delete it and send it again");
+                return Err(invalid(why));
+            }
+            return Err(exists());
+        }
     }
-    let exists = || {
-        status(
-            StatusCode::CONFLICT,
-            "AlreadyExists",
-            format!("{} \"{name}\" already exists", kind.plural),
-        )
-    };
     // The revision a Deployment is sent back to, where what is sent is `kubectl rollout undo`.
     let mut undo = None;
     let read = {
@@ -2576,6 +2647,15 @@ async fn write(
             return Err(status(StatusCode::CONFLICT, "Conflict", why));
         }
         let was = before.as_ref().map(|(_, object)| object.clone());
+        // A Pod shares its name space with the Job and the Workload it might have been, and with the
+        // pods of what owns one. (ponytail: read and written under two calls for the other kind's key,
+        // so a Job and an Always Pod of one name made at once may both be made; a same-kind one cannot.)
+        if kind.kind == "Pod"
+            && (how == How::Create || (how == How::Apply && !there))
+            && taken(&state.store, namespace, &name)
+        {
+            return Err(exists());
+        }
         // What is there and was not made here, or not as this kind, is not written over.
         if live.is_some() && before.is_none() {
             let why = format!(
@@ -2738,8 +2818,26 @@ async fn delete(
             "{kind}/{name}: gracePeriodSeconds is taken and changes nothing: what it runs is stopped as kith stops it"
         ));
     }
+    // A Pod that is a bare one is deleted as what it is held as, by that holder's own right; any
+    // other Pod name is a replica's, and a delete restarts it.
+    let mut kind = kind;
     if kind.kind == "Pod" {
-        return delete_pod(call, kind, namespace, name, hints).await;
+        // (Before the store is looked at, for a bare Pod's name or any other: who holds no right to
+        // delete a Job or a Workload, or to restart a replica, is told that and nothing of which names exist.)
+        let place = Some(namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE));
+        if let Err(refused) = call.allowed(&BARE[1], place, Verb::Apply)
+            && !BARE.iter().any(|row| call.allowed(row, place, Verb::Delete).is_ok())
+        {
+            return Err(refused);
+        }
+        let held = {
+            let state = call.shared.store.lock().expect("a handler panicked holding the store");
+            held_bare(&state.store, namespace, name)
+        };
+        match held {
+            Some(row) => kind = row,
+            None => return delete_pod(call, kind, namespace, name, hints).await,
+        }
     }
     // (Asked first: who may not delete here is not told what is there.)
     call.allowed(kind, namespace, Verb::Delete)?;
@@ -2814,10 +2912,28 @@ async fn delete(
     Ok(Written(StatusCode::OK, Some(done), hints).into_response())
 }
 
-/// `kubectl delete pod NAME` restarts that one replica: its node stops it and its Workload starts
-/// it again, with the same name and number and a new start time. Needs the apply right on the
-/// Workload; a pod that is no Workload's replica (a bare pod, a Job's run, a NodeWorkload's copy)
-/// is refused by name. No grace period and no force: what runs is stopped as kith stops it.
+/// The row a Pod named exactly `name` is held as when it is a bare one: the Job or the Workload of
+/// that name that carries the `kith.dev/pod` mark and is read back as a Pod. The mark alone tells it
+/// from a replica of an owner (`web-0` of Workload `web`), which [`delete_pod`] restarts.
+fn held_bare(store: &Store, namespace: Option<&str>, name: &str) -> Option<&'static Kind> {
+    BARE.iter().find(|row| {
+        let Some(held) = store.get(&key(row, namespace, name)) else {
+            return false;
+        };
+        let marked = held
+            .metadata
+            .annotations
+            .get("kith.dev/pod")
+            .is_some_and(|mark| mark == "true");
+        marked && served(held).is_some_and(|(of, _)| std::ptr::eq(of, *row))
+    })
+}
+
+/// `kubectl delete pod NAME` on a name that is no bare Pod (see [`held_bare`], which `delete` asks
+/// first) restarts that one replica: its node stops it and its Workload starts it again, with the
+/// same name and number and a new start time. Needs the apply right on the Workload; a pod that is
+/// no Workload's replica is refused by name when it is a Job's run or a NodeWorkload's copy, and is
+/// not found when it is nothing. No grace period and no force: what runs is stopped as kith stops it.
 async fn delete_pod(
     call: &Call,
     kind: &'static Kind,
@@ -2826,7 +2942,17 @@ async fn delete_pod(
     hints: Vec<String>,
 ) -> Result<Response, No> {
     let namespace = namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE);
-    let Some(("Workload", owner, replica)) = pod_owner(name) else {
+    let owned = pod_owner(name);
+    let Some(("Workload", owner, replica)) = owned else {
+        // (A name no Job's run or NodeWorkload's copy has is no pod, as it is not in Kubernetes: Helm
+        // deletes the test pod of an earlier run before it makes one, and wants NotFound of what is not there.)
+        let held = |holder: &str, owner: &str| {
+            let state = call.shared.store.lock().expect("a handler panicked holding the store");
+            state.store.get(&format!("{holder}/{namespace}/{owner}")).is_some()
+        };
+        if !owned.is_some_and(|(holder, owner, _)| held(holder, owner)) {
+            return Err(not_found(kind, name));
+        }
         let why = format!(
             "Pod/{name}: only a replica of a Workload is restarted by a delete: kith runs no other pod that is restarted so"
         );
@@ -4031,6 +4157,230 @@ spec: {role: writer, subjects: [carol]}
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A Pod named `name` that restarts as `policy` says (none: says nothing).
+    fn a_pod(name: &str, policy: Option<&str>) -> Value {
+        let mut spec =
+            json!({ "containers": [{ "name": "main", "image": "i", "env": [{ "name": "A", "value": "1" }] }] });
+        if let Some(policy) = policy {
+            spec["restartPolicy"] = policy.into();
+        }
+        let meta = json!({ "name": name, "labels": { "app": name }, "annotations": { "note": "kept" } });
+        json!({ "apiVersion": "v1", "kind": "Pod", "metadata": meta, "spec": spec })
+    }
+
+    async fn send_pod(shared: &Arc<crate::Shared>, caller: Caller, pod: Value) -> (StatusCode, Value) {
+        let (code, said) = answer_as(shared.clone(), caller, "POST", "", "namespaces/default/pods", pod).await;
+        (code, serde_json::from_str(&said).unwrap_or(Value::String(said)))
+    }
+
+    async fn pods_of(shared: &Arc<crate::Shared>, rest: &str) -> (StatusCode, Value) {
+        let (code, said) = answer_as(shared.clone(), Caller::Admin, "GET", "", rest, Value::Null).await;
+        (code, serde_json::from_str(&said).unwrap_or(Value::String(said)))
+    }
+
+    /// A Pod sent is a Job when it is not run again (Never, OnFailure) and a one-replica
+    /// Workload when it is (Always, and none said), marked, and got by its own name with the
+    /// labels and fields it was sent with.
+    #[tokio::test]
+    async fn bare_pod_is_a_job_or_a_workload_marked_and_got_by_name() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let cases = [
+            ("never", Some("Never"), "Job"),
+            ("onfail", Some("OnFailure"), "Job"),
+            ("always", Some("Always"), "Workload"),
+            ("unset", None, "Workload"),
+        ];
+        for (name, policy, held) in cases {
+            let (code, said) = send_pod(&shared, Caller::Admin, a_pod(name, policy)).await;
+            assert_eq!(code, StatusCode::CREATED, "{name}: {said}");
+            let key = format!("{held}/default/{name}");
+            let marked = {
+                let state = shared.store.lock().unwrap();
+                let live = state.store.get(&key).unwrap_or_else(|| panic!("{key} is not held"));
+                live.metadata.annotations.get("kith.dev/pod").cloned()
+            };
+            assert_eq!(marked.as_deref(), Some("true"), "{key}");
+            let (code, pod) = pods_of(&shared, &format!("namespaces/default/pods/{name}")).await;
+            assert_eq!(code, StatusCode::OK, "{name}: {pod}");
+            assert_eq!(pod["kind"], "Pod");
+            assert_eq!(pod["metadata"]["name"], name, "{pod}");
+            assert_eq!(pod["metadata"]["labels"]["app"], name, "{pod}");
+            assert_eq!(pod["spec"]["containers"][0]["env"][0]["value"], "1", "{pod}");
+            assert_eq!(pod["status"]["phase"], "Pending", "a pod not run yet is Pending: {pod}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A name a Job, a Workload, another Pod or another owner's pod has is taken (409
+    /// AlreadyExists) whichever of the two a Pod would be; what kith does not carry is refused
+    /// by name; and a Pod is made by who may apply what it comes to, asked before the store is.
+    #[tokio::test]
+    async fn bare_pod_access_is_the_apply_right_on_the_kind_it_becomes() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-access-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let roles = "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: jobber}\nspec: {}\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: jobs}\nspec: {rules: [{kinds: [Job], verbs: [apply]}]}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: jobber-jobs}\nspec: {role: jobs, subjects: [jobber]}\n";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(roles).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        // Apply on Job alone makes a Never Pod; an Always one is a Workload, which it may not, and
+        // that is told before anything of the store is (the name `taken` is a Workload's).
+        let job = Caller::Identity("jobber".into());
+        let made = |kind: &str, name: &str| json!({ "apiVersion": "apps/v1", "kind": kind, "metadata": { "name": name }, "spec": { "replicas": 1, "selector": { "matchLabels": { "a": name } }, "template": { "metadata": { "labels": { "a": name } }, "spec": { "containers": [{ "name": "main", "image": "i" }] } } } });
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "POST",
+            "apps",
+            "namespaces/default/deployments",
+            made("Deployment", "taken"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let (code, said) = send_pod(&shared, job.clone(), a_pod("jobbed", Some("Never"))).await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        for name in ["fresh", "taken"] {
+            let (code, said) = send_pod(&shared, job.clone(), a_pod(name, Some("Always"))).await;
+            assert_eq!(code, StatusCode::FORBIDDEN, "{name}: {said}");
+        }
+        assert!(
+            shared
+                .store
+                .lock()
+                .unwrap()
+                .store
+                .get("Workload/default/fresh")
+                .is_none()
+        );
+        // Taken: by a Workload (as a Job or as one), by a Job, by a Pod, by a Deployment's pod, a Job's, a DaemonSet's.
+        let mut daemon = made("DaemonSet", "ds");
+        daemon["spec"].as_object_mut().unwrap().remove("replicas");
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "POST",
+            "apps",
+            "namespaces/default/daemonsets",
+            daemon,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let job_of = json!({ "apiVersion": "batch/v1", "kind": "Job", "metadata": { "name": "j" }, "spec": { "template": { "spec": { "restartPolicy": "Never", "containers": [{ "name": "main", "image": "i" }] } } } });
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "POST",
+            "batch",
+            "namespaces/default/jobs",
+            job_of,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let names = ["taken", "j", "jobbed", "taken-0", "j-j0", "ds-n0"];
+        for name in names {
+            for policy in ["Never", "Always"] {
+                let (code, said) = send_pod(&shared, Caller::Admin, a_pod(name, Some(policy))).await;
+                assert_eq!(code, StatusCode::CONFLICT, "{name} {policy}: {said}");
+                assert!(said.to_string().contains("already exists"), "{name} {policy}: {said}");
+            }
+        }
+        // The same name twice: the second is refused, and the first is as it was.
+        let (code, _) = send_pod(&shared, Caller::Admin, a_pod("twice", Some("Never"))).await;
+        assert_eq!(code, StatusCode::CREATED);
+        let (code, said) = send_pod(&shared, Caller::Admin, a_pod("twice", Some("Always"))).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{said}");
+        assert!(
+            shared
+                .store
+                .lock()
+                .unwrap()
+                .store
+                .get("Workload/default/twice")
+                .is_none()
+        );
+        // What kith does not carry is refused naming the field, and nothing is made.
+        for field in ["nodeName", "hostNetwork", "activeDeadlineSeconds", "hostPID"] {
+            let mut pod = a_pod("odd", Some("Never"));
+            pod["spec"][field] = if field == "nodeName" { json!("n1") } else { json!(true) };
+            let (code, said) = send_pod(&shared, Caller::Admin, pod).await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{field}: {said}");
+            assert!(said.to_string().contains(field), "{field}: {said}");
+        }
+        assert!(shared.store.lock().unwrap().store.get("Job/default/odd").is_none());
+        // A Pod that is there is not written over through the Pod's paths.
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "PUT",
+            "",
+            "namespaces/default/pods/twice",
+            a_pod("twice", Some("Never")),
+        )
+        .await;
+        assert_ne!(code, StatusCode::OK, "{said}");
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Get and list give a bare Pod as it was sent, by its own name and not NAME-jN, owned by
+    /// nothing, with what its Job or Workload says of its run in its status.
+    #[tokio::test]
+    async fn bare_pod_reads_back_as_sent_by_its_own_name() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-read-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        for (name, policy) in [("once", "Never"), ("always", "Always")] {
+            let (code, said) = send_pod(&shared, Caller::Admin, a_pod(name, Some(policy))).await;
+            assert_eq!(code, StatusCode::CREATED, "{name}: {said}");
+        }
+        let units = json!({ "containers": [{ "name": "main", "replica": 0, "state": "running", "ready": true, "restarts": 0 }] });
+        {
+            let mut state = shared.store.lock().unwrap();
+            let status = json!({ "state": "running", "containers": units["containers"] });
+            state.store.set_status("Job/default/once", Some(status)).unwrap();
+            state.store.set_status("Workload/default/always", Some(units)).unwrap();
+        }
+        let (code, listed) = pods_of(&shared, "namespaces/default/pods").await;
+        assert_eq!(code, StatusCode::OK, "{listed}");
+        let mut names: Vec<_> = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pod| pod["metadata"]["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["always", "once"], "{listed}");
+        for name in ["once", "always"] {
+            let (code, pod) = pods_of(&shared, &format!("namespaces/default/pods/{name}")).await;
+            assert_eq!(code, StatusCode::OK, "{name}: {pod}");
+            assert_eq!(pod["metadata"]["labels"], json!({ "app": name }), "{pod}");
+            assert_eq!(pod["metadata"]["annotations"]["note"], "kept", "{pod}");
+            assert!(pod["metadata"]["ownerReferences"].is_null(), "owned by nothing: {pod}");
+            assert_eq!(pod["spec"]["containers"][0]["env"][0]["name"], "A", "{pod}");
+            assert_eq!(pod["status"]["phase"], "Running", "{pod}");
+            // (The name it would have as a Job's or a Workload's pod is no pod.)
+            let (code, said) = pods_of(&shared, &format!("namespaces/default/pods/{name}-j0")).await;
+            assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
+        }
+        // A Pod is not a Job to the Job's paths.
+        let (code, jobs) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "GET",
+            "batch",
+            "namespaces/default/jobs",
+            Value::Null,
+        )
+        .await;
+        let jobs: Value = serde_json::from_str(&jobs).unwrap();
+        assert_eq!(code, StatusCode::OK, "{jobs}");
+        assert!(jobs["items"].as_array().unwrap().is_empty(), "{jobs}");
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// What `serve` answers a request by `caller`: the status and the body as text.
     async fn answer_as(
         shared: Arc<crate::Shared>,
@@ -4123,7 +4473,7 @@ spec: {role: writer, subjects: [carol]}
             .collect();
         names.sort();
         assert_eq!(names, ["x-0", "x-1"], "{listed}");
-        // A pod kith runs no Workload replica of is refused by name, and marks nothing.
+        // A name that is no pod is not found (Helm deletes what it made before, and wants this), and marks nothing.
         for no in ["bare", "x-j0"] {
             let (code, said) = answer_as(
                 shared.clone(),
@@ -4134,7 +4484,7 @@ spec: {role: writer, subjects: [carol]}
                 Value::Null,
             )
             .await;
-            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{no}: {said}");
+            assert_eq!(code, StatusCode::NOT_FOUND, "{no}: {said}");
             assert!(said.contains(no), "{no}: {said}");
         }
         // A Workload that is not there has no such replica.
@@ -4215,6 +4565,151 @@ spec: {role: writer, subjects: [carol]}
         .await;
         assert_eq!(code, StatusCode::OK, "{said}");
         assert_eq!(shared.restarts.lock().unwrap().len(), 1);
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn delete_pod_named(shared: &Arc<crate::Shared>, caller: Caller, name: &str) -> (StatusCode, String) {
+        answer_as(
+            shared.clone(),
+            caller,
+            "DELETE",
+            "",
+            &format!("namespaces/default/pods/{name}"),
+            Value::Null,
+        )
+        .await
+    }
+
+    /// A marked bare Pod is deleted as the Job or the Workload it is held as, and is then no pod; one
+    /// named like a replica (`web-0`, with no Workload `web`) is deleted too and not 404; the pod
+    /// of an owner is still restarted, not deleted; and a delete is a delete (nothing is restarted).
+    #[tokio::test]
+    async fn bare_pod_delete_removes_the_marked_pod_and_still_restarts_an_owners_replica() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-delete-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        two_replicas_of_x(&shared).await;
+        for (name, policy, held) in [
+            ("once", Some("Never"), "Job"),
+            ("always", None, "Workload"),
+            ("web-0", None, "Workload"),
+        ] {
+            let (code, said) = send_pod(&shared, Caller::Admin, a_pod(name, policy)).await;
+            assert_eq!(code, StatusCode::CREATED, "{name}: {said}");
+            let (code, said) = delete_pod_named(&shared, Caller::Admin, name).await;
+            assert_eq!(code, StatusCode::OK, "{name}: {said}");
+            let said: Value = serde_json::from_str(&said).unwrap();
+            assert_eq!(said["details"]["name"], name, "{said}");
+            assert!(
+                shared
+                    .store
+                    .lock()
+                    .unwrap()
+                    .store
+                    .get(&format!("{held}/default/{name}"))
+                    .is_none(),
+                "{name}"
+            );
+            let (code, said) = pods_of(&shared, &format!("namespaces/default/pods/{name}")).await;
+            assert_eq!(code, StatusCode::NOT_FOUND, "{name}: {said}");
+            let (code, _) = delete_pod_named(&shared, Caller::Admin, name).await;
+            assert_ne!(code, StatusCode::OK, "{name} is deleted once");
+        }
+        assert!(
+            shared.restarts.lock().unwrap().is_empty(),
+            "a delete of a bare pod restarts nothing"
+        );
+        // A run of a Job that is there is a pod that is not restarted by a delete: refused by name; one of a Job that is not is no pod.
+        let (code, said) = send_pod(&shared, Caller::Admin, a_pod("job", Some("Never"))).await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let (code, said) = delete_pod_named(&shared, Caller::Admin, "job-j0").await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{said}");
+        let (code, said) = delete_pod_named(&shared, Caller::Admin, "gone-j0").await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
+        // The owner's replica next to them is restarted, and its Workload stays.
+        let (code, said) = delete_pod_named(&shared, Caller::Admin, "x-0").await;
+        assert_eq!(code, StatusCode::OK, "{said}");
+        let marked: Vec<(String, u32)> = shared.restarts.lock().unwrap().iter().cloned().collect();
+        assert_eq!(marked, [("Workload/default/x".to_string(), 0)]);
+        assert!(shared.store.lock().unwrap().store.get("Workload/default/x").is_some());
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a bare pod needs the delete right on what it is held as: get alone is 403 and the
+    /// pod stays; apply alone is 403 too (a delete is not an apply); delete takes it.
+    #[tokio::test]
+    async fn bare_pod_delete_needs_the_delete_right_on_its_holder() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-delete-access-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let mut roles = String::new();
+        for (who, verb) in [("ann", "get"), ("bob", "apply"), ("cat", "delete")] {
+            roles += &format!(
+                "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{name: {who}}}\nspec: {{}}\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: {{name: {who}-role}}\nspec: {{rules: [{{kinds: [Job, Workload], verbs: [{verb}]}}]}}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{name: {who}-binding}}\nspec: {{role: {who}-role, subjects: [{who}]}}\n---\n"
+            );
+        }
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(&roles).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        for (name, policy, held) in [("once", Some("Never"), "Job"), ("always", None, "Workload")] {
+            let (code, said) = send_pod(&shared, Caller::Admin, a_pod(name, policy)).await;
+            assert_eq!(code, StatusCode::CREATED, "{name}: {said}");
+            for who in ["ann", "bob"] {
+                let (code, said) = delete_pod_named(&shared, Caller::Identity(who.into()), name).await;
+                assert_eq!(code, StatusCode::FORBIDDEN, "{who} {name}: {said}");
+                assert!(
+                    shared
+                        .store
+                        .lock()
+                        .unwrap()
+                        .store
+                        .get(&format!("{held}/default/{name}"))
+                        .is_some()
+                );
+            }
+            let (code, said) = delete_pod_named(&shared, Caller::Identity("cat".into()), name).await;
+            assert_eq!(code, StatusCode::OK, "{name}: {said}");
+            assert!(
+                shared
+                    .store
+                    .lock()
+                    .unwrap()
+                    .store
+                    .get(&format!("{held}/default/{name}"))
+                    .is_none()
+            );
+        }
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A caller with no right on Jobs or Workloads is told 403, the same, of a name that is a pod
+    /// (a bare one, a replica) and of one that is nothing: a delete is no way to find what exists.
+    #[tokio::test]
+    async fn bare_pod_delete_of_a_caller_with_no_rights_is_403_for_every_name() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-delete-oracle-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let who = "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: nobody}\nspec: {}\n";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(who).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        two_replicas_of_x(&shared).await;
+        let (code, said) = send_pod(&shared, Caller::Admin, a_pod("once", Some("Never"))).await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let mut answers = Vec::new();
+        for name in ["once", "x-0", "x-j0", "ghost"] {
+            let (code, said) = delete_pod_named(&shared, Caller::Identity("nobody".into()), name).await;
+            assert_eq!(code, StatusCode::FORBIDDEN, "{name}: {said}");
+            answers.push(said);
+        }
+        assert!(answers.windows(2).all(|two| two[0] == two[1]), "{answers:?}");
+        assert!(shared.store.lock().unwrap().store.get("Job/default/once").is_some());
         drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
     }

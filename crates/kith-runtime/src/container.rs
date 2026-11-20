@@ -1515,7 +1515,20 @@ fn cgroup_parent() -> Result<String> {
         return Ok("/kith".into());
     }
     let own = fs::read_to_string("/proc/self/cgroup").ctx("reading /proc/self/cgroup")?;
-    let own = own.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("/");
+    parent_of_own(&own)
+}
+
+/// Whether [`Runtime::new`] can find a cgroup to put containers in here (the same question as
+/// `cgroup_parent`, so a test that needs one can skip where it has none, as in a kith Job).
+#[doc(hidden)]
+pub fn has_delegated_cgroup() -> bool {
+    cgroup_parent().is_ok()
+}
+
+/// The delegated parent of the cgroup `/proc/self/cgroup` (`proc`) names: its parent, unless that is
+/// the root, which no user was given.
+fn parent_of_own(proc: &str) -> Result<String> {
+    let own = proc.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("/");
     match Path::new(own).parent() {
         Some(parent) if parent != Path::new("/") => Ok(parent.display().to_string()),
         _ => err("no delegated cgroup: run kith inside a systemd user session or scope"),
@@ -2312,6 +2325,35 @@ mod tests {
 
     /// A create a runner's cgroup refuses (no pids limit) is a skip the CI log shows, not a silent
     /// pass: the line is a GitHub `::warning` annotation, written past the test harness's capture.
+    /// Where a test needs a cgroup to put containers in and there is none (a kith Job has no delegated
+    /// one), it says so and returns: `false` means skip.
+    fn delegated_or_skip() -> bool {
+        let has = has_delegated_cgroup();
+        if !has {
+            report_skip("skipped: no delegated cgroup here");
+        }
+        has
+    }
+
+    /// A root has `/kith`; a user has the parent of its own cgroup unless that is the root: a path
+    /// directly under the root, or the root itself, is no delegation and is an error, not a panic.
+    #[test]
+    fn cgroup_parent_is_none_without_a_delegated_one() {
+        assert_eq!(
+            parent_of_own("0::/user.slice/user-1000.slice/session-1.scope\n").unwrap(),
+            "/user.slice/user-1000.slice"
+        );
+        // (A hybrid host: v1 lines first, then the v2 one.)
+        assert_eq!(
+            parent_of_own("1:name=x:/a/b\n0::/user.slice/a.slice/b.scope\n").unwrap(),
+            "/user.slice/a.slice"
+        );
+        for no in ["0::/\n", "0::/kith-job\n", "", "1:name=x:/a/b\n"] {
+            let said = parent_of_own(no).unwrap_err().to_string();
+            assert!(said.contains("no delegated cgroup"), "{no:?}: {said}");
+        }
+    }
+
     #[test]
     fn pids_limit_skip_is_reported_only_for_a_cgroup_refusal() {
         let line = cgroup_skip("failed to create: cgroup error: no pids").expect("a cgroup refusal skips");
@@ -3210,6 +3252,9 @@ mod tests {
     /// in the log its init process wrote, which the unit's failure must carry.
     #[test]
     fn create_error_names_what_failed_beneath() {
+        if !delegated_or_skip() {
+            return;
+        }
         let root = std::env::temp_dir().join(format!("kith-create-error-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let runtime = Runtime::new(root.join("runtime")).unwrap();
@@ -3251,6 +3296,9 @@ mod tests {
     /// of them says so within the watchdog.
     #[test]
     fn create_from_many_threads() {
+        if !delegated_or_skip() {
+            return;
+        }
         const THREADS: usize = 8;
         const EACH: usize = 6;
         let root = std::env::temp_dir().join(format!("kith-create-threads-{}", std::process::id()));
@@ -3315,6 +3363,9 @@ mod tests {
     /// own status, which the program keeps when it execs.)
     #[test]
     fn container_starts_with_no_signal_blocked() {
+        if !delegated_or_skip() {
+            return;
+        }
         let root = std::env::temp_dir().join(format!("kith-sigblk-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let runtime = Runtime::new(root.join("runtime")).unwrap();
@@ -3416,7 +3467,7 @@ mod tests {
     /// this host's hardened kernel does; on one that allows it, it checks the overlay is what is made.)
     #[test]
     fn a_rootless_writable_root_is_read_only_only_where_the_kernel_refuses_overlay() {
-        if nix::unistd::getuid().is_root() {
+        if nix::unistd::getuid().is_root() || !delegated_or_skip() {
             return;
         }
         let root = std::env::temp_dir().join(format!("kith-overlay-refused-{}", std::process::id()));
