@@ -807,34 +807,52 @@ fn stage(from: &Path, digest: &str, dir: &Path) -> Result<PathBuf, String> {
             dir.display()
         ));
     }
-    let mut bytes = Vec::new();
-    std::fs::File::open(from)
-        .and_then(|file| file.take(STAGE_MOST + 1).read_to_end(&mut bytes))
-        .map_err(|e| format!("reading the new kithd ({}): {e}", from.display()))?;
-    if bytes.len() as u64 > STAGE_MOST {
-        return Err(format!(
-            "the new kithd ({}) is larger than {STAGE_MOST} bytes",
-            from.display()
-        ));
-    }
-    let got = crate::os::sha256(&bytes);
-    if !got.eq_ignore_ascii_case(digest) {
-        return Err(format!(
-            "the new kithd's sha256 is {got}, and the release's signed header names {digest}"
-        ));
-    }
     let (new, file) = (dir.join("kithd.new"), dir.join("kithd"));
     let _ = std::fs::remove_file(&new);
-    let wrote = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .open(&new)
-        .and_then(|mut out| out.write_all(&bytes).and_then(|()| out.sync_all()))
-        .and_then(|()| std::fs::rename(&new, &file));
+    // Streamed: each chunk goes through the hasher and into `kithd.new` (at most STAGE_MOST of
+    // them), and the file is put in place only when the digest comes out as the signed one.
+    let wrote = (|| -> Result<(), String> {
+        let mut src = std::fs::File::open(from)
+            .map_err(|e| format!("reading the new kithd ({}): {e}", from.display()))?
+            .take(STAGE_MOST + 1);
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&new)
+            .map_err(|e| format!("staging the new kithd in {}: {e}", dir.display()))?;
+        let (mut hash, mut buf, mut size) = (ring::digest::Context::new(&ring::digest::SHA256), [0u8; 65536], 0u64);
+        loop {
+            let n = src
+                .read(&mut buf)
+                .map_err(|e| format!("reading the new kithd ({}): {e}", from.display()))?;
+            if n == 0 {
+                break;
+            }
+            size += n as u64;
+            if size > STAGE_MOST {
+                return Err(format!(
+                    "the new kithd ({}) is larger than {STAGE_MOST} bytes",
+                    from.display()
+                ));
+            }
+            hash.update(&buf[..n]);
+            out.write_all(&buf[..n])
+                .map_err(|e| format!("staging the new kithd in {}: {e}", dir.display()))?;
+        }
+        let got = crate::pki::hex(hash.finish().as_ref());
+        if !got.eq_ignore_ascii_case(digest) {
+            return Err(format!(
+                "the new kithd's sha256 is {got}, and the release's signed header names {digest}"
+            ));
+        }
+        out.sync_all()
+            .and_then(|()| std::fs::rename(&new, &file))
+            .map_err(|e| format!("staging the new kithd in {}: {e}", dir.display()))
+    })();
     if let Err(e) = wrote {
         let _ = std::fs::remove_file(&new);
-        return Err(format!("staging the new kithd in {}: {e}", dir.display()));
+        return Err(e);
     }
     Ok(file)
 }
@@ -842,7 +860,7 @@ fn stage(from: &Path, digest: &str, dir: &Path) -> Result<PathBuf, String> {
 /// Stages the kithd of the release just written into slot `into`, as `digest` (the signed header's)
 /// has it: the slot's root is mounted read-only for as long as `/sbin/init` is read from it.
 fn stage_release(into: char, digest: &str) -> Result<PathBuf, String> {
-    use nix::mount::{MsFlags, mount, umount};
+    use nix::mount::{MntFlags, MsFlags, mount, umount2};
     let device =
         crate::init::labelled(&format!("root-{into}")).ok_or(format!("no partition is labelled root-{into}"))?;
     let at = Path::new(NEW_ROOT);
@@ -851,21 +869,38 @@ fn stage_release(into: char, digest: &str) -> Result<PathBuf, String> {
     mount(Some(&device), at, Some("squashfs"), flags, None::<&str>)
         .map_err(|e| format!("mounting {}: {e}", device.display()))?;
     let staged = stage(&at.join("sbin/init"), digest, Path::new(crate::keeper::STAGED_DIR));
-    if let Err(e) = umount(at) {
+    // (Detached: a umount that fails with EBUSY must not leave the next hand-over's mount to fail.)
+    if let Err(e) = umount2(at, MntFlags::MNT_DETACH) {
         eprintln!("kithd: update: unmounting {NEW_ROOT}: {e}");
     }
     staged
 }
 
-/// Writes down that the kithd that is the sha256 `digest` is `version`'s (see [`effective`]).
-fn hand_over(record: &Path, version: &str, digest: &str) -> Result<(), String> {
-    if version.is_empty() || version.contains(char::is_whitespace) {
+/// Writes down that the kithd that is the sha256 `digest` is `version`'s (see [`effective`]),
+/// the node running `running` now: only a newer version is one a hand-over moves to.
+fn hand_over(record: &Path, running: &str, version: &str, digest: &str) -> Result<(), String> {
+    if version.is_empty() || version.contains(char::is_whitespace) || !before(running, version) {
         return Err(format!(
-            "kith OS {version:?} is not a version a hand-over can write down"
+            "kith OS {version:?} is not a version a hand-over from {running} can write down"
         ));
     }
     crate::pki::write_whole(record, format!("{version} {digest}\n").as_bytes())
         .map_err(|e| format!("keeping a note of the hand-over ({}): {e}", record.display()))
+}
+
+/// What the hand-over note in `record` says: the version it names, if that is newer than
+/// `os_release`, and whether `exe`'s sha256 is the kithd it names (so it is this one that runs).
+fn handed_over(os_release: &str, record: &Path, exe: &Path) -> Option<(String, bool)> {
+    let handed = std::fs::read_to_string(record).ok()?;
+    let (version, digest) = handed.trim().split_once(' ')?;
+    if !before(os_release, version) {
+        return None;
+    }
+    let runs = std::fs::read(exe).map(|bytes| crate::os::sha256(&bytes));
+    Some((
+        version.to_string(),
+        runs.is_ok_and(|runs| runs.eq_ignore_ascii_case(digest)),
+    ))
 }
 
 /// The version this node runs: `os_release`'s (the root is read-only, and a kithd-only
@@ -873,14 +908,25 @@ fn hand_over(record: &Path, version: &str, digest: &str) -> Result<(), String> {
 /// the kithd it names (`exe`'s sha256): a keeper that fell back to its own kithd runs the old
 /// release again, and a reboot has the new root, whose os-release says so.
 fn effective(os_release: String, record: &Path, exe: &Path) -> String {
-    let handed = std::fs::read_to_string(record).ok();
-    let Some((version, digest)) = handed.as_deref().and_then(|text| text.trim().split_once(' ')) else {
-        return os_release;
-    };
-    let runs = std::fs::read(exe).map(|bytes| crate::os::sha256(&bytes));
-    match runs {
-        Ok(runs) if before(&os_release, version) && runs.eq_ignore_ascii_case(digest) => version.to_string(),
+    match handed_over(&os_release, record, exe) {
+        Some((version, true)) => version,
         _ => os_release,
+    }
+}
+
+/// A hand-over whose kithd is not the one that runs (it crashed, and the keeper went back to
+/// this one) is a try that failed: written as `Tried`, so [`node`] does not fetch and hand over
+/// to that version again at every poll.
+fn forgo_failed_hand_over(state: &Path, os_release: &str, record: &Path, exe: &Path) {
+    let Some((version, false)) = handed_over(os_release, record, exe) else {
+        return;
+    };
+    let tried = Tried {
+        version,
+        why: "the kithd handed over to failed".into(),
+    };
+    if let Err(e) = crate::pki::write_whole(&self::tried(state), &serde_json::to_vec(&tried).expect("text")) {
+        eprintln!("kithd: update: noting the failed hand-over: {e}");
     }
 }
 
@@ -1100,10 +1146,14 @@ pub async fn node(
     }
     let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     // (After a kithd-only hand-over the root still says the old version: see `effective`.)
-    let version = std::fs::read_to_string("/etc/os-release")
+    let os_release = std::fs::read_to_string("/etc/os-release")
         .ok()
-        .and_then(|text| version_in(&text))
-        .map(|version| effective(version, Path::new(HANDED_OVER), Path::new("/proc/self/exe")));
+        .and_then(|text| version_in(&text));
+    let (record, exe) = (Path::new(HANDED_OVER), Path::new("/proc/self/exe"));
+    if let Some(os_release) = &os_release {
+        forgo_failed_hand_over(&state, os_release, record, exe);
+    }
+    let version = os_release.map(|version| effective(version, record, exe));
     let (Some(slot), Some(version), Some(cluster)) = (crate::init::options(&line).0.slot, version, &shared.cluster)
     else {
         return;
@@ -1203,15 +1253,16 @@ pub async fn node(
                 // staged and started with no unit stopped. Else, or if that fails, the restart.)
                 Ok((_, Some(kithd))) if crate::keeper::kept().is_some() => {
                     let staged = stage_release(crate::os::other(slot), &kithd)
-                        .and_then(|_| hand_over(Path::new(HANDED_OVER), &wanted, &kithd));
+                        .and_then(|_| hand_over(Path::new(HANDED_OVER), &version, &wanted, &kithd));
                     match staged {
                         Ok(()) => {
                             eprintln!(
                                 "kithd: kith OS {wanted} differs in kithd alone: handing over to the kithd staged"
                             );
-                            crate::init::HANDING_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
                             // (The keeper counts a kithd that ends sooner than this as a failure.)
                             tokio::time::sleep(crate::keeper::HANDOVER_AFTER + Duration::from_secs(1)).await;
+                            // (Set only now: a power-button stop during the wait is not a hand-over.)
+                            crate::init::HANDING_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
                             shared.stop.send_replace(true);
                             return;
                         }
@@ -2437,7 +2488,7 @@ mod stage {
         let says = |os: &str| effective(os.to_string(), &record, &exe);
         // No record: what the system says.
         assert_eq!(says("1.0"), "1.0");
-        hand_over(&record, "1.1", &sum(KITHD)).unwrap();
+        hand_over(&record, "1.0", "1.1", &sum(KITHD)).unwrap();
         assert_eq!(says("1.0"), "1.1");
         // The system itself has caught up (a reboot into the new slot): its own word.
         assert_eq!(says("1.1"), "1.1");
@@ -2449,6 +2500,46 @@ mod stage {
         std::fs::write(&record, "nonsense").unwrap();
         assert_eq!(says("1.0"), "1.0");
         // A version that could not be read back is not recorded.
-        assert!(hand_over(&record, "1.1 x", &sum(KITHD)).is_err());
+        assert!(hand_over(&record, "1.0", "1.1 x", &sum(KITHD)).is_err());
+        // Nor is a version that is not newer than the one that runs.
+        std::fs::remove_file(&record).unwrap();
+        assert!(hand_over(&record, "1.1", "1.1", &sum(KITHD)).is_err());
+        assert!(hand_over(&record, "1.1", "1.0", &sum(KITHD)).is_err());
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn a_kithd_handed_over_to_that_was_not_the_one_that_runs_is_noted_as_a_try_that_failed() {
+        let root = tests::scratch("stage-failed");
+        let (record, exe, state) = (root.join("handed-over"), root.join("exe"), root.join("state"));
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(&exe, KITHD).unwrap();
+        hand_over(&record, "1.0", "1.1", &sum(KITHD)).unwrap();
+        // The staged kithd runs: nothing failed.
+        forgo_failed_hand_over(&state, "1.0", &record, &exe);
+        assert!(!tried(&state).exists());
+        // It crashed and the keeper went back to the old one: 1.1 is a try that failed.
+        std::fs::write(&exe, b"the old kithd").unwrap();
+        forgo_failed_hand_over(&state, "1.0", &record, &exe);
+        let said = report(&state, "1.0", 'a', "");
+        assert_eq!(said["failed"], "1.1");
+        assert!(
+            said["why"].as_str().unwrap().contains("handed over to failed"),
+            "{said}"
+        );
+        // A system that has caught up (a reboot into the new slot) has nothing to note.
+        std::fs::remove_file(tried(&state)).unwrap();
+        forgo_failed_hand_over(&state, "1.1", &record, &exe);
+        assert!(!tried(&state).exists());
+    }
+
+    #[test]
+    fn refuses_a_file_larger_than_most_and_leaves_nothing_staged() {
+        let (dir, from) = folders("large");
+        let big = vec![7u8; STAGE_MOST as usize + 1];
+        std::fs::write(&from, &big).unwrap();
+        let why = stage(&from, &sum(&big), &dir).unwrap_err();
+        assert!(why.contains("larger"), "{why}");
+        assert!(!dir.join("kithd").exists() && !dir.join("kithd.new").exists());
     }
 }
