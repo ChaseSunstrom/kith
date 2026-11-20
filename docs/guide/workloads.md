@@ -29,6 +29,13 @@ directory is refused.
 - **Logs.** `kith logs KIND/NAME` prints a unit's output; `--unit`, `--replica`, `--stderr`,
   `--tail LINES`, `--previous` (the one old copy) and `-f` narrow it. Deleting the Workload or Job
   deletes its logs.
+- **One-off containers.** `kith launch IMAGE [-n NS] [--name N] [-e K=V] [-p PORT] [-d] [-- CMD]`
+  applies a `Job` (no retries, never restarted), follows its logs and exits with the container's
+  exit code; `-d` applies a one-replica `Workload` instead and returns. The name is the image's
+  and the first number free (`alpine-1`). `kith ps [-n NS | -A]` lists every Workload replica,
+  Job run and exec unit with its node, state, exit code, image or command and age, from the
+  `status.containers` kithd writes. It is not `kith run`: `kith run` is waypipe's (a graphical
+  program on a node, `--on` required) and keeps that meaning.
 - **Probes.** `readiness` decides whether a replica counts as ready. A `liveness` probe that fails
   `failureThreshold` times in a row (3) restarts the container. `tcp` and `http` probes go to
   `localhost` every `intervalSeconds` (10), and once a second until the first success. A liveness

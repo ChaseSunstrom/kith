@@ -13,6 +13,7 @@ use std::process::ExitCode;
 
 mod context;
 mod import;
+mod launch;
 mod remote;
 mod signing;
 mod ui;
@@ -144,6 +145,10 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Run one container without a file: a Job whose output and exit code are this command's, or with -d a Workload (`run` is for apps' windows)
+    Launch(launch::Launch),
+    /// List what runs: each unit of the Workloads, NodeWorkloads and Jobs, with its node, state, exit code and age
+    Ps(launch::Ps),
     /// Run an app on a node and show its window here, through waypipe (installed on both ends)
     Run {
         /// The node's name, or labels (KEY=VALUE[,KEY=VALUE]) for the first ready node that has them
@@ -1399,27 +1404,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             if let Some(unit) = unit {
                 path += &format!("&unit={}", escape(&unit));
             }
-            let mut from = tail.map_or("&offset=0".into(), |lines| format!("&tail={lines}"));
-            loop {
-                let reply: serde_json::Value = request(&kithd, "GET", &format!("{path}{from}"), b"")?;
-                let data = reply["data"].as_str().unwrap_or_default();
-                {
-                    use std::io::Write;
-                    let mut out = std::io::stdout();
-                    if out.write_all(data.as_bytes()).and_then(|()| out.flush()).is_err() {
-                        break; // `kith logs | head`
-                    }
-                }
-                from = format!("&offset={}", reply["next"].as_u64().unwrap_or(0));
-                if data.is_empty() {
-                    // Drained. Without -f that is all; with it, wait for more while more may come.
-                    if !follow || reply["more"] != true {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-            }
+            stream_logs(&kithd, &path, tail, follow)?;
         }
+        Command::Launch(launch) => return launch::launch(launch, &backend()?),
+        Command::Ps(ps) => launch::ps(&ps, &backend()?)?,
         Command::History { target } => {
             let history = backend()?.history(&target.key(&backend)?)?;
             let rows = history.iter().map(|r| {
@@ -2506,6 +2494,32 @@ fn load(files: &Files) -> Result<Vec<Resource>, String> {
         Ok(resources)
     } else {
         Err(errors.join("\n"))
+    }
+}
+
+/// Print a unit's output from kithd's `path` (`kith logs`, and `kith launch` following its Job):
+/// from `tail` lines back or the start; with `follow`, until no more may come. False when stdout
+/// was closed first (`kith logs | head`).
+fn stream_logs(kithd: &Kithd, path: &str, tail: Option<u64>, follow: bool) -> Result<bool, String> {
+    let mut from = tail.map_or("&offset=0".into(), |lines| format!("&tail={lines}"));
+    loop {
+        let reply: serde_json::Value = request(kithd, "GET", &format!("{path}{from}"), b"")?;
+        let data = reply["data"].as_str().unwrap_or_default();
+        {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            if out.write_all(data.as_bytes()).and_then(|()| out.flush()).is_err() {
+                return Ok(false);
+            }
+        }
+        from = format!("&offset={}", reply["next"].as_u64().unwrap_or(0));
+        if data.is_empty() {
+            // Drained. Without -f that is all; with it, wait for more while more may come.
+            if !follow || reply["more"] != true {
+                return Ok(true);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
 }
 

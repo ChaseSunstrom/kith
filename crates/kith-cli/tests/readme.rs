@@ -770,6 +770,21 @@ fn the_guide_says_a_bare_pod_is_run_and_deleted() {
     );
 }
 
+/// `kith launch` and `kith ps` are written down, with why the one-off container is not `run`
+/// (which is waypipe's, and needs `--on`).
+#[test]
+fn the_docs_say_launch_and_ps_and_why_it_is_not_run() {
+    for said in [
+        "kith launch alpine -- echo hi",
+        "kith ps -A",
+        "`kith launch IMAGE",
+        "`kith ps [-n NS | -A]`",
+        "`kith run` is waypipe's",
+    ] {
+        assert!(README.contains(said), "the docs no longer say {said:?}");
+    }
+}
+
 /// The installer's page (docs/install.html) carries the three answer files kithd's own unit test parses
 /// (`the_install_page_examples`), and the front page and the guide lead to it.
 #[test]

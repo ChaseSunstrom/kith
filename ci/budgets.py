@@ -82,7 +82,10 @@ KITHD_IDLE_RSS = 9 * MB
 # RAISE, kith 3.04 to 3.05 and kith-remote 3.66 to 3.67 (T-1192 for train B): main 76101487 with
 # train B's eight lanes builds kith at 3,192,184 B and kith-remote at 3,843,512 B (main alone
 # 3,179,864 B and 3,831,160 B); T-0269 brings them back down.
-SIZE_BUDGETS = {"kith": int(3.05 * MB), "kith-remote": int(3.67 * MB), "kithd": int(KITHD_SIZE * MB)}
+# RAISE, kith 3.05 to 3.06 and kith-remote 3.67 to 3.68 (T-1215): kith launch and kith ps (a Job
+# or Workload built and applied, the logs followed, a table of status.containers) make kith
+# 3,200,344 B and kith-remote 3,851,640 B built here, 2.0 KB and 3.4 KB over.
+SIZE_BUDGETS = {"kith": int(3.06 * MB), "kith-remote": int(3.68 * MB), "kithd": int(KITHD_SIZE * MB)}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
