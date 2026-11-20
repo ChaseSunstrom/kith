@@ -30,7 +30,7 @@ const LABEL_SCALE: usize = 2;
 /// the tails of g, j, p, q, y, the comma and the semicolon. Lines are `LINE_H` rows apart.
 const GLYPH_H: usize = 9;
 const CAP_H: usize = 7;
-const LINE_H: usize = 12;
+const LINE_H: usize = GLYPH_H + 3;
 
 /// The rail's stops, in the order the installer asks its questions (install.rs's `interview`).
 pub const STOPS: [&str; 6] = ["Disk", "Name", "Address", "Join", "Encryption", "Erase"];
@@ -757,7 +757,13 @@ mod tests {
         line.rect(0, 0, 800, 600, site("bg"));
         let room = (800 - 2 * MARGIN) / (6 * LABEL_SCALE);
         for (n, piece) in wrap(text, room).iter().enumerate() {
-            line.text(MARGIN, LINE_Y + n * LINE_H * LABEL_SCALE, LABEL_SCALE, piece, site("dim"));
+            line.text(
+                MARGIN,
+                LINE_Y + n * LINE_H * LABEL_SCALE,
+                LABEL_SCALE,
+                piece,
+                site("dim"),
+            );
         }
         for y in LINE_Y..LINE_Y + (LINE_H + GLYPH_H) * LABEL_SCALE {
             for x in 0..800 {
