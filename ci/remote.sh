@@ -21,11 +21,11 @@
 # --vm runs each named test of ci/vm.sh (sh ci/vm.sh --test TEST) in a Job of its own, one at a
 # time on each node, with the node's /dev/kvm: a Device ci-kvm-NODE of it, granted to namespace ci
 # alone, and a shared DeviceClaim ci-kvm-NODE, named by the Job (the claim is applied each run, the
-# Device only where it is not there; one that is wrong is deleted first: DELETE /v1/resources/Device/ci-kvm-NODE).
+# Device only where it is not there, or is wrong (another node's or path, or granted past ci: it is applied over).
 # Everything else this applies (Volumes, Jobs, claims) is in namespace ci: a Volume ci-NODE that an
 # earlier version made in namespace default stays until it is deleted by hand (DELETE
 # /v1/resources/Volume/default/ci-NODE). A Job that is
-# still pending after KITH_REMOTE_PENDING seconds (600) is given up on, with its claim's own message
+# still pending after KITH_REMOTE_PENDING seconds (600; --vm Jobs only) is given up on, with its claim's own message
 # as the log, so a node with no /dev/kvm to give ends the run at once, not at the hour. The tools the tests need are
 # installed by apt into a copy of the image's root in the node's Volume, once; there too stay the
 # OS build's cache and cargo's. A test that ci/vm.sh skips (no KVM, a tool missing) counts as
@@ -36,6 +36,8 @@ timeout=${KITH_REMOTE_TIMEOUT:-3600}
 cache_mb=${KITH_REMOTE_CACHE_MB:-30000}
 # (How long a Job may stay pending before the run gives up on it, seconds.)
 pending=${KITH_REMOTE_PENDING:-600}
+# (Both are used in arithmetic and in a Job's env: digits, or the run is refused.)
+case $cache_mb$pending in '' | *[!0-9]*) echo "remote.sh: KITH_REMOTE_CACHE_MB and KITH_REMOTE_PENDING are whole numbers" >&2; exit 64 ;; esac
 # (CI's namespace: its Volumes, Jobs and claims, and the one /dev/kvm is granted to.)
 ns=ci
 
@@ -196,8 +198,9 @@ one() (
     volume_json "$node" | api apply -H 'content-type: application/json' --data-binary @- >"$answer" 2>&1
     if grep -qE '"error"|^curl:' "$answer"; then cp "$answer" "$dir/$i.log"; echo "Volume refused" >"$dir/$i.state"; return 0; fi
     if [ -n "$vmtest" ]; then
-        # (The Device only where it is not there, so a run does not write it over again; the claim each time.)
-        if api "resources/Device/ci-kvm-$node" | jq -e '.kind == "Device"' >/dev/null 2>&1; then dev_json "$node" | jq '[.[1]]'; else dev_json "$node"; fi |
+        # (The Device only where it is not there or is wrong (not this node's /dev/kvm, or granted past ci), applied over; the claim each time.)
+        if api "resources/Device/ci-kvm-$node" | jq -e --arg node "$node" --arg ns "$ns" \
+            '.kind == "Device" and .spec.node == $node and .spec.path == "/dev/kvm" and .metadata.labels["kith.dev/namespaces"] == $ns' >/dev/null 2>&1; then dev_json "$node" | jq '[.[1]]'; else dev_json "$node"; fi |
             api apply -H 'content-type: application/json' --data-binary @- >"$answer" 2>&1
         if grep -qE '"error"|^curl:' "$answer"; then cp "$answer" "$dir/$i.log"; echo "Device refused" >"$dir/$i.state"; return 0; fi
     fi
@@ -220,7 +223,8 @@ one() (
     while [ "$state" != succeeded ] && [ "$state" != failed ]; do
         [ "$waited" -lt $((timeout + 600)) ] || { gave="no end after $waited s"; break; }
         # (Still pending after PENDING s: nothing placed it, as when the node has no /dev/kvm to give. Its claim says why.)
-        if [ "$state" = pending ] && [ "$waited" -ge "$pending" ]; then
+        # (Only a --vm Job: a fan Job waits its node's turn behind another run's, as long as the timeout.)
+        if [ -n "$vmtest" ] && [ "$state" = pending ] && [ "$waited" -ge "$pending" ]; then
             why=$(api "resources/DeviceClaim/$ns/ci-kvm-$node" | jq -r '.status.message // empty' 2>/dev/null) || why=''
             gave="Job still pending after $waited s${why:+: $why}"
             break

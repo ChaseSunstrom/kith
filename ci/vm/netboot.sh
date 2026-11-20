@@ -159,9 +159,14 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
                     }
                     # Told to seal, a machine with no TPM says why not, and runs on as it was.
                     lock seal | grep -q '"seal": *true' || fail "the machine could not be told to seal its key"
-                    # (The cluster handed the key out, so kithd reads the firmware's event log before it opens the TPM: with no TPM there is no log to read, and that is what it says.)
-                    hears beta 'is not sealed: reading /sys/kernel/security/tpm0/binary_bios_measurements'
-                    told 'binary_bios_measurements'
+                    # (Where the firmware leaves no event log, KITH_VM_NO_TPM_LOG=1, which the cluster's Jobs set, kithd reads the log before it opens the TPM: with no TPM there is no log, and that is what it says.)
+                    if [ -n "${KITH_VM_NO_TPM_LOG:-}" ]; then
+                        hears beta 'is not sealed: reading /sys/kernel/security/tpm0/binary_bios_measurements'
+                        told 'binary_bios_measurements'
+                    else
+                        hears beta 'is not sealed: this machine has no TPM'
+                        told 'no TPM'
+                    fi
                     off
                     [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the machine's disk, read from outside: $(says "$work/beta.disk")"
                     # With its TPM: it asks the node this once, and seals its key to what it runs.

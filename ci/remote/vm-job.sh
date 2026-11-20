@@ -51,7 +51,8 @@ EOF
     # (Root here is the Job's user, the one uid this namespace maps: tar, as root, would give a file
     # its owner in the archive, a uid not mapped, and fail on it. TAR_OPTIONS keeps the files ours.)
     export LD_PRELOAD="$shim" TAR_OPTIONS=--no-same-owner HOME="$work" TMPDIR=/tmp CARGO_HOME="$cache/cargo" \
-        CARGO_TARGET_DIR="$cache/target" KITH_OS_CACHE="$cache/os" XDG_CACHE_HOME="$cache/xdg"
+        CARGO_TARGET_DIR="$cache/target" KITH_OS_CACHE="$cache/os" XDG_CACHE_HOME="$cache/xdg" \
+        KITH_VM_NO_TPM_LOG=1
     # (What a machine of one's own has: rollout signs with the checkout's kith from target/debug;
     # kube wants kubectl and helm, which ci/kube.sh --vm fetches, checked by their hashes.)
     case $TEST in
@@ -66,6 +67,7 @@ end() { [ "$1" = 0 ] || echo "FAILED $TEST"; echo "SUMMARY exit=$1 test=$TEST ho
 cd "$cache" && mkdir -p in src cargo os apt/archives/partial apt/lists/partial
 find in -type f -mtime +1 -delete
 # (The cargo target folder only grows: dropped at CAP_MB, as ci/remote.sh's own Jobs drop theirs.)
+case ${CAP_MB:-30000} in '' | *[!0-9]*) end 2 why=CAP_MB ;; esac
 mb=$(du -sm target 2>/dev/null | cut -f1); [ "${mb:-0}" -lt "${CAP_MB:-30000}" ] || rm -rf target
 cd src && { [ -d .git ] || git init -q; }
 git fetch -q --depth 1 "$REPO" $BASES || end 2 why=fetch

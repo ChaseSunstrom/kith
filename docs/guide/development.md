@@ -99,7 +99,10 @@ The VM tests (`sh ci/vm.sh --test NAME`) can go to the same cluster:
     no persistent NVRAM, and that second start gave the disk no boot index; it has one now.
   - `blackout`: the guests find no TPM event log
     (`/sys/kernel/security/tpm0/binary_bios_measurements`) with Debian's OVMF and swtpm, so
-    no node seals its key. The test skips, with that reason, where the log is missing.
+    no node seals its key. A Job sets `KITH_VM_NO_TPM_LOG=1`, and with it `blackout`, `tpm`
+    and `netboot` skip, with that reason, at the step the log is missing (`netboot` expects the
+    log-read error there instead of "this machine has no TPM"). Without it, a run on a machine
+    of one's own asserts the TPM texts as before, and fails where its firmware has no log.
   - `share` ("the Share mine does not say where it is") compared a status that has had a
     `served` flag since T-1010: the check accepts it.
   - `kube` ("the claim was refused") is likely the nodes' clocks, hours off; it is not yet
@@ -107,13 +110,15 @@ The VM tests (`sh ci/vm.sh --test NAME`) can go to the same cluster:
   - `clock`, `mesh`, `nofile` and `fido2` came after that run: not yet run on a Job. Nothing in
     them asks more of a Job than the others (`fido2` makes its keys in the guest, on its
     kernel's uhid); a failure there is a difference of the Job to read.
-- **The Device.** It is applied only when the cluster has none by that name, so a second run
-  leaves a Device alone that someone changed. An old Volume `ci-NODE` of the `default`
+- **The Device.** It is applied only when the cluster has none by that name, or one that is
+  wrong (another node or path, or granted to more than `ci`): a second run leaves a right one
+  alone. An old Volume `ci-NODE` of the `default`
   namespace (from before Jobs went to `ci`) is not used: remove it with
   `DELETE /v1/resources/Volume/default/ci-NODE`.
-- **A pending Job.** A Job still pending after `KITH_REMOTE_PENDING` seconds (600 by default)
-  fails with the DeviceClaim's status message. The cache is dropped at the size
-  `KITH_REMOTE_CACHE_MB` gives (30000 MB by default), as the fan's is.
+- **A pending Job.** A `--vm` Job still pending after `KITH_REMOTE_PENDING` seconds (600 by
+  default) fails with the DeviceClaim's status message; a fan Job waits as long as its timeout.
+  The cache is dropped at the size `KITH_REMOTE_CACHE_MB` gives (30000 MB by default), as the
+  fan's is. Both settings must be whole numbers, or the run is refused (exit 64).
 
 Time budgets are medians of five runs on one machine, no VM. `python3 ci/budgets.py --times`
 prints them; `python3 ci/budgets.py` holds each to twice the slowest of three medians on main on

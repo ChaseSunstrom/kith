@@ -20,7 +20,7 @@ self_test() {
     # skips, and fails the rest)
     mkdir "$t/w/ci"
     # shellcheck disable=SC2016 # (the stub's)
-    printf '%s\n' '[ "$1" = --test ] || exit 9' 'case $2 in alone) [ "${TAR_OPTIONS-}" = --no-same-owner ] || { echo "vm.sh: FAIL: tar keeps owners"; exit 1; }; echo "vm.sh: ok: alone" ;; skipme) echo "skipped: no KVM"; exit 0 ;; *) echo "vm.sh: FAIL: $2"; exit 1 ;; esac' >"$t/w/ci/vm.sh"
+    printf '%s\n' '[ "$1" = --test ] || exit 9' 'case $2 in alone) [ "${TAR_OPTIONS-}" = --no-same-owner ] || { echo "vm.sh: FAIL: tar keeps owners"; exit 1; }; [ "${KITH_VM_NO_TPM_LOG-}" = 1 ] || { echo "vm.sh: FAIL: the Job does not say its firmware has no TPM log"; exit 1; }; echo "vm.sh: ok: alone" ;; skipme) echo "skipped: no KVM"; exit 0 ;; *) echo "vm.sh: FAIL: $2"; exit 1 ;; esac' >"$t/w/ci/vm.sh"
     # shellcheck disable=SC2016 # (the stub's)
     printf '%s\n' 'echo "kube.sh $*" >>"$FAKE_RAN"' 'echo "kube.sh: skipped: could not fetch kubectl" >&2' >"$t/w/ci/kube.sh"
     echo three >"$t/w/f" && echo x >"$t/w/g" && git -C "$t/w" add g ci && git -C "$t/w" commit -qam three
@@ -125,7 +125,8 @@ EOF
             case $1 in
             apply) cat >>"$t/applied" ;;
             volumes/*) cat >/dev/null ;;
-            resources/Device/ci-kvm-n3) echo '{"kind": "Device", "metadata": {"name": "ci-kvm-n3"}}' ;;
+            resources/Device/ci-kvm-n3) echo '{"kind": "Device", "metadata": {"name": "ci-kvm-n3", "labels": {"kith.dev/namespaces": "ci"}}, "spec": {"node": "n3", "path": "/dev/kvm"}}' ;;
+            resources/Device/ci-kvm-n4) echo '{"kind": "Device", "metadata": {"name": "ci-kvm-n4", "labels": {"kith.dev/namespaces": "ci,default"}}, "spec": {"node": "n4", "path": "/dev/kvm"}}' ;;
             resources/Device/*) echo '{"error": "no such resource"}' ;;
             resources/*) echo '{"status": {"state": "succeeded"}}' ;;
             logs/*) echo '{"data": "SUMMARY exit=0"}' ;;
@@ -137,12 +138,13 @@ EOF
         one n1 0 3 "$c" "$bases" --workspace "$t/ns"
         one n2 1 3 "$c" "$bases" "" "$t/ns" alone
         one n3 2 3 "$c" "$bases" "" "$t/ns" alone
+        one n4 3 4 "$c" "$bases" "" "$t/ns" alone
     ) || die "one, its API stubbed, failed"
-    [ "$(jq -s -r 'add | map(select(.kind == "Device") | .metadata.name) | join(",")' "$t/applied")" = ci-kvm-n2 ] || die "a Device was applied that is there already, or not applied that is not: $(cat "$t/applied")"
-    [ "$(jq -s -r 'add | map(select(.kind == "DeviceClaim") | .metadata.name) | join(",")' "$t/applied")" = ci-kvm-n2,ci-kvm-n3 ] || die "a claim is not applied each run"
-    jq -s -e 'add | length == 9 and all(if .kind == "Device" then .metadata.labels["kith.dev/namespaces"] == "ci" and .metadata.namespace == null else .metadata.namespace == "ci" end)' "$t/applied" >/dev/null || die "an object applied outside namespace ci: $(cat "$t/applied")"
+    [ "$(jq -s -r 'add | map(select(.kind == "Device") | .metadata.name) | join(",")' "$t/applied")" = ci-kvm-n2,ci-kvm-n4 ] || die "a Device was applied that is right already, or not applied that is absent or wrong (granted past ci): $(cat "$t/applied")"
+    [ "$(jq -s -r 'add | map(select(.kind == "DeviceClaim") | .metadata.name) | join(",")' "$t/applied")" = ci-kvm-n2,ci-kvm-n3,ci-kvm-n4 ] || die "a claim is not applied each run"
+    jq -s -e 'add | length == 13 and all(if .kind == "Device" then .metadata.labels["kith.dev/namespaces"] == "ci" and .metadata.namespace == null else .metadata.namespace == "ci" end)' "$t/applied" >/dev/null || die "an object applied outside namespace ci: $(cat "$t/applied")"
     ! grep -vE '^(apply|resources/Device/ci-kvm-n[0-9]+|(resources/Job|logs/Job|volumes)/ci/.)' "$t/paths" || die "an API path outside namespace ci"
-    ok "every object a run applies (Volume, Job, claim) is in namespace ci; the Device is granted to ci alone, and applied only where it is not there"
+    ok "every object a run applies (Volume, Job, claim) is in namespace ci; the Device is granted to ci alone, and applied only where it is absent or wrong"
     # a Job still pending after a while is given up on, with the claim's own word of why (the claim of
     # /dev/kvm that no node can give, say), not waited on for the hour
     : >"$t/paths" && mkdir "$t/pend" && mkdir "$t/pend/in" && : >"$t/pend/in/x.bundle"
@@ -165,6 +167,30 @@ EOF
     grep -q 'still pending after .* s: no Device ci-kvm-n1 is free' "$t/pend/0.log" || die "a Job pending for ever has no claim's message in its log: $(cat "$t/pend/0.log")"
     [ "$(grep -c '^resources/Job/ci/.*' "$t/paths")" -lt 10 ] || die "a pending Job was waited on far past its time: $(grep -c '^resources/Job' "$t/paths") asks"
     ok "a Job still pending after a while fails at once with the claim's message, not after the hour"
+    # a fan Job queues behind another run's on its node: not cut at the pending time, only at its timeout
+    : >"$t/paths" && mkdir "$t/pend2"
+    # shellcheck disable=SC2030,SC2034,SC2317 # (the stubs are the subshell's)
+    (
+        api() {
+            case $1 in
+            apply | volumes/*) cat >/dev/null ;;
+            resources/Job/*) echo '{"status": {}}' ;;
+            logs/*) echo '{"data": null}' ;;
+            esac
+        }
+        sleep() { :; }
+        timeout=300 pending=60
+        one n1 0 1 "$c" "$bases" "" "$t/pend2"
+    ) || die "one, a fan Job pending, failed"
+    ! grep -q 'still pending' "$t/pend2/0.log" || die "a fan Job was cut at the pending time: $(cat "$t/pend2/0.log")"
+    grep -q 'no end after' "$t/pend2/0.log" || die "a fan Job pending was not held to its timeout: $(cat "$t/pend2/0.log")"
+    # the two numbers go into arithmetic and a Job's env: not digits, refused
+    for v in KITH_REMOTE_PENDING KITH_REMOTE_CACHE_MB; do
+        code=0
+        env "$v=1;x" sh "$self" --vm alone HEAD >/dev/null 2>&1 || code=$?
+        [ "$code" = 64 ] || die "$v=1;x was not refused (exit $code)"
+    done
+    ok "a fan Job is held to its timeout, not the pending time; a setting that is not a whole number is refused"
     # one test per node at a time, each test once: the cluster's answers stubbed, one as it is (a
     # Job named ci-NODE-COMMIT-TEST-TIME starts at its apply and ends at its log)
     : >"$t/sched"
@@ -247,6 +273,14 @@ EOF
         sh -c "$SCRIPT"
     ) >"$t/vm/9.log" 2>&1 || die "--vm: a run with no CAP_MB failed: $(cat "$t/vm/9.log")"
     [ -e "$t/vc/target/big" ] || die "--vm: a target folder was dropped with no CAP_MB set"
+    # (a CAP_MB that is not a whole number ends the Job at the start, with exit 2, and runs nothing)
+    # shellcheck disable=SC2030,SC2031 # (the PATH is the subshell's: the node's)
+    (
+        export CACHE="$t/vc" WORK="$t/vw7" REPO="file://$t/gh.git" COMMIT="$c" BASES="$bases" TEST=alone PKGS="qemu socat" \
+            FROM="$t/from" SCRIPT="$vm_script" PATH="$t/bin:$PATH" FAKE_RAN="$t/ran" CAP_MB='1;x'
+        sh -c "$SCRIPT"
+    ) >"$t/vm/7.log" 2>&1 && die "--vm: a CAP_MB that is not digits was accepted"
+    grep -q '^SUMMARY exit=2 test=alone .*why=CAP_MB$' "$t/vm/7.log" || die "--vm: a bad CAP_MB is not exit 2 with its reason: $(cat "$t/vm/7.log")"
     # a gcc that leaves half a file and fails: the shim is not there to be taken for built next time
     printf '#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\necho half >"$2"\nexit 1\n' >"$t/bin/gcc" && chmod +x "$t/bin/gcc"
     mkdir "$t/vg"
