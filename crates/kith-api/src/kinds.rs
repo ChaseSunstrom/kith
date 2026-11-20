@@ -203,7 +203,8 @@ spec! {
         /// Kept and not acted on: an update is an `OSRelease`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub update_policy: Option<UpdatePolicy>,
-        /// Kept and not acted on: the mesh is set by kithd's flags.
+        /// The mesh switch (`enabled`, `port`): acted on by every node started without `--mesh`.
+        /// The rest of it is kept and not acted on: the mesh's addresses come from the CA.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub mesh: Option<MeshSpec>,
         /// Cluster-wide package values. Kept and not acted on: a package takes its own.
@@ -265,8 +266,15 @@ spec! {
         /// IPv6 ULA prefix for mesh addresses.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub cidr: Option<String>,
+        /// The switch: `true` and every node of the cluster that was not started with `--mesh`
+        /// brings the WireGuard mesh up (on `port`, 51820 without); off or left out, it does not.
+        /// A kith OS node takes it with no reinstall. The rest of this kind is kept and not
+        /// acted on.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub enabled: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub ipv4: Option<bool>,
+        /// The UDP port of the mesh's interface, with `enabled`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub port: Option<u16>,
     }

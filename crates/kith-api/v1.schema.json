@@ -1608,7 +1608,7 @@
               "type": "null"
             }
           ],
-          "description": "Kept and not acted on: the mesh is set by kithd's flags."
+          "description": "The mesh switch (`enabled`, `port`): acted on by every node started without `--mesh`.\nThe rest of it is kept and not acted on: the mesh's addresses come from the CA."
         },
         "values": {
           "type": "object",
@@ -2794,6 +2794,13 @@
           ],
           "description": "IPv6 ULA prefix for mesh addresses."
         },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The switch: `true` and every node of the cluster that was not started with `--mesh`\nbrings the WireGuard mesh up (on `port`, 51820 without); off or left out, it does not.\nA kith OS node takes it with no reinstall. The rest of this kind is kept and not\nacted on."
+        },
         "ipv4": {
           "type": [
             "boolean",
@@ -2807,7 +2814,8 @@
           ],
           "format": "uint16",
           "minimum": 0,
-          "maximum": 65535
+          "maximum": 65535,
+          "description": "The UDP port of the mesh's interface, with `enabled`."
         }
       }
     },
