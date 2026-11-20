@@ -732,6 +732,112 @@ spec:
     assert_eq!(out.lines().count(), 3, "{out}");
 }
 
+/// T-0031: the context verbs over a HOME of their own, and which of the file, the environment
+/// and the flags a command takes its server from (a kith without `remote` names the server and
+/// identity it was to call, which is all that is read here).
+#[test]
+fn context_verbs_and_the_order_of_what_names_the_server() {
+    let sb = Sandbox::new("contexts");
+    for dir in ["alice", "bob"] {
+        std::fs::create_dir(sb.0.join(dir)).unwrap();
+    }
+    let kith = |env: &[(&str, &str)], args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kith"));
+        command
+            .args(args)
+            .current_dir(&sb.0)
+            .env("HOME", sb.0.join("home"))
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("KITH_STORE")
+            .env_remove("KITH_SERVER")
+            .env_remove("KITH_IDENTITY")
+            .env_remove("KITH_CONTEXT")
+            .env_remove("KITH_SOCKET")
+            .envs(env.iter().copied());
+        let out = command.output().unwrap();
+        let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
+        (out.status.code().unwrap(), text(out.stdout), text(out.stderr))
+    };
+    let file = sb.0.join("home/.config/kith/contexts.yaml");
+    let (code, _, err) = kith(
+        &[],
+        &[
+            "context",
+            "add",
+            "lab",
+            "--server",
+            "lab.test:7443",
+            "--identity",
+            "alice",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    kith(
+        &[],
+        &[
+            "context",
+            "add",
+            "other",
+            "--server",
+            "other.test:7443",
+            "--identity",
+            "bob",
+        ],
+    );
+    assert!(file.is_file());
+    // No current one yet: a command that needs kithd goes to the socket, not to a server.
+    let (_, _, err) = kith(&[], &["get"]);
+    assert!(!err.contains("test:7443"), "{err}");
+    assert_eq!(kith(&[], &["context", "use", "lab"]).0, 0);
+    let (code, listing, _) = kith(&[], &["context", "ls"]);
+    assert!(
+        code == 0 && listing.contains("* lab\tlab.test:7443\t") && listing.contains("  other\t"),
+        "{listing}"
+    );
+
+    // The current one, the environment's, then the flag's: each names the server it was to call.
+    let (_, _, err) = kith(&[], &["get"]);
+    assert!(err.contains("lab.test:7443") && err.contains("alice"), "{err}");
+    let (_, _, err) = kith(&[("KITH_CONTEXT", "other")], &["get"]);
+    assert!(err.contains("other.test:7443") && err.contains("bob"), "{err}");
+    let (_, _, err) = kith(&[("KITH_CONTEXT", "other")], &["--context", "lab", "get"]);
+    assert!(err.contains("lab.test:7443"), "{err}");
+    // A flag wins over the file, each half on its own.
+    let (_, _, err) = kith(&[], &["--server", "flag.test:1", "--identity", "bob", "get"]);
+    assert!(err.contains("flag.test:1") && err.contains("bob"), "{err}");
+    let (_, _, err) = kith(&[], &["--context", "lab", "--identity", "bob", "get"]);
+    assert!(err.contains("lab.test:7443") && err.contains("bob"), "{err}");
+    // A store, or a socket, named as well: the file's current context is not what is meant.
+    let store = sb.0.join("store/store.json").display().to_string();
+    let (code, _, err) = kith(&[], &["--store", &store, "get"]);
+    assert_eq!(code, 0, "{err}");
+    let (_, _, err) = kith(&[], &["--socket", "none.sock", "get"]);
+    assert!(!err.contains("test:7443"), "{err}");
+
+    // An unknown name and a missing identity directory name the file.
+    let (code, _, err) = kith(&[], &["--context", "nope", "get"]);
+    assert!(
+        code == 2 && err.contains("no context") && err.contains("contexts.yaml"),
+        "{err}"
+    );
+    std::fs::remove_dir(sb.0.join("alice")).unwrap();
+    let (code, _, err) = kith(&[], &["get"]);
+    assert!(
+        code == 2 && err.contains("identity directory") && err.contains("contexts.yaml"),
+        "{err}"
+    );
+    // A command that calls no kithd does not read the file.
+    assert_eq!(kith(&[], &["schema"]).0, 0);
+
+    // rm: the current one is gone, and a second rm says so.
+    assert_eq!(kith(&[], &["context", "rm", "lab"]).0, 0);
+    assert_eq!(kith(&[], &["context", "rm", "lab"]).0, 2);
+    let (_, listing, _) = kith(&[], &["context", "ls"]);
+    assert_eq!(listing.lines().count(), 1, "{listing}");
+    let (_, _, err) = kith(&[], &["get"]);
+    assert!(!err.contains("test:7443"), "{err}");
+}
+
 /// A Cluster's fields that nothing reads: `kith lint` says so of each one the file sets, on
 /// stderr, and the file is still fine.
 #[test]
