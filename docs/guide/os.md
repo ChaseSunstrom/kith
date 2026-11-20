@@ -108,7 +108,11 @@ sh os/build.sh --spec n1.yaml --out target/os-n1
 
 A node with no card a feature matches prints `features: []`; a node that runs no kith OS has no
 `wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
-card the catalogue does not list yet) is chosen by hand, as above.
+card the catalogue does not list yet) is chosen by hand, as above. A line may give `vendor:*`
+instead of a device id, which matches any display card (PCI class 03) of that vendor and not its
+audio function: `all` has `10de:*`, so a node with an NVIDIA GPU wants `all` (nouveau's driver is
+in it). A node that also has an AMD Phoenix GPU wants `all` alone, which build.sh would refuse with
+`gpu-amd-phoenix` and whose modules cover that GPU.
 
 #### The `all` feature: drivers as signed modules
 

@@ -68,7 +68,7 @@ features: [gpu-amd-phoenix]
 <pre><code class="language-sh">kith node features n1 &gt; n1.yaml
 sh os/build.sh --spec n1.yaml --out target/os-n1
 </code></pre>
-<p>A node with no card a feature matches prints <code>features: []</code>; a node that runs no kith OS has no <code>wants</code> and the command says so. Only PCI cards are matched. A feature with no <code># pci:</code> line (a card the catalogue does not list yet) is chosen by hand, as above.</p>
+<p>A node with no card a feature matches prints <code>features: []</code>; a node that runs no kith OS has no <code>wants</code> and the command says so. Only PCI cards are matched. A feature with no <code># pci:</code> line (a card the catalogue does not list yet) is chosen by hand, as above. A line may give <code>vendor:*</code> instead of a device id, which matches any display card (PCI class 03) of that vendor and not its audio function: <code>all</code> has <code>10de:*</code>, so a node with an NVIDIA GPU wants <code>all</code> (nouveau's driver is in it). A node that also has an AMD Phoenix GPU wants <code>all</code> alone, which build.sh would refuse with <code>gpu-amd-phoenix</code> and whose modules cover that GPU.</p>
 <h4 id="the-all-feature-drivers-as-signed-modules">The <code>all</code> feature: drivers as signed modules <a class="anchor" href="#the-all-feature-drivers-as-signed-modules" aria-label="Link to this section">#</a></h4>
 <pre><code class="language-sh">KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
 KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
