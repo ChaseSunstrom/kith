@@ -13,7 +13,8 @@
 #   hmac-secret = HMAC-SHA256(HMAC-SHA256(seed byte x 32, credential id), salt)
 # and checks: seed 1's and seed 2's secrets are what their seeds say and are not each other's;
 # seed 3 has its touch withheld first (the client gives up, no credential is made) and then given
-# (its secret is what its seed says). A disk file only: the machine's disk is a copy of the image.
+# (its secret is what its seed says). Seed 1's key lists PIN/UV auth protocol 1 only, seed 2's
+# protocol 2 only, seed 3's both (the client takes 2): both protocols run. A disk file only: the machine's disk is a copy of the image.
 # It never touches a real key or disk.
     [ "$time" -gt 180 ] || time=180
     cp "$osdir/kith-os.raw" "$work/disk.raw"
@@ -56,6 +57,15 @@ print(hmac.new(random, bytes(range(32)), hashlib.sha256).hexdigest())' "$1" "$2"
         eval "secret$seed=\$got"
     done
     [ "$secret1" != "$secret2" ] || fail "two keys with two seeds gave the same hmac-secret"
+    # Both PIN/UV auth protocols: the stand-in refuses one it does not list, so these secrets are proof.
+    said_clean 'kithd: fido2-test: key 1 lists pinUvAuthProtocols \[1\]$' || fail "key 1 did not list protocol 1 alone"
+    said_clean 'kithd: fido2-test: key 2 lists pinUvAuthProtocols \[2\]$' || fail "key 2 did not list protocol 2 alone"
+    said_clean 'kithd: fido2-test: key 3 lists pinUvAuthProtocols \[1, 2\]$' || fail "key 3 did not list both protocols"
+    # What each key served (its clientPIN getKeyAgreement): the client takes 2 whenever it is listed.
+    said_clean 'kithd: fido2-test: key 1 served pinUvAuthProtocol 1$' || fail "key 1 did not serve protocol 1"
+    said_clean 'kithd: fido2-test: key 2 served pinUvAuthProtocol 2$' || fail "key 2 did not serve protocol 2"
+    said_clean 'kithd: fido2-test: key 3 served pinUvAuthProtocol 2$' || fail "key 3 (lists both) did not serve protocol 2"
+    ! said_clean 'kithd: fido2-test: key 3 served pinUvAuthProtocol 1$' || fail "key 3 (lists both) served protocol 1: the client did not take 2"
     # Seed 3: the withheld touch was given up on, before the credential that came with the touch.
     log=$(cat "$work/clean")
     gave=$(printf '%s\n' "$log" | grep -an 'kithd: fido2-test: key 3: touch withheld: gave up' | head -n 1 | cut -d: -f1)

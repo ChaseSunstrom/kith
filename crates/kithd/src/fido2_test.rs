@@ -22,7 +22,7 @@ pub const STARTUP_LINE: &[u8] = b"kithd: built with fido2-test: `fido2-test` amo
 pub mod auth {
     use crate::fido2::cbor::{self, Value};
     use crate::fido2::frame::{self, BROADCAST, Device, REPORT};
-    use crate::fido2::{cbc, hmac};
+    use crate::fido2::hmac;
     use ring::{agreement, digest, hmac as ring_hmac, rand};
     use std::{collections::VecDeque, io, path::PathBuf};
 
@@ -79,7 +79,8 @@ pub mod auth {
         /// Every CTAP2 request received: its command byte and its map.
         #[cfg(test)]
         pub seen: Vec<(u8, Value)>,
-        agreement: Option<agreement::EphemeralPrivateKey>,
+        /// The last getKeyAgreement's private key, and the protocol it was asked for.
+        agreement: Option<(hmac::Protocol, agreement::EphemeralPrivateKey)>,
         incoming: Option<(u32, u8, usize, Vec<u8>)>,
         /// A request waiting for its touch: the channel and the request.
         pending: Option<(u32, Vec<u8>)>,
@@ -112,7 +113,7 @@ pub mod auth {
                 fault: Fault::None,
                 seed: 1,
                 pin: false,
-                protocols: vec![1],
+                protocols: vec![1, 2],
                 extensions: vec!["hmac-secret"],
                 grant_hmac: true,
                 creds: vec![],
@@ -188,6 +189,15 @@ pub mod auth {
                 .collect()
         }
 
+        /// The protocol a request names, if this key lists it (INVALID_PARAMETER if not).
+        fn protocol(named: Option<&Value>, listed: &[u64]) -> Result<hmac::Protocol, u8> {
+            match named {
+                Some(Value::Uint(1)) if listed.contains(&1) => Ok(hmac::Protocol::One),
+                Some(Value::Uint(2)) if listed.contains(&2) => Ok(hmac::Protocol::Two),
+                _ => Err(0x02),
+            }
+        }
+
         fn ctap(&mut self, cmd: u8, p: &Value) -> Result<Value, u8> {
             match cmd {
                 0x04 => Ok(Value::Map(vec![
@@ -196,7 +206,8 @@ pub mod auth {
                     (u(6), Value::Array(self.protocols.iter().map(|n| u(*n)).collect())),
                 ])),
                 0x06 => {
-                    if p.get(&u(1)) != Some(&u(1)) || p.get(&u(2)) != Some(&u(2)) {
+                    let protocol = Self::protocol(p.get(&u(1)), &self.protocols)?;
+                    if p.get(&u(2)) != Some(&u(2)) {
                         return Err(0x02);
                     }
                     let k = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rand::SystemRandom::new())
@@ -206,7 +217,14 @@ pub mod auth {
                     if public.len() != 65 {
                         return Err(0x7f);
                     }
-                    self.agreement = Some(k);
+                    // (the VM test reads which protocol each key served: ci/vm/fido2.sh)
+                    #[cfg(feature = "fido2-test")]
+                    eprintln!(
+                        "kithd: fido2-test: key {} served pinUvAuthProtocol {}",
+                        self.seed,
+                        protocol.number()
+                    );
+                    self.agreement = Some((protocol, k));
                     Ok(Value::Map(vec![(u(1), hmac::cose(&public[1..33], &public[33..]))]))
                 }
                 0x01 => {
@@ -248,18 +266,23 @@ pub mod auth {
                         return Err(0x14);
                     };
                     let peer = hmac::point(cose).map_err(|_| 0x02u8)?;
-                    let k = self.agreement.take().ok_or(0x21u8)?; // PROCESSING
-                    let secret = agreement::agree_ephemeral(
+                    let (protocol, k) = self.agreement.take().ok_or(0x21u8)?; // PROCESSING
+                    // the request names its protocol (4, one by default) and it is the agreement's
+                    if Self::protocol(ext.get(&u(4)).or(Some(&u(1))), &self.protocols)? != protocol {
+                        return Err(0x02);
+                    }
+                    let keys = agreement::agree_ephemeral(
                         k,
                         &agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, &peer[..]),
-                        hmac::derive,
+                        |x| hmac::Keys::derive(protocol, x),
                     )
-                    .map_err(|_| 0x02u8)?;
-                    if hmac::mac16(&secret[..], enc) != auth[..] {
+                    .map_err(|_| 0x02u8)?
+                    .map_err(|_| 0x7fu8)?;
+                    if keys.authenticate(enc) != auth[..] {
                         return Err(0x33); // PIN_AUTH_INVALID
                     }
-                    let salt = cbc::run(&secret, &[0; 16], enc, false).map_err(|_| 0x02u8)?;
-                    let sealed = cbc::run(&secret, &[0; 16], &self.expected(&id, &salt), true).map_err(|_| 0x7fu8)?;
+                    let salt = keys.decrypt(enc).map_err(|_| 0x02u8)?;
+                    let sealed = keys.encrypt(&self.expected(&id, &salt)).map_err(|_| 0x7fu8)?;
                     let hmac_secret = match self.fault {
                         Fault::HmacSecretNotBytes => t("sealed"),
                         _ => Value::Bytes(sealed),
@@ -960,6 +983,17 @@ fn plug(seed: u8, touch: bool) -> Result<hidraw::Hidraw, String> {
     std::thread::spawn(move || {
         let mut key = auth::Key::new();
         key.seed = seed;
+        // seed 1 lists PIN/UV protocol 1 only, seed 2 protocol 2 only, the rest both (the client
+        // takes 2, and the key says it served 2): a key refuses a protocol it does not list
+        key.protocols = match seed {
+            1 => vec![1],
+            2 => vec![2],
+            _ => vec![1, 2],
+        };
+        eprintln!(
+            "kithd: fido2-test: key {seed} lists pinUvAuthProtocols {:?}",
+            key.protocols
+        );
         key.touch = touch.then(|| TOUCH.into());
         let e = uhid::run(&mut key, &format!("kith FIDO2 test key {seed}"));
         eprintln!("kithd: fido2-test: key {seed} ended: {e:?}");

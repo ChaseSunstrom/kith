@@ -53,13 +53,21 @@ and `getAssertion` with `hmac-secret` at the console. Re-checked against what th
   through ring. What is tested is the derivation from the shared secret's x coordinate (SHA-256
   of it, the protocol 1 key) on a fixed x. The independent check of the whole exchange is one
   real key, tried by the owner (section 2).
-- **PIN protocol 1 only, a limit and not a recommendation.** Protocol 1 (the SHA-256 of the ECDH
-  x coordinate as the key, a zero IV, the first 16 bytes of an HMAC) is what every CTAP2.0 key
-  must have. Protocol 2 exists partly for FIPS, and protocol 1 on a key that has both is
-  **unsupported** by the specification's own direction, not a guarantee of it. This record
-  does not claim that keys with protocol 2 still list protocol 1. A key that lists only
-  protocol 2 is refused with a message naming `pinUvAuthProtocols`. **Protocol 2 is required
-  before any release**, or the owner accepts the limit in writing (open, section 8).
+- **PIN/UV auth protocols 1 and 2, both built (T-0959).** Protocol 1 (the SHA-256 of the ECDH
+  x coordinate as both keys, a zero IV, the first 16 bytes of an HMAC) is what every CTAP2.0 key
+  must have. Protocol 2 (CTAP2.1; it exists partly for FIPS) is HKDF-SHA-256 with a salt of 32
+  zero bytes over the x coordinate, with the info strings `CTAP2 HMAC key` and `CTAP2 AES key`
+  for two 32-byte keys; AES-256-CBC with a random 16-byte IV that leads each ciphertext (the
+  salt goes as 48 bytes, the key's answer comes back as 48); and the whole 32-byte
+  HMAC-SHA-256 as the salt's authentication. ring has HKDF, so no crate was added. The client
+  reads getInfo's `pinUvAuthProtocols` and takes protocol 2 if it is listed, else 1; a key
+  that lists neither is refused with a message naming `pinUvAuthProtocols`. The chosen protocol
+  goes in the getKeyAgreement request and, for protocol 2 only, as key 4 in the `hmac-secret`
+  input (absent means 1 in CTAP, and a key that lists only 1 may refuse a key it does not know). The vectors are
+  RFC 5869 for HKDF, NIST for the CBC loop, and, for the CTAP2.1 layout, numbers computed outside
+  Rust; the specification publishes no ECDH or whole-exchange vectors, so **a trial against one
+  real key stays a manual step by the owner: no task runs it.** That includes whether a key
+  that lists both protocols takes protocol 2 as built.
 - **A key that already has a PIN set is probably not enrolled by v1.** v1 asks for a touch
   (user presence) only; a key with a PIN set answers `makeCredential` without `pinUvAuth` with
   `PIN_REQUIRED` (unverified: no real key was touched). Either the enrolment uses `pinUvAuth`
@@ -234,8 +242,9 @@ says so in those words; either way it has a test on a node with no cluster.
 
 ## 5. kithd's size against the budget
 
-`KITHD_SIZE = 13.20` (`ci/budgets.py:48`), in MiB: `MB = 1024 * 1024` (`ci/budgets.py:31`) and the
-limit is `int(KITHD_SIZE * MB)` (`ci/budgets.py:61`), so 13,841,203 bytes. `docs/numbers.json` rounds to 12 against 13 (`kithd.size`,
+`KITHD_SIZE = 13.40` (`ci/budgets.py:51`; it was 13.20 when this record was written, and was raised
+for a train of features), in MiB: `MB = 1024 * 1024` (`ci/budgets.py:31`) and the
+limit is `int(KITHD_SIZE * MB)` (`ci/budgets.py:64`), so 14,050,918 bytes. `docs/numbers.json` rounds to 12 against 13 (`kithd.size`,
 `kithd.size.budget`) and cannot say more. The size on main when this was written is about
 **13.17 MiB** (the figure the brief for this record gives; `ci/budgets.py` was not run here), so
 the **headroom is about 0.03 MiB, 30 kB**.
@@ -305,8 +314,8 @@ record, so only T-0956 can open a state by touch and measure the size of what is
   for user verification is a different secret (CTAP2.1's `CredRandomWithUV`), so enrolling with
   a PIN is a new line, not an edit of this one.
 - **A key with a PIN already set** is probably refused by v1 (`PIN_REQUIRED`, section 1).
-- **PIN protocol 2** (section 1): required before any release, or accepted as a limit by the
-  owner.
+- **PIN protocol 2** (section 1): built (T-0959). What stays open is the trial against one real
+  key, by the owner by hand, for both protocols.
 - **canokey** in QEMU, where a QEMU has it (section 2), as the test that is not by the same hand.
 - **A downgrade loses the lines** (section 4): an older kithd that rewrites the record drops
   `fido2:` lines it does not know. adr-unlock's rule for passphrase lines is the same; a
