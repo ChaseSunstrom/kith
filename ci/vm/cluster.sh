@@ -101,6 +101,22 @@
                 mkdir -p "$image/rootfs/bin"
                 cp "$work/pod" "$image/rootfs/bin/pod"
                 echo '{}' >"$image/config.json"
+                # (kube: what `kubectl exec` and `kubectl cp` run in a pod, this machine's own with the
+                # libraries ldd names: a tar that gives a file no owner, as a cp has no right to give.)
+                if [ "$test" = kube ]; then
+                    for tool in sh cat tar true sleep; do
+                        from=/usr/bin/$tool
+                        [ -x "$from" ] || fail "no $from on this machine, for the pods of the kube test"
+                        cp -L "$from" "$image/rootfs/bin/$tool"
+                        ldd "$from" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i }' | while read -r lib; do
+                            mkdir -p "$image/rootfs${lib%/*}"
+                            cp -L "$lib" "$image/rootfs$lib"
+                        done
+                    done
+                    mv "$image/rootfs/bin/tar" "$image/rootfs/bin/tar-real"
+                    printf '#!/bin/sh\nexec /bin/tar-real "$@" --no-same-owner\n' >"$image/rootfs/bin/tar"
+                    chmod 755 "$image/rootfs/bin/tar"
+                fi
                 # (outlive: pod on the node's own disk as well, for its exec units.)
                 [ "$test" != outlive ] || { mkdir -p "$work/seed/tools" && cp "$work/pod" "$work/seed/tools/pod"; }
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
@@ -185,7 +201,12 @@
                 fi
                 sfdisk -l -o Start,Sectors,Name "$1" | awk '$3 == "state" { print $1, $2 }' >"$work/state.at"
                 read -r state_start state_sectors <"$work/state.at"
-                mkfs.ext4 -q -d "$work/seed" -E root_owner=0:0 $project "$work/state.img" "$((state_sectors / 2))k" >&2
+                # (kube: the seed's directories are this user's, and a node's runtime directory is root's
+                # as kithd makes it: a tenant of `kubectl exec` joins a pod's user namespace, where this
+                # user's directory is not its own. `unshare -r` makes this user root, to mkfs.)
+                as_root=''
+                [ "$test" != kube ] || as_root='unshare -r'
+                $as_root mkfs.ext4 -q -d "$work/seed" -E root_owner=0:0 $project "$work/state.img" "$((state_sectors / 2))k" >&2
             fi
             read -r state_start state_sectors <"$work/state.at"
             dd if="$work/state.img" of="$1" bs=512 seek="$state_start" conv=notrunc status=none

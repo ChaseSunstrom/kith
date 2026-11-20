@@ -517,6 +517,22 @@ pub async fn connect(pod: Option<(&Shared, &str)>, port: u16) -> std::io::Result
     }
 }
 
+/// A connection to `port` of pod `id` through the pod's own namespace and no other way: a pod this node has not
+/// made (pending, or between two makings) is an error, where [`connect`] would reach this machine's loopback.
+pub async fn connect_made(pods: &std::sync::Mutex<Pods>, id: &str, port: u16) -> std::io::Result<TcpStream> {
+    if !pods
+        .lock()
+        .expect("nothing panics holding the pods")
+        .made
+        .contains_key(id)
+    {
+        return Err(std::io::Error::other(
+            "the pod has no network on this node (not started, or starting again)",
+        ));
+    }
+    through(&crate::root_part::Direct::today(pods, None), pods, id, port).await
+}
+
 /// A connection to `port` on the loopback of pod `id`, from a socket made ahead there. The
 /// family that last reached something goes first.
 pub async fn through<R: crate::root_part::Root>(
@@ -1780,6 +1796,20 @@ mod tests {
             .get("w_a_b_0")
             .map_or(0, |spare| spare.v4.len() + spare.v6.len());
         assert_eq!(spare, 0, "the new pod's pool holds the old one's sockets");
+    }
+
+    /// A pod that is not made has no way to its port: not the host's loopback, where something listens.
+    #[tokio::test]
+    async fn connect_made_refuses_a_pod_that_is_not_made_and_does_not_fall_back_to_the_loopback() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pods = std::sync::Mutex::new(Pods::default());
+        let refused = connect_made(&pods, "w_a_b_0", port).await.unwrap_err();
+        assert!(refused.to_string().contains("no network"), "{refused}");
+        assert!(
+            connect(None, port).await.is_ok(),
+            "the port is reachable on the loopback, which is the point"
+        );
     }
 
     /// A published UDP port stopped (its pod gone) is free at once for the pod made again,
