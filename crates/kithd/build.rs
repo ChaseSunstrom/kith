@@ -120,8 +120,8 @@ fn write_site(dir: &Path, out: &Path) {
 }
 
 /// os/features' `# pci:` lines as `OS_FEATURES` (devices.rs matches the PCI bus against it): each
-/// feature that has some, by name, with its vendor and device ids as sysfs writes them. A line
-/// that is not `vendor:device` in hex, or a `#pci:`/`# PCI:` line not written `# pci:`, stops the
+/// feature that has some, by name, with its vendor and device ids as sysfs writes them (or
+/// `vendor:*`). A line that is not `vendor:device` in hex (or `vendor:*`), or a `#pci:`/`# PCI:` line not written `# pci:`, stops the
 /// build, so a typo is not a card never matched. kithd is only built in this repository, so a
 /// missing os/features stops it too (a kithd that matches nothing would say so to nobody).
 fn features_table() {
@@ -155,11 +155,12 @@ fn features_table() {
             .map(|pair| {
                 let hex = |id: &str| id.len() == 4 && id.bytes().all(|b| b.is_ascii_hexdigit());
                 match pair.split_once(':') {
-                    Some((vendor, device)) if hex(vendor) && hex(device) => {
+                    // (`vendor:*`: any display card of the vendor, devices.rs checks the class.)
+                    Some((vendor, device)) if hex(vendor) && (hex(device) || device == "*") => {
                         (vendor.to_ascii_lowercase(), device.to_ascii_lowercase())
                     }
                     _ => panic!(
-                        "{}: '{pair}' in a `# pci:` line is not vendor:device in hex",
+                        "{}: '{pair}' in a `# pci:` line is not vendor:device in hex (or vendor:*)",
                         file.display()
                     ),
                 }

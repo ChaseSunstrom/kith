@@ -1050,6 +1050,13 @@ fn main() {
             // reboot(2): LINUX_REBOOT_CMD_POWER_OFF.
             syscall(169, [0xfee1dead, 672274793, 0x4321fedc, 0, 0]);
         }
+        // Its open-file limits as the kernel keeps them (/proc/self/limits: soft, then hard).
+        ["nofile"] => {
+            let limits = std::fs::read_to_string("/proc/self/limits").expect("its limits");
+            let line = limits.lines().find(|l| l.starts_with("Max open files")).expect("a limit of files");
+            let mut words = line.split_whitespace().skip(3);
+            println!("nofile: {} {}", words.next().expect("soft"), words.next().expect("hard"));
+        }
         ["free", path] => {
             // statfs(2): struct statfs is 15 words on x86-64; f_bavail the 5th, f_frsize the 10th.
             let name = std::ffi::CString::new(*path).expect("a path");

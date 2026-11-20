@@ -108,7 +108,11 @@ sh os/build.sh --spec n1.yaml --out target/os-n1
 
 A node with no card a feature matches prints `features: []`; a node that runs no kith OS has no
 `wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
-card the catalogue does not list yet) is chosen by hand, as above.
+card the catalogue does not list yet) is chosen by hand, as above. A line may give `vendor:*`
+instead of a device id, which matches any display card (PCI class 03) of that vendor and not its
+audio function: `all` has `10de:*`, so a node with an NVIDIA GPU wants `all` (nouveau's driver is
+in it). A node that also has an AMD Phoenix GPU wants `all` alone, which build.sh would refuse with
+`gpu-amd-phoenix` and whose modules cover that GPU.
 
 #### The `all` feature: drivers as signed modules
 
@@ -299,8 +303,17 @@ The header also carries a `kithd` object: the digests of kithd, of the boot file
 hash, and of the root but for kithd and its os-release. It is signed with the rest. Before it writes,
 a node reads it against the header kept for the system it runs, and works out whether only kithd
 differs (the kernel and the rest of the root are the same) or the update is a full one. A header
-without it, or no kept header, is a full update. Nothing is done with a kithd-only answer yet: the
-update is still a full one.
+without it, or no kept header, is a full update, and the log says which part differed.
+
+Where only kithd differs, the node does not restart. It writes the other slot as ever, mounts its
+root for a moment, and copies the new kithd out of it into `/run/kith/bin`, a tmpfs of its own that
+is root-only and mounted exec, nosuid and nodev (`/run` stays noexec). It stages the file only if its
+SHA-256 is the signed digest. Then kithd ends with a hand-over, and the machine's first process starts
+the staged kithd. Every container keeps running and the new kithd takes them back by their record, as
+at any restart of kithd. A staged kithd that fails within a minute is given up for the one that was
+running; that end counts toward the ten failures in a minute, a hand-over does not. The root still
+says the old version (it is read-only), so the node says the new one from a note in `/run` that holds
+only for the kithd it names: a reboot starts the slot that was written, which has the new release whole.
 
 **Which keys a node takes.** Its own only, whatever key an OSRelease names. Give them before the
 first release:
@@ -533,6 +546,11 @@ that disk is lost**, and nobody is asked at the machine: name only cards of mach
 erase. `--disk only` (the default) installs on a machine's one disk and refuses a machine with
 several; `--disk nvme0n1` names it. Netboot turns itself off after `--minutes` (30; at most 60),
 when the node restarts, or with `--off`.
+
+The machine is installed with this node's release keys (as the node holds them when netboot is
+turned on) and `--lan-releases`, if the node has them: it takes kith OS releases from the same
+keys, not from the first release's. The answers hold 8 keys at most: a node with more, or with
+keys it cannot read, does not turn netboot on and says which.
 
 The node must be the one that started the cluster (it holds the CA, which makes the join tokens)
 and run with `--listen`. An Identity that may apply Nodes, Roles and RoleBindings sends the same
