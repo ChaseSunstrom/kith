@@ -766,7 +766,6 @@ fn serving_calls() -> Vec<i64> {
         libc::SYS_dup,
         libc::SYS_dup3,
         libc::SYS_pipe2,
-        libc::SYS_ioctl,
         libc::SYS_umask,
         libc::SYS_sync,
         libc::SYS_syncfs,
@@ -815,8 +814,6 @@ fn serving_calls() -> Vec<i64> {
         libc::SYS_sigaltstack,
         libc::SYS_kill,
         libc::SYS_tgkill,
-        libc::SYS_clone,
-        libc::SYS_clone3,
         libc::SYS_execve,
         libc::SYS_wait4,
         libc::SYS_exit,
@@ -844,7 +841,6 @@ fn serving_calls() -> Vec<i64> {
         libc::SYS_getresuid,
         libc::SYS_getresgid,
         libc::SYS_capget,
-        libc::SYS_prctl,
         libc::SYS_prlimit64,
         libc::SYS_getrlimit,
         libc::SYS_getrusage,
@@ -902,11 +898,49 @@ fn serving_calls() -> Vec<i64> {
     calls
 }
 
+/// For a probe of a confinement, the calls a compromised process would try: `clone` with
+/// `flags` (and `SIGCHLD`: a fork, so no stack is needed) when `flags` is `Some`, else `clone3`
+/// with no arguments, else `ioctl(TIOCSTI)` on the standard input. Each returns the error it
+/// got (`EPERM` of the filter, `ENOSYS` for `clone3`), or `Ok` when the kernel let it through:
+/// a child that clone made ends at once.
+pub fn try_call(call: Try) -> Result<()> {
+    // SAFETY: each is a raw call with no pointer in it (a null for the `clone3` arguments with
+    // a size of 0, which the kernel refuses); a child of `clone` leaves with `_exit` before it
+    // returns into anything of this program, and the parent waits for it.
+    let got = unsafe {
+        match call {
+            Try::Clone(flags) => {
+                let pid = libc::syscall(libc::SYS_clone, flags | libc::SIGCHLD as u64, 0, 0, 0, 0);
+                if pid == 0 {
+                    libc::_exit(0);
+                }
+                if pid > 0 {
+                    libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+                }
+                pid
+            }
+            Try::Clone3 => libc::syscall(libc::SYS_clone3, 0, 0),
+            Try::Tiocsti => libc::syscall(libc::SYS_ioctl, 0, libc::TIOCSTI, 0),
+        }
+    };
+    if got < 0 { Err(Error::last_os_error()) } else { Ok(()) }
+}
+
+/// What [`try_call`] tries.
+pub enum Try {
+    Clone(u64),
+    Clone3,
+    Tiocsti,
+}
+
 /// A seccomp filter for the calling process (and every thread of it): the calls in `allowed` pass,
 /// every other answers `EPERM`, and the calls of another architecture's numbering are killed.
 /// Needs `no_new_privs` (or CAP_SYS_ADMIN) first, and cannot be undone.
 pub fn seccomp_allow(allowed: &[i64]) -> Result<()> {
-    let mut program = allow_program(allowed);
+    seccomp_install(allow_program(allowed, &[]))
+}
+
+fn seccomp_install(mut program: Vec<libc::sock_filter>) -> Result<()> {
     let fprog = libc::sock_fprog {
         len: u16::try_from(program.len()).map_err(|_| Error::other("the filter is longer than a filter can be"))?,
         filter: program.as_mut_ptr(),
@@ -921,12 +955,58 @@ pub fn seccomp_allow(allowed: &[i64]) -> Result<()> {
 
 /// [`seccomp_allow`] for what a serving part makes (see `serving_calls`).
 pub fn seccomp_serving() -> Result<()> {
-    seccomp_allow(&serving_calls())
+    seccomp_install(serving_program())
+}
+
+/// A call the serving part makes only in part: what its arguments say decides.
+enum Rule {
+    /// `clone`: refused when its flags (argument 0) hold any `CLONE_NEW*` bit, so no namespace
+    /// is made by it, as `unshare` and `setns` are left out of the list.
+    NoNewSpace,
+    /// Not there (`ENOSYS`): `clone3` keeps its flags behind a pointer a filter cannot read, and
+    /// the C libraries fall back to `clone`.
+    Absent,
+    /// Allowed when the 32 bits at this offset of `seccomp_data` are one of these (an `ioctl`'s
+    /// request, a `prctl`'s option), else `EPERM`.
+    Only(u32, &'static [u32]),
+}
+
+/// Offsets of `struct seccomp_data`: the first argument, and the second.
+const ARG0: u32 = 16;
+const ARG1: u32 = 24;
+/// `CLONE_NEWNS | NEWCGROUP | NEWUTS | NEWIPC | NEWUSER | NEWPID | NEWNET | NEWTIME`.
+const CLONE_NEW: u32 =
+    0x0002_0000 | 0x0200_0000 | 0x0400_0000 | 0x0800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000 | 0x80;
+
+/// What a serving part asks of `ioctl` (the request is the second argument): a socket or pipe
+/// made non-blocking or close-on-exec, the bytes waiting, and whether a stream is a terminal
+/// (`TCGETS`, which the C library asks to decide how to buffer). Not `TIOCSTI` (pushing input
+/// into a terminal), `TIOCLINUX`, `TIOCSCTTY`, a terminal's settings, or a device's.
+const SERVING_IOCTLS: &[u32] = &[0x5421, 0x541B, 0x5451, 0x5450, 0x5401, 0x5413];
+/// What it asks of `prctl` (the option is the first): a thread's name, the parent-death signal,
+/// dumpable and no_new_privs as asked or already set, the bounding set as read, the seccomp
+/// mode as read, the timer slack, `PR_SET_VMA` (the allocator names its maps) and the thread's
+/// address as read.
+const SERVING_PRCTLS: &[u32] = &[1, 2, 3, 4, 15, 16, 21, 23, 29, 30, 38, 39, 40, 0x5356_4d41];
+
+fn serving_rules() -> Vec<(i64, Rule)> {
+    vec![
+        (libc::SYS_clone, Rule::NoNewSpace),
+        (libc::SYS_clone3, Rule::Absent),
+        (libc::SYS_ioctl, Rule::Only(ARG1, SERVING_IOCTLS)),
+        (libc::SYS_prctl, Rule::Only(ARG0, SERVING_PRCTLS)),
+    ]
+}
+
+fn serving_program() -> Vec<libc::sock_filter> {
+    allow_program(&serving_calls(), &serving_rules())
 }
 
 /// The classic BPF program of [`seccomp_allow`]: the architecture checked, then for each call a
-/// compare and an allow (a jump of two instructions at most: BPF's are eight bits), then `EPERM`.
-fn allow_program(allowed: &[i64]) -> Vec<libc::sock_filter> {
+/// compare and an allow (a jump of two instructions at most: BPF's are eight bits), then for each
+/// call with a rule a compare and its block (which always ends in an answer, so the number of
+/// the call is still in the accumulator where a block is jumped over), then `EPERM`.
+fn allow_program(allowed: &[i64], rules: &[(i64, Rule)]) -> Vec<libc::sock_filter> {
     let arch = if cfg!(target_arch = "x86_64") {
         0xC000_003E
     } else {
@@ -942,6 +1022,34 @@ fn allow_program(allowed: &[i64]) -> Vec<libc::sock_filter> {
     for call in allowed {
         program.push(op(0x15, 0, 1, *call as u32)); // this one: the allow after it; else over it
         program.push(op(0x06, 0, 0, 0x7fff_0000));
+    }
+    let (allow, errno) = (0x7fff_0000, |e: i32| 0x0005_0000 | e as u32);
+    for (call, rule) in rules {
+        let block = match rule {
+            Rule::NoNewSpace => vec![
+                op(0x20, 0, 0, ARG0),
+                op(0x45, 0, 1, CLONE_NEW), // a new namespace: the refusal after it; else over it
+                op(0x06, 0, 0, errno(libc::EPERM)),
+                op(0x06, 0, 0, allow),
+            ],
+            Rule::Absent => vec![op(0x06, 0, 0, errno(libc::ENOSYS))],
+            Rule::Only(at, wanted) => {
+                let mut block = vec![op(0x20, 0, 0, *at)];
+                for w in *wanted {
+                    block.push(op(0x15, 0, 1, *w)); // this one: the allow after it; else over it
+                    block.push(op(0x06, 0, 0, allow));
+                }
+                block.push(op(0x06, 0, 0, errno(libc::EPERM)));
+                block
+            }
+        };
+        program.push(op(
+            0x15,
+            0,
+            u8::try_from(block.len()).expect("a block of a rule is short"),
+            *call as u32,
+        ));
+        program.extend(block);
     }
     program.push(op(0x06, 0, 0, 0x0005_0000 | libc::EPERM as u32));
     program
@@ -1423,6 +1531,131 @@ mod tests {
     static CHILDREN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn children() -> std::sync::MutexGuard<'static, ()> {
         CHILDREN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What the serving filter does with a call: runs its classic BPF on a `seccomp_data` of
+    /// the call, its architecture and its first two arguments (the ones the filter reads), and
+    /// returns the action (`0x7fff0000` allow, `0x50000 | errno`, `0x80000000` kill).
+    fn filtered(arch: u32, nr: i64, args: [u64; 2]) -> u32 {
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&(nr as u32).to_ne_bytes());
+        data[4..8].copy_from_slice(&arch.to_ne_bytes());
+        data[16..24].copy_from_slice(&args[0].to_ne_bytes());
+        data[24..32].copy_from_slice(&args[1].to_ne_bytes());
+        let program = serving_program();
+        let (mut a, mut pc) = (0u32, 0usize);
+        loop {
+            let i = &program[pc];
+            pc += 1;
+            match i.code {
+                0x20 => a = u32::from_ne_bytes(data[i.k as usize..i.k as usize + 4].try_into().unwrap()),
+                0x15 => pc += usize::from(if a == i.k { i.jt } else { i.jf }),
+                0x45 => pc += usize::from(if a & i.k != 0 { i.jt } else { i.jf }),
+                0x06 => return i.k,
+                other => panic!("an instruction the test does not know: {other:#x}"),
+            }
+        }
+    }
+
+    const ALLOW: u32 = 0x7fff_0000;
+    fn refused(errno: i32) -> u32 {
+        0x0005_0000 | errno as u32
+    }
+    fn ours(nr: i64, args: [u64; 2]) -> u32 {
+        filtered(
+            if cfg!(target_arch = "x86_64") {
+                0xC000_003E
+            } else {
+                0xC000_00B7
+            },
+            nr,
+            args,
+        )
+    }
+
+    #[test]
+    fn serving_filter_refuses_what_is_not_listed_and_kills_a_foreign_architecture() {
+        assert_eq!(ours(libc::SYS_read, [0; 2]), ALLOW);
+        assert_eq!(ours(libc::SYS_mount, [0; 2]), refused(libc::EPERM));
+        assert_eq!(ours(libc::SYS_unshare, [0; 2]), refused(libc::EPERM));
+        assert_eq!(ours(libc::SYS_setns, [0; 2]), refused(libc::EPERM));
+        assert_eq!(filtered(0x4000_0003, libc::SYS_read, [0; 2]), 0x8000_0000);
+    }
+
+    #[test]
+    fn serving_filter_refuses_a_clone_that_makes_a_namespace() {
+        // A thread (what the runtime makes) and a fork pass; each flag of a new namespace is refused.
+        let thread =
+            (libc::CLONE_VM | libc::CLONE_FS | libc::CLONE_FILES | libc::CLONE_SIGHAND | libc::CLONE_THREAD) as u64;
+        assert_eq!(ours(libc::SYS_clone, [thread, 0]), ALLOW);
+        assert_eq!(ours(libc::SYS_clone, [libc::SIGCHLD as u64, 0]), ALLOW);
+        for flag in [
+            libc::CLONE_NEWUSER,
+            libc::CLONE_NEWNS,
+            libc::CLONE_NEWNET,
+            libc::CLONE_NEWPID,
+            libc::CLONE_NEWIPC,
+            libc::CLONE_NEWUTS,
+            libc::CLONE_NEWCGROUP,
+            0x80, // CLONE_NEWTIME
+        ] {
+            assert_eq!(
+                ours(libc::SYS_clone, [thread | flag as u64, 0]),
+                refused(libc::EPERM),
+                "clone with {flag:#x}"
+            );
+            assert_eq!(
+                ours(libc::SYS_clone, [flag as u64 | libc::SIGCHLD as u64, 0]),
+                refused(libc::EPERM)
+            );
+        }
+        // clone3 reads its flags behind a pointer the filter cannot follow: not there at all,
+        // and the C libraries fall back to clone.
+        assert_eq!(ours(libc::SYS_clone3, [0; 2]), refused(libc::ENOSYS));
+    }
+
+    #[test]
+    fn serving_filter_lets_ioctl_and_prctl_ask_only_what_the_serving_part_asks() {
+        for request in [libc::FIONBIO, libc::FIONREAD, libc::FIOCLEX, libc::TCGETS] {
+            assert_eq!(
+                ours(libc::SYS_ioctl, [3, u64::from(request as u32)]),
+                ALLOW,
+                "ioctl {request:#x}"
+            );
+        }
+        for request in [
+            libc::TIOCSTI,
+            0x541C, /* TIOCLINUX */
+            libc::TIOCSCTTY,
+            libc::TCSETS,
+        ] {
+            assert_eq!(
+                ours(libc::SYS_ioctl, [0, u64::from(request as u32)]),
+                refused(libc::EPERM),
+                "ioctl {request:#x}"
+            );
+        }
+        for option in [
+            libc::PR_SET_NAME,
+            libc::PR_GET_NAME,
+            libc::PR_SET_NO_NEW_PRIVS,
+            libc::PR_GET_DUMPABLE,
+        ] {
+            assert_eq!(ours(libc::SYS_prctl, [option as u64, 0]), ALLOW, "prctl {option}");
+        }
+        for option in [
+            libc::PR_SET_MM,
+            libc::PR_SET_SECCOMP,
+            libc::PR_SET_KEEPCAPS,
+            libc::PR_CAP_AMBIENT,
+            0x5961_6d61, /* PR_SET_PTRACER */
+        ] {
+            assert_eq!(
+                ours(libc::SYS_prctl, [option as u64, 0]),
+                refused(libc::EPERM),
+                "prctl {option}"
+            );
+        }
     }
 
     #[test]

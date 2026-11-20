@@ -253,11 +253,20 @@ unrecursive), a user and group that are not 0 and no other group (`setgroups`, `
 any set (effective raised from permitted, the bounding set dropped one by one, ambient cleared,
 `capset` to nothing, then read back and refused if anything is left), `no_new_privs`, and last a
 seccomp filter: an allow-list by call number, `EPERM` for the rest, and the process killed on a
-foreign architecture. `Plan::filter` off leaves the filter out and nothing else (the filter is the
+foreign architecture. Four calls are allowed in part (the arguments decide): `clone` is refused
+when its flags hold any `CLONE_NEW*` bit (so no namespace is made, though `unshare` and `setns`
+are left out), `clone3` answers `ENOSYS` (its flags are behind a pointer a filter cannot read, and
+the C libraries fall back to `clone`), and `ioctl` and `prctl` pass only the requests and options
+the serving part makes (non-blocking, close-on-exec, bytes waiting, `TCGETS`; a thread's name,
+`no_new_privs` and dumpable as read or set): not `TIOCSTI`, `TIOCLINUX`, a terminal's settings,
+`PR_SET_MM` or `PR_CAP_AMBIENT`. A request the part meets that is not in the list is refused with
+`EPERM`: the list is read off the code and the VM run, and widened by a line when a run shows one.
+`Plan::filter` off leaves the filter out and nothing else (the filter is the
 step most likely to meet a call the list lacks); it is `--no-filter` on the probe, and no kithd
 flag until the serving part is a process. `kithd confine-probe DIR` does the same steps on
 itself and reports its own `/proc` status and mountinfo and what it tried and was refused (setuid,
-a capability, the node's disk, a mount, a call outside the filter), and `sh ci/vm.sh --test
+a capability, the node's disk, a mount, a call outside the filter, a namespace made by `clone`
+of each kind, `clone3`, `TIOCSTI`), and `sh ci/vm.sh --test
 privilege` holds the node to it, then kills kithd under a pod.
 
 **Not done, said here** (the first is the reason `--split` stays off): confinement is per thread

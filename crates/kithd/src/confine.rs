@@ -244,6 +244,29 @@ fn report(plan: &Plan, listener: std::net::TcpListener, mut store: std::fs::File
         "filter {}",
         if plan.filter { word(call.is_err()) } else { "off" }
     ));
+    // What a filter alone must refuse in the calls it allows in part: a namespace made by clone
+    // (each flag), clone3 (not there), and a push of input into a terminal.
+    use kith_dm_sys::Try;
+    use nix::errno::Errno;
+    let is = |t: Try, errno: Errno| kith_dm_sys::try_call(t).is_err_and(|e| e.raw_os_error() == Some(errno as i32));
+    // (CLONE_NEWUSER, NEWNS, NEWNET, NEWPID, NEWIPC, NEWUTS, NEWCGROUP.)
+    let namespaces: [u64; 7] = [
+        0x1000_0000,
+        0x0002_0000,
+        0x4000_0000,
+        0x2000_0000,
+        0x0800_0000,
+        0x0400_0000,
+        0x0200_0000,
+    ];
+    let tries = [
+        ("clone", namespaces.iter().all(|f| is(Try::Clone(*f), Errno::EPERM))),
+        ("clone3", is(Try::Clone3, Errno::ENOSYS)),
+        ("ioctl", is(Try::Tiocsti, Errno::EPERM)),
+    ];
+    for (name, refused) in tries {
+        say(format!("{name} {}", if plan.filter { word(refused) } else { "off" }));
+    }
     Ok(())
 }
 

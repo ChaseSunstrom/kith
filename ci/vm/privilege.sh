@@ -46,9 +46,14 @@ EOF
             done
             [ "$(grep -o 'confine: status Seccomp: [0-9]' "$work/confined.said" | cut -d ' ' -f 4)" = 2 ] || fail "confined: the filter is not on"
             grep -q 'confine: filter refused' "$work/confined.said" || fail "confined: a call outside the filter was not refused"
+            # (The calls it lets through in part: a clone that makes a namespace of each kind, clone3, TIOCSTI.)
+            for held in 'clone refused' 'clone3 refused' 'ioctl refused'; do
+                grep -q "confine: $held" "$work/confined.said" || fail "confined: not '$held': $(grep -a 'confine: ' "$work/confined.said" | grep 'clone\|ioctl')"
+            done
+            grep -q 'confine: clone off' "$work/unfiltered.said" || fail "unfiltered: it did not say the filter is off for clone"
             [ "$(grep -o 'confine: status Seccomp: [0-9]' "$work/unfiltered.said" | cut -d ' ' -f 4)" = 0 ] || fail "unfiltered: a filter is on with --no-filter"
             grep -q 'confine: filter off' "$work/unfiltered.said" || fail "unfiltered: it did not say the filter is off"
-            echo "vm.sh: the confined process: $(grep -o 'confine: \(setuid\|capability\|disk\|mount\|filter\) [a-z]*' "$work/confined.said" | cut -d ' ' -f 2- | tr '\n' ';')" >&2
+            echo "vm.sh: the confined process: $(grep -o 'confine: \(setuid\|capability\|disk\|mount\|filter\|clone3\|clone\|ioctl\) [a-z]*' "$work/confined.said" | cut -d ' ' -f 2- | tr '\n' ';')" >&2
             # kithd ended under a pod (--split): it is started again, and the pod goes on as the same process.
             said() { any GET "/v1/logs/$1/default/$2${3:+?unit=$3}" 2>/dev/null; }
             waited=0
@@ -85,5 +90,5 @@ EOF
             done
             [ "$(said Workload ticker tick | grep -o 'tick: process [0-9]* started at [0-9]*')" = "$before" ] || fail "the pod's process was not the same after kithd was killed"
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: one node with --split: the confined process holds uid and gid 4100, no capability in any set, no_new_privs, a filter, its own state directory's mount alone; setuid, a capability, the node's disk and a mount refused; kithd killed under a pod: started again, the pod the same process" >&2
+            echo "vm.sh: ok: one node with --split: the confined process holds uid and gid 4100, no capability in any set, no_new_privs, a filter, its own state directory's mount alone; setuid, a capability, the node's disk, a mount, a namespace made by clone, clone3 and TIOCSTI refused; kithd killed under a pod: started again, the pod the same process" >&2
             exit 0
