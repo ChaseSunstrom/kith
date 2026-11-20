@@ -8,7 +8,9 @@ CTAPHID framing, the CBOR subset) and its second half (T-0968: AES-256-CBC, ECDH
 `makeCredential` and `getAssertion`), all tested on a scripted key and never yet on a real one;
 and the software key of section 2's test build (T-0970: `crates/kithd/src/fido2_test.rs`, the
 cargo feature `fido2-test`, with its four release guards in `os/build.sh`, `ci/vm/tests.sh` and
-`ci/musl.sh`; its VM test is not yet built).
+`ci/musl.sh`; its VM test is `sh ci/vm.sh --test fido2`, `ci/vm/fido2.sh`, T-0973: the client
+against the stand-in through uhid and hidraw, the hmac-secret checked from the seed outside Rust,
+a withheld touch timed out).
 This record settles what [adr-unlock.md](adr-unlock.md)
 left as "FIDO2: deferred", item by item, so that the build can be cut into slices that each
 stand alone. Where the code differs from a line here, the code is the word. A decision here
@@ -51,13 +53,21 @@ and `getAssertion` with `hmac-secret` at the console. Re-checked against what th
   through ring. What is tested is the derivation from the shared secret's x coordinate (SHA-256
   of it, the protocol 1 key) on a fixed x. The independent check of the whole exchange is one
   real key, tried by the owner (section 2).
-- **PIN protocol 1 only, a limit and not a recommendation.** Protocol 1 (the SHA-256 of the ECDH
-  x coordinate as the key, a zero IV, the first 16 bytes of an HMAC) is what every CTAP2.0 key
-  must have. Protocol 2 exists partly for FIPS, and protocol 1 on a key that has both is
-  **unsupported** by the specification's own direction, not a guarantee of it. This record
-  does not claim that keys with protocol 2 still list protocol 1. A key that lists only
-  protocol 2 is refused with a message naming `pinUvAuthProtocols`. **Protocol 2 is required
-  before any release**, or the owner accepts the limit in writing (open, section 8).
+- **PIN/UV auth protocols 1 and 2, both built (T-0959).** Protocol 1 (the SHA-256 of the ECDH
+  x coordinate as both keys, a zero IV, the first 16 bytes of an HMAC) is what every CTAP2.0 key
+  must have. Protocol 2 (CTAP2.1; it exists partly for FIPS) is HKDF-SHA-256 with a salt of 32
+  zero bytes over the x coordinate, with the info strings `CTAP2 HMAC key` and `CTAP2 AES key`
+  for two 32-byte keys; AES-256-CBC with a random 16-byte IV that leads each ciphertext (the
+  salt goes as 48 bytes, the key's answer comes back as 48); and the whole 32-byte
+  HMAC-SHA-256 as the salt's authentication. ring has HKDF, so no crate was added. The client
+  reads getInfo's `pinUvAuthProtocols` and takes protocol 2 if it is listed, else 1; a key
+  that lists neither is refused with a message naming `pinUvAuthProtocols`. The chosen protocol
+  goes in the getKeyAgreement request and, for protocol 2 only, as key 4 in the `hmac-secret`
+  input (absent means 1 in CTAP, and a key that lists only 1 may refuse a key it does not know). The vectors are
+  RFC 5869 for HKDF, NIST for the CBC loop, and, for the CTAP2.1 layout, numbers computed outside
+  Rust; the specification publishes no ECDH or whole-exchange vectors, so **a trial against one
+  real key stays a manual step by the owner: no task runs it.** That includes whether a key
+  that lists both protocols takes protocol 2 as built.
 - **A key that already has a PIN set is probably not enrolled by v1.** v1 asks for a touch
   (user presence) only; a key with a PIN set answers `makeCredential` without `pinUvAuth` with
   `PIN_REQUIRED` (unverified: no real key was touched). Either the enrolment uses `pinUvAuth`
@@ -91,10 +101,10 @@ and answers the client's CTAPHID frames. Candidates, checked:
 
 **The choice: write it in this tree**, as a module of kithd behind a cargo feature, `fido2-test`.
 It is the shape `forge` already has: a test-only build of kithd, made in a target directory of its own
-by `ci/musl.sh` with `KITHD_FEATURES=fido2-test` (`ci/musl.sh:28-39` handles
-`forge` so), whose shipped binary is checked to hold none of it (`ci/musl.sh:50-53`: the shipped
-kithd is grepped for the forge route; the same grep gets a string only the stand-in has). The
-feature is declared like `forge = []` (`crates/kithd/Cargo.toml:12`). Because the feature is off in
+by `ci/musl.sh` with `KITHD_FEATURES=fido2-test` (the `case` on `KITHD_FEATURES` in `ci/musl.sh`
+handles `forge` so), whose shipped binary is checked to hold none of it (the shipped
+kithd is grepped for the forge route; a second grep looks for the strings only the stand-in has).
+The feature is declared like `forge = []` (the `[features]` table of `crates/kithd/Cargo.toml`). Because the feature is off in
 release, **the stand-in adds nothing to kithd's size**, which section 5 needs.
 
 How it works: it opens `/dev/uhid`, sends `UHID_CREATE2` with a report descriptor of usage page
@@ -117,18 +127,19 @@ as the TPM, `docs/adr-unlock.md`'s Unverified items).
 four guards, and `fido2-test` gets each one; T-0955 extends each of them, and the slice is not
 done until all four are:
 
-1. **The build output.** `os/build.sh:98-103` refuses an `--out` that is not `target/os-forge`
-   for a forge build; the same rule is extended so a `fido2-test` build goes only to its own
-   folder (`target/os-fido2`) and a shipped image is never made from it.
-2. **The test runner.** `ci/vm/tests.sh:22` sets `KITHD_FEATURES=forge` and
+1. **The build output.** The feature rule in `os/build.sh` refuses an `--out` that is not
+   `target/os-forge` for a forge build; the same rule is extended so a `fido2-test` build goes
+   only to its own folder (`target/os-fido2`) and a shipped image is never made from it.
+2. **The test runner.** `ci/vm/tests.sh` sets `KITHD_FEATURES=forge` and
    `osdir=$root/target/os-forge` for the access test alone; the stand-in's test sets
    `KITHD_FEATURES=fido2-test` and `osdir=$root/target/os-fido2` the same way, and no other test
    gets either.
-3. **The musl build.** `ci/musl.sh`'s case table (`ci/musl.sh:28-39`) knows `forge` only, and
-   its release-path grep (`ci/musl.sh:50-53`) looks for the forge route in the shipped kithd;
-   both gain `fido2-test` and a string only the stand-in has.
-4. **A loud startup line.** `crates/kithd/src/main.rs:365` prints a line when the forge is on;
-   a `fido2-test` kithd prints one too, at the start, naming that it will answer as a key.
+3. **The musl build.** `ci/musl.sh`'s case on `KITHD_FEATURES` knew `forge` only, and
+   its release-path grep looks for the forge route in the shipped kithd;
+   both gain `fido2-test` and the strings only the stand-in has (its startup line, the start of
+   each line the VM run prints, the touch file).
+4. **A loud startup line.** `main` in `crates/kithd/src/main.rs` prints a line when the forge is
+   on; a `fido2-test` kithd prints one too, at the start, naming that it makes keys.
 
 `ci/budgets.py:439` already strips `KITHD_FEATURES` from its build, so the size measure never
 sees the stand-in.
@@ -231,8 +242,9 @@ says so in those words; either way it has a test on a node with no cluster.
 
 ## 5. kithd's size against the budget
 
-`KITHD_SIZE = 13.20` (`ci/budgets.py:48`), in MiB: `MB = 1024 * 1024` (`ci/budgets.py:31`) and the
-limit is `int(KITHD_SIZE * MB)` (`ci/budgets.py:61`), so 13,841,203 bytes. `docs/numbers.json` rounds to 12 against 13 (`kithd.size`,
+`KITHD_SIZE = 13.40` (`ci/budgets.py:51`; it was 13.20 when this record was written, and was raised
+for a train of features), in MiB: `MB = 1024 * 1024` (`ci/budgets.py:31`) and the
+limit is `int(KITHD_SIZE * MB)` (`ci/budgets.py:64`), so 14,050,918 bytes. `docs/numbers.json` rounds to 12 against 13 (`kithd.size`,
 `kithd.size.budget`) and cannot say more. The size on main when this was written is about
 **13.17 MiB** (the figure the brief for this record gives; `ci/budgets.py` was not run here), so
 the **headroom is about 0.03 MiB, 30 kB**.
@@ -266,7 +278,7 @@ Each is one task and stands alone: it merges and passes its gates without the ne
 |---|---|
 | T-0953 | **Kernel.** `CONFIG_HIDRAW=y`, `CONFIG_USB_HID=y` in `os/kernel.config`; `CONFIG_UHID` in the test-only `os/features/uhid-test.config`; the check on the **built `.config`** (section 3), with `# CONFIG_UHID is not set` asserted for a shipped build; the image size and the second kernel's build time measured. |
 | T-0954 (carved: T-0966 the wire half, T-0968 the rest) | **The client.** `crates/kithd/src/fido2.rs`: CTAPHID framing and the CBOR subset (T-0966), then ECDH (T-0968), `hmac-secret` with the hand-written CBC, behind a trait of the device so tests use a pipe; tested on NIST's CBC vectors, the x-coordinate derivation and bad frames (short, a wrong channel, an oversize length, a keep-alive storm). **No size measure and no budget raise here:** nothing calls the code yet, and the linker may drop it, so a number taken now is not the number the feature costs. |
-| T-0955 | **The stand-in, and the client against it.** The `fido2-test` feature with the uhid authenticator and the four release guards of section 2 (`os/build.sh:98-103`, `ci/vm/tests.sh:22`, `ci/musl.sh`'s case table and grep, a loud startup line). Its VM test is **the client against the stand-in through uhid and hidraw, and nothing more**: a `fido2-test` subcommand of the test build that runs `makeCredential` and `getAssertion` with a known salt on the stand-in and prints the `hmac-secret`, which the test compares with what the seed says it must be; a second stand-in with another seed gives another secret, and a touch withheld times out. It needs no record, no console prompt and no verb. |
+| T-0955 | **The stand-in, and the client against it.** The `fido2-test` feature with the uhid authenticator and the four release guards of section 2 (`os/build.sh`'s feature rule, `ci/vm/tests.sh`, `ci/musl.sh`'s case table and grep, a loud startup line). Its VM test (`ci/vm/fido2.sh`, T-0973) is **the client against the stand-in through uhid and hidraw, and nothing more**: a `fido2-test` word on the kernel's command line, read by the test build alone, that runs `makeCredential` and `getAssertion` with a known salt on the stand-in and prints the `hmac-secret`, which the test compares with what the seed says it must be; a second stand-in with another seed gives another secret, and a touch withheld times out. It needs no record, no console prompt and no verb. |
 | T-0956 | **The record, the verbs and the state opened by touch.** The `fido2:` lines (two), the console's "touch your key" beside its typed lines (judged after the passphrase, with the same two seconds before an answer, in `console`, timed from the start of the attempt, so a wrong key is answered as every wrong line), `kith node key add` and `remove` with the order of writes above, the audit log; the VM test of enrolling two keys and **opening the state by touching one of two stand-ins** (the other opens it too, a key it was not enrolled with is refused) and of losing one. **kithd's size is measured here, before and after, with the feature called, and the budget raised with the number if it must be** (section 5). |
 
 The order is 1, 2, 3, 4; slices 1 and 2 are independent of each other. Only T-0956 needs the
@@ -302,8 +314,8 @@ record, so only T-0956 can open a state by touch and measure the size of what is
   for user verification is a different secret (CTAP2.1's `CredRandomWithUV`), so enrolling with
   a PIN is a new line, not an edit of this one.
 - **A key with a PIN already set** is probably refused by v1 (`PIN_REQUIRED`, section 1).
-- **PIN protocol 2** (section 1): required before any release, or accepted as a limit by the
-  owner.
+- **PIN protocol 2** (section 1): built (T-0959). What stays open is the trial against one real
+  key, by the owner by hand, for both protocols.
 - **canokey** in QEMU, where a QEMU has it (section 2), as the test that is not by the same hand.
 - **A downgrade loses the lines** (section 4): an older kithd that rewrites the record drops
   `fido2:` lines it does not know. adr-unlock's rule for passphrase lines is the same; a
