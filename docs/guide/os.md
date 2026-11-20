@@ -15,6 +15,21 @@ As process 1, kithd:
   six digits of its first network card's address;
 - brings every card up and asks for an address (DHCP, renewed). Where there is none, say
   `kith.ip=10.0.0.5/24,10.0.0.1` (address, gateway) and `kith.dns=9.9.9.9`;
+- keeps the time: a machine has no clock battery to trust, so after the network is up kithd asks
+  an SNTP server for the time at start and every hour, and sets the clock when it is more than
+  two seconds off. The server is the one you name, `kith.ntp=ADDRESS[:PORT]` (the only one asked
+  when set: what a network says is whatever a machine on it sent); where none is named, the one
+  DHCP names (option 42), then the gateway. The cluster's leader (a worker asks its control node)
+  is asked too, over the cluster's own TLS, and its time wins over a server over two seconds
+  from it. The server you name is followed alone, whatever the step. Before the clock was ever
+  set (it reads before 2026) the first answer is enough; after that a network's word alone moves
+  it by ten seconds in all (its steps together, until the leader agrees), and more needs the
+  leader within a second of the same time (servers a network names do not vouch for each
+  other), or it is left and the status says so; a node that runs alone for long should set
+  `kith.ntp`. A node whose clock is not yet set answers its peers' time
+  question with a 503. Each Node's status says its `clock`: the server, the offset and whether it
+  stepped it. A node under the `hardened` policy does not set its clock: its status says the
+  offset and the refusal;
 - reads its own arguments after ` -- ` on the command line: `console=ttyS0 kith.hostname=alpha
   -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443`;
 - collects orphaned processes and says what it says on every console the kernel has;
@@ -470,6 +485,7 @@ disk: "serial:S4EWNX0R123456"  # or nvme0n1, or `only`: the one disk of a machin
 hostname: alpha
 ip: 10.0.0.5/24,10.0.0.1      # without it the network is asked (DHCP)
 dns: 10.0.0.1
+ntp: 10.0.0.1                 # a time server, ADDRESS or ADDRESS:PORT; the only one asked when set, and followed alone; without it DHCP's (four at most), then the gateway
 join:                         # without it the node starts a new cluster
   address: 10.0.0.7:7443
   token: $TOKEN
