@@ -1473,6 +1473,17 @@ fn cgroup_parent() -> Result<String> {
     }
 }
 
+/// A new cgroup called `name` next to where container cgroups go ([`cgroup_parent`]), made now:
+/// its path. An error where none can be made (no cgroup v2, no delegation). The caller moves
+/// processes in through `cgroup.procs`, ends them with `cgroup.kill` and removes it when empty.
+pub fn leaf_cgroup(name: &str) -> Result<PathBuf> {
+    let parent = Path::new("/sys/fs/cgroup").join(cgroup_parent()?.trim_start_matches('/'));
+    let leaf = parent.join(name);
+    fs::create_dir_all(&parent).ctx("making the cgroup parent")?;
+    fs::create_dir(&leaf).ctx("making a cgroup")?;
+    Ok(leaf)
+}
+
 /// What to tell the person when a cgroup cannot be made in `parent` (below `root`, the cgroup
 /// mount): a mkdir and an rmdir of an empty one. `None` where it can be made.
 fn probe(root: &Path, parent: &str) -> Option<String> {

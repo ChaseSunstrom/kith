@@ -21,7 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 # A passphrase is typed unseen (`kith node passphrase`).
-nix = { version = "0.29", features = ["term"] }
+nix = { version = "0.29", features = ["term", "signal"] }
 # The admin's key, from the passphrase: PBKDF2 and Ed25519 (`signing.rs`, kithd's `access_sign.rs`).
 ring = "0.17"
 # The TLS client behind `--server` (cargo feature `remote`, off by default: the default kith links no TLS).

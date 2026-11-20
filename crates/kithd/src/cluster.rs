@@ -280,6 +280,17 @@ impl Drop for Place {
     }
 }
 
+/// Has the kernel probe a connection that has been quiet for 15 s, three times 15 s apart, and
+/// drop it when none is answered: a peer that vanished (powered off) ends what it held, such as
+/// a run's tunnel (reqwest does the same for the connections this node makes). Best effort.
+fn keep_alive(stream: &tokio::net::TcpStream) {
+    use nix::sys::socket::{setsockopt, sockopt};
+    let _ = setsockopt(stream, sockopt::KeepAlive, &true);
+    let _ = setsockopt(stream, sockopt::TcpKeepIdle, &15);
+    let _ = setsockopt(stream, sockopt::TcpKeepInterval, &15);
+    let _ = setsockopt(stream, sockopt::TcpKeepCount, &3);
+}
+
 pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::Result<TlsListener> {
     let local = tcp.local_addr()?;
     let (tx, ready) = mpsc::channel(GUESTS);
@@ -296,6 +307,7 @@ pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::R
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
+            keep_alive(&stream);
             // An address that holds its share already is hung up on: it waits for itself.
             let Some(place) = crowd.place(addr.ip()) else {
                 continue;
