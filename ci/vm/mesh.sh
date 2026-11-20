@@ -94,7 +94,13 @@ EOF
             any GET "/v1/logs/Job/default/across?stderr=true" >"$work/across.err" 2>/dev/null || true
             printf '%s\n' "$line" | grep -q succeeded || fail "bytes from a pod on n1 through the Service to the replica on n2 did not all come back: $line: $(cat "$work/across.out" "$work/across.err")"
             reached=$(grep -o 'check: reached [^"\\]*' "$work/across.out") || fail "the Job across did not say what it reached: $(cat "$work/across.out")"
-            [ "${reached#check: reached }" = "[$address]:80" ] || fail "the pod's connection reached ${reached#check: reached }, not kithd at the Service's mesh address [$address]:80"
+            # (kithd's own listener either way: at the Service's mesh address, or at its IPv4 one from the
+            # Service range (T-0664), which a pod whose name gives both may call first. The replica's address
+            # on n2 is neither, so a connection the kernel sent straight there would fail this.)
+            case ${reached#check: reached } in
+                "[$address]:80" | 100.87.*:80) ;;
+                *) fail "the pod's connection reached ${reached#check: reached }, not kithd at the Service's mesh address [$address]:80 or its IPv4 one" ;;
+            esac
             # (n2 had the replica: kithd on n2 heard the connection over its mesh address, as it has no other way to be reached from n1's Service address.)
             # And off again: the switch removed, each node takes its mesh status back, nothing restarts.
             printf '[{"apiVersion":"kith.dev/v1","kind":"Cluster","metadata":{"name":"home"},"spec":{"mesh":{"enabled":false}}}]' >"$work/switch.json"
