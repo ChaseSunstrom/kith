@@ -487,6 +487,34 @@ What each restart of the node costs:
   running process of a `vms` unit carried to another node) is a later, separate feature, and the
   costs above are for a container, not a VM.
 
+#### Dev machines
+
+`kith machine` writes [that recipe](#a-workload-that-outlives-its-node) for you: one Workload of
+one replica and a replicated home Volume, applied through the same call as `kith apply`. Nothing is
+new on kithd's side; `kith get workload/dev` shows the machine as it shows any Workload.
+
+```sh
+kith machine create dev --distro debian --node alpha   # debian, alpine, ubuntu or REGISTRY/NAME:TAG
+kith machine run dev -- sh -c 'cd project && make index'   # a Job in its image, as its user, on its home
+kith machine list
+kith machine rm dev              # its Jobs and the Workload; the home Volume stays unless --purge
+```
+
+- **Your user.** The container runs as your numeric user, read from the process and never 0: kith
+  as root is refused, and so is a `$HOME` that is not yours. Where kithd is your service that user
+  is yours on the node, and [its users](#what-a-container-is-kept-from) say what it is elsewhere.
+  Its `$HOME` is `/home/$USER` there.
+- **Its home** is the Volume `NAME-home` with `replicas: 2` (`--replicas`, `sync: 10s`), mounted at
+  `/home/$USER`. The node that holds it first is `--node`, or the cluster's only node. When that
+  node is lost the Volume's other copy takes over and the Workload follows it, as above.
+- **A command** is `kith machine run`, a Job of its own with the machine's container and mount;
+  read it with `kith logs job NAME-run-N -f`. The machine's own container only sleeps.
+- **Not yet.** There is no way into a running container, so no interactive `shell`; `sudo` does
+  not work, since a container has `no_new_privs` and a setuid program is an ordinary program;
+  `userNamespaces: true` is not set. Your real home is not mounted: an absolute host path is a
+  `kith-system` Volume, which cannot be replicated, so the machine's home is its own. No images
+  built from a spec, no dotfile sync, no ports opened, no snapshots.
+
 ### What a container is given
 
 Files from a ConfigMap or a Secret, directories of its replica's own, what it is told from maps
