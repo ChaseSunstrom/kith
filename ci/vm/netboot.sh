@@ -22,8 +22,19 @@
             # line's key must be one of, and a root that differs makes the update a full one, a
             # restart: three releases that only said another version would be hand-overs of
             # kithd, with no restart at all.
+            #
+            # What this run does not do end to end (T-1180): a slot on trial is killed 15 s
+            # after it starts, not left to wait its 300 s (TRIAL_WAIT) and restart by itself, so
+            # that restart (init::end(true)) and the 300 s retry of a seal-again that began before
+            # its slot was good (UNSEALED_RETRY) are not run here; the boot loader's count of
+            # tries is what the legs read (ondisk b N). And an update from a stick cannot seal
+            # ahead by design: init takes it before the state is opened, when kithd holds no key
+            # to seal, so that leg checks what it can (the stick's slot has no seal and the old
+            # slot comes back), and the control that sealing ahead works is the signed leg above it.
             releasing=''
             if [ -n "$sealing" ]; then
+                command -v xxd >/dev/null 2>&1 || skip "no xxd to make a release key with"
+                command -v openssl >/dev/null 2>&1 || skip "no openssl to make a release key with"
                 keygen() { # NAME: a key file in $work (PKCS#8 in hex, as os/update.sh --sign reads it); its public key said
                     (umask 077 && openssl genpkey -algorithm ed25519 -outform DER | xxd -p -c 256 >"$work/$1")
                     xxd -r -p <"$work/$1" | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | xxd -p -c 64
@@ -199,6 +210,15 @@ sys.exit(1)' "$work/beta.disk" "$1"
                         kill "$vm"
                         wait "$vm" 2>/dev/null || true
                     }
+                    restarts() { # WHAT: the machine restarts itself (its qemu ends) within 5 minutes
+                        tries=0
+                        while kill -0 "$vm" 2>/dev/null; do
+                            tries=$((tries + 1))
+                            [ "$tries" -lt 1500 ] || fail "the machine did not restart after $1"
+                            sleep 0.2
+                        done
+                        wait "$vm" || true
+                    }
                     told() { # WHAT: the cluster's NodeKey of the machine comes to say it
                         tries=0
                         until api GET /v1/resources/NodeKey/kith-000902 | grep -q "$1"; do
@@ -276,7 +296,7 @@ EOF
                     release r1 9.1.0 key1 "$key1" r1
                     hears beta1 '9.1.0 is a full update (a restart)'
                     hears beta1 'kith OS 9.1.0 is in the other slot: restarting into it'
-                    wait "$vm" || true
+                    restarts 'the first release'
                     [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the disk of the machine that took its first release, read from outside: $(says "$work/beta.disk")"
                     # With its TPM: it asks the node this once, and seals its key to what it runs.
                     own beta2 web
@@ -382,7 +402,7 @@ with open(sys.argv[1], "r+b") as disk:
                     lock lock | grep -q '"locked": *true' || fail "the sealed machine could not be locked"
                     hears beta7 "this machine's TPM no longer holds the key of its state"
                     hears beta7 'kithd: the cluster has locked this node'
-                    wait "$vm" || true
+                    restarts 'the cluster locked it'
                     [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the locked machine's disk, read from outside: $(says "$work/beta.disk")"
                     own beta8
                     hears beta8 'still locked: 10.9.0.1:7443 does not hand this node'
@@ -411,7 +431,7 @@ with open(sys.argv[1], "r+b") as disk:
                     hears up1 '9.2.0 is a full update (a restart)'
                     hears up1 "the key of this node's state is sealed ahead for 9.2.0"
                     hears up1 'kith OS 9.2.0 is in the other slot: restarting into it'
-                    wait "$vm" || true
+                    restarts 'the second release'
                     [ "$(says "$work/beta.disk")" = 'sealed held tpm tpm-parent tpm-next' ] || fail "the disk of the machine that sealed ahead, read from outside: $(says "$work/beta.disk")"
                     ondisk a 3
                     own up2 away
@@ -426,20 +446,26 @@ with open(sys.argv[1], "r+b") as disk:
                     ondisk a good
                     recovered rec1
                     # An update from a stick is taken on the word of whoever holds it (no release
-                    # signed it): it seals nothing ahead, whatever it holds. It is the third release
-                    # here, which no key signed so far, and what the slot holds is tried three times
-                    # with no key for it (no node in reach) before the old slot starts again.
+                    # signed it), and never sealed for. By design it cannot be: init takes it before
+                    # the state is opened, so kithd holds no key to seal ahead with (and its boot
+                    # carries a command line of its own, which the TPM refuses anyway). So this
+                    # checks what is observable, and the signed leg above is its control (the same
+                    # kind of update, sealed ahead, opens its slot by tpm-next): the disk says no
+                    # tpm-next after it, and the slot it wrote is tried three times and asks the
+                    # cluster each time, never opened by its TPM, before the old slot starts again.
+                    # It is the third release here, which no key signed so far.
                     cp "$work/www/r3.update" "$work/stick.update"
                     truncate -s %1M "$work/stick.update"
                     own stick away -drive "file=$work/stick.update,format=raw,if=virtio,readonly=on" -smbios 'type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.update=vdb'
                     hears stick 'kithd: init: kith OS 9.3.0 from vdb is in the other slot'
-                    wait "$vm" || true
+                    restarts 'the update from a stick'
                     # (From here the record says "seen": the recovery key was typed at the console.)
                     [ "$(says "$work/beta.disk")" = 'sealed held tpm tpm-parent seen' ] || fail "the disk of the machine that took an update from a stick, read from outside: $(says "$work/beta.disk")"
                     ondisk b 3
                     trial stick1 2
                     trial stick2 1
                     trial stick3 0
+                    ! grep -aqF 'TPM gave the key' "$work/stick1.log" "$work/stick2.log" "$work/stick3.log" || fail "the slot an update from a stick wrote was opened by the TPM: something was sealed for it"
                     own stick4 away
                     hears stick4 'slot b did not come up in 3 tries: this is slot a'
                     hears stick4 'TPM gave the key of its state: no node was asked'
@@ -455,14 +481,22 @@ with open(sys.argv[1], "r+b") as disk:
                     release r3 9.3.0 key1 "$key1" r3
                     hears dm2 "the key of this node's state is sealed ahead for 9.3.0"
                     hears dm2 'kith OS 9.3.0 is in the other slot: restarting into it'
-                    wait "$vm" || true
+                    restarts 'the third release'
                     [ "$(says "$work/beta.disk")" = 'sealed held tpm tpm-parent tpm-next seen' ] || fail "the disk of the machine that sealed ahead again, read from outside: $(says "$work/beta.disk")"
                     ondisk b 3
                     python3 -c '
 import hashlib, re, struct, sys
-# (The record is written twice, one after the other, and its "sum:" line is the SHA-256 of
-# the rest: one byte changed and the sum kept would be a damaged record, not a seal the TPM
-# refuses. So the byte is changed in both copies and the sum made again.)
+# (The format of the lock record is in crates/kithd/src/crypt.rs, Record::read and Record::write: it sits
+# at 512 KiB of the "config" partition and a copy follows 4096 bytes on, written first; its text is
+# "kith-lock v1", a "sum:" line that is the SHA-256 of the rest, then the lines. One byte changed
+# and the sum kept would be a damaged record kithd refuses, not a seal the TPM refuses; so the
+# byte is changed in both copies and the sum made again.
+# The byte is hex digit 40 of tpm-next:, byte 20 of the sealed blob: inside the integrity HMAC
+# of the TPM2B_PRIVATE (bytes 4 to 36), so what reads the record whole and parses the blob (sizes
+# untouched) is TPM2_Load of the TPM, and that is what refuses. The log cannot say so: a seal that
+# does not open is said as the refusal of tpm:, the system that runs now. The control is the signed
+# leg above, whose undamaged tpm-next opens its slot; here the old slot "TPM gave the key" line
+# and the three tries are what is read.)
 with open(sys.argv[1], "r+b") as disk:
     disk.seek(512 + 72)
     entries = struct.unpack("<Q", disk.read(8))[0] * 512
@@ -487,6 +521,7 @@ with open(sys.argv[1], "r+b") as disk:
                     trial dmg1 2
                     trial dmg2 1
                     trial dmg3 0
+                    ! grep -aqF 'TPM gave the key' "$work/dmg1.log" "$work/dmg2.log" "$work/dmg3.log" || fail "the TPM gave the key from the seal that was damaged"
                     own dmg4 away
                     hears dmg4 'slot b did not come up in 3 tries: this is slot a'
                     hears dmg4 'TPM gave the key of its state: no node was asked'

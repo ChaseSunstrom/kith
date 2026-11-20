@@ -750,9 +750,17 @@ All against swtpm, in VMs on disk files. None on a real TPM, a real FIDO2 key or
   seconds instead of waiting out the five minutes (that wait is the unit test's). The damaged
   byte is one hex digit of the sealed blob in `tpm-next:`, changed in both copies of the record
   with its `sum:` made again (else the record is damaged, and not a seal the TPM refuses); the
-  old slot then starts by the boot loader's count, and `tpm:` opens it.
+  old slot then starts by the boot loader's count, and `tpm:` opens it. That digit lies in the
+  integrity HMAC of the sealed blob, so the TPM's load is what refuses (the log says the
+  refusal of `tpm:`, the system that runs, not of `tpm-next:`); the signed leg before it, whose
+  undamaged `tpm-next:` opens its slot, is the control. Not run end to end: the 300 second wait
+  and the restart it ends with (the trials are killed first), and the 300 second retry of a
+  seal-again that began before its slot was good.
 - An unsigned update from a stick: no `tpm-next:`, and the trial wait leads back (as built:
-  the stick's slot is tried three times, the old slot starts, the disk reads `tpm` only).
+  the stick's slot is tried three times, the old slot starts, the disk reads `tpm` only). A
+  stick update cannot seal ahead at all: init takes it before the state is opened, when kithd
+  holds no key to seal, so the leg reads what is observable (no `tpm-next:` on the disk, the
+  stick's slot never opened by its TPM) and the signed leg is its control.
 - Every VM test ends by opening the disk with its recovery key.
 
 ## On hardware: the owner's checklist

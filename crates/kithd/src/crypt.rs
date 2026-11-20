@@ -1733,7 +1733,8 @@ const MEASUREMENTS: &str = "/sys/kernel/security/tpm0/binary_bios_measurements";
 fn measurements() -> Result<Vec<u8>, String> {
     if !Path::new(MEASUREMENTS).exists() {
         use nix::mount::{MsFlags, mount};
-        let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+        // (Read only: the log is all this reads of it; T-1180's VM run reads it so.)
+        let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_RDONLY;
         // (Already mounted, or no TPM: the read says.)
         let _ = mount(
             Some("securityfs"),
