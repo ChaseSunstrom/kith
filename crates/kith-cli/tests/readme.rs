@@ -770,6 +770,25 @@ fn the_guide_says_a_bare_pod_is_run_and_deleted() {
     );
 }
 
+/// The recipe for a workload that outlives its node says kith runs no Kubernetes and no VM for it,
+/// and that live migration of a VM workload is a later, separate feature (T-1131).
+#[test]
+fn the_session_recipe_says_no_kubernetes_no_vm_and_live_migration_is_later() {
+    let page = std::fs::read_to_string(root().join("docs/guide/workloads.md")).unwrap();
+    let from = page
+        .find("### A workload that outlives its node")
+        .expect("the recipe's section");
+    let section = &page[from..];
+    let section = &section[..section[4..].find("\n### ").map_or(section.len(), |at| at + 4)];
+    for said in [
+        "Kith runs no Kubernetes and no virtual machine for this",
+        "Live migration of a VM workload",
+        "a later, separate feature",
+    ] {
+        assert!(section.contains(said), "the recipe's section no longer says {said:?}");
+    }
+}
+
 /// The installer's page (docs/install.html) carries the three answer files kithd's own unit test parses
 /// (`the_install_page_examples`), and the front page and the guide lead to it.
 #[test]
