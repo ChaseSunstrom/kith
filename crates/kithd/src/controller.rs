@@ -2086,7 +2086,7 @@ impl Controller {
                 .values()
                 .flat_map(|slot| slot.volumes.iter().map(|(dir, _, _)| dir));
             let theirs: Vec<_> = mounts.filter(|dir| dir.node != me).collect();
-            crate::share::release(self.logs.parent().unwrap_or(&self.logs), &theirs);
+            crate::share::release(self.logs.parent().unwrap_or(&self.logs), &theirs).await;
         }
 
         // What pods wrote outside their volumes: one past its limit, or the biggest writer on a
