@@ -1914,13 +1914,16 @@ const GIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// trees or slow ones, can run the root part out of descriptors. A give that finds it short
 /// waits for another to finish, up to a limit, and then fails alone.
 ///
-/// One namespace holds at most half of it: a tenant with many starts of big or slow volumes waits
-/// on its own share, and the other half is always there for the rest.
+/// One namespace holds at most half of it (its share), so ONE hog waits on its own share and the
+/// other half is there for the rest. Two namespaces can still hold the whole pool between them,
+/// and then a third waits (30 s, then fails alone).
 ///
 /// ponytail: a give holds its slots for its whole walk, so a slow volume (a network file system)
 /// holds its namespace's share as long as it is walked, and starts of that namespace past it wait
 /// (30 s, then fail, and the volume is walked again by the next start: the walk is idempotent).
-/// If that ever bites, give the slots back between directories and take them again.
+/// If that ever bites, give the slots back between directories and take them again. The 30 s wait
+/// is a sync Condvar wait run inside the controller's async start: when T-0811/T-0812 add
+/// concurrent gives, run create under `spawn_blocking` (T-1126).
 struct GiveSlots {
     total: usize,
     /// The descriptors held, all together and for each namespace.

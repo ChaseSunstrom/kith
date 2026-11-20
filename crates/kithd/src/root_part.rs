@@ -645,6 +645,12 @@ pub fn check_unit(id: &str, unit: &Unit, ground: &Ground, owns: &dyn Fn(&Path) -
     if let Some(hostname) = &unit.hostname {
         label("hostname", hostname)?;
     }
+    // (The key of the give pool's share (`GiveSlots`), from the serving part: a name of the form
+    // every namespace has, so a start cannot be its own tenant by a fresh long one each time.
+    // Empty is the one bucket of units that name none.)
+    if !unit.namespace.is_empty() {
+        kith_api::check_name(&unit.namespace).map_err(|e| format!("namespace: {e}"))?;
+    }
     if !unit.no_node_root
         && let Some(refusal) = policy.refusal("rootContainers")
     {
@@ -2206,6 +2212,41 @@ mod tests {
             no_node_root: false,
             ..Unit::default()
         }
+    }
+
+    /// A unit's namespace keys the give pool's shares: refused unless a name of the form every
+    /// namespace has (or empty), and a unit without one deserializes to empty.
+    #[test]
+    fn a_units_namespace_is_a_namespace_name_or_empty() {
+        let (_, state) = book("unit-namespace");
+        let on = ground(&state, "");
+        let with = |namespace: &str| Unit {
+            namespace: namespace.into(),
+            ..plain()
+        };
+        for good in ["", "team-a", "a.b", &"a".repeat(63)] {
+            assert_eq!(refused(&with(good), &on), None, "{good:?}");
+        }
+        for bad in [
+            &"a".repeat(64),
+            &"a".repeat(5000),
+            "a b",
+            "A",
+            "a/b",
+            "a\nb",
+            "-a",
+            "a_b",
+        ] {
+            let why = refused(&with(bad), &on).unwrap_or_else(|| panic!("{bad:?} was let through"));
+            assert!(why.starts_with("namespace:"), "{bad:?}: {why}");
+        }
+        let old: Unit = serde_json::from_str("{}").unwrap_or_else(|_| {
+            // (The serving part's JSON of a unit from before the field: its other fields only.)
+            let mut json = serde_json::to_value(Unit::default()).unwrap();
+            json.as_object_mut().unwrap().remove("namespace");
+            serde_json::from_value(json).unwrap()
+        });
+        assert_eq!(old.namespace, "");
     }
 
     #[test]
