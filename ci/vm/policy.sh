@@ -155,9 +155,9 @@ EOF
             printf '%s\n' "$line" | grep -Eq '^[0-9]+ failed' || fail "the container on n1 made a file that the one on n2 made: $line"
             grep -q '/data/from-n2: File exists' "$work/shared-again.err" || fail "the container on n1 did not find what the one on n2 wrote: $(cat "$work/shared-again.err")"
             echo "vm.sh: a shared volume of n1, written from n2 and seen on n1: $(grep -a 'File exists' "$work/shared-again.err" | head -n 1)" >&2
-            # (c) A pod whose container is not root. (This test runs no command in a running
-            # pod, and no exec probe: what kithd does in a pod's namespaces for itself is the
-            # network a pod joins as it starts, which each
+            # (c) A pod whose container is not root. (kith has no command that runs in a
+            # running pod, and the probe that would, `exec`, is not run yet: what kithd does in
+            # a pod's namespaces for itself is the network a pod joins as it starts, which each
             # pod here did, and the /proc/PID/root of a pod that is given an input device as
             # it is plugged, which no VM here has.)
             job lowly n2 '"image":"kith.test/pod:user","command":["/bin/pod","tell"]'
