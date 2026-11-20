@@ -97,6 +97,16 @@ pub fn held_back(yield_to: &YieldTo, activity: Option<&str>) -> bool {
     yield_to.when.contains(&now)
 }
 
+/// A seat of node `me` that last said `active` or `fullscreen`: its name, and which (the first by
+/// the first listed). A seat that says nothing, or idle, or is not on `me`, is not busy (as `held_back` reads it).
+pub fn busy(store: &Store, me: &str) -> Option<(String, String)> {
+    store.list(Some("Seat")).find_map(|found| {
+        let says = found.status.as_ref()?["activity"].as_str()?;
+        let on_me = seat(store, &found.metadata.name).is_some_and(|spec| spec.node == me);
+        (on_me && matches!(says, "active" | "fullscreen")).then(|| (found.metadata.name.clone(), says.to_string()))
+    })
+}
+
 /// What the cgroup of each unit of a workload on `me` should say: the memory it is guaranteed
 /// (a holder of a seat of `me` with a reserve; 0 when the reserve names no memory) and whether
 /// it is held back. Only workloads that hold such a seat or say `yieldTo` are in it.
@@ -281,10 +291,16 @@ spec:
         let batch = |store: &Store, node: &str| tunes(store, node)["Workload/default/batch"];
         // Nothing said is idle: not held back. Active is not one of its states either.
         assert_eq!(batch(&store, "a"), (None, false));
+        assert_eq!(busy(&store, "a"), None);
         says(&mut store, "active");
         assert_eq!(batch(&store, "a"), (None, false));
+        assert_eq!(busy(&store, "a"), Some(("a-seat0".into(), "active".into())));
+        assert_eq!(busy(&store, "b"), None);
+        says(&mut store, "idle");
+        assert_eq!(busy(&store, "a"), None);
         says(&mut store, "fullscreen");
         assert_eq!(batch(&store, "a"), (None, true));
+        assert_eq!(busy(&store, "a"), Some(("a-seat0".into(), "fullscreen".into())));
         // (A copy of it on another node is in nobody's way.)
         assert_eq!(batch(&store, "b"), (None, false));
         // Held, the seat keeps what it says; its last holder gone, it says nothing again.

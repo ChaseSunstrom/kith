@@ -144,6 +144,14 @@ pub(crate) fn cordon_on(spec: &mut Value, key: &str, effect: &str) {
     spec["taints"] = Value::Array(taints);
 }
 
+/// Does this cordon record say an owner set the cordon first? Its value is `owner`, or
+/// `owner;plan:NAME` when an update plan put the record on (`update.rs`).
+fn owner_set(taint: &Value) -> bool {
+    taint["value"]
+        .as_str()
+        .is_some_and(|value| value == "owner" || value.starts_with("owner;"))
+}
+
 /// Takes the cordon record under `key` off a Node's spec, and the cordon with it unless an
 /// owner set it. When the record set the cordon and another record still holds it, that other
 /// record now says it set it, so its own end takes the cordon off.
@@ -155,13 +163,19 @@ pub(crate) fn cordon_off(spec: &mut Value, key: &str) {
         return;
     };
     let taint = taints.remove(at);
-    let mut lift = taint["value"] != "owner";
+    let mut lift = !owner_set(&taint);
     let held = taints
         .iter_mut()
         .find(|taint| CORDON_RECORDS.contains(&taint["key"].as_str().unwrap_or_default()));
     if let Some(other) = held {
-        if lift && let Some(other) = other.as_object_mut() {
-            other.remove("value");
+        if lift && let Some(rest) = other["value"].as_str().and_then(|v| v.strip_prefix("owner")) {
+            // It no longer says an owner set the cordon; a plan stamp after it stays (`update.rs`).
+            match rest.strip_prefix(';') {
+                Some(stamp) => other["value"] = stamp.into(),
+                None => {
+                    other.as_object_mut().map(|other| other.remove("value"));
+                }
+            }
         }
         lift = false;
     }
@@ -405,10 +419,106 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
     (fields, left)
 }
 
+/// Where each replicated Volume on a drained node (one with the drain record, and `extra`: a node
+/// to plan with the drain on) goes with its Workloads: the node whose copy takes it over, or why
+/// none can. Only a Volume whose every Workload then runs on another node goes: the scheduler is
+/// asked with the primaries moved, and one that would not be placed there (a Job, which a drain
+/// leaves, a Workload with a pin that stays, no room) keeps its Volume where it is.
+/// `respect_errors`: a Volume whose last handover failed is not planned to go (the plan is shown
+/// so; the leader, which asks again after a while, leaves this off).
+pub(crate) fn handovers(
+    store: &Store,
+    seen: Seen,
+    grace: Duration,
+    extra: Option<&str>,
+    respect_errors: bool,
+) -> BTreeMap<String, Result<String, String>> {
+    let away: BTreeSet<String> = store
+        .list(Some("Node"))
+        .filter(|node| has_record(&node.spec, kith_sched::DRAIN) || extra == Some(node.metadata.name.as_str()))
+        .map(|node| node.metadata.name.clone())
+        .collect();
+    let mut plan = BTreeMap::new();
+    let lost = |node: &str| seen(node).1;
+    for (key, dir, _) in crate::volumes::replicated(store) {
+        if !away.contains(&dir.node) {
+            continue;
+        }
+        let status = store.get(&key).and_then(|volume| volume.status.as_ref());
+        let error = status.and_then(|status| status["handover-error"]["why"].as_str());
+        let idle = status.is_none_or(|status| status["handover"].is_null());
+        let target = crate::replicas::handover_target(store, &key, &dir, &|node| away.contains(node), &lost);
+        let target = match (target, error) {
+            (Ok(to), Some(error)) if respect_errors && idle => {
+                Err(format!("the copy on {to} could not be brought up to date: {error}"))
+            }
+            (target, _) => target,
+        };
+        plan.insert(key, target);
+    }
+    // Each pass moves the Volumes planned to go and looks at what the scheduler then does with
+    // the Workloads that mount them; one that is not placed on another node holds its Volumes
+    // back (more of them each time round, so it ends).
+    while plan.values().any(Result::is_ok) {
+        let (.., made) = decide(&flipped(store, &plan), seen, grace, extra);
+        let mut held: BTreeMap<String, String> = BTreeMap::new();
+        for (owner, mounted) in crate::volumes::resolve(store).owners {
+            let Ok(mounted) = mounted else { continue };
+            let dirs = mounted
+                .volumes
+                .values()
+                .chain(mounted.each.values().flatten().flat_map(|own| own.dirs.values()));
+            let keys: Vec<String> = dirs
+                .map(|dir| format!("Volume/{}/{}", dir.namespace, dir.name))
+                .filter(|key| plan.get(key).is_some_and(Result::is_ok))
+                .collect();
+            let count = store.get(&owner).and_then(wants).map_or(0, |(count, ..)| count);
+            for replica in (0..count).map(|replica| format!("{owner}#{replica}")) {
+                let placed = made.bind.get(&replica).filter(|node| !away.contains(*node));
+                if placed.is_none() && !keys.is_empty() {
+                    let why = made
+                        .unschedulable
+                        .get(&replica)
+                        .map_or("it stays where it is", String::as_str);
+                    held.extend(
+                        keys.iter()
+                            .map(|key| (key.clone(), format!("{owner} would not go with it: {why}"))),
+                    );
+                }
+            }
+        }
+        if held.is_empty() {
+            break;
+        }
+        plan.extend(held.into_iter().map(|(key, why)| (key, Err(why))));
+    }
+    plan
+}
+
+/// The store as it would be with each Volume of `plan` that goes at its new primary.
+fn flipped(store: &Store, plan: &BTreeMap<String, Result<String, String>>) -> Store {
+    let mut after = store.clone();
+    for (key, to) in plan.iter().filter_map(|(key, to)| Some((key, to.as_ref().ok()?))) {
+        let mut status = after
+            .get(key)
+            .and_then(|volume| volume.status.clone())
+            .unwrap_or_default();
+        status["primary"] = to.clone().into();
+        let _ = after.set_status(key, Some(status));
+    }
+    after
+}
+
 /// What `kith node drain` would do to what runs on `node`, as the scheduler works it out with
-/// the drain on: one line per Workload, Job and NodeWorkload that has a copy there now.
+/// the drain on: one line per Workload, Job and NodeWorkload that has a copy there now. A
+/// Workload pinned by a replicated Volume moves with it, where [`handovers`] says it can.
 pub(crate) fn drain_lines(store: &Store, seen: Seen, grace: Duration, node: &str) -> Vec<Value> {
-    let (nodes, replicas, made) = decide(store, seen, grace, Some(node));
+    let handed = handovers(store, seen, grace, Some(node), true);
+    let (nodes, replicas, made) = decide(&flipped(store, &handed), seen, grace, Some(node));
+    let (mounts, served) = (
+        crate::volumes::resolve(store).owners,
+        crate::volumes::served(store, node),
+    );
     let mut lines = Vec::new();
     for r in &replicas {
         let after = made.bind.get(&r.id).map(String::as_str);
@@ -416,7 +526,30 @@ pub(crate) fn drain_lines(store: &Store, seen: Seen, grace: Duration, node: &str
             continue;
         }
         let (key, replica) = r.id.rsplit_once('#').unwrap_or((r.id.as_str(), "0"));
+        // Why a Volume of it on this node keeps it there: the Volumes it mounts that are here.
+        let held = mounts.get(key).and_then(|held| held.as_ref().ok());
+        let held = held.and_then(|held| held.of_replica(replica.parse().unwrap_or(0)).ok());
+        let here = held
+            .iter()
+            .flat_map(|held| held.volumes.values())
+            .filter(|dir| dir.node == node);
+        let here = here.filter(|dir| !served.contains(dir));
+        let volumes: Vec<String> = here
+            .map(|dir| {
+                let volume = format!("Volume {}/{}", dir.namespace, dir.name);
+                match handed.get(&format!("Volume/{}/{}", dir.namespace, dir.name)) {
+                    Some(Err(why)) => format!("{volume}: {why}"),
+                    Some(Ok(_)) => String::new(),
+                    None if dir.namespace == crate::volumes::SYSTEM => {
+                        format!("{volume} is a path on this node's host, with no copy anywhere else")
+                    }
+                    None => format!("{volume} has one copy only (replicas: 2 or more keeps another on a second node)"),
+                }
+            })
+            .filter(|why| !why.is_empty())
+            .collect();
         let (outcome, to, why) = match after {
+            Some(to) if to == node && !volumes.is_empty() => ("stays", None, volumes.join("; ")),
             Some(to) if to == node => ("stays", None, made.stays.get(&r.id).cloned().unwrap_or_default()),
             Some(to) => ("moves", Some(to.to_string()), String::new()),
             None => (
@@ -529,6 +662,11 @@ fn line(key: String, replica: Option<&str>, outcome: &str, to: Option<String>, w
 /// a change to the store), while this node leads.
 pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Receiver<bool>) {
     let mut generation = shared.generation.subscribe();
+    // For each Volume whose handover failed: when that was last seen, how many in a row, and
+    // whether its error is there now (a drain asks again after longer each time).
+    // (The claims below, written from a snapshot, can undo what a node just said, a handover's
+    // answer too: the ask then times out and is made again.)
+    let mut failed: BTreeMap<String, (Instant, u32, bool)> = BTreeMap::new();
     loop {
         tokio::select! {
             _ = generation.changed() => {}
@@ -555,6 +693,51 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
             let lost = |name: &str| seen(name).1;
             let mut fields = fields;
             fields.extend(crate::replicas::writes(&state.store, &lost, grace));
+            // A drained node's replicated Volumes are handed to the copy that is current (the
+            // handover asks it, then switches); one that failed is asked again after a while.
+            // (Nothing is worked out while no node is drained and no Volume has a handover's field.)
+            let store = &state.store;
+            let draining = store
+                .list(Some("Node"))
+                .any(|node| has_record(&node.spec, kith_sched::DRAIN));
+            let handing = store.list(Some("Volume")).any(|volume| {
+                let status = volume.status.as_ref();
+                status.is_some_and(|status| {
+                    crate::replicas::FIELDS[3..]
+                        .iter()
+                        .any(|field| !status[*field].is_null())
+                })
+            });
+            let plan = if draining || handing {
+                handovers(store, &seen, grace, None, false)
+            } else {
+                BTreeMap::new()
+            };
+            let now = Instant::now();
+            let errors = crate::replicas::failed(store);
+            // A Volume that works again, or is no longer handed over, starts over.
+            failed.retain(|key, _| plan.contains_key(key) || errors.contains_key(key));
+            for (key, entry) in &mut failed {
+                match (errors.contains_key(key), entry.2) {
+                    (true, false) => *entry = (now, entry.1 + 1, true),
+                    (false, _) => entry.2 = false,
+                    _ => {}
+                }
+            }
+            for key in errors.into_keys() {
+                failed.entry(key).or_insert((now, 1, true));
+            }
+            let busy: BTreeSet<&str> = fields.iter().map(|(key, _)| key.as_str()).collect();
+            let blocked = |key: &str| {
+                let failing = failed.get(key);
+                failing.is_some_and(|(at, count, _)| now.duration_since(*at) < crate::replicas::retry_after(*count))
+            };
+            let moves = crate::replicas::handover_writes(store, &plan, kith_api::store::now(), &blocked);
+            let moves: Vec<_> = moves
+                .into_iter()
+                .filter(|(key, _)| !busy.contains(key.as_str()))
+                .collect();
+            fields.extend(moves);
             (fields, left, claimed, volumes)
         };
         // What a lost node ran stops counting as ready before its replicas get a new home.
@@ -1553,5 +1736,171 @@ spec:
             .find(|(of, _)| of == "Workload/default/gpu-work")
             .map(|(_, f)| f["nodes"].clone());
         assert_eq!(nodes, Some(json!({ "0": "a" })));
+    }
+
+    /// `a` is drained and holds each of these Volumes, with a Workload that mounts it (all
+    /// running on a): `data` has a copy on b, `solo` none, `host` is in kith-system, `far`'s copy
+    /// is on c (a node that is down in the tests), `data2` has one on b but its Workload also
+    /// mounts `solo`.
+    const MOUNTED: &str = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: c }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: data }
+spec: { node: a, path: data, replicas: 2 }
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: data2 }
+spec: { node: a, path: data2, replicas: 2 }
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: far }
+spec: { node: a, path: far, replicas: 2 }
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: solo }
+spec: { node: a, path: solo }
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: host, namespace: kith-system }
+spec: { node: a, path: /var/lib/host }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db }
+spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volume: data, path: /d }] }] } }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: both }
+spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volume: data2, path: /d }, { volume: solo, path: /s }] }] } }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: faraway }
+spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volume: far, path: /d }] }] } }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: alone }
+spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volume: solo, path: /d }] }] } }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: sys, namespace: kith-system }
+spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volume: host, path: /d }] }] } }
+";
+
+    fn mounted(statuses: &[(&str, Value)]) -> Store {
+        let ran = |key: &'static str| (key, json!({ "nodes": { "0": "a" } }));
+        let mut all = vec![
+            ran("Workload/default/db"),
+            ran("Workload/default/both"),
+            ran("Workload/default/faraway"),
+            ran("Workload/default/alone"),
+            ran("Workload/kith-system/sys"),
+            ("Volume/default/data", json!({ "primary": "a", "replicas": ["b"] })),
+            ("Volume/default/data2", json!({ "primary": "a", "replicas": ["b"] })),
+            ("Volume/default/far", json!({ "primary": "a", "replicas": ["c"] })),
+        ];
+        all.retain(|(key, _)| !statuses.iter().any(|(set, _)| set == key));
+        all.extend(statuses.iter().cloned());
+        drained_store(&format!("{DRAINED}---\n{MOUNTED}"), &all)
+    }
+
+    /// c is down; the others are there.
+    fn c_is_down(node: &str) -> (Option<(f64, f64)>, Option<Duration>) {
+        (Some((4.0, 8e9)), (node == "c").then_some(Duration::from_secs(90)))
+    }
+
+    fn line_of(lines: &[Value], key: &str) -> Value {
+        let found = lines.iter().find(|line| line["key"] == key);
+        found.cloned().unwrap_or_else(|| panic!("no line for {key}: {lines:?}"))
+    }
+
+    /// A Workload whose only pin to the drained node is a Volume that has a copy on another node
+    /// moves with it. A Volume with no other copy, one in kith-system, one whose copy cannot take
+    /// it and one whose Workload has another pin that stays keep it, and the plan says why.
+    #[test]
+    fn drain_plan_moves_with_a_replicated_volume() {
+        let store = mounted(&[]);
+        let lines = drain_lines(&store, &c_is_down, Duration::from_secs(300), "a");
+        let db = line_of(&lines, "Workload/default/db");
+        assert_eq!(
+            (db["outcome"].as_str(), db["to"].as_str()),
+            (Some("moves"), Some("b")),
+            "{db}"
+        );
+        let alone = line_of(&lines, "Workload/default/alone");
+        assert_eq!(alone["outcome"], "stays");
+        let why = alone["why"].as_str().unwrap();
+        assert!(why.contains("Volume default/solo") && why.contains("one copy"), "{why}");
+        let sys = line_of(&lines, "Workload/kith-system/sys");
+        assert_eq!(sys["outcome"], "stays");
+        let why = sys["why"].as_str().unwrap();
+        assert!(
+            why.contains("Volume kith-system/host") && why.contains("kith-system"),
+            "{why}"
+        );
+        let far = line_of(&lines, "Workload/default/faraway");
+        assert_eq!(far["outcome"], "stays");
+        assert!(far["why"].as_str().unwrap().contains("c is down"), "{far}");
+        // (`both` has a replicated Volume and one that has not: the pair cannot be on two nodes.)
+        let both = line_of(&lines, "Workload/default/both");
+        assert_eq!(both["outcome"], "stays");
+        let why = both["why"].as_str().unwrap();
+        assert!(why.contains("Volume default/solo") && why.contains("one copy"), "{why}");
+        // The drain is planned, not done: nothing in the store changed.
+        assert_eq!(crate::volumes::dir(&store, "default", "data").unwrap().node, "a");
+        // The plan the leader acts on names the Volume that goes, and says why for each that stays.
+        let plan = handovers(&store, &c_is_down, Duration::from_secs(300), None, false);
+        assert_eq!(plan["Volume/default/data"], Ok("b".to_string()));
+        assert!(plan["Volume/default/far"].as_ref().unwrap_err().contains("c is down"));
+        assert!(plan["Volume/default/data2"].is_err(), "{plan:?}");
+        assert!(!plan.contains_key("Volume/default/solo"), "{plan:?}");
+    }
+
+    /// A copy that cannot be brought up to date (it said so, or its node is down) leaves the
+    /// Volume and its Workload where they are, the plan says why, and the leader writes no change
+    /// of primary: it is made only once the copy says it is current (`replicas`' own tests).
+    #[test]
+    fn drain_handover_that_fails_changes_nothing() {
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let said = json!({ "primary": "a", "replicas": ["b"], "handover-error": { "to": "b", "at": 1, "why": "nothing came for 30 s" } });
+        let store = mounted(&[("Volume/default/data", said)]);
+        let lines = drain_lines(&store, &there, Duration::from_secs(300), "a");
+        let db = line_of(&lines, "Workload/default/db");
+        assert_eq!(db["outcome"], "stays", "{db}");
+        let why = db["why"].as_str().unwrap();
+        assert!(
+            why.contains("could not be brought up to date") && why.contains("nothing came for 30 s"),
+            "{why}"
+        );
+        // The leader asks again later (the Volume says so and `blocked` says when): the plan it
+        // acts on does not hold the error against the Volume, but never changes the primary itself.
+        let plan = handovers(&store, &there, Duration::from_secs(300), None, false);
+        assert_eq!(plan["Volume/default/data"], Ok("b".to_string()));
+        let writes = crate::replicas::handover_writes(&store, &plan, 1000, &|key| key == "Volume/default/data");
+        assert!(
+            writes.iter().all(|(_, fields)| !fields.contains_key("primary")),
+            "{writes:?}"
+        );
+        // The node it would go to is down: it is not asked, and the Volume stays with its Workload.
+        let down = mounted(&[]);
+        let plan = handovers(&down, &c_is_down, Duration::from_secs(300), None, false);
+        let writes = crate::replicas::handover_writes(&down, &plan, 1000, &|_| false);
+        assert!(writes.iter().all(|(key, _)| key != "Volume/default/far"), "{writes:?}");
+        assert!(
+            writes.iter().all(|(_, fields)| !fields.contains_key("primary")),
+            "{writes:?}"
+        );
     }
 }

@@ -158,6 +158,18 @@ spec:
   primary and workloads that mount the volume are placed there. A node that comes back is not
   given the volume back; what it had is kept beside it as `.PATH.was-TIME`, a hidden name (yours to
   delete).
+- A [drain](cluster.md#restarting-a-node-on-purpose) of the primary's node hands the volume over
+  and the workloads that mount it move with it: the cluster asks the copy that synced last (a
+  control node's before a worker's) to sync now (`status.handover`), and makes it primary only
+  once it says it is current (`status.handover-done`); the old node keeps what it had as
+  `.PATH.was-TIME` and syncs from the new primary. A copy that cannot be brought up to date (the sync
+  fails, the node is down, no answer in 15 minutes) leaves the volume and its workloads where they
+  are: the plan says why (`status.handover-error`), and it is asked again after 60 s, then 5 and
+  25 minutes, then every 30 minutes. A node is asked for one volume at a time, so a drain of a node
+  with several moves them one after another. The volume goes
+  only if every workload that mounts it would then be placed on another node. What the workload
+  wrote after that last sync stays in `.PATH.was-TIME` on the old node (a handover is not a
+  freeze: stop the workload first to lose nothing).
 - **A failover loses what was written after the last sync**, and a copy is the directory as read
   while in use: a database caught mid-write may need its own recovery.
 - A restore, a replica's first copy and each sync unpack no more than the Volume's `size` and
