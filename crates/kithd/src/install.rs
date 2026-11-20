@@ -112,7 +112,7 @@ fn serial(disk: &Path) -> String {
 }
 
 /// The one disk that gives `serial` (after `serial:`), or why none is.
-fn by_serial<'a>(serial: &str, disks: &'a [Disk]) -> Result<&'a Disk, String> {
+pub(crate) fn by_serial<'a>(serial: &str, disks: &'a [Disk]) -> Result<&'a Disk, String> {
     let serial = serial.trim();
     if serial.is_empty() {
         return Err("`disk: serial:` names no serial".into());
