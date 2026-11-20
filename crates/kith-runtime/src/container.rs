@@ -485,6 +485,12 @@ impl Runtime {
         let images = ImageStore::new(&root)?;
         fs::create_dir_all(root.join("containers")).ctx("creating the runtime directory")?;
         fs::create_dir_all(root.join("state")).ctx("creating the runtime directory")?;
+        // (Copies of an init's spec an enter of a kithd that was killed never removed.)
+        for entry in fs::read_dir(&root).ctx("creating the runtime directory")?.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(SCRATCH) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
         nix::sys::prctl::set_child_subreaper(true).ctx("becoming a child subreaper")?;
         Ok(Runtime {
             root,
@@ -1068,6 +1074,91 @@ fn init_process(spec: &oci_spec::runtime::Spec) -> std::result::Result<&oci_spec
         .ok_or_else(|| "its spec has no process".to_string())
 }
 
+/// What the scratch directories of [`enter`] are named under the runtime directory (swept by
+/// [`Runtime::new`]: a kithd killed in an enter leaves one).
+const SCRATCH: &str = "enter-scratch-";
+
+/// The init's `spec` for a tenant to be validated against: the same but for the groups of its
+/// user (a user namespace refuses them, and the tenant is given its own), and a root path that
+/// is relative to the init's `bundle` made absolute (the copy is kept somewhere else).
+/// Namespaces, capabilities and the seccomp filter are not touched: the tenant joins the init's.
+fn scratch_spec(spec: &Spec, bundle: &Path) -> Spec {
+    let mut copy = spec.clone();
+    if let Some(mut process) = copy.process().clone() {
+        let mut user = process.user().clone();
+        user.set_additional_gids(None);
+        process.set_user(user);
+        copy.set_process(Some(process));
+    }
+    if let Some(mut root) = copy.root().clone()
+        && root.path().is_relative()
+    {
+        root.set_path(bundle.join(root.path()));
+        copy.set_root(Some(root));
+    }
+    copy
+}
+
+/// A private copy of an init's state.json and config.json for a tenant's libcontainer to read
+/// (see [`scratch_spec`]): a directory of this process's user, mode 0700, with the container's
+/// directory in it. Removed when dropped, and so on every way `enter` ends.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    /// A new one under `runtime`, named so that none exists: a name taken (by a link too) is not
+    /// opened, another is tried.
+    fn new(runtime: &Path, id: &str, state: &libcontainer::container::State, spec: &Spec) -> io::Result<Scratch> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let pid = std::process::id();
+        let mut last = None;
+        for _ in 0..16 {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            match Scratch::at(runtime.join(format!("{SCRATCH}{pid}-{n}")), id, state, spec) {
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+                made => return made,
+            }
+        }
+        Err(last.expect("sixteen tries"))
+    }
+
+    /// One at `dir`, which must not exist (`mkdir` and `O_EXCL` follow no link, and the 0700
+    /// directory is nobody else's to put a link in).
+    fn at(dir: PathBuf, id: &str, state: &libcontainer::container::State, spec: &Spec) -> io::Result<Scratch> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let made = |path: &Path| fs::DirBuilder::new().mode(0o700).create(path);
+        made(&dir)?;
+        let scratch = Scratch(dir); // (from here a failure removes what was made)
+        let inner = scratch.0.join(id);
+        made(&inner)?;
+        let write = |name: &str, bytes: Vec<u8>| {
+            let flags = nix::libc::O_NOFOLLOW;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(flags)
+                .open(inner.join(name))?;
+            file.write_all(&bytes)
+        };
+        let mut state = state.clone();
+        let bundle = std::mem::replace(&mut state.bundle, inner.clone());
+        write("state.json", serde_json::to_vec(&state)?)?;
+        write("config.json", serde_json::to_vec(&scratch_spec(spec, &bundle))?)?;
+        Ok(scratch)
+    }
+
+    /// The directory libcontainer is told is its runtime's (the one holding the container's).
+    fn root(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Run `argv` in the running container `id` of the runtime kept under `root` (the `root` of
 /// [`Runtime::new`]): in its pid, mount, net and other namespaces, as its init's user, with its
 /// capabilities and its seccomp filter, and in its cgroup. What it reads and writes is the pipes
@@ -1094,8 +1185,13 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
     let made = oci_spec::runtime::Spec::load(container.bundle().join("config.json")).ctx(&what)?;
     let process = init_process(&made).ctx(&what)?;
     let who = process.user();
+    // libcontainer checks the init's spec again, in the user namespace the helper joins below,
+    // and refuses `additionalGids` there (CVE-2014-8989: a user that may not drop its groups
+    // may not name them). So it is given a private copy of the init's state and spec without
+    // them; the tenant says its groups itself, below.
+    let scratch = Scratch::new(root, id, &container.state, &made).ctx(&what)?;
     let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
-        .with_root_path(root.join("state"))
+        .with_root_path(scratch.root())
         .ctx(&what)?
         .with_stdin(stdin)
         .with_stdout(stdout)
@@ -1148,6 +1244,8 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
         drop(forking);
         forked.collect(HELPER_DEADLINE).ctx(&what)?
     };
+    // (The tenant has read the copy by now, or failed to: nothing of it is needed past this.)
+    drop(scratch);
     let pid = match said.split_first() {
         Some((0, pid)) if pid.len() == 4 => Pid::from_raw(i32::from_le_bytes(pid.try_into().expect("four bytes"))),
         Some((_, text)) => return err(format!("{what}: {}", String::from_utf8_lossy(text))),
@@ -3597,6 +3695,178 @@ mod tests {
             "{init:?}"
         );
         assert!(init.len() >= 9, "{init:?}");
+    }
+
+    /// An init's spec as a root kithd writes it: a user with its group said once more, and the
+    /// namespaces, capabilities and seccomp filter a tenant must have as well.
+    fn init_spec_with_groups() -> Spec {
+        let mut spec = oci_spec::runtime::Spec::default();
+        let user = UserBuilder::default()
+            .uid(1234u32)
+            .gid(5678u32)
+            .additional_gids(vec![5678u32]);
+        let mut process = spec.process().clone().unwrap();
+        process.set_user(user.build().unwrap());
+        process.set_no_new_privileges(Some(true));
+        spec.set_process(Some(process));
+        let mut linux = spec.linux().clone().unwrap_or_default();
+        let filter = oci_spec::runtime::LinuxSeccompBuilder::default()
+            .default_action(oci_spec::runtime::LinuxSeccompAction::ScmpActErrno)
+            .build()
+            .unwrap();
+        linux.set_seccomp(Some(filter));
+        spec.set_linux(Some(linux));
+        spec.set_root(Some(RootBuilder::default().path("rootfs").build().unwrap()));
+        spec
+    }
+
+    /// The copy a tenant is validated against differs from the init's spec in the one field that
+    /// a user namespace refuses (`process.user.additionalGids`): its namespaces, capabilities,
+    /// seccomp filter and the rest are the init's own, and a relative root stays where it was.
+    #[test]
+    fn enter_scratch_spec_drops_only_additional_gids() {
+        let init = init_spec_with_groups();
+        let copy = scratch_spec(&init, Path::new("/bundle"));
+        let user = copy.process().as_ref().unwrap().user();
+        assert_eq!((user.uid(), user.gid(), user.additional_gids()), (1234, 5678, &None));
+        // Put the one field back and the copy is the init's spec, but for the root's path.
+        let (mut back, mut same) = (copy.clone(), init.clone());
+        let mut process = back.process().clone().unwrap();
+        process.set_user(init.process().as_ref().unwrap().user().clone());
+        back.set_process(Some(process));
+        assert_eq!(back.root().as_ref().unwrap().path(), Path::new("/bundle/rootfs"));
+        same.set_root(back.root().clone());
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&same).unwrap()
+        );
+        let (a, b) = (copy.linux().as_ref().unwrap(), init.linux().as_ref().unwrap());
+        assert_eq!(a.namespaces(), b.namespaces());
+        assert_eq!(a.seccomp(), b.seccomp());
+        assert!(a.seccomp().is_some());
+        let caps = |spec: &Spec| spec.process().as_ref().unwrap().capabilities().clone();
+        assert_eq!(caps(&copy), caps(&init));
+    }
+
+    /// The scratch directory is private to this process's user (0700, its own), holds the copied
+    /// state.json (naming the copy as the bundle) and config.json and nothing else, never follows
+    /// a link (one planted at its name is refused and its target left alone), and is gone when
+    /// dropped.
+    #[test]
+    fn enter_scratch_dir_is_private_complete_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("kith-scratch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (planted, elsewhere) = (root.join("planted"), root.join("elsewhere"));
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+        let state = libcontainer::container::State {
+            id: "c".into(),
+            bundle: "/old/bundle".into(),
+            ..Default::default()
+        };
+        let init = init_spec_with_groups();
+        assert!(
+            Scratch::at(planted.clone(), "c", &state, &init).is_err(),
+            "a link is not followed"
+        );
+        assert_eq!(
+            fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "nothing was made through it"
+        );
+
+        let scratch = Scratch::new(&root, "c", &state, &init).unwrap();
+        let dir = scratch.root().to_path_buf();
+        let meta = fs::symlink_metadata(&dir).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
+        assert_eq!(meta.uid(), nix::unistd::geteuid().as_raw());
+        let inner = dir.join("c");
+        assert_eq!(fs::metadata(&inner).unwrap().permissions().mode() & 0o7777, 0o700);
+        let mut names: Vec<_> = fs::read_dir(&inner)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["config.json", "state.json"]);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "only the container's directory");
+        let loaded = Container::load(dir.join("c"));
+        // (Its pid is not one: the status is refreshed to stopped, the rest is what was copied.)
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.bundle(), &inner);
+        let config = Spec::load(inner.join("config.json")).unwrap();
+        assert_eq!(config.process().as_ref().unwrap().user().additional_gids(), &None);
+        drop(scratch);
+        assert!(!dir.exists(), "removed with its guard");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Nothing of the scratch copy is left in the runtime directory when `enter` is done with a
+    /// container, whether the process started or the program was one the image lacks.
+    #[test]
+    fn enter_scratch_is_removed_whether_the_tenant_starts_or_not() {
+        let root = std::env::temp_dir().join(format!("kith-enter-scratch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        host_rootfs(&root.join("rootfs"), &["sleep", "cat"]);
+        let image = Image {
+            rootfs: root.join("rootfs"),
+            entrypoint: vec!["/bin/sleep".into(), "300".into()],
+            ..Image::default()
+        };
+        let (out, err) = (
+            File::create(root.join("out")).unwrap(),
+            File::create(root.join("err")).unwrap(),
+        );
+        let mut handle = match runtime.create("scratch1", &image, &Unit::default(), out, err) {
+            Err(e) if cgroup_skip(&e.to_string()).is_some() => {
+                let _ = fs::remove_dir_all(&root);
+                return report_skip(&cgroup_skip(&e.to_string()).unwrap());
+            }
+            made => made.unwrap(),
+        };
+        handle.start().unwrap();
+        let state = root.join("runtime");
+        let left = || {
+            fs::read_dir(&state)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(SCRATCH))
+                .count()
+        };
+        let ok = enter(&state, "scratch1", &["/bin/cat".into(), "/proc/1/cmdline".into()]);
+        let started = ok.map(|entered| entered.wait()).is_ok();
+        let missing = enter(&state, "scratch1", &["/bin/nothing".into()]).is_err();
+        let not_running = enter(&state, "nothing-here", &["/bin/cat".into()]).is_err();
+        let counted = left();
+        let _ = handle.kill();
+        while let Ok(None) = handle.try_wait() {
+            reap_orphans(&[handle.pid()]);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = handle.delete();
+        let _ = fs::remove_dir_all(&root);
+        assert!(started && missing && not_running);
+        assert_eq!(counted, 0, "no scratch copy left behind");
+    }
+
+    /// A scratch directory a stopped kithd left (it was killed in an `enter`) is swept by the
+    /// next runtime on that directory.
+    #[test]
+    fn enter_scratch_left_by_a_dead_kithd_is_swept() {
+        let root = std::env::temp_dir().join(format!("kith-scratch-swept-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(format!("{SCRATCH}stale/c"))).unwrap();
+        fs::write(root.join(format!("{SCRATCH}stale/c/state.json")), "{}").unwrap();
+        fs::write(root.join("enter-1.log"), "").unwrap();
+        let _runtime = Runtime::new(&root).unwrap();
+        assert!(!root.join(format!("{SCRATCH}stale")).exists());
+        assert!(
+            root.join("enter-1.log").exists(),
+            "what is not a scratch directory stays"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// An init whose spec has no process is refused: there is no user to enter as.
