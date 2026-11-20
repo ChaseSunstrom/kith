@@ -213,8 +213,17 @@ spec:
 ```
 
 - A machine starts from a `kernel` (a microVM; `initrd`, `cmdline`) or from its `disks` through
-  `firmware`. `memory` is required; `cpus` is 1 unless said. Every path is a file on the node; a
-  disk is a raw image (`readOnly: true` if it must not be written).
+  `firmware`. `memory` is required; `cpus` is 1 unless said. A disk is a raw image
+  (`readOnly: true` if it must not be written): a `path` is a file on the node.
+- **A disk in a replicated Volume.** `disks: [{ volume: home, file: disk.img, size: 40Gi }]`
+  names a [Volume](storage.md) instead of a `path` (one of the two, not both; `file` is
+  `disk.img` unless said, one name in the Volume's directory). The machine runs where the
+  Volume is, as a container that mounts it does, and kithd makes the image there once, sparse and
+  `size` big, if the file is missing; it never resizes or overwrites one that exists. A node
+  without the Volume is not given the machine: it says why in the unit's note. When the Volume
+  is handed over to another replica, the machine follows it and starts from the same image. Keep
+  one replica of the machine, and mount the Volume nowhere else: a container that shares its
+  directory could swap the image for a link between kithd's check and the hypervisor's open.
 - kithd supervises the hypervisor; the serial console (`console=ttyS0`) is the unit's log: `kith
   logs Workload/windows --unit machine`. `hypervisor: qemu` (default, with KVM) or
   `cloudHypervisor`; the node needs `qemu-system-x86_64` (`-aarch64` on arm64) or
@@ -226,7 +235,7 @@ spec:
   Device its template claims; a container never does. The owner binds it before kithd starts
   (`vfio-pci.ids=10de:2684,10de:22ba`, IOMMU on).
 - Not yet: Firecracker; a network beyond QEMU's own NAT (the machine reaches out, nothing
-  reaches it); a disk from a Volume; kithd binding `vfio-pci`; `vms` on kith OS. Tested: a Job
+  reaches it); live migration of a machine with a Volume disk; kithd binding `vfio-pci`; `vms` on kith OS. Tested: a Job
   boots a kernel under KVM. Not tested: cloud-hypervisor, a real GPU passed through.
 
 ### Switching one GPU

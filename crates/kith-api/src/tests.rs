@@ -1365,6 +1365,37 @@ fn a_vm_unit_names_what_it_starts_by_absolute_paths_and_its_memory() {
     assert!(job(twice).unwrap_err().contains("two units are named `vm`"));
 }
 
+/// A VM's disk is a path on the node or a Volume's file, never both, and a Volume's needs a size.
+#[test]
+fn a_vm_disk_is_a_path_or_a_volume_and_a_volumes_has_a_size() {
+    let job = |disk: &str| {
+        let text = format!(
+            "apiVersion: kith.dev/v1\nkind: Job\nmetadata: {{ name: boot }}\nspec:\n  template:\n    vms:\n      - {{ name: vm, firmware: /f, memory: 1Gi, disks: [{disk}] }}\n"
+        );
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    job("{ volume: home, size: 20Gi }").unwrap();
+    job("{ volume: home, file: root.img, size: 1Mi, readOnly: true }").unwrap();
+    for (bad, why) in [
+        ("{ path: /d.raw, volume: home, size: 1Gi }", "exactly one of"),
+        ("{ readOnly: true }", "exactly one of"),
+        ("{ path: /d.raw, size: 1Gi }", "are a `volume`'s"),
+        ("{ path: /d.raw, file: a.img }", "are a `volume`'s"),
+        ("{ volume: home }", "needs a size"),
+        ("{ volume: home, size: 1Ki }", "needs a size"),
+        ("{ volume: home, size: 2000Ti }", "needs a size"),
+        ("{ volume: home, file: ../x, size: 1Gi }", "one name"),
+        ("{ volume: home, file: a/b, size: 1Gi }", "one name"),
+        ("{ volume: home, file: 'a,b', size: 1Gi }", "no comma"),
+        ("{ volume: home, file: '', size: 1Gi }", "one name"),
+        ("{ volume: ../x, size: 1Gi }", "volume"),
+    ] {
+        let refused = job(bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+}
+
 /// A release may hand its key over to others: what it says is checked for its shape when
 /// it is applied (whether it is signed, by the node that would take it).
 #[test]

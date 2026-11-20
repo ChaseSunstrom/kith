@@ -4273,8 +4273,36 @@
       "additionalProperties": false,
       "properties": {
         "path": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "description": "A raw disk image on the node, by absolute path."
+        },
+        "volume": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A Volume (or a VolumeClaim's) that holds the image `file`, so that it is kept on\nthe Volume's replicas and goes with it when the Volume's node changes: the machine\nruns where the Volume is. Needs `size`; one replica of a Workload at most."
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The image's name inside the Volume [default: disk.img]."
+        },
+        "size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Quantity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How big the image is made, sparse, when `file` is not in the Volume yet."
         },
         "readOnly": {
           "type": [
@@ -4283,9 +4311,7 @@
           ]
         }
       },
-      "required": [
-        "path"
-      ]
+      "description": "Exactly one of `path` or `volume`."
     },
     "VmUnit": {
       "type": "object",
