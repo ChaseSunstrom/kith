@@ -765,6 +765,12 @@ fn node_workload_runs_one_copy_alone() {
 /// applied it and whatever the store says, and its status says which word turned it off.
 #[test]
 fn node_policy_refuses_what_the_node_turned_off() {
+    // Without a delegated cgroup kithd runs no workloads ("workloads will not run"), so nothing of
+    // the Workload's status appears.
+    if !kith_runtime::has_delegated_cgroup() {
+        eprintln!("skipped: no delegated cgroup here");
+        return;
+    }
     let daemon = Daemon::start_with("policy", &["--node-policy", "no-exec-units"]);
     daemon.apply(&exec("Workload", "tool", "echo ran", ""));
     wait_for("the Workload to say this node's policy refuses it", || {

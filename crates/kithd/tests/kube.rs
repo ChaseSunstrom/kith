@@ -1413,6 +1413,12 @@ fn access_is_kiths_own_and_the_kubernetes_api_is_no_way_past_it() {
 /// may get alone, and carol may run in `team`. Asked with curl, so no kubectl is needed.
 #[test]
 fn access_first_exec_attach_and_cp_are_refused_before_any_upgrade() {
+    // Without a delegated cgroup kithd runs no workloads ("workloads will not run"), so the pods
+    // of the Deployment and the Job never appear.
+    if !kith_runtime::has_delegated_cgroup() {
+        eprintln!("skipped: no delegated cgroup here");
+        return;
+    }
     let cluster = Cluster::boot("kube-exec-access");
     cluster.kith(&["identity", "cert", "bob", "--out", "."]);
     cluster.kith(&["identity", "cert", "carol", "--out", "."]);
