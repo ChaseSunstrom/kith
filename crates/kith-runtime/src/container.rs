@@ -1872,8 +1872,20 @@ impl Handle {
             }),
             deleted => {
                 // It was killed just now: collect it, or it stays a zombie for as long as we live.
+                // Not for ever: an init does not end while a tenant it left is a zombie in its pid
+                // namespace, and what takes that one (`reap_orphans`) runs after the delete that waits.
+                // ponytail: a second of waiting at most; past it `reap_orphans` collects the init,
+                // as it does any orphan, and a process with no reaper keeps a zombie until it ends.
                 if deleted.is_ok() && !self.reaped && self.adopted.is_none() {
-                    let _ = waitpid(self.pid, None);
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    let flags = Some(nix::sys::wait::WaitPidFlag::WNOHANG);
+                    while matches!(
+                        waitpid(self.pid, flags),
+                        Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::EINTR)
+                    ) && std::time::Instant::now() < until
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
                 }
                 let removed = remove_bundle(&self.bundle).ctx("deleting the container");
                 deleted.and(removed).map_err(|error| Undeleted { error, handle: None })
@@ -5050,6 +5062,62 @@ mod tests {
             "{init:?}"
         );
         assert!(init.len() >= 9, "{init:?}");
+    }
+
+    /// A delete does not block on an init that cannot end yet: while a tenant it left is a zombie in
+    /// its pid namespace, the init waits for that zombie to be taken, and what takes it (kithd's
+    /// `reap_orphans`, at the end of the pass whose stop is waiting for this delete) never runs.
+    #[test]
+    fn delete_does_not_wait_for_an_init_held_by_a_tenants_zombie() {
+        let root = std::env::temp_dir().join(format!("kith-enter-del-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        host_rootfs(&root.join("rootfs"), &["sleep", "true"]);
+        let image = Image {
+            rootfs: root.join("rootfs"),
+            entrypoint: vec!["/bin/sleep".into(), "300".into()],
+            ..Image::default()
+        };
+        let (out, err) = (
+            File::create(root.join("out")).unwrap(),
+            File::create(root.join("err")).unwrap(),
+        );
+        let mut handle = match runtime.create("enterdel1", &image, &Unit::default(), out, err) {
+            Err(e) if cgroup_skip(&e.to_string()).is_some() => {
+                let _ = fs::remove_dir_all(&root);
+                return report_skip(&cgroup_skip(&e.to_string()).unwrap());
+            }
+            made => made.unwrap(),
+        };
+        handle.start().unwrap();
+        // A tenant that ended, with no one to take its status: a zombie of the init's pid namespace.
+        let tenant = enter(&root.join("runtime"), "enterdel1", &["/bin/true".into()]).unwrap();
+        let pid = tenant.pid();
+        let zombie = || {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .is_ok_and(|stat| stat.rsplit(')').next().is_some_and(|r| r.trim_start().starts_with('Z')))
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !zombie() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(zombie(), "the tenant ended and is waiting to be taken");
+        drop(tenant);
+        let (done, said) = std::sync::mpsc::channel();
+        let deleting = std::thread::spawn(move || done.send(handle.delete().is_ok()));
+        let finished = said.recv_timeout(std::time::Duration::from_secs(15));
+        // (What kithd's reaper does next: the init ends once the zombie is taken.)
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !deleting.is_finished() && std::time::Instant::now() < until {
+            reap_orphans(&[]);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        reap_orphans(&[]);
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            finished.is_ok(),
+            "the delete waited for an init that the reaper after it was to free"
+        );
     }
 
     /// An init's spec as a root kithd writes it: a user with its group said once more, and the
