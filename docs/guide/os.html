@@ -68,7 +68,7 @@ features: [gpu-amd-phoenix]
 <pre><code class="language-sh">kith node features n1 &gt; n1.yaml
 sh os/build.sh --spec n1.yaml --out target/os-n1
 </code></pre>
-<p>A node with no card a feature matches prints <code>features: []</code>; a node that runs no kith OS has no <code>wants</code> and the command says so. Only PCI cards are matched. A feature with no <code># pci:</code> line (a card the catalogue does not list yet) is chosen by hand, as above.</p>
+<p>A node with no card a feature matches prints <code>features: []</code>; a node that runs no kith OS has no <code>wants</code> and the command says so. Only PCI cards are matched. A feature with no <code># pci:</code> line (a card the catalogue does not list yet) is chosen by hand, as above. A line may give <code>vendor:*</code> instead of a device id, which matches any display card (PCI class 03) of that vendor and not its audio function: <code>all</code> has <code>10de:*</code>, so a node with an NVIDIA GPU wants <code>all</code> (nouveau's driver is in it). A node that also has an AMD Phoenix GPU wants <code>all</code> alone, which build.sh would refuse with <code>gpu-amd-phoenix</code> and whose modules cover that GPU.</p>
 <h4 id="the-all-feature-drivers-as-signed-modules">The <code>all</code> feature: drivers as signed modules <a class="anchor" href="#the-all-feature-drivers-as-signed-modules" aria-label="Link to this section">#</a></h4>
 <pre><code class="language-sh">KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
 KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
@@ -205,6 +205,7 @@ kith node netboot --off
 sh ci/vm.sh --test netboot             # the same, in QEMU, on a disk that is a file
 </code></pre>
 <p>Then set each machine to start from the network (PXE, IPv4) once, or first in its boot order: a machine that has the installer is not answered again and goes on to its disk. <strong>Everything on that disk is lost</strong>, and nobody is asked at the machine: name only cards of machines you mean to erase. <code>--disk only</code> (the default) installs on a machine's one disk and refuses a machine with several; <code>--disk nvme0n1</code> names it. Netboot turns itself off after <code>--minutes</code> (30; at most 60), when the node restarts, or with <code>--off</code>.</p>
+<p>The machine is installed with this node's release keys (as the node holds them when netboot is turned on) and <code>--lan-releases</code>, if the node has them: it takes kith OS releases from the same keys, not from the first release's. The answers hold 8 keys at most: a node with more, or with keys it cannot read, does not turn netboot on and says which.</p>
 <p>The node must be the one that started the cluster (it holds the CA, which makes the join tokens) and run with <code>--listen</code>. An Identity that may apply Nodes, Roles and RoleBindings sends the same over TLS (<code>GET</code> says where it stands, <code>DELETE</code> turns it off):</p>
 <pre><code class="language-sh">curl --cacert ca.pem --cert cert.pem --key key.pem --data-binary @target/os/kith-netboot.efi \
     -X PUT 'https://NODE:7443/v1/netboot?macs=52:54:00:12:34:56,52:54:00:12:34:57&amp;minutes=30&amp;disk=only'
