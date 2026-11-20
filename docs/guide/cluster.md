@@ -489,7 +489,13 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
   its selector, or the plan is deleted. It waits at most `drainSeconds` (300 unless said, 3600 at
   most). It lifts only a drain it put on: yours, put on first, stays until you undrain. The plan's
   name is in the value of its taints (`plan:NAME`), which is how a deleted plan's drain and cordon
-  are found and lifted; a taint without it is never lifted by a plan.
+  are found and lifted; a taint without it is never lifted by a plan. A plan that picks a node
+  whose drain a deleted plan left takes that drain over. Three things to know:
+  - The taint values `plan:NAME` and `owner;plan:NAME` are reserved for this; do not set them.
+  - The plan's name can be read by anyone who may read Nodes (`Node.spec.taints[].value`).
+  - During a rolling upgrade, an older kithd reads only the exact value `owner`, so on a node
+    with `owner;plan:NAME` it may lift a cordon that was an operator's, or leave one stuck until
+    `kith node uncordon`. Finish the upgrade before you run an UpdatePlan with `drain: true`.
 
 ### Checkpointing a long GPU Job
 
