@@ -2425,7 +2425,7 @@ fn rbac_is_enforced_and_audited() {
     assert_eq!(status, 403);
     assert_eq!(
         reply["error"],
-        "alice may not get ConfigMap in namespace default: no Role bound to it allows that"
+        "alice may not get ConfigMap other in namespace default: no Role bound to it allows that"
     );
     assert_eq!(call("first", "GET", "/v1/resources?kind=Role", "").0, 403);
     assert_eq!(call("first", "GET", "/v1/watch", "").0, 403);
@@ -2460,10 +2460,15 @@ fn rbac_is_enforced_and_audited() {
     line(
         "alice",
         "apply",
-        "ConfigMap in namespace default",
+        "ConfigMap other in namespace default",
         "alice may not apply ConfigMap",
     );
-    line("alice", "delete", "ConfigMap in namespace web", "alice may not delete");
+    line(
+        "alice",
+        "delete",
+        "ConfigMap site in namespace web",
+        "alice may not delete",
+    );
     line("alice", "apply", "RoleBinding", "alice may not apply RoleBinding");
     line("local", "socket", "Identity/alice", "ok");
     assert!(audit.contains("Role/web-editor"), "{audit}");
