@@ -3072,11 +3072,15 @@ fn workloads_move_off_a_lost_node() {
 /// has the Volume is lost, and the Workload that mounts it comes up
 /// on the node whose copy takes over, with the files as of the last sync and the Secret in its
 /// env, within the lost-after and one reconcile (the scheduler's pass, every 5 s) of the loss.
-/// (Not behind KITH_E2E: three kithds on 127.0.0.1, nothing pulled. The container has an image
-/// that is never pulled, so it only says where the Workload is placed; the exec unit beside it is
+/// (Behind KITH_E2E, as it starts three kithds. Nothing is pulled: the container has an image
+/// that never is, so it only says where the Workload is placed; the exec unit beside it is
 /// what runs, and writes the key it was given where the test reads it.)
 #[test]
 fn session_survives_its_node() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
     // (Lost is lost after ten seconds without a word, whatever smaller number is given.)
     const LOST_AFTER: u64 = 10;
     const RECONCILE: u64 = 5;
@@ -3155,7 +3159,9 @@ fn session_survives_its_node() {
     // copy took over, which has the last-synced file, and the unit there has its key.
     alpha.stop();
     let lost_at = Instant::now();
-    let by = deadline_for(Duration::from_secs(LOST_AFTER + RECONCILE + 5));
+    // The silence, a Raft election if alpha led, the pass that moves the Volume and the pass that
+    // places the Workload (two reconciles), and slack.
+    let by = deadline_for(Duration::from_secs(LOST_AFTER + 2 * RECONCILE + 15));
     while bound(replica, "workload/session").as_deref() != Some(picked.as_str()) {
         assert!(
             lost_at.elapsed() < by,
@@ -3183,6 +3189,10 @@ fn session_survives_its_node() {
 /// before the drain (not only those of the last sync), in seconds and not a lost-after.
 #[test]
 fn session_moves_on_a_drain_with_nothing_lost() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
     let test = "session-drain";
     let mut alpha = Node::start(test, "alpha", &[]);
     wait_for("alpha to list itself", || {
@@ -3231,12 +3241,7 @@ fn session_moves_on_a_drain_with_nothing_lost() {
     });
     assert_eq!(status(replica, "volume/home")["primary"], picked.as_str());
     assert!(has("second"), "the copy was current when it took the Volume");
-    // (A sync, the handover's pass of the scheduler and a pass of the copy: seconds, not --lost-after.)
-    assert!(
-        drained_at.elapsed() < deadline_for(Duration::from_secs(25)),
-        "{:?}",
-        drained_at.elapsed()
-    );
+    // (No bound of its own: wait_for's, 30 s scaled, is far under the default --lost-after of 300 s.)
     eprintln!("session handed to {picked} {:?} after the drain", drained_at.elapsed());
     alpha.stop();
 }

@@ -2484,13 +2484,18 @@ fn session_recipe_costs_are_said() {
         row.unwrap_or_else(|| panic!("the cost table has no row for {first:?}"))
             .to_lowercase()
     };
-    let planned = row("A planned drain or an OS update");
+    let planned = row("A planned drain, or an OS update");
     assert!(
         planned.contains("handed over") && planned.contains("seconds"),
         "{planned}"
     );
     assert!(planned.contains("nothing is lost"), "{planned}");
+    // An OS update is a handover only through a plan that drains; without it the reboot is a loss.
+    assert!(planned.contains("`drain: true`"), "{planned}");
+    assert!(planned.contains("image pull"), "{planned}");
     let lost = row("A crash or a lost node");
+    assert!(lost.contains("without `drain: true`"), "{lost}");
+    assert!(lost.contains("5 minutes") && lost.contains("--lost-after 10"), "{lost}");
     assert!(
         lost.contains(&format!("up to {seconds} seconds")),
         "the row says the sync's {seconds} seconds: {lost}"

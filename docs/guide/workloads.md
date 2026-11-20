@@ -455,16 +455,23 @@ spec:
 
 A Workload or Job that mounts a Volume runs on the node that has it (the Volume's `primary`), so
 the session and its Jobs share one home. Put the key in the Secret and not in the image or the
-Volume: it is sent only to the node that runs the Workload, and a restart elsewhere reads it again.
+Volume. A worker is sent the Secrets of what is placed on it and no others, but a control node
+holds every Secret of the cluster (`docs/adr-workers.md`), so a key in a Secret is as safe as the
+cluster's control nodes are.
+Clients find the session after a move by a Service that selects the Workload, not by a node's
+address ([Services across nodes](cluster.md#services-across-nodes)).
 
 What each restart of the node costs:
 
 | What happens | The Volume | The Workload | What is lost |
 |---|---|---|---|
-| A planned drain or an OS update (`kith node drain`, a kith OS update) | The copy that synced last is asked to sync now and is handed over once it is current | Starts on that node, in seconds | Nothing is lost of what was written before the drain asked for the sync; a write in the seconds between that sync and the Workload's stop stays on the old node as `.PATH.was-TIME` |
-| A crash or a lost node | The copy that synced last becomes the primary after the node is lost (10 seconds of silence, or `--lost-after` if longer) | Starts on that node within one reconcile (5 seconds) of that | Writes of up to 10 seconds, those since the last sync; the old node keeps them as `.PATH.was-TIME` |
-| A Job that was running when its node went | A drain holds the Volume back until the Job ends | A planned drain waits for the Job and nothing is lost; after a loss it starts over on the new primary, from its first command | The Job's progress: it is in memory, so a Job that must not start over writes its own checkpoints into the home |
+| A planned drain, or an OS update by an `UpdatePlan` with `drain: true` ([restarting a node on purpose](cluster.md#restarting-a-node-on-purpose)) | The copy that synced last is asked to sync now and is handed over once it is current | Starts on that node in seconds, plus the image pull if that node does not have the image yet (`pullPolicy: ifNotPresent`) | Nothing is lost of what was written before the drain asked for the sync; a write in the seconds between that sync and the Workload's stop stays on the old node as `.PATH.was-TIME` |
+| A crash or a lost node, which is also an OS update without `drain: true`: the reboot is a loss | The copy that synced last becomes the primary once the node has been silent for `--lost-after`: about 5 minutes on a default cluster, and about 15 seconds with `--lost-after 10` (10 seconds is the least) | Starts on that node within one reconcile (5 seconds) of that, plus the image pull if needed | Writes of up to 10 seconds (the sync), those since the last sync; the old node keeps them as `.PATH.was-TIME` |
+| A Job that was running when its node went | A drain holds the Volume back until the Job ends | A planned drain waits for the Job and nothing is lost. After a loss, a Job on a replicated Volume starts over on the new primary from its first command; a Job on a Volume with no `replicas` waits for its node ([checkpointing a long GPU Job](cluster.md#checkpointing-a-long-gpu-job)) | The Job's progress: it is in memory, so a Job that must not start over writes its own checkpoints into the home and reads the last at its start |
 
+- **Set `--lost-after` where kithd starts.** `kithd --lost-after 10` (or `KITH_LOST_AFTER=10`) on
+  every node; a node is lost after 10 seconds at the least, whatever smaller number is given.
+  Left at its default, a crash is 5 minutes of nothing before the move.
 - **Seconds, not a lost-after, for a planned move.** A drain is told the Workload's node is going,
   so nothing waits for a silence; the session is down for the time the container takes to start.
   After a loss the cost is what was written since the last sync: shorten `sync` to shrink it
