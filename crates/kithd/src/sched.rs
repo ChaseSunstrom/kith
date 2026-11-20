@@ -648,8 +648,11 @@ fn line(key: String, replica: Option<&str>, outcome: &str, to: Option<String>, w
 /// a change to the store), while this node leads.
 pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Receiver<bool>) {
     let mut generation = shared.generation.subscribe();
-    // When a Volume's handover was last seen to fail (a drain asks again after a while).
-    let mut failed: BTreeMap<String, Instant> = BTreeMap::new();
+    // For each Volume whose handover failed: when that was last seen, how many in a row, and
+    // whether its error is there now (a drain asks again after longer each time).
+    // (The claims below, written from a snapshot, can undo what a node just said, a handover's
+    // answer too: the ask then times out and is made again.)
+    let mut failed: BTreeMap<String, (Instant, u32, bool)> = BTreeMap::new();
     loop {
         tokio::select! {
             _ = generation.changed() => {}
@@ -678,20 +681,44 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
             fields.extend(crate::replicas::writes(&state.store, &lost, grace));
             // A drained node's replicated Volumes are handed to the copy that is current (the
             // handover asks it, then switches); one that failed is asked again after a while.
+            // (Nothing is worked out while no node is drained and no Volume has a handover's field.)
+            let store = &state.store;
+            let draining = store
+                .list(Some("Node"))
+                .any(|node| has_record(&node.spec, kith_sched::DRAIN));
+            let handing = store.list(Some("Volume")).any(|volume| {
+                let status = volume.status.as_ref();
+                status.is_some_and(|status| {
+                    crate::replicas::FIELDS[3..]
+                        .iter()
+                        .any(|field| !status[*field].is_null())
+                })
+            });
+            let plan = if draining || handing {
+                handovers(store, &seen, grace, None, false)
+            } else {
+                BTreeMap::new()
+            };
             let now = Instant::now();
-            let errors = crate::replicas::failed(&state.store);
-            failed.retain(|key, _| errors.contains_key(key));
-            for key in errors.into_keys() {
-                failed.entry(key).or_insert(now);
+            let errors = crate::replicas::failed(store);
+            // A Volume that works again, or is no longer handed over, starts over.
+            failed.retain(|key, _| plan.contains_key(key) || errors.contains_key(key));
+            for (key, entry) in &mut failed {
+                match (errors.contains_key(key), entry.2) {
+                    (true, false) => *entry = (now, entry.1 + 1, true),
+                    (false, _) => entry.2 = false,
+                    _ => {}
+                }
             }
-            let plan = handovers(&state.store, &seen, grace, None, false);
+            for key in errors.into_keys() {
+                failed.entry(key).or_insert((now, 1, true));
+            }
             let busy: BTreeSet<&str> = fields.iter().map(|(key, _)| key.as_str()).collect();
             let blocked = |key: &str| {
-                failed
-                    .get(key)
-                    .is_some_and(|at| now.duration_since(*at) < crate::replicas::HANDOVER_RETRY)
+                let failing = failed.get(key);
+                failing.is_some_and(|(at, count, _)| now.duration_since(*at) < crate::replicas::retry_after(*count))
             };
-            let moves = crate::replicas::handover_writes(&state.store, &plan, kith_api::store::now(), &blocked);
+            let moves = crate::replicas::handover_writes(store, &plan, kith_api::store::now(), &blocked);
             let moves: Vec<_> = moves
                 .into_iter()
                 .filter(|(key, _)| !busy.contains(key.as_str()))

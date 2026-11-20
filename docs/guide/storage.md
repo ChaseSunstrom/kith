@@ -163,8 +163,10 @@ spec:
   control node's before a worker's) to sync now (`status.handover`), and makes it primary only
   once it says it is current (`status.handover-done`); the old node keeps what it had as
   `.PATH.was-TIME` and syncs from the new primary. A copy that cannot be brought up to date (the sync
-  fails, the node is down, no answer in 300 s) leaves the volume and its workloads where they are:
-  the plan says why (`status.handover-error`), and it is asked again after 60 s. The volume goes
+  fails, the node is down, no answer in 15 minutes) leaves the volume and its workloads where they
+  are: the plan says why (`status.handover-error`), and it is asked again after 60 s, then 5 and
+  25 minutes, then every 30 minutes. A node is asked for one volume at a time, so a drain of a node
+  with several moves them one after another. The volume goes
   only if every workload that mounts it would then be placed on another node. What the workload
   wrote after that last sync stays in `.PATH.was-TIME` on the old node (a handover is not a
   freeze: stop the workload first to lose nothing).
