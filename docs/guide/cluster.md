@@ -496,9 +496,12 @@ under `NS/NAME` for the first node by name and `NS/NAME@NODE` for each other.
 ## Restarting a node on purpose
 
 Drain a node before restarting or upgrading it. A drain cordons it and adds the `kith.dev/drain`
-taint (`NoExecute`): movable replicas start elsewhere; ones pinned by a Volume, a Device or
-placement stay, as does a running Job (a drain never stops one), and the plan says why, before
-anything changes.
+taint (`NoExecute`): movable replicas start elsewhere, and so do those pinned only by a
+[replicated Volume](storage.md#replicas) with a copy on another node (the drain hands the Volume
+over to that copy, once it is current, and the plan says it moves); ones pinned by a Volume with
+no other copy (or a `shared` or `kith-system` one), a Device or placement stay, as does a running
+Job (a drain never stops one), and the plan says why, before anything changes. A copy that
+cannot be brought up to date leaves the Volume and what mounts it where they are.
 
 ```sh
 kith node drain n1 --dry-run   # says what moves and what stays, and why; changes nothing
@@ -522,8 +525,19 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
   does](os.md#rolling-a-release-through-the-cluster)): it drains the node, restarts it once each replica the
   plan says moves runs on another node (a replica that stays holds nothing), and lifts the drain
   when the node is done, the plan is paused or changed, its OSRelease is gone, or the node leaves
-  its selector. It waits at most `drainSeconds` (300 unless said, 3600 at most). It lifts only a
-  drain it put on: yours, put on first, stays until you undrain.
+  its selector, or the plan is deleted. It waits at most `drainSeconds` (300 unless said, 3600 at
+  most). It lifts only a drain it put on: yours, put on first, stays until you undrain. The plan's
+  name is in the value of its taints (`plan:NAME`), which is how a deleted plan's drain and cordon
+  are found and lifted; a taint without it is never lifted by a plan. A plan that picks a node
+  whose drain a deleted plan left takes that drain over. Three things to know:
+  - The taint values `plan:NAME` and `owner;plan:NAME` are reserved for this; do not set them.
+  - The plan's name can be read by anyone who may read Nodes (`Node.spec.taints[].value`).
+  - During a rolling upgrade, an older kithd reads only the exact value `owner`, so on a node
+    with `owner;plan:NAME` it may lift a cordon that was an operator's, or leave one stuck until
+    `kith node uncordon`. Finish the upgrade before you run an UpdatePlan with `drain: true`.
+  - A plan lifts only a drain or cordon that carries its own stamp. One an older kithd put on
+    has none, so it stays after the plan ends or is deleted, until `kith node undrain` or
+    `kith node uncordon`.
 
 ### Checkpointing a long GPU Job
 
