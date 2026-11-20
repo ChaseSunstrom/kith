@@ -28,6 +28,7 @@ EOF
             stock='no stock image was tried (KITH_E2E=1 pulls busybox)'
             if [ "${KITH_E2E:-}" = 1 ]; then
                 # busybox as it is shipped: its shell says the limits it was started with.
+                # shellcheck disable=SC2016 # (the container's shell expands it, not this one)
                 job box '"image":"mirror.gcr.io/library/busybox:1.36","command":["sh","-c","echo ulimit $(ulimit -Sn) $(ulimit -Hn)"]'
                 got=$(grep -o 'ulimit [0-9]* [0-9]*' "$work/box.out" | head -n 1)
                 [ "$got" = 'ulimit 1024 524288' ] || fail "busybox's ulimit -Sn and -Hn are \"$got\", not 1024 and 524288: $(cat "$work/box.out" "$work/box.err")"
