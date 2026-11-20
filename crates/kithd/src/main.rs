@@ -51,6 +51,7 @@ mod kubeproto;
 mod levels;
 mod members;
 mod mesh;
+mod metrics;
 mod modules;
 mod netboot;
 mod os;
@@ -122,6 +123,9 @@ struct Args {
     /// The IPv4 network this node's pods get their addresses from (/8 to /24; refused if an address of this node, a LAN or a tailnet, is in it)
     #[arg(long, env = "KITH_POD_RANGE", value_name = "ADDR/BITS", default_value_t = kith_mesh::pod::Range::default())]
     pod_range: kith_mesh::pod::Range,
+    /// The IPv4 network the Services' addresses come from (the same on every node; refused if it overlaps --pod-range, the people's 100.89.0.0/16 or a network this node has; the default, if it overlaps one, turns Service IPv4 off for this node) [default: 100.87.0.0/16]
+    #[arg(long, env = "KITH_SERVICE_RANGE", value_name = "ADDR/BITS")]
+    service_range: Option<kith_mesh::pod::Range>,
     /// Serve the API to other nodes on this address (TLS); the first start makes this node a cluster of one
     #[arg(long, env = "KITH_LISTEN", value_name = "ADDR:PORT")]
     listen: Option<std::net::SocketAddr>,
@@ -294,6 +298,12 @@ pub struct Shared {
     pub members: members::Members,
     /// The mesh's peers as last looked at, for `kith node status`; null without a mesh.
     pub mesh: Mutex<serde_json::Value>,
+    /// The UDP port of the mesh this node is to be on, none without one: from `--mesh`, or from
+    /// the Cluster's `spec.mesh` (`mesh::follow`). What listens by it (Services, the published ports) follows.
+    pub mesh_port: watch::Sender<Option<u16>>,
+    /// kithd was started with `--mesh` (not told by the Cluster's switch): what a netbooted
+    /// machine is started with, for it is a flag that stays.
+    pub mesh_flag: std::sync::atomic::AtomicBool,
     /// Set once kithd is told to stop: long-polls answer at once instead of holding it up.
     pub stop: watch::Sender<bool>,
     /// The pods of this node, and their networks.
@@ -751,6 +761,8 @@ async fn replica(
         generation,
         members: members::Members::new(name),
         mesh: Mutex::default(),
+        mesh_port: watch::channel(None).0,
+        mesh_flag: false.into(),
         cluster,
         stop: watch::channel(false).0,
         pods: Mutex::default(),
@@ -889,6 +901,14 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             format_args!("kithd: WARNING: {clash} (going on: pods may not reach, or be reached from, that network)\n"),
         );
     }
+    // The Services' IPv4 range: an explicit one that clashes refuses; the default that clashes is
+    // left off for this node (said once), and kithd starts without Service IPv4 here.
+    let (service_range, off) =
+        services::v4::choose(args.service_range, |range| range.service_clash_in_use(&args.pod_range))?;
+    if let Some(off) = off {
+        let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("kithd: WARNING: {off}\n"));
+    }
+    pods::set_service_range(service_range);
     // --people: neither the pods' range nor a network of this node may overlap 100.89.0.0/16
     // (docs/adr-people.md, Review 4). The range is a flag, so it refuses; a lease that lands in
     // the people's range is only said where a refusal would restart the machine (as above).
@@ -1025,6 +1045,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     ))?;
     // (An exit's pods pass on to the mesh by its link alone.)
     shared.pods.lock().expect("nothing panics holding the pods").mesh = args.mesh_interface.clone();
+    // (With the flag the mesh is there from the first moment; without, the Cluster's switch says: `mesh::follow`.)
+    shared.mesh_port.send_replace(args.mesh);
+    shared
+        .mesh_flag
+        .store(args.mesh.is_some(), std::sync::atomic::Ordering::Relaxed);
     // The root part on the far end of a socket pair, a thread of this process for now (T-0811).
     if args.split {
         let end = root_part::split().map_err(|e| fail("splitting the root part", &e))?;
@@ -1231,13 +1256,16 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             };
             tokio::join!(pods, asked);
         };
-        let mesh = async {
-            if let Some(port) = args.mesh {
-                mesh::run(shared.clone(), mesh_options(&args, &state, port), stopping.clone()).await;
-            } else {
-                mesh::left(shared.clone(), "mesh", stopping.clone()).await;
+        let mesh = mesh::follow(shared.clone(), args.mesh, stopping.clone(), |port, ended| {
+            let shared = shared.clone();
+            let options = port.map(|port| mesh_options(&args, &state, port));
+            async move {
+                match options {
+                    Some(options) => mesh::run(shared, options, ended).await,
+                    None => mesh::left(shared, "mesh", ended).await,
+                }
             }
-        };
+        });
         // (Its own leftovers too, with no --people: see `people::device`.)
         let device = async {
             let held = args.people.map(|_| levels::Config {
@@ -1259,7 +1287,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();
         let taken = args.ingress.then_some(taken);
         // (Without a mesh too: a node's Services answer its pods there as well, T-0723.)
-        let services = services::run(shared.clone(), args.mesh, taken, stopping.clone());
+        let services = services::run(shared.clone(), taken, stopping.clone());
         // (What each pod may reach, kept in step with its policies: on a node alone too.)
         let held = pods::keep_held(shared.clone(), stopping.clone());
         let proxy = async {
@@ -1301,13 +1329,20 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         ];
         let saying = async {
             let format = raft::tend_format(shared.clone(), stopping.clone());
+            let state = shared.logs.parent().unwrap_or(&shared.logs).to_path_buf();
+            let sampler = metrics::run(state, stopping.clone());
             // (Only a machine's first process keeps its clock: on another system something else does.)
             let clock = async {
                 if init::is_init() {
                     clock::run(shared.clone(), stopping.clone()).await;
                 }
             };
-            tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format, clock);
+            tokio::join!(
+                say_serves(shared.clone(), says, stopping.clone()),
+                format,
+                sampler,
+                clock
+            );
         };
         let house = home::run(shared.clone(), stopping.clone());
         let (served, nodes, (), (), (), (), (), (), (), (), _) = tokio::join!(
@@ -1554,6 +1589,25 @@ mod tests {
         assert!(super::clash_refuses(named, false));
         assert!(!super::clash_refuses(named, true), "as init it would loop the reboot");
         assert!(!super::clash_refuses(default, false) && !super::clash_refuses(default, true));
+    }
+
+    #[test]
+    fn service_range_is_the_default_or_a_network_the_node_names() {
+        use clap::Parser;
+        let parse = |args: &[&str]| super::Args::try_parse_from(["kithd"].into_iter().chain(args.iter().copied()));
+        assert!(
+            parse(&[]).unwrap().service_range.is_none(),
+            "the default is chosen at start"
+        );
+        assert_eq!(
+            parse(&["--service-range", "10.99.0.0/16"])
+                .unwrap()
+                .service_range
+                .unwrap()
+                .to_string(),
+            "10.99.0.0/16"
+        );
+        assert!(parse(&["--service-range", "127.0.0.0/16"]).is_err(), "loopback");
     }
 
     #[test]

@@ -308,6 +308,7 @@ spec:
   windows: ["Sat,Sun 02:00-05:00"] # UTC; `23:00-04:00` is every night; none: any time
   drain: true                      # drain each node (`kith node drain`) before it restarts
   drainSeconds: 300                # how long to wait for what moves to run elsewhere (300 unless said; 3600 at most)
+  waitForIdleSeats: true           # a node whose Seat is active or fullscreen waits (idleWaitSeconds, 3600 unless said; 86400 at most)
 ```
 
 The signature is over the update's header, which names the SHA-256 of every piece, so a node
@@ -426,7 +427,14 @@ boot loader gave up after three tries and it is back on its old system (`os.fail
 Node's status). Nobody else is given that release until the OSRelease is changed or the plan
 names another, and then it starts over. `paused: true` stops it by hand (a node already told to
 go finishes). While a voting node is away no other is restarted. A node told to update that says
-nothing for fifteen minutes counts as failed. `waitForIdleSeats` does nothing yet.
+nothing for fifteen minutes counts as failed. With `waitForIdleSeats: true` a node is picked only
+while its Seats last said `idle` (a Seat that has said nothing, or has no holder, is idle, and so is a
+node with no Seat); one that says `active` or `fullscreen` is passed over and the plan's `reason`
+names the Seat and that it waits. A seat that stays busy lets the node go after `idleWaitSeconds`
+(3600 unless said, 86400 at most), and the `reason` says so. `idleWaitSeconds` counts continuous
+waiting while the plan is picking: a pause, a closed window or a node that drops out (unreachable, off
+the selector, its seat idle for a moment) starts the count again. Unset or false, a Seat is not
+looked at. A kithd older than this one, as leader during a mixed-version update, ignores the flag.
 
 With `drain: true` a node picked is drained as `kith node drain` does it: it is cordoned, the
 `kith.dev/drain` taint goes on, and what the drain plan says can move starts elsewhere. The plan
@@ -513,6 +521,7 @@ join:                         # without it the node starts a new cluster
 encrypt: true                 # its state under a key the cluster holds: see "Encrypted state"
 releaseKey: $KEY              # kith OS releases signed by this key only: see "Rolling a release"
 lanReleases: true             # releases may come from a server on the node's private ranges
+mesh: true                    # starts with its WireGuard mesh on (`--mesh`); see "The mesh" in the cluster guide
 nodePolicy: hardened          # what the cluster may not have this node do: see "What a node refuses, whatever the cluster says"
 ```
 
@@ -580,7 +589,9 @@ when the node restarts, or with `--off`.
 The machine is installed with this node's release keys (as the node holds them when netboot is
 turned on) and `--lan-releases`, if the node has them: it takes kith OS releases from the same
 keys, not from the first release's. The answers hold 8 keys at most: a node with more, or with
-keys it cannot read, does not turn netboot on and says which.
+keys it cannot read, does not turn netboot on and says which. A node started
+with `--mesh` has the machine start with `mesh: true` as well. A node on the Cluster's
+`spec.mesh` does not: the machine has no flag, so it follows the Cluster's switch once it has joined.
 
 The node must be the one that started the cluster (it holds the CA, which makes the join tokens)
 and run with `--listen`. An Identity that may apply Nodes, Roles and RoleBindings sends the same

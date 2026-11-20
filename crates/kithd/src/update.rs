@@ -44,6 +44,9 @@ pub struct Node {
     /// What the drain plan says moves off it and is not running elsewhere yet
     /// (`sched::drain_waits`); read only for a node the plan is draining.
     pub waits: Vec<String>,
+    /// A seat of it that last said `active` or `fullscreen` (its name, and which); none for a node
+    /// whose seats are idle, say nothing or are not there.
+    pub seat: Option<(String, String)>,
 }
 
 /// What [`step`] wants written.
@@ -66,12 +69,18 @@ struct Held {
     drain: Vec<(String, bool)>,
     /// Nodes whose drain was lifted, until a Node shows none: a lift that was lost is made up.
     lifting: Vec<String>,
+    /// Nodes held back for a seat that is not idle, and since when (`waitForIdleSeats`).
+    idle: BTreeMap<String, u64>,
 }
 
 /// Seconds a drain waits for what moves, unless the plan says (`drainSeconds`).
 const DRAIN_SECONDS: u64 = 300;
 /// The most a plan may ask a drain to wait: a node is not held off its update for longer.
 const DRAIN_CEILING: u64 = 3600;
+/// Seconds a node waits for its seat to be idle, unless the plan says (`idleWaitSeconds`), and the
+/// most it may ask: the update never hangs on a machine in daily use.
+const IDLE_SECONDS: u64 = 3600;
+const IDLE_CEILING: u64 = 86_400;
 
 /// How many replicas, as words. The plan's status says how many, never which: an UpdatePlan is
 /// read by whoever may read UpdatePlans, and a replica's name is its namespace's.
@@ -187,11 +196,20 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
         .flatten()
         .filter_map(|(name, why)| Some((name.clone(), why.as_str()?.to_string())))
         .collect();
+    // The wait for a seat counts continuous picking: it is kept only by the pass that picks, so any
+    // other (paused, a closed window, no release) writes none and the clock starts again.
+    let mut idle_before: BTreeMap<String, u64> = old
+        .and_then(|status| status["idleSince"].as_object())
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, at)| Some((name.clone(), at.as_u64()?)))
+        .collect();
     let mut held = Held {
         drained: names("drained"),
         gave,
         drain: Vec::new(),
         lifting: Vec::new(),
+        idle: BTreeMap::new(),
     };
     // A lift that was lost (the Node still shows the drain) is asked for again.
     for name in names("undraining") {
@@ -212,6 +230,7 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
             ("drained".to_string(), json!(held.drained)),
             ("undraining".to_string(), json!(held.lifting)),
             ("gaveUp".to_string(), json!(held.gave)),
+            ("idleSince".to_string(), json!(held.idle)),
         ]),
         cordon,
         drain: held.drain,
@@ -235,6 +254,7 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
             let_go(&name, &mut cordoned, &mut held, &mut cordon);
         }
         held.gave.clear();
+        idle_before.clear();
     }
     let selected = |node: &&Node| {
         let wanted = spec["selector"].as_object();
@@ -375,12 +395,42 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
         .collect();
     waiting.sort_by_key(|node| (node.voter, node.leader, node.name.clone()));
     let voters_up = nodes.iter().filter(|node| node.voter).all(|node| node.up);
+    // With `waitForIdleSeats` a node whose seat is busy is not picked, until `idleWaitSeconds` from
+    // when it was first held back (a seat that says idle, or none, ends the wait).
+    let idle_patience = spec["idleWaitSeconds"]
+        .as_u64()
+        .unwrap_or(IDLE_SECONDS)
+        .min(IDLE_CEILING);
+    let idle_wait = spec["waitForIdleSeats"].as_bool() == Some(true);
+    let mut idle = BTreeMap::new();
+    let mut seat_waits = Vec::new();
     for node in waiting {
         let now_going = going(&states);
         let alone = now_going.is_empty();
         let fits = now_going.len() < most && !now_going.iter().any(|other| other.voter);
+        let busy = node.seat.as_ref().filter(|_| idle_wait);
+        // (The count runs while it waits for its turn too.)
+        let began = idle_before.get(&node.name).copied().unwrap_or(now);
+        if busy.is_some() {
+            idle.insert(node.name.clone(), began);
+        }
         if !(if node.voter { alone && voters_up } else { fits }) {
             continue;
+        }
+        if let Some((seat, says)) = busy {
+            if now.saturating_sub(began) < idle_patience {
+                seat_waits.push(format!(
+                    "waiting for seat {seat} of {} to be idle (it says {says})",
+                    node.name
+                ));
+                continue;
+            }
+            let why = format!(
+                "{} was let go after {idle_patience} seconds: seat {seat} still said {says}",
+                node.name
+            );
+            held.gave.insert(node.name.clone(), why);
+            idle.remove(&node.name);
         }
         since.insert(node.name.clone(), now);
         if spec["drain"].as_bool() == Some(true) {
@@ -403,6 +453,7 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
             states.insert(node.name.clone(), "updating".into());
         }
     }
+    held.idle = idle;
     let stuck = going(&states).is_empty() && !voters_up;
     let draining: Vec<&Node> = going(&states)
         .into_iter()
@@ -423,7 +474,12 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
     } else {
         (
             "Progressing",
-            held.gave.values().cloned().collect::<Vec<_>>().join("; "),
+            held.gave
+                .values()
+                .cloned()
+                .chain(seat_waits)
+                .collect::<Vec<_>>()
+                .join("; "),
         )
     };
     done(phase, why, states, since, cordoned, cordon, held)
@@ -549,6 +605,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 let lost = shared.members.lost_for(&name, now);
                 let unreachable = status.is_some_and(|status| status["state"] == "unreachable");
                 Node {
+                    seat: crate::seats::busy(store, &name),
                     drained: crate::sched::has_record(&node.spec, kith_sched::DRAIN),
                     waits: if draining.contains(&name) {
                         crate::sched::drain_waits(store, &seen, grace, &name)
@@ -2882,6 +2939,106 @@ mod tests {
             (&json!("Done"), &json!(""))
         );
         assert_eq!(done.drain, [("a".to_string(), false)]);
+    }
+
+    fn seated(name: &str, says: &str) -> Node {
+        Node {
+            seat: Some((format!("{name}-seat0"), says.into())),
+            ..node(name, "1", false)
+        }
+    }
+
+    #[test]
+    fn update_waits_for_idle_seats() {
+        let spec = json!({ "waitForIdleSeats": true, "maxUnavailable": 3 });
+        let go = |spec: &Value, last: Option<&Decided>, nodes: &[Node], at: u64| {
+            step(&plan(spec.clone(), last), Some(("2", "next@1")), nodes, at)
+        };
+        let mut nodes = vec![seated("a", "active"), seated("b", "fullscreen"), node("c", "1", false)];
+        // Active and fullscreen wait, and the message names the seat and that it waits; a node with
+        // no seat goes.
+        let first = go(&spec, None, &nodes, 0);
+        assert_eq!(told(&first), ["c"]);
+        let reason = first.status["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("a-seat0") && reason.contains("b-seat0") && reason.contains("idle"),
+            "{reason}"
+        );
+        // One seat says idle (or its report is anything else but active or fullscreen): that node goes.
+        nodes[0].seat = None;
+        nodes[1].seat = None;
+        let second = go(&spec, Some(&first), &nodes, 10);
+        assert_eq!(told(&second), ["a", "b", "c"]);
+        assert!(
+            second.status["reason"].as_str().unwrap().is_empty(),
+            "{:?}",
+            second.status["reason"]
+        );
+    }
+
+    #[test]
+    fn update_idle_seats_off_and_gives_up() {
+        let go = |spec: &Value, last: Option<&Decided>, nodes: &[Node], at: u64| {
+            step(&plan(spec.clone(), last), Some(("2", "next@1")), nodes, at)
+        };
+        let nodes = vec![seated("a", "active")];
+        // Unset or false: the seat is not looked at.
+        for spec in [json!({}), json!({ "waitForIdleSeats": false })] {
+            let decided = go(&spec, None, &nodes, 0);
+            assert_eq!(told(&decided), ["a"], "{spec}");
+            assert_eq!(decided.status["reason"], "");
+        }
+        // A seat that stays active lets the node go after 3600 seconds, with the reason.
+        let spec = json!({ "waitForIdleSeats": true });
+        let first = go(&spec, None, &nodes, 1000);
+        assert!(told(&first).is_empty());
+        let late = go(&spec, Some(&first), &nodes, 1000 + 3599);
+        assert!(told(&late).is_empty());
+        let gave = go(&spec, Some(&late), &nodes, 1000 + 3600);
+        assert_eq!(told(&gave), ["a"]);
+        let reason = gave.status["reason"].as_str().unwrap();
+        assert!(reason.contains("a-seat0") && reason.contains("3600"), "{reason}");
+        // The plan's own seconds count, with a ceiling.
+        let quick = json!({ "waitForIdleSeats": true, "idleWaitSeconds": 60 });
+        let first = go(&quick, None, &nodes, 0);
+        assert!(told(&go(&quick, Some(&first), &nodes, 59)).is_empty());
+        assert_eq!(told(&go(&quick, Some(&first), &nodes, 60)), ["a"]);
+        let long = json!({ "waitForIdleSeats": true, "idleWaitSeconds": 10_000_000 });
+        let first = go(&long, None, &nodes, 0);
+        assert!(told(&go(&long, Some(&first), &nodes, 86_399)).is_empty());
+        assert_eq!(told(&go(&long, Some(&first), &nodes, 86_400)), ["a"]);
+    }
+
+    /// The wait for a seat counts continuous picking: a pause or a closed window restarts it.
+    #[test]
+    fn update_idle_wait_restarts_after_a_pause_or_a_closed_window() {
+        let go = |spec: &Value, last: Option<&Decided>, nodes: &[Node], at: u64| {
+            step(&plan(spec.clone(), last), Some(("2", "next@1")), nodes, at)
+        };
+        let nodes = vec![seated("a", "active")];
+        let open = json!({ "waitForIdleSeats": true });
+        let first = go(&open, None, &nodes, 1000);
+        assert!(told(&first).is_empty());
+        // Paused for a day: the next pass picks again, and the clock starts there.
+        let paused = go(
+            &json!({ "waitForIdleSeats": true, "paused": true }),
+            Some(&first),
+            &nodes,
+            1000 + 86_400,
+        );
+        assert_eq!(paused.status["idleSince"], json!({}));
+        let again = go(&open, Some(&paused), &nodes, 1000 + 86_400);
+        assert!(told(&again).is_empty(), "{:?}", again.status);
+        assert_eq!(told(&go(&open, Some(&again), &nodes, 1000 + 86_400 + 3600)), ["a"]);
+        // A closed window (1970-01-01 is a Thursday; 00:00 UTC is minute 0 of that day) does too.
+        let spec = json!({ "waitForIdleSeats": true, "windows": ["00:00-00:30"] });
+        let first = go(&spec, None, &nodes, 0);
+        assert!(told(&first).is_empty());
+        let closed = go(&spec, Some(&first), &nodes, 3600 * 12);
+        assert_eq!(closed.status["phase"], "Waiting");
+        assert_eq!(closed.status["idleSince"], json!({}));
+        let next_night = go(&spec, Some(&closed), &nodes, 86_400);
+        assert!(told(&next_night).is_empty(), "{:?}", next_night.status);
     }
 
     /// An update ends only the cordon it put on: one its owner set first stays, a drained node

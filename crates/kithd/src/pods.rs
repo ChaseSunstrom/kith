@@ -103,6 +103,8 @@ pub struct Pods {
     pub mesh: String,
     /// Set when the tables could not be made again for a change of egress rules: tried again.
     unsent: bool,
+    /// The (address, port) pairs of the Services, the only ones of the node's own a pod reaches by TCP.
+    services: Vec<(IpAddr, u16)>,
 }
 
 /// Where each pod made is written down (its number, its exit's tunnel, its address) for a
@@ -132,6 +134,18 @@ pub fn set_range(range: kith_mesh::pod::Range) {
 
 pub fn range() -> kith_mesh::pod::Range {
     RANGE.get().copied().unwrap_or_default()
+}
+
+/// The range the Services' IPv4 addresses come from on this node (`--service-range`), set once at
+/// start; none when IPv4 for Services is off for the node.
+static SERVICE_RANGE: std::sync::OnceLock<Option<kith_mesh::pod::Range>> = std::sync::OnceLock::new();
+
+pub fn set_service_range(range: Option<kith_mesh::pod::Range>) {
+    let _ = SERVICE_RANGE.set(range);
+}
+
+pub fn service_range() -> Option<kith_mesh::pod::Range> {
+    SERVICE_RANGE.get().copied().flatten()
 }
 
 /// Removes a gone pod's directory. Not `remove_dir_all`, which holds a descriptor per level
@@ -419,6 +433,13 @@ impl Pods {
         }
     }
 
+    /// Whether `ip` is the IPv4 address of a pod made here (not just any address of the pods' range).
+    pub fn serves4(&self, ip: Ipv4Addr) -> bool {
+        self.made
+            .values()
+            .any(|pod| kith_mesh::pod::addresses(range(), None, pod.number).0 == ip)
+    }
+
     /// Whether the tables could not be made again for a change of egress rules (tried again).
     pub fn unsent(&self) -> bool {
         self.unsent
@@ -462,7 +483,13 @@ impl Pods {
                 egress: pod.egress.clone(),
             })
             .collect();
-        kith_mesh::pod::node(range(), Path::new(GUARDED).exists(), &self.mesh, &served)
+        kith_mesh::pod::node(
+            range(),
+            &self.services,
+            Path::new(GUARDED).exists(),
+            &self.mesh,
+            &served,
+        )
     }
 }
 
@@ -573,20 +600,42 @@ fn take<R: crate::root_part::Root>(
 }
 
 /// Keep what each pod may reach in step with its policies: `wanted` is the rules of each
-/// owner's pods now (`services::egress_of`). The tables are made again, whole, when any
-/// differs (a change that could not be sent is tried again on the next call).
+/// owner's pods now (`services::egress_of`). The tables are made again, whole, when it differs and
+/// there are pods (a change that could not be sent is tried again on the next call).
 pub fn hold_again(shared: &Shared, wanted: &BTreeMap<String, Option<Vec<kith_mesh::pod::Egress>>>) {
     let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
-    if !pods.follow(wanted) && !pods.unsent {
+    let changed = pods.follow(wanted);
+    // (A node with no pods has no tables to keep: the first pod's own make them.)
+    if !(changed || pods.unsent) || pods.made.is_empty() {
         return;
     }
-    pods.unsent = match pods.serve() {
-        Ok(_) => false,
-        Err(e) => {
-            eprintln!("kithd: making the tables of this node's pods again, for their policies: {e}");
-            true
-        }
-    };
+    pods.remake();
+}
+
+/// The (address, port) pairs the Services' round listens on now (`services::open_keys`), the only
+/// ones of the node's own a pod reaches by TCP: the tables are made again when they differ.
+pub fn open_to(shared: &Shared, services: Vec<(IpAddr, u16)>) {
+    let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
+    if pods.services == services {
+        return;
+    }
+    pods.services = services;
+    if !pods.made.is_empty() {
+        pods.remake();
+    }
+}
+
+impl Pods {
+    /// Make the tables again; one that could not be sent is tried again by `hold_again`.
+    fn remake(&mut self) {
+        self.unsent = match self.serve() {
+            Ok(_) => false,
+            Err(e) => {
+                eprintln!("kithd: making the tables of this node's pods again: {e}");
+                true
+            }
+        };
+    }
 }
 
 /// Keeps every pod here in step with its policies until stopped, on a node in a cluster or
@@ -598,18 +647,16 @@ pub async fn keep_held(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>)
     loop {
         // The owners asked of the pods, the rules of the store, then the pods told: never both locks at once.
         let owners = shared.pods.lock().expect("nothing panics holding the pods").owners();
-        if !owners.is_empty() {
-            let prefix = crate::services::mesh_prefix(&shared);
-            let held: BTreeMap<String, Option<Vec<kith_mesh::pod::Egress>>> = {
-                let state = shared.store.lock().expect("nothing panics holding the store");
-                // (One no longer in the store keeps its rules until its pods go: not let loose.)
-                let present = owners.iter().filter(|owner| state.store.get(owner).is_some());
-                present
-                    .map(|owner| (owner.clone(), crate::services::egress_of(&state.store, owner, prefix)))
-                    .collect()
-            };
-            hold_again(&shared, &held);
-        }
+        let prefix = crate::services::mesh_prefix(&shared);
+        let held = {
+            let state = shared.store.lock().expect("nothing panics holding the store");
+            // (One no longer in the store keeps its rules until its pods go: not let loose.)
+            let present = owners.iter().filter(|owner| state.store.get(owner).is_some());
+            present
+                .map(|owner| (owner.clone(), crate::services::egress_of(&state.store, owner, prefix)))
+                .collect::<BTreeMap<String, Option<Vec<kith_mesh::pod::Egress>>>>()
+        };
+        hold_again(&shared, &held);
         tokio::select! {
             _ = generation.changed() => {}
             () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
@@ -653,6 +700,7 @@ fn inside<T: Send>(shared: &Shared, id: &str, make: impl FnOnce() -> std::io::Re
 // and says nothing of it but kithd's log.
 pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut stopping: watch::Receiver<bool>) {
     let mut generation = shared.generation.subscribe();
+    let mut mesh_port = shared.mesh_port.subscribe();
     // (Each port's pod, and its relay.)
     type Relay = (Asker, tokio::task::JoinHandle<()>);
     let mut open: BTreeMap<(bool, u16), Relay> = BTreeMap::new();
@@ -664,6 +712,9 @@ pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut sto
         // (Asked before the store is read: it only gets newer.)
         let current = current(&shared);
         let (asking, mut asked) = published(&shared);
+        // (The mesh's port may come with the Cluster's switch, after the flags were read.)
+        let mesh = (*shared.mesh_port.borrow()).map(|port| (port, "mesh"));
+        let own: Vec<_> = own.iter().copied().chain(mesh).collect();
         let mut refused = refuse_own(&mut asked, &own);
         refused.extend(keep_for(&mut kept, current.then_some(&asking), &mut asked));
         let held = open.iter().map(|(port, (pod, _))| (*port, pod.clone())).collect();
@@ -702,6 +753,8 @@ pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut sto
         }
         tokio::select! {
             _ = generation.changed() => {}
+            // (The Cluster's switch moves the mesh's port: a port a pod asked for is free of it, or refused for it, at once.)
+            _ = mesh_port.changed() => {}
             // (A pod is made, or goes, with nothing written: looked at again soon.)
             () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
             _ = stopping.changed() => break,
@@ -1243,6 +1296,17 @@ mod tests {
         }
     }
 
+    /// Only the IPv4 address of a pod made here is a pod's: another address of the range is not.
+    #[test]
+    fn serves4_is_the_made_pods_addresses_only() {
+        let mut pods = Pods::default();
+        pods.made.insert("a".into(), pod("Workload/default/web", 2, None));
+        let (served, other) = (range().address(2), range().address(3));
+        assert!(pods.serves4(served));
+        assert!(!pods.serves4(other));
+        assert!(!pods.serves4(Ipv4Addr::LOCALHOST));
+    }
+
     /// The egress rules of each pod follow its Workload's policies: a pod's rules are wanted
     /// again when a policy changes, a pod of an owner nobody asked about keeps its own, and
     /// the tables are made again (by the caller) only when something differs.
@@ -1679,7 +1743,14 @@ mod tests {
             Err((Some(made), "not asked".into()))
         }
 
-        fn tune(&self, _: &(), _: &str, _: Option<u64>, _: Option<u64>) -> Result<Vec<String>, String> {
+        fn tune(
+            &self,
+            _: &(),
+            _: &str,
+            _: Option<u64>,
+            _: Option<u64>,
+            _: Option<kith_runtime::Idle>,
+        ) -> Result<Vec<String>, String> {
             Err("not asked".into())
         }
 

@@ -434,11 +434,11 @@ async fn here(shared: &Shared, dir: Dir, bound: u64, body: Body) -> Result<Value
         let into = crate::root_part::open(&state, &dir)?;
         // (A disk that cannot be asked has nothing free.)
         let free = || {
-            let disk = nix::sys::statvfs::statvfs(&into);
+            let disk = nix::sys::statvfs::statvfs(into.held());
             disk.map_or(0, |disk| disk.blocks_available() * disk.fragment_size())
         };
         let (rest, ended) = (Bytes::new(), false);
-        unpack(In { from, rest, ended }, &into, bound, &free)
+        unpack(In { from, rest, ended }, into.held(), bound, &free)
     });
     let mut chunks = body.into_data_stream();
     loop {
@@ -503,7 +503,7 @@ fn out(shared: &Shared, dir: &Dir) -> Result<Response, String> {
         let out = io::BufWriter::with_capacity(64 << 10, Out { to, runtime });
         // (A stream that ends in an error is cut short, which its reader can tell: if it
         // still reads.)
-        if let Err(e) = crate::backups::stream(&from, out).and_then(|mut out| out.flush()) {
+        if let Err(e) = crate::backups::stream(from.held(), out).and_then(|mut out| out.flush()) {
             let _ = waiting.block_on(failed.send_timeout(Err(e), QUIET));
         }
     });
