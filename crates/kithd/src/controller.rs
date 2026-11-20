@@ -3,8 +3,7 @@
 //! what it sees in each one's status.
 //!
 // ponytail: this node's share of each (the scheduler says which replicas are its own).
-// Not handled, and said so in the status where it matters: exec probes. A container's
-// ports only name them (units share the host's network).
+// A container's ports only name them (units share the host's network).
 // A rolling update replaces one replica at a time. A replica that is a pod (as root, no
 // device, seat or volume, and room on the node for a second) is replaced by surge: the new
 // one starts beside the old (the generations take turns at ids with and without a `b`:
@@ -581,9 +580,7 @@ pub async fn run(
         }
     }
     controller.stop.store(true, Ordering::Relaxed);
-    for (id, slot) in &mut controller.slots {
-        stop(id, slot).await;
-    }
+    stop_all(&mut controller.slots, crate::init::handing_over()).await;
     // A count or removal holds directories of the state disk open: it is waited for, a little,
     // so the disk can be unmounted once kithd is gone.
     let counts = controller
@@ -609,6 +606,18 @@ pub async fn run(
             "kithd: gave up waiting after 2 s for {}: the state disk may be busy; what a removal left (the scratch and the scratch.* levels beside it, each listed once, at most four directories open, never `..`, never across a file system) goes as trees of their own at its pod's next count, or with its replica directory once the pod is gone; an image half removed is out of the images already, and goes at the next look at them",
             left.join(", ")
         );
+    }
+}
+
+/// Every unit stopped at kithd's end; but a hand-over to the next kithd (update.rs) stops none:
+/// they run on, and it takes them back.
+async fn stop_all(slots: &mut BTreeMap<String, Slot>, handing_over: bool) {
+    if handing_over {
+        eprintln!("kithd: handing over: units left running for the next kithd");
+        return;
+    }
+    for (id, slot) in slots {
+        stop(id, slot).await;
     }
 }
 
@@ -981,6 +990,21 @@ fn live_gen(
         true => !new,
         false => new,
     }
+}
+
+/// Of a replica being replaced beside the old, the generation that answers: the one the status tells of.
+fn answers(
+    gens: &BTreeMap<(String, u32), bool>,
+    surging: &Surging,
+    slots: &BTreeMap<String, Slot>,
+    slot: &Slot,
+) -> bool {
+    is_second(slot) == live_gen(gens, surging, slots, &slot.owner, slot.replica)
+}
+
+/// What the status says of a unit: its revision and whether it is ready (a probe passed, if it has one).
+fn unit_status(slot: &Slot) -> Value {
+    json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts, "revision": slot.revision })
 }
 
 /// Every unit of the generation `b` of the replica is ready: it answers for the replica.
@@ -2269,7 +2293,7 @@ impl Controller {
                             ("running", running_said(note, replaced), None, Instant::now());
                         if let Run::Container(c) = &slot.run {
                             let pod = slot.pod.as_ref().map(|(pod, _)| pod.clone());
-                            slot.probes = crate::probe::start(shared.clone(), c, pod);
+                            slot.probes = crate::probe::start(shared.clone(), c, id, pod);
                         }
                         job_moved = true;
                     }
@@ -2360,27 +2384,34 @@ impl Controller {
                 notes.extend(says.iter().map(|(_, said)| said.clone()));
             }
             // Of a replica being replaced beside the old, the one that answers.
-            let answers = |slot: &&Slot| {
-                is_second(slot) == live_gen(&self.gens, &self.surging, &self.slots, &slot.owner, slot.replica)
-            };
             let mine: Vec<&Slot> = self
                 .slots
                 .values()
                 .filter(|slot| slot.owner == key)
-                .filter(answers)
+                .filter(|slot| answers(&self.gens, &self.surging, &self.slots, slot))
                 .collect();
             let units: Vec<Value> = mine
                 .iter()
                 .map(|slot| {
-                    let mut c = json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts, "revision": slot.revision });
+                    let mut c = unit_status(slot);
                     if let Some(code) = slot.exit_code {
                         c["exitCode"] = json!(code);
                     }
                     if let Some(at) = slot.restarted {
                         c["restarted"] = json!(at);
                     }
-                    let said = says.iter().filter(|(r, _)| *r == slot.replica && me.is_some()).map(|(_, said)| said.as_str());
-                    let message: Vec<&str> = slot.message.as_deref().into_iter().chain(said).collect();
+                    let said = says
+                        .iter()
+                        .filter(|(r, _)| *r == slot.replica && me.is_some())
+                        .map(|(_, said)| said.as_str());
+                    let cannot = slot.probes.as_ref().and_then(|p| p.why());
+                    let message: Vec<&str> = slot
+                        .message
+                        .as_deref()
+                        .into_iter()
+                        .chain(cannot.as_deref())
+                        .chain(said)
+                        .collect();
                     if !message.is_empty() {
                         c["message"] = json!(message.join("; "));
                     }
@@ -4017,6 +4048,62 @@ mod tests {
         assert!(!second_is_live(&slots, "Workload/x/a", 0, true));
     }
 
+    /// A rollout whose container has only an exec readiness probe: until the command has passed, the
+    /// status (and the Deployment kubectl reads off it) keeps the old copy's revision and counts, so
+    /// `kubectl rollout status` and `helm --wait` wait for the probe, not for the container to run.
+    #[tokio::test]
+    async fn rollout_waits_for_exec_readiness() {
+        let owner = "Workload/x/a";
+        let exec: Container = serde_json::from_value(json!({
+            "name": "app", "image": "img", "readiness": { "exec": ["test", "-f", "/tmp/ready"] },
+        }))
+        .unwrap();
+        assert!(crate::probe::problems(&exec).is_empty());
+        let (mut slots, mut gens, mut surging) = (BTreeMap::new(), BTreeMap::new(), Surging::new());
+        let (old_id, mut old) = surge_unit(false, "running");
+        old.revision = Some(1);
+        slots.insert(old_id, old);
+        let (new_id, mut new) = surge_unit(true, "running");
+        new.revision = Some(2);
+        // (Started with the probe running and not yet passed: what `probe::start` gives a container with one.)
+        let (probes, passed) = crate::probe::held(crate::probe::Health {
+            live: true,
+            ready: false,
+        });
+        new.probes = Some(probes);
+        slots.insert(new_id, new);
+        gens.insert((owner.to_string(), 0), true);
+        surging.insert((owner.to_string(), 0), (Instant::now(), None));
+
+        // The Deployment kubectl reads, over what the controller reports.
+        let read = |slots: &BTreeMap<String, Slot>| -> Value {
+            let units: Vec<Value> = slots
+                .values()
+                .filter(|slot| answers(&gens, &surging, slots, slot))
+                .map(unit_status)
+                .collect();
+            let resource: Resource = serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": "Workload",
+                "metadata": { "name": "a", "namespace": "x", "revision": 2 },
+                "spec": {}, "status": { "containers": units },
+            }))
+            .unwrap();
+            crate::kube::status_of("Deployment", &json!({ "spec": { "replicas": 1 } }), &resource).unwrap()
+        };
+        let counts = |status: &Value| {
+            ["replicas", "updatedReplicas", "readyReplicas", "availableReplicas"].map(|n| status[n].as_u64().unwrap())
+        };
+        // Running, the probe not passed: the old copy answers, at its own revision.
+        let before = read(&slots);
+        assert_eq!(counts(&before), [1, 0, 1, 1], "{before}");
+        assert_eq!(before["conditions"][1]["reason"], "ReplicaSetUpdated");
+        // The probe passes: the new copy answers.
+        passed.send_modify(|health| health.ready = true);
+        let after = read(&slots);
+        assert_eq!(counts(&after), [1, 1, 1, 1], "{after}");
+        assert_eq!(after["conditions"][1]["reason"], "NewReplicaSetAvailable");
+    }
+
     /// What is held once (a volume, a device, the node's network) is not held by two replicas
     /// at once: its replica is stopped first, and the note says why.
     #[test]
@@ -4420,6 +4507,19 @@ mod tests {
             !slots.contains_key(id),
             "a replaced unit goes, and what is wanted starts afresh"
         );
+    }
+
+    /// The stop at kithd's end stops every unit, but not on a hand-over to the next kithd. (A slot
+    /// that is `leaving` with no handle is the unit stand-in: a stop clears the mark, a hand-over does not.)
+    #[tokio::test]
+    async fn a_hand_over_stops_no_unit() {
+        let mut ended = slot_of("Workload/a/b", &[], "app");
+        ended.leaving = true;
+        let mut slots = BTreeMap::from([("w_a_b_0_app".to_string(), ended)]);
+        stop_all(&mut slots, true).await;
+        assert!(slots["w_a_b_0_app"].leaving, "a hand-over leaves the unit as it is");
+        stop_all(&mut slots, false).await;
+        assert!(!slots["w_a_b_0_app"].leaving, "any other end stops it");
     }
 
     /// An input device plugged into a running container is no reason to start it over, so the device
