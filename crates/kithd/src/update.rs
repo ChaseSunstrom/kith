@@ -1961,7 +1961,7 @@ mod tests {
             let at = listener.local_addr().unwrap();
             let log = serving(listener, |path| {
                 crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
-                moved(&format!("{}", path.trim_start_matches('/').replace("%2F", "/")))
+                moved(&path.trim_start_matches('/').replace("%2F", "/"))
             });
             for (target, words) in [
                 ("ftp:%2F%2Fx.example%2Fa", "fetched over http or https"),
