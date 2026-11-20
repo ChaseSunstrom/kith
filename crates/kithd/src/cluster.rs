@@ -298,14 +298,9 @@ fn hung_up_on(called: std::io::Result<SocketAddr>, mesh: Option<Ipv6Addr>) -> bo
     mesh.is_some_and(|mesh| !called.is_ok_and(|to| may_answer(to, mesh)))
 }
 
-#[cfg(test)]
-pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::Result<TlsListener> {
-    listen_on(tcp, config, None)
-}
-
-/// [`listen`], hanging up at once on a connection to an address of this machine that
+/// Listens for the node API, hanging up at once on a connection to an address of this machine that
 /// [`may_answer`] refuses, when the socket is bound to every address and `mesh` is this node's
-/// address on the mesh.
+/// address on the mesh (`None`: no filter).
 pub fn listen_on(
     tcp: TcpListener,
     config: Arc<rustls::ServerConfig>,
@@ -1587,6 +1582,12 @@ pub async fn request_join(
 }
 
 /// What the tests of a call to one node need: nodes of one CA, and one that counts what it is sent.
+/// [`listen_on`] with no filter: a socket of one address.
+#[cfg(test)]
+pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::Result<TlsListener> {
+    listen_on(tcp, config, None)
+}
+
 #[cfg(test)]
 pub(crate) mod pinned_peer {
     use super::*;
