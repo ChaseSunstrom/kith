@@ -48,6 +48,9 @@ pub struct Identity {
     issuer: String,
     subject: String,
     authority: Vec<CertificateDer<'static>>,
+    /// The roots of the timestamp authority whose RFC 3161 timestamps the rule takes (none: it
+    /// takes the log's promise alone, and refuses a bundle that is of Rekor v2).
+    tsa: Vec<CertificateDer<'static>>,
     /// The log's key (its point), and its id: SHA-256 of its DER, in hex.
     log: Vec<u8>,
     log_id: String,
@@ -68,31 +71,49 @@ fn pem(text: &str) -> Option<Vec<u8>> {
     STANDARD.decode(base64).ok().filter(|der| !der.is_empty())
 }
 
-/// Reads an identity as a rule gives it (its JSON text: `issuer`, `subject`, `authority`, `log`).
+/// 1 to `AUTHORITY` PEM certificates, as the identity's field `key` gives them: that and the
+/// first thing wrong, said.
+fn certificates(given: &Value, key: &str, subject: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let given = given.as_array().map(Vec::as_slice).unwrap_or_default();
+    if given.is_empty() || given.len() > AUTHORITY {
+        let of = if key == "tsa" {
+            "as its `tsa`"
+        } else {
+            "of its authority"
+        };
+        return err(format!(
+            "signedBy: the identity {subject} gives 1 to {AUTHORITY} certificates {of}"
+        ));
+    }
+    let mut certs = Vec::new();
+    for cert in given {
+        let der = cert.as_str().and_then(pem).map(CertificateDer::from);
+        match der.filter(|der| webpki::anchor_from_trusted_cert(der).is_ok()) {
+            Some(der) => certs.push(der),
+            None => {
+                return err(format!(
+                    "signedBy: the identity {subject}'s `{key}` holds what is no certificate"
+                ));
+            }
+        }
+    }
+    Ok(certs)
+}
+
+/// Reads an identity as a rule gives it (its JSON text: `issuer`, `subject`, `authority`, `log`,
+/// and a `tsa` if the rule takes a timestamp authority's word on when).
 pub fn identity(said: &str) -> Result<Identity> {
     let said: Value = serde_json::from_str(said).unwrap_or_default();
     let text = |key: &str| said[key].as_str().filter(|text| !text.is_empty()).map(String::from);
     let (Some(issuer), Some(subject)) = (text("issuer"), text("subject")) else {
         return err("signedBy: an identity names its `issuer` and its `subject`");
     };
-    let given = said["authority"].as_array().cloned().unwrap_or_default();
-    if given.is_empty() || given.len() > AUTHORITY {
-        return err(format!(
-            "signedBy: the identity {subject} gives 1 to {AUTHORITY} certificates of its authority"
-        ));
-    }
-    let mut authority = Vec::new();
-    for cert in &given {
-        let der = cert.as_str().and_then(pem).map(CertificateDer::from);
-        match der.filter(|der| webpki::anchor_from_trusted_cert(der).is_ok()) {
-            Some(der) => authority.push(der),
-            None => {
-                return err(format!(
-                    "signedBy: the identity {subject}'s authority holds what is no certificate"
-                ));
-            }
-        }
-    }
+    let authority = certificates(&said["authority"], "authority", &subject)?;
+    // (A rule stored before there was a `tsa` has none, or null: a field given as anything else is read.)
+    let tsa = match said.get("tsa") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(given) => certificates(given, "tsa", &subject)?,
+    };
     let log = text("log").as_deref().and_then(pem);
     let Some(point) = log
         .as_ref()
@@ -105,8 +126,13 @@ pub fn identity(said: &str) -> Result<Identity> {
     };
     let log_id = hex(&sha256(log.as_deref().unwrap_or_default()));
     let all = [issuer.as_bytes(), subject.as_bytes(), log_id.as_bytes()].into_iter();
+    // (The tsa's roots are in the hash only when given, after a mark: an identity without one has
+    // the id it had before there was a field, and one with is not another's with the roots moved.)
+    let marked = (!tsa.is_empty()).then_some(b"tsa".as_slice());
     let all: Vec<u8> = all
         .chain(authority.iter().map(|der| der.as_ref()))
+        .chain(marked)
+        .chain(tsa.iter().map(|der| der.as_ref()))
         .flat_map(sha256)
         .collect();
     Ok(Identity {
@@ -115,6 +141,7 @@ pub fn identity(said: &str) -> Result<Identity> {
         issuer,
         subject,
         authority,
+        tsa,
         log_id,
     })
 }
@@ -353,13 +380,42 @@ fn promised(signed: &Signed, promise: &Promise, who: &Identity) -> std::result::
     entry(signed, &promise.body)
 }
 
+/// Whether `signed` is a signature of the image `digest` by `who`, with the timestamp the rule
+/// asks for: a rule without a `tsa` takes the log's promise as before and refuses a bundle of
+/// Rekor v2 (a timestamp and no promise), naming the field; one with takes only a bundle whose
+/// timestamp is from one of its roots, a v1 bundle's too (its time is still the log's).
+/// Why not, if not. What a bundle was found to be timed by a rule is not kept for the next.
+pub fn verify(signed: &mut Signed, digest: &str, who: &Identity) -> std::result::Result<(), String> {
+    signed.stamped = None;
+    if who.tsa.is_empty() {
+        if signed.promise.is_none() && signed.stamp.is_some() {
+            return Err(
+                "its log is Rekor v2 (a timestamp and no promise), and the rule names no `tsa`: the root of \
+                 the timestamp authority to take its time from"
+                    .into(),
+            );
+        }
+        return check(signed, digest, who);
+    }
+    if signed.stamp.is_none() {
+        return Err("the rule names a `tsa`, and the bundle has no timestamp from it".into());
+    }
+    let mut refused = Vec::new();
+    for root in &who.tsa {
+        match timestamp(signed, root) {
+            Ok(_) => return check(signed, digest, who),
+            Err(why) => refused.push(why),
+        }
+    }
+    refused.dedup();
+    Err(refused.join("; "))
+}
+
 /// Checks a Rekor v2 bundle's RFC 3161 timestamp against the root `tsa` (a certificate's
 /// DER) of the timestamp authority a rule names; on success the bundle is taken to have been
 /// signed at the timestamp's time (`check` then holds its certificate to that), which is
 /// returned. Why not, if not.
-// (Nothing calls it until a rule can name the TSA's root: T-0564.)
-#[allow(dead_code)]
-pub fn timestamp(signed: &mut Signed, tsa: &[u8]) -> std::result::Result<i64, String> {
+fn timestamp(signed: &mut Signed, tsa: &[u8]) -> std::result::Result<i64, String> {
     let time = stamped(signed, tsa)?;
     signed.stamped = Some(time);
     Ok(time)
@@ -1449,6 +1505,103 @@ pub(crate) mod tests {
         bare["verificationMaterial"]["tlogEntries"][0]["inclusionPromise"] = Value::Null;
         let said = super::bundle(bare.to_string().as_bytes()).err().unwrap();
         assert!(said.contains("Rekor v2"), "{said}");
+    }
+
+    /// An identity's text with the `tsa` field: the roots' certificates (PEM).
+    fn with_tsa(who: &str, roots: &[&CertificateDer]) -> String {
+        let mut said: Value = serde_json::from_str(who).unwrap();
+        said["tsa"] = roots.iter().map(|root| pem_of("CERTIFICATE", root)).collect();
+        said.to_string()
+    }
+
+    /// What a rule without `tsa` and one with it make of a bundle with a log's promise (Rekor
+    /// v1's), one without (Rekor v2's), and one of v1's that carries a timestamp too.
+    #[test]
+    fn tsa_field_decides_which_bundles_are_taken() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let made = Making {
+            at: START + 120,
+            seen: START + 300,
+            ..Making::new(&authority, &log, DIGEST)
+        };
+        let (cert, key) = tsa.leaf(
+            START + 100,
+            "tsa@example.test",
+            ISSUED,
+            ExtendedKeyUsagePurpose::TimeStamping,
+        );
+        let (v1, v2) = (made.bundle(), v2(&made, &cert, &key, None, 300, ""));
+        // v1 with a timestamp (over its own signature) as well.
+        let mut both = v1.clone();
+        let sig = STANDARD
+            .decode(v1["dsseEnvelope"]["signatures"][0]["sig"].as_str().unwrap())
+            .unwrap();
+        both["verificationMaterial"]["timestampVerificationData"] = serde_json::json!({ "rfc3161Timestamps": [{ "signedTimestamp": STANDARD.encode(response(&cert, &key, &sig, 300, "")) }] });
+        let verdict = |bundle: &Value, who: &str| {
+            let mut signed = super::bundle(bundle.to_string().as_bytes())?;
+            verify(&mut signed, DIGEST, &identity(who).unwrap())
+        };
+        let (without, with) = (who.clone(), with_tsa(&who, &[&tsa.root]));
+        // No tsa: v1 as before, v2 refused naming the field (and not "no entry in a log").
+        assert_eq!(verdict(&v1, &without), Ok(()));
+        assert_eq!(verdict(&both, &without), Ok(()));
+        let said = verdict(&v2, &without).unwrap_err();
+        assert!(said.contains("`tsa`") && said.contains("Rekor v2"), "{said}");
+        // A tsa: v2 is taken at the timestamp's time; v1 needs a timestamp too.
+        assert_eq!(verdict(&v2, &with), Ok(()));
+        assert_eq!(verdict(&both, &with), Ok(()));
+        let said = verdict(&v1, &with).unwrap_err();
+        assert!(said.contains("`tsa`") && said.contains("timestamp"), "{said}");
+        // A timestamp of another authority is no timestamp: refused for v1 as for v2.
+        let other = with_tsa(&who, &[&Authority::new().root]);
+        for bundle in [&both, &v2] {
+            let said = verdict(bundle, &other).unwrap_err();
+            assert!(said.contains("not from the authority named"), "{said}");
+        }
+        // Any of up to four roots may be the authority's.
+        let roots = with_tsa(&who, &[&Authority::new().root, &tsa.root]);
+        assert_eq!(verdict(&v2, &roots), Ok(()));
+        // What one rule found is not carried to the next: a bundle timed for one identity is
+        // not timed for another that names no tsa.
+        let mut signed = super::bundle(v2.to_string().as_bytes()).unwrap();
+        assert_eq!(verify(&mut signed, DIGEST, &identity(&with).unwrap()), Ok(()));
+        let said = verify(&mut signed, DIGEST, &identity(&without).unwrap()).unwrap_err();
+        assert!(said.contains("`tsa`"), "{said}");
+    }
+
+    /// The `tsa` field is 1 to 4 PEM certificates, optional, and part of what an identity is.
+    #[test]
+    fn tsa_rule_reads_one_to_four_certificates() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let read = |said: &str| identity(said).map(|read| read.id).map_err(|e| e.to_string());
+        let plain = read(&who).unwrap();
+        // (A rule that stored no tsa is `who` itself: its id has no tsa in it, as before.)
+        let one = read(&with_tsa(&who, &[&tsa.root])).unwrap();
+        assert_ne!(one, plain);
+        let four = [&tsa.root; 4];
+        assert_ne!(read(&with_tsa(&who, &four)).unwrap(), one);
+        // DER inside the PEM is a certificate; the PEM's own label is not read.
+        assert!(read(&with_tsa(&who, &[&authority.root])).is_ok());
+        for (said, why) in [
+            (with_tsa(&who, &[]), "gives 1 to 4 certificates as its `tsa`"),
+            (
+                with_tsa(&who, &[&tsa.root; 5]),
+                "gives 1 to 4 certificates as its `tsa`",
+            ),
+            (
+                with_tsa(&who, &[&CertificateDer::from(&b"not a certificate"[..])]),
+                "`tsa` holds what is no certificate",
+            ),
+        ] {
+            let got = read(&said).unwrap_err();
+            assert!(got.contains(why), "expected `{why}`, got `{got}`");
+        }
+        // Not a list of text: refused too, not taken as no tsa.
+        let mut said: Value = serde_json::from_str(&who).unwrap();
+        said["tsa"] = Value::from("tsa.pem");
+        assert!(read(&said.to_string()).unwrap_err().contains("`tsa`"));
     }
 
     #[test]

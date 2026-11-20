@@ -838,7 +838,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - the log's inclusion proof and the certificate's own log proof (its SCT) are not
     checked: offline, with no witness, they add nothing the log's promise does not;
   - a log of Rekor v2 (an inclusion proof and a time from a timestamp authority, no
-    promise) is not read: such a signature is refused, naming it;
+    promise) is taken only under an identity that names the authority's root as `tsa`
+    (its RFC 3161 timestamp then says when); without `tsa` such a signature is refused,
+    naming the field. The log's inclusion proof is still not read, so a signature timed
+    this way was not shown to be in any log;
   - an attestation (an in-toto statement of another kind) is never taken as a signature.
 - **A control node that is taken is the cluster taken, until its Node is deleted.** It has the
   whole store, every Secret in it, and a node's rights (a worker has less: below). `kith delete node/NAME` ends

@@ -189,7 +189,11 @@ spec:
   ```
 
   The image runs only if a certificate from that authority names exactly that subject and issuer
-  and was valid when the log (under its key) saw the signature. What this proves and what it
+  and was valid when the log (under its key) saw the signature. A signature in a log of Rekor v2
+  (a time from a timestamp authority, no promise) is refused unless the identity also gives
+  `tsa: [ "-----BEGIN CERTIFICATE-----\n…" ]`, the authority's root (1 to 4), whose RFC 3161
+  timestamp then times it; with `tsa`, every signature of that identity needs the timestamp.
+  What this proves and what it
   does not: [SECURITY.md](../../SECURITY.md#what-is-not-defended) and
   [docs/adr-keyless.md](../../docs/adr-keyless.md).
 - **Keys named once, for the cluster.** A `Cluster`'s `spec.images` says which keys sign the
@@ -223,7 +227,7 @@ spec:
   `vms` unit is for.
 - **Not yet.** No AppArmor or SELinux profile. On kith OS, no user namespace for a container on
   the node's network, one given devices or one with a volume of another node. A call the kernel
-  gains later is let through until it is named in the filter. A log of Rekor v2 is not read. An
+  gains later is let through until it is named in the filter. A log of Rekor v2 is not read: its signatures are taken only by a timestamp (an identity's `tsa`). An
   `exec` unit is none of this: it is a process of the host.
 
 ### A replica as a pod

@@ -26,7 +26,8 @@ signedBy:
 - { issuer: https://token.actions.githubusercontent.com,
     subject: https://github.com/acme/tool/.github/workflows/release.yml@refs/heads/main,
     authority: [<PEM certificate>, ...],   # the authority's root, and its intermediates
-    log: <PEM public key> }                # the log's key
+    log: <PEM public key>,                 # the log's key
+    tsa: [<PEM certificate>, ...] }        # optional: the timestamp authority's root(s), 1 to 4
 ```
 
 - `issuer` and `subject` are matched whole, byte for byte. There are no patterns, which
@@ -36,6 +37,14 @@ signedBy:
   each held to its own validity at the log's time as the leaf is, so an intermediate that
   has been retired no longer passes. A root's own dates are not read.
 - `log` is an ECDSA P-256 key, the same as Rekor's.
+- `tsa` is optional (a rule stored without it reads as before, and is the same identity with
+  the same id). It gives the root certificates, 1 to 4, of the RFC 3161 timestamp authority
+  that timed the signature. Without it a bundle of Rekor v2 (a timestamp, no promise) is
+  refused, naming `tsa`; a bundle with a log's promise is taken as it was. With it,
+  `keyless::verify` runs `timestamp` against each root before `check`: a Rekor v2 bundle
+  is timed by it, and a v1 bundle needs its timestamp too (it must be there and be the
+  authority's; the time the certificate is held to is still the log's promise). A signature
+  kept under the tag has no timestamp, so under a rule with `tsa` it is refused.
 - Nothing is built in and nothing is fetched (no TUF). A wrong root or key refuses every
   signature. It never widens what runs.
 - A template's identities narrow a rule's in the same way its keys do. An identity is the
@@ -154,12 +163,13 @@ the hash covering all four fields, the way a key is remembered by its id.
 - **Revocation.** There is none for a ten-minute certificate. The time from the log is
   what bounds it.
 - **Rekor v2 (no promise; a timestamp authority's RFC 3161 token instead).** Without a
-  timestamp it is refused, naming it. `keyless::timestamp` reads the token in the bundle
+  timestamp, or under a rule with no `tsa`, it is refused, naming it. `keyless::timestamp` reads the token in the bundle
   (`timestampVerificationData`) and takes its genTime as the signing time when the TSA's
   signature over the signed attributes, their messageDigest, the SHA-256 imprint of the
   signature, and a chain to the TSA root given (EKU timeStamping, valid at genTime) all
   hold; the log's inclusion proof is not read. The rule field that carries the TSA root is
-  T-0564's. cosign 3 still logs to Rekor v1 by default on the public instance (sigstore
+  the identity's `tsa`: `keyless::verify` is what calls `timestamp`, per identity, and
+  forgets what it found before the next identity is asked. cosign 3 still logs to Rekor v1 by default on the public instance (sigstore
   blog, "Rekor v2 GA", Oct 2025).
 - **A log that lies along with the authority.** This is not caught: who runs them is the
   owner's choice of trust, and README and SECURITY.md say so.

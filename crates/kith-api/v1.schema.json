@@ -2514,6 +2514,16 @@
         "log": {
           "type": "string",
           "description": "The log's public key, PEM (ECDSA P-256)."
+        },
+        "tsa": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "The root certificates (PEM, 1 to 4) of the timestamp authority whose RFC 3161 timestamp\nsays when the signature was made. Without it a signature logged to Rekor v2 (which\nhas no promise of its own) is refused, and with it every signature needs the timestamp."
         }
       },
       "required": [

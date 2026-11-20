@@ -57,6 +57,11 @@ spec! {
         pub authority: Vec<String>,
         /// The log's public key, PEM (ECDSA P-256).
         pub log: String,
+        /// The root certificates (PEM, 1 to 4) of the timestamp authority whose RFC 3161 timestamp
+        /// says when the signature was made. Without it a signature logged to Rekor v2 (which
+        /// has no promise of its own) is refused, and with it every signature needs the timestamp.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tsa: Option<Vec<String>>,
     }
 }
 
@@ -1459,6 +1464,14 @@ fn not_keys(signers: &[Signer]) -> Option<String> {
         } else if !p256(&identity.log) {
             Some(format!(
                 "signedBy: the identity `{who}`'s log is not an ECDSA P-256 public key"
+            ))
+        } else if identity
+            .tsa
+            .as_ref()
+            .is_some_and(|tsa| tsa.is_empty() || tsa.len() > 4 || !tsa.iter().all(cert))
+        {
+            Some(format!(
+                "signedBy: the identity `{who}` gives its tsa as 1 to 4 PEM certificates of at most 8 KiB"
             ))
         } else {
             None
