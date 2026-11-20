@@ -291,7 +291,10 @@ never followed, and a file with another hard link is left as it is (it may be on
 volume; a hard link inside a volume is therefore not given, and the start logs how many files it
 left). The walk is streamed: it holds one descriptor for each directory it is inside, at most 128
 deep (deeper fails that start), and keeps no list of names, so its cost is bounded by its own
-depth, not by a tenant's width, and no start's walk is counted against another's. A check between
+depth, not by a tenant's width. The walks of a process together hold at most half its soft limit
+of descriptors (8192 at most), each taking its 130 before it opens one: a give that finds them
+taken waits for another to finish, 30 s at most, and then only that start fails, with a plain
+error. A check between
 the stat and the
 chown of one entry is still a race; `protected_hardlinks` limits what it gains. In `--split` the
 descriptor follows the unit across the socket (`Call::Create.volumes` names the mounts, their

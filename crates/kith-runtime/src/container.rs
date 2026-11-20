@@ -1894,9 +1894,73 @@ fn still_held(unit: &Unit) -> io::Result<()> {
 
 /// The most directories a volume is given through: a tree deeper is refused whole. A walk holds
 /// one descriptor for each directory it is inside (its listing is that descriptor), so one
-/// costs at most this many and one more, whatever the tree is wide, and no walk counts against
-/// another: a tenant's volume cannot make another's start fail.
+/// costs at most this many and one more, whatever the tree is wide. The walks of a process
+/// together are bounded by [`GiveSlots`], each by this.
 const GIVE_DEEP: u32 = 128;
+
+/// What one walk takes from the process's descriptors, whatever its tree: one for each of
+/// [`GIVE_DEEP`] directories and the top, and one to spare.
+const GIVE_COST: usize = GIVE_DEEP as usize + 2;
+
+/// How long a give waits for descriptors another start's give holds before only it fails.
+const GIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A count of descriptors the gives of this process may hold together: a walk takes its
+/// [`GIVE_COST`] before it opens one and returns it when it is done, so no number of starts, deep
+/// trees or slow ones, can run the root part out of descriptors. A give that finds it short
+/// waits for another to finish, up to a limit, and then fails alone.
+struct GiveSlots {
+    free: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// The descriptors a take holds, given back on drop (a walk that fails or panics included).
+struct GiveHeld<'a>(&'a GiveSlots);
+
+impl GiveSlots {
+    fn new(total: usize) -> Self {
+        // (At least one walk's worth: a smaller total would refuse every give.)
+        Self {
+            free: std::sync::Mutex::new(total.max(GIVE_COST)),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn take(&self, wait: std::time::Duration) -> io::Result<GiveHeld<'_>> {
+        // (A walk that panicked left the count whole, so a poisoned lock is still a good one.)
+        let free = self.free.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut free, timeout) = self
+            .freed
+            .wait_timeout_while(free, wait, |free| *free < GIVE_COST)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if timeout.timed_out() && *free < GIVE_COST {
+            return Err(io::Error::other(format!(
+                "no descriptors to give the volume with after {wait:?}: other starts are giving theirs"
+            )));
+        }
+        *free -= GIVE_COST;
+        Ok(GiveHeld(self))
+    }
+}
+
+impl Drop for GiveHeld<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) += GIVE_COST;
+        self.0.freed.notify_all();
+    }
+}
+
+/// The process's slots: half its soft limit of descriptors, at most 8192 (each walk also keeps a
+/// listing buffer for every directory it is inside), so the rest stays for everything else.
+fn give_slots() -> &'static GiveSlots {
+    static SLOTS: std::sync::OnceLock<GiveSlots> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let soft = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+            .map(|(soft, _)| soft)
+            .unwrap_or(1024);
+        GiveSlots::new(usize::try_from(soft / 2).unwrap_or(usize::MAX).min(8192))
+    })
+}
 
 /// [`give_volume`] for a directory named by path (a volume that is not held, one file of a map).
 fn give_path(dir: &Path, uid: u32, gid: u32) -> io::Result<u32> {
@@ -1917,13 +1981,19 @@ fn give_path(dir: &Path, uid: u32, gid: u32) -> io::Result<u32> {
 }
 
 /// [`give_volume`] for the directory `top` is open on, holding at most [`GIVE_DEEP`] and one
-/// descriptors at once: how many files it did not give (see below).
+/// descriptors at once, out of the process's [`give_slots`]: how many files it did not give (see
+/// below).
 ///
 /// A file with another name too is not given, in this directory or in one outside it (a volume is
 /// one file system, so a link a program made to a file of the node's is one of these): what is
 /// written beside it must not change its owner. The workload may then find such a file not its
 /// own, and the count is what the caller says of it.
 fn give_fd(top: File, uid: u32, gid: u32) -> io::Result<u32> {
+    give_fd_in(give_slots(), GIVE_WAIT, top, uid, gid)
+}
+
+/// [`give_fd`] with its slots and how long it waits for them named.
+fn give_fd_in(slots: &GiveSlots, wait: std::time::Duration, top: File, uid: u32, gid: u32) -> io::Result<u32> {
     use nix::dir::Dir;
     use nix::fcntl::OFlag;
     use nix::sys::stat::{Mode, SFlag, fstatat};
@@ -1974,6 +2044,8 @@ fn give_fd(top: File, uid: u32, gid: u32) -> io::Result<u32> {
     if (has.uid(), has.gid()) == (uid, gid) {
         return Ok(0);
     }
+    // (Taken before the walk opens a directory of its own, given back when it is done.)
+    let _held = slots.take(wait)?;
     let mut skipped = 0;
     walk(Dir::from(top)?, (uid, gid), GIVE_DEEP, &mut skipped)?;
     Ok(skipped)
@@ -3375,8 +3447,8 @@ mod tests {
     }
 
     /// Walks that run at once do not fail one another: each holds its own descriptors, at most one
-    /// for a directory it is inside, and none is counted against another. Sixteen volumes of the
-    /// deepest tree given together, each several times, all succeed.
+    /// for a directory it is inside, and the process's slots make the rest wait. Sixteen volumes
+    /// of the deepest tree given together, each several times, all succeed.
     #[test]
     fn give_nofollow_walks_at_once_do_not_fail_each_other() {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -3418,6 +3490,81 @@ mod tests {
         for walk in 0..WALKS {
             assert_eq!(fs::metadata(dir.join(format!("v{walk}"))).unwrap().gid(), gid);
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// More gives than the slots hold at once all finish, by waiting for one another: with room
+    /// for a single walk, eight of the deepest tree given together are done one after the other.
+    #[test]
+    fn give_nofollow_gives_over_the_slots_wait_and_all_finish() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let Some((uid, _, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-queue-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        const WALKS: usize = 8;
+        for walk in 0..WALKS {
+            fs::create_dir_all(dir.join(format!("v{walk}")).join(vec!["d"; 128].join("/"))).unwrap();
+        }
+        let slots = GiveSlots::new(GIVE_COST);
+        std::thread::scope(|scope| {
+            let walks: Vec<_> = (0..WALKS)
+                .map(|walk| {
+                    let (dir, slots) = (&dir, &slots);
+                    scope.spawn(move || {
+                        let flags = nix::libc::O_DIRECTORY;
+                        let open = fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(flags)
+                            .open(dir.join(format!("v{walk}")))
+                            .unwrap();
+                        give_fd_in(slots, std::time::Duration::from_secs(120), open, uid, other).unwrap();
+                    })
+                })
+                .collect();
+            for walk in walks {
+                walk.join().expect("a give failed instead of waiting");
+            }
+        });
+        for walk in 0..WALKS {
+            let volume = dir.join(format!("v{walk}"));
+            assert_eq!(fs::metadata(&volume).unwrap().gid(), other);
+            assert_eq!(
+                fs::metadata(volume.join(vec!["d"; 128].join("/"))).unwrap().gid(),
+                other
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A give that cannot get its slots within the time it waits fails alone, with a plain error,
+    /// and the slots are whole again when the holder lets go.
+    #[test]
+    fn give_nofollow_a_give_that_waits_too_long_fails_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let short = std::time::Duration::from_millis(100);
+        let slots = GiveSlots::new(GIVE_COST);
+        let held = slots.take(short).unwrap();
+        let said = slots.take(short).err().expect("no slot was free").to_string();
+        assert!(said.contains("no descriptors to give the volume with"), "{said}");
+        // (A total smaller than one walk is made one walk: it never refuses every give.)
+        assert!(GiveSlots::new(1).take(short).is_ok());
+        let Some((uid, _, other)) = second_group() else {
+            drop(held);
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-late-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("a")).unwrap();
+        let open = || fs::OpenOptions::new().read(true).open(&dir).unwrap();
+        let said = give_fd_in(&slots, short, open(), uid, other).unwrap_err().to_string();
+        assert!(said.contains("no descriptors to give the volume with"), "{said}");
+        // (Nothing was given, nothing opened.)
+        assert_ne!(fs::metadata(dir.join("a")).unwrap().gid(), other);
+        drop(held);
+        assert_eq!(give_fd_in(&slots, short, open(), uid, other).unwrap(), 0);
+        assert_eq!(fs::metadata(dir.join("a")).unwrap().gid(), other);
         fs::remove_dir_all(&dir).unwrap();
     }
 
