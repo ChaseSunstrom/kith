@@ -26,6 +26,12 @@ pub static POWER_OFF: AtomicBool = AtomicBool::new(false);
 /// end is a hand-over (keeper.rs `HANDOVER`), not a restart of the machine.
 pub static HANDING_OVER: AtomicBool = AtomicBool::new(false);
 
+/// Whether this kithd's end is a hand-over: the flag is set and no power-off was asked since.
+/// Its stop leaves the units running (controller.rs), and [`end`] exits for the keeper.
+pub fn handing_over() -> bool {
+    HANDING_OVER.load(Ordering::Relaxed) && !POWER_OFF.load(Ordering::Relaxed)
+}
+
 /// Woken when the power button is pressed: to be waited for beside SIGTERM, which it is.
 pub static BUTTON: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
@@ -996,7 +1002,7 @@ pub fn hear_term() {
 pub fn end(failed: bool) -> ! {
     // A kithd-only update (update.rs): the keeper starts the kithd it staged, and nothing is
     // stopped or unmounted: units and the state stay as they are, as at any restart of kithd.
-    if HANDING_OVER.load(Ordering::Relaxed) && !failed && !POWER_OFF.load(Ordering::Relaxed) {
+    if handing_over() && !failed {
         eprintln!("kithd: init: handing over");
         std::process::exit(crate::keeper::HANDOVER);
     }

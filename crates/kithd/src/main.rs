@@ -474,6 +474,8 @@ fn main() -> ExitCode {
         eprintln!("kithd: {msg}");
     }
     if first {
+        // ponytail: a run that fails after a hand-over was begun takes the failure restart with the units
+        // unstopped (`end(true)` is no hand-over): the restart's boot ends them; no special case until seen.
         init::end(done.is_err());
     }
     if done.is_ok() {

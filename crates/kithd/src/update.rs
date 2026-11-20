@@ -1563,7 +1563,11 @@ pub async fn node(
                                 "kithd: kith OS {wanted} differs in kithd alone: handing over to the kithd staged"
                             );
                             // (The keeper counts a kithd that ends sooner than this as a failure.)
-                            tokio::time::sleep(crate::keeper::HANDOVER_AFTER + Duration::from_secs(1)).await;
+                            // (A stop asked for in the wait, the power button or SIGTERM, is that stop's: no hand-over.)
+                            tokio::select! {
+                                _ = tokio::time::sleep(crate::keeper::HANDOVER_AFTER + Duration::from_secs(1)) => {}
+                                _ = stopping.changed() => return,
+                            }
                             // (Set only now: a power-button stop during the wait is not a hand-over.)
                             crate::init::HANDING_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
                             shared.stop.send_replace(true);
