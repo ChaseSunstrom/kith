@@ -35,6 +35,8 @@
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network; then on the mesh with
 #                               a second node that opens no links (of before), each sends to the other's
+#   sh ci/vm.sh --test mesh     two nodes started with no --mesh: the Cluster's spec.mesh turns the mesh on
+#                               with no reinstall; a pod on one reaches a Service whose replica is on the other
 #   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) and media.yml
 #                               (eight, the media stack's shape) imported with kith import compose, applied,
 #                               ready, each asked for by its compose name; KITH_E2E=1 also runs media.yml
@@ -66,6 +68,9 @@
 #                               RoleBinding was deleted is refused where the log is kept; and
 #                               three entries a forging leader appends (bare, a changed body,
 #                               a replayed nonce) are refused at apply by every node
+#   sh ci/vm.sh --test fido2    the client of kithd against a software security key (the fido2-test
+#                               build) through the kernel's uhid and hidraw: the hmac-secret each seed
+#                               says it must be, another seed another secret, a withheld touch timing out
 #   sh ci/vm.sh --test policy   two nodes whose policy turns off exec units, VM paths and /v1/run: kithd
 #                               cut its bounding set, and a pod that is root, a container with no filter
 #                               and a sandbox inside a container still run
@@ -241,6 +246,14 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    no `link` and opens none, as a node of before): a pod on each sends
                    through the Service of a pod on the other, both ways. Needs rustc for
                    x86_64-unknown-linux-musl
+  --test mesh      instead: two nodes on disk files started with no --mesh (as kith OS starts),
+                   the second joined to the first: neither brings a mesh up. The Cluster then
+                   says spec.mesh {enabled: true} and both do, with no restart: kith0 up, an
+                   address in the cluster's /48 on each Node, and a Job in a pod on the first
+                   sends through a Service whose only replica is on the second, every byte
+                   back, reaching kithd at the Service's mesh address. The switch set to
+                   false takes each node's mesh status back. Needs rustc for
+                   x86_64-unknown-linux-musl
   --test compose  instead: one node on the mesh, and on this machine `kith import
                    compose` of ci/compose/stack.yml (four services of the test pod,
                    nothing in it left out) and of ci/compose/media.yml (the eight services
@@ -310,6 +323,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    seconds are printed), and two cards are never heard answering at
                    once, not when the stopped one goes on again; needs socat and
                    python3 as --test chaos does
+  --test fido2     instead: the image of a kithd built with the cargo feature fido2-test
+                   (and a kernel with /dev/uhid), one machine: it makes three software
+                   security keys on uhid in turn and runs the client against each through
+                   hidraw (makeCredential, getAssertion, a known salt). Expected: each
+                   hmac-secret is what its seed says (computed again here in Python), seeds 1
+                   and 2 differ, seed 3's withheld touch is given up on and its given touch
+                   answered; a disk file only, no real key; needs OVMF, socat, python3
   --test access    instead: three nodes as for rollout, and the cluster's admin
                    writing through n2 and n3 by a RoleBinding that is deleted through
                    n1, once while n2 is cut off from the others. Expected: no write
@@ -387,7 +407,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | privilege | nested | nofile | alone | disk | clock) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, privilege, nested, nofile" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | privilege | nested | nofile | alone | disk | clock | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, privilege, nested, nofile, fido2" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1

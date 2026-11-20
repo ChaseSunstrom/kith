@@ -4,6 +4,8 @@
 # variables and functions; not a script to run alone.
     command -v socat >/dev/null 2>&1 || skip "no socat to press keys with"
     command -v openssl >/dev/null 2>&1 || skip "no openssl to call the node with"
+    # (fido2 computes the secrets it expects with python3: asked before the image is built, so it can't skip after.)
+    [ "$test" != fido2 ] || command -v python3 >/dev/null 2>&1 || skip "no python3 to compute the secrets with"
     firmware=''
     for f in /usr/share/edk2-ovmf/x64/OVMF.4m.fd /usr/share/edk2/x64/OVMF.4m.fd /usr/share/OVMF/OVMF.fd /usr/share/ovmf/OVMF.fd; do
         [ -r "$f" ] && { firmware=$f; break; }
@@ -33,7 +35,7 @@
     # folder of its own, so the plain image stays plain.)
     [ "$test" != privilege ] || { KITHD_FEATURES=confine-probe osdir=$root/target/os-probe; export KITHD_FEATURES; }
     sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC"} --out "$osdir" >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = privilege ] || [ "$test" = nested ] || [ "$test" = nofile ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = privilege ] || [ "$test" = nested ] || [ "$test" = nofile ]; then
         . "$root/ci/vm/cluster.sh"
     fi
     if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ] || [ "$test" = blackout ] || [ "$test" = alone ]; then
@@ -91,6 +93,9 @@
     fi
     if [ "$test" = disk ]; then
         . "$root/ci/vm/disk.sh"
+    fi
+    if [ "$test" = fido2 ]; then
+        . "$root/ci/vm/fido2.sh"
     fi
 
     # (The disk is longer than the image written to it, as a real one is: 40 GB, of which

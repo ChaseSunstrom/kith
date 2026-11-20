@@ -76,9 +76,9 @@ if grep -aqE '/v1/forge([^t]|$)|built with forge: ' "$out/kithd"; then
     echo "musl.sh: $out/kithd has the forge route in it: a build that ships has none" >&2
     exit 1
 fi
-# And no software security key: the startup line of a fido2-test build (which names its
-# subcommand) is in nothing else (fido2_test.rs).
-if grep -aq 'built with fido2-test: ' "$out/kithd"; then
+# And no software security key: the startup line of a fido2-test build, the start of each line
+# its VM run prints and the touch file it reads are in nothing else (fido2_test.rs).
+if grep -aqE 'built with fido2-test: |kithd: fido2-test: |/run/fido2-touch' "$out/kithd"; then
     echo "musl.sh: $out/kithd has the fido2-test authenticator in it: a build that ships has none" >&2
     exit 1
 fi

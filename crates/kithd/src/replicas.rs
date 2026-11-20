@@ -252,7 +252,7 @@ pub async fn copy(
     let archived = tokio::task::spawn_blocking(move || {
         let from = crate::root_part::volume(&state, &dir)?;
         let temp = state.join("replicas/.sending");
-        let (hash, _) = crate::backups::archive(&from, &temp)?;
+        let (hash, _) = crate::backups::archive(from.held(), &temp)?;
         // (Read through the open file, which has no name any more: nothing is left behind.)
         let file = std::fs::File::open(temp.join(&hash)).map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(temp.join(&hash));
@@ -370,9 +370,10 @@ async fn sync(
     let placed = tokio::task::spawn_blocking(move || {
         let into = crate::root_part::open(&state, &dir)?;
         let marker = self::marker(&state, &dir);
-        let hash = place(incoming, &temp, &into, cap, |new| {
+        // (The directory is replaced by its name: the path it was taken at.)
+        let hash = place(incoming, &temp, into.real(), cap, |new| {
             let me = shared.members.me();
-            put_in(&shared.store, &dir, me, &new, &into, &marker, aside, |new| {
+            put_in(&shared.store, &dir, me, &new, into.real(), &marker, aside, |new| {
                 crate::backups::remove_unpacked(new);
             })
         })?;
