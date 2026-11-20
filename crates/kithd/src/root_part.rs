@@ -217,8 +217,8 @@ impl Place {
 /// What a request gives back.
 #[derive(Debug)]
 pub enum Reply {
-    /// A Volume's directory, as the root part made it.
-    Path(PathBuf),
+    /// A Volume's directory, as the root part made it and holds it.
+    Dir(crate::volumes::VolumeDir),
     /// `(bytes, files, most files)` of a pod's project, or `None` when it has none.
     Usage(Option<(u64, u64, u64)>),
     /// The bytes an image's removal freed, or `None` when it stayed.
@@ -1545,7 +1545,7 @@ impl<H: Hands> Direct<'_, H> {
             node: String::new(),
             encrypted: volume.encrypted,
         };
-        crate::volumes::host_dir_under(&state, &dir, &self.policy()).map(Reply::Path)
+        crate::volumes::host_dir_under(&state, &dir, &self.policy()).map(Reply::Dir)
     }
 
     fn act(&self, request: Request, files: Vec<File>) -> Result<Reply, String> {
@@ -1703,28 +1703,29 @@ fn asked_of_volumes(state: &Path, request: Request) -> Result<Reply, String> {
     }
 }
 
-fn path_of(state: &Path, request: Request) -> Result<PathBuf, String> {
+fn dir_of(state: &Path, request: Request) -> Result<crate::volumes::VolumeDir, String> {
     match asked_of_volumes(state, request)? {
-        Reply::Path(path) => Ok(path),
+        Reply::Dir(dir) => Ok(dir),
         _ => Err("the root part answered a volume with another reply".into()),
     }
 }
 
 /// The directory of the Volume `dir` on this node, made if it is not there: for what mounts it,
-/// reads it (a backup, a replica's source, a download).
-pub fn volume(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
-    path_of(state, Request::Volume { volume: Place::of(dir) })
+/// reads it (a backup, a replica's source, a download). It derefs to a path through the held
+/// descriptor, so it is read where it was taken: keep it for as long as it is used.
+pub fn volume(state: &Path, dir: &Dir) -> Result<crate::volumes::VolumeDir, String> {
+    dir_of(state, Request::Volume { volume: Place::of(dir) })
 }
 
 /// The directory of the Volume `dir` to write into (an upload, a replica's copy): the files made
 /// take the directory's own owner.
-pub fn open(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
-    path_of(state, Request::Open { volume: Place::of(dir) })
+pub fn open(state: &Path, dir: &Dir) -> Result<crate::volumes::VolumeDir, String> {
+    dir_of(state, Request::Open { volume: Place::of(dir) })
 }
 
 /// The directory of the Volume `dir` a backup is restored into.
-pub fn restore(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
-    path_of(state, Request::Restore { volume: Place::of(dir) })
+pub fn restore(state: &Path, dir: &Dir) -> Result<crate::volumes::VolumeDir, String> {
+    dir_of(state, Request::Restore { volume: Place::of(dir) })
 }
 
 /// The data of the Volume `dir` removed from this node (not there is done).
@@ -3962,10 +3963,10 @@ mod tests {
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
         // A plain one is made beneath the root, and the reply says where.
         for ask in volume_asks(place("shop", "data", "deep/er")) {
-            let Ok(Reply::Path(at)) = root.request(ask) else {
-                panic!("not a path")
+            let Ok(Reply::Dir(at)) = root.request(ask) else {
+                panic!("not a directory")
             };
-            assert_eq!(at, shop.join("deep/er"));
+            assert_eq!(at.real(), shop.join("deep/er"));
         }
         // And one of the node's own is made where the policy has hostPaths.
         let open = Direct::with(Nobody, &book).under(policy("hardened,host-paths"));
@@ -3973,7 +3974,7 @@ mod tests {
         let ask = Request::Volume {
             volume: place("kith-system", "data", own.to_str().unwrap()),
         };
-        assert!(matches!(open.request(ask), Ok(Reply::Path(at)) if at == own));
+        assert!(matches!(open.request(ask), Ok(Reply::Dir(at)) if at.real() == own));
         std::fs::remove_dir_all(&outside).unwrap();
     }
 
@@ -4001,7 +4002,7 @@ mod tests {
         let ask = Request::Volume {
             volume: place("kith-system", "data", &format!("{at}/own")),
         };
-        assert!(matches!(root.request(ask), Ok(Reply::Path(_))));
+        assert!(matches!(root.request(ask), Ok(Reply::Dir(_))));
         std::fs::remove_dir_all(&outside).unwrap();
     }
 
@@ -4101,9 +4102,9 @@ mod tests {
         };
         let state = state.canonicalize().unwrap();
         let own = state.join("volumes/shop/data/in/side");
-        assert_eq!(volume(&state, &dir).unwrap(), own);
-        assert_eq!(open(&state, &dir).unwrap(), own);
-        assert_eq!(restore(&state, &dir).unwrap(), own);
+        assert_eq!(volume(&state, &dir).unwrap().real(), own);
+        assert_eq!(open(&state, &dir).unwrap().real(), own);
+        assert_eq!(restore(&state, &dir).unwrap().real(), own);
         let climbing = Dir {
             path: "../x".into(),
             ..dir.clone()
@@ -4128,7 +4129,7 @@ mod tests {
             let ask = Request::Volume {
                 volume: place("ns", &format!("data{i}"), "x"),
             };
-            assert!(matches!(root.request(ask), Ok(Reply::Path(_))));
+            assert!(matches!(root.request(ask), Ok(Reply::Dir(_))));
         }
         assert_eq!(book.crossed(Kind::Volume), 2);
         assert_eq!(book.total(), 5);
@@ -4161,6 +4162,24 @@ mod tests {
     /// [`serving`], with the serving part's end as a [`Socket`] (twenty seconds to a call).
     fn over_socket<H: Hands, T: Send>(root: &Direct<H>, limits: &Limits, then: impl FnOnce(Socket) -> T + Send) -> T {
         serving(root, limits, move |fd| then(Socket::new(fd, Duration::from_secs(20))))
+    }
+
+    #[test]
+    fn a_volume_directory_crosses_the_socket_with_its_descriptor() {
+        let (book, state) = book("volume-over-socket");
+        let root = Direct::with(Fake::default(), &book);
+        let at = state.canonicalize().unwrap().join("volumes/shop/data");
+        over_socket(&root, &Limits::default(), |socket| {
+            let Ok(Reply::Dir(got)) = socket.request(Request::Volume {
+                volume: place("shop", "data", "deep/er"),
+            }) else {
+                panic!("not a directory")
+            };
+            assert_eq!(got.real(), at.join("deep/er"));
+            // The descriptor that came over the socket is the directory: a file made through it is in it.
+            std::fs::write(got.held().join("made"), "x").unwrap();
+        });
+        assert_eq!(std::fs::read_to_string(at.join("deep/er/made")).unwrap(), "x");
     }
 
     /// A regular file to stand for a unit's output (`/dev/null` is a device node: refused).

@@ -13,6 +13,7 @@ use kith_api::kinds::{VolumeClaimSpec, VolumeSpec};
 use kith_api::{Resource, store::Store};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 /// The one namespace whose volumes may be anywhere on the host: the system's own.
@@ -686,23 +687,60 @@ pub fn served(store: &Store, me: &str) -> Vec<Dir> {
     volumes(store).into_values().filter_map(mine).collect()
 }
 
-/// Make the directory a volume is on this node, and say where it is. In `kith-system` it is the
-/// path as written; anywhere else it is `<state>/volumes/<namespace>/<name>/<path>`.
+/// A directory on this node that a Volume names, held open. Its descriptor is the directory: a
+/// container with the Volume mounted can swap any part of the path it was taken by for a link
+/// after it was taken, and what it names does not move. [`VolumeDir::held`] is `/proc/self/fd/N`,
+/// which names the held directory in this process: a file opened or a directory read through it
+/// goes where it was taken, not where the path now leads. It is not a name for the directory
+/// itself, so a rename or a sibling made beside it takes [`VolumeDir::real`], the path it was
+/// taken at, which is also what another process reads (an NFS export, a mount's source).
+#[derive(Debug)]
+pub struct VolumeDir {
+    fd: OwnedFd,
+    via: PathBuf,
+    real: PathBuf,
+}
+
+impl VolumeDir {
+    /// A held directory and the path it was taken at (the root part's reply, once its descriptor
+    /// came over the socket).
+    pub fn from_parts(fd: OwnedFd, real: PathBuf) -> VolumeDir {
+        let via = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+        VolumeDir { fd, via, real }
+    }
+
+    /// The path it was taken at.
+    pub fn real(&self) -> &Path {
+        &self.real
+    }
+
+    /// The directory's contents, through the held descriptor, in this process only.
+    pub fn held(&self) -> &Path {
+        &self.via
+    }
+
+    /// The descriptor and the path it was taken at, to send to another process.
+    pub fn into_parts(self) -> (OwnedFd, PathBuf) {
+        (self.fd, self.real)
+    }
+}
+
+/// Make the directory a volume is on this node, and hold it. In `kith-system` it is the path as
+/// written; anywhere else it is `<state>/volumes/<namespace>/<name>/<path>`.
 ///
-/// Nothing is made or followed outside that root: each part is made one at a time, one that is
-/// a symbolic link (a container with the volume mounted can make one) or a file is refused, and
-/// the result is checked to be inside the root once more.
-//
-// ponytail: between this check and the container's mount, something that can write the directory
-// could swap a part for a link; the mount follows the final path. A kernel that has openat2
-// with RESOLVE_BENEATH would close it: bind from a file descriptor.
-pub fn host_dir(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
+/// Nothing is made or followed outside that root: the parts are opened beneath it one at a time
+/// by the kernel (`openat2` with `RESOLVE_BENEATH`, no links, no magic links, no other file
+/// system), a part that is a link or a file is refused, and the descriptor is what is returned.
+// ponytail: a `kith-system` Volume's path is the path as written and is walked by name, so a
+// container with it mounted can still swap a part of it for a link; `beneath` from `/` would
+// refuse the operator's own links too. Add when a node's hostPaths Volumes need the same.
+pub fn host_dir(state: &Path, dir: &Dir) -> Result<VolumeDir, String> {
     host_dir_under(state, dir, &crate::policy::get())
 }
 
 /// [`host_dir`], under a node's policy: one that has `hostPaths` off makes and mounts no
 /// directory of the node's own that the store names.
-pub(crate) fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Policy) -> Result<PathBuf, String> {
+pub(crate) fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Policy) -> Result<VolumeDir, String> {
     check_path(&dir.namespace, &dir.path)?;
     let made = |path: &Path, e: std::io::Error| format!("cannot make {}: {e}", path.display());
     if dir.namespace == SYSTEM {
@@ -711,7 +749,8 @@ pub(crate) fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Po
         }
         let path = PathBuf::from(&dir.path);
         std::fs::create_dir_all(&path).map_err(|e| made(&path, e))?;
-        return Ok(path);
+        let fd: OwnedFd = std::fs::File::open(&path).map_err(|e| made(&path, e))?.into();
+        return Ok(VolumeDir::from_parts(fd, path));
     }
     let state = state.canonicalize().map_err(|e| made(state, e))?;
     let root = state.join("volumes").join(&dir.namespace).join(&dir.name);
@@ -727,27 +766,19 @@ pub(crate) fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Po
     if !dir.encrypted && crate::encrypted::made(&state, &dir.namespace, &dir.name) {
         return Err("it was made encrypted and its file is still on this node: say `encrypted: true` again".into());
     }
-    let mut path = state;
-    let inside = ["volumes", &dir.namespace, &dir.name]
-        .into_iter()
-        .chain(dir.path.split('/'));
-    for part in inside {
-        path.push(part);
-        match std::fs::symlink_metadata(&path) {
-            Ok(found) if found.is_symlink() => return Err(format!("{} is a symbolic link", path.display())),
-            Ok(found) if !found.is_dir() => return Err(format!("{} is not a directory", path.display())),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&path).map_err(|e| made(&path, e))?;
-            }
-            Err(e) => return Err(made(&path, e)),
-        }
+    let at = root.join(&dir.path);
+    let inside = format!("volumes/{}/{}/{}", dir.namespace, dir.name, dir.path);
+    let fd = kith_dm_sys::beneath(&state, &inside).map_err(|e| made(&at, e))?;
+    let via = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+    let kind = std::fs::metadata(&via).map_err(|e| made(&at, e))?;
+    if !kind.is_dir() {
+        return Err(format!("{} is not a directory", at.display()));
     }
-    let real = path.canonicalize().map_err(|e| made(&path, e))?;
+    let real = std::fs::read_link(&via).map_err(|e| made(&at, e))?;
     if !real.starts_with(&root) {
         return Err(format!("{} is outside {}", real.display(), root.display()));
     }
-    Ok(real)
+    Ok(VolumeDir::from_parts(fd, real))
 }
 
 #[cfg(test)]
@@ -1221,10 +1252,10 @@ spec: { node: a, path: tiny, size: 1Gi }
             ..dir("default", "data")
         };
         let there = host_dir(&state, &held).unwrap();
-        std::fs::write(there.join("kept"), "x").unwrap();
+        std::fs::write(there.held().join("kept"), "x").unwrap();
         store.delete("Volume/default/db").unwrap();
         let again = host_dir(&state, &held).unwrap();
-        assert_eq!(std::fs::read_to_string(again.join("kept")).unwrap(), "x");
+        assert_eq!(std::fs::read_to_string(again.held().join("kept")).unwrap(), "x");
         let _ = std::fs::remove_dir_all(&state);
     }
 
@@ -1382,14 +1413,15 @@ spec: { node: a, path: tiny, size: 1Gi }
     fn a_namespaces_volume_directory_is_made_under_its_own_root_and_nowhere_else() {
         let state = state("root");
         let made = host_dir(&state, &dir("shop", "db/files")).unwrap();
-        assert_eq!(made, state.join("volumes/shop/data/db/files"));
-        assert!(made.is_dir());
+        assert_eq!(made.real(), state.join("volumes/shop/data/db/files"));
+        assert!(made.held().is_dir());
         // A second time finds it as it is.
-        assert_eq!(host_dir(&state, &dir("shop", "db/files")).unwrap(), made);
-        std::fs::write(made.join("kept"), "x").unwrap();
+        assert_eq!(host_dir(&state, &dir("shop", "db/files")).unwrap().real(), made.real());
+        std::fs::write(made.held().join("kept"), "x").unwrap();
         assert!(
             host_dir(&state, &dir("shop", "db/files"))
                 .unwrap()
+                .held()
                 .join("kept")
                 .exists()
         );
@@ -1409,7 +1441,7 @@ spec: { node: a, path: tiny, size: 1Gi }
         std::fs::create_dir_all(&outside).unwrap();
         // A container with the volume mounted made a link in it that points out of it.
         let root = host_dir(&state, &dir("shop", "base")).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.held().join("link")).unwrap();
         let why = host_dir(&state, &dir("shop", "base/link/sub")).unwrap_err();
         assert!(why.contains("symbolic link"), "{why}");
         assert!(!outside.join("sub").exists(), "nothing was made through the link");
@@ -1417,15 +1449,68 @@ spec: { node: a, path: tiny, size: 1Gi }
         assert!(host_dir(&state, &dir("shop", "base/link")).is_err());
         let file = state.join("file");
         std::fs::write(&file, "x").unwrap();
-        std::os::unix::fs::symlink(&file, root.join("f")).unwrap();
+        std::os::unix::fs::symlink(&file, root.held().join("f")).unwrap();
         assert!(host_dir(&state, &dir("shop", "base/f")).is_err());
         // A plain file where a directory is wanted is refused as well.
-        std::fs::write(root.join("plain"), "x").unwrap();
+        std::fs::write(root.held().join("plain"), "x").unwrap();
         assert!(
             host_dir(&state, &dir("shop", "base/plain/x"))
                 .unwrap_err()
-                .contains("not a directory")
+                .contains("Not a directory")
         );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A container with the Volume mounted swaps the part `sub` of its path for a link to outside
+    /// the root, and back, while `host_dir` takes it. Each directory taken is inside the root, and
+    /// the descriptor it is held by refers to a directory inside the root too: never outside.
+    #[test]
+    fn host_dir_beneath() {
+        let state = state("beneath");
+        let root = state.canonicalize().unwrap().join("volumes/shop/data");
+        let outside = state.join("outside");
+        std::fs::create_dir_all(outside.join("in")).unwrap();
+        let part = root.join("sub");
+        std::fs::create_dir_all(&part).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut taken = 0;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                use std::sync::atomic::Ordering::Relaxed;
+                while !stop.load(Relaxed) {
+                    let _ = std::fs::remove_dir(&part);
+                    let _ = std::os::unix::fs::symlink(&outside, &part);
+                    let _ = std::fs::remove_file(&part);
+                    let _ = std::fs::create_dir(&part);
+                }
+            });
+            for _ in 0..2000 {
+                let Ok(held) = host_dir(&state, &dir("shop", "sub")) else {
+                    continue;
+                };
+                taken += 1;
+                assert!(held.real().starts_with(&root), "{}", held.real().display());
+                // The descriptor's own path: a directory inside the root, whatever was swapped since.
+                let at = std::fs::read_link(held.held()).unwrap();
+                assert!(at.starts_with(&root), "{}", at.display());
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert!(taken > 0, "no directory was taken at all");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A directory is renamed by the path it was taken at. Its `held` path names a link in
+    /// `/proc`, not the directory: a rename by it fails, so a restore or a replica placed by it
+    /// would replace nothing.
+    #[test]
+    fn a_held_directory_is_renamed_by_its_real_path() {
+        let state = state("held-rename");
+        let made = host_dir(&state, &dir("shop", "db")).unwrap();
+        let moved = made.real().with_file_name("moved");
+        assert!(std::fs::rename(made.held(), &moved).is_err());
+        std::fs::rename(made.real(), &moved).unwrap();
+        assert!(moved.is_dir());
         let _ = std::fs::remove_dir_all(&state);
     }
 
@@ -1434,7 +1519,7 @@ spec: { node: a, path: tiny, size: 1Gi }
         let state = state("system");
         let at = state.join("somewhere/else");
         let made = host_dir(&state, &dir(SYSTEM, at.to_str().unwrap())).unwrap();
-        assert_eq!(made, at);
+        assert_eq!(made.real(), at);
         assert!(at.is_dir());
         assert!(
             host_dir(&state, &dir(SYSTEM, "relative"))

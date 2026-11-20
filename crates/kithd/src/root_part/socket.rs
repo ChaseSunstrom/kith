@@ -89,7 +89,9 @@ struct Back {
 #[derive(Serialize, Deserialize)]
 enum Answer {
     Done,
-    Path(PathBuf),
+    /// A Volume's directory as it was taken, with its descriptor beside the message: the path is
+    /// for the peer to read, the descriptor is what it uses.
+    Dir(PathBuf),
     Usage(Option<(u64, u64, u64)>),
     Freed(Option<u64>),
     /// One descriptor beside the message.
@@ -205,11 +207,14 @@ fn reply(answer: Answer, fds: Vec<OwnedFd>) -> Result<Reply, String> {
             Ok([fd]) => Reply::Socket(fd),
             Err(_) => return Err(odd()),
         },
+        Answer::Dir(real) => match <[OwnedFd; 1]>::try_from(fds) {
+            Ok([fd]) => Reply::Dir(crate::volumes::VolumeDir::from_parts(fd, real)),
+            Err(_) => return Err(odd()),
+        },
         Answer::Sockets(n) if n == fds.len() => Reply::Sockets(fds),
         Answer::Sockets(_) => return Err(odd()),
         _ if !fds.is_empty() => return Err(odd()),
         Answer::Done => Reply::Done,
-        Answer::Path(path) => Reply::Path(path),
         Answer::Usage(usage) => Reply::Usage(usage),
         Answer::Freed(freed) => Reply::Freed(freed),
         Answer::Pod(given) => Reply::Pod(given),
@@ -639,7 +644,14 @@ fn unit_or_request<H: Hands>(
             kept: false,
         },
         Ok(Reply::Done) => Out::ok(Answer::Done),
-        Ok(Reply::Path(path)) => Out::ok(Answer::Path(path)),
+        Ok(Reply::Dir(dir)) => {
+            let (fd, real) = dir.into_parts();
+            Out {
+                said: Ok(Answer::Dir(real)),
+                fds: vec![fd],
+                kept: false,
+            }
+        }
         Ok(Reply::Usage(usage)) => Out::ok(Answer::Usage(usage)),
         Ok(Reply::Freed(freed)) => Out::ok(Answer::Freed(freed)),
         Ok(Reply::Pod(given)) => Out::ok(Answer::Pod(given)),

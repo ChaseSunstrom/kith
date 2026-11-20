@@ -412,7 +412,12 @@ Only the newest version is fixed. There are no security releases of older ones.
   which nothing here defends against.
 - **A Volume's archive** (a Backup, an Image, a replica's copy) is read through directory
   handles that are held open: nothing in the volume is reached by a path the workload
-  could point elsewhere meanwhile. When one is unpacked, no entry writes outside the
+  could point elsewhere meanwhile. A Volume's directory is opened beneath its root by
+  openat2 (no link out of it, no `..`), and kithd reads and writes its contents through
+  that held descriptor. A step that replaces the directory (a restore or a replica's new
+  copy, renamed into place), or that must name the path (a container's mount and bind,
+  which runc resolves in its own process, and an NFS export), uses the checked path, and
+  is not closed by this. When one is unpacked, no entry writes outside the
   volume; a restored Backup has no setuid or setgid file (a replica's copy keeps them
   as its volume had them). A restore, a replica's first copy and each sync unpack no more
   than the Volume's `size`, where it says one: the entries are counted as they come, each

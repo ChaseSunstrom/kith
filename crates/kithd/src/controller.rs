@@ -3192,7 +3192,9 @@ async fn start(
         // (Only a shared volume of another node ever gets here: `volumes::mounts`.)
         let host = match mesh.filter(|(_, me)| *me != dir.node) {
             Some((prefix, me)) => crate::share::mount(state, dir, prefix, me).await,
-            None => crate::root_part::volume(state, dir),
+            // (The path it was taken at: the container's mount and its OCI bind name a path, so
+            // the descriptor is not kept past this point.)
+            None => crate::root_part::volume(state, dir).map(|held| held.real().to_path_buf()),
         };
         let host = host.map_err(|e| format!("volume {}: {e}", dir.name))?;
         unit.mounts.push(kith_runtime::Mount {
@@ -4474,7 +4476,7 @@ spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volum
         let state = state.canonicalize().unwrap();
         let dir = crate::volumes::dir(&store, "default", "db").unwrap();
         let root = crate::volumes::host_dir(&state, &dir).unwrap();
-        std::fs::write(root.join("file"), "x").unwrap();
+        std::fs::write(root.held().join("file"), "x").unwrap();
         let data = state.join("volumes/default/db");
         // Not on another node, and not while a unit mounts it.
         let held = |store: &kith_api::store::Store| mounting(&crate::volumes::mounts(store, "a"));
