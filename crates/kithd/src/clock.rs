@@ -11,8 +11,8 @@
 //! cluster port, a node asking another over mutual TLS: a closed network with one clock in
 //! it still has one time), whose time outweighs a server that is over two seconds from it.
 //! The operator's server is followed alone, by any step. Before the clock was ever set (it reads
-//! before `FLOOR_US`) the first answer is enough; after, a network's word alone moves it by an
-//! hour at most, and more takes a second source to agree (see `ask`). While the clock is
+//! before `FLOOR_US`) the first answer is enough; after, a network's word alone moves it by ten
+//! seconds in all (`ONE_SOURCE_US`), and more takes a second source to agree (see `ask`). While the clock is
 //! unset, `/v1/clock` answers 503: a node that reads 1970 is no one's time. What it found is
 //! in this Node's status as `clock`: `{server, offsetMs, delayMs, stepped, checked}`, or
 //! `{error, checked}` where no one answered.
@@ -41,9 +41,10 @@ use std::sync::Arc;
 const STEP_OVER_US: i64 = 2_000_000;
 /// Two sources say the same time when their offsets are this near (see `ask`).
 const AGREE_US: i64 = 1_000_000;
-/// A step of at most an hour may follow one source that is not the operator's (a drifting
-/// clock without a battery is off by seconds in hours); a longer one needs a second.
-const ONE_SOURCE_US: i64 = 3_600_000_000;
+/// What one source that is not the operator's may step a set clock by, all steps together, until
+/// a second source agrees (a clock without a battery drifts by seconds in days; a spoofed
+/// server must not walk it by sub-hour steps, repeated).
+const ONE_SOURCE_US: i64 = 10_000_000;
 /// 2026-01-01: a clock before it was never set (a machine that starts in 1970), one after it
 /// was, and a network's word alone does not move it by years. Stale in time, never wrong.
 const FLOOR_US: i64 = 1_767_225_600_000_000;
@@ -330,10 +331,12 @@ fn nothing(why: &str, at: i64) -> Value {
 /// - the leader's (a member's, over the cluster's mutual TLS) when a server is over two seconds
 ///   from it, and when no server answered;
 /// - else the first server's. Time from a network is unsigned: once the clock was set (`synced`:
-///   by a check, or before kithd started), a step of over an hour takes a second source (another
-///   server, or the leader) within a second of the same time, and is otherwise said in the status
-///   and not followed. A step of less follows one source; so does any of the server the operator
-///   `told` (that is the operator's word). Before the clock was ever set, the first server answers.
+///   by a check, or before kithd started), one source alone may step it only within a budget
+///   (`ONE_SOURCE_US`, all its steps together, `spent` of it used since a step a second source
+///   agreed with, or the leader or the operator's server made); past that a second source (another
+///   server, or the leader) within a second of the same time is needed, and otherwise it is said
+///   in the status and not followed. The server the operator `told` is followed alone (that is
+///   the operator's word). Before the clock was ever set, the first server answers.
 async fn ask(
     servers: &[SocketAddr],
     wait: Duration,
@@ -341,6 +344,7 @@ async fn ask(
     set_to: impl Fn(i64) -> std::io::Result<()>,
     synced: bool,
     told: bool,
+    spent: &mut i64,
 ) -> Value {
     let (mut found, mut why) = (Vec::new(), Vec::new());
     for server in servers {
@@ -376,15 +380,21 @@ async fn ask(
         .map(|(_, s)| s)
         .chain(leader.iter().map(|(_, s)| s))
         .any(|s| (s.offset_us - sample.offset_us).abs() <= AGREE_US);
-    let step = if sample.offset_us.abs() <= STEP_OVER_US {
+    let off = sample.offset_us.abs();
+    let corroborated = !synced || trusted || told || agrees;
+    let step = if off <= STEP_OVER_US {
         None
-    } else if synced && !trusted && !told && sample.offset_us.abs() > ONE_SOURCE_US && !agrees {
+    } else if !corroborated && *spent + off > ONE_SOURCE_US {
         Some(Err(format!(
             "{server} says the clock is {:+.1} s off and no second source agrees",
             sample.offset_us as f64 / 1e6
         )))
     } else {
-        Some(set_to(now_us() + sample.offset_us).map_err(|e| e.to_string()))
+        let done = set_to(now_us() + sample.offset_us).map_err(|e| e.to_string());
+        if done.is_ok() {
+            *spent = if corroborated { 0 } else { *spent + off };
+        }
+        Some(done)
     };
     render(&server, sample, step.as_ref(), now_us())
 }
@@ -402,6 +412,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         let _ = tokio::time::timeout(Duration::from_secs(10), LEARNED.notified()).await;
         let mut said = String::new();
         let mut synced = now_us() > FLOOR_US;
+        let mut spent = 0;
         UNSET.store(!synced, Ordering::Relaxed);
         loop {
             let (servers, told) = {
@@ -411,7 +422,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                     sources.told.is_some(),
                 )
             };
-            let now = ask(&servers, WAIT, leader_time(&shared), set, synced, told).await;
+            let now = ask(&servers, WAIT, leader_time(&shared), set, synced, told, &mut spent).await;
             if now["error"].is_null() && now["server"].is_string() {
                 synced = true;
                 UNSET.store(false, Ordering::Relaxed);
@@ -498,6 +509,18 @@ mod tests {
     }
 
     const SOON: Duration = Duration::from_millis(400);
+
+    /// `super::ask` with a budget of one source's steps that nothing has used.
+    async fn ask(
+        servers: &[SocketAddr],
+        wait: Duration,
+        leader: impl Future<Output = Result<Sample, String>>,
+        set_to: impl Fn(i64) -> std::io::Result<()>,
+        synced: bool,
+        told: bool,
+    ) -> Value {
+        super::ask(servers, wait, leader, set_to, synced, told, &mut 0).await
+    }
 
     #[test]
     fn clock_time_stamps_go_both_ways_and_across_eras() {
@@ -736,11 +759,11 @@ mod tests {
     /// `ask` once the clock has been set, with servers at these skews and a leader at `leader`
     /// (microseconds ahead; none: not in a cluster): what it stepped to (the offset), and the status.
     async fn after_first_sync(skews: &[i64], leader: Option<i64>) -> (Option<i64>, Value) {
-        after_sync(skews, leader, false).await
+        after_sync(skews, leader, false, &mut 0).await
     }
 
     /// The same, with the server the operator `told` (or not).
-    async fn after_sync(skews: &[i64], leader: Option<i64>, told: bool) -> (Option<i64>, Value) {
+    async fn after_sync(skews: &[i64], leader: Option<i64>, told: bool, spent: &mut i64) -> (Option<i64>, Value) {
         let set_to = std::cell::Cell::new(None);
         let record = |us: i64| {
             set_to.set(Some(us));
@@ -759,7 +782,7 @@ mod tests {
                 .ok_or("not in a cluster".to_string())
         };
         let before = now_us();
-        let said = ask(&servers, SOON, leader, record, true, told).await;
+        let said = super::ask(&servers, SOON, leader, record, true, told, spent).await;
         (set_to.get().map(|to| to - before), said)
     }
 
@@ -807,19 +830,49 @@ mod tests {
     async fn clock_the_server_told_is_followed_alone_the_others_to_an_hour() {
         const HOUR: i64 = 3_600_000_000;
         // The operator's server is the operator's word: five seconds, and eight hours, are stepped.
-        let (to, _) = after_sync(&[5_000_000], None, true).await;
+        let (to, _) = after_sync(&[5_000_000], None, true, &mut 0).await;
         assert!(to.is_some());
-        let (to, said) = after_sync(&[8 * HOUR], None, true).await;
+        let (to, said) = after_sync(&[8 * HOUR], None, true, &mut 0).await;
         assert!(to.is_some_and(|to| (to - 8 * HOUR).abs() < 200_000), "{to:?} {said}");
         // The network's: five seconds alone is followed; two hours alone is not.
-        let (to, _) = after_sync(&[5_000_000], None, false).await;
+        let (to, _) = after_sync(&[5_000_000], None, false, &mut 0).await;
         assert!(to.is_some());
-        let (to, said) = after_sync(&[2 * HOUR], None, false).await;
+        let (to, said) = after_sync(&[2 * HOUR], None, false, &mut 0).await;
         assert_eq!(to, None);
         assert!(
             said["error"].as_str().unwrap().contains("no second source agrees"),
             "{said}"
         );
+    }
+
+    #[tokio::test]
+    async fn clock_one_source_cannot_walk_the_clock_by_steps_that_are_each_small() {
+        const HALF_HOUR: i64 = 1_800_000_000;
+        // Thirty minutes, again and again, from a source nothing agrees with: the budget is
+        // over at the first (it is more than all of it), and stays over.
+        let mut spent = 0;
+        for _ in 0..3 {
+            let (to, said) = after_sync(&[HALF_HOUR], None, false, &mut spent).await;
+            assert_eq!(to, None);
+            assert!(
+                said["error"].as_str().unwrap().contains("no second source agrees"),
+                "{said}"
+            );
+        }
+        // Steps inside the budget are followed until it is spent: 4 s, 4 s, then 4 s is refused.
+        let mut spent = 0;
+        let steps = [4_000_000; 3];
+        let mut stepped = Vec::new();
+        for step in steps {
+            stepped.push(after_sync(&[step], None, false, &mut spent).await.0.is_some());
+        }
+        assert_eq!(stepped, [true, true, false]);
+        // A second source that agrees steps it, and gives the budget back.
+        let (to, _) = after_sync(&[4_000_000, 4_200_000], None, false, &mut spent).await;
+        assert!(to.is_some());
+        assert_eq!(spent, 0);
+        let (to, _) = after_sync(&[4_000_000], None, false, &mut spent).await;
+        assert!(to.is_some());
     }
 
     #[test]

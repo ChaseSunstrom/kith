@@ -23,8 +23,8 @@ As process 1, kithd:
   is asked too, over the cluster's own TLS, and its time wins over a server over two seconds
   from it. The server you name is followed alone, whatever the step. Before the clock was ever
   set (it reads before 2026) the first answer is enough; after that a network's word alone moves
-  it by an hour at most, and more needs a second source within a second of the same time, or it
-  is left and the status says so. A node whose clock is not yet set answers its peers' time
+  it by ten seconds in all (its steps together, until a second source agrees), and more needs a
+  second source within a second of the same time, or it is left and the status says so. A node whose clock is not yet set answers its peers' time
   question with a 503. Each Node's status says its `clock`: the server, the offset and whether it
   stepped it. A node under the `hardened` policy does not set its clock: its status says the
   offset and the refusal;
