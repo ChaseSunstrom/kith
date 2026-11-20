@@ -1222,7 +1222,8 @@ pub mod hmac {
             self.encrypt_with(&iv, plain)
         }
 
-        /// [`Keys::encrypt`] with the IV given (protocol 1 has no IV to give: it uses zeros).
+        /// [`Keys::encrypt`] with the IV given. Protocol 1 has no IV on the wire and IGNORES `iv`
+        /// (it uses zeros), so only protocol 2's vectors can pin one.
         pub(crate) fn encrypt_with(&self, iv: &[u8; cbc::BLOCK], plain: &[u8]) -> Result<Vec<u8>, String> {
             match self.protocol {
                 Protocol::One => cbc::run(&self.aes, &[0; cbc::BLOCK], plain, true),
@@ -1323,16 +1324,20 @@ pub mod hmac {
         }
 
         /// The `hmac-secret` input of getAssertion for `salt`: our key (1), the salt
-        /// encrypted (2), its authentication (3) and the protocol (4).
+        /// encrypted (2), its authentication (3) and, for protocol 2 only, the protocol (4):
+        /// absent means 1 in CTAP, and a key that lists only 1 may refuse a key it does not know.
         pub fn request(&self, salt: &[u8; SALT]) -> Result<Value, String> {
             let enc = self.keys.encrypt(salt)?;
             let auth = self.keys.authenticate(&enc);
-            Ok(Value::Map(vec![
+            let mut map = vec![
                 (uint(1), self.key.clone()),
                 (uint(2), Value::Bytes(enc)),
                 (uint(3), Value::Bytes(auth)),
-                (uint(4), uint(self.keys.protocol.number())),
-            ]))
+            ];
+            if self.keys.protocol == Protocol::Two {
+                map.push((uint(4), uint(self.keys.protocol.number())));
+            }
+            Ok(Value::Map(map))
         }
 
         /// The secret out of the encrypted answer in the assertion's extensions.
@@ -1444,10 +1449,12 @@ pub mod hmac {
                         [..auth_len]
                 );
                 assert_eq!(req.get(&uint(1)), Some(&s.key));
+                // protocol 2 names itself; protocol 1 is the default and sends no key 4
+                let named = (protocol == Protocol::Two).then(|| uint(2));
                 assert_eq!(
                     req.get(&uint(4)),
-                    Some(&uint(protocol.number())),
-                    "the protocol travels"
+                    named.as_ref(),
+                    "{protocol:?}: the protocol travels as 2 or not at all"
                 );
                 // the answer is the secret, encrypted the same way, and comes back as it was
                 let secret = [0x77u8; 32];
@@ -1652,7 +1659,7 @@ mod choose {
         (key, cid)
     }
 
-    /// What a request's `pinUvAuthProtocol` said: clientPIN's (1), then hmac-secret's (4).
+    /// What a request's `pinUvAuthProtocol` said: clientPIN's (1), then hmac-secret's (4, if any).
     fn spoken(key: &Key) -> (Option<Value>, Option<Value>) {
         let pin = key
             .seen
@@ -1676,7 +1683,9 @@ mod choose {
             let salt = [0x42; 32];
             let secret = flow::get_assertion(&mut key, cid, "kith.local", &id, &salt).unwrap();
             assert_eq!(secret[..], key.expected(&id, &salt)[..], "{listed:?}");
-            assert_eq!(spoken(&key), (Some(uint(spoke)), Some(uint(spoke))), "{listed:?}");
+            // clientPIN names the protocol always; hmac-secret only for 2 (absent is 1)
+            let ext = (spoke == 2).then(|| uint(2));
+            assert_eq!(spoken(&key), (Some(uint(spoke)), ext), "{listed:?}");
         }
     }
 

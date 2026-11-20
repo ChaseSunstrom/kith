@@ -62,11 +62,12 @@ and `getAssertion` with `hmac-secret` at the console. Re-checked against what th
   HMAC-SHA-256 as the salt's authentication. ring has HKDF, so no crate was added. The client
   reads getInfo's `pinUvAuthProtocols` and takes protocol 2 if it is listed, else 1; a key
   that lists neither is refused with a message naming `pinUvAuthProtocols`. The chosen protocol
-  goes in the getKeyAgreement request and, as key 4, in the `hmac-secret` input. The vectors are
+  goes in the getKeyAgreement request and, for protocol 2 only, as key 4 in the `hmac-secret`
+  input (absent means 1 in CTAP, and a key that lists only 1 may refuse a key it does not know). The vectors are
   RFC 5869 for HKDF, NIST for the CBC loop, and, for the CTAP2.1 layout, numbers computed outside
   Rust; the specification publishes no ECDH or whole-exchange vectors, so **a trial against one
   real key stays a manual step by the owner: no task runs it.** That includes whether a key
-  takes key 4 on a protocol 1 request (it is sent so, as the specification's default is 1).
+  that lists both protocols takes protocol 2 as built.
 - **A key that already has a PIN set is probably not enrolled by v1.** v1 asks for a touch
   (user presence) only; a key with a PIN set answers `makeCredential` without `pinUvAuth` with
   `PIN_REQUIRED` (unverified: no real key was touched). Either the enrolment uses `pinUvAuth`
@@ -241,8 +242,9 @@ says so in those words; either way it has a test on a node with no cluster.
 
 ## 5. kithd's size against the budget
 
-`KITHD_SIZE = 13.20` (`ci/budgets.py:48`), in MiB: `MB = 1024 * 1024` (`ci/budgets.py:31`) and the
-limit is `int(KITHD_SIZE * MB)` (`ci/budgets.py:61`), so 13,841,203 bytes. `docs/numbers.json` rounds to 12 against 13 (`kithd.size`,
+`KITHD_SIZE = 13.40` (`ci/budgets.py:51`; it was 13.20 when this record was written, and was raised
+for a train of features), in MiB: `MB = 1024 * 1024` (`ci/budgets.py:31`) and the
+limit is `int(KITHD_SIZE * MB)` (`ci/budgets.py:64`), so 14,050,918 bytes. `docs/numbers.json` rounds to 12 against 13 (`kithd.size`,
 `kithd.size.budget`) and cannot say more. The size on main when this was written is about
 **13.17 MiB** (the figure the brief for this record gives; `ci/budgets.py` was not run here), so
 the **headroom is about 0.03 MiB, 30 kB**.

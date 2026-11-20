@@ -217,6 +217,13 @@ pub mod auth {
                     if public.len() != 65 {
                         return Err(0x7f);
                     }
+                    // (the VM test reads which protocol each key served: ci/vm/fido2.sh)
+                    #[cfg(feature = "fido2-test")]
+                    eprintln!(
+                        "kithd: fido2-test: key {} served pinUvAuthProtocol {}",
+                        self.seed,
+                        protocol.number()
+                    );
                     self.agreement = Some((protocol, k));
                     Ok(Value::Map(vec![(u(1), hmac::cose(&public[1..33], &public[33..]))]))
                 }
@@ -976,8 +983,8 @@ fn plug(seed: u8, touch: bool) -> Result<hidraw::Hidraw, String> {
     std::thread::spawn(move || {
         let mut key = auth::Key::new();
         key.seed = seed;
-        // seed 1 lists PIN/UV protocol 1 only, seed 2 protocol 2 only, the rest both (so 2 is
-        // chosen): a key refuses a protocol it does not list, so a secret got is proof of it
+        // seed 1 lists PIN/UV protocol 1 only, seed 2 protocol 2 only, the rest both (the client
+        // takes 2, and the key says it served 2): a key refuses a protocol it does not list
         key.protocols = match seed {
             1 => vec![1],
             2 => vec![2],

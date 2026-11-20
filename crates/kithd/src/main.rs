@@ -28,7 +28,7 @@ mod encrypted;
 mod exits;
 #[allow(
     dead_code,
-    reason = "the CTAP2 client's wire half (T-0966): nothing calls it until the record slice (docs/adr-fido2.md section 6); its tests run"
+    reason = "the CTAP2 client's wire half (T-0966): crypt.rs calls get_assertion; the rest of the client that nothing calls yet waits for the rest of docs/adr-fido2.md section 6"
 )]
 mod fido2;
 // A software security key: in unit tests and in the `fido2-test` build, in no release

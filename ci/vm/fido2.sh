@@ -61,6 +61,11 @@ print(hmac.new(random, bytes(range(32)), hashlib.sha256).hexdigest())' "$1" "$2"
     said_clean 'kithd: fido2-test: key 1 lists pinUvAuthProtocols \[1\]$' || fail "key 1 did not list protocol 1 alone"
     said_clean 'kithd: fido2-test: key 2 lists pinUvAuthProtocols \[2\]$' || fail "key 2 did not list protocol 2 alone"
     said_clean 'kithd: fido2-test: key 3 lists pinUvAuthProtocols \[1, 2\]$' || fail "key 3 did not list both protocols"
+    # What each key served (its clientPIN getKeyAgreement): the client takes 2 whenever it is listed.
+    said_clean 'kithd: fido2-test: key 1 served pinUvAuthProtocol 1$' || fail "key 1 did not serve protocol 1"
+    said_clean 'kithd: fido2-test: key 2 served pinUvAuthProtocol 2$' || fail "key 2 did not serve protocol 2"
+    said_clean 'kithd: fido2-test: key 3 served pinUvAuthProtocol 2$' || fail "key 3 (lists both) did not serve protocol 2"
+    ! said_clean 'kithd: fido2-test: key 3 served pinUvAuthProtocol 1$' || fail "key 3 (lists both) served protocol 1: the client did not take 2"
     # Seed 3: the withheld touch was given up on, before the credential that came with the touch.
     log=$(cat "$work/clean")
     gave=$(printf '%s\n' "$log" | grep -an 'kithd: fido2-test: key 3: touch withheld: gave up' | head -n 1 | cut -d: -f1)
