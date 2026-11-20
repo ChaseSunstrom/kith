@@ -278,8 +278,19 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
                     "people",
                     "peopleNotes",
                     "alone",
+                    "shares",
                 ],
             )?;
+            // (The Shares it serves over NFS, by name: for the leader to say a Share is served.)
+            if let Some(shares) = fields.get("shares") {
+                let names = shares.as_array().filter(|names| names.len() <= 256);
+                if !shares.is_null()
+                    && !names
+                        .is_some_and(|names| names.iter().all(|name| name.as_str().is_some_and(|n| n.len() <= 253)))
+                {
+                    return Err(refused(key, "`shares` is null or up to 256 names"));
+                }
+            }
             if let Some(people) = fields.get("people") {
                 people_shape(key, people)?;
             }
@@ -379,11 +390,20 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
             }
         }
         "Volume" => {
-            only(key, fields, &["synced"])?;
+            // (`synced-NODE` is the node's own time, written alone so two replicas never overwrite
+            // each other's; `synced` is the whole object an older kithd wrote.)
+            let own = format!("{}{node}", crate::replicas::SYNCED);
+            only(key, fields, &["synced", own.as_str()])?;
             let status = live.status.as_ref();
             let replica = status.and_then(|status| status["replicas"].as_array());
             if !replica.is_some_and(|replicas| replicas.iter().any(|replica| replica == node)) {
                 return Err(refused(key, "this node is no replica of it"));
+            }
+            if let Some(at) = fields.get(&own) {
+                return match at.is_u64() && fields.len() == 1 {
+                    true => Ok(()),
+                    false => Err(refused(key, "a replica's `synced-NODE` is a time, written alone")),
+                };
             }
             let empty = Map::new();
             let was = status.and_then(|status| status["synced"].as_object()).unwrap_or(&empty);
@@ -913,6 +933,31 @@ spec: { volume: there, every: 1d }
         }
         // Another node's status is not its own to say.
         assert!(try_as(&store, "w-b", patch_of("Node/w", json!({ "alone": ran }))).is_err());
+    }
+
+    /// A worker says which Shares it serves over NFS in its own Node: names, or null.
+    #[test]
+    fn a_worker_says_which_shares_it_serves_as_names() {
+        let store = store();
+        for ok in [json!(["default/films"]), json!([]), json!(null)] {
+            assert!(try_as(&store, "w", patch_of("Node/w", json!({ "shares": ok }))).is_ok());
+        }
+        for bad in [
+            json!("default/films"),
+            json!([1]),
+            json!({ "a": 1 }),
+            json!(["x".repeat(300)]),
+        ] {
+            assert!(try_as(&store, "w", patch_of("Node/w", json!({ "shares": bad }))).is_err());
+        }
+        assert!(
+            try_as(
+                &store,
+                "w-b",
+                patch_of("Node/w", json!({ "shares": ["default/films"] }))
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1683,6 +1728,12 @@ spec: { volume: there, every: 1d }
             )
             .is_err()
         );
+        // The same, as the node's own field: a time, alone, and its own.
+        assert!(try_as(&store, "w", patch_of(kept, json!({ "synced-w": 200 }))).is_ok());
+        assert!(try_as(&store, "w", patch_of(kept, json!({ "synced-w": "late" }))).is_err());
+        assert!(try_as(&store, "w", patch_of(kept, json!({ "synced-a": 900 }))).is_err());
+        assert!(try_as(&store, "w", patch_of(kept, json!({ "synced-w": 200, "primary": "w" }))).is_err());
+        assert!(try_as(&store, "w-b", patch_of(kept, json!({ "synced-w-b": 200 }))).is_err());
     }
 
     #[test]

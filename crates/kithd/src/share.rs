@@ -34,7 +34,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// NFS's port, on the mesh address.
 pub const PORT: u16 = 2049;
@@ -298,22 +298,34 @@ pub async fn mount(state: &Path, dir: &Dir, prefix: Ipv6Addr, me: &str) -> Resul
     match mounted(&mountinfo, &at).iter().rfind(|(found, _)| *found == at) {
         Some((_, found)) if *found == quote(&from) => return Ok(target),
         // (Its Volume was given another path: what is mounted is not it any more.)
-        Some(_) => {
-            nix::mount::umount2(&target, MntFlags::MNT_DETACH).map_err(|e| format!("unmounting what was there: {e}"))?
-        }
+        Some(_) => detach(target.clone())
+            .await
+            .map_err(|e| format!("unmounting what was there: {e}"))?,
         None => {}
     }
     std::fs::create_dir_all(&target).map_err(|e| format!("cannot make {}: {e}", target.display()))?;
     // The mount itself waits minutes for a server that is not there, and nothing here may:
-    // ask first, briefly.
+    // ask first, briefly, and once for the node whatever number of units start (a node that
+    // does not answer costs the two seconds once a round, not once a unit).
     let away = || {
         format!(
             "node {} does not serve it (no answer on its mesh address, port {PORT}): is it up, and is the volume `shared`?",
             dir.node
         )
     };
-    let asked = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect((server, PORT))).await;
-    asked.map_err(|_| away())?.map_err(|_| away())?;
+    let up = match PROBES.recall(server, Instant::now()) {
+        Some(up) => up,
+        None => {
+            let asked =
+                tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect((server, PORT))).await;
+            let up = matches!(asked, Ok(Ok(_)));
+            PROBES.note(server, Instant::now(), up);
+            up
+        }
+    };
+    if !up {
+        return Err(away());
+    }
     let mounting = {
         let target = target.clone();
         move || {
@@ -339,7 +351,7 @@ pub async fn mount(state: &Path, dir: &Dir, prefix: Ipv6Addr, me: &str) -> Resul
 /// Unmount the other nodes' volumes that nothing here mounts any more: every mount under
 /// `<state>/remote` that is not for one of `used`. (What still has files open in one keeps it
 /// until it is done; nothing waits for a server that is away.)
-pub fn release(state: &Path, used: &[&Dir]) {
+pub async fn release(state: &Path, used: &[&Dir]) {
     let Ok(state) = state.canonicalize() else { return };
     let (remote, mountinfo) = (state.join("remote"), std::fs::read_to_string("/proc/self/mountinfo"));
     let (true, Some(under), Ok(mountinfo)) = (remote.exists(), remote.to_str(), mountinfo) else {
@@ -351,11 +363,49 @@ pub fn release(state: &Path, used: &[&Dir]) {
         .collect();
     for (at, _) in mounted(&mountinfo, &quote(under)) {
         if let (false, Some(path)) = (used.iter().any(|used| used == at), unquote(at)) {
-            match nix::mount::umount2(path.as_str(), MntFlags::MNT_DETACH) {
+            match detach(PathBuf::from(&path)).await {
                 Ok(()) => eprintln!("kithd: unmounted {path}: nothing here mounts it"),
                 Err(e) => eprintln!("kithd: cannot unmount {path}: {e}"),
             }
         }
+    }
+}
+
+/// Lazily unmount `path`, off the async thread: the call can wait on the kernel for as long as
+/// the file system's server is away.
+async fn detach(path: PathBuf) -> Result<(), String> {
+    off_thread(move || nix::mount::umount2(&path, MntFlags::MNT_DETACH).map_err(|e| e.to_string())).await
+}
+
+/// Run `work` on a thread tokio keeps for what may block, and wait for it.
+async fn off_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(work)
+        .await
+        .expect("work that blocks does not panic")
+}
+
+/// How long what a probe of a node found is believed: a bit under a scheduler round, so each
+/// round asks once for each node and the next asks again.
+const PROBED_FOR: Duration = Duration::from_secs(5);
+
+/// Which nodes answered the last probe of their NFS port, and when.
+struct Probes(Mutex<BTreeMap<Ipv6Addr, (Instant, bool)>>);
+
+static PROBES: Probes = Probes(Mutex::new(BTreeMap::new()));
+
+impl Probes {
+    /// What the probe of `server` found, if one was made within [`PROBED_FOR`] of `now`.
+    fn recall(&self, server: Ipv6Addr, now: Instant) -> Option<bool> {
+        let found = self.0.lock().expect("nothing panics holding the probes");
+        let (at, up) = found.get(&server)?;
+        (now.saturating_duration_since(*at) < PROBED_FOR).then_some(*up)
+    }
+
+    fn note(&self, server: Ipv6Addr, now: Instant, up: bool) {
+        let mut found = self.0.lock().expect("nothing panics holding the probes");
+        // (Those too old to be believed are forgotten: nodes come and go.)
+        found.retain(|_, (at, _)| now.saturating_duration_since(*at) < PROBED_FOR);
+        found.insert(server, (now, up));
     }
 }
 
@@ -381,8 +431,9 @@ fn start(address: Ipv6Addr) -> Result<(), String> {
     let control = Path::new("/proc/fs/nfsd");
     let tell = |name: &str, text: &str| std::fs::write(control.join(name), text).map_err(|e| format!("{name}: {e}"));
     let listening = std::fs::read_to_string(control.join("portlist")).unwrap_or_default();
-    // (All but the threads cannot be said twice: an earlier try may have got that far.)
-    if !listening.lines().any(|line| line.starts_with("ipv6 ")) {
+    // (All but the threads cannot be said twice: an earlier try may have got that far. The
+    // kernel lists a listener as `tcp 2049`, whatever its address: any line is one.)
+    if listening.trim().is_empty() {
         tell("versions", "-3 +4 -4.0 -4.1 +4.2\n")?;
         tell("nfsv4leasetime", "30\n")?;
         tell("nfsv4gracetime", "30\n")?;
@@ -394,16 +445,42 @@ fn start(address: Ipv6Addr) -> Result<(), String> {
 
 /// Have the kernel's server listen on `address` too (a socket bound here and handed over).
 fn listen(address: IpAddr) -> Result<(), String> {
+    let given = listen_at(address, PORT, |listener| {
+        std::fs::write("/proc/fs/nfsd/portlist", format!("{}\n", listener.as_raw_fd()))
+            .map_err(|e| format!("portlist: {e}"))
+    });
+    // (Where the port is held, and the server is the one kithd started, the port is held by
+    // that server: kithd's last start made this listener, and a restart does not unmake it.)
+    let held = std::fs::read_to_string("/proc/fs/nfsd/portlist").is_ok_and(|ports| !ports.trim().is_empty());
+    match given {
+        Err(e) if held && in_use(&e) => Ok(()),
+        given => given,
+    }
+}
+
+/// Whether a bind's error is EADDRINUSE (98 on Linux), whatever the C library calls it
+/// (musl says "Address in use", glibc "Address already in use").
+fn in_use(error: &str) -> bool {
+    error.contains("(os error 98)")
+}
+
+/// Bind `address` and `port` and hand the socket to `give`. The socket is closed when `give`
+/// returns (the kernel has its own hold on one it was given), so a bind after that finds
+/// nothing of this process's holding the port.
+fn listen_at(
+    address: IpAddr,
+    port: u16,
+    give: impl FnOnce(std::os::fd::OwnedFd) -> Result<(), String>,
+) -> Result<(), String> {
     let listener = Direct::new().request(Request::Bind {
         address,
-        port: PORT,
+        port,
         proto: Proto::Tcp,
     })?;
     let Reply::Socket(listener) = listener else {
         return Err("the root part answered a bind with something else".into());
     };
-    let told = std::fs::write("/proc/fs/nfsd/portlist", format!("{}\n", listener.as_raw_fd()));
-    told.map_err(|e| format!("portlist: {e}"))
+    give(listener)
 }
 
 /// The Shares of volumes on `me` that name NFS clients: each one's name, its volume, and what
@@ -469,7 +546,17 @@ pub fn writes(store: &Store) -> Vec<(String, Option<Value>)> {
                 json!({ "message": "it is given to nobody: name `nfs.clients` or `users`" })
             }
             (Some(dir), None) => {
-                json!({ "node": dir.node, "path": format!("/{}/{}/{}", dir.namespace, dir.name, dir.path) })
+                let mut said =
+                    json!({ "node": dir.node, "path": format!("/{}/{}/{}", dir.namespace, dir.name, dir.path) });
+                // Whether that node serves it over NFS, as the node itself says (`status.shares`
+                // of its Node; false until it has said so, as when it is down).
+                if names {
+                    let name = format!("{namespace}/{}", share.metadata.name);
+                    let node = store.get(&format!("Node/{}", dir.node));
+                    let serving = node.and_then(|node| node.status.as_ref()?["shares"].as_array());
+                    said["served"] = json!(serving.is_some_and(|names| names.iter().any(|served| *served == name)));
+                }
+                said
             }
         };
         if share.status.as_ref() != Some(&status) {
@@ -537,6 +624,40 @@ fn answer(table: Arc<Mutex<Table>>) -> Result<(), String> {
     spawned.map(drop).map_err(|e| e.to_string())
 }
 
+/// What a node says in its own Node's status of the Shares it serves over NFS: their names
+/// (`NAMESPACE/NAME`), or null for none.
+fn shares_said(names: &[String]) -> Value {
+    match names.is_empty() {
+        true => Value::Null,
+        false => json!(names),
+    }
+}
+
+/// Say in this node's own Node what it serves (`status.shares`), where that is not what the
+/// Node says already. The leader tells a Share's reader from it. `told` is what was last
+/// sent that the store did not show yet (or refused): not sent again until what is served
+/// changes.
+async fn report(shared: &Arc<crate::Shared>, me: &str, names: &[String], told: &mut Option<Vec<String>>) {
+    let (key, want) = (format!("Node/{me}"), shares_said(names));
+    let differs = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let said = |node: &kith_api::Resource| node.status.as_ref().map_or(Value::Null, |s| s["shares"].clone());
+        state.store.get(&key).map(|node| said(node) != want)
+    };
+    if differs != Some(true) {
+        *told = None;
+        return;
+    }
+    if told.as_deref() == Some(names) {
+        return;
+    }
+    *told = Some(names.to_vec());
+    let statuses = vec![(key, serde_json::Map::from_iter([("shares".to_string(), want)]))];
+    if let Err(e) = shared.submit(kith_store::Command::Patch { statuses }).await {
+        eprintln!("kithd: shared volumes: saying which Shares this node serves: {e}");
+    }
+}
+
 /// Serve this node's shared volumes to the cluster's other nodes, until stopped: nothing is
 /// started while it has none.
 pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio::sync::watch::Receiver<bool>) {
@@ -544,6 +665,9 @@ pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio
     let (me, prefix) = (cluster.me.name.as_str(), crate::mesh::prefix(&cluster.me.ca));
     let table = Arc::new(Mutex::new(Table::default()));
     let (mut answering, mut said) = (false, String::new());
+    // Whether the kernel's server was handed a socket for every IPv4 address (once is enough:
+    // it keeps it), and what this node last told its Node it serves.
+    let (mut v4, mut told): (bool, Option<Vec<String>>) = (false, None);
     loop {
         tokio::select! {
             _ = tokio::time::sleep(ROUND) => {}
@@ -576,9 +700,10 @@ pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio
         let own = own.filter_map(|card| Some(card.address?.as_sockaddr_in()?.ip()));
         nodes.extend(own);
         if dirs.is_empty() && shares.is_empty() && !answering {
+            report(&shared, me, &[], &mut told).await;
             continue;
         }
-        let serve = || -> Result<String, String> {
+        let serve = || -> Result<(String, Vec<String>), String> {
             let root = state.canonicalize().map_err(|e| e.to_string())?.join("volumes");
             std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
             // (One volume whose directory cannot be made does not take the others with it.)
@@ -597,6 +722,7 @@ pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio
                 }
             }
             let (count, shares, given) = (served.len(), given.clone(), given.len());
+            let names: Vec<String> = shares.keys().cloned().collect();
             *table.lock().expect("nothing panics holding the table") = Table {
                 root,
                 served,
@@ -617,20 +743,27 @@ pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio
             // address of this node until it restarts, answering only whom a Share names;
             // IPv6 clients that are not nodes are not served. Listen per address, and stop,
             // when a node has networks a Share should not be heard on.
-            let listening = std::fs::read_to_string("/proc/fs/nfsd/portlist").unwrap_or_default();
-            if given > 0 && !listening.lines().any(|line| line.starts_with("ipv4 ")) {
+            // (Once: the kernel's server keeps the socket it was given, and the same address
+            // bound again is in use. The kernel's list of listeners does not say which are IPv4.)
+            if given > 0 && !v4 {
                 listen(IpAddr::V4(Ipv4Addr::UNSPECIFIED))?;
+                v4 = true;
             }
             let lan = if given > 0 {
                 format!("; {given} Share(s) to the addresses they name")
             } else {
                 String::new()
             };
-            Ok(format!(
-                "serving {count} shared volume(s) to the cluster's nodes (NFS 4.2, mesh only){lan}{not}"
-            ))
+            let saying =
+                format!("serving {count} shared volume(s) to the cluster's nodes (NFS 4.2, mesh only){lan}{not}");
+            Ok((saying, names))
         };
-        let saying = serve().unwrap_or_else(|e| format!("shared volumes are not served: {e}"));
+        let (saying, serving) = match serve() {
+            Ok(done) => done,
+            // (What did not start serves nobody, and the Node says so.)
+            Err(e) => (format!("shared volumes are not served: {e}"), Vec::new()),
+        };
+        report(&shared, me, &serving, &mut told).await;
         if saying != said {
             eprintln!("kithd: {saying}");
             said = saying;
@@ -822,7 +955,7 @@ spec: {volume: gone, nfs: {clients: [192.168.1.9]}}
             .collect();
         assert_eq!(
             said["Share/default/films"],
-            json!({ "node": "a", "path": "/default/media/films" })
+            json!({ "node": "a", "path": "/default/media/films", "served": false })
         );
         assert_eq!(
             said["Share/default/smb-only"],
@@ -842,6 +975,138 @@ spec: {volume: gone, nfs: {clients: [192.168.1.9]}}
         let statuses = writes(&store);
         kith_store::run(&mut store, kith_store::Command::Status { statuses }).unwrap();
         assert!(writes(&store).is_empty());
+    }
+
+    /// A Share's status says whether the node that has its volume serves it: from what that node
+    /// says in its own Node (`status.shares`), for a Share that names NFS clients.
+    #[test]
+    fn a_shares_status_says_whether_its_node_serves_it() {
+        let mut store = Store::default();
+        let text = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: {name: a}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: ada}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: {name: media}
+spec: {node: a, path: films}
+---
+apiVersion: kith.dev/v1
+kind: Share
+metadata: {name: films}
+spec: {volume: media, nfs: {clients: [192.168.1.0/24]}}
+---
+apiVersion: kith.dev/v1
+kind: Share
+metadata: {name: smb-only}
+spec: {volume: media, users: [ada]}
+";
+        for resource in kith_api::Resource::from_source(text).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let status = |store: &Store, key: &str| {
+            let found = writes(store).into_iter().find(|(share, _)| share == key);
+            found.map(|(_, status)| status.unwrap())
+        };
+        // The node has said nothing yet: where it is, and not served.
+        assert_eq!(
+            status(&store, "Share/default/films").unwrap(),
+            json!({ "node": "a", "path": "/default/media/films", "served": false })
+        );
+        // (Served over NFS is what a Share that names clients is; one for SMB users has no `served`.)
+        assert_eq!(
+            status(&store, "Share/default/smb-only").unwrap(),
+            json!({ "node": "a", "path": "/default/media/films" })
+        );
+        // The node says it serves it.
+        let said = |store: &mut Store, shares: Value| {
+            store.set_status("Node/a", Some(json!({ "shares": shares }))).unwrap();
+        };
+        said(&mut store, json!(["default/films"]));
+        assert_eq!(status(&store, "Share/default/films").unwrap()["served"], true);
+        // Said once: the status is written, and not again.
+        let statuses = writes(&store);
+        kith_store::run(&mut store, kith_store::Command::Status { statuses }).unwrap();
+        assert!(writes(&store).is_empty());
+        // It serves others, or none: this one is not served any more, and the status says so.
+        said(&mut store, json!(["default/other"]));
+        assert_eq!(status(&store, "Share/default/films").unwrap()["served"], false);
+        said(&mut store, Value::Null);
+        assert_eq!(status(&store, "Share/default/films").unwrap()["served"], false);
+        // What a node says is of its own Node: null when it serves none.
+        assert_eq!(shares_said(&[]), Value::Null);
+        assert_eq!(shares_said(&["default/films".to_string()]), json!(["default/films"]));
+    }
+
+    /// A node is probed once for the units that start in a round: what was found is kept for
+    /// [`PROBED_FOR`], and asked again after.
+    #[test]
+    fn a_nodes_probe_is_kept_for_the_round() {
+        let probes = Probes(Mutex::new(BTreeMap::new()));
+        let (a, b): (Ipv6Addr, Ipv6Addr) = ("fd00:1::1".parse().unwrap(), "fd00:1::2".parse().unwrap());
+        let start = Instant::now();
+        assert_eq!(probes.recall(a, start), None, "not probed yet");
+        probes.note(a, start, false);
+        // The units that start after it in the round use it, down or up.
+        assert_eq!(probes.recall(a, start + Duration::from_secs(1)), Some(false));
+        assert_eq!(
+            probes.recall(a, start + PROBED_FOR - Duration::from_millis(1)),
+            Some(false)
+        );
+        assert_eq!(probes.recall(b, start), None, "each node has its own");
+        // The next round asks again, and the old answer is forgotten.
+        assert_eq!(probes.recall(a, start + PROBED_FOR), None);
+        probes.note(b, start + PROBED_FOR, true);
+        assert_eq!(probes.recall(b, start + PROBED_FOR), Some(true));
+        assert_eq!(probes.0.lock().unwrap().len(), 1, "a is forgotten");
+    }
+
+    /// A lazy unmount can wait on the kernel for as long as a server is away: it is called from
+    /// a thread kept for what blocks, never the one the async tasks run on.
+    #[tokio::test]
+    async fn an_unmount_runs_off_the_async_thread() {
+        let here = std::thread::current().id();
+        let there = off_thread(|| std::thread::current().id()).await;
+        assert_ne!(here, there);
+        // The unmount itself goes that way: nothing is mounted at this path, so it is refused,
+        // and the refusal comes back as text.
+        let nothing = std::env::temp_dir().join(format!("kith-share-nothing-{}", std::process::id()));
+        assert!(detach(nothing).await.is_err());
+    }
+
+    /// The listener is bound again where nothing holds the old one (the kernel's server keeps
+    /// what it was given, and this process lets go of its own at once): twice on one address
+    /// and port; and while one is held, the bind is refused as in use, and so is told apart.
+    #[test]
+    fn the_listener_is_bound_again_once_the_old_is_dropped() {
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let let_go = |listener| {
+            drop(listener);
+            Ok(())
+        };
+        for _ in 0..2 {
+            assert_eq!(listen_at(address, port, let_go), Ok(()));
+        }
+        let mut held = Vec::new();
+        let hold = |listener| {
+            held.push(listener);
+            Ok(())
+        };
+        assert_eq!(listen_at(address, port, hold), Ok(()));
+        let refused = listen_at(address, port, |_| Ok(())).unwrap_err();
+        assert!(in_use(&refused), "{refused}");
+        drop(held);
+        assert_eq!(listen_at(address, port, let_go), Ok(()));
     }
 
     /// Only a node's mesh address is a client: any other address of the mesh's /48 (a
