@@ -1262,11 +1262,14 @@ fn probes_gate_ready_and_restart() {
         daemon.log("w_default_stuck_0_main").starts_with("up\nup\n")
     });
 
-    // An exec probe is run in the container, and is no problem for the status to say.
+    // A probe that cannot run says so and holds nothing back.
     let probes = "        readiness: { exec: [\"true\"] }\n";
     daemon.apply(&boxed("plain", 1, "rolling", "sleep 300", probes));
     wait_for("plain to be ready", || daemon.status("Workload/plain")["ready"] == 1);
-    assert!(daemon.status("Workload/plain")["notes"][0].is_null());
+    assert_eq!(
+        daemon.status("Workload/plain")["notes"][0],
+        "main: readiness probe: exec probes are not run yet"
+    );
 }
 
 /// A busybox pod whose main process is `httpd` in the foreground, as the default user, stays up:
@@ -2422,7 +2425,7 @@ fn rbac_is_enforced_and_audited() {
     assert_eq!(status, 403);
     assert_eq!(
         reply["error"],
-        "alice may not get ConfigMap in namespace default: no Role bound to it allows that"
+        "alice may not get ConfigMap other in namespace default: no Role bound to it allows that"
     );
     assert_eq!(call("first", "GET", "/v1/resources?kind=Role", "").0, 403);
     assert_eq!(call("first", "GET", "/v1/watch", "").0, 403);
@@ -2457,10 +2460,15 @@ fn rbac_is_enforced_and_audited() {
     line(
         "alice",
         "apply",
-        "ConfigMap in namespace default",
+        "ConfigMap other in namespace default",
         "alice may not apply ConfigMap",
     );
-    line("alice", "delete", "ConfigMap in namespace web", "alice may not delete");
+    line(
+        "alice",
+        "delete",
+        "ConfigMap site in namespace web",
+        "alice may not delete",
+    );
     line("alice", "apply", "RoleBinding", "alice may not apply RoleBinding");
     line("local", "socket", "Identity/alice", "ok");
     assert!(audit.contains("Role/web-editor"), "{audit}");

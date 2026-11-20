@@ -174,7 +174,10 @@ the hash covering all four fields, the way a key is remembered by its id.
   signature, and a chain to the TSA root given (EKU timeStamping, valid at genTime) all
   hold; the log's inclusion proof is not read. The rule field that carries the TSA root is
   the identity's `tsa`: `keyless::verify` is what calls `timestamp`, per identity, and
-  forgets what it found before the next identity is asked. cosign 3 still logs to Rekor v1 by default on the public instance (sigstore
+  forgets what it found before the next identity is asked. The token is read as DER only, of
+  at most 16 KiB, nested at most 8 deep (not counting what a certificate or an attribute's
+  values hold), with at most 4 certificates; past a limit, or in BER, it is refused naming
+  which. cosign 3 still logs to Rekor v1 by default on the public instance (sigstore
   blog, "Rekor v2 GA", Oct 2025).
 - **A log that lies along with the authority.** This is not caught: who runs them is the
   owner's choice of trust, and README and SECURITY.md say so.

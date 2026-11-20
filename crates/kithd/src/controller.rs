@@ -3,7 +3,8 @@
 //! what it sees in each one's status.
 //!
 // ponytail: this node's share of each (the scheduler says which replicas are its own).
-// A container's ports only name them (units share the host's network).
+// Not handled, and said so in the status where it matters: exec probes. A container's
+// ports only name them (units share the host's network).
 // A rolling update replaces one replica at a time. A replica that is a pod (as root, no
 // device, seat or volume, and room on the node for a second) is replaced by surge: the new
 // one starts beside the old (the generations take turns at ids with and without a `b`:
@@ -990,21 +991,6 @@ fn live_gen(
         true => !new,
         false => new,
     }
-}
-
-/// Of a replica being replaced beside the old, the generation that answers: the one the status tells of.
-fn answers(
-    gens: &BTreeMap<(String, u32), bool>,
-    surging: &Surging,
-    slots: &BTreeMap<String, Slot>,
-    slot: &Slot,
-) -> bool {
-    is_second(slot) == live_gen(gens, surging, slots, &slot.owner, slot.replica)
-}
-
-/// What the status says of a unit: its revision and whether it is ready (a probe passed, if it has one).
-fn unit_status(slot: &Slot) -> Value {
-    json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts, "revision": slot.revision })
 }
 
 /// Every unit of the generation `b` of the replica is ready: it answers for the replica.
@@ -2293,7 +2279,7 @@ impl Controller {
                             ("running", running_said(note, replaced), None, Instant::now());
                         if let Run::Container(c) = &slot.run {
                             let pod = slot.pod.as_ref().map(|(pod, _)| pod.clone());
-                            slot.probes = crate::probe::start(shared.clone(), c, id, pod);
+                            slot.probes = crate::probe::start(shared.clone(), c, pod);
                         }
                         job_moved = true;
                     }
@@ -2384,34 +2370,27 @@ impl Controller {
                 notes.extend(says.iter().map(|(_, said)| said.clone()));
             }
             // Of a replica being replaced beside the old, the one that answers.
+            let answers = |slot: &&Slot| {
+                is_second(slot) == live_gen(&self.gens, &self.surging, &self.slots, &slot.owner, slot.replica)
+            };
             let mine: Vec<&Slot> = self
                 .slots
                 .values()
                 .filter(|slot| slot.owner == key)
-                .filter(|slot| answers(&self.gens, &self.surging, &self.slots, slot))
+                .filter(answers)
                 .collect();
             let units: Vec<Value> = mine
                 .iter()
                 .map(|slot| {
-                    let mut c = unit_status(slot);
+                    let mut c = json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts, "revision": slot.revision });
                     if let Some(code) = slot.exit_code {
                         c["exitCode"] = json!(code);
                     }
                     if let Some(at) = slot.restarted {
                         c["restarted"] = json!(at);
                     }
-                    let said = says
-                        .iter()
-                        .filter(|(r, _)| *r == slot.replica && me.is_some())
-                        .map(|(_, said)| said.as_str());
-                    let cannot = slot.probes.as_ref().and_then(|p| p.why());
-                    let message: Vec<&str> = slot
-                        .message
-                        .as_deref()
-                        .into_iter()
-                        .chain(cannot.as_deref())
-                        .chain(said)
-                        .collect();
+                    let said = says.iter().filter(|(r, _)| *r == slot.replica && me.is_some()).map(|(_, said)| said.as_str());
+                    let message: Vec<&str> = slot.message.as_deref().into_iter().chain(said).collect();
                     if !message.is_empty() {
                         c["message"] = json!(message.join("; "));
                     }
@@ -4046,62 +4025,6 @@ mod tests {
         // A new unit that failed to start does not take over.
         slots.get_mut(&new_id).unwrap().state = "failed";
         assert!(!second_is_live(&slots, "Workload/x/a", 0, true));
-    }
-
-    /// A rollout whose container has only an exec readiness probe: until the command has passed, the
-    /// status (and the Deployment kubectl reads off it) keeps the old copy's revision and counts, so
-    /// `kubectl rollout status` and `helm --wait` wait for the probe, not for the container to run.
-    #[tokio::test]
-    async fn rollout_waits_for_exec_readiness() {
-        let owner = "Workload/x/a";
-        let exec: Container = serde_json::from_value(json!({
-            "name": "app", "image": "img", "readiness": { "exec": ["test", "-f", "/tmp/ready"] },
-        }))
-        .unwrap();
-        assert!(crate::probe::problems(&exec).is_empty());
-        let (mut slots, mut gens, mut surging) = (BTreeMap::new(), BTreeMap::new(), Surging::new());
-        let (old_id, mut old) = surge_unit(false, "running");
-        old.revision = Some(1);
-        slots.insert(old_id, old);
-        let (new_id, mut new) = surge_unit(true, "running");
-        new.revision = Some(2);
-        // (Started with the probe running and not yet passed: what `probe::start` gives a container with one.)
-        let (probes, passed) = crate::probe::held(crate::probe::Health {
-            live: true,
-            ready: false,
-        });
-        new.probes = Some(probes);
-        slots.insert(new_id, new);
-        gens.insert((owner.to_string(), 0), true);
-        surging.insert((owner.to_string(), 0), (Instant::now(), None));
-
-        // The Deployment kubectl reads, over what the controller reports.
-        let read = |slots: &BTreeMap<String, Slot>| -> Value {
-            let units: Vec<Value> = slots
-                .values()
-                .filter(|slot| answers(&gens, &surging, slots, slot))
-                .map(unit_status)
-                .collect();
-            let resource: Resource = serde_json::from_value(json!({
-                "apiVersion": "kith.dev/v1", "kind": "Workload",
-                "metadata": { "name": "a", "namespace": "x", "revision": 2 },
-                "spec": {}, "status": { "containers": units },
-            }))
-            .unwrap();
-            crate::kube::status_of("Deployment", &json!({ "spec": { "replicas": 1 } }), &resource).unwrap()
-        };
-        let counts = |status: &Value| {
-            ["replicas", "updatedReplicas", "readyReplicas", "availableReplicas"].map(|n| status[n].as_u64().unwrap())
-        };
-        // Running, the probe not passed: the old copy answers, at its own revision.
-        let before = read(&slots);
-        assert_eq!(counts(&before), [1, 0, 1, 1], "{before}");
-        assert_eq!(before["conditions"][1]["reason"], "ReplicaSetUpdated");
-        // The probe passes: the new copy answers.
-        passed.send_modify(|health| health.ready = true);
-        let after = read(&slots);
-        assert_eq!(counts(&after), [1, 1, 1, 1], "{after}");
-        assert_eq!(after["conditions"][1]["reason"], "NewReplicaSetAvailable");
     }
 
     /// What is held once (a volume, a device, the node's network) is not held by two replicas

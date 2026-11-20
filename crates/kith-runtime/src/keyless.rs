@@ -36,9 +36,10 @@ const SHA256_OID: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01
 const SHA384_OID: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
 #[cfg(test)]
 const CONTENT_TYPE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x03];
-/// The most bytes of a timestamp, and certificates in it, that are read.
-const STAMP: usize = 64 * 1024;
-const STAMP_CERTS: usize = 8;
+/// The most bytes of a timestamp, certificates in it, and levels of DER nesting that are read.
+const STAMP: usize = 16 * 1024;
+const STAMP_CERTS: usize = 4;
+const STAMP_DEPTH: usize = 8;
 
 /// Who an image may be signed by without a kept key: whom the authority certified, as whom
 /// the issuer signed them in, and the authority's certificates and the log's key that say so.
@@ -478,12 +479,47 @@ fn unix(text: &[u8]) -> Option<i64> {
     Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
+/// Whether a timestamp (DER) is within the limits: at most STAMP bytes, constructed elements
+/// nested at most STAMP_DEPTH deep (the response is depth 0), at most STAMP_CERTS certificates,
+/// and no BER. Else why not, to follow "its timestamp".
+fn limits(der: &[u8]) -> std::result::Result<(), &'static str> {
+    if der.len() > STAMP {
+        return Err("is over 16 KiB");
+    }
+    nest(der, 0)
+}
+
+/// The elements of `input`, each at `depth`, and what they hold. The certificates (the SignedData's
+/// [0], at depth 4) are counted and not entered, nor are an attribute's values (a SET after its
+/// OID): real tokens carry deep ones there, and the reader takes only the digest from them.
+fn nest(input: &[u8], depth: usize) -> std::result::Result<(), &'static str> {
+    let (mut rest, mut last) = (input, 0);
+    while !rest.is_empty() {
+        let Some((tag, contents, after)) = element(rest) else {
+            return Err(match rest.get(1) {
+                Some(0x80) => "is BER, not DER (an indefinite length)",
+                _ => "cannot be read",
+            });
+        };
+        if tag == 0xa0 && depth == 4 {
+            if elements(contents).count() > STAMP_CERTS {
+                return Err("holds more than 4 certificates");
+            }
+        } else if tag & 0x20 != 0 && !(tag == 0x31 && last == 0x06) {
+            if depth > STAMP_DEPTH {
+                return Err("nests deeper than 8");
+            }
+            nest(contents, depth + 1)?;
+        }
+        (rest, last) = (after, tag);
+    }
+    Ok(())
+}
+
 /// Reads a TimeStampResp: granted, a SignedData of one SignerInfo with signed attributes and
 /// a TSTInfo of a SHA-256 imprint. None for anything else, or bytes cut or past its end.
 fn stamp(der: &[u8]) -> Option<Stamp<'_>> {
-    if der.len() > STAMP {
-        return None;
-    }
+    limits(der).ok()?;
     let (response, rest) = expect(der, 0x30)?;
     let (status, token) = expect(response, 0x30)?;
     let (status, _) = expect(status, 0x02)?;
@@ -587,6 +623,7 @@ fn stamp(der: &[u8]) -> Option<Stamp<'_>> {
 /// for timestamping at the time it gives; that time.
 fn stamped(signed: &Signed, tsa: &[u8]) -> std::result::Result<i64, String> {
     let der = signed.stamp.as_deref().ok_or("it has no timestamp")?;
+    limits(der).map_err(|why| format!("its timestamp {why}"))?;
     let read = stamp(der).ok_or("its timestamp cannot be read")?;
     let carried: Vec<CertificateDer> = read.certs.iter().map(|der| CertificateDer::from(*der)).collect();
     // The signer is the certificate whose key signed the attributes.
@@ -707,10 +744,12 @@ fn element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         0..=0x7f => (usize::from(first), rest),
         0x81..=0x83 => {
             let (bytes, rest) = rest.split_at_checked(usize::from(first & 0x7f))?;
-            (
-                bytes.iter().fold(0usize, |len, &byte| len << 8 | usize::from(byte)),
-                rest,
-            )
+            let len = bytes.iter().fold(0usize, |len, &byte| len << 8 | usize::from(byte));
+            // DER writes a length in the fewest bytes: a long form for under 128 is BER.
+            if len < 0x80 || bytes[0] == 0 {
+                return None;
+            }
+            (len, rest)
         }
         _ => return None,
     };
@@ -1376,6 +1415,7 @@ pub(crate) mod tests {
     fn der(tag: u8, body: Vec<u8>) -> Vec<u8> {
         let len = match body.len() {
             n if n < 0x80 => vec![n as u8],
+            n if n < 0x100 => vec![0x81, n as u8],
             n => vec![0x82, (n >> 8) as u8, n as u8],
         };
         [vec![tag], len, body].concat()
@@ -1436,6 +1476,15 @@ pub(crate) mod tests {
                 der(0xa0, attrs),
                 ecdsa,
                 der(0x04, signature),
+                // Unsigned attributes, which the reader skips: `levels` of nesting or a blob.
+                match fault {
+                    "deep" | "edge" => {
+                        let levels = if fault == "deep" { 3 } else { 2 };
+                        der(0xa1, (0..levels).fold(vec![5, 0], |inner, _| der(0x30, inner)))
+                    }
+                    "big" => der(0xa1, der(0x04, vec![0; STAMP])),
+                    _ => vec![],
+                },
             ]
             .concat(),
         );
@@ -1446,7 +1495,7 @@ pub(crate) mod tests {
                 int(3),
                 der(0x31, sha256_alg),
                 encap,
-                der(0xa0, cert.to_vec()),
+                der(0xa0, cert.repeat(if fault == "certs" { 5 } else { 1 })),
                 der(0x31, info),
             ]
             .concat(),
@@ -1695,9 +1744,64 @@ pub(crate) mod tests {
         }
     }
 
+    /// A token the test builds reads back its signer, signed attributes, digest, imprint and time.
+    #[test]
+    fn the_timestamp_reader_reads_a_token() {
+        let (tsa, imprint) = (Authority::new(), b"what was stamped");
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let response = response(&cert, &key, imprint, 90, "");
+        let read = stamp(&response).unwrap();
+        assert_eq!(read.certs, [cert.as_ref()]);
+        assert_eq!(read.imprint, sha256(imprint));
+        assert_eq!(read.time, (START + 90) as i64);
+        // The digest in the signed attributes is of the TSTInfo, and the attributes are what
+        // the signature covers: a SET OF holding that digest.
+        assert_eq!(read.message_digest, sha256(read.content));
+        assert_eq!(read.attributes[0], 0x31);
+        assert!(read.attributes.windows(32).any(|w| w == read.message_digest));
+        assert!(std::ptr::eq(read.algorithm, &ring::digest::SHA256));
+        assert!(!read.signature.is_empty());
+        // The unsigned attributes at the depth limit are skipped, as a wider SET of certs is not.
+        assert_eq!(
+            stamp(&self::response(&cert, &key, imprint, 90, "edge")).unwrap().time,
+            read.time
+        );
+    }
+
+    /// Over 16 KiB, nesting past 8, a fifth certificate and BER are each refused, saying why.
+    fn refuses_what_is_past_the_limits() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let good = v2(&made, &cert, &key, None, 60, "");
+        let refused = |der: Vec<u8>, why: &str| {
+            assert!(stamp(&der).is_none(), "{why}");
+            let mut bundle = super::bundle(good.to_string().as_bytes()).unwrap();
+            bundle.stamp = Some(der);
+            let said = timestamp(&mut bundle, &tsa.root).unwrap_err();
+            assert!(said.contains(why), "expected `{why}`, got `{said}`");
+        };
+        let imprint = super::bundle(good.to_string().as_bytes()).unwrap().signature;
+        let with = |fault: &str| response(&cert, &key, &imprint, 60, fault);
+        refused(with("big"), "is over 16 KiB");
+        refused(vec![0x30; STAMP + 1], "is over 16 KiB");
+        refused(with("deep"), "nests deeper than 8");
+        refused(with("certs"), "holds more than 4 certificates");
+        // BER: an indefinite length on the outer sequence, and a length written longer than needed.
+        let ok = with("");
+        let ber = [&[0x30, 0x80][..], &ok[4..], &[0, 0]].concat();
+        refused(ber, "is BER, not DER");
+        assert_eq!(ok[1], 0x82);
+        let long = [&[0x30, 0x83, 0, ok[2], ok[3]][..], &ok[4..]].concat();
+        refused(long, "cannot be read");
+        // Nesting to the limit is not refused.
+        assert!(stamp(&with("edge")).is_some());
+    }
+
     /// The reader fed every cut and 2000 altered responses: it says why not, never panics.
     #[test]
     fn the_timestamp_reader_survives_damaged_bytes() {
+        refuses_what_is_past_the_limits();
         let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
         let made = Making::new(&authority, &log, DIGEST);
         let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
