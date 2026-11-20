@@ -496,16 +496,8 @@ impl Keys {
     /// How the update with header `block` is taken, against the system in `slot` that runs the
     /// image `running`: kithd alone only when the header kept for that system is its own
     /// (`signed_system`) and says the kernel and the rest of the root are the same. A missing,
-    /// unsigned, stale or older-style kept header is a full update.
-    #[cfg(test)]
-    pub fn way(&self, slot: char, running: &[u8], block: &[u8]) -> crate::os::Way {
-        match self.kithd_only(slot, running, block) {
-            Ok(()) => crate::os::Way::KithdOnly,
-            Err(_) => crate::os::Way::Full,
-        }
-    }
-
-    /// [`Keys::way`], saying why it is a full update where it is.
+    /// unsigned, stale or older-style kept header is a full update. Says why it is a full
+    /// update where it is. (`Keys::way`, in the tests at the foot of this file, is the same as a `Way`.)
     pub fn kithd_only(&self, slot: char, running: &[u8], block: &[u8]) -> Result<(), String> {
         let (_, _, kept) = self
             .signed_system(slot, running)
@@ -2891,5 +2883,18 @@ mod stage {
         let why = stage(&from, &sum(&big), &dir).unwrap_err();
         assert!(why.contains("larger"), "{why}");
         assert!(!dir.join("kithd").exists() && !dir.join("kithd.new").exists());
+    }
+}
+
+/// (Here, at the foot, so that `#[cfg(test)]` comes after the code the cluster's `pinned_peer`
+/// test counts clients in: it reads each file up to the first one.)
+#[cfg(test)]
+impl Keys {
+    /// [`Keys::kithd_only`] as a [`crate::os::Way`].
+    pub fn way(&self, slot: char, running: &[u8], block: &[u8]) -> crate::os::Way {
+        match self.kithd_only(slot, running, block) {
+            Ok(()) => crate::os::Way::KithdOnly,
+            Err(_) => crate::os::Way::Full,
+        }
     }
 }
