@@ -1300,9 +1300,13 @@ spec! {
         /// anyway. Defaults to 300; at most 3600.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub drain_seconds: Option<u32>,
-        /// Hold back nodes with an active seat until it is idle.
+        /// Pick a node only while its seats last said idle (or it has none).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub wait_for_idle_seats: Option<bool>,
+        /// How long a node waits for its seat to be idle before it goes anyway. Defaults to
+        /// 3600; at most 86400.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub idle_wait_seconds: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub paused: Option<bool>,
         /// Let nodes take a release older than the one they run. Refused otherwise.

@@ -4169,7 +4169,16 @@
             "boolean",
             "null"
           ],
-          "description": "Hold back nodes with an active seat until it is idle."
+          "description": "Pick a node only while its seats last said idle (or it has none)."
+        },
+        "idleWaitSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How long a node waits for its seat to be idle before it goes anyway. Defaults to\n3600; at most 86400."
         },
         "paused": {
           "type": [
