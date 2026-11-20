@@ -50,7 +50,7 @@ use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::syscall::syscall::SyscallType;
 use libcontainer::workload::default::DefaultExecutor;
-use libcontainer::workload::{Executor, ExecutorError, ExecutorValidationError};
+use libcontainer::workload::{Executor, ExecutorError, ExecutorSetEnvsError, ExecutorValidationError};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use oci_spec::runtime::{
@@ -2006,6 +2006,16 @@ impl Executor for Entry {
     fn validate(&self, spec: &Spec) -> std::result::Result<(), ExecutorValidationError> {
         DefaultExecutor {}.validate(spec)
     }
+
+    /// The default does this through `std::env`, whose lock a forked child can hold for good
+    /// (see `kith_dm_sys::replace_environ`): this child is the only thread it has.
+    fn setup_envs(
+        &self,
+        envs: std::collections::HashMap<String, String>,
+    ) -> std::result::Result<(), ExecutorSetEnvsError> {
+        let vars: Vec<(String, String)> = envs.into_iter().collect();
+        kith_dm_sys::replace_environ(&vars).map_err(|e| ExecutorSetEnvsError::Other(e.to_string()))
+    }
 }
 
 /// Gives a volume to a user: all of it, when its directory is not theirs already (a new
@@ -2144,7 +2154,7 @@ fn init_dispatch(log: &Path) -> Result<tracing::Dispatch> {
 // ponytail: this keeps kith's own subscribers apart; another crate's, or a first event of a
 // call site on another thread, may still hold a lock of tracing's at a fork. The helper's
 // deadline ends that wait.
-static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// How long a create waits for its helper (the process that makes the container) before it
 /// kills it. A create takes milliseconds to seconds; this only bounds a helper that hangs.
@@ -3589,6 +3599,65 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A container's first process sets its environment without the lock Rust's std keeps on it:
+    /// `Command::spawn` of any other thread holds that lock across its fork, so a child forked
+    /// then holds it for good, and std's `remove_var` waits for it forever (the 60 s stalls of
+    /// `create`). The children here run `setup_envs` while other threads spawn processes
+    /// without pause; each must end with exactly the spec's environment, within the deadline.
+    #[test]
+    fn setup_envs_does_not_wait_for_the_environment_lock() {
+        // (No other test forks meanwhile, or its child holds what the test has open: the spawns
+        // here are many, and an image test whose lock they hold finds it taken.)
+        let _forking = FORKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::process::Command::new("/bin/true").status();
+                    }
+                })
+            })
+            .collect();
+        let mut failed = None;
+        for _ in 0..150 {
+            // (Awaited, as a create's helper is: another test's `reap_orphans` takes any child.)
+            let (forked, _awaited) = spawn_awaited(
+                || {
+                    kith_dm_sys::fork_start(|| {
+                        let spec = std::collections::HashMap::from([("ONLY".to_string(), "1".to_string())]);
+                        if Entry.setup_envs(spec).is_err() {
+                            return b"error".to_vec();
+                        }
+                        // (A read of std's lock: one a spawning thread holds is shared, so it never waits.)
+                        std::env::vars()
+                            .map(|(k, v)| format!("{k}={v}\n"))
+                            .collect::<String>()
+                            .into_bytes()
+                    })
+                },
+                |forked| u32::try_from(forked.pid()).ok(),
+            )
+            .unwrap();
+            match forked.collect(std::time::Duration::from_secs(10)) {
+                Ok(said) if said == b"ONLY=1\n" => {}
+                other => {
+                    failed = Some(format!("{other:?}"));
+                    break;
+                }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert!(
+            failed.is_none(),
+            "a child did not end with the spec's environment: {failed:?}"
+        );
+    }
+
     /// Creates from many threads of one process (as kithd's are, from its tokio workers) all return:
     /// libcontainer clones its intermediate process with a raw `clone3`, which a thread of this
     /// process may have caught holding a lock, and that child then waits for it forever. Each create
@@ -3785,7 +3854,7 @@ mod tests {
         // A create takes FORKING and then the awaited list; so `enter` must too, and never hold
         // the list while it waits for FORKING (two threads, one holding each, wait for ever).
         // Here a thread is held at FORKING, and the list must be free while it waits.
-        let forking = FORKING.lock().unwrap();
+        let forking = FORKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let waiting = std::thread::spawn({
             let state = state.clone();
             move || enter(&state, "enter1", &["/bin/cat".into()]).map(drop)

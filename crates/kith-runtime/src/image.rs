@@ -1236,6 +1236,17 @@ mod tests {
         path
     }
 
+    /// Keeps every other test of this process from forking while the caller's test runs. A
+    /// child forked while a store's `images/.lock` is open here holds that lock (the open
+    /// file is copied, and a created container's first process keeps it until it execs): a
+    /// removal that must find the lock free then finds it taken. (The tests of removal
+    /// hold it; a kithd that forks meanwhile only has its removal wait for the next look.)
+    fn no_forks() -> std::sync::MutexGuard<'static, ()> {
+        crate::container::FORKING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn sandbox(name: &str) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!("kith-runtime-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -3011,6 +3022,7 @@ mod tests {
     /// only it linked. A layer and a shared file another image has stay, and that image whole.
     #[test]
     fn image_removal_takes_an_unused_image_whole_with_what_only_it_named() {
+        let _forks = no_forks();
         let (dir, _) = sandbox("image-removal");
         let store = ImageStore::new(dir.join("store")).unwrap();
         let common: &[E] = &[E::File("lib", "library")];
@@ -3082,6 +3094,7 @@ mod tests {
     /// holds the store. An image of a kithd from before layers were noted goes with no layer.
     #[test]
     fn image_removal_keeps_what_is_in_use_or_within_grace() {
+        let _forks = no_forks();
         let (dir, _) = sandbox("image-kept");
         let store = ImageStore::new(dir.join("store")).unwrap();
         let file: &[E] = &[E::File("f", "file")];
@@ -3137,6 +3150,7 @@ mod tests {
     /// what is left of it, and the next look (`tidy`) removes the rest, not the store's opening.
     #[test]
     fn image_removal_cut_halfway_leaves_no_half_image() {
+        let _forks = no_forks();
         let (dir, _) = sandbox("image-cut");
         let store = ImageStore::new(dir.join("store")).unwrap();
         let entries: &[E] = &[E::Dir("stuck", 0o755), E::File("stuck/f", "x"), E::File("g", "y")];
@@ -3201,6 +3215,7 @@ mod tests {
     /// blobs beside the store, which the node's registry serves its Images from.
     #[test]
     fn image_removal_takes_the_layers_no_image_names() {
+        let _forks = no_forks();
         let (dir, _) = sandbox("image-unnamed");
         let store = ImageStore::new(dir.join("state/runtime")).unwrap();
         let a = stored(&store, "a:1", 'a', &[('1', &[E::File("f", "file")])]);
@@ -3249,7 +3264,9 @@ mod tests {
     /// A pull answered from the store marks the image used; an image removed is pulled again
     /// in full, its layer fetched and unpacked anew.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // (a test on one thread: nothing else waits on it but forks)
     async fn image_removal_an_image_removed_is_pulled_again() {
+        let _forks = no_forks();
         let (dir, _) = sandbox("image-pulled-again");
         let registry = Registry::start(false);
         let digest = registry.publish("1", "/bin/one");

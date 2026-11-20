@@ -629,6 +629,41 @@ pub fn no_new_privs() -> Result<()> {
     }
 }
 
+/// Replaces this process's whole environment with `vars`, through the C library and not
+/// through `std::env`: std keeps a lock on the environment that `Command::spawn` of any
+/// other thread holds across its fork, so a child forked then holds it for good and
+/// `remove_var` there waits forever. For a process that has one thread (a forked child);
+/// a process with more must use `std::env`.
+pub fn replace_environ(vars: &[(String, String)]) -> Result<()> {
+    let bad = |what: &str| {
+        Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("an environment variable {what}"),
+        )
+    };
+    let mut cs = Vec::with_capacity(vars.len());
+    for (key, value) in vars {
+        if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
+            return Err(bad("has a name or value that C cannot hold"));
+        }
+        let pair = |s: &str| std::ffi::CString::new(s).map_err(|_| bad("has a NUL"));
+        cs.push((pair(key)?, pair(value)?));
+    }
+    // SAFETY: clearenv takes no argument; setenv copies its two NUL-ended strings (live here).
+    // No thread of this process reads the environment meanwhile (see above).
+    unsafe {
+        if libc::clearenv() != 0 {
+            return Err(Error::last_os_error());
+        }
+        for (key, value) in &cs {
+            if libc::setenv(key.as_ptr(), value.as_ptr(), 1) != 0 {
+                return Err(Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `setresuid(2)` of the process: real, effective and saved user id, `None` for one left as
 /// it is. (The C library sets it on every thread.)
 pub fn setresuid(real: Option<u32>, effective: Option<u32>, saved: Option<u32>) -> Result<()> {
