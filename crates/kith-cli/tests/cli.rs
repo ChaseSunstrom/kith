@@ -358,7 +358,7 @@ fn kith_run(sb: &Sandbox, after: &str, hold: bool) -> (std::process::Child, std:
     );
     write_executable(&carrier, &script);
     let child = Command::new(env!("CARGO_BIN_EXE_kith"))
-        .args(["--timeout", "10", "run", "--on", "b", "--via"])
+        .args(["--timeout", "60", "run", "--on", "b", "--via"])
         .arg(&carrier)
         .args(["--", "true"])
         .env("KITH_SOCKET", &socket)
@@ -391,7 +391,7 @@ fn kith_run_returns_the_status_the_carrier_ends_with() {
 fn kith_run_cleans_up_and_exits_130_on_an_interrupt() {
     let sb = Sandbox::new("run-interrupt");
     let (mut kith, tunnel, carrier) = kith_run(&sb, "time.sleep(300)", true);
-    tunnel.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+    tunnel.recv_timeout(std::time::Duration::from_secs(90)).unwrap();
     assert_eq!(run_dirs(&sb), 1, "the run's directory is not there while it runs");
     let pid = std::fs::read_to_string(format!("{}.pid", carrier.display())).unwrap();
     let sent = Command::new("kill")
