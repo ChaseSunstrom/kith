@@ -489,14 +489,31 @@ fn stamp(spec: &mut Value, key: &str, plan: &str) {
     taint["value"] = format!("{}plan:{plan}", if owner { "owner;" } else { "" }).into();
 }
 
-/// The spec `what` makes of `spec`, with the record stamped by `plan` when put on: a record a
-/// deleted plan left is taken over, not left to the sweep. `None` when nothing changes.
-fn written(spec: &Value, on: bool, what: fn(&Value, bool) -> Option<Value>, record: &str, plan: &str) -> Option<Value> {
+/// The spec `what` makes of `spec`, with the record stamped by `plan` when this write puts it
+/// on, or when it is one a plan that is no longer `live` left (taken over, not left to the
+/// sweep). A record that was there with no stamp, or another live plan's, is not the plan's:
+/// it is left as it is. `None` when nothing changes.
+fn written(
+    spec: &Value,
+    on: bool,
+    what: fn(&Value, bool) -> Option<Value>,
+    record: &str,
+    plan: &str,
+    live: &dyn Fn(&str) -> bool,
+) -> Option<Value> {
     let mut next = what(spec, on).unwrap_or_else(|| spec.clone());
-    if on {
+    let ours = !crate::sched::has_record(spec, record) || stamped_by(spec, record).is_some_and(|by| !live(by));
+    if on && ours {
         stamp(&mut next, record, plan);
     }
     (next != *spec).then_some(next)
+}
+
+/// The plan whose stamp the record under `key` carries, if it has one.
+fn stamped_by<'a>(spec: &'a Value, key: &str) -> Option<&'a str> {
+    let taint = spec["taints"].as_array()?.iter().find(|taint| taint["key"] == key)?;
+    let value = taint["value"].as_str()?;
+    value.strip_prefix("owner;").unwrap_or(value).strip_prefix("plan:")
 }
 
 /// The cordon records on Nodes that an UpdatePlan which is gone put on: (node, record key).
@@ -508,12 +525,7 @@ fn orphans<'a>(
     let mut found = Vec::new();
     for (name, spec) in nodes {
         for key in [kith_sched::DRAIN, crate::sched::UPDATE_CORDON] {
-            let taint = spec["taints"]
-                .as_array()
-                .and_then(|taints| taints.iter().find(|taint| taint["key"] == key));
-            let value = taint.and_then(|taint| taint["value"].as_str()).unwrap_or_default();
-            let plan = value.strip_prefix("owner;").unwrap_or(value).strip_prefix("plan:");
-            if plan.is_some_and(|plan| !live(plan)) {
+            if stamped_by(spec, key).is_some_and(|plan| !live(plan)) {
                 found.push((name.to_string(), key));
             }
         }
@@ -536,12 +548,18 @@ async fn write_cordon(
     const TRIES: usize = 3;
     let key = format!("Node/{name}");
     for _ in 0..TRIES {
-        let found = {
+        let (found, gone) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
-            state.store.get(&key).cloned()
+            let found = state.store.get(&key).cloned();
+            // (Is the plan that stamped the record on the Node gone? `written` asks only of that one.)
+            let gone = found
+                .as_ref()
+                .and_then(|node| stamped_by(&node.spec, record))
+                .map(|by| state.store.get(&format!("UpdatePlan/{by}")).is_none());
+            (found, gone.unwrap_or(false))
         };
         let Some(mut node) = found else { return };
-        let Some(spec) = written(&node.spec, on, what, record, plan) else {
+        let Some(spec) = written(&node.spec, on, what, record, plan, &|_| !gone) else {
             return;
         };
         node.spec = spec;
@@ -2906,8 +2924,8 @@ mod tests {
                 (drain, drained_spec as fn(&Value, bool) -> Option<Value>),
                 (cordon, cordoned_spec),
             ] {
-                spec = written(&spec, true, what, record, "p").expect("a stamp to take over");
-                assert_eq!(written(&spec, true, what, record, "p"), None);
+                spec = written(&spec, true, what, record, "p", &live).expect("a stamp to take over");
+                assert_eq!(written(&spec, true, what, record, "p", &live), None);
             }
             assert!(orphans([("a", &spec)].into_iter(), live).is_empty(), "{spec}");
             // The owner's cordon is still said to be an owner's.
@@ -2917,6 +2935,38 @@ mod tests {
                 "{spec}"
             );
         }
+    }
+
+    /// A record that was there before the plan's write, with no stamp or another live plan's, is
+    /// not the plan's: it is not stamped, so no end or deletion of the plan lifts it.
+    #[test]
+    fn update_delete_lifts_not_an_operators_record_a_plan_writes_over() {
+        let (drain, cordon) = (kith_sched::DRAIN, crate::sched::UPDATE_CORDON);
+        let live = |plan: &str| plan == "p" || plan == "q";
+        let mut drained = json!({});
+        crate::sched::drain_on(&mut drained);
+        let mut drained_over_owner = json!({ "unschedulable": true });
+        crate::sched::drain_on(&mut drained_over_owner);
+        let mut cordoned = json!({});
+        crate::sched::cordon_on(&mut cordoned, crate::sched::UPDATE_CORDON, "noSchedule");
+        let theirs_live = put_on_by(&json!({}), "q", true);
+        let drains = [&drained, &drained_over_owner, &theirs_live];
+        for spec in drains {
+            assert_eq!(written(spec, true, drained_spec, drain, "p", &live), None, "{spec}");
+        }
+        assert_eq!(written(&cordoned, true, cordoned_spec, cordon, "p", &live), None);
+        // Deleted plans: only the stamped one is the plan's.
+        let none = |_: &str| false;
+        assert!(
+            orphans(
+                [("a", &drained), ("b", &drained_over_owner), ("c", &cordoned)].into_iter(),
+                none
+            )
+            .is_empty()
+        );
+        // A record the write creates is stamped.
+        let made = written(&json!({}), true, drained_spec, drain, "p", &live).expect("a drain");
+        assert_eq!(made["taints"][0]["value"], "plan:p");
     }
 
     #[test]
