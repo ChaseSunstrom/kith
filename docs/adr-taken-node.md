@@ -490,7 +490,17 @@ nodes too, and a replay decides alike.
   `own_writes::signed` holds each to its owner at apply, in one place, on every node: it calls
   `releases::writer_may` for every resource the write touches (the owner is in the store, and
   the write is within its writer's rights), refuses to overwrite a resource another owner
-  holds, and for a write with no owner falls to the layer 2 `rules`. The table test
+  holds, and for a write with no owner falls to the layer 2 `rules`. Three limits on what a
+  node-signed write may name as its owner (T-1084): it never changes access (a Role, a
+  RoleBinding, an Identity, a KindDefinition or the Cluster, applied or deleted: `writer_may`
+  asks only that the writer may write it, not that the Release renders it, so a taken leader
+  could have named a Release whose writer may), a fetched Package is one that a Release asks
+  of that Repository by name and version, and does not overwrite one that is another's or
+  nobody's, and a missing owner's leftovers are deleted only where a Release, a Source or a
+  KindDefinition's kind could have left them. A Release or Source that renders a Role or the
+  like is refused under `required`, then, and its status says why. What remains: a taken
+  leader can still write, as the writer of an owner that is there, any other kind that
+  writer may write, owned by it, and the owner's prune takes it away. The table test
   `own_writes_signed_owned_writes_are_held_to_writer_may_at_apply` names each kind. The
   same entry is refused on every node, and a replay decides alike. Every other bare
   `Apply`, `Delete`, `Rollback` and `Import` is refused at apply (`access_sign::bare`,

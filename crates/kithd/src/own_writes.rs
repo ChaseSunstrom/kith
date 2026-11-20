@@ -374,6 +374,15 @@ pub fn admit(
 /// Delete of what [`takes_away`] allows; else what it writes as itself bare, but for the blobs it
 /// holds (a signed entry is decided by the store alone: no blob is held).
 fn signed(store: &Store, prefix: Ipv6Addr, by: (&str, bool), command: &Command) -> Result<(), String> {
+    // Whatever the owner it names, a node never signs a write that changes access (a Role, a
+    // RoleBinding, an Identity, a KindDefinition or the Cluster): a Release's writer may be allowed
+    // one, and `writer_may` asks only that, not that the Release renders it. People sign those.
+    if crate::raft::changes_access(command) {
+        return Err(not_made(
+            "a node's own write",
+            "it changes access, and only a person signs that",
+        ));
+    }
     match command {
         Command::Apply { resources, .. } => {
             let decided: Vec<_> = resources.iter().map(|r| mine(store, prefix, by, r)).collect();
@@ -462,8 +471,16 @@ fn takes_away(store: &Store, leads: bool, key: &str) -> Option<Result<(), String
             Some(_) => Err("its claim is there".into()),
         },
         Some(of) if of.starts_with("CronJob/") && held.kind == "Job" => Ok(()),
-        // (An owner that is not there leaves no rights to ask; one that is and has no writer, does.)
-        Some(of) if store.get(of).is_none() => Ok(()),
+        // (An owner that is not there leaves no rights to ask; one that is and has no writer, does.
+        // And only of a kind a controller makes things of: what merely carries the annotation of
+        // another stays. Nobody applies one by hand, `releases::claims`: it is the reaper's to take.)
+        Some(of) if store.get(of).is_none() => {
+            let kind = kind_of(of);
+            match matches!(kind, "Release" | "Source") || store.definition(kind).is_some() {
+                true => Ok(()),
+                false => Err(format!("{of} is gone, and no controller makes things of a {kind}")),
+            }
+        }
         Some(of) => {
             writer_of(store, of).and_then(|writer| crate::releases::writer_may(store, writer, &[], &[key.to_string()]))
         }
@@ -487,11 +504,27 @@ fn fetched(store: &Store, leads: bool, package: &Resource) -> Result<(), String>
     let key = package.key();
     let said = package.metadata.annotations.get(crate::releases::REPOSITORY);
     let name = said.and_then(|said| said.split('@').next()).unwrap_or_default();
+    // (The registry names a Package `NAME-VERSION`, its `spec.version` the version: the name and
+    // version a Release asks of that Repository, and that its `version` fits.)
     let wanted = |release: &&Resource| {
-        release.spec["package"]["repo"] == name && crate::releases::supplied(store, release).is_ok()
+        let asks = &release.spec["package"];
+        let version = package.spec["version"].as_str().unwrap_or_default();
+        asks["repo"] == name
+            && asks["name"]
+                .as_str()
+                .is_some_and(|asked| package.metadata.name == format!("{asked}-{version}"))
+            && crate::releases::fits(asks["version"].as_str(), version)
+            && crate::releases::supplied(store, release).is_ok()
     };
+    // (Over a Package that is there: only the same Repository's, as the registry does it. One no
+    // one fetched, or another Repository's, is not for a fetch to overwrite.)
+    let overwrites_another = store.get(&key).is_some_and(|held| {
+        let from = held.metadata.annotations.get(crate::releases::REPOSITORY);
+        from.and_then(|from| from.split('@').next()) != Some(name)
+    });
     match (leads, crate::releases::origin(store, name)) {
         (false, _) => Err(not_made(key, "only the leader writes what a Repository sent")),
+        _ if overwrites_another => Err(not_made(key, "it is there, and not what that Repository sent")),
         (_, origin) if origin.as_ref() == said && store.list(Some("Release")).any(|r| wanted(&r)) => Ok(()),
         _ => Err(not_made(
             key,
@@ -1405,6 +1438,181 @@ mod tests {
         assert_eq!(admitted(&store, a), Ok(()));
     }
 
+    /// A node-signed write never changes access, whatever owner it names (T-1084): a Release, a
+    /// Source or a controller's resource is held to what its writer may, and a writer who may write
+    /// a Role may not have a taken leader write one for it. Nor does a node-signed Delete take one away.
+    #[test]
+    fn own_writes_signed_owned_writes_never_change_access_whatever_the_owner() {
+        use crate::releases::{OWNER, bob_is, bobs_note};
+        let ca = pki::Ca::create().unwrap();
+        let (mut store, nodes) = required(&ca, &["a"]);
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        let note = bobs_note(0);
+        for resource in kith_api::Resource::from_source(&format!(
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: bob }}\nspec: {{ rules: [\
+             {{ kinds: [ConfigMap], verbs: [apply, delete], namespaces: [shop] }}, \
+             {{ kinds: [Role, RoleBinding, Identity, KindDefinition, Cluster], verbs: [apply, delete] }}] }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob }}\nspec: {{ role: bob, subjects: [bob] }}\n"
+        ))
+        .unwrap()
+        {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        bob_is(&mut store, 0);
+        for resource in kith_api::Resource::from_source(&format!(
+            "apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: mine, namespace: shop, {note} }}\n\
+             spec: {{ package: {{ name: maps }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: repo, namespace: shop, {note} }}\n\
+             spec: {{ git: {{ url: 'https://example.org/a.git' }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: {{ name: gameserver, {note} }}\n\
+             spec: {{ group: games.example.com, version: v1, kind: GameServer, schema: {{ type: object }} }}\n"
+        ))
+        .unwrap()
+        {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let leader = kith_store::node_id("a");
+        let admitted = |store: &Store, command: &Command| {
+            let entry = sign(&nodes[0], &id, command).unwrap();
+            crate::access_sign::admit(store, &id, &entry, leader)
+        };
+        let made = |owner: &str, kind: &str, name: &str| {
+            let mut made = named(kind, name, serde_json::json!({ "data": {} }));
+            made.metadata.namespace = (!["Cluster", "Role", "RoleBinding", "Identity", "KindDefinition"]
+                .contains(&kind))
+            .then(|| "shop".to_string());
+            made.metadata.annotations.insert(OWNER.into(), owner.into());
+            made
+        };
+        // (The same write of a ConfigMap is what the owner's writer may: the control.)
+        for owner in ["Release/shop/mine", "Source/shop/repo", "GameServer/play/one"] {
+            let ok = apply(vec![made(owner, "ConfigMap", "c")]);
+            if owner != "GameServer/play/one" {
+                assert_eq!(admitted(&store, &ok), Ok(()), "{owner}");
+            }
+            for kind in ["Role", "RoleBinding", "Identity", "KindDefinition", "Cluster"] {
+                let access = made(owner, kind, "x");
+                let said = admitted(&store, &apply(vec![access.clone()])).unwrap_err();
+                assert!(said.contains("changes access"), "{owner} {kind}: {said}");
+                // Mixed with what it may write, still refused: one thing refused is the entry refused.
+                let mixed = apply(vec![made(owner, "ConfigMap", "c"), access.clone()]);
+                assert!(admitted(&store, &mixed).is_err(), "{owner} {kind}");
+                // Nor taken away, there or not (whoever owns it, or its owner is gone).
+                let said = admitted(&store, &Command::Delete { key: access.key() }).unwrap_err();
+                assert!(said.contains("changes access"), "{owner} {kind}: {said}");
+            }
+        }
+    }
+
+    /// A Package the registry fetched is of the name and version a qualifying Release asks for, and
+    /// does not overwrite one that is another Repository's, or that nobody fetched (T-1084).
+    #[test]
+    fn own_writes_signed_fetched_package_is_the_one_a_release_asks_for_and_no_ones_else() {
+        use crate::releases::{REPOSITORY, bob_is, bobs_note};
+        let ca = pki::Ca::create().unwrap();
+        let (mut store, nodes) = required(&ca, &["a"]);
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        for resource in kith_api::Resource::from_source(&format!(
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: bob }}\nspec: {{ rules: [\
+             {{ kinds: [Package], verbs: [apply] }}] }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob }}\nspec: {{ role: bob, subjects: [bob] }}\n"
+        ))
+        .unwrap()
+        {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        bob_is(&mut store, 0);
+        let note = bobs_note(0);
+        for resource in kith_api::Resource::from_source(&format!(
+            "apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: mine, namespace: shop, {note} }}\n\
+             spec: {{ package: {{ name: maps, repo: hub, version: '1.0.0' }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Repository\nmetadata: {{ name: hub }}\n\
+             spec: {{ url: 'https://example.org/r' }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Repository\nmetadata: {{ name: other }}\n\
+             spec: {{ url: 'https://example.org/o' }}\n"
+        ))
+        .unwrap()
+        {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let leader = kith_store::node_id("a");
+        let admitted = |store: &Store, package: &kith_api::Resource| {
+            let entry = sign(&nodes[0], &id, &apply(vec![package.clone()])).unwrap();
+            crate::access_sign::admit(store, &id, &entry, leader)
+        };
+        let origin = crate::releases::origin(&store, "hub").unwrap();
+        let package = |name: &str, version: &str, origin: &str| {
+            let mut package = named("Package", name, serde_json::json!({ "version": version, "files": {} }));
+            package.metadata.namespace = None;
+            package.metadata.annotations.insert(REPOSITORY.into(), origin.into());
+            package
+        };
+        // The control: what the Release asks of the Repository it names.
+        assert_eq!(admitted(&store, &package("maps-1.0.0", "1.0.0", &origin)), Ok(()));
+        // Another name, or a version the Release does not ask for, is nothing it wants.
+        for (name, version) in [
+            ("other-1.0.0", "1.0.0"),
+            ("maps-2.0.0", "2.0.0"),
+            ("maps-1.0.0", "9.9.9"),
+        ] {
+            let said = admitted(&store, &package(name, version, &origin)).unwrap_err();
+            assert!(said.contains("asks that Repository"), "{name} {version}: {said}");
+        }
+        // Over a Package that is there: its own Repository's, again, is the registry's re-fetch;
+        // nobody's, or another Repository's, is not its to overwrite.
+        let mut held = package("maps-1.0.0", "1.0.0", "hub@old");
+        store.apply(held.clone()).unwrap();
+        assert_eq!(admitted(&store, &package("maps-1.0.0", "1.0.0", &origin)), Ok(()));
+        held.metadata.annotations.insert(REPOSITORY.into(), "other@old".into());
+        store.apply(held.clone()).unwrap();
+        let said = admitted(&store, &package("maps-1.0.0", "1.0.0", &origin)).unwrap_err();
+        assert!(said.contains("not what"), "{said}");
+        held.metadata.annotations.remove(REPOSITORY);
+        store.apply(held).unwrap();
+        let said = admitted(&store, &package("maps-1.0.0", "1.0.0", &origin)).unwrap_err();
+        assert!(said.contains("not what"), "{said}");
+    }
+
+    /// A node-signed Delete of what names an owner that is not there takes it away only where a
+    /// controller could have left it: an owner of a kind a Release, a Source or a KindDefinition
+    /// makes things of. A resource that merely carries the annotation of anything else stays (T-1084).
+    #[test]
+    fn own_writes_signed_deletes_of_a_missing_owners_leftovers_are_a_controllers_kinds_only() {
+        use crate::releases::OWNER;
+        let ca = pki::Ca::create().unwrap();
+        let (mut store, nodes) = required(&ca, &["a"]);
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        for resource in kith_api::Resource::from_source(
+            "apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: { name: gameserver }\n\
+             spec: { group: games.example.com, version: v1, kind: GameServer, schema: { type: object } }\n",
+        )
+        .unwrap()
+        {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let leader = kith_store::node_id("a");
+        let mut deleted = |owner: &str| {
+            let mut held = named("ConfigMap", "c", serde_json::json!({ "data": {} }));
+            held.metadata.annotations.insert(OWNER.into(), owner.into());
+            store.apply(held.clone()).unwrap();
+            let entry = sign(&nodes[0], &id, &Command::Delete { key: held.key() }).unwrap();
+            let said = crate::access_sign::admit(&store, &id, &entry, leader);
+            store.delete(&held.key()).unwrap();
+            said
+        };
+        for owner in ["Release/shop/gone", "Source/shop/gone", "GameServer/play/gone"] {
+            assert_eq!(deleted(owner), Ok(()), "{owner}");
+        }
+        for owner in [
+            "ConfigMap/default/gone",
+            "Workload/default/web",
+            "Node/gone",
+            "Secret/kith-system/acme-account",
+        ] {
+            assert!(deleted(owner).is_err(), "{owner}");
+        }
+    }
+
     /// A try again of a write whose answer was lost (`raft.rs` `write_as` signs at each try) is
     /// signed with a nonce of its own: the first try's is taken, and the second is not refused for it.
     #[test]
@@ -1526,8 +1734,8 @@ mod tests {
             let ok = apply(vec![config.clone()]);
             assert_eq!(admitted(&store, a, &ok), Ok(()), "{owner}");
             assert!(admitted(&store, b, &ok).unwrap_err().contains("leader"), "{owner}");
-            // What it may not (no Secret, no Workload, no Role: not even by way of a Release).
-            for kind in ["Secret", "Workload", "Role"] {
+            // What it may not (no Secret, no Workload; a Role is no node's to sign at all, below).
+            for kind in ["Secret", "Workload"] {
                 let said = admitted(&store, a, &apply(vec![made(owner, kind, namespace, "x")])).unwrap_err();
                 assert!(said.contains("bob may not apply"), "{owner} {kind}: {said}");
             }
