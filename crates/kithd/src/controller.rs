@@ -132,6 +132,8 @@ struct Slot {
     /// What its cgroup was last told for its node's seats (memory guaranteed, CPU limit), if
     /// anything; none again each time it starts.
     tuned: Option<(Option<u64>, Option<u64>)>,
+    /// Its template says `priority: idle` (T-1118): its cgroup is told so once it runs.
+    idle: bool,
     handle: Option<Handle>,
     state: &'static str,
     restarts: u32,
@@ -1656,6 +1658,7 @@ impl Controller {
                             tried: None,
                             accounted: false,
                             tuned: None,
+                            idle: template.priority == Some(kith_api::kinds::Priority::Idle),
                             handle: None,
                             state: "pending",
                             restarts: 0,
@@ -1834,6 +1837,7 @@ impl Controller {
                 || new.exit != slot.exit
                 || new.notes != slot.notes
                 || new.policy != slot.policy
+                || new.idle != slot.idle
                 || devices
                 || new.dmem != slot.dmem
                 || new.seat != slot.seat
@@ -2289,7 +2293,7 @@ impl Controller {
                 continue;
             };
             let asked = tunes.get(&slot.owner).copied();
-            if asked.is_none() && slot.tuned.is_none() {
+            if asked.is_none() && slot.tuned.is_none() && !slot.idle {
                 continue;
             }
             let (guaranteed, held_back) = asked.unwrap_or_default();
@@ -2306,7 +2310,11 @@ impl Controller {
                 own
             };
             if slot.tuned != Some((guaranteed, cpu)) {
-                match Direct::units().tune(handle, id, guaranteed, cpu) {
+                let memory = resources.as_ref().and_then(|r| r.memory.as_ref());
+                let idle = slot.idle.then(|| kith_runtime::Idle {
+                    memory_high: memory.map(|q| q.value() as u64),
+                });
+                match Direct::units().tune(handle, id, guaranteed, cpu, idle) {
                     Ok(refused) => {
                         for refused in refused {
                             eprintln!("kithd: {id}: its seat's arrangement is not all in place: {refused}");
@@ -3869,6 +3877,7 @@ mod tests {
             tried: None,
             accounted: false,
             tuned: None,
+            idle: false,
             handle: None,
             state: "pending",
             restarts: 0,

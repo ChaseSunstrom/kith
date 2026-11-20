@@ -186,6 +186,9 @@ spec:
   may apply `Seat`s); it shows as `status.activity`. A seat nobody holds is idle.
 - A workload with `yieldTo` runs on a twentieth of a CPU on that seat's node while the seat is
   in a state it names, and gets its limit back when the state changes (about ten seconds).
+- A template that says `priority: idle` goes further down: `cpu.idle`, the lowest `io.weight` and
+  a `memory.high`, on every node and whatever the seat does. Batch work beside a desktop takes
+  only spare cycles (see [idle work](workloads.md#idle-work)).
 
 ### Virtual machines
 

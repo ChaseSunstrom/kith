@@ -1714,6 +1714,81 @@ spec: {}
         );
     }
 
+    /// A template's `priority` goes through the API for a Workload, a Job and a CronJob (it is
+    /// kept as sent), and a value that is neither `normal` nor `idle` is refused (422), at apply
+    /// and at plan (T-1118).
+    #[tokio::test]
+    async fn idle_class_priority_is_kept_through_apply_and_a_bad_value_is_refused() {
+        let dir = std::env::temp_dir().join(format!("kithd-idle-class-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let sent = |kind: &str, name: &str| -> Vec<Resource> {
+            let template = "template: {priority: idle, exec: [{name: w, command: [true]}]}";
+            let spec = match kind {
+                "CronJob" => format!("{{schedule: '* * * * *', job: {{{template}}}}}"),
+                _ => format!("{{{template}}}"),
+            };
+            let text = format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{name: {name}}}\nspec: {spec}\n");
+            Resource::from_source(&text)
+                .unwrap()
+                .into_iter()
+                .map(Result::unwrap)
+                .collect()
+        };
+        // What a client that sends JSON can send: the value is not checked until the store is asked.
+        let bad = |kind: &str| -> Vec<Resource> {
+            let mut sent = sent(kind, "bad");
+            let at = if kind == "CronJob" {
+                "/job/template/priority"
+            } else {
+                "/template/priority"
+            };
+            *sent[0].spec.pointer_mut(at).unwrap() = "urgent".into();
+            sent
+        };
+        let within = std::time::Duration::from_secs(30);
+        for kind in ["Workload", "Job", "CronJob"] {
+            let name = kind.to_lowercase();
+            let kept = tokio::time::timeout(within, applied(&shared, &Caller::Admin, sent(kind, &name)))
+                .await
+                .unwrap();
+            kept.unwrap_or_else(|_| panic!("{kind} with priority idle was refused"));
+            let stored = shared
+                .store
+                .lock()
+                .unwrap()
+                .store
+                .get(&format!("{kind}/default/{name}"))
+                .cloned();
+            let stored = stored.unwrap();
+            let template = match kind {
+                "CronJob" => &stored.spec["job"]["template"],
+                _ => &stored.spec["template"],
+            };
+            assert_eq!(template["priority"], "idle", "{kind}: {}", stored.spec);
+            for answer in [
+                applied(&shared, &Caller::Admin, bad(kind)).await.map(drop),
+                plan(&shared, &Caller::Admin, bad(kind)).await.map(drop),
+            ] {
+                let Err(e) = answer else {
+                    panic!("{kind} with priority urgent was taken")
+                };
+                assert!(matches!(e, ApiError::Store(Error::Invalid(_))), "{kind}");
+                assert_eq!(e.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
+            }
+            assert!(
+                shared
+                    .store
+                    .lock()
+                    .unwrap()
+                    .store
+                    .get(&format!("{kind}/default/bad"))
+                    .is_none()
+            );
+        }
+    }
+
     /// A watch ends (401) once its Identity is deleted or given another key while it waits,
     /// and what it ended for is written down.
     #[tokio::test]

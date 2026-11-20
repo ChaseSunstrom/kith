@@ -32,6 +32,7 @@
 {"u":"guide/workloads.html","t":"What kithd does today","h":""},
 {"u":"guide/workloads.html#images","t":"What kithd does today","h":"Images"},
 {"u":"guide/workloads.html#cronjobs","t":"What kithd does today","h":"CronJobs"},
+{"u":"guide/workloads.html#idle-work","t":"What kithd does today","h":"Idle work"},
 {"u":"guide/workloads.html#not-yet","t":"What kithd does today","h":"Not yet"},
 {"u":"guide/workloads.html#what-a-container-is-kept-from","t":"What kithd does today","h":"What a container is kept from"},
 {"u":"guide/workloads.html#a-replica-as-a-pod","t":"What kithd does today","h":"A replica as a pod"},

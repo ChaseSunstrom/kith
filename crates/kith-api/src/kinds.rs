@@ -399,6 +399,10 @@ spec! {
         /// Hold this replica back (a sliver of one CPU) while a seat of its node is busy.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub yield_to: Option<YieldTo>,
+        /// `idle` makes this replica's units take only the node's spare CPU and disk (and their
+        /// memory is reclaimed first); `normal`, the default, changes nothing.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub priority: Option<Priority>,
         /// Run each replica as Kubernetes runs a pod: its containers share a network of
         /// their own (any port is theirs, `localhost` is each other, and the replica has
         /// an address on the mesh), each may write its root file system unless it says
@@ -417,6 +421,11 @@ spec! {
         #[serde(default, skip_serializing_if = "Labels::is_empty")]
         pub annotations: Labels,
     }
+
+    /// How a replica's units share the node. `idle`: CPU and disk only when nothing else wants
+    /// them (`cpu.idle`, the lowest `io.weight`), and memory reclaimed from them first
+    /// (`memory.high` at the unit's memory amount, if it has one).
+    pub enum Priority { Normal, Idle }
 
     pub struct YieldTo {
         /// Name of the `Seat`.

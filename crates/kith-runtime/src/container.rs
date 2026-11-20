@@ -1094,6 +1094,12 @@ pub fn reap_orphans(mains: &[i32]) {
     }
 }
 
+/// The idle class of a unit (`tune`): `memory_high` is the memory amount it was given, if any.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Idle {
+    pub memory_high: Option<u64>,
+}
+
 /// The most the kernel takes for `cpu.weight` and `io.weight` (the default is 100): a unit with
 /// a guarantee goes before everything else on the node when they want the same CPU or disk.
 const TOP_WEIGHT: u32 = 10_000;
@@ -1103,17 +1109,30 @@ const TOP_WEIGHT: u32 = 10_000;
 /// (none: no guarantee, the default weights), and `cpu_millis` thousandths of a CPU (none: no
 /// limit). What could not be written is returned in plain words, and the rest is written
 /// anyway: a kernel or a cgroup without the io controller still gives the memory and the CPU.
-pub fn tune(cgroup: &Path, guaranteed: Option<u64>, cpu_millis: Option<u64>) -> Vec<String> {
-    let weight = if guaranteed.is_some() { TOP_WEIGHT } else { 100 };
+///
+/// An `idle` unit (a template that says `priority: idle`) also gets `cpu.idle` 1 (the kernel's
+/// SCHED_IDLE for the whole cgroup: it runs only on CPU nothing else wants), the lowest
+/// `io.weight`, and `memory.high` where it has a memory amount, so its memory is reclaimed first.
+/// A normal unit is written none of these.
+pub fn tune(cgroup: &Path, guaranteed: Option<u64>, cpu_millis: Option<u64>, idle: Option<Idle>) -> Vec<String> {
+    let weight = match (idle, guaranteed) {
+        (Some(_), _) => 1,
+        (None, Some(_)) => TOP_WEIGHT,
+        (None, None) => 100,
+    };
     let cpu = cpu_millis.map_or("max".to_string(), |millis| {
         millis.max(10).saturating_mul(100).to_string()
     });
-    let files = [
+    let mut files = vec![
         ("memory.min", guaranteed.unwrap_or(0).to_string()),
         ("cpu.weight", weight.to_string()),
         ("io.weight", format!("default {weight}")),
         ("cpu.max", format!("{cpu} 100000")),
     ];
+    if let Some(idle) = idle {
+        files.push(("cpu.idle", "1".into()));
+        files.extend(idle.memory_high.map(|bytes| ("memory.high", bytes.to_string())));
+    }
     let write = |(file, value): &(&str, String)| {
         let done = fs::write(cgroup.join(file), value);
         done.err().map(|e| format!("{file} = {value}: {e}"))
@@ -2529,7 +2548,7 @@ mod tests {
         let cgroup = std::env::temp_dir().join(format!("kith-tune-guarantee-{}", std::process::id()));
         fs::create_dir_all(&cgroup).unwrap();
         let read = |file: &str| fs::read_to_string(cgroup.join(file)).unwrap();
-        assert!(tune(&cgroup, Some(4 << 30), None).is_empty());
+        assert!(tune(&cgroup, Some(4 << 30), None, None).is_empty());
         assert_eq!(read("memory.min"), "4294967296");
         assert_eq!(
             (read("cpu.weight"), read("io.weight")),
@@ -2537,18 +2556,53 @@ mod tests {
         );
         assert_eq!(read("cpu.max"), "max 100000");
         // Held back to a twentieth of a CPU, with no guarantee: the defaults, and the limit.
-        assert!(tune(&cgroup, None, Some(50)).is_empty());
+        assert!(tune(&cgroup, None, Some(50), None).is_empty());
         assert_eq!((read("memory.min"), read("cpu.weight")), ("0".into(), "100".into()));
         assert_eq!(read("cpu.max"), "5000 100000");
         // A file the kernel will not take (here: a directory in its place) is named; the others are written.
         fs::remove_file(cgroup.join("io.weight")).unwrap();
         fs::create_dir(cgroup.join("io.weight")).unwrap();
-        let said = tune(&cgroup, Some(1), Some(500));
+        let said = tune(&cgroup, Some(1), Some(500), None);
         assert!(said.len() == 1 && said[0].starts_with("io.weight"), "{said:?}");
         assert_eq!(
             (read("memory.min"), read("cpu.max")),
             ("1".into(), "50000 100000".into())
         );
+        let _ = fs::remove_dir_all(cgroup);
+    }
+
+    #[test]
+    fn idle_class_writes_cpu_idle_the_lowest_io_weight_and_memory_high() {
+        let cgroup = std::env::temp_dir().join(format!("kith-tune-idle-{}", std::process::id()));
+        fs::create_dir_all(&cgroup).unwrap();
+        let read = |file: &str| fs::read_to_string(cgroup.join(file)).unwrap();
+        // A normal unit's files are as they were: nothing of the idle class is written.
+        assert!(tune(&cgroup, None, None, None).is_empty());
+        for file in ["cpu.idle", "memory.high"] {
+            assert!(!cgroup.join(file).exists(), "{file} written for a normal unit");
+        }
+        assert_eq!(read("io.weight"), "default 100");
+        // Idle, with a memory amount: reclaimed from at that amount.
+        assert!(
+            tune(
+                &cgroup,
+                None,
+                None,
+                Some(Idle {
+                    memory_high: Some(64 << 20)
+                })
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            (read("cpu.idle"), read("io.weight"), read("memory.high")),
+            ("1".into(), "default 1".into(), "67108864".into())
+        );
+        // Idle with none: no memory.high is written (the one from before stays as it was).
+        fs::remove_file(cgroup.join("memory.high")).unwrap();
+        assert!(tune(&cgroup, None, None, Some(Idle { memory_high: None })).is_empty());
+        assert!(!cgroup.join("memory.high").exists());
+        assert_eq!((read("cpu.idle"), read("io.weight")), ("1".into(), "default 1".into()));
         let _ = fs::remove_dir_all(cgroup);
     }
 
