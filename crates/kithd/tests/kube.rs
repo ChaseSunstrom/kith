@@ -2181,6 +2181,11 @@ fn workflows_kubectl_port_forward_carries_bytes_both_ways() {
     if !has_kubectl() {
         return;
     }
+    // Without a delegated cgroup kithd runs no workloads, so tool-0 never runs (CI's runner).
+    if !kith_runtime::has_delegated_cgroup() {
+        eprintln!("skipped: no delegated cgroup here");
+        return;
+    }
     let _alone = alone();
     let cluster = with_running("kube-forward-bytes", true);
     let (_forward, local) = forward(&cluster, echo());
@@ -2204,6 +2209,11 @@ fn workflows_kubectl_port_forward_carries_bytes_both_ways() {
 #[test]
 fn workflows_kubectl_port_forward_ends_a_silent_stream_and_bounds_its_streams() {
     if !has_kubectl() {
+        return;
+    }
+    // Without a delegated cgroup kithd runs no workloads, so tool-0 never runs (CI's runner).
+    if !kith_runtime::has_delegated_cgroup() {
+        eprintln!("skipped: no delegated cgroup here");
         return;
     }
     let _alone = alone();
@@ -2238,6 +2248,11 @@ fn workflows_kubectl_port_forward_ends_a_silent_stream_and_bounds_its_streams() 
 #[test]
 fn workflows_kubectl_port_forward_does_not_reach_the_host_through_a_pod_that_is_not_made() {
     if !has_kubectl() {
+        return;
+    }
+    // Without a delegated cgroup kithd runs no workloads, so tool-0 never runs (CI's runner).
+    if !kith_runtime::has_delegated_cgroup() {
+        eprintln!("skipped: no delegated cgroup here");
         return;
     }
     let _alone = alone();
@@ -2312,6 +2327,11 @@ fn access_port_forward_ends_a_session_that_hears_nothing() {
 #[test]
 fn workflows_kubectl_port_forward_asks_the_right_again_for_each_connection() {
     if !has_kubectl() {
+        return;
+    }
+    // Without a delegated cgroup kithd runs no workloads, so tool-0 never runs (CI's runner).
+    if !kith_runtime::has_delegated_cgroup() {
+        eprintln!("skipped: no delegated cgroup here");
         return;
     }
     let _alone = alone();
