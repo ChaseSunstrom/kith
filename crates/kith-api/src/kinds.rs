@@ -319,6 +319,13 @@ spec! {
         /// never through an edge node (which would see it). Defaults to `auto`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub relay: Option<Relay>,
+        /// Rotate this node's WireGuard key: a name of the rotation (any text, up to 64
+        /// characters), made once for each new one. The node makes a new key, the nodes it is
+        /// connected to take it, and the old key stays in force until they have shaken hands on
+        /// the new one; none that do, and it stays. The node's status says the last one made
+        /// (`status.mesh.rotated`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub rotate: Option<String>,
     }
 
     pub enum Relay { Auto, Never }
