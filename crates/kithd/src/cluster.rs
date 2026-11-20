@@ -8,6 +8,7 @@
 //! POST /v1/tokens                      -> {token}                      local socket, or an Identity that may apply Nodes, Roles and RoleBindings
 //! POST /v1/identities/<name>/certificate -> {ca, cert, key}            local socket only
 //! GET  /v1/cluster                    -> {node, leader, voters, learners, applied, mesh}   local socket only
+//! GET  /v1/clock                       -> this node's time, microseconds since 1970   members only (`clock`)
 //! ```
 //! Raft (`raft.rs`), which gives every node its own copy of the store, is for members
 //! only. The resource API is for members and for Identities with a certificate, who
@@ -760,7 +761,9 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
         .route("/v1/run-hop", post(api::run::hop))
         .route(POD_HOP, post(crate::pod_exec::hop))
         .route("/v1/raft/stands", get(standing))
+        .route("/v1/clock", get(crate::clock::serve))
         .route("/v1/view", get(crate::view::serve))
+        .route("/v1/node-metrics", get(crate::metrics::node))
         .route("/v1/blob-copy/{name}", get(crate::blobs::copy))
         .route("/v1/volume-copy/{namespace}/{name}", get(crate::replicas::copy))
         .route(
@@ -1086,7 +1089,9 @@ pub async fn netboot(
             let minutes = minutes.map_err(|_| "minutes is a number")?;
             let disk = asked.get("disk").map_or("only", String::as_str);
             let encrypt = asked.get("encrypt").is_some_and(|encrypt| encrypt == "true");
-            netboot::on(image.to_vec(), machines, minutes, disk, encrypt, || {
+            // (Only a node started with `--mesh`: a machine given the flag could not follow the Cluster's switch.)
+            let mesh = shared.mesh_flag.load(std::sync::atomic::Ordering::Relaxed);
+            netboot::on(image.to_vec(), machines, minutes, disk, encrypt, mesh, || {
                 cluster.tokens.mint(&ca.cert, Some(&cluster.me), pki::Lets::Control)
             })
             .await

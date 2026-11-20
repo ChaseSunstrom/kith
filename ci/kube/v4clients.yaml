@@ -1,0 +1,15 @@
+# The client of ci/kube/v4.yaml, applied once its Deployment has rolled out: it turns IPv6 off
+# and asks the Service by name and by its IPv4 address.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: v4only
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: v4only
+          image: kith.test/pod:1
+          command: ["/bin/pod", "v4only", "echo4", "80"]

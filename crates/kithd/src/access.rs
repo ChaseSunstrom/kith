@@ -143,6 +143,12 @@ impl Grants {
         Grants(Some(rules.flat_map(|role| role.rules).collect()))
     }
 
+    /// What these rules allow, for a test.
+    #[cfg(test)]
+    pub fn of_rules(rules: Vec<AccessRule>) -> Grants {
+        Grants(Some(rules))
+    }
+
     /// May it do `verb` to a `kind` in `namespace` (`None`: one that is in no namespace)?
     pub fn may(&self, verb: &Verb, kind: &str, namespace: Option<&str>) -> bool {
         let Some(rules) = &self.0 else { return true };
@@ -165,7 +171,7 @@ impl Grants {
 
 /// What an Identity can reach on the TLS port. A new route is not open to them until it
 /// is named here: name it once its handler asks [`Grants`].
-const FOR_IDENTITIES: [&str; 26] = [
+const FOR_IDENTITIES: [&str; 27] = [
     "/v1/duress",
     "/v1/peers",
     "/v1/backups",
@@ -183,6 +189,7 @@ const FOR_IDENTITIES: [&str; 26] = [
     "/v1/history",
     "/v1/rollback",
     "/v1/logs",
+    "/v1/metrics",
     "/v1/packages",
     "/v1/audit",
     "/v1/schemas",

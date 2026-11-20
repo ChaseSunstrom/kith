@@ -93,7 +93,8 @@ Only the newest version is fixed. There are no security releases of older ones.
   Node) is not taken: what it passes on is refused whoever it names (see "A node that
   is taken").
 - **Node-to-node routes** (Raft, copies of blobs and volumes, a volume's key, running a
-  command on another node) take a node's certificate only, and, like the API, only
+  command on another node, a node's usage series for `GET /v1/metrics`, which the asked
+  node answers an Identity with only if its Role may list Nodes) take a node's certificate only, and, like the API, only
   while that node's Node is in the store: each request is asked again.
 - **What one node passes on to another is pinned to its name.** A passphrase, a Volume's
   key, a caller's Volume files, a restore, `kith run`, a unit's output, a Volume's copy,
@@ -434,7 +435,28 @@ Only the newest version is fixed. There are no security releases of older ones.
   which nothing here defends against.
 - **A Volume's archive** (a Backup, an Image, a replica's copy) is read through directory
   handles that are held open: nothing in the volume is reached by a path the workload
-  could point elsewhere meanwhile. When one is unpacked, no entry writes outside the
+  could point elsewhere meanwhile. A Volume's directory is opened beneath its root by
+  openat2 (no link out of it, no `..`, and no mount below the root; the root itself may be
+  the mount of an encrypted Volume), and a share, a backup, a replica, the volume files, an
+  image and the controller's check read and write its contents through that held
+  descriptor. A container's start works from the held descriptor too: the controller hands
+  it to the runtime (over the socket, in `--split`), which as root mounts, gives and binds
+  the volume from it and never names the path again, so swapping the directory for a link
+  after it is opened gets no bind or chown of what the link points at; the chown does not
+  follow a link and leaves a file with another hard link alone (the start logs how many
+  files it left, as it is not given them). A kithd that is not root has no clone to bind
+  from: it refuses the start when the path is no longer the directory held (device and
+  inode, checked just before the container's init binds it), but a tenant that swaps the
+  directory for a link in the short time after that check is bound what the link names,
+  which is anything kithd's own user can reach: here the tenant and kithd's user are two
+  sides of a boundary, and only a kithd that is root closes it fully. Still by path, and not
+  closed by this: a subPath without the id-mapped mount (refused); a container's scratch
+  directory, its map files, its identity, seat and pod files, which kithd makes and the
+  runtime reads by path; a restore's
+  and a replica's new copy, whose directory is read with `read_dir` and renamed into place
+  by path; and an NFS export, which is by path. A node's own `hostPaths` directory refuses
+  a link at its last component. A workload that can swap a directory on one of these
+  paths for a link can redirect that step. When one is unpacked, no entry writes outside the
   volume; a restored Backup has no setuid or setgid file (a replica's copy keeps them
   as its volume had them). A restore, a replica's first copy and each sync unpack no more
   than the Volume's `size`, where it says one: the entries are counted as they come, each
@@ -870,7 +892,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - the log's inclusion proof and the certificate's own log proof (its SCT) are not
     checked: offline, with no witness, they add nothing the log's promise does not;
   - a log of Rekor v2 (an inclusion proof and a time from a timestamp authority, no
-    promise) is not read: such a signature is refused, naming it;
+    promise) is taken only under an identity that names the authority's root as `tsa`
+    (its RFC 3161 timestamp then says when); without `tsa` such a signature is refused,
+    naming the field. The log's inclusion proof is still not read, so a signature timed
+    this way was not shown to be in any log;
   - an attestation (an in-toto statement of another kind) is never taken as a signature.
 - **A node's WireGuard key is replaced on its own Node's word, and never leaves it with no key.**
   `spec.mesh.rotate` (a name; nothing rotates by itself or on a timer) makes the node write a

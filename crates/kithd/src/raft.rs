@@ -785,6 +785,19 @@ impl Shared {
         self.write_as(command, who).await.map(|(done, _)| done)
     }
 
+    /// Put `command` in the log here and nowhere else: whether it was (`false`: this node leads no
+    /// more, and the next round says it as the leader then, or not). For what a node planned from
+    /// its own view as the leader (the Services' IPv4 addresses): sent on to a new leader it would
+    /// overwrite what that one, with a view of its own, gave.
+    pub async fn write_here(&self, command: Command) -> Result<bool, String> {
+        match tokio::time::timeout(PATIENCE, self.raft.client_write(command)).await {
+            Ok(Ok(written)) => written.data.map(|_| true).map_err(|e| e.to_string()),
+            Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_)))) => Ok(false),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("no majority in time".into()),
+        }
+    }
+
     /// [`Shared::submit`] for the blob store's own Blobs: the bytes were just put.
     pub async fn write(&self, command: Command) -> Result<Done, Error> {
         self.write_at(command).await.map(|(done, _)| done)
@@ -2561,6 +2574,29 @@ mod tests {
         let at = kith_api::store::now();
         shared.write(Command::Apply { resources, at }).await.unwrap();
         (shared, ca)
+    }
+
+    /// A write kept here is put in the log by the node that leads, and by one that does not lead
+    /// it is not (nor passed on to a leader): `false`, to be planned again from that node's view.
+    #[tokio::test]
+    async fn write_here_is_put_by_the_leader_and_never_passed_on() {
+        let (leader, ca) = leading("write-here", &[]).await;
+        let kept = map("kept");
+        let apply = |resource| Command::Apply {
+            resources: vec![resource],
+            at: kith_api::store::now(),
+        };
+        assert_eq!(leader.write_here(apply(kept)).await, Ok(true));
+        assert!(holds(&leader, "ConfigMap/default/kept"));
+        // A node whose raft was never started leads nothing.
+        let other = crate::cluster::pinned_peer::shared_with(
+            "write-here-other",
+            crate::cluster::pinned_peer::node(&ca, "write-here-other"),
+            &[],
+        )
+        .await;
+        assert_eq!(other.write_here(apply(map("not-kept"))).await, Ok(false));
+        assert!(!holds(&other, "ConfigMap/default/not-kept"));
     }
 
     fn map(name: &str) -> kith_api::Resource {

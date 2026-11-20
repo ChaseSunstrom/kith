@@ -37,12 +37,69 @@ python3 ci/budgets.py            # binary-size and memory budgets, enforced in C
 python3 ci/bench.py              # the plan's numbers for one node: cached start < 150 ms, 20+ containers under 30 MB of kithd
 ```
 
-The tests of a pushed commit can run on another kith node instead, as a Job there:
-`KITH_REMOTE=ADDR KITH_REMOTE_CREDS=DIR sh ci/remote.sh [COMMIT [CARGO TEST ARGS]]`, with DIR
-holding the cluster's `ca.crt` and a client's `root.crt` and `root.key`. It prints what failed
-and exits as `cargo test` did. On a kith OS mini PC (16 CPUs) the whole workspace took 218 s from
-a fresh clone, with one test that differs there: `node_policy_refuses_what_the_node_turned_off`
-(kithd's e2e) timed out in the pod.
+The workspace's tests can run on a kith cluster instead, spread over all its nodes, from a commit
+that is not pushed:
+`KITH_REMOTE=ADDR KITH_REMOTE_CREDS=DIR sh ci/remote.sh --fan [COMMIT [CARGO TEST ARGS]]`
+(`COMMIT` is `HEAD` unless named; the arguments are `cargo test`'s and `--workspace` unless
+given), with DIR holding the cluster's `ca.crt` and a client's `root.crt` and `root.key`.
+
+- **What is sent.** Only what GitHub lacks: a `git bundle` of `origin/main..COMMIT`, put into the
+  node's Volume `ci-NODE` (made if it is not there). The node fetches the commits the bundle
+  builds on from GitHub, shallow, so a push is never needed.
+- **The cache.** The same Volume keeps the node's cargo registry, its target folder and the
+  checkout, so only what changed builds on a second run. A node whose target folder is over
+  `KITH_REMOTE_CACHE_MB` (30000) drops it at the start of a run. The Volume stays; its folder
+  `volumes/ci/ci-NODE` in the node's state is what to remove to free the disk.
+- **The namespace.** CI runs in namespace `ci`, and /dev/kvm is granted only there: every
+  Volume, Job and claim the script applies is in `ci`.
+- **The split.** Each node lists the workspace's tests (`cargo test -- --list`), keeps the names
+  whose hash is its place among the nodes' and runs them (`-- --exact NAMES`, `--no-fail-fast`)
+  as a user who is not root, in a pod. Every node builds all of it, so a cold node takes as long
+  as one alone; the run time is the longest share's.
+- **The result.** One merged report: each node's summary line (tests passed and failed, the
+  seconds, whether its cache was warm) and `FAILED: NODE: TEST` for each failure. The exit is 0,
+  101 when a test or a build failed, or 2 when a node's Job did not run to its end. A second run
+  of the same user waits for the first on each node (a lock in the Volume).
+- **No cluster.** With `KITH_REMOTE` unset, or no node answering, `cargo test` runs here with
+  the same arguments and exit status, on the working tree.
+- **Check it.** `sh ci/remote.sh --self-test` runs offline: the bundle of a commit GitHub lacks,
+  shares of 1 to 5 nodes covering each test once, a Job of three nodes against a folder for a
+  GitHub, the merged report and the fallback.
+
+Not yet: a Job has no low priority, so a run uses the nodes' CPUs as any Job does.
+
+The VM tests (`sh ci/vm.sh --test NAME`) can go to the same cluster:
+`KITH_REMOTE=ADDR KITH_REMOTE_CREDS=DIR sh ci/remote.sh --vm TEST[,TEST...] [COMMIT]`.
+
+- **The KVM.** Per node it applies, unchanged on a second run, a Device `ci-kvm-NODE` of the
+  node's /dev/kvm (class `other`), granted to namespace `ci` alone, and a shared DeviceClaim
+  `ci-kvm-NODE` in `ci` that each Job names. The Job is not privileged: it runs as 1000 in a
+  user namespace.
+- **The tools.** The Job copies the image's root into the Volume and installs ci/vm.sh's tools
+  there with apt (its archives and lists in the Volume too), then runs the test chrooted in it,
+  as root of a user namespace of its own. That copy is kept until the image or the list of
+  tools changes. `KITH_OS_CACHE`, cargo's registry and its target folder are in the Volume, so
+  the kernel builds once per node. Two things differ from a machine of your own: a pod's
+  seccomp answers `FS_IOC_SETFLAGS` with "not permitted", which systemd-repart gives up on, so a
+  small preloaded library answers "not supported" as tmpfs would; and tar runs with
+  `--no-same-owner`, as the user namespace maps one uid only.
+- **The split.** The tests are dealt to the nodes in turn, in the order given, and each node
+  runs its own one at a time. One merged report names `FAILED: NODE: TEST` for each failure; a test
+  that ci/vm.sh skips (no KVM, a tool missing) counts as failed, with its reason.
+- **What runs there.** On a cluster of three nodes, 21 of the 29 tests pass: alone, image,
+  update, modules, disk, rollout, install, vps, access, pods, poddns, nested, outlive, services,
+  compose, quota, worker, chaos, home, policy and tunnel (from 30 s warm to 17 minutes for the
+  first kernel and image a node builds). rollout gets the checkout's `kith` built first; kube
+  goes by `sh ci/kube.sh --vm`, which fetches kubectl and helm. The rest, and why:
+  - `init` skips: it boots the host's kernel, and a Job has none in /boot.
+  - `netboot`, `crypt`, `tpm` and `duress`: the machine installed from the network starts
+    again into the firmware's UEFI shell, not its disk. Debian's OVMF has a built-in shell,
+    and that second start gives the disk no boot index.
+  - `blackout`: the guests find no TPM event log
+    (`/sys/kernel/security/tpm0/binary_bios_measurements`) with Debian's OVMF and swtpm, so
+    no node seals its key.
+  - `share` ("the Share mine does not say where it is") and `kube` ("the claim was refused")
+    fail there, on more than one node, and are not explained yet.
 
 Time budgets are medians of five runs on one machine, no VM. `python3 ci/budgets.py --times`
 prints them; `python3 ci/budgets.py` holds each to twice the slowest of three medians on main on
@@ -90,6 +147,7 @@ sh ci/vm.sh --test image                                # kith OS's image: UEFI,
 sh ci/vm.sh --test update                               # and its two slots: an update, marked good; a broken one, gone back from
 sh ci/vm.sh --test chaos                                # three nodes: each cut off in turn, each reset in turn, all reset at once, while writes go on
 sh ci/vm.sh --test access                               # three nodes: a RoleBinding deleted while one is cut off; no write after it is kept
+sh ci/vm.sh --test fido2                                # a test-build kithd's FIDO2 client against its software key (uhid, hidraw): the hmac-secret each seed says, a withheld touch timed out
 sh ci/vm.sh --test pods                                 # two nodes: pods with a network, an address and a root each
 sh ci/vm.sh --test quota                                # pods' storage limits held at the write, across a restart
 sh ci/kube.sh                                           # the real kubectl and helm (fetched once, by hash) against kithd

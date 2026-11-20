@@ -69,10 +69,10 @@ EOF
             must 'kubectl apply of the Job and the CronJob' k apply -f "$root/ci/kube/jobs.yaml"
             heard ask 'shop-0 hello hunter2' 'shop-1 hello hunter2' 'shop-2 hello hunter2' 'db-0 started 1'
             # The replica's own name and the headless Service's name answer an address each
-            # (AAAA: a client that asks for IPv6, which getaddrinfo does); the pod says so, a
-            # line a name. Anchored, so each line is its own name's: with one replica the
+            # (AAAA: a client that asks for IPv6, which getaddrinfo does; the Service's name
+            # answers its IPv4 address too, so its list has both); the pod says so, a line a name. Anchored, so each line is its own name's: with one replica the
             # headless answer is db-0's address, and not the db Service's.
-            heard replicas '^db-0.db-replicas.default.svc.cluster.local: \["[0-9a-f]*:' '^db-replicas.default.svc.cluster.local: \["[0-9a-f]*:' '^db.default.svc.cluster.local: \["[0-9a-f]*:'
+            heard replicas '^db-0.db-replicas.default.svc.cluster.local: \["[0-9a-f]*:' '^db-replicas.default.svc.cluster.local: \["[0-9a-f]*:' '^db.default.svc.cluster.local: \[.*"[0-9a-f]*:[0-9a-f:]*"'
             own=$(sed -n 's/^db-0\.db-replicas\.default\.svc\.cluster\.local: //p' "$work/replicas.out")
             headless=$(sed -n 's/^db-replicas\.default\.svc\.cluster\.local: //p' "$work/replicas.out")
             svc=$(sed -n 's/^db\.default\.svc\.cluster\.local: //p' "$work/replicas.out")
@@ -90,6 +90,31 @@ EOF
             must 'the StatefulSet did not roll out again' k rollout status statefulset/db --timeout=240s
             must 'kubectl create job --from' k create job again --from=cronjob/tick
             heard again 'db-0 started 2'
+
+            # The Service's IPv4 address (--service-range): a client reaches a Service by the
+            # A record its resolver at the pod range's IPv4 gateway answers with, and by that
+            # address as a literal (which a fallback to IPv6 cannot do). (The replica's peer is
+            # kithd's own connection on the pod's loopback, whose family kithd picks: not asserted.) (A pod cannot turn IPv6 off in its own
+            # namespace, its /proc/sys is read-only: the pod says whether it did, and a
+            # namespace with it off is proved in kith-mesh's pod tests.) The replicas are
+            # on both nodes, so with the client on one, the Service's connections reach one on
+            # its own node and one on the other. A client with IPv6 is still given the AAAA.
+            must 'kubectl apply of the Service with an IPv4 address' k apply -f "$root/ci/kube/v4.yaml"
+            must 'the Deployment behind the IPv4 Service did not roll out' k rollout status deployment/echo4 --timeout=240s
+            must 'kubectl apply of the clients of the IPv4 Service' k apply -f "$root/ci/kube/v4clients.yaml"
+            heard v4only '^ipv6: ' '^addresses: \[100\.87\.[0-9]*\.[0-9]*\]' 'name: HTTP/1.0 200 OK echo4-[0-9] peer[46] ' 'literal: HTTP/1.0 200 OK echo4-[0-9] peer[46] '
+            ! grep -q 'failed' "$work/v4only.out" || fail "a connection to the IPv4 Service failed: $(cat "$work/v4only.out")"
+            must 'kubectl create job, to look the IPv4 Service up with IPv6 on' k create job both --image=kith.test/pod:1 -- /bin/pod lookup echo4.default.svc.cluster.local
+            heard both '^echo4.default.svc.cluster.local: \[.*"100\.87\.[0-9.]*"' '^echo4.default.svc.cluster.local: \[.*"[0-9a-f]*:[0-9a-f:]*"'
+            k get pods -o 'jsonpath={range .items[*]}{.metadata.name} {.spec.nodeName}{"\n"}{end}' >"$work/where" 2>&1 || fail "kubectl get pods: $(cat "$work/where")"
+            client=$(sed -n 's/^v4only[^ ]* //p' "$work/where")
+            [ -n "$client" ] || fail "the client's node is not said: $(cat "$work/where")"
+            grep "^echo4-[0-9] $client\$" "$work/where" >/dev/null || fail "no replica on the client's node $client: $(cat "$work/where")"
+            grep "^echo4-[0-9] " "$work/where" | grep -v " $client\$" >/dev/null || fail "no replica on the other node than $client: $(cat "$work/where")"
+            for replica in $(sed -n 's/^\(echo4-[0-9]\) .*/\1/p' "$work/where"); do
+                grep -q "name: HTTP/1.0 200 OK $replica peer[46] " "$work/v4only.out" || fail "the client's connections by name never reached $replica: $(cat "$work/v4only.out") on $(cat "$work/where")"
+            done
+            must 'kubectl delete of the Service with an IPv4 address' k delete deployment/echo4 service/echo4 job/v4only job/both
 
             # What a stock chart says of a pod beyond its image (ci/kube/files.yaml): a
             # ConfigMap and a Secret as files, directories of its own, what it is told from
@@ -287,7 +312,7 @@ EOF
             [ "$(k get pod ring-1 -o 'jsonpath={.status.phase}' 2>&1)" = Running ] || fail "the replica whose claim was deleted stopped: $(k get pods 2>&1)"
 
             # Deleted, nothing of it is left: not the volume made for the claim either.
-            must 'kubectl delete of the manifests' k delete -f "$root/ci/kube"
+            must 'kubectl delete of the manifests' k delete --ignore-not-found -f "$root/ci/kube"
             must 'kubectl delete of what was made by hand' k delete deployment,service made
             must 'kubectl delete of the Jobs made by hand' k delete job again ask-made
             must 'kubectl delete of the claims' k delete pvc data-db-0 data-ring-0 data-ring-2
