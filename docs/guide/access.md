@@ -122,12 +122,37 @@ kith --server HOST:PORT --identity ~/alice logs Workload/web -f
 ```
 
 `KITH_SERVER` and `KITH_IDENTITY` say the same. `get`, `apply`, `watch`, `logs -f`, and the
-tunnels of `run` and `ui` all work over `--server`; `--store` and `--socket` still win over it
-when they are given. HOST:PORT is the node's `--listen` address, and its certificate must be
+tunnels of `run` and `ui` all work over `--server`; `--store` still wins over it
+when it is given. HOST:PORT is the node's `--listen` address, and its certificate must be
 signed by the cluster's CA and name `kith`: a node of another cluster, or one whose name is
 something else, is refused before anything is sent. The identity directory must hold one
 `NAME.key` and its `NAME.crt`; a key that anyone but its owner can read is refused, and `kith`
 says the `chmod 600` to run. The Roles of the identity decide what it may do, as above.
+
+### Contexts: a name for a cluster
+
+A laptop that reaches one cluster does not want the two flags on every line. A context keeps
+them under a name, in `~/.config/kith/contexts.yaml` (under `$XDG_CONFIG_HOME` when that is set),
+a file `kith` writes itself with mode 0600 in a 0700 directory:
+
+```sh
+kith context add lab --server HOST:PORT --identity ~/alice
+kith context use lab        # the one kith takes when none is named
+kith get                    # the same as kith --server HOST:PORT --identity ~/alice get
+kith --context other get    # or KITH_CONTEXT=other
+kith context ls             # the current one is starred
+kith context rm lab
+```
+
+A second `add` of a name replaces it, and the identity directory is kept as a full path. A flag
+given as well wins over the entry, each of `--server` and `--identity` on its own. The current
+context is left alone when `--store`, `--socket` or `--server` is given (a context named with
+`--context` is not). A name the file does not hold, or an identity directory that is gone, is an
+error that names the file. The identity is held to its Roles exactly as over `--server`: what they
+do not allow is refused.
+
+Renewal and revocation of a node's own certificate is not here: it is a change to kithd's PKI,
+and is T-1014.
 
 ## Let a person's phone in
 

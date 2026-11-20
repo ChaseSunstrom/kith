@@ -67,6 +67,7 @@
 {"u":"guide/access.html#who-may-do-what","t":"Access: who may do what, and what a node refuses","h":"Who may do what"},
 {"u":"guide/access.html#a-workload-that-calls-the-api","t":"Access: who may do what, and what a node refuses","h":"A Workload that calls the API"},
 {"u":"guide/access.html#use-kith-from-a-laptop","t":"Access: who may do what, and what a node refuses","h":"Use kith from a laptop"},
+{"u":"guide/access.html#contexts-a-name-for-a-cluster","t":"Access: who may do what, and what a node refuses","h":"Contexts: a name for a cluster"},
 {"u":"guide/access.html#let-a-persons-phone-in","t":"Access: who may do what, and what a node refuses","h":"Let a person's phone in"},
 {"u":"guide/access.html#what-a-node-refuses-whatever-the-cluster-says","t":"Access: who may do what, and what a node refuses","h":"What a node refuses, whatever the cluster says"},
 {"u":"guide/api.html","t":"Resources and the language","h":""},

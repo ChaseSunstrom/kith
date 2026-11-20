@@ -108,6 +108,7 @@ is still there when it starts again.
 | Let other people and programs in, each with their own rights | [Who may do what](docs/guide/access.md#who-may-do-what) |
 | Run `kith` on a laptop, over TLS to a node | [Use kith from a laptop](docs/guide/access.md#use-kith-from-a-laptop) |
 | Let a person's phone into the home network over WireGuard, with a level of what it reaches (and what bounds it) | [Let a person's phone in](docs/guide/access.md#let-a-persons-phone-in); [SECURITY.md](SECURITY.md) |
+| Name a remote cluster once (`kith context add`) and reach it with `--context` | [Contexts](docs/guide/access.md#contexts-a-name-for-a-cluster) |
 | Hand out GPUs and seats, run virtual machines | [Hardware](docs/guide/hardware.md#hardware) |
 | Run a Flatpak app in a seat's window | [Running a Flatpak app in a session](docs/guide/hardware.md#running-a-flatpak-app-in-a-session) |
 | Keep data: volumes, shares, replicas, backups | [Storage](docs/guide/storage.md#storage) |
@@ -301,3 +302,15 @@ read it as the order of magnitude, not a ratio. How it was taken:
 - k3s stopped at 300 on three nodes: the API handshake timed out after 198 s and no node answered, with nothing logged on any of them. The cause is not established; the row does not say whether the API or the hosts were saturated.
 - k3s at 1000 on three nodes: the API stopped answering after 171 s.
 - Two earlier k3s rows at 100 on one node and 300 on three had no cause. The adapter raised an uncaught error reading the memory reader and the row kept only the console lines. That was a bug in ci/stress_workloads.py, fixed and tested; the rows above are the reruns.
+
+## Containers inside containers
+
+`sh ci/stress.sh --nested` is an experiment on one kith OS machine, not a feature: a container with kith's defaults starts a second runtime (bubblewrap) and kithd in agent mode, and then the same with each opening in turn. The `nested` rows of [ci/stress.txt](ci/stress.txt) say what refused what, with the guest kernel's settings (here `max_user_namespaces` 1816, nothing that restricts user namespaces, and cgroup2 with `memory`, `cpu`, `pids` offered). No default was changed. What a container meets when it starts a runtime inside a container:
+
+- **Works with the defaults.** kithd in agent mode starts inside a container and serves its socket and its API; plain processes run as they do in any container.
+- **Needs an opening.** A second runtime that makes a user namespace (bubblewrap, Flatpak's and Steam's sandboxes) is refused twice with the defaults: kith's seccomp filter refuses `unshare` and `clone` with namespace flags (the guest kernel allows them: with `seccomp: {unconfined: true}` alone `unshare` works), and the capability kept in the bounding set makes bubblewrap refuse ("Unexpected capabilities but not setuid"). `userNamespaces: true` on the container is the smallest opening, of the four tried, that ran it (bubblewrap): the bounding set is empty in the namespace and the filter lets the calls through. SECURITY.md says what that opening costs.
+- **Not recommended.** `runAsUser: 0` does not help (the filter still refuses, as the other rows imply; and the container is more privileged for nothing), and `seccomp` unconfined only to get past the filter takes off more than the runtime needs. The containers of the kithd inside do not run under any opening kith has today: the container's `/sys/fs/cgroup` is a read-only mount, so it can make no cgroup, its cgroup is the root of its namespace, and kithd says "no delegated cgroup". That is kith's mount, not the guest kernel's. A container that can run a cluster in it would need a writable, delegated cgroup subtree, which is not offered.
+
+The cost of `userNamespaces: true`: the container may make namespaces and mount in them, and a node hardened with `no-unconfined` refuses such a pod (see [SECURITY.md](SECURITY.md)).
+
+Nothing here runs a nested k3s, and a nested runtime shares the node's network, so a second kithd's registry on port 5000 meets the node's own.
