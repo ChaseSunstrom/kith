@@ -35,7 +35,7 @@
   <ol class="found" aria-live="polite" hidden></ol>
   <details class="rail" open>
     <summary>The guide</summary>
-    <nav aria-label="The guide's pages"><ol class="stops"><li><a href="index.html">All the pages</a></li><li><a href="os.html">kith OS</a></li><li><a href="cluster.html">A cluster</a></li><li class=here><a href="workloads.html" aria-current="page">What kithd does today</a><ol class="inner"><li class="h2"><a href="#images">Images</a></li><li class="h2"><a href="#cronjobs">CronJobs</a></li><li class="h2"><a href="#idle-work">Idle work</a></li><li class="h2"><a href="#not-yet">Not yet</a></li><li class="h2"><a href="#what-a-container-is-kept-from">What a container is kept from</a></li><li class="h2"><a href="#a-replica-as-a-pod">A replica as a pod</a></li><li class="h2"><a href="#a-pod-behind-a-vpn-exit">A pod behind a VPN exit</a></li><li class="h2"><a href="#what-a-container-is-given">What a container is given</a></li></ol></li><li><a href="storage.html">Storage</a></li><li><a href="hardware.html">Hardware</a></li><li><a href="packages.html">Packages and Sources</a></li><li><a href="access.html">Access</a></li><li><a href="api.html">Resources and the language</a></li><li><a href="kubernetes.html">Coming from Kubernetes, Helm, Proxmox or compose</a></li><li><a href="ui.html">Web UI</a></li><li><a href="development.html">Working on kith</a></li><li><a href="numbers.html">How the numbers beside k3s were taken</a></li></ol><p class="rail-group">Decisions and reviews</p><ol class="stops"><li><a href="../adr-encrypt-in-place.html">Encrypting a node's state in place: the journal and the order of writes</a></li><li><a href="../adr-fido2.html">A FIDO2 key as a way into a node's state</a></li><li><a href="../adr-keyless.html">image signatures made without a kept key (T-0463)</a></li><li><a href="../adr-people.html">People's devices into the home network: peers, levels and where a level holds</a></li><li><a href="../adr-privilege.html">kithd in two parts: what reads the network holds no root</a></li><li><a href="../adr-second-disk.html">A second disk for a node's data, under the state's key</a></li><li><a href="../adr-taken-node.html">A taken control node is not the cluster taken</a></li><li><a href="../adr-unlock.html">The ways into a node's encrypted state, and what each leaves open</a></li><li><a href="../adr-workers.html">A worker keeps no Secret that nothing placed on it names</a></li><li><a href="../security-review-2.html">Security review 2</a></li></ol></nav>
+    <nav aria-label="The guide's pages"><ol class="stops"><li><a href="index.html">All the pages</a></li><li><a href="os.html">kith OS</a></li><li><a href="cluster.html">A cluster</a></li><li class=here><a href="workloads.html" aria-current="page">What kithd does today</a><ol class="inner"><li class="h2"><a href="#images">Images</a></li><li class="h2"><a href="#cronjobs">CronJobs</a></li><li class="h2"><a href="#idle-work">Idle work</a></li><li class="h2"><a href="#not-yet">Not yet</a></li><li class="h2"><a href="#what-a-container-is-kept-from">What a container is kept from</a></li><li class="h2"><a href="#a-replica-as-a-pod">A replica as a pod</a></li><li class="h2"><a href="#a-pod-behind-a-vpn-exit">A pod behind a VPN exit</a></li><li class="h2"><a href="#a-workload-that-outlives-its-node">A workload that outlives its node</a></li><li class="h2"><a href="#what-a-container-is-given">What a container is given</a></li></ol></li><li><a href="storage.html">Storage</a></li><li><a href="hardware.html">Hardware</a></li><li><a href="packages.html">Packages and Sources</a></li><li><a href="access.html">Access</a></li><li><a href="api.html">Resources and the language</a></li><li><a href="kubernetes.html">Coming from Kubernetes, Helm, Proxmox or compose</a></li><li><a href="ui.html">Web UI</a></li><li><a href="development.html">Working on kith</a></li><li><a href="numbers.html">How the numbers beside k3s were taken</a></li></ol><p class="rail-group">Decisions and reviews</p><ol class="stops"><li><a href="../adr-encrypt-in-place.html">Encrypting a node's state in place: the journal and the order of writes</a></li><li><a href="../adr-fido2.html">A FIDO2 key as a way into a node's state</a></li><li><a href="../adr-keyless.html">image signatures made without a kept key (T-0463)</a></li><li><a href="../adr-people.html">People's devices into the home network: peers, levels and where a level holds</a></li><li><a href="../adr-privilege.html">kithd in two parts: what reads the network holds no root</a></li><li><a href="../adr-second-disk.html">A second disk for a node's data, under the state's key</a></li><li><a href="../adr-taken-node.html">A taken control node is not the cluster taken</a></li><li><a href="../adr-unlock.html">The ways into a node's encrypted state, and what each leaves open</a></li><li><a href="../adr-workers.html">A worker keeps no Secret that nothing placed on it names</a></li><li><a href="../security-review-2.html">Security review 2</a></li></ol></nav>
   </details>
 </aside>
 <div class="page" role="main">
@@ -173,6 +173,64 @@ spec:
         ports: [{ port: 8080, publish: true }]
 </code></pre>
 <ul><li><strong>Through the tunnel, or nowhere.</strong> Before the pod's link is made, kithd writes rules that send everything the pod sends outside the cluster into the tunnel, or, with no tunnel, nowhere; the firewall drops whatever would leave by any other link, whether kithd runs or not. With the provider silent, or the tunnel or the Exit deleted, the pod reaches nothing outside: it never falls back to the node's own way out. IPv6 never leaves. Nothing comes in from the tunnel that was not started from this side, so the provider reaches none of the node's services.</li><li><strong>Names.</strong> The pod asks the exit's DNS (<code>DNS</code> in the file, or the Exit's <code>dns</code>) through the tunnel, never the node's resolver, so it has no cluster DNS names.</li><li><strong>Only where the tunnel is.</strong> An exit's pods are placed on its node; a node with no tunnel for it, or a kithd that is not root, does not start them. A Workload in a namespace the Exit does not list is refused. Only a Workload's pods leave by an exit, not a Job's, NodeWorkload's or exec unit's.</li><li><strong>Its web UI from the LAN.</strong> <code>publish: true</code> on a port (TCP, or <code>protocol: udp</code>) makes kithd listen on that port of each of the node's IPv4 addresses and pass each connection or datagram to the pod; replies go back the same way, not through the tunnel. <code>publish</code> works for any pod. The app must listen on <code>0.0.0.0</code>, not 127.0.0.1 alone, and sees each client as the pod's own address.<ul><li>A port belongs to the first pod of a namespace that has it; another of the same namespace waits, one of another namespace is refused. At most 8 ports a pod and 64 a node, none below 1024 or one kithd serves on (5000, 7443 and 51820).</li><li>A connection ends after 10 seconds with nothing sent, or 10 minutes once something has been.</li></ul></li><li><strong>An Exit</strong> is cluster-wide: whoever may write one decides which namespaces' pods leave through it, so a Role scoped to a namespace cannot. Only its node is sent it and its Secret. <code>Endpoint</code> has to be an address; the tunnel carries IPv4 only. Changing an Exit's namespaces or <code>dns</code> leaves its tunnel up, and a tunnel, rule or route taken away is made again within a minute.</li><li><strong>Not yet:</strong> OpenVPN, port forwarding, one key on two nodes, an exit's traffic from a pod on another node, and phones or laptops through an exit.</li></ul>
+<h3 id="a-workload-that-outlives-its-node">A workload that outlives its node <a class="anchor" href="#a-workload-that-outlives-its-node" aria-label="Link to this section">#</a></h3>
+<p>A dev session, a desktop app, a game server or a database is one process that holds state and runs for weeks. Kith keeps it going across a node's restarts with three kinds it has already: a Workload of one replica, its home on a replicated Volume, its key in a Secret, and each long command as a Job of its own.</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: home }
+spec:
+  node: alpha            # where it is first made: the files are in state/volumes/default/home/home
+  path: home
+  replicas: 2            # copies in all: this one, and one on another node
+  sync: 10s              # the other is brought up to date every 10 seconds (10s is the least)
+---
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: session-key }
+spec:
+  data:
+    API_KEY: replace-with-the-key
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: session }
+spec:
+  replicas: 1            # one: it is a process with one home, not a service to spread
+  template:
+    containers:
+      - name: dev
+        image: ghcr.io/example/devbox:1
+        volumeMounts: [{ volume: home, path: /home/dev }]
+        env:
+          - { name: API_KEY, secret: { name: session-key, key: API_KEY } }
+</code></pre>
+<p>The long commands are Jobs, so that the session itself is only what you type into, and a build, an index or a training run is a thing kith can see end, fail and run again:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: reindex }
+spec:
+  template:
+    containers:
+      - name: run
+        image: ghcr.io/example/devbox:1
+        command: [sh, -c, "cd /home/dev/project &amp;&amp; make index"]
+        volumeMounts: [{ volume: home, path: /home/dev }]
+---
+apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: nightly-build }
+spec:
+  template:
+    containers:
+      - name: run
+        image: ghcr.io/example/devbox:1
+        command: [sh, -c, "cd /home/dev/project &amp;&amp; make release"]
+        volumeMounts: [{ volume: home, path: /home/dev }]
+</code></pre>
+<p>A Workload or Job that mounts a Volume runs on the node that has it (the Volume's <code>primary</code>), so the session and its Jobs share one home. Put the key in the Secret and not in the image or the Volume. A worker is sent the Secrets of what is placed on it and no others, but a control node holds every Secret of the cluster (<code>docs/adr-workers.md</code>), so a key in a Secret is as safe as the cluster's control nodes are. Clients find the session after a move by a Service that selects the Workload, not by a node's address (<a href="cluster.html#services-across-nodes">Services across nodes</a>).</p>
+<p>What each restart of the node costs:</p>
+<div class="table"><table><thead><tr><th>What happens</th><th>The Volume</th><th>The Workload</th><th>What is lost</th></tr></thead><tbody><tr><td>A planned drain, or an OS update by an <code>UpdatePlan</code> with <code>drain: true</code> (<a href="cluster.html#restarting-a-node-on-purpose">restarting a node on purpose</a>)</td><td>The copy that synced last is asked to sync now and is handed over once it is current</td><td>Starts on that node in seconds, plus the image pull if that node does not have the image yet (<code>pullPolicy: ifNotPresent</code>)</td><td>Nothing is lost of what was written before the drain asked for the sync; a write in the seconds between that sync and the Workload's stop stays on the old node as <code>.PATH.was-TIME</code></td></tr><tr><td>A crash or a lost node, which is also an OS update without <code>drain: true</code>: the reboot is a loss</td><td>The copy that synced last becomes the primary once the node has been silent for <code>--lost-after</code>: about 5 minutes on a default cluster, and about 15 seconds with <code>--lost-after 10</code> (10 seconds is the least)</td><td>Starts on that node within one reconcile (5 seconds) of that, plus the image pull if needed</td><td>Writes of up to 10 seconds (the sync), those since the last sync; the old node keeps them as <code>.PATH.was-TIME</code></td></tr><tr><td>A Job that was running when its node went</td><td>A drain holds the Volume back until the Job ends</td><td>A planned drain waits for the Job and nothing is lost. After a loss, a Job on a replicated Volume starts over on the new primary from its first command; a Job on a Volume with no <code>replicas</code> waits for its node (<a href="cluster.html#checkpointing-a-long-gpu-job">checkpointing a long GPU Job</a>)</td><td>The Job's progress: it is in memory, so a Job that must not start over writes its own checkpoints into the home and reads the last at its start</td></tr></tbody></table></div>
+<ul><li><strong>Set <code>--lost-after</code> where kithd starts.</strong> <code>kithd --lost-after 10</code> (or <code>KITH_LOST_AFTER=10</code>) on every node; a node is lost after 10 seconds at the least, whatever smaller number is given. Left at its default, a crash is 5 minutes of nothing before the move.</li><li><strong>Seconds, not a lost-after, for a planned move.</strong> A drain is told the Workload's node is going, so nothing waits for a silence; the session is down for the time the container takes to start. After a loss the cost is what was written since the last sync: shorten <code>sync</code> to shrink it (10 seconds is the least), or save a file that must not be lost and wait out one sync.</li><li><strong>A process in memory is not kept.</strong> The session starts again from its home: a shell, an editor's buffers and a running server do not move, and a program that keeps its state in files (a game server's world, a database's data directory) comes back from the last sync of them. A database wants its own log or replication besides, as a copy 10 seconds old is a crash-consistent one, not a point it chose.</li><li><strong>No Kubernetes and no VM.</strong> Kith runs no Kubernetes and no virtual machine for this: the session is a container kithd starts, in the cluster's own scheduler, and a restart is the container started again on another node. Live migration of a VM workload (the memory, devices and the running process of a <code>vms</code> unit carried to another node) is a later, separate feature, and the costs above are for a container, not a VM.</li></ul>
 <h3 id="what-a-container-is-given">What a container is given <a class="anchor" href="#what-a-container-is-given" aria-label="Link to this section">#</a></h3>
 <p>Files from a ConfigMap or a Secret, directories of its replica's own, what it is told from maps and of itself, and containers that run before it. A Deployment sent through <a href="kubernetes.html#kubectl-and-helm-as-they-are">the Kubernetes API</a> says them as Kubernetes does:</p>
 <pre><code class="language-yaml">apiVersion: kith.dev/v1

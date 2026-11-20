@@ -2385,3 +2385,122 @@ fn a_node_says_its_lan_address_before_its_mesh_one() {
     assert_eq!(said(&node), ["10.9.0.2:7443", "[fd00::2]:7443"]);
     assert_eq!(node.lan_address().map(|ip| ip.to_string()).as_deref(), Some("10.9.0.2"));
 }
+
+const WORKLOADS_GUIDE: &str = include_str!("../../../docs/guide/workloads.md");
+
+/// The guide's section for a workload that outlives its node (T-1131): up to the next heading.
+fn session_section() -> &'static str {
+    let from = WORKLOADS_GUIDE
+        .find("### A workload that outlives its node")
+        .expect("docs/guide/workloads.md has a section '### A workload that outlives its node'");
+    let section = &WORKLOADS_GUIDE[from..];
+    let end = section[4..].find("\n#").map_or(section.len(), |at| at + 4);
+    &section[..end]
+}
+
+/// The yaml blocks of `text`, each as written.
+fn yaml_blocks(text: &str) -> Vec<String> {
+    text.split("```yaml\n")
+        .skip(1)
+        .map(|block| block.split("```").next().unwrap().to_string())
+        .collect()
+}
+
+/// Every yaml block of the section is taken by kith-api whole, and together they are the recipe:
+/// a Volume with replicas and a short sync, a Secret, one Workload of one replica that mounts the
+/// Volume and reads the Secret into its env, and Jobs that mount the same Volume.
+#[test]
+fn session_recipe_validates() {
+    let blocks = yaml_blocks(session_section());
+    assert!(!blocks.is_empty(), "the section has no yaml block");
+    let mut kinds = Vec::new();
+    for block in &blocks {
+        let docs = Resource::from_source(block).unwrap_or_else(|e| panic!("{e}\n{block}"));
+        for doc in docs {
+            let doc = doc.map_err(|e| e.to_string()).and_then(Resource::validated);
+            let doc = doc.unwrap_or_else(|e| panic!("{e}\n{block}"));
+            kinds.push((doc.kind.clone(), doc.metadata.name.clone(), doc.spec.clone()));
+        }
+    }
+    let of = |kind: &str| kinds.iter().filter(|(k, ..)| k == kind).collect::<Vec<_>>();
+    let [(_, home, volume)] = of("Volume")[..] else {
+        panic!("one Volume: {kinds:?}")
+    };
+    assert!(
+        volume["replicas"].as_u64() >= Some(2),
+        "the home has a copy on another node: {volume}"
+    );
+    let sync = volume["sync"].as_str().expect("the home says its sync");
+    let seconds = sync.strip_suffix('s').and_then(|s| s.parse::<u64>().ok());
+    assert!(
+        seconds.is_some_and(|s| (10..=60).contains(&s)),
+        "a short sync in seconds: {sync}"
+    );
+    let [(_, secret, _)] = of("Secret")[..] else {
+        panic!("one Secret: {kinds:?}")
+    };
+    let [(_, _, workload)] = of("Workload")[..] else {
+        panic!("one Workload: {kinds:?}")
+    };
+    assert_eq!(workload["replicas"], 1, "one replica: {workload}");
+    let unit = &workload["template"]["containers"][0];
+    let mounts = |unit: &Value| unit["volumeMounts"].as_array().cloned().unwrap_or_default();
+    assert!(
+        mounts(unit).iter().any(|m| m["volume"] == home.as_str()),
+        "the home is mounted: {unit}"
+    );
+    let env = unit["env"].as_array().cloned().unwrap_or_default();
+    assert!(
+        env.iter().any(|e| e["secret"]["name"] == secret.as_str()),
+        "the key is read from the Secret: {unit}"
+    );
+    let jobs = of("Job");
+    assert!(jobs.len() >= 2, "long commands are separate Jobs: {kinds:?}");
+    for (_, name, job) in jobs {
+        let unit = &job["template"]["containers"][0];
+        assert!(
+            mounts(unit).iter().any(|m| m["volume"] == home.as_str()),
+            "Job {name} works in the home: {job}"
+        );
+    }
+}
+
+/// The section says what each of three restarts costs, as a table, with the sync's number.
+#[test]
+fn session_recipe_costs_are_said() {
+    let section = session_section();
+    let sync = yaml_blocks(section)
+        .iter()
+        .flat_map(|block| Resource::from_source(block).unwrap())
+        .map(|doc| doc.unwrap())
+        .find(|doc| doc.kind == "Volume")
+        .and_then(|doc| doc.spec["sync"].as_str().map(str::to_string))
+        .expect("the recipe's Volume says its sync");
+    let seconds = sync.trim_end_matches('s');
+    let row = |first: &str| {
+        let row = section
+            .lines()
+            .find(|line| line.starts_with('|') && line[1..].trim_start().starts_with(first));
+        row.unwrap_or_else(|| panic!("the cost table has no row for {first:?}"))
+            .to_lowercase()
+    };
+    let planned = row("A planned drain, or an OS update");
+    assert!(
+        planned.contains("handed over") && planned.contains("seconds"),
+        "{planned}"
+    );
+    assert!(planned.contains("nothing is lost"), "{planned}");
+    // An OS update is a handover only through a plan that drains; without it the reboot is a loss.
+    assert!(planned.contains("`drain: true`"), "{planned}");
+    assert!(planned.contains("image pull"), "{planned}");
+    let lost = row("A crash or a lost node");
+    assert!(lost.contains("without `drain: true`"), "{lost}");
+    assert!(lost.contains("5 minutes") && lost.contains("--lost-after 10"), "{lost}");
+    assert!(
+        lost.contains(&format!("up to {seconds} seconds")),
+        "the row says the sync's {seconds} seconds: {lost}"
+    );
+    assert!(lost.contains("last sync"), "{lost}");
+    let job = row("A Job that was running");
+    assert!(job.contains("waits") && job.contains("starts over"), "{job}");
+}
