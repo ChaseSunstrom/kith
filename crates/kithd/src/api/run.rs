@@ -85,7 +85,18 @@ async fn take(mut request: Request) -> Result<(Spec, OnUpgrade, axum::body::Byte
                 "the ask's body did not arrive in time".to_string(),
             )
         })?
-        .map_err(|e| (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()))?;
+        .map_err(|e| {
+            // (Too long is 413; a body that broke on the way is the caller's, 400.)
+            let long = std::error::Error::source(&e).is_some_and(|s| s.to_string().contains("length limit"));
+            (
+                if long {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                e.to_string(),
+            )
+        })?;
     let spec: Spec = serde_json::from_slice(&bytes).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     if spec.argv.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "argv names no program".into()));
@@ -157,15 +168,16 @@ pub async fn run(
     Extension(caller): Extension<Caller>,
     request: Request,
 ) -> Response {
+    // The app runs as kithd's user, outside any container: that is the run of the node, so it
+    // takes a rule for the whole cluster (`exec` on `Node`, no namespaces), never one namespace's.
+    // (Before the body is read: a caller that may not run anything makes kithd buffer nothing.)
+    if let Err(refused) = permit(&shared, &caller, Verb::Exec, |_| vec![("Node".into(), None)]) {
+        return refused.into_response();
+    }
     let (spec, upgrade, _) = match take(request).await {
         Ok(taken) => taken,
         Err((status, why)) => return say(status, why),
     };
-    // The app runs as kithd's user, outside any container: that is the run of the node, so it
-    // takes a rule for the whole cluster (`exec` on `Node`, no namespaces), never one namespace's.
-    if let Err(refused) = permit(&shared, &caller, Verb::Exec, |_| vec![("Node".into(), None)]) {
-        return refused.into_response();
-    }
     let (node, there) = match resolve(&shared, &spec.on) {
         Ok(found) => found,
         Err(e) => return e.into_response(),
@@ -379,7 +391,13 @@ struct Leaf(PathBuf);
 impl Leaf {
     /// `None` where none can be made (no cgroup v2, no delegation): the process group is all there is.
     fn make(name: &str) -> Option<Leaf> {
-        kith_runtime::leaf_cgroup(name).ok().map(Leaf)
+        match kith_runtime::leaf_cgroup(name) {
+            Ok(leaf) => Some(Leaf(leaf)),
+            Err(e) => {
+                eprintln!("kithd: run: no cgroup for this run, the process group is all that ends it: {e}");
+                None
+            }
+        }
     }
 
     fn kill(&self) {
@@ -448,7 +466,11 @@ impl App {
             _ => format!("cannot start {via} on node {node}: {e}"),
         })?;
         if let (Some(leaf), Some(pid)) = (&leaf, child.id()) {
-            let _ = std::fs::write(leaf.0.join("cgroup.procs"), pid.to_string());
+            if let Err(e) = std::fs::write(leaf.0.join("cgroup.procs"), pid.to_string()) {
+                eprintln!(
+                    "kithd: run: could not put the app in its cgroup, the process group is all that ends it: {e}"
+                );
+            }
         }
         Ok(App {
             group: child.id().and_then(|pid| i32::try_from(pid).ok()),
