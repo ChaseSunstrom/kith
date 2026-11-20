@@ -41,9 +41,14 @@ pub struct Node {
     pub up: bool,
     /// It carries the `kith.dev/drain` taint now.
     pub drained: bool,
+    /// That drain is stamped by an UpdatePlan that is gone: a plan that picks the node takes it over.
+    pub stale: bool,
     /// What the drain plan says moves off it and is not running elsewhere yet
     /// (`sched::drain_waits`); read only for a node the plan is draining.
     pub waits: Vec<String>,
+    /// A seat of it that last said `active` or `fullscreen` (its name, and which); none for a node
+    /// whose seats are idle, say nothing or are not there.
+    pub seat: Option<(String, String)>,
 }
 
 /// What [`step`] wants written.
@@ -66,12 +71,18 @@ struct Held {
     drain: Vec<(String, bool)>,
     /// Nodes whose drain was lifted, until a Node shows none: a lift that was lost is made up.
     lifting: Vec<String>,
+    /// Nodes held back for a seat that is not idle, and since when (`waitForIdleSeats`).
+    idle: BTreeMap<String, u64>,
 }
 
 /// Seconds a drain waits for what moves, unless the plan says (`drainSeconds`).
 const DRAIN_SECONDS: u64 = 300;
 /// The most a plan may ask a drain to wait: a node is not held off its update for longer.
 const DRAIN_CEILING: u64 = 3600;
+/// Seconds a node waits for its seat to be idle, unless the plan says (`idleWaitSeconds`), and the
+/// most it may ask: the update never hangs on a machine in daily use.
+const IDLE_SECONDS: u64 = 3600;
+const IDLE_CEILING: u64 = 86_400;
 
 /// How many replicas, as words. The plan's status says how many, never which: an UpdatePlan is
 /// read by whoever may read UpdatePlans, and a replica's name is its namespace's.
@@ -187,11 +198,20 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
         .flatten()
         .filter_map(|(name, why)| Some((name.clone(), why.as_str()?.to_string())))
         .collect();
+    // The wait for a seat counts continuous picking: it is kept only by the pass that picks, so any
+    // other (paused, a closed window, no release) writes none and the clock starts again.
+    let mut idle_before: BTreeMap<String, u64> = old
+        .and_then(|status| status["idleSince"].as_object())
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, at)| Some((name.clone(), at.as_u64()?)))
+        .collect();
     let mut held = Held {
         drained: names("drained"),
         gave,
         drain: Vec::new(),
         lifting: Vec::new(),
+        idle: BTreeMap::new(),
     };
     // A lift that was lost (the Node still shows the drain) is asked for again.
     for name in names("undraining") {
@@ -212,6 +232,7 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
             ("drained".to_string(), json!(held.drained)),
             ("undraining".to_string(), json!(held.lifting)),
             ("gaveUp".to_string(), json!(held.gave)),
+            ("idleSince".to_string(), json!(held.idle)),
         ]),
         cordon,
         drain: held.drain,
@@ -235,6 +256,7 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
             let_go(&name, &mut cordoned, &mut held, &mut cordon);
         }
         held.gave.clear();
+        idle_before.clear();
     }
     let selected = |node: &&Node| {
         let wanted = spec["selector"].as_object();
@@ -375,12 +397,42 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
         .collect();
     waiting.sort_by_key(|node| (node.voter, node.leader, node.name.clone()));
     let voters_up = nodes.iter().filter(|node| node.voter).all(|node| node.up);
+    // With `waitForIdleSeats` a node whose seat is busy is not picked, until `idleWaitSeconds` from
+    // when it was first held back (a seat that says idle, or none, ends the wait).
+    let idle_patience = spec["idleWaitSeconds"]
+        .as_u64()
+        .unwrap_or(IDLE_SECONDS)
+        .min(IDLE_CEILING);
+    let idle_wait = spec["waitForIdleSeats"].as_bool() == Some(true);
+    let mut idle = BTreeMap::new();
+    let mut seat_waits = Vec::new();
     for node in waiting {
         let now_going = going(&states);
         let alone = now_going.is_empty();
         let fits = now_going.len() < most && !now_going.iter().any(|other| other.voter);
+        let busy = node.seat.as_ref().filter(|_| idle_wait);
+        // (The count runs while it waits for its turn too.)
+        let began = idle_before.get(&node.name).copied().unwrap_or(now);
+        if busy.is_some() {
+            idle.insert(node.name.clone(), began);
+        }
         if !(if node.voter { alone && voters_up } else { fits }) {
             continue;
+        }
+        if let Some((seat, says)) = busy {
+            if now.saturating_sub(began) < idle_patience {
+                seat_waits.push(format!(
+                    "waiting for seat {seat} of {} to be idle (it says {says})",
+                    node.name
+                ));
+                continue;
+            }
+            let why = format!(
+                "{} was let go after {idle_patience} seconds: seat {seat} still said {says}",
+                node.name
+            );
+            held.gave.insert(node.name.clone(), why);
+            idle.remove(&node.name);
         }
         since.insert(node.name.clone(), now);
         if spec["drain"].as_bool() == Some(true) {
@@ -395,7 +447,7 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
                 held.lifting.remove(at);
                 held.drain.retain(|(name, on)| *name != node.name || *on);
             }
-            if !node.drained || lifting.is_some() {
+            if !node.drained || node.stale || lifting.is_some() {
                 held.drained.push(node.name.clone());
                 held.drain.push((node.name.clone(), true));
             }
@@ -403,6 +455,7 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
             states.insert(node.name.clone(), "updating".into());
         }
     }
+    held.idle = idle;
     let stuck = going(&states).is_empty() && !voters_up;
     let draining: Vec<&Node> = going(&states)
         .into_iter()
@@ -423,7 +476,12 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
     } else {
         (
             "Progressing",
-            held.gave.values().cloned().collect::<Vec<_>>().join("; "),
+            held.gave
+                .values()
+                .cloned()
+                .chain(seat_waits)
+                .collect::<Vec<_>>()
+                .join("; "),
         )
     };
     done(phase, why, states, since, cordoned, cordon, held)
@@ -471,19 +529,104 @@ fn drained_spec(spec: &Value, on: bool) -> Option<Value> {
     (next != *spec).then_some(next)
 }
 
+/// Stamps the plan on the record under `key`, in its taint's value (`plan:NAME`, after `owner;`
+/// when an owner cordoned the node first): the Taint has no other field to name it in. A record
+/// an operator put on has no stamp, so no plan's end lifts it.
+fn stamp(spec: &mut Value, key: &str, plan: &str) {
+    let Some(taint) = spec["taints"]
+        .as_array_mut()
+        .and_then(|taints| taints.iter_mut().find(|taint| taint["key"] == key))
+    else {
+        return;
+    };
+    let owner = taint["value"]
+        .as_str()
+        .is_some_and(|v| v == "owner" || v.starts_with("owner;"));
+    taint["value"] = format!("{}plan:{plan}", if owner { "owner;" } else { "" }).into();
+}
+
+/// The spec `what` makes of `spec`, with the record stamped by `plan` when this write puts it
+/// on, or when it is one a plan that is no longer `live` left (taken over, not left to the
+/// sweep). A record that was there with no stamp, or another live plan's, is not the plan's:
+/// it is left as it is. `None` when nothing changes.
+fn written(
+    spec: &Value,
+    on: bool,
+    what: fn(&Value, bool) -> Option<Value>,
+    record: &str,
+    plan: &str,
+    live: &dyn Fn(&str) -> bool,
+) -> Option<Value> {
+    if !on && crate::sched::has_record(spec, record) {
+        // Only the plan's own record is lifted by it; the sweep (`plan` empty) lifts a gone plan's.
+        let by = stamped_by(spec, record);
+        if !(if plan.is_empty() {
+            by.is_some_and(|by| !live(by))
+        } else {
+            by == Some(plan)
+        }) {
+            return None;
+        }
+    }
+    let mut next = what(spec, on).unwrap_or_else(|| spec.clone());
+    let ours = !crate::sched::has_record(spec, record) || stamped_by(spec, record).is_some_and(|by| !live(by));
+    if on && ours {
+        stamp(&mut next, record, plan);
+    }
+    (next != *spec).then_some(next)
+}
+
+/// The plan whose stamp the record under `key` carries, if it has one.
+fn stamped_by<'a>(spec: &'a Value, key: &str) -> Option<&'a str> {
+    let taint = spec["taints"].as_array()?.iter().find(|taint| taint["key"] == key)?;
+    let value = taint["value"].as_str()?;
+    value.strip_prefix("owner;").unwrap_or(value).strip_prefix("plan:")
+}
+
+/// The cordon records on Nodes that an UpdatePlan which is gone put on: (node, record key).
+/// `live` says whether a plan of that name exists.
+fn orphans<'a>(
+    nodes: impl Iterator<Item = (&'a str, &'a Value)>,
+    live: impl Fn(&str) -> bool,
+) -> Vec<(String, &'static str)> {
+    let mut found = Vec::new();
+    for (name, spec) in nodes {
+        for key in [kith_sched::DRAIN, crate::sched::UPDATE_CORDON] {
+            if stamped_by(spec, key).is_some_and(|plan| !live(plan)) {
+                found.push((name.to_string(), key));
+            }
+        }
+    }
+    found
+}
+
 /// Set or lift the update's cordon (`what` is `cordoned_spec`) or drain (`drained_spec`) on
-/// `name`. Each try re-reads the Node, so a try that lost a race to another write (a Conflict)
+/// `name`; `record` is its taint's key, and a record put on is stamped with `plan`. Each try
+/// re-reads the Node, so a try that lost a race to another write (a Conflict)
 /// is finished by the next one; a bounded number of tries.
-async fn write_cordon(shared: &Shared, name: &str, on: bool, what: fn(&Value, bool) -> Option<Value>) {
+async fn write_cordon(
+    shared: &Shared,
+    name: &str,
+    on: bool,
+    what: fn(&Value, bool) -> Option<Value>,
+    record: &str,
+    plan: &str,
+) {
     const TRIES: usize = 3;
     let key = format!("Node/{name}");
     for _ in 0..TRIES {
-        let found = {
+        let (found, gone) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
-            state.store.get(&key).cloned()
+            let found = state.store.get(&key).cloned();
+            // (Is the plan that stamped the record on the Node gone? `written` asks only of that one.)
+            let gone = found
+                .as_ref()
+                .and_then(|node| stamped_by(&node.spec, record))
+                .map(|by| state.store.get(&format!("UpdatePlan/{by}")).is_none());
+            (found, gone.unwrap_or(false))
         };
         let Some(mut node) = found else { return };
-        let Some(spec) = what(&node.spec, on) else {
+        let Some(spec) = written(&node.spec, on, what, record, plan, &|_| !gone) else {
             return;
         };
         node.spec = spec;
@@ -540,6 +683,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                         .map(|(name, _)| name.clone())
                 })
                 .collect();
+            let live = |plan: &str| store.get(&format!("UpdatePlan/{plan}")).is_some();
             let node = |node: &Resource| {
                 let status = node.status.as_ref();
                 let text = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_string);
@@ -549,7 +693,11 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 let lost = shared.members.lost_for(&name, now);
                 let unreachable = status.is_some_and(|status| status["state"] == "unreachable");
                 Node {
+                    seat: crate::seats::busy(store, &name),
                     drained: crate::sched::has_record(&node.spec, kith_sched::DRAIN),
+                    stale: orphans([(name.as_str(), &node.spec)].into_iter(), live)
+                        .iter()
+                        .any(|(_, record)| *record == kith_sched::DRAIN),
                     waits: if draining.contains(&name) {
                         crate::sched::drain_waits(store, &seen, grace, &name)
                     } else {
@@ -584,8 +732,36 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                     let statuses = vec![(plan.key(), decided.status)];
                     commands.push(Command::Patch { statuses });
                 }
-                cordons.extend(decided.cordon);
-                drains.extend(decided.drain);
+                let by = |(name, on)| (name, on, plan.metadata.name.clone());
+                cordons.extend(decided.cordon.into_iter().map(by));
+                drains.extend(decided.drain.into_iter().map(by));
+            }
+            // What a plan that is gone put on is lifted (written again each round until it is),
+            // except on a node a live plan has or is just now taking: it takes the record over.
+            let mut busy: Vec<String> = (cordons.iter().chain(&drains))
+                .filter(|(_, on, _)| *on)
+                .map(|(name, _, _)| name.clone())
+                .collect();
+            for plan in store.list(Some("UpdatePlan")) {
+                let nodes = plan.status.as_ref().and_then(|status| status["nodes"].as_object());
+                let going = nodes
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, state)| *state == "draining" || *state == "updating");
+                busy.extend(going.map(|(name, _)| name.clone()));
+            }
+            let nodes = store
+                .list(Some("Node"))
+                .map(|node| (node.metadata.name.as_str(), &node.spec));
+            for (name, record) in orphans(nodes, live)
+                .into_iter()
+                .filter(|(name, _)| !busy.contains(name))
+            {
+                if record == kith_sched::DRAIN {
+                    drains.push((name, false, String::new()));
+                } else {
+                    cordons.push((name, false, String::new()));
+                }
             }
         }
         for command in commands {
@@ -593,11 +769,19 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 eprintln!("kithd: writing down an update plan's step: {e}");
             }
         }
-        for (name, cordoned) in cordons {
-            write_cordon(&shared, &name, cordoned, cordoned_spec).await;
+        for (name, cordoned, plan) in cordons {
+            write_cordon(
+                &shared,
+                &name,
+                cordoned,
+                cordoned_spec,
+                crate::sched::UPDATE_CORDON,
+                &plan,
+            )
+            .await;
         }
-        for (name, drained) in drains {
-            write_cordon(&shared, &name, drained, drained_spec).await;
+        for (name, drained, plan) in drains {
+            write_cordon(&shared, &name, drained, drained_spec, kith_sched::DRAIN, &plan).await;
         }
     }
 }
@@ -1563,7 +1747,11 @@ pub async fn node(
                                 "kithd: kith OS {wanted} differs in kithd alone: handing over to the kithd staged"
                             );
                             // (The keeper counts a kithd that ends sooner than this as a failure.)
-                            tokio::time::sleep(crate::keeper::HANDOVER_AFTER + Duration::from_secs(1)).await;
+                            // (A stop asked for in the wait, the power button or SIGTERM, is that stop's: no hand-over.)
+                            tokio::select! {
+                                _ = tokio::time::sleep(crate::keeper::HANDOVER_AFTER + Duration::from_secs(1)) => {}
+                                _ = stopping.changed() => return,
+                            }
                             // (Set only now: a power-button stop during the wait is not a hand-over.)
                             crate::init::HANDING_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
                             shared.stop.send_replace(true);
@@ -2692,6 +2880,201 @@ mod tests {
         assert_eq!(done.status["drained"], json!([]));
     }
 
+    /// A node as the plan leaves it: the drain (and the update's cordon) it put on, stamped with it.
+    fn put_on_by(spec: &Value, plan: &str, drain: bool) -> Value {
+        let mut next = if drain {
+            drained_spec(spec, true)
+        } else {
+            cordoned_spec(spec, true)
+        }
+        .expect("a record to put on");
+        stamp(
+            &mut next,
+            if drain {
+                kith_sched::DRAIN
+            } else {
+                crate::sched::UPDATE_CORDON
+            },
+            plan,
+        );
+        next
+    }
+
+    /// What the sweep would lift from these nodes when only the plans in `live` exist.
+    fn swept(nodes: &[(&str, &Value)], live: &[&str]) -> Vec<(String, &'static str)> {
+        orphans(nodes.iter().map(|(name, spec)| (*name, *spec)), |plan| {
+            live.contains(&plan)
+        })
+    }
+
+    #[test]
+    fn update_delete_lifts_the_drain_and_cordon_the_plan_put_on_and_no_operators() {
+        let (drain, cordon) = (kith_sched::DRAIN, crate::sched::UPDATE_CORDON);
+        // The plan's own drain, its own cordon, a drain on a node an owner had cordoned first.
+        let drained = put_on_by(&json!({}), "p", true);
+        let cordoned = put_on_by(&json!({}), "p", false);
+        let owned = put_on_by(&json!({ "unschedulable": true }), "p", true);
+        // The operator's: a drain with no stamp, one an owner cordoned over, a cordon of theirs,
+        // and a drain the operator re-put after the plan's was lifted.
+        let mut theirs = json!({});
+        crate::sched::drain_on(&mut theirs);
+        let mut theirs_owned = json!({ "unschedulable": true });
+        crate::sched::drain_on(&mut theirs_owned);
+        let cordon_only = json!({ "unschedulable": true });
+        let nodes = [
+            ("drained", &drained),
+            ("cordoned", &cordoned),
+            ("owned", &owned),
+            ("theirs", &theirs),
+            ("theirs-owned", &theirs_owned),
+            ("cordon-only", &cordon_only),
+        ];
+        // The plan is there: nothing is lifted.
+        assert!(swept(&nodes, &["p"]).is_empty());
+        // The plan is deleted: its records, and only those.
+        let lifted = swept(&nodes, &[]);
+        assert_eq!(
+            lifted,
+            [
+                ("drained".to_string(), drain),
+                ("cordoned".to_string(), cordon),
+                ("owned".to_string(), drain)
+            ]
+        );
+        // Another plan's records stay while that plan is there.
+        assert_eq!(swept(&nodes, &["q"]), lifted);
+        // Lifting leaves no taint and no cordon, except the owner's cordon.
+        assert_eq!(drained_spec(&drained, false).expect("a lift")["taints"], json!([]));
+        assert!(drained_spec(&drained, false).unwrap().get("unschedulable").is_none());
+        assert!(cordoned_spec(&cordoned, false).unwrap().get("unschedulable").is_none());
+        let kept = drained_spec(&owned, false).expect("a lift");
+        assert_eq!(
+            (kept["taints"].clone(), kept["unschedulable"].clone()),
+            (json!([]), json!(true))
+        );
+        // A lift that was lost is asked for again: the nodes are the same, so is the sweep.
+        assert_eq!(swept(&nodes, &[]), lifted);
+        // The plan's stamp survives the drain and the update cordon on one node, and an owner
+        // record gone from under it.
+        let both = put_on_by(&drained, "p", false);
+        assert_eq!(
+            swept(&[("n", &both)], &[]),
+            [("n".to_string(), drain), ("n".to_string(), cordon)]
+        );
+        let after_drain = drained_spec(&both, false).expect("a lift");
+        assert_eq!(swept(&[("n", &after_drain)], &[]), [("n".to_string(), cordon)]);
+        assert_eq!(after_drain["unschedulable"], true);
+    }
+
+    /// A plan picks a node that carries a record of a plan deleted in the same snapshot (a
+    /// rename, or two plans on one selector): the new plan takes the record over, and the sweep
+    /// leaves the node alone, so it keeps its drain and cordon.
+    #[test]
+    fn update_delete_lifts_not_what_a_plan_picking_the_node_takes_over() {
+        let (drain, cordon) = (kith_sched::DRAIN, crate::sched::UPDATE_CORDON);
+        for owner in [false, true] {
+            let base = if owner {
+                json!({ "unschedulable": true })
+            } else {
+                json!({})
+            };
+            let mut spec = put_on_by(&put_on_by(&base, "q", true), "q", false);
+            let live = |plan: &str| plan == "p";
+            assert_eq!(
+                orphans([("a", &spec)].into_iter(), live),
+                [("a".to_string(), drain), ("a".to_string(), cordon)]
+            );
+            // The plan sees a drain that is a gone plan's, and holds it as its own.
+            let mut nodes = vec![node("a", "1", false)];
+            nodes[0].drained = true;
+            nodes[0].stale = true;
+            let picked = step(&plan(json!({ "drain": true }), None), Some(("2", "next@1")), &nodes, 0);
+            assert_eq!(picked.drain, [("a".to_string(), true)]);
+            assert_eq!(picked.status["drained"], json!(["a"]));
+            // Written with its stamp over the old one, the sweep finds nothing; a second write is no change.
+            for (record, what) in [
+                (drain, drained_spec as fn(&Value, bool) -> Option<Value>),
+                (cordon, cordoned_spec),
+            ] {
+                spec = written(&spec, true, what, record, "p", &live).expect("a stamp to take over");
+                assert_eq!(written(&spec, true, what, record, "p", &live), None);
+            }
+            assert!(orphans([("a", &spec)].into_iter(), live).is_empty(), "{spec}");
+            // The owner's cordon is still said to be an owner's.
+            assert_eq!(
+                spec["taints"][0]["value"].as_str().unwrap().starts_with("owner;"),
+                owner,
+                "{spec}"
+            );
+        }
+    }
+
+    /// A record that was there before the plan's write, with no stamp or another live plan's, is
+    /// not the plan's: it is not stamped, so no end or deletion of the plan lifts it.
+    #[test]
+    fn update_delete_lifts_not_an_operators_record_a_plan_writes_over() {
+        let (drain, cordon) = (kith_sched::DRAIN, crate::sched::UPDATE_CORDON);
+        let live = |plan: &str| plan == "p" || plan == "q";
+        let mut drained = json!({});
+        crate::sched::drain_on(&mut drained);
+        let mut drained_over_owner = json!({ "unschedulable": true });
+        crate::sched::drain_on(&mut drained_over_owner);
+        let mut cordoned = json!({});
+        crate::sched::cordon_on(&mut cordoned, crate::sched::UPDATE_CORDON, "noSchedule");
+        let theirs_live = put_on_by(&json!({}), "q", true);
+        let drains = [&drained, &drained_over_owner, &theirs_live];
+        for spec in drains {
+            assert_eq!(written(spec, true, drained_spec, drain, "p", &live), None, "{spec}");
+        }
+        assert_eq!(written(&cordoned, true, cordoned_spec, cordon, "p", &live), None);
+        // Deleted plans: only the stamped one is the plan's.
+        let none = |_: &str| false;
+        assert!(
+            orphans(
+                [("a", &drained), ("b", &drained_over_owner), ("c", &cordoned)].into_iter(),
+                none
+            )
+            .is_empty()
+        );
+        // A record the write creates is stamped.
+        let made = written(&json!({}), true, drained_spec, drain, "p", &live).expect("a drain");
+        assert_eq!(made["taints"][0]["value"], "plan:p");
+    }
+
+    /// A lift takes off only a record that is the plan's own (its stamp), or, for the sweep (plan
+    /// `""`), one a gone plan left: not an operator's drain put on after the plan's.
+    #[test]
+    fn update_delete_lifts_not_a_record_put_on_after_the_plans() {
+        let (drain, cordon) = (kith_sched::DRAIN, crate::sched::UPDATE_CORDON);
+        let live = |plan: &str| plan == "p" || plan == "q";
+        // The plan drained and cordoned `a`; the operator undrained and drained again: a new,
+        // unstamped record. The plan's end, and the sweep, leave it.
+        let mut spec = put_on_by(&json!({}), "p", true);
+        let mut redone = spec.clone();
+        apply_drain(&mut redone, false);
+        apply_drain(&mut redone, true);
+        assert_eq!(stamped_by(&redone, drain), None);
+        assert_eq!(written(&redone, false, drained_spec, drain, "p", &live), None);
+        assert_eq!(written(&redone, false, drained_spec, drain, "", &|_| false), None);
+        // The same for the update's cordon.
+        let mut cordoned = json!({});
+        crate::sched::cordon_on(&mut cordoned, cordon, "noSchedule");
+        assert_eq!(written(&cordoned, false, cordoned_spec, cordon, "p", &live), None);
+        assert_eq!(written(&cordoned, false, cordoned_spec, cordon, "", &|_| false), None);
+        // Its own stamp is lifted by it, and by no other live plan; the sweep lifts it only
+        // once the plan is gone.
+        assert_eq!(written(&spec, false, drained_spec, drain, "q", &live), None);
+        assert_eq!(written(&spec, false, drained_spec, drain, "", &live), None);
+        let lifted = written(&spec, false, drained_spec, drain, "p", &live).expect("its own drain");
+        assert!(!crate::sched::has_record(&lifted, drain), "{lifted}");
+        let gone = written(&spec, false, drained_spec, drain, "", &|plan| plan != "p").expect("a gone plan's");
+        assert!(!crate::sched::has_record(&gone, drain), "{gone}");
+        // With nothing recorded there is nothing to lift (an older kithd's update cordon is
+        // still taken off as before).
+        spec = json!({ "unschedulable": true });
+        assert!(written(&spec, false, cordoned_spec, cordon, "p", &live).is_some());
+    }
+
     #[test]
     fn update_drain_leaves_the_operators() {
         let spec = json!({ "drain": true });
@@ -2879,6 +3262,106 @@ mod tests {
             (&json!("Done"), &json!(""))
         );
         assert_eq!(done.drain, [("a".to_string(), false)]);
+    }
+
+    fn seated(name: &str, says: &str) -> Node {
+        Node {
+            seat: Some((format!("{name}-seat0"), says.into())),
+            ..node(name, "1", false)
+        }
+    }
+
+    #[test]
+    fn update_waits_for_idle_seats() {
+        let spec = json!({ "waitForIdleSeats": true, "maxUnavailable": 3 });
+        let go = |spec: &Value, last: Option<&Decided>, nodes: &[Node], at: u64| {
+            step(&plan(spec.clone(), last), Some(("2", "next@1")), nodes, at)
+        };
+        let mut nodes = vec![seated("a", "active"), seated("b", "fullscreen"), node("c", "1", false)];
+        // Active and fullscreen wait, and the message names the seat and that it waits; a node with
+        // no seat goes.
+        let first = go(&spec, None, &nodes, 0);
+        assert_eq!(told(&first), ["c"]);
+        let reason = first.status["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("a-seat0") && reason.contains("b-seat0") && reason.contains("idle"),
+            "{reason}"
+        );
+        // One seat says idle (or its report is anything else but active or fullscreen): that node goes.
+        nodes[0].seat = None;
+        nodes[1].seat = None;
+        let second = go(&spec, Some(&first), &nodes, 10);
+        assert_eq!(told(&second), ["a", "b", "c"]);
+        assert!(
+            second.status["reason"].as_str().unwrap().is_empty(),
+            "{:?}",
+            second.status["reason"]
+        );
+    }
+
+    #[test]
+    fn update_idle_seats_off_and_gives_up() {
+        let go = |spec: &Value, last: Option<&Decided>, nodes: &[Node], at: u64| {
+            step(&plan(spec.clone(), last), Some(("2", "next@1")), nodes, at)
+        };
+        let nodes = vec![seated("a", "active")];
+        // Unset or false: the seat is not looked at.
+        for spec in [json!({}), json!({ "waitForIdleSeats": false })] {
+            let decided = go(&spec, None, &nodes, 0);
+            assert_eq!(told(&decided), ["a"], "{spec}");
+            assert_eq!(decided.status["reason"], "");
+        }
+        // A seat that stays active lets the node go after 3600 seconds, with the reason.
+        let spec = json!({ "waitForIdleSeats": true });
+        let first = go(&spec, None, &nodes, 1000);
+        assert!(told(&first).is_empty());
+        let late = go(&spec, Some(&first), &nodes, 1000 + 3599);
+        assert!(told(&late).is_empty());
+        let gave = go(&spec, Some(&late), &nodes, 1000 + 3600);
+        assert_eq!(told(&gave), ["a"]);
+        let reason = gave.status["reason"].as_str().unwrap();
+        assert!(reason.contains("a-seat0") && reason.contains("3600"), "{reason}");
+        // The plan's own seconds count, with a ceiling.
+        let quick = json!({ "waitForIdleSeats": true, "idleWaitSeconds": 60 });
+        let first = go(&quick, None, &nodes, 0);
+        assert!(told(&go(&quick, Some(&first), &nodes, 59)).is_empty());
+        assert_eq!(told(&go(&quick, Some(&first), &nodes, 60)), ["a"]);
+        let long = json!({ "waitForIdleSeats": true, "idleWaitSeconds": 10_000_000 });
+        let first = go(&long, None, &nodes, 0);
+        assert!(told(&go(&long, Some(&first), &nodes, 86_399)).is_empty());
+        assert_eq!(told(&go(&long, Some(&first), &nodes, 86_400)), ["a"]);
+    }
+
+    /// The wait for a seat counts continuous picking: a pause or a closed window restarts it.
+    #[test]
+    fn update_idle_wait_restarts_after_a_pause_or_a_closed_window() {
+        let go = |spec: &Value, last: Option<&Decided>, nodes: &[Node], at: u64| {
+            step(&plan(spec.clone(), last), Some(("2", "next@1")), nodes, at)
+        };
+        let nodes = vec![seated("a", "active")];
+        let open = json!({ "waitForIdleSeats": true });
+        let first = go(&open, None, &nodes, 1000);
+        assert!(told(&first).is_empty());
+        // Paused for a day: the next pass picks again, and the clock starts there.
+        let paused = go(
+            &json!({ "waitForIdleSeats": true, "paused": true }),
+            Some(&first),
+            &nodes,
+            1000 + 86_400,
+        );
+        assert_eq!(paused.status["idleSince"], json!({}));
+        let again = go(&open, Some(&paused), &nodes, 1000 + 86_400);
+        assert!(told(&again).is_empty(), "{:?}", again.status);
+        assert_eq!(told(&go(&open, Some(&again), &nodes, 1000 + 86_400 + 3600)), ["a"]);
+        // A closed window (1970-01-01 is a Thursday; 00:00 UTC is minute 0 of that day) does too.
+        let spec = json!({ "waitForIdleSeats": true, "windows": ["00:00-00:30"] });
+        let first = go(&spec, None, &nodes, 0);
+        assert!(told(&first).is_empty());
+        let closed = go(&spec, Some(&first), &nodes, 3600 * 12);
+        assert_eq!(closed.status["phase"], "Waiting");
+        assert_eq!(closed.status["idleSince"], json!({}));
+        let next_night = go(&spec, Some(&closed), &nodes, 86_400);
+        assert!(told(&next_night).is_empty(), "{:?}", next_night.status);
     }
 
     /// An update ends only the cordon it put on: one its owner set first stays, a drained node
