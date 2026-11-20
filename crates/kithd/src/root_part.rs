@@ -11,9 +11,15 @@
 //! names a unit by the id this part made at Create, and is refused one it did not; `Plug` a
 //! device no claim granted; `Usage`: what a pod of its units holds of the state disk). The
 //! handle itself is this process's, as for Create and Start, so these are [`Root`] methods
-//! that take it (and the handle must be the unit's, [`Hands::is`]), and a [`Request`] for one has
-//! nothing to act on until the root part is a process. An exec unit ([`Root::exec`]) and one
+//! that take it (and the handle must be the unit's, [`Hands::is`]); over a socket the root part
+//! keeps the handle and the unit is named by its id. An exec unit ([`Root::exec`]) and one
 //! taken back from an earlier run ([`Root::adopt`]) are made here as a created one is.
+//!
+//! The Volumes family (`Volume`, `Open`, `Restore`, `VolumeGone`: [`volume`], [`open`],
+//! [`restore`] and [`volume_gone`] ask them) names a Volume as the store does and has the
+//! directory derived here, beneath `<state>/volumes`, from the state directory the Book has;
+//! and `Run` ([`run`]) is the node's policy on `POST /v1/run`, asked before the program is
+//! started. `Update`, `Reboot` and `Lock` of the Node family are not built.
 //!
 //! A claim is of the node's devices, not of a unit's, as it is for `Create`: any unit made here
 //! may be given a device any claim granted, and a `Plug` or `Unplug` is no finer than that.
@@ -26,11 +32,18 @@
 //! asserted against it (the `crossings` tests).
 //
 // ponytail: Create and Start take what only this process has (an Image, a Handle): they are
-// not in [`Request`], and cross no wire until the root part is a process (T-0810). Said here
+// not in [`Request`]. Over the socket (`mod socket`, `--split`) they are calls of their own that
+// name the unit by its id, and the root part keeps the handle; the controller's own Create,
+// Start and the rest stay in this process until the root part is confined (T-0811). Said here
 // so that they are not taken for a gap in `check`.
+
+mod socket;
+
+use socket::{Limits, SPLIT, Socket};
 
 use crate::pods::{Given, Pods};
 use crate::policy::Policy;
+use crate::volumes::Dir;
 use kith_runtime::{Handle, Image, ImageStore, Mount, Runtime, Unit};
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
 use serde::{Deserialize, Serialize};
@@ -61,6 +74,10 @@ const MOST_LAYERS: usize = 256;
 /// thousandths): a request for more is for what no node has.
 const MOST_GUARANTEED: u64 = 1 << 42;
 const MOST_CPU_MILLIS: u64 = 1_024_000;
+/// The most a `Run` is: arguments, and bytes of them and of the program's name (the API reads a
+/// body of at most 64 KiB, which is what a run's whole spec is in).
+const MOST_ARGS: usize = 1024;
+const MOST_ARGV_BYTES: usize = 64 << 10;
 
 /// What a socket is for: only these two, so a request for any other protocol does not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,11 +174,51 @@ pub enum Request {
     /// ends in `b`) holds of the state disk, if it is held to a limit as it writes. The path is
     /// derived here, from the state directory.
     Usage { pod: String },
+    /// The directory of the Volume `volume` on this node, made if it is not there (what
+    /// `volumes::host_dir` does): the one a unit mounts, a backup, a replica or a download reads.
+    Volume { volume: Place },
+    /// The directory of the Volume to be written into, as for `Volume`: an upload's, a replica's
+    /// copy. The files made take the Volume directory's own owner, as unpacking derives it.
+    Open { volume: Place },
+    /// The directory of the Volume a backup is restored into, as for `Open`.
+    Restore { volume: Place },
+    /// The data of the Volume `namespace`/`name` removed: `<state>/volumes/<namespace>/<name>`
+    /// and nothing beside it (`volumes::wipe`).
+    VolumeGone { namespace: String, name: String },
+    /// An app run for a caller (`POST /v1/run`): `via` is the program, `argv` what it runs. Refused
+    /// where the node's policy has `run` off; the process itself is the serving part's, which
+    /// holds the connection it is joined to.
+    Run { via: String, argv: Vec<String> },
+}
+
+/// Where a Volume's data is, as the Volume says it (`volumes::Dir`, but for the node it is on:
+/// this one's, and the state directory is the root part's own).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Place {
+    pub namespace: String,
+    pub name: String,
+    /// The Volume's `spec.path`.
+    pub path: String,
+    pub encrypted: bool,
+}
+
+impl Place {
+    fn of(dir: &Dir) -> Place {
+        Place {
+            namespace: dir.namespace.clone(),
+            name: dir.name.clone(),
+            path: dir.path.clone(),
+            encrypted: dir.encrypted,
+        }
+    }
 }
 
 /// What a request gives back.
 #[derive(Debug)]
 pub enum Reply {
+    /// A Volume's directory, as the root part made it.
+    Path(PathBuf),
     /// `(bytes, files, most files)` of a pod's project, or `None` when it has none.
     Usage(Option<(u64, u64, u64)>),
     /// The bytes an image's removal freed, or `None` when it stayed.
@@ -188,7 +245,8 @@ pub struct Create<'a> {
 
 /// Read one request off the wire: at most [`MAX_REQUEST`] bytes, JSON, no field or variant
 /// this build does not know.
-// (Nothing reads a wire yet: the root part is not a second process. The tests do.)
+// (The socket's reader decodes an `Ask`, which holds a Request; this is the Request alone, as
+// the tests and a reader of a bare one have it.)
 #[allow(dead_code)]
 pub fn decode(bytes: &[u8]) -> Result<Request, String> {
     if bytes.len() > MAX_REQUEST {
@@ -209,6 +267,13 @@ pub(crate) fn label(what: &str, text: &str) -> Result<(), String> {
             text.escape_debug()
         )),
     }
+}
+
+/// A Volume's namespace and name, in the form the store gives every name (kith-api's
+/// `check_name`, the one the controller's own names pass: at most 63, lowercase letters, digits,
+/// `-` and `.`, a letter or digit at both ends), so that each is one part of a path.
+fn names(namespace: &str, name: &str) -> Result<(), String> {
+    kith_api::check_name(namespace).and_then(|()| kith_api::check_name(name))
 }
 
 /// Why a request is refused, or `Ok` when the root part may do it. It looks at what is
@@ -261,6 +326,26 @@ pub fn check(request: &Request) -> Result<(), String> {
         // (Against the units made here and the claims: [`Book::known`].)
         Request::Kill { id } | Request::Delete { id } => label("unit id", id),
         Request::Usage { pod } => label("pod id", pod),
+        // (The place is of this node's state directory, the root part's own: the form of the names
+        // and the path only here, and where it may be, in `act`, under the node's policy.)
+        Request::Volume { volume } | Request::Open { volume } | Request::Restore { volume } => {
+            names(&volume.namespace, &volume.name)?;
+            crate::volumes::check_path(&volume.namespace, &volume.path)
+        }
+        Request::VolumeGone { namespace, name } => names(namespace, name),
+        Request::Run { via, argv } => {
+            let all = || argv.iter().chain([via]);
+            let bad = via.is_empty()
+                || argv.is_empty()
+                || argv.len() > MOST_ARGS
+                || all().map(String::len).sum::<usize>() > MOST_ARGV_BYTES
+                || all().any(|text| text.contains('\0'));
+            // (1024 arguments and 64 KiB: `MOST_ARGS`, `MOST_ARGV_BYTES`.)
+            match bad {
+                true => Err("run: a program, at most 1024 arguments of 64 KiB, no NUL".into()),
+                false => Ok(()),
+            }
+        }
         Request::Tune {
             id,
             guaranteed,
@@ -496,10 +581,16 @@ fn check_mount(mount: &Mount, ground: &Ground, id: &str) -> Result<(), String> {
 /// Why a container is not created, or `Ok`: what the root part would not have made itself.
 /// `owns`: whether a path is the namespace of a pod this node made.
 pub fn check_create(create: &Create, ground: &Ground, owns: &dyn Fn(&Path) -> bool) -> Result<(), String> {
-    let (unit, policy) = (create.unit, &ground.policy);
-    label("unit id", create.id)?;
+    check_unit(create.id, create.unit, ground, owns)
+}
+
+/// The same for a unit that is made with no image (an exec): what a unit may be, whoever
+/// supplied it, so the root part checks a peer's unit as it checks the controller's.
+pub fn check_unit(id: &str, unit: &Unit, ground: &Ground, owns: &dyn Fn(&Path) -> bool) -> Result<(), String> {
+    let policy = &ground.policy;
+    label("unit id", id)?;
     for mount in &unit.mounts {
-        check_mount(mount, ground, create.id)?;
+        check_mount(mount, ground, id)?;
     }
     // What is given a user is chowned to it, tree and all, before the runtime looks at the
     // user: where there are ranges (kithd is root, and the runtime shifts this unit: one of its
@@ -572,7 +663,7 @@ pub struct Book {
     mesh: Mutex<Option<MeshTold>>,
     /// Held by a mesh request from its check to its end: one at a time.
     meshing: Mutex<()>,
-    crossed: [AtomicUsize; 15],
+    crossed: [AtomicUsize; 20],
 }
 
 /// What a request is, for counting.
@@ -599,6 +690,15 @@ pub enum Kind {
     Plug,
     Unplug,
     Usage,
+    /// A Volume's directory asked for (`Volume`, `Open`, `Restore`: once each, by whatever mounts,
+    /// reads or fills a Volume), and its data removed (`VolumeGone`). A unit's start asks one
+    /// `Volume` for each Volume it mounts, besides its three.
+    Volume,
+    Open,
+    Restore,
+    VolumeGone,
+    /// An app run for a caller (`Run`).
+    Run,
 }
 
 impl Book {
@@ -609,7 +709,7 @@ impl Book {
             units: Mutex::new(BTreeSet::new()),
             mesh: Mutex::new(None),
             meshing: Mutex::new(()),
-            crossed: [const { AtomicUsize::new(0) }; 15],
+            crossed: [const { AtomicUsize::new(0) }; 20],
         }
     }
 
@@ -923,8 +1023,9 @@ pub trait Root {
     // handle is this process's, as for `start`. Each is [`check`]ed, and a unit that is not one
     // made here, or a device no claim granted, is refused.
     //
-    // ponytail: the cgroup is the handle's, which the runtime made from the id; as a process
-    // of its own (T-0810) the root part derives it from the id, and holds the handle itself.
+    // ponytail: the cgroup is the handle's, which the runtime made from the id; over a socket
+    // (`Socket`) the root part holds the handle itself and the caller's is the id alone (`Held`).
+    // The controller's own units stay in this process until the root part is confined (T-0811).
     fn kill(&self, made: &mut Self::Made, id: &str) -> Result<(), String>;
     /// A refused or failed delete gives the handle back, unless the unit is gone.
     fn delete(&self, made: Self::Made, id: &str) -> Result<(), (Option<Self::Made>, String)>;
@@ -946,6 +1047,9 @@ pub struct Direct<'a, H: Hands = Nobody> {
     book: &'a Book,
     /// The node's own policy, unless a test says another.
     policy: Option<Policy>,
+    /// The root part as a process of its own (`--split`): a request that has no handle goes
+    /// there, and is counted and checked there. Only [`Direct::new`] and [`Direct::today`] set it.
+    via: Option<&'a Socket>,
 }
 
 /// Hands for a Direct that is asked for sockets to listen on, for the mesh and for images, and nothing else.
@@ -1110,9 +1214,8 @@ impl Direct<'static, Nobody> {
     /// For the Listeners family alone.
     pub fn new() -> Self {
         Direct {
-            hands: Nobody,
-            book: &BOOK,
-            policy: None,
+            via: SPLIT.get(),
+            ..Direct::with(Nobody, &BOOK)
         }
     }
 }
@@ -1120,21 +1223,25 @@ impl Direct<'static, Nobody> {
 impl<'a> Direct<'a, Today<'a>> {
     /// The root part of this node: its pods, and its runtime if containers are made.
     pub fn today(pods: &'a Mutex<Pods>, runtime: Option<&'a Runtime>) -> Self {
-        Direct::with(
-            Today {
-                pods: Some(pods),
-                runtime,
-            },
-            &BOOK,
-        )
+        Direct {
+            via: SPLIT.get(),
+            ..Direct::with(
+                Today {
+                    pods: Some(pods),
+                    runtime,
+                },
+                &BOOK,
+            )
+        }
     }
 }
 
 impl Direct<'static, Today<'static>> {
     /// For the Units family alone: the handles are the caller's, and it makes no pod.
     //
-    // ponytail: a root part of the controller's own process (the one `BOOK` is). As a process of
-    // its own (T-0810) it holds the handles and the controller names them by id alone.
+    // ponytail: a root part of the controller's own process (the one `BOOK` is), and not over the
+    // socket: the controller keeps its handles until the root part is a confined process of its
+    // own (T-0811), when it holds them and the controller names them by id alone (`Held`).
     pub fn units() -> Self {
         Direct::with(
             Today {
@@ -1152,6 +1259,7 @@ impl<'a, H: Hands> Direct<'a, H> {
             hands,
             book,
             policy: None,
+            via: None,
         }
     }
 
@@ -1249,7 +1357,7 @@ impl<H: Hands> Root for Direct<'_, H> {
 
     fn exec(&self, id: &str, unit: &Unit, out: File, err: File) -> Result<H::Made, String> {
         self.book.count(Kind::Create);
-        label("unit id", id)?;
+        check_unit(id, unit, &self.ground(), &|path| self.hands.owns_netns(path))?;
         let made = self.hands.exec(id, unit, out, err)?;
         self.book.made(id.into())?;
         Ok(made)
@@ -1399,7 +1507,46 @@ impl<H: Hands> Direct<'_, H> {
         }
     }
 
+    /// The node's policy, or the one a test gave.
+    fn policy(&self) -> Policy {
+        self.policy.clone().unwrap_or_else(crate::policy::get)
+    }
+
+    /// A request of the Volumes family: the state directory is the Book's, never the asker's, and
+    /// every path is derived beneath `<state>/volumes/<namespace>/<name>` (`volumes::host_dir`:
+    /// nothing is made or followed outside it; a directory of the node's own, where a Volume
+    /// of `kith-system` says one, only where the policy has `hostPaths`).
+    fn volumes_request(&self, request: Request) -> Result<Reply, String> {
+        let state = self.book.state().ok_or("this root part has no state directory")?;
+        let volume = match request {
+            Request::VolumeGone { namespace, name } => {
+                let dir = Dir {
+                    namespace,
+                    name,
+                    path: String::new(),
+                    node: String::new(),
+                    encrypted: false,
+                };
+                return crate::volumes::wipe(&state, &dir).map(|()| Reply::Done);
+            }
+            Request::Volume { volume } | Request::Open { volume } | Request::Restore { volume } => volume,
+            _ => return Err("not a request of the volumes".into()),
+        };
+        let dir = Dir {
+            namespace: volume.namespace,
+            name: volume.name,
+            path: volume.path,
+            node: String::new(),
+            encrypted: volume.encrypted,
+        };
+        crate::volumes::host_dir_under(&state, &dir, &self.policy()).map(Reply::Path)
+    }
+
     fn act(&self, request: Request, files: Vec<File>) -> Result<Reply, String> {
+        // (The root part's own process counts it, checks it and acts on it: not both.)
+        if let Some(socket) = self.via {
+            return socket.request_with(request, files);
+        }
         self.book.count(match request {
             Request::Bind { .. } => Kind::Bind,
             Request::Pod { .. } => Kind::Pod,
@@ -1416,7 +1563,18 @@ impl<H: Hands> Direct<'_, H> {
             Request::Plug { .. } => Kind::Plug,
             Request::Unplug { .. } => Kind::Unplug,
             Request::Usage { .. } => Kind::Usage,
+            Request::Volume { .. } => Kind::Volume,
+            Request::Open { .. } => Kind::Open,
+            Request::Restore { .. } => Kind::Restore,
+            Request::VolumeGone { .. } => Kind::VolumeGone,
+            Request::Run { .. } => Kind::Run,
         });
+        // (Where run is off that is what is said, not the shape of what was asked.)
+        if matches!(request, Request::Run { .. })
+            && let Some(why) = self.policy().refusal("run")
+        {
+            return Err(why);
+        }
         check(&request)?;
         if !files.is_empty() && !matches!(request, Request::Unpack { .. }) {
             return Err("only an unpack comes with files".into());
@@ -1428,7 +1586,7 @@ impl<H: Hands> Direct<'_, H> {
             | Request::Plug { .. }
             | Request::Unplug { .. } => {
                 self.book.known(&request)?;
-                Err("a unit's handle is in this process: ask Root::kill and the others, not a request".into())
+                Err("no handle is held for this unit: it was not made over this connection".into())
             }
             Request::Usage { ref pod } => {
                 self.book.known(&request)?;
@@ -1436,6 +1594,12 @@ impl<H: Hands> Direct<'_, H> {
                 Ok(Reply::Usage(crate::controller::storage::Projects::usage(&state, pod)))
             }
             images @ (Request::Unpack { .. } | Request::Drop { .. }) => self.images_request(images, files),
+            volumes @ (Request::Volume { .. }
+            | Request::Open { .. }
+            | Request::Restore { .. }
+            | Request::VolumeGone { .. }) => self.volumes_request(volumes),
+            // (The program is the serving part's to start: it holds the connection it is joined to.)
+            Request::Run { .. } => Ok(Reply::Done),
             mesh @ (Request::MeshUp { .. }
             | Request::Mesh { .. }
             | Request::MeshSeen { .. }
@@ -1471,6 +1635,29 @@ impl<H: Hands> Direct<'_, H> {
     }
 }
 
+/// `--split`: from here the requests of [`Direct::new`] and [`Direct::today`] that have no handle
+/// cross a socket pair. Returns the root part's end, for [`serve_split`]. Once only.
+pub fn split() -> std::io::Result<std::os::fd::OwnedFd> {
+    let (socket, theirs) = Socket::pair(socket::DEADLINE)?;
+    SPLIT
+        .set(socket)
+        .map_err(|_| std::io::Error::other("the root part is split already"))?;
+    Ok(theirs)
+}
+
+/// The root part of this node on its end of the socket pair: serves until the serving part's end
+/// is closed. (A thread of this process until the root part is a process of its own: T-0811.)
+pub fn serve_split(pods: &Mutex<Pods>, end: std::os::fd::OwnedFd) {
+    let root = Direct::with(
+        Today {
+            pods: Some(pods),
+            runtime: None,
+        },
+        &BOOK,
+    );
+    socket::serve(&root, end, &Limits::default());
+}
+
 /// An image unpacked from its `manifest` and the layer `files`, as the root part of this node
 /// does it: asked of it, with the files beside the request.
 pub fn unpack(image: String, manifest: String, files: Vec<File>) -> Result<(), String> {
@@ -1490,6 +1677,61 @@ pub fn drop_image(image: &str, before: std::time::SystemTime) -> Result<Option<u
         Reply::Freed(freed) => Ok(freed),
         _ => Err("the root part answered a drop with another reply".into()),
     }
+}
+
+/// A request of the Volumes family asked of the root part of this node. The state directory is
+/// the root part's own, the one `set_state` told it; `state` is the caller's and is read only in
+/// a test, whose book is one of its own with that directory (each test has a state directory
+/// of its own, and the process has the one book).
+fn asked_of_volumes(state: &Path, request: Request) -> Result<Reply, String> {
+    #[cfg(test)]
+    {
+        let book = Book::new();
+        book.set_state(state.canonicalize().map_err(|e| format!("{}: {e}", state.display()))?);
+        Direct::with(Nobody, &book).request(request)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = state;
+        Direct::new().request(request)
+    }
+}
+
+fn path_of(state: &Path, request: Request) -> Result<PathBuf, String> {
+    match asked_of_volumes(state, request)? {
+        Reply::Path(path) => Ok(path),
+        _ => Err("the root part answered a volume with another reply".into()),
+    }
+}
+
+/// The directory of the Volume `dir` on this node, made if it is not there: for what mounts it,
+/// reads it (a backup, a replica's source, a download).
+pub fn volume(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
+    path_of(state, Request::Volume { volume: Place::of(dir) })
+}
+
+/// The directory of the Volume `dir` to write into (an upload, a replica's copy): the files made
+/// take the directory's own owner.
+pub fn open(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
+    path_of(state, Request::Open { volume: Place::of(dir) })
+}
+
+/// The directory of the Volume `dir` a backup is restored into.
+pub fn restore(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
+    path_of(state, Request::Restore { volume: Place::of(dir) })
+}
+
+/// The data of the Volume `dir` removed from this node (not there is done).
+pub fn volume_gone(state: &Path, dir: &Dir) -> Result<(), String> {
+    let (namespace, name) = (dir.namespace.clone(), dir.name.clone());
+    asked_of_volumes(state, Request::VolumeGone { namespace, name }).map(drop)
+}
+
+/// Whether this node runs an app for a caller, as the root part has it: `Ok` or why not. The
+/// program is started by the caller.
+pub fn run(via: &str, argv: &[String]) -> Result<(), String> {
+    let (via, argv) = (via.into(), argv.to_vec());
+    Direct::new().request(Request::Run { via, argv }).map(drop)
 }
 
 /// The pod `ask` (a [`Request::Pod`]) as a container of it is given it: asked of the root part
@@ -2470,7 +2712,7 @@ mod tests {
 
     /// What the serving part does to start the container `c` of the pod `id`, as the
     /// controller does: ask for the pod (told once), create, start.
-    fn start_one(root: &Direct<Fake>, pods: &Mutex<Pods>, state: &Path, id: &str, c: &str) {
+    fn start_one<R: Root>(root: &R, pods: &Mutex<Pods>, state: &Path, id: &str, c: &str) {
         let given = pod(root, pods, pod_ask(id, "a", "b-0", None)).unwrap();
         let unit = Unit {
             no_node_root: false,
@@ -2491,11 +2733,11 @@ mod tests {
             id: &unit_id,
             image: &image,
             unit: &unit,
-            out: null(),
-            err: null(),
+            out: regular(),
+            err: regular(),
         };
         let made = root.create(create).unwrap();
-        root.start(made, &unit_id, "ab12").unwrap();
+        root.start(made, &unit_id, "ab12").map_err(|(_, why)| why).unwrap();
     }
 
     #[test]
@@ -2675,6 +2917,32 @@ mod tests {
             assert!(why.contains("not a name"), "{why}");
         }
         assert_eq!(root.hands.reached(), ["exec", "kill"]);
+        // A unit is checked as a created one is, whoever supplied it: a device no claim granted, a
+        // network that is no pod's of this node's, a mount outside the state directory.
+        let device = Unit {
+            devices: vec![PathBuf::from("/dev/mem")],
+            ..plain()
+        };
+        let netns = Unit {
+            netns: Some(PathBuf::from("/proc/1/ns/net")),
+            ..plain()
+        };
+        let mounted = Unit {
+            mounts: vec![Mount {
+                give: true,
+                ..mount(Path::new("/etc"), "/etc")
+            }],
+            ..plain()
+        };
+        for (unit, why) in [
+            (device, "no claim of this node's granted this device"),
+            (netns, "not the network of a pod this node made"),
+            (mounted, "may not be given"),
+        ] {
+            let got = root.exec("w_a_b_1_c", &unit, null(), null()).unwrap_err();
+            assert!(got.contains(why) && !got.is_empty(), "{got}");
+        }
+        assert_eq!(root.hands.reached(), ["exec", "kill"]);
         // What a run before this one made, and this takes back, is made here; what is no name is
         // not taken back (the runtime's sweep removes what is not kept).
         root.hands.adopting(["w_a_b_5_c", "a..b"]);
@@ -2785,7 +3053,7 @@ mod tests {
         (book, prefix)
     }
 
-    fn up(root: &Direct<Fake>, prefix: Ipv6Addr) -> Result<Reply, String> {
+    fn up<R: Root>(root: &R, prefix: Ipv6Addr) -> Result<Reply, String> {
         let address = kith_mesh::node_address(prefix, "a");
         root.request(Request::MeshUp {
             interface: WG.into(),
@@ -3207,28 +3475,36 @@ mod tests {
         );
     }
 
-    /// `n` connections into the pod `id`, through sockets made ahead, to a real listener.
-    async fn connect_n(book: &Book, n: usize, v6_listener: bool) -> usize {
+    /// `n` connections into the pod `id`, through sockets `root` makes ahead, to a real listener:
+    /// false where there is no listener to be had (no IPv6 loopback).
+    async fn connect_with<R: Root>(root: &R, n: usize, v6_listener: bool) -> bool {
         let listener = match v6_listener {
             true => std::net::TcpListener::bind("[::1]:0"),
             false => std::net::TcpListener::bind("127.0.0.1:0"),
         };
-        let Ok(listener) = listener else { return 0 };
+        let Ok(listener) = listener else { return false };
         let port = listener.local_addr().unwrap().port();
         // (Answers each, or a backlog of 128 would hold back the 129th.)
         std::thread::spawn(move || {
             let kept: Vec<_> = listener.incoming().flatten().collect();
             drop(kept);
         });
-        let root = Direct::with(Fake::default(), book);
         let pods = Mutex::new(Pods::default());
         let mut held = Vec::new();
         for at in 0..n {
-            let one = crate::pods::through(&root, &pods, "w_a_b_0", port).await;
+            let one = crate::pods::through(root, &pods, "w_a_b_0", port).await;
             held.push(one.unwrap_or_else(|e| panic!("connection {at} of {n}: {e}")));
         }
         assert_eq!(held.len(), n);
-        book.crossed(Kind::Sockets)
+        true
+    }
+
+    async fn connect_n(book: &Book, n: usize, v6_listener: bool) -> usize {
+        let root = Direct::with(Fake::default(), book);
+        match connect_with(&root, n, v6_listener).await {
+            true => book.crossed(Kind::Sockets),
+            false => 0,
+        }
     }
 
     #[tokio::test]
@@ -3607,5 +3883,805 @@ mod tests {
         start_one(&root, &pods, &state, "w_a_b_0", "first");
         assert_eq!(book.total(), 3);
         assert_eq!((book.crossed(Kind::Unpack), book.crossed(Kind::Drop)), (0, 0));
+    }
+
+    fn place(namespace: &str, name: &str, path: &str) -> Place {
+        Place {
+            namespace: namespace.into(),
+            name: name.into(),
+            path: path.into(),
+            encrypted: false,
+        }
+    }
+
+    /// The three requests that name a Volume's directory, for one place.
+    fn volume_asks(place: Place) -> [Request; 3] {
+        [
+            Request::Volume { volume: place.clone() },
+            Request::Open { volume: place.clone() },
+            Request::Restore { volume: place },
+        ]
+    }
+
+    #[test]
+    fn a_volume_outside_the_volume_root_is_refused_whatever_the_caller_says() {
+        let (book, state) = book("volume-outside");
+        let outside = std::env::temp_dir().join(format!("kith-root-part-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let root = Direct::with(Nobody, &book).under(policy("hardened"));
+        let refused = [
+            // A path that climbs, repeats a slash or starts from here.
+            place("shop", "data", "../x"),
+            place("shop", "data", "a/../.."),
+            place("shop", "data", "a//b"),
+            place("shop", "data", "./a"),
+            place("shop", "data", "/etc"),
+            place("shop", "data", ""),
+            place("shop", "data", "a\0b"),
+            // A name that is not one of the store's, as a path in itself.
+            place("shop", "../x", "data"),
+            place("../x", "data", "data"),
+            place("shop", "a/b", "data"),
+            place("shop", "", "data"),
+            place("shop", "UPPER", "data"),
+            place("shop", &"a".repeat(64), "data"),
+            place("shop", "-a", "data"),
+            // A directory of the node's own, where the policy has no hostPaths.
+            place("kith-system", "data", outside.to_str().unwrap()),
+        ];
+        for one in refused {
+            for ask in volume_asks(one.clone()) {
+                let kind = format!("{ask:?}");
+                assert!(root.request(ask).is_err(), "{kind}");
+            }
+            let gone = Request::VolumeGone {
+                namespace: one.namespace.clone(),
+                name: one.name.clone(),
+            };
+            if one.namespace != "shop" || one.name != "data" {
+                assert!(root.request(gone).is_err(), "{one:?}");
+            }
+        }
+        // Nothing was made, in the state directory or at the node's own path.
+        assert!(!state.join("volumes").exists() || std::fs::read_dir(state.join("volumes/shop")).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        // A symbolic link in the way is not followed.
+        let shop = state.join("volumes/shop/data");
+        std::fs::create_dir_all(&shop).unwrap();
+        std::os::unix::fs::symlink(&outside, shop.join("link")).unwrap();
+        for ask in volume_asks(place("shop", "data", "link/inner")) {
+            let why = root.request(ask).unwrap_err();
+            assert!(why.contains("symbolic link"), "{why}");
+        }
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        // A plain one is made beneath the root, and the reply says where.
+        for ask in volume_asks(place("shop", "data", "deep/er")) {
+            let Ok(Reply::Path(at)) = root.request(ask) else {
+                panic!("not a path")
+            };
+            assert_eq!(at, shop.join("deep/er"));
+        }
+        // And one of the node's own is made where the policy has hostPaths.
+        let open = Direct::with(Nobody, &book).under(policy("hardened,host-paths"));
+        let own = outside.join("own");
+        let ask = Request::Volume {
+            volume: place("kith-system", "data", own.to_str().unwrap()),
+        };
+        assert!(matches!(open.request(ask), Ok(Reply::Path(at)) if at == own));
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn a_node_path_that_climbs_is_refused_even_where_the_policy_has_host_paths() {
+        let (book, _) = book("volume-climb");
+        let outside = std::env::temp_dir().join(format!("kith-root-part-climb-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let root = Direct::with(Nobody, &book).under(policy("hardened,host-paths"));
+        let at = outside.to_str().unwrap();
+        for path in [
+            "/a/../../etc".to_string(),
+            format!("{at}/../escaped"),
+            format!("{at}/./x"),
+            format!("{at}//x"),
+            format!("{at}/"),
+        ] {
+            for ask in volume_asks(place("kith-system", "data", &path)) {
+                assert!(root.request(ask).is_err(), "{path}");
+            }
+        }
+        // Nothing was made beside the directory, and one that does not climb is.
+        assert!(!outside.join("../escaped").exists());
+        assert!(!outside.join("x").exists());
+        let ask = Request::Volume {
+            volume: place("kith-system", "data", &format!("{at}/own")),
+        };
+        assert!(matches!(root.request(ask), Ok(Reply::Path(_))));
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn a_volume_gone_removes_only_the_volumes_own_directory() {
+        let (book, state) = book("volume-gone");
+        let root = Direct::with(Nobody, &book).under(policy("hardened"));
+        let own = state.join("volumes/shop/data");
+        let next = state.join("volumes/shop/data2");
+        std::fs::create_dir_all(own.join("deep")).unwrap();
+        std::fs::create_dir_all(&next).unwrap();
+        let gone = |namespace: &str, name: &str| {
+            root.request(Request::VolumeGone {
+                namespace: namespace.into(),
+                name: name.into(),
+            })
+        };
+        for (namespace, name) in [("kith-system", "data"), ("shop", ".."), ("..", "shop"), ("shop", "a/b")] {
+            assert!(gone(namespace, name).is_err(), "{namespace}/{name}");
+        }
+        assert!(own.exists() && next.exists());
+        assert!(matches!(gone("shop", "data"), Ok(Reply::Done)));
+        assert!(!own.exists() && next.exists());
+        // A second one finds it gone and says so as done.
+        assert!(matches!(gone("shop", "data"), Ok(Reply::Done)));
+        assert_eq!(book.crossed(Kind::VolumeGone), 6);
+    }
+
+    #[test]
+    fn run_is_refused_where_the_policy_has_it_off() {
+        let (book, _) = book("run");
+        let run = |words: &str, via: &str, argv: &[&str]| {
+            Direct::with(Nobody, &book).under(policy(words)).request(Request::Run {
+                via: via.into(),
+                argv: argv.iter().map(|a| a.to_string()).collect(),
+            })
+        };
+        let why = run("hardened", "waypipe", &["firefox"]).unwrap_err();
+        assert!(why.contains("run"), "{why}");
+        assert!(matches!(run("hardened,run", "waypipe", &["firefox"]), Ok(Reply::Done)));
+        assert!(run("hardened,run", "/usr/bin/waypipe", &[]).is_err());
+        // What would not be one program's name and arguments is refused where it is allowed too.
+        assert!(run("hardened,run", "", &["a"]).is_err());
+        assert!(run("hardened,run", "waypipe", &["a\0b"]).is_err());
+        assert!(run("hardened,run", "waypipe", &["a"; MOST_ARGS + 1]).is_err());
+        let wide = "a".repeat(MOST_ARGV_BYTES + 1);
+        assert!(run("hardened,run", "waypipe", &[wide.as_str()]).is_err());
+        // Each, refused or not, was one crossing.
+        assert_eq!(book.crossed(Kind::Run), 7);
+        // Where it is off, the policy is what is said, not the shape of the request.
+        let why = run("hardened", "", &[]).unwrap_err();
+        assert!(!why.starts_with("run: a program"), "{why}");
+        assert_eq!(why, run("hardened", "waypipe", &["firefox"]).unwrap_err());
+    }
+
+    #[test]
+    fn the_volumes_and_run_requests_are_on_the_wire() {
+        for request in [
+            Request::Volume {
+                volume: place("shop", "data", "x"),
+            },
+            Request::Open {
+                volume: place("shop", "data", "x"),
+            },
+            Request::Restore {
+                volume: place("shop", "data", "x"),
+            },
+            Request::VolumeGone {
+                namespace: "shop".into(),
+                name: "data".into(),
+            },
+            Request::Run {
+                via: "waypipe".into(),
+                argv: vec!["firefox".into()],
+            },
+        ] {
+            let sent = serde_json::to_vec(&request).unwrap();
+            assert_eq!(decode(&sent).unwrap(), request);
+        }
+        // The state directory is the root part's own: the asker has no field to give one in.
+        let state = br#"{"Volume":{"volume":{"namespace":"a","name":"b","path":"c","encrypted":false},"state":"/"}}"#;
+        assert!(decode(state).is_err());
+        let inner = br#"{"Volume":{"volume":{"namespace":"a","name":"b","path":"c","encrypted":false,"state":"/"}}}"#;
+        assert!(decode(inner).is_err());
+    }
+
+    #[test]
+    fn what_asks_of_the_volumes_gets_the_directory_a_request_would() {
+        let state = std::env::temp_dir().join(format!("kith-root-part-wrappers-{}", std::process::id()));
+        std::fs::create_dir_all(&state).unwrap();
+        let dir = Dir {
+            namespace: "shop".into(),
+            name: "data".into(),
+            path: "in/side".into(),
+            node: "a".into(),
+            encrypted: false,
+        };
+        let state = state.canonicalize().unwrap();
+        let own = state.join("volumes/shop/data/in/side");
+        assert_eq!(volume(&state, &dir).unwrap(), own);
+        assert_eq!(open(&state, &dir).unwrap(), own);
+        assert_eq!(restore(&state, &dir).unwrap(), own);
+        let climbing = Dir {
+            path: "../x".into(),
+            ..dir.clone()
+        };
+        assert!(volume(&state, &climbing).is_err() && open(&state, &climbing).is_err());
+        assert!(restore(&state, &climbing).is_err());
+        volume_gone(&state, &dir).unwrap();
+        assert!(!state.join("volumes/shop/data").exists());
+        std::fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn a_start_with_volumes_adds_one_crossing_for_each_and_nothing_else() {
+        let (book, state) = book("start-volumes");
+        let root = Direct::with(Fake::default(), &book).under(policy("no-host-paths"));
+        let pods = Mutex::new(Pods::default());
+        pods.lock().unwrap().pretend("w_a_b_0", &state);
+        start_one(&root, &pods, &state, "w_a_b_0", "first");
+        // The ADR's three, and one `Volume` for each the unit mounts, which the controller asks
+        // before it makes the unit (it is not counted among the three).
+        for i in 0..2 {
+            let ask = Request::Volume {
+                volume: place("ns", &format!("data{i}"), "x"),
+            };
+            assert!(matches!(root.request(ask), Ok(Reply::Path(_))));
+        }
+        assert_eq!(book.crossed(Kind::Volume), 2);
+        assert_eq!(book.total(), 5);
+    }
+
+    // The transport: the root part over a socket pair (`socket.rs`).
+
+    use kith_dm_sys::{MOST_FDS, recv_fds, send_fds, socketpair};
+    use serde_json::{Value, json};
+    use socket::Held;
+    use std::os::fd::{AsFd, BorrowedFd};
+    use std::os::unix::net::{UnixDatagram, UnixStream};
+    use std::time::{Duration, Instant};
+
+    /// `root` serving one end of a socket pair on this thread while `then` has the other on
+    /// another. `serve` ends when `then` does (its end closes, or it panics), and `then`'s answer
+    /// is given back.
+    fn serving<H: Hands, T: Send>(root: &Direct<H>, limits: &Limits, then: impl FnOnce(OwnedFd) -> T + Send) -> T {
+        let (mine, theirs) = socketpair().unwrap();
+        std::thread::scope(|scope| {
+            let client = scope.spawn(move || then(mine));
+            socket::serve(root, theirs, limits);
+            match client.join() {
+                Ok(done) => done,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
+    }
+
+    /// [`serving`], with the serving part's end as a [`Socket`] (twenty seconds to a call).
+    fn over_socket<H: Hands, T: Send>(root: &Direct<H>, limits: &Limits, then: impl FnOnce(Socket) -> T + Send) -> T {
+        serving(root, limits, move |fd| then(Socket::new(fd, Duration::from_secs(20))))
+    }
+
+    /// A regular file to stand for a unit's output (`/dev/null` is a device node: refused).
+    fn regular() -> File {
+        File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap()
+    }
+
+    /// An end that is a peer by hand, which gives up on a reply after five seconds.
+    fn raw(fd: OwnedFd) -> UnixDatagram {
+        let end = UnixDatagram::from(fd);
+        end.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        end.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        end
+    }
+
+    fn said(end: &UnixDatagram, bytes: &[u8], fds: &[BorrowedFd]) -> std::io::Result<()> {
+        send_fds(end.as_fd(), bytes, fds)
+    }
+
+    /// A call by hand: `seq` and the call's JSON.
+    fn raw_ask(end: &UnixDatagram, seq: u64, call: &Value, fds: &[BorrowedFd]) {
+        let bytes = serde_json::to_vec(&json!({"seq": seq, "call": call})).unwrap();
+        said(end, &bytes, fds).unwrap();
+    }
+
+    /// `request` as a call.
+    fn as_call(request: Request) -> Value {
+        json!({"Request": serde_json::to_value(&request).unwrap()})
+    }
+
+    /// The next message by hand with the descriptors beside it, or none where the socket is closed.
+    fn raw_back(end: &UnixDatagram) -> Option<(Value, Vec<OwnedFd>)> {
+        let mut buf = vec![0u8; MAX_REQUEST];
+        match recv_fds(end.as_fd(), &mut buf, MOST_FDS) {
+            Ok((0, _)) | Err(_) => None,
+            Ok((n, fds)) => Some((serde_json::from_slice(&buf[..n]).unwrap(), fds)),
+        }
+    }
+
+    /// The refusal a reply says, or an empty one.
+    fn refusal(back: &Value) -> &str {
+        back["said"]["Err"].as_str().unwrap_or("")
+    }
+
+    #[test]
+    fn root_part_socket_answers_what_direct_answers() {
+        let (book, state) = book("socket-answers");
+        book.set_mesh(WG.into(), 51820, PathBuf::from("/nowhere/mesh.key"), "a".into())
+            .unwrap();
+        let prefix = kith_mesh::prefix(b"a cluster");
+        book.set_prefix(prefix).unwrap();
+        let root = Direct::with(Fake::default(), &book);
+        over_socket(&root, &Limits::default(), |socket| {
+            // A socket to listen on, with the descriptor beside the reply; and what Direct refuses.
+            let tcp = TcpListener::from(socket_of(socket.request(ask("127.0.0.1", 0, Proto::Tcp))));
+            assert!(tcp.local_addr().unwrap().ip().is_loopback());
+            let own = socket.request(ask("127.0.0.1", OWN_PORTS[0], Proto::Tcp)).unwrap_err();
+            assert!(own.contains("serves on itself"), "{own}");
+            let taken = tcp.local_addr().unwrap().port();
+            let why = socket.request(ask("127.0.0.1", taken, Proto::Tcp)).unwrap_err();
+            assert!(why.contains("binding 127.0.0.1"), "{why}");
+            // Several descriptors beside one reply.
+            let sockets = Request::Sockets {
+                pod: "w_a_b_0".into(),
+                v6: false,
+                count: 5,
+            };
+            let Ok(Reply::Sockets(five)) = socket.request(sockets) else {
+                panic!("not sockets")
+            };
+            assert_eq!(five.len(), 5);
+            // A pod, with its files the root part's own.
+            let Ok(Reply::Pod(given)) = socket.request(pod_ask("w_a_b_0", "a", "b-0", None)) else {
+                panic!("not a pod")
+            };
+            assert!(given.files[0].starts_with(&state));
+            // The mesh: up, set, seen, down.
+            assert!(matches!(up(&socket, prefix), Ok(Reply::Key(key)) if key == [7; 32]));
+            assert!(matches!(socket.request(mesh_ask(WG, vec![], &[])), Ok(Reply::Done)));
+            let seen = Request::MeshSeen { interface: WG.into() };
+            assert!(matches!(socket.request(seen), Ok(Reply::Seen(seen)) if seen.is_empty()));
+            let down = Request::MeshDown { interface: WG.into() };
+            assert!(matches!(socket.request(down), Ok(Reply::Done)));
+            // What is refused is refused at the root part, and said.
+            let why = socket.request(Request::Usage { pod: "w_a_b_0".into() }).unwrap_err();
+            assert!(why.contains("made here"), "{why}");
+        });
+        assert_eq!(
+            root.hands.reached(),
+            ["sockets", "pod", "mesh_up", "mesh", "mesh_seen", "mesh_down"]
+        );
+        // Counted once each, at the root part: a refusal as much as an answer.
+        assert_eq!((book.crossed(Kind::Bind), book.crossed(Kind::Sockets)), (3, 1));
+        assert_eq!((book.crossed(Kind::Pod), book.crossed(Kind::Usage)), (1, 1));
+    }
+
+    #[test]
+    fn root_part_socket_holds_a_unit_by_its_id() {
+        let (book, _) = book("socket-units");
+        book.claim([PathBuf::from(INPUT)]);
+        let root = Direct::with(Fake::default(), &book).under(policy(""));
+        over_socket(&root, &Limits::default(), |socket| {
+            let image = Image::default();
+            let create = |id: &str| {
+                socket.create(Create {
+                    id,
+                    image: &image,
+                    unit: &plain(),
+                    out: regular(),
+                    err: regular(),
+                })
+            };
+            let id = "w_a_b_0_c";
+            let made = create(id).unwrap();
+            assert_eq!(made, Held(id.into()));
+            // The id is held already: a second unit of it is no unit.
+            assert!(create(id).unwrap_err().contains("held here already"));
+            let made = socket.start(made, id, "ab12").unwrap();
+            let mut made = made;
+            assert!(socket.kill(&mut made, id).is_ok());
+            assert_eq!(socket.tune(&made, id, Some(1 << 20), Some(500)), Ok(Vec::new()));
+            assert!(socket.plug(&made, id, Path::new(INPUT)).is_ok());
+            assert!(socket.unplug(&made, id, Path::new(INPUT)).is_ok());
+            assert!(matches!(
+                socket.request(Request::Usage { pod: "w_a_b_0".into() }),
+                Ok(Reply::Usage(None))
+            ));
+            // A handle is for its own id, said before anything is sent.
+            let other = Held("w_a_b_1_c".into());
+            for why in [
+                socket.kill(&mut other.clone(), id).unwrap_err(),
+                socket.tune(&other, id, None, None).unwrap_err(),
+                socket.plug(&other, id, Path::new(INPUT)).unwrap_err(),
+                socket.unplug(&other, id, Path::new(INPUT)).unwrap_err(),
+                socket.start(other.clone(), id, "ab12").unwrap_err().1,
+                socket.delete(other.clone(), id).unwrap_err().1,
+            ] {
+                assert!(why.contains("not the unit"), "{why}");
+            }
+            // A delete that failed leaves the unit and gives the handle back, to be asked again;
+            // one that worked forgets it, and a second is refused with no handle to give.
+            root.hands.fail("delete", true);
+            let (back, why) = socket.delete(made.clone(), id).unwrap_err();
+            assert_eq!((back.as_ref(), why.contains("delete failed")), (Some(&made), true));
+            assert!(socket.kill(&mut made, id).is_ok());
+            root.hands.fail("delete", false);
+            assert!(socket.delete(made.clone(), id).is_ok());
+            let (back, why) = socket.delete(made.clone(), id).unwrap_err();
+            assert!(back.is_none() && why.contains("made here"), "{back:?} {why}");
+            assert!(socket.kill(&mut made, id).unwrap_err().contains("made here"));
+        });
+        assert_eq!(
+            root.hands.reached(),
+            [
+                "create", "start", "kill", "tune", "plug", "unplug", "delete", "kill", "delete"
+            ]
+        );
+    }
+
+    #[test]
+    fn root_part_socket_takes_back_what_a_run_before_left_and_makes_an_exec() {
+        let (book, _) = book("socket-adopt");
+        let root = Direct::with(Fake::default(), &book).under(policy(""));
+        root.hands.adopting(["w_a_b_5_c"]);
+        over_socket(&root, &Limits::default(), |socket| {
+            let mut taken = socket.adopt();
+            assert_eq!(taken.keys().collect::<Vec<_>>(), ["w_a_b_5_c"]);
+            let (mut five, mark) = taken.remove("w_a_b_5_c").unwrap();
+            assert_eq!((&five, mark.as_str()), (&Held("w_a_b_5_c".into()), "mark"));
+            assert!(socket.kill(&mut five, "w_a_b_5_c").is_ok());
+            let mut exec = socket.exec("w_a_b_6_x", &plain(), regular(), regular()).unwrap();
+            assert!(socket.kill(&mut exec, "w_a_b_6_x").is_ok());
+            assert!(socket.delete(five, "w_a_b_5_c").is_ok());
+        });
+        assert_eq!(root.hands.reached(), ["kill", "exec", "kill", "delete"]);
+    }
+
+    #[test]
+    fn root_part_socket_unpacks_with_the_layers_beside_the_message() {
+        let (book, state, store) = imaged("socket-unpack");
+        let root = Direct::with(Nobody, &book);
+        let bytes = layer("a", b"one");
+        let (image, manifest) = made(&[&bytes]);
+        over_socket(&root, &Limits::default(), |socket| {
+            // Layers that are not the manifest's are refused where the digests are checked.
+            let other = layer("b", b"two");
+            assert!(
+                socket
+                    .request_with(unpack_ask(&image, &manifest), vec![held(&state, &other)])
+                    .is_err()
+            );
+            let layers = vec![held(&state, &bytes)];
+            assert!(matches!(
+                socket.request_with(unpack_ask(&image, &manifest), layers),
+                Ok(Reply::Done)
+            ));
+            let far = Request::Drop {
+                image: image.clone(),
+                before: 1 << 40,
+            };
+            assert!(matches!(socket.request(far), Ok(Reply::Freed(Some(freed))) if freed > 0));
+        });
+        assert!(!store.root().join("images").join(&image["sha256:".len()..]).exists());
+        assert_eq!((book.crossed(Kind::Unpack), book.crossed(Kind::Drop)), (2, 1));
+    }
+
+    #[test]
+    fn root_part_socket_takes_files_only_where_they_belong() {
+        let (book, state) = book("socket-files");
+        let root = Direct::with(Fake::default(), &book).under(policy(""));
+        serving(&root, &Limits::default(), |fd| {
+            let end = raw(fd);
+            let file = regular();
+            let dir = std::fs::File::open(state.parent().unwrap()).unwrap();
+            let device = null();
+            let (pipe, _held) = UnixStream::pair().unwrap();
+            let create = json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain()}});
+            let exec = json!({"Exec": {"id": "w_a_b_0_x", "unit": plain()}});
+            let cases: [(Value, Vec<BorrowedFd>, &str); 9] = [
+                // More files than the call takes is refused as it is read, before it is queued...
+                (
+                    as_call(ask("127.0.0.1", 0, Proto::Tcp)),
+                    vec![file.as_fd()],
+                    "at most 0",
+                ),
+                (create.clone(), vec![file.as_fd(); 3], "at most 2"),
+                (exec.clone(), vec![file.as_fd(); 200], "at most 2"),
+                // ... and fewer than it needs, or ones that are not a unit's output, at the worker.
+                (create.clone(), vec![file.as_fd()], "two files"),
+                (create.clone(), vec![], "two files"),
+                (exec.clone(), vec![file.as_fd()], "two files"),
+                (create.clone(), vec![dir.as_fd(), file.as_fd()], "not a file, a pipe"),
+                (exec.clone(), vec![file.as_fd(), device.as_fd()], "not a file, a pipe"),
+                // A layer that is no regular file would be read for ever.
+                (
+                    as_call(unpack_ask(&sha(b"x"), "{}")),
+                    vec![pipe.as_fd()],
+                    "not a regular file",
+                ),
+            ];
+            for (at, (call, fds, why)) in cases.iter().enumerate() {
+                raw_ask(&end, at as u64 + 1, call, fds);
+                let (back, given) = raw_back(&end).expect("an answer");
+                assert_eq!(back["seq"], at as u64 + 1);
+                assert!(refusal(&back).contains(why), "{at}: {back}");
+                assert!(given.is_empty());
+            }
+            // The same peer is served still, with the files it has to bring.
+            raw_ask(&end, 10, &create, &[file.as_fd(), file.as_fd()]);
+            let (back, _) = raw_back(&end).unwrap();
+            assert_eq!(back["said"], json!({"Ok": "Done"}), "{back}");
+            // A pipe and a socket are a unit's output too.
+            let exec = json!({"Exec": {"id": "w_a_b_0_y", "unit": plain()}});
+            raw_ask(&end, 11, &exec, &[pipe.as_fd(), file.as_fd()]);
+            let (back, _) = raw_back(&end).unwrap();
+            assert_eq!(back["said"], json!({"Ok": "Done"}), "{back}");
+        });
+        assert_eq!(root.hands.reached(), ["create", "exec"]);
+    }
+
+    #[test]
+    fn root_part_socket_closes_a_peer_that_sends_what_is_no_request_at_the_limit() {
+        let (book, _) = book("socket-bad");
+        let root = Direct::with(Nobody, &book);
+        let limits = Limits {
+            bad: 3,
+            ..Limits::default()
+        };
+        serving(&root, &limits, |fd| {
+            let end = raw(fd);
+            let own = as_call(ask("127.0.0.1", OWN_PORTS[0], Proto::Tcp));
+            let noise: [&[u8]; 4] = [
+                b"not json",
+                b"[1, 2]",
+                br#"{"seq":1,"call":{"Request":{"Bind":{"address":"::1","port":1,"proto":"tcp"}}},"more":1}"#,
+                br#"{"seq":1,"call":{"Exec":{"argv":["sh"]}}}"#,
+            ];
+            // Each is answered with a refusal that is no call's; a good one between resets the count.
+            for round in 0..3 {
+                for bytes in &noise[..2] {
+                    said(&end, bytes, &[]).unwrap();
+                    let (back, _) = raw_back(&end).unwrap_or_else(|| panic!("closed in round {round}"));
+                    assert!(refusal(&back).starts_with("request: "), "{back}");
+                    assert_eq!(back["seq"], 0);
+                }
+                raw_ask(&end, round + 1, &own, &[]);
+                let (back, _) = raw_back(&end).unwrap();
+                assert!(refusal(&back).contains("serves on itself"), "{back}");
+                assert_eq!(back["seq"], round + 1);
+            }
+            // Three in a row: each is answered, and the third is the last.
+            for bytes in [noise[2], noise[3], noise[0]] {
+                said(&end, bytes, &[]).unwrap();
+                assert!(raw_back(&end).is_some());
+            }
+            assert!(raw_back(&end).is_none(), "the peer is closed");
+            assert!(said(&end, b"{}", &[]).is_err(), "and sent to no more");
+        });
+    }
+
+    #[test]
+    fn root_part_socket_a_peer_that_asks_faster_than_it_is_answered_is_told_busy() {
+        let (book, prefix) = meshed("a cluster");
+        let root = Direct::with(Fake::default(), &book);
+        let limits = Limits {
+            queue: 1,
+            ..Limits::default()
+        };
+        let up = as_call(Request::MeshUp {
+            interface: WG.into(),
+            address: kith_mesh::node_address(prefix, "a"),
+        });
+        let backs = serving(&root, &limits, |fd| {
+            let end = raw(fd);
+            for seq in 1..=40 {
+                raw_ask(&end, seq, &up, &[]);
+            }
+            (1..=40)
+                .map(|_| raw_back(&end).expect("an answer to each").0)
+                .collect::<Vec<_>>()
+        });
+        // Each is answered once, by its own seq; what the queue could not hold is told at once.
+        let mut seqs: Vec<u64> = backs.iter().map(|b| b["seq"].as_u64().unwrap()).collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs, (1..=40).collect::<Vec<_>>());
+        let busy = backs.iter().filter(|b| refusal(b).contains("queue is full")).count();
+        assert!(busy >= 10, "{busy} of 40 were told busy");
+        // And what was done was done one at a time.
+        assert_eq!(root.hands.most.load(Ordering::SeqCst), 1);
+        assert!(root.hands.reached().len() <= 40 - busy);
+    }
+
+    #[test]
+    fn root_part_socket_a_request_that_waited_past_its_deadline_is_refused_unread() {
+        let (book, prefix) = meshed("a cluster");
+        let root = Direct::with(Fake::default(), &book);
+        let limits = Limits {
+            wait: Duration::from_millis(10),
+            ..Limits::default()
+        };
+        let up = as_call(Request::MeshUp {
+            interface: WG.into(),
+            address: kith_mesh::node_address(prefix, "a"),
+        });
+        let backs = serving(&root, &limits, |fd| {
+            let end = raw(fd);
+            for seq in 1..=3 {
+                raw_ask(&end, seq, &up, &[]);
+            }
+            (1..=3).map(|_| raw_back(&end).unwrap().0).collect::<Vec<_>>()
+        });
+        // (Each takes thirty milliseconds: the second and the third waited longer than ten.)
+        for back in &backs[1..] {
+            assert!(refusal(back).contains("past its deadline"), "{back}");
+        }
+        assert_eq!(
+            root.hands.reached(),
+            ["mesh_up"],
+            "the late ones did not reach the machine"
+        );
+    }
+
+    #[test]
+    fn root_part_socket_a_peer_that_reads_no_reply_is_closed_at_the_reply_deadline() {
+        let (book, _) = book("socket-deaf");
+        let root = Direct::with(Nobody, &book);
+        let limits = Limits {
+            reply: Duration::from_millis(50),
+            ..Limits::default()
+        };
+        let started = Instant::now();
+        let sent = serving(&root, &limits, |fd| {
+            let end = raw(fd);
+            let own = serde_json::to_vec(&json!({
+                "seq": 1,
+                "call": as_call(ask("127.0.0.1", OWN_PORTS[0], Proto::Tcp)),
+            }))
+            .unwrap();
+            // It asks and reads nothing: its own receive queue fills, and the root part, whose
+            // reply is then not taken, gives the socket up, which this peer finds on a send.
+            (0..100_000).take_while(|_| said(&end, &own, &[]).is_ok()).count()
+        });
+        assert!(sent < 100_000, "the socket was never closed on it");
+        assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn root_part_socket_a_late_answer_is_not_taken_for_the_next_calls() {
+        let (book, prefix) = meshed("a cluster");
+        let root = Direct::with(Fake::default(), &book);
+        over_socket(&root, &Limits::default(), |mut socket| {
+            // A mesh call takes thirty milliseconds: five is not enough, and the call says so.
+            socket.deadline = Duration::from_millis(5);
+            let why = up(&socket, prefix).unwrap_err();
+            assert!(why.contains("in time"), "{why}");
+            // Its answer comes meanwhile and waits in the socket: the next call reads past it.
+            std::thread::sleep(Duration::from_millis(200));
+            socket.deadline = Duration::from_secs(20);
+            let seen = Request::MeshSeen { interface: WG.into() };
+            assert!(matches!(socket.request(seen), Ok(Reply::Seen(seen)) if seen.is_empty()));
+        });
+    }
+
+    #[test]
+    fn root_part_socket_refuses_a_request_over_the_limit_before_sending_it() {
+        let (book, _) = book("socket-long");
+        let root = Direct::with(Nobody, &book);
+        over_socket(&root, &Limits::default(), |socket| {
+            let peers: Vec<_> = (0..3000).map(|i| peer(i as u8, vec![])).collect();
+            let why = socket.request(mesh_ask(WG, peers, &[])).unwrap_err();
+            assert!(why.contains("at most"), "{why}");
+            // Nothing of it was sent: the next call is answered as it is.
+            let tcp = socket_of(socket.request(ask("127.0.0.1", 0, Proto::Tcp)));
+            assert!(TcpListener::from(tcp).local_addr().is_ok());
+        });
+        assert_eq!(book.total(), 1);
+    }
+
+    #[test]
+    fn root_part_socket_a_root_part_that_is_gone_is_an_error_and_a_delete_keeps_its_handle() {
+        let (socket, theirs) = Socket::pair(Duration::from_secs(1)).unwrap();
+        drop(theirs);
+        assert!(socket.request(ask("127.0.0.1", 0, Proto::Tcp)).is_err());
+        assert!(socket.adopt().is_empty());
+        let made = Held("w_a_b_0_c".into());
+        let (back, _) = socket.delete(made.clone(), "w_a_b_0_c").unwrap_err();
+        assert_eq!(back, Some(made.clone()), "a delete not answered may not have been done");
+        let (back, _) = socket.start(made.clone(), "w_a_b_0_c", "ab12").unwrap_err();
+        assert_eq!(back, made);
+    }
+
+    // The ADR's table of a hot path's cost, as the root part counts it over the socket.
+
+    #[test]
+    fn crossings_over_socket_of_a_container_start_are_at_most_three() {
+        let (book, state) = book("socket-start");
+        let root = Direct::with(Fake::default(), &book).under(policy("no-host-paths"));
+        let pods = Mutex::new(Pods::default());
+        pods.lock().unwrap().pretend("w_a_b_0", &state);
+        over_socket(&root, &Limits::default(), |socket| {
+            // The first container of a pod: its pod, its creation, its start.
+            start_one(&socket, &pods, &state, "w_a_b_0", "first");
+            assert_eq!(book.total(), 3);
+            assert_eq!(
+                (
+                    book.crossed(Kind::Pod),
+                    book.crossed(Kind::Create),
+                    book.crossed(Kind::Start)
+                ),
+                (1, 1, 1)
+            );
+            // The pod was told once: the next container of it is a creation and a start.
+            start_one(&socket, &pods, &state, "w_a_b_0", "second");
+            assert_eq!(book.total(), 5);
+            assert_eq!(book.crossed(Kind::Sockets) + book.crossed(Kind::Bind), 0);
+            // A pod let go is asked for again.
+            pods.lock().unwrap().keep(|_| false);
+            pods.lock().unwrap().pretend("w_a_b_0", &state);
+            start_one(&socket, &pods, &state, "w_a_b_0", "third");
+            assert_eq!(book.crossed(Kind::Pod), 2);
+        });
+        assert_eq!(
+            root.hands.reached(),
+            ["pod", "create", "start", "create", "start", "pod", "create", "start"]
+        );
+    }
+
+    #[test]
+    fn crossings_over_socket_of_an_unchanged_mesh_are_none() {
+        let (book, prefix) = meshed("a cluster");
+        let root = Direct::with(Fake::default(), &book);
+        over_socket(&root, &Limits::default(), |socket| {
+            up(&socket, prefix).unwrap();
+            let net = |name: &str| (IpAddr::V6(kith_mesh::node_net(prefix, name)), kith_mesh::NODE_BITS);
+            let mut told = None;
+            let mut set = |peers: Vec<kith_mesh::Peer>| mesh(&socket, &mut told, WG, peers, BTreeSet::new());
+            let b = || vec![peer(1, vec![net("b")])];
+            assert!(set(b()).unwrap());
+            for _ in 0..50 {
+                assert!(!set(b()).unwrap());
+            }
+            assert_eq!(book.crossed(Kind::Mesh), 2, "the interface up and the first set");
+            // One the root part refused is not taken for told: asked again, and counted.
+            let bad = || vec![peer(1, vec![net("a")])];
+            assert!(set(bad()).is_err());
+            assert!(set(bad()).is_err());
+            assert_eq!(book.crossed(Kind::Mesh), 4);
+        });
+    }
+
+    #[test]
+    fn crossings_over_socket_of_n_connections_into_a_pod_are_at_most_n_over_8_and_one() {
+        for n in [1, 8, 9, 100, 200] {
+            let book = Book::new();
+            let root = Direct::with(Fake::default(), &book);
+            over_socket(&root, &Limits::default(), |socket| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                assert!(runtime.block_on(connect_with(&socket, n, false)));
+            });
+            let crossed = book.crossed(Kind::Sockets);
+            assert!(
+                (1..=n / 8 + 1).contains(&crossed),
+                "{n} connections: {crossed} requests"
+            );
+            assert_eq!(book.total(), crossed, "{n}");
+        }
+    }
+
+    #[test]
+    fn crossings_over_socket_of_a_direct_are_counted_once_at_the_root_part() {
+        let (book, _) = book("socket-via");
+        let root = Direct::with(Nobody, &book);
+        let front = Book::new();
+        over_socket(&root, &Limits::default(), |socket| {
+            // What `--split` makes `Direct::new` and `today`: acting is asking over the socket.
+            let direct = Direct {
+                via: Some(&socket),
+                ..Direct::with(Nobody, &front)
+            };
+            let tcp = socket_of(direct.request(ask("127.0.0.1", 0, Proto::Tcp)));
+            assert!(TcpListener::from(tcp).local_addr().is_ok());
+            assert!(direct.request(ask("127.0.0.1", OWN_PORTS[1], Proto::Udp)).is_err());
+        });
+        assert_eq!((front.total(), book.total()), (0, 2));
+        assert_eq!(book.crossed(Kind::Bind), 2);
     }
 }

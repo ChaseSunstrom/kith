@@ -92,7 +92,7 @@ impl Local {
 }
 
 /// A pulled, unpacked image.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Image {
     /// The manifest digest, `sha256:<hex>`.
     pub digest: String,
