@@ -3,7 +3,8 @@
 # (this text), which it runs again as root of a user namespace of its own (`mounts`: that root is
 # the Job's user, 1000) chrooted into CACHE/vmroot: a copy of the image's root (FROM) with PKGS,
 # owned by 1000, so apt can install into it (`tools`) and the test runs in it (`run`). It takes
-# CACHE (the node's Volume), WORK (scratch), REPO, COMMIT, BASES and PKGS. The checkout is as
+# CACHE (the node's Volume), WORK (scratch), REPO, COMMIT, BASES, PKGS and CAP_MB (the size in MB
+# at which the cache's target folder is dropped, 30000 unless given). The checkout is as
 # ci/remote.sh's Jobs make it; KITH_OS_CACHE, cargo's registry and target folder stay in the
 # Volume, so a second run is warm. A test that ci/vm.sh skips exits 3 with why=skipped: ..., as a
 # failure. Its last line is SUMMARY.
@@ -27,7 +28,8 @@ run)
     # kith's pod seccomp answers EPERM to FS_IOC_SETFLAGS, and systemd-repart (--empty=create sets
     # NOCOW) gives up on any error but "not supported": this shim says that, as tmpfs would.
     shim=$cache/ci-nocow.so
-    [ -f "$shim" ] || gcc -shared -fPIC -x c -o "$shim" - <<'EOF' || exit 1
+    # (Built to a name of its own and moved: a build cut short must not leave half a file there to be kept.)
+    [ -f "$shim" ] || { gcc -shared -fPIC -x c -o "$shim.$$" - <<'EOF' && mv "$shim.$$" "$shim"
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
@@ -44,6 +46,7 @@ int ioctl(int fd, unsigned long req, ...) {
     return real(fd, req, arg);
 }
 EOF
+    } || { rm -f "$shim.$$"; exit 1; }
     cd "$cache/src" || exit 1
     # (Root here is the Job's user, the one uid this namespace maps: tar, as root, would give a file
     # its owner in the archive, a uid not mapped, and fail on it. TAR_OPTIONS keeps the files ours.)
@@ -62,6 +65,8 @@ t0=$(date +%s)
 end() { [ "$1" = 0 ] || echo "FAILED $TEST"; echo "SUMMARY exit=$1 test=$TEST host=$(hostname) secs=$(($(date +%s) - t0)) $2"; exit "$1"; }
 cd "$cache" && mkdir -p in src cargo os apt/archives/partial apt/lists/partial
 find in -type f -mtime +1 -delete
+# (The cargo target folder only grows: dropped at CAP_MB, as ci/remote.sh's own Jobs drop theirs.)
+mb=$(du -sm target 2>/dev/null | cut -f1); [ "${mb:-0}" -lt "${CAP_MB:-30000}" ] || rm -rf target
 cd src && { [ -d .git ] || git init -q; }
 git fetch -q --depth 1 "$REPO" $BASES || end 2 why=fetch
 [ ! -f "../in/$COMMIT.bundle" ] || git bundle unbundle "../in/$COMMIT.bundle" >/dev/null || end 2 why=bundle

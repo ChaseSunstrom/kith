@@ -213,7 +213,8 @@ import json, sys
 found = json.load(open(sys.argv[1]))
 found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
 status = next(r.get("status") for r in found if r["kind"] == "Share" and r["metadata"]["name"] == "mine")
-sys.exit(0 if status == {"node": "n1", "path": "/default/on1/own"} else 1)
+# (`served` is the node's own word of whether it serves the Share yet: a bool that may still be false here.)
+sys.exit(0 if isinstance(status.get("served"), bool) and {k: v for k, v in status.items() if k != "served"} == {"node": "n1", "path": "/default/on1/own"} else 1)
 EOF
 
             # An encrypted volume on the second node. Its key is made there and kept by the

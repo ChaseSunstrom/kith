@@ -102,7 +102,20 @@ EOF
     echo "$d" | jq -e '.[1] | .kind == "DeviceClaim" and .metadata.name == "ci-kvm-n1" and .spec == {device: "ci-kvm-n1", access: "shared"}' >/dev/null || die "no shared claim of it: $d"
     j=$(vm_job_json j n1 alone "$c" "$bases")
     echo "$j" | jq -e '.[0].spec.template | .deviceClaims == ["ci-kvm-n1"] and (.containers[0] | .runAsUser == 1000 and (keys - ["name", "image", "runAsUser", "userNamespaces", "env", "volumeMounts", "command"]) == [] and (.volumeMounts | map(.volume) | index("ci-n1")) != null and (.env | map(select(.name == "TEST" and .value == "alone")) | length == 1))' >/dev/null || die "the Job does not claim ci-kvm-n1 as 1000: $j"
-    ok "--vm: a Device of each node's /dev/kvm, a shared claim, and a Job that names it, as 1000"
+    echo "$j" | jq -e --arg cap "$cache_mb" '.[0].spec.template.containers[0].env | map(select(.name == "CAP_MB" and .value == $cap)) | length == 1' >/dev/null || die "the --vm Job has no CAP_MB for its cache: $j"
+    ok "--vm: a Device of each node's /dev/kvm, a shared claim, and a Job that names it, as 1000, with the cache's cap"
+    # a test name that is a glob is refused by what it says, not by the files it would match here
+    code=0
+    (cd "$t/w" && vm '*' HEAD) >/dev/null 2>&1 || code=$?
+    [ "$code" = 64 ] || die "--vm '*' was not refused as no test name (exit $code)"
+    ok "--vm: a name that is a glob is refused, not expanded to the files of the folder it runs in"
+    # the report prints a SUMMARY line as it prints the rest of a log: no control characters from a Job
+    mkdir "$t/rep" && echo n1 >"$t/rep/0.node" && echo succeeded >"$t/rep/0.state" && : >"$t/rep/failures.txt"
+    printf 'SUMMARY exit=0 test=x why=\033[31mred\007\n' >"$t/rep/0.log"
+    rep=$(report "$t/rep" 1) || die "a passing SUMMARY gave a failing report"
+    [ -z "$(echo "$rep" | tr -d '[:print:]\n\t')" ] || die "the report carries a control character of the Job's log"
+    echo "$rep" | grep -q '^n1: exit=0 test=x why=\[31mred$' || die "the SUMMARY is not in the report: $rep"
+    ok "the merged report holds no control character of a Job's SUMMARY"
     # all that a run applies and asks for, fan's and --vm's, is in namespace ci: the API stubbed
     : >"$t/applied" && : >"$t/paths" && mkdir "$t/ns"
     # shellcheck disable=SC2030,SC2034,SC2317 # (the stubs are the subshell's)
@@ -112,6 +125,8 @@ EOF
             case $1 in
             apply) cat >>"$t/applied" ;;
             volumes/*) cat >/dev/null ;;
+            resources/Device/ci-kvm-n3) echo '{"kind": "Device", "metadata": {"name": "ci-kvm-n3"}}' ;;
+            resources/Device/*) echo '{"error": "no such resource"}' ;;
             resources/*) echo '{"status": {"state": "succeeded"}}' ;;
             logs/*) echo '{"data": "SUMMARY exit=0"}' ;;
             esac
@@ -119,12 +134,37 @@ EOF
         sleep() { :; }
         timeout=1
         mkdir "$t/ns/in" && : >"$t/ns/in/x.bundle"
-        one n1 0 2 "$c" "$bases" --workspace "$t/ns"
-        one n2 1 2 "$c" "$bases" "" "$t/ns" alone
+        one n1 0 3 "$c" "$bases" --workspace "$t/ns"
+        one n2 1 3 "$c" "$bases" "" "$t/ns" alone
+        one n3 2 3 "$c" "$bases" "" "$t/ns" alone
     ) || die "one, its API stubbed, failed"
-    jq -s -e 'add | length == 6 and all(if .kind == "Device" then .metadata.labels["kith.dev/namespaces"] == "ci" and .metadata.namespace == null else .metadata.namespace == "ci" end)' "$t/applied" >/dev/null || die "an object applied outside namespace ci: $(cat "$t/applied")"
-    ! grep -vE '^(apply|(resources/Job|logs/Job|volumes)/ci/.)' "$t/paths" || die "an API path outside namespace ci"
-    ok "every object a run applies (Volume, Job, claim) is in namespace ci; the Device is granted to ci alone"
+    [ "$(jq -s -r 'add | map(select(.kind == "Device") | .metadata.name) | join(",")' "$t/applied")" = ci-kvm-n2 ] || die "a Device was applied that is there already, or not applied that is not: $(cat "$t/applied")"
+    [ "$(jq -s -r 'add | map(select(.kind == "DeviceClaim") | .metadata.name) | join(",")' "$t/applied")" = ci-kvm-n2,ci-kvm-n3 ] || die "a claim is not applied each run"
+    jq -s -e 'add | length == 9 and all(if .kind == "Device" then .metadata.labels["kith.dev/namespaces"] == "ci" and .metadata.namespace == null else .metadata.namespace == "ci" end)' "$t/applied" >/dev/null || die "an object applied outside namespace ci: $(cat "$t/applied")"
+    ! grep -vE '^(apply|resources/Device/ci-kvm-n[0-9]+|(resources/Job|logs/Job|volumes)/ci/.)' "$t/paths" || die "an API path outside namespace ci"
+    ok "every object a run applies (Volume, Job, claim) is in namespace ci; the Device is granted to ci alone, and applied only where it is not there"
+    # a Job still pending after a while is given up on, with the claim's own word of why (the claim of
+    # /dev/kvm that no node can give, say), not waited on for the hour
+    : >"$t/paths" && mkdir "$t/pend" && mkdir "$t/pend/in" && : >"$t/pend/in/x.bundle"
+    # shellcheck disable=SC2030,SC2034,SC2317 # (the stubs are the subshell's)
+    (
+        api() {
+            echo "$1" >>"$t/paths"
+            case $1 in
+            apply | volumes/*) cat >/dev/null ;;
+            resources/Device/*) echo '{"kind": "Device"}' ;;
+            resources/DeviceClaim/ci/ci-kvm-n1) echo '{"status": {"message": "no Device ci-kvm-n1 is free"}}' ;;
+            resources/Job/*) echo '{"status": {}}' ;;
+            logs/*) echo '{"data": null}' ;;
+            esac
+        }
+        sleep() { :; }
+        timeout=3600 pending=60
+        one n1 0 1 "$c" "$bases" "" "$t/pend" alone
+    ) || die "one, its Job pending, failed"
+    grep -q 'still pending after .* s: no Device ci-kvm-n1 is free' "$t/pend/0.log" || die "a Job pending for ever has no claim's message in its log: $(cat "$t/pend/0.log")"
+    [ "$(grep -c '^resources/Job/ci/.*' "$t/paths")" -lt 10 ] || die "a pending Job was waited on far past its time: $(grep -c '^resources/Job' "$t/paths") asks"
+    ok "a Job still pending after a while fails at once with the claim's message, not after the hour"
     # one test per node at a time, each test once: the cluster's answers stubbed, one as it is (a
     # Job named ci-NODE-COMMIT-TEST-TIME starts at its apply and ends at its log)
     : >"$t/sched"
@@ -170,6 +210,8 @@ EOF
     chmod +x "$t/bin/unshare" "$t/bin/chroot" "$t/bin/mount" "$t/bin/apt-get" "$t/bin/rustup"
     mkdir -p "$t/from/etc" "$t/from/usr" "$t/vm"
     : >"$t/ran" && : >"$t/vm/failures.txt"
+    # (a target folder of 2 MB, over the cap of 1 MB the first run gives: gone before the test runs)
+    mkdir -p "$t/vc/target" && head -c 2097152 /dev/zero >"$t/vc/target/big"
     i=0
     for x in alone skipme broken; do
         echo "n$((i + 1))" >"$t/vm/$i.node" && echo succeeded >"$t/vm/$i.state"
@@ -177,7 +219,7 @@ EOF
         # shellcheck disable=SC2030,SC2031 # (the PATH is the subshell's: the node's)
         (
             export CACHE="$t/vc" WORK="$t/vw$i" REPO="file://$t/gh.git" COMMIT="$c" BASES="$bases" TEST="$x" PKGS="qemu socat" \
-                FROM="$t/from" SCRIPT="$vm_script" PATH="$t/bin:$PATH" FAKE_RAN="$t/ran"
+                FROM="$t/from" SCRIPT="$vm_script" PATH="$t/bin:$PATH" FAKE_RAN="$t/ran" CAP_MB=1
             mkdir -p "$CACHE/in" && cp "$t/dir/in/"* "$CACHE/in/"
             sh -c "$SCRIPT"
         ) >"$t/vm/$i.log" 2>&1 || code=$?
@@ -192,6 +234,30 @@ EOF
     done
     ! echo "$rep" | grep -q '^FAILED: n1' || die "the test that passed is named failed: $rep"
     ok "--vm: a skipped test fails the run as a failed one does, named with its node; the tools installed once and kept; tar leaves owners be"
+    [ ! -e "$t/vc/target/big" ] || die "--vm: a target folder over CAP_MB was kept"
+    [ -s "$t/vc/ci-nocow.so" ] || die "--vm: no shim was built"
+    [ -z "$(ls "$t"/vc/ci-nocow.so.* 2>/dev/null)" ] || die "--vm: the shim's temporary file was left: $(ls "$t"/vc)"
+    # (under the cap, or with no CAP_MB, it stays)
+    mkdir -p "$t/vc/target" && head -c 2097152 /dev/zero >"$t/vc/target/big"
+    # shellcheck disable=SC2030,SC2031 # (the PATH is the subshell's: the node's)
+    (
+        export CACHE="$t/vc" WORK="$t/vw9" REPO="file://$t/gh.git" COMMIT="$c" BASES="$bases" TEST=alone PKGS="qemu socat" \
+            FROM="$t/from" SCRIPT="$vm_script" PATH="$t/bin:$PATH" FAKE_RAN="$t/ran"
+        unset CAP_MB
+        sh -c "$SCRIPT"
+    ) >"$t/vm/9.log" 2>&1 || die "--vm: a run with no CAP_MB failed: $(cat "$t/vm/9.log")"
+    [ -e "$t/vc/target/big" ] || die "--vm: a target folder was dropped with no CAP_MB set"
+    # a gcc that leaves half a file and fails: the shim is not there to be taken for built next time
+    printf '#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\necho half >"$2"\nexit 1\n' >"$t/bin/gcc" && chmod +x "$t/bin/gcc"
+    mkdir "$t/vg"
+    # shellcheck disable=SC2030,SC2031 # (the PATH is the subshell's: the node's)
+    (
+        export CACHE="$t/vg" WORK="$t/vw8" TEST=alone SCRIPT="$vm_script" PATH="$t/bin:$PATH"
+        sh -c "$SCRIPT" vm run
+    ) >"$t/vm/8.log" 2>&1 && die "--vm: a failing gcc did not fail the run"
+    [ -z "$(ls "$t"/vg/ci-nocow.so* 2>/dev/null)" ] || die "--vm: half a shim was left after gcc failed: $(ls "$t/vg")"
+    rm -f "$t/bin/gcc"
+    ok "--vm: the cache's target folder is dropped over CAP_MB and kept under it; the shim is built to a temporary name and moved, none left on a failed build"
     # rollout and kube: what a machine of one's own has, the Job makes first
     # shellcheck disable=SC2016 # (the stub's)
     printf '#!/bin/sh\necho "cargo $*" >>"$FAKE_RAN"\n' >"$t/bin/cargo" && chmod +x "$t/bin/cargo"

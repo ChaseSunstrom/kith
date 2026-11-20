@@ -622,7 +622,11 @@ if [ -z "$kernel" ]; then
     for k in "/boot/vmlinuz-$(uname -r)" "/lib/modules/$(uname -r)/vmlinuz" /boot/vmlinuz-* /boot/vmlinuz; do
         [ -r "$k" ] && { kernel=$k; break; }
     done
-    [ -n "$kernel" ] || skip "no readable kernel in /boot (pass --kernel)"
+    # (A machine with no kernel of its own, as a cluster Job's is, starts the image's: built here if need be.)
+    if [ -z "$kernel" ]; then
+        [ -r "$root/target/os/vmlinuz" ] || sh "$root/os/build.sh" --out "$root/target/os" >&2 || { [ $? -ne 3 ] || skip "no readable kernel in /boot (pass --kernel), and this machine cannot build the image's"; exit 1; }
+        kernel=$root/target/os/vmlinuz
+    fi
 fi
 [ -r "$kernel" ] || skip "kernel $kernel is not readable"
 

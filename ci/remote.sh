@@ -20,8 +20,13 @@
 # KITH_REMOTE_CACHE_MB (the size at which a node's target folder is dropped, 30000) are settable.
 # --vm runs each named test of ci/vm.sh (sh ci/vm.sh --test TEST) in a Job of its own, one at a
 # time on each node, with the node's /dev/kvm: a Device ci-kvm-NODE of it, granted to namespace ci
-# alone, and a shared DeviceClaim ci-kvm-NODE, applied each run (the same each time), named by the
-# Job. Everything this applies (Volumes, Jobs, claims) is in namespace ci. The tools the tests need are
+# alone, and a shared DeviceClaim ci-kvm-NODE, named by the Job (the claim is applied each run, the
+# Device only where it is not there; one that is wrong is deleted first: DELETE /v1/resources/Device/ci-kvm-NODE).
+# Everything else this applies (Volumes, Jobs, claims) is in namespace ci: a Volume ci-NODE that an
+# earlier version made in namespace default stays until it is deleted by hand (DELETE
+# /v1/resources/Volume/default/ci-NODE). A Job that is
+# still pending after KITH_REMOTE_PENDING seconds (600) is given up on, with its claim's own message
+# as the log, so a node with no /dev/kvm to give ends the run at once, not at the hour. The tools the tests need are
 # installed by apt into a copy of the image's root in the node's Volume, once; there too stay the
 # OS build's cache and cargo's. A test that ci/vm.sh skips (no KVM, a tool missing) counts as
 # failed. One merged result names the node and test of each failure; it exits 0 when all passed.
@@ -29,6 +34,8 @@ set -eu
 repo=${KITH_REMOTE_REPO:-https://github.com/ChaseSunstrom/kith}
 timeout=${KITH_REMOTE_TIMEOUT:-3600}
 cache_mb=${KITH_REMOTE_CACHE_MB:-30000}
+# (How long a Job may stay pending before the run gives up on it, seconds.)
+pending=${KITH_REMOTE_PENDING:-600}
 # (CI's namespace: its Volumes, Jobs and claims, and the one /dev/kvm is granted to.)
 ns=ci
 
@@ -113,12 +120,13 @@ dev_json() {
 # vm_job_json NAME NODE TEST COMMIT BASES: the Job of one VM test on NODE, with its claim of /dev/kvm.
 vm_job_json() {
     jq -n --arg name "$1" --arg node "$2" --arg test "$3" --arg commit "$4" --arg bases "$5" --arg script "$vm_script" \
-        --arg repo "$repo" --arg pkgs "$pkgs" --argjson timeout "$timeout" --arg ns "$ns" '[{
+        --arg repo "$repo" --arg pkgs "$pkgs" --arg cap "$cache_mb" --argjson timeout "$timeout" --arg ns "$ns" '[{
   apiVersion: "kith.dev/v1", kind: "Job", metadata: {name: $name, namespace: $ns},
   spec: {retries: 0, timeoutSeconds: $timeout, template: {pod: true, deviceClaims: [("ci-kvm-" + $node)], containers: [{
     name: "test", image: "docker.io/library/rust:1.99.1", runAsUser: 1000, userNamespaces: true,
     env: [{name: "RUSTUP_TOOLCHAIN", value: "1.99.1"}, {name: "REPO", value: $repo}, {name: "COMMIT", value: $commit},
-          {name: "BASES", value: $bases}, {name: "TEST", value: $test}, {name: "PKGS", value: $pkgs}, {name: "SCRIPT", value: $script}],
+          {name: "BASES", value: $bases}, {name: "TEST", value: $test}, {name: "PKGS", value: $pkgs}, {name: "CAP_MB", value: $cap},
+          {name: "SCRIPT", value: $script}],
     volumeMounts: [{volume: ("ci-" + $node), path: "/cache"}, {scratch: "work", path: "/work"}],
     command: ["sh", "-c", $script]}]}}}]'
 }
@@ -163,7 +171,7 @@ report() {
     echo "=== merged: $2 Jobs"
     i=0
     while [ "$i" -lt "$2" ]; do
-        echo "$(cat "$1/$i.node"): $(grep '^SUMMARY ' "$1/$i.log" | tail -1 | cut -c9- || true)"
+        echo "$(cat "$1/$i.node"): $(grep '^SUMMARY ' "$1/$i.log" | tail -1 | cut -c9- | tr -cd '[:print:]\n\t' || true)"
         i=$((i + 1))
     done
     if [ -s "$1/failures.txt" ]; then
@@ -188,7 +196,9 @@ one() (
     volume_json "$node" | api apply -H 'content-type: application/json' --data-binary @- >"$answer" 2>&1
     if grep -qE '"error"|^curl:' "$answer"; then cp "$answer" "$dir/$i.log"; echo "Volume refused" >"$dir/$i.state"; return 0; fi
     if [ -n "$vmtest" ]; then
-        dev_json "$node" | api apply -H 'content-type: application/json' --data-binary @- >"$answer" 2>&1
+        # (The Device only where it is not there, so a run does not write it over again; the claim each time.)
+        if api "resources/Device/ci-kvm-$node" | jq -e '.kind == "Device"' >/dev/null 2>&1; then dev_json "$node" | jq '[.[1]]'; else dev_json "$node"; fi |
+            api apply -H 'content-type: application/json' --data-binary @- >"$answer" 2>&1
         if grep -qE '"error"|^curl:' "$answer"; then cp "$answer" "$dir/$i.log"; echo "Device refused" >"$dir/$i.state"; return 0; fi
     fi
     if [ -d "$dir/in" ]; then
@@ -206,15 +216,21 @@ one() (
         api apply -H 'content-type: application/json' --data-binary @- >"$answer" 2>&1
     if grep -qE '"error"|^curl:' "$answer"; then cp "$answer" "$dir/$i.log"; echo "Job refused" >"$dir/$i.state"; return 0; fi
     echo "remote.sh: $node: Job $name" >&2
-    state=pending waited=0
+    state=pending waited=0 gave=''
     while [ "$state" != succeeded ] && [ "$state" != failed ]; do
-        [ "$waited" -lt $((timeout + 600)) ] || { echo "no end after $waited s" >"$dir/$i.log"; break; }
+        [ "$waited" -lt $((timeout + 600)) ] || { gave="no end after $waited s"; break; }
+        # (Still pending after PENDING s: nothing placed it, as when the node has no /dev/kvm to give. Its claim says why.)
+        if [ "$state" = pending ] && [ "$waited" -ge "$pending" ]; then
+            why=$(api "resources/DeviceClaim/$ns/ci-kvm-$node" | jq -r '.status.message // empty' 2>/dev/null) || why=''
+            gave="Job still pending after $waited s${why:+: $why}"
+            break
+        fi
         sleep 15
         waited=$((waited + 15))
         state=$(api "resources/Job/$ns/$name" | jq -r '.status.state // "pending"') || state=pending
         echo "$state" >"$dir/$i.state"
     done
-    api "logs/Job/$ns/$name" | jq -r .data >"$dir/$i.log" || true
+    if [ -n "$gave" ]; then echo "$gave" >"$dir/$i.log"; else api "logs/Job/$ns/$name" | jq -r .data >"$dir/$i.log" || true; fi
     api "resources/Job/$ns/$name" -X DELETE >/dev/null || true
 )
 
@@ -262,6 +278,7 @@ fan() {
 # vm TEST[,TEST...] COMMIT: each VM test in a Job of its own; the Kth on node K mod N, after that
 # node's one before it, so a node runs one at a time (its /dev/kvm, CPUs and Volume are the test's).
 vm() {
+    set -f # (a name is checked as it is typed: a `*` must not become the files of this folder)
     tests=$(echo "$1" | tr , ' ')
     for x in $tests; do
         case $x in *[!a-z0-9]*) echo "remote.sh: --vm: '$x' is not a test of ci/vm.sh" >&2; exit 64 ;; esac

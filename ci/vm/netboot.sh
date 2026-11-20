@@ -62,7 +62,7 @@
             hears alpha 'kithd: netboot: on for 10 minutes'
 
             beta() { # LOG [disk]: the machine: an empty disk at first, and its card, which it starts from (or: from its disk)
-                vm "$1" -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device "virtio-blk-pci,drive=d${2+,bootindex=0}" \
+                vm "$1" -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device "virtio-blk-pci,drive=d${2+,bootindex=0}${2-,bootindex=2}" \
                     -netdev "socket,id=n,connect=127.0.0.1:$((port + 8))" -device "virtio-net-pci,netdev=n,mac=$mac${2-,bootindex=1}"
             }
             blank beta
@@ -159,8 +159,9 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
                     }
                     # Told to seal, a machine with no TPM says why not, and runs on as it was.
                     lock seal | grep -q '"seal": *true' || fail "the machine could not be told to seal its key"
-                    hears beta 'is not sealed: this machine has no TPM'
-                    told 'no TPM'
+                    # (The cluster handed the key out, so kithd reads the firmware's event log before it opens the TPM: with no TPM there is no log to read, and that is what it says.)
+                    hears beta 'is not sealed: reading /sys/kernel/security/tpm0/binary_bios_measurements'
+                    told 'binary_bios_measurements'
                     off
                     [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the machine's disk, read from outside: $(says "$work/beta.disk")"
                     # With its TPM: it asks the node this once, and seals its key to what it runs.
