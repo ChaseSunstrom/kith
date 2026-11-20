@@ -431,7 +431,7 @@ async fn here(shared: &Shared, dir: Dir, bound: u64, body: Body) -> Result<Value
     let (to, from) = mpsc::channel(16);
     let unpacking = tokio::task::spawn_blocking(move || {
         let _one = one;
-        let into = crate::volumes::host_dir(&state, &dir)?;
+        let into = crate::root_part::open(&state, &dir)?;
         // (A disk that cannot be asked has nothing free.)
         let free = || {
             let disk = nix::sys::statvfs::statvfs(&into);
@@ -494,7 +494,7 @@ fn out(shared: &Shared, dir: &Dir) -> Result<Response, String> {
     let busy = |_| format!("this node is packing {GETS} volumes already: ask again when one is done");
     let one = PACKING.try_acquire().map_err(busy)?;
     let state = shared.logs.parent().ok_or("kithd has no state directory")?;
-    let from = crate::volumes::host_dir(state, dir)?;
+    let from = crate::root_part::volume(state, dir)?;
     let (to, packed) = mpsc::channel(16);
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {

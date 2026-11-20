@@ -751,7 +751,7 @@ async fn make(shared: &Shared, state: &Path, job: &Job, at: u64) -> Result<Value
         .map(|s3| bucket(shared, &job.namespace, s3))
         .transpose()?;
     let _alone = BUSY.lock().await;
-    let from = crate::volumes::host_dir(state, &job.dir)?;
+    let from = crate::root_part::volume(state, &job.dir)?;
     let blobs = crate::blobs::dir(shared);
     let into = blobs.clone();
     let archived = tokio::task::spawn_blocking(move || archive(&from, &into)).await;
@@ -997,7 +997,7 @@ pub async fn restore(
     let restored = async {
         let _alone = BUSY.lock().await;
         let state = shared.logs.parent().ok_or("kithd has no state directory")?;
-        let into = crate::volumes::host_dir(state, &dir)?;
+        let into = crate::root_part::restore(state, &dir)?;
         match (entry["blob"].as_str(), entry["object"].as_str(), &spec.s3) {
             (Some(blob), _, _) => {
                 let archive = crate::blobs::here(&shared, &format!("Blob/{namespace}/{blob}")).await?;

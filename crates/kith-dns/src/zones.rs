@@ -121,6 +121,16 @@ impl Records {
         Ok(())
     }
 
+    /// Makes `name` exist with no records of its own yet: asked for a type, it answers NODATA
+    /// (NOERROR, the SOA), not NXDOMAIN. Records added to it later join it.
+    pub fn add_name(&mut self, name: &str) -> Result<(), String> {
+        if !valid_name(name) {
+            return Err(format!("invalid DNS name {name:?}"));
+        }
+        self.by_name.entry(key(name)).or_default();
+        Ok(())
+    }
+
     /// The closest zone apex at or above `name`.
     fn apex(&self, name: &str) -> Option<&Record> {
         suffixes(name).find_map(|s| {
