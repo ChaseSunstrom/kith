@@ -496,9 +496,23 @@ nodes too, and a replay decides alike.
   asks only that the writer may write it, not that the Release renders it, so a taken leader
   could have named a Release whose writer may), a fetched Package is one that a Release asks
   of that Repository by name and version, and does not overwrite one that is another's or
-  nobody's, and a missing owner's leftovers are deleted only where a Release, a Source or a
-  KindDefinition's kind could have left them. A Release or Source that renders a Role or the
-  like is refused under `required`, then, and its status says why. What remains: a taken
+  nobody's (the whole `NAME@print` it says, and it names no writer), and a missing owner's
+  leftovers are deleted only where a Release, a Source or a KindDefinition's kind could have
+  left them. A Release or Source a node-signed write names as owner says the writer and key
+  its owner says (`kith.dev/written-by`, `kith.dev/written-key`; `sources` copies both onto
+  what a Source brings), else a taken leader could name a Release written as the admin and
+  then write anything as that Release. The kinds that reach the mesh or the network policy
+  (AccessLevel, RemotePeer, NetworkPolicy) are refused as well, applied or deleted.
+  Secret and Backup stay: a chart renders both, and the owner's writer must hold them.
+  What I found reading the controller path (T-1084): a Release's render and a wasm
+  controller's answer already refuse every cluster-scoped kind and a Release, a Source or a
+  KindDefinition (`releases::render`, `controllers::desired`), so no Role, RoleBinding,
+  Identity, AccessLevel or RemotePeer is rendered in any mode. What a refusal under
+  `required` does cost: a Source that brings a KindDefinition (`sources`) and the prune that
+  takes one away, the reaper's delete of an orphaned access kind, and a NetworkPolicy a
+  Release renders (the only namespaced kind of these). A person applies those, signed,
+  not a Release; the Release's status says "changes access" or "reaches the mesh". What
+  remains: a taken
   leader can still write, as the writer of an owner that is there, any other kind that
   writer may write, owned by it, and the owner's prune takes it away. The table test
   `own_writes_signed_owned_writes_are_held_to_writer_may_at_apply` names each kind. The

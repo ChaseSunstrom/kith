@@ -383,6 +383,24 @@ fn signed(store: &Store, prefix: Ipv6Addr, by: (&str, bool), command: &Command) 
             "it changes access, and only a person signs that",
         ));
     }
+    // Nor one of who joins the mesh and at what level, or of what traffic flows: no Release's or
+    // Source's chart needs one signed by a node that a person cannot apply (T-1084).
+    let network = |kind: &str| {
+        ["AccessLevel", "RemotePeer", "NetworkPolicy"]
+            .iter()
+            .any(|of| of.eq_ignore_ascii_case(kind))
+    };
+    let reaches = match command {
+        Command::Apply { resources, .. } => resources.iter().any(|resource| network(&resource.kind)),
+        Command::Delete { key } => network(kind_of(key)),
+        _ => false,
+    };
+    if reaches {
+        return Err(not_made(
+            "a node's own write",
+            "it reaches the mesh or the network policy, and only a person signs that",
+        ));
+    }
     match command {
         Command::Apply { resources, .. } => {
             let decided: Vec<_> = resources.iter().map(|r| mine(store, prefix, by, r)).collect();
@@ -454,6 +472,16 @@ fn owned(store: &Store, leads: bool, of: &str, resource: &Resource) -> Result<()
         return Err(not_made(key, format!("it is there, and not what {of} made")));
     }
     let writer = writer_of(store, of).map_err(|why| not_made(&key, why))?;
+    // A Release, Source or Package says who wrote it and with what key, and what it renders says
+    // what its owner says (`sources`): another would be written as a writer that is not its owner's.
+    if matches!(resource.kind.as_str(), "Release" | "Source" | "Package") {
+        use crate::releases::{KEY, WRITER};
+        for note in [WRITER, KEY] {
+            if resource.metadata.annotations.get(note) != writer.metadata.annotations.get(note) {
+                return Err(not_made(key, format!("it is not written by who wrote {of} ({note})")));
+            }
+        }
+    }
     crate::releases::writer_may(store, writer, std::slice::from_ref(resource), &[])
 }
 
@@ -518,12 +546,16 @@ fn fetched(store: &Store, leads: bool, package: &Resource) -> Result<(), String>
     };
     // (Over a Package that is there: only the same Repository's, as the registry does it. One no
     // one fetched, or another Repository's, is not for a fetch to overwrite.)
-    let overwrites_another = store.get(&key).is_some_and(|held| {
-        let from = held.metadata.annotations.get(crate::releases::REPOSITORY);
-        from.and_then(|from| from.split('@').next()) != Some(name)
-    });
+    let overwrites_another = store
+        .get(&key)
+        .is_some_and(|held| held.metadata.annotations.get(crate::releases::REPOSITORY) != said);
+    // (The registry stamps the Repository and nothing else: a writer or a key on it is not its.)
+    let stamped = [crate::releases::WRITER, crate::releases::KEY]
+        .iter()
+        .any(|note| package.metadata.annotations.contains_key(*note));
     match (leads, crate::releases::origin(store, name)) {
         (false, _) => Err(not_made(key, "only the leader writes what a Repository sent")),
+        _ if stamped => Err(not_made(key, "a fetched Package names no writer")),
         _ if overwrites_another => Err(not_made(key, "it is there, and not what that Repository sent")),
         (_, origin) if origin.as_ref() == said && store.list(Some("Release")).any(|r| wanted(&r)) => Ok(()),
         _ => Err(not_made(
@@ -1448,12 +1480,12 @@ mod tests {
         let (mut store, nodes) = required(&ca, &["a"]);
         let id = pki::fingerprint(&ca.cert).unwrap();
         let note = bobs_note(0);
-        for resource in kith_api::Resource::from_source(&format!(
-            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: bob }}\nspec: {{ rules: [\
-             {{ kinds: [ConfigMap], verbs: [apply, delete], namespaces: [shop] }}, \
-             {{ kinds: [Role, RoleBinding, Identity, KindDefinition, Cluster], verbs: [apply, delete] }}] }}\n---\n\
-             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob }}\nspec: {{ role: bob, subjects: [bob] }}\n"
-        ))
+        for resource in kith_api::Resource::from_source(
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: bob }\nspec: { rules: [\
+             { kinds: [ConfigMap], verbs: [apply, delete], namespaces: [shop] }, \
+             { kinds: [Role, RoleBinding, Identity, KindDefinition, Cluster], verbs: [apply, delete] }] }\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob }\nspec: { role: bob, subjects: [bob] }\n",
+        )
         .unwrap()
         {
             store.apply(resource.unwrap()).unwrap();
@@ -1512,11 +1544,11 @@ mod tests {
         let ca = pki::Ca::create().unwrap();
         let (mut store, nodes) = required(&ca, &["a"]);
         let id = pki::fingerprint(&ca.cert).unwrap();
-        for resource in kith_api::Resource::from_source(&format!(
-            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: bob }}\nspec: {{ rules: [\
-             {{ kinds: [Package], verbs: [apply] }}] }}\n---\n\
-             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob }}\nspec: {{ role: bob, subjects: [bob] }}\n"
-        ))
+        for resource in kith_api::Resource::from_source(
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: bob }\nspec: { rules: [\
+             { kinds: [Package], verbs: [apply] }] }\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob }\nspec: { role: bob, subjects: [bob] }\n",
+        )
         .unwrap()
         {
             store.apply(resource.unwrap()).unwrap();
@@ -1549,6 +1581,14 @@ mod tests {
         };
         // The control: what the Release asks of the Repository it names.
         assert_eq!(admitted(&store, &package("maps-1.0.0", "1.0.0", &origin)), Ok(()));
+        // The registry names no writer on what it fetches: one that does is not its.
+        let mut written = package("maps-1.0.0", "1.0.0", &origin);
+        written
+            .metadata
+            .annotations
+            .insert(crate::releases::WRITER.into(), "local socket".into());
+        let said = admitted(&store, &written).unwrap_err();
+        assert!(said.contains("names no writer"), "{said}");
         // Another name, or a version the Release does not ask for, is nothing it wants.
         for (name, version) in [
             ("other-1.0.0", "1.0.0"),
@@ -1560,9 +1600,15 @@ mod tests {
         }
         // Over a Package that is there: its own Repository's, again, is the registry's re-fetch;
         // nobody's, or another Repository's, is not its to overwrite.
-        let mut held = package("maps-1.0.0", "1.0.0", "hub@old");
+        let mut held = package("maps-1.0.0", "1.0.0", &origin);
         store.apply(held.clone()).unwrap();
         assert_eq!(admitted(&store, &package("maps-1.0.0", "1.0.0", &origin)), Ok(()));
+        // The same name before the `@`, another print after it (the Repository's url or key was
+        // not what it is now): not the same fetch, so not its to overwrite either.
+        held.metadata.annotations.insert(REPOSITORY.into(), "hub@old".into());
+        store.apply(held.clone()).unwrap();
+        let said = admitted(&store, &package("maps-1.0.0", "1.0.0", &origin)).unwrap_err();
+        assert!(said.contains("not what"), "{said}");
         held.metadata.annotations.insert(REPOSITORY.into(), "other@old".into());
         store.apply(held.clone()).unwrap();
         let said = admitted(&store, &package("maps-1.0.0", "1.0.0", &origin)).unwrap_err();
@@ -1822,5 +1868,125 @@ mod tests {
         assert!(admitted(&store, b, &ok).is_err());
         node.spec["trust"] = "control".into();
         assert!(admitted(&store, a, &apply(vec![node])).is_err(), "more than a cordon");
+    }
+
+    /// A Release or Source a Source renders says who wrote it, and the key, exactly as its owner
+    /// does: a taken leader that says another (the admin's `local socket`) would have what it
+    /// renders written as that writer, whose rights are all (T-1084).
+    #[test]
+    fn own_writes_signed_a_rendered_release_is_written_by_its_owners_writer() {
+        use crate::releases::{KEY, OWNER, WRITER, bob_is, bobs_note};
+        let ca = pki::Ca::create().unwrap();
+        let (mut store, nodes) = required(&ca, &["a"]);
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        let note = bobs_note(0);
+        for resource in kith_api::Resource::from_source(
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: bob }\nspec: { rules: [\
+             { kinds: [Release, Source, ConfigMap], verbs: [apply, delete], namespaces: [shop] }] }\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob }\nspec: { role: bob, subjects: [bob] }\n",
+        )
+        .unwrap()
+        {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        bob_is(&mut store, 0);
+        for resource in kith_api::Resource::from_source(&format!(
+            "apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: repo, namespace: shop, {note} }}\n\
+             spec: {{ git: {{ url: 'https://example.org/a.git' }} }}\n"
+        ))
+        .unwrap()
+        {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let leader = kith_store::node_id("a");
+        let admitted = |store: &Store, command: &Command| {
+            let entry = sign(&nodes[0], &id, command).unwrap();
+            crate::access_sign::admit(store, &id, &entry, leader)
+        };
+        let held = store.get("Source/shop/repo").unwrap().metadata.annotations.clone();
+        let render = |kind: &str, name: &str, forged: Option<(&str, Option<&str>)>| {
+            let spec = match kind {
+                "Source" => serde_json::json!({ "git": { "url": "https://example.org/b.git" } }),
+                _ => serde_json::json!({ "package": { "name": "maps" } }),
+            };
+            let mut made = named(kind, name, spec);
+            made.metadata.namespace = Some("shop".into());
+            made.metadata.annotations = held.clone();
+            made.metadata
+                .annotations
+                .insert(OWNER.into(), "Source/shop/repo".into());
+            match forged {
+                Some((note, Some(to))) => made.metadata.annotations.insert(note.into(), to.into()),
+                Some((note, None)) => made.metadata.annotations.remove(note),
+                None => None,
+            };
+            made
+        };
+        let zeros = "0".repeat(64);
+        for kind in ["Release", "Source"] {
+            // The control: as the Source says, the writer and key both.
+            let ok = render(kind, "r2", None);
+            assert_eq!(admitted(&store, &apply(vec![ok])), Ok(()), "{kind}");
+            // Another writer (one with every right), another key, or none: not its owner's.
+            let forged = [
+                ("writer", WRITER, Some("local socket")),
+                ("no writer", WRITER, None),
+                ("key", KEY, Some(zeros.as_str())),
+                ("no key", KEY, None),
+            ];
+            for (what, note, to) in forged {
+                let said = admitted(&store, &apply(vec![render(kind, "r2", Some((note, to)))])).unwrap_err();
+                assert!(said.contains("written by"), "{kind} {what}: {said}");
+            }
+        }
+    }
+
+    /// A node-signed write of a kind that reaches who may join the mesh or how traffic flows is
+    /// refused, whatever the owner: none of a Release's or Source's charts need one under
+    /// `required` that a person cannot apply (T-1084).
+    #[test]
+    fn own_writes_signed_owned_writes_never_reach_the_mesh_or_the_network_policy() {
+        use crate::releases::{OWNER, bob_is, bobs_note};
+        let ca = pki::Ca::create().unwrap();
+        let (mut store, nodes) = required(&ca, &["a"]);
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        let note = bobs_note(0);
+        for resource in kith_api::Resource::from_source(&format!(
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: bob }}\nspec: {{ rules: [\
+             {{ kinds: [ConfigMap, NetworkPolicy], verbs: [apply, delete], namespaces: [shop] }}, \
+             {{ kinds: [AccessLevel, RemotePeer], verbs: [apply, delete] }}] }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob }}\nspec: {{ role: bob, subjects: [bob] }}\n\
+             ---\napiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: mine, namespace: shop, {note} }}\n\
+             spec: {{ package: {{ name: maps }} }}\n"
+        ))
+        .unwrap()
+        {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        bob_is(&mut store, 0);
+        let leader = kith_store::node_id("a");
+        let admitted = |store: &Store, command: &Command| {
+            let entry = sign(&nodes[0], &id, command).unwrap();
+            crate::access_sign::admit(store, &id, &entry, leader)
+        };
+        let made = |kind: &str, name: &str| {
+            let mut made = named(kind, name, serde_json::json!({ "data": {} }));
+            made.metadata.namespace = (kind != "AccessLevel" && kind != "RemotePeer").then(|| "shop".to_string());
+            made.metadata
+                .annotations
+                .insert(OWNER.into(), "Release/shop/mine".into());
+            made
+        };
+        // The control: what the Release may render.
+        assert_eq!(admitted(&store, &apply(vec![made("ConfigMap", "c")])), Ok(()));
+        for kind in ["AccessLevel", "RemotePeer", "NetworkPolicy"] {
+            let held = made(kind, "x");
+            let said = admitted(&store, &apply(vec![held.clone()])).unwrap_err();
+            assert!(said.contains("only a person signs"), "{kind}: {said}");
+            let mixed = apply(vec![made("ConfigMap", "c"), held.clone()]);
+            assert!(admitted(&store, &mixed).is_err(), "{kind}");
+            let said = admitted(&store, &Command::Delete { key: held.key() }).unwrap_err();
+            assert!(said.contains("only a person signs"), "{kind}: {said}");
+        }
     }
 }
