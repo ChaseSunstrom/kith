@@ -45,7 +45,10 @@ RUNS = 5  # each time is the median of this many runs
 # dialog; main was 12.997 MB), which raised it to 13.10; 13.13 MB with the people's levels held
 # on the --people node (T-0780: levels.rs), which raised it to 13.20. The way back under 13:
 # the web UI's text (about 107 KB of HTML, CSS and JS, embedded as it is) served compressed.
-KITHD_SIZE = 13.20
+# Raised to 13.40 for one train of features (T-0810 socketpair Root +139 KB, T-0838/T-0842
+# kubectl port-forward/exec/attach/cp, T-0797 exits, T-0849 own writes): the end-of-run size
+# pass brings it back down.
+KITHD_SIZE = 13.40
 KITHD_IDLE_RSS = 9 * MB
 # binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
 # 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.

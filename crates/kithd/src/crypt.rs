@@ -131,7 +131,70 @@ pub struct Record {
     /// The public keys of the duress codes the cluster made for this node, and for all.
     duress: Option<Vec<u8>>,
     duress_all: Option<Vec<u8>>,
+    /// The state's key wrapped under what each FIDO2 key gives (`fido2:` lines, at most
+    /// [`FIDO2_KEYS`]; docs/adr-fido2.md section 4).
+    fido2: Vec<Fido2>,
     peers: Vec<String>,
+}
+
+/// How many `fido2:` lines a record holds: two keys, so a lost one does not lock the node
+/// out; four would not fit [`ROOM`] beside the other ways.
+const FIDO2_KEYS: usize = 2;
+/// What a wrapped key is made of (a nonce, the key, a tag), and what CTAP2 gives a
+/// `fido2:` line: a credential id of 128 bytes at most, a salt and a secret of 32.
+const NONCE: usize = aead::NONCE_LEN;
+const TAG: usize = aead::MAX_TAG_LEN;
+const CRED_ID_MAX: usize = 128;
+const SALT: usize = 32;
+/// A wrapped state key at most (a 64-byte key is 92; this leaves room for a longer one).
+const WRAPPED_MAX: usize = 128;
+
+/// A FIDO2 key's line: its credential id (not secret), the salt asked of its `hmac-secret`,
+/// and the state's key wrapped under what it gave.
+#[derive(Clone, Debug, PartialEq)]
+struct Fido2 {
+    id: Vec<u8>,
+    salt: Vec<u8>,
+    wrapped: Vec<u8>,
+}
+
+#[allow(
+    dead_code,
+    reason = "the record's half of fido2 (T-0971): the console and the verbs call it next (docs/adr-fido2.md section 6)"
+)]
+impl Fido2 {
+    /// A line of the sizes CTAP2 gives (an id of 128 bytes at most, a salt of 32) and a
+    /// wrapped key of a nonce, a key and a tag: one that is none is not written, as it
+    /// would be dropped when read.
+    fn shaped(self) -> Option<Fido2> {
+        let fits = (1..=CRED_ID_MAX).contains(&self.id.len())
+            && self.salt.len() == SALT
+            && (NONCE + 1 + TAG..=WRAPPED_MAX).contains(&self.wrapped.len());
+        fits.then_some(self)
+    }
+
+    /// A line for a key that gave `secret` (the 32 bytes `hmac-secret` gives: a shorter one
+    /// is not wrapped under).
+    fn new(id: &[u8], salt: &[u8], secret: &[u8], key: &[u8]) -> Option<Fido2> {
+        (secret.len() == SALT).then_some(())?;
+        let (id, salt, wrapped) = (id.to_vec(), salt.to_vec(), wrap(secret, key));
+        Fido2 { id, salt, wrapped }.shaped()
+    }
+
+    /// The state's key, if `secret` is what this key gave for the line's salt.
+    fn open(&self, secret: &[u8]) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        unwrap_kept(secret, &self.wrapped)
+    }
+
+    fn parse(line: &str) -> Option<Fido2> {
+        let mut words = line.split_whitespace().map(unhex);
+        let (id, salt, wrapped) = (words.next()??, words.next()??, words.next()??);
+        Fido2 { id, salt, wrapped }.shaped()
+    }
+
+    fn text(&self) -> String {
+        format!("{} {} {}", hex(&self.id), hex(&self.salt), hex(&self.wrapped))
+    }
 }
 
 /// The key wrapped under a passphrase: what drawing the wrapping key from it costs
@@ -226,20 +289,26 @@ fn sealing(secret: &[u8]) -> aead::LessSafeKey {
 /// `key` sealed under `secret` (ChaCha20-Poly1305, its key drawn from the secret): a
 /// nonce, then what only the secret opens.
 fn wrap(secret: &[u8], key: &[u8]) -> Vec<u8> {
-    let nonce: [u8; 12] = random();
-    let mut sealed = key.to_vec();
+    let nonce: [u8; NONCE] = random();
+    let mut sealed = zeroize::Zeroizing::new(key.to_vec());
     let nonced = aead::Nonce::assume_unique_for_key(nonce);
-    let done = sealing(secret).seal_in_place_append_tag(nonced, aead::Aad::empty(), &mut sealed);
+    let done = sealing(secret).seal_in_place_append_tag(nonced, aead::Aad::empty(), &mut *sealed);
     done.expect("a key is short enough to seal");
     [&nonce[..], &sealed].concat()
 }
 
 fn unwrap(secret: &[u8], wrapped: &[u8]) -> Option<Vec<u8>> {
-    let (nonce, sealed) = wrapped.split_at_checked(12)?;
-    let mut sealed = sealed.to_vec();
+    unwrap_kept(secret, wrapped).map(|key| key.to_vec())
+}
+
+/// The key `wrapped` holds, if `secret` opens it: kept in what wipes itself, as is the copy
+/// it was opened in.
+fn unwrap_kept(secret: &[u8], wrapped: &[u8]) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    let (nonce, sealed) = wrapped.split_at_checked(NONCE)?;
+    let mut sealed = zeroize::Zeroizing::new(sealed.to_vec());
     let nonce = aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
     let key = sealing(secret).open_in_place(nonce, aead::Aad::empty(), &mut sealed);
-    key.ok().map(|key| key.to_vec())
+    key.ok().map(|key| zeroize::Zeroizing::new(key.to_vec()))
 }
 
 fn drawn(passphrase: &str, salt: &[u8], (memory, passes): (u32, u32)) -> Option<[u8; 32]> {
@@ -337,9 +406,16 @@ impl Record {
             // (A seal line cut to its bare name is an unreadable one, not a damaged record.)
             let bare = |name: &'static str| line.strip_suffix(':').filter(|n| *n == name).map(|n| (n, ""));
             let (name, value) = line.split_once(": ").or_else(|| {
-                ["tpm-parent", "tpm-pin", "tpm-next", "tpm-pin-next", "passphrase"]
-                    .into_iter()
-                    .find_map(bare)
+                [
+                    "tpm-parent",
+                    "tpm-pin",
+                    "tpm-next",
+                    "tpm-pin-next",
+                    "passphrase",
+                    "fido2",
+                ]
+                .into_iter()
+                .find_map(bare)
             })?;
             match name {
                 "secret" => record.secret = unhex(value)?,
@@ -356,6 +432,17 @@ impl Record {
                     record.pass = Pass::parse(value);
                     unread(record.pass.is_some(), "passphrase", said);
                 }
+                // (One that cannot be read is dropped, and said; so is a third, which no
+                // kithd writes: a record's room holds two. Neither is a damaged record.)
+                "fido2" => match Fido2::parse(value) {
+                    Some(line) if record.fido2.len() < FIDO2_KEYS => record.fido2.push(line),
+                    Some(_) => said(&format!(
+                        "kithd: init: the lock record has more than {FIDO2_KEYS} fido2: lines: the others are dropped (kith node key remove NAME takes both off, and kith node key add NAME enrols two again)"
+                    )),
+                    None => said(
+                        "kithd: init: the lock record's fido2: line cannot be read: it is dropped, and the rest of the record stands (kith node key remove NAME takes the keys off, and kith node key add NAME enrols two again)",
+                    ),
+                },
                 "tpm-pin" => {
                     let pin = PinSeal::parse(value);
                     unread(pin.is_some(), "tpm-pin", said);
@@ -401,6 +488,9 @@ impl Record {
         }
         if let Some(pass) = &self.pass {
             text += &format!("passphrase: {}\n", pass.text());
+        }
+        for line in &self.fido2 {
+            text += &format!("fido2: {}\n", line.text());
         }
         if let Some(pin) = &self.pin {
             text += &format!("tpm-pin: {}\n", pin.text());
@@ -462,6 +552,25 @@ impl Record {
     /// all of what was there, and read it back. One that would not fit its room but by
     /// peers left out is not written: the line it would cut is named.
     fn write(&self, disk: &File, at: u64) -> Result<(), String> {
+        let order = self.order()?;
+        let bytes = &order[1].1;
+        let mut back = vec![0; ROOM];
+        let wrote = order.iter().try_for_each(|(to, bytes)| {
+            let written = disk.write_all_at(bytes, at + *to as u64);
+            written.and_then(|()| disk.sync_all())
+        });
+        let read = wrote.and_then(|()| from_disk(disk, at).read_exact_at(&mut back, at));
+        read.map_err(|e| format!("writing the lock record: {e}"))?;
+        (back == *bytes)
+            .then_some(())
+            .ok_or("the lock record did not stay on the disk as written".into())
+    }
+
+    /// The writes that put this record on a disk, in their order: where each goes (from the
+    /// record's place) and its ROOM bytes. The copy is first, so the record stays the old one,
+    /// whole, until the copy holds the new; a cut after that is read as the new one (from the
+    /// copy, where the record was cut).
+    fn order(&self) -> Result<[(usize, Vec<u8>); 2], String> {
         let mut bytes = self.text().into_bytes();
         // (A zero ends it, so one byte less than the room.)
         if bytes.len() >= ROOM {
@@ -479,17 +588,80 @@ impl Record {
             ));
         }
         bytes.resize(ROOM, 0);
-        let mut back = vec![0; ROOM];
-        let wrote = disk
-            .write_all_at(&bytes, at + ROOM as u64)
-            .and_then(|()| disk.sync_all())
-            .and_then(|()| disk.write_all_at(&bytes, at))
-            .and_then(|()| disk.sync_all());
-        let read = wrote.and_then(|()| from_disk(disk, at).read_exact_at(&mut back, at));
-        read.map_err(|e| format!("writing the lock record: {e}"))?;
-        (back == bytes)
-            .then_some(())
-            .ok_or("the lock record did not stay on the disk as written".into())
+        Ok([(ROOM, bytes.clone()), (0, bytes)])
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the record's half of fido2 (T-0971): the verbs call it next (docs/adr-fido2.md section 6)"
+)]
+impl Record {
+    /// This record with `new` (a credential id, its salt and the secret the key gave for it)
+    /// as its two fido2 keys, the state's `key` wrapped under each secret. Two keys or none;
+    /// none held yet (a third line is refused); and it must fit its room, which is said here
+    /// and not when the write is begun. Every other line stays as it is.
+    fn with_fido2(&self, key: &[u8], new: &[(&[u8], &[u8], &[u8])]) -> Result<Record, String> {
+        if new.len() != FIDO2_KEYS {
+            return Err(format!(
+                "{FIDO2_KEYS} fido2 keys are enrolled together: not {}",
+                new.len()
+            ));
+        }
+        if !self.fido2.is_empty() {
+            return Err("this node already holds fido2 keys: they are removed before others are enrolled".into());
+        }
+        // (Two keys that gave one secret are one way in: the second would be no spare.)
+        if new[0].0 == new[1].0 || new[0].2 == new[1].2 {
+            return Err("that is the same key".into());
+        }
+        let made = new.iter().map(|(id, salt, secret)| Fido2::new(id, salt, secret, key));
+        let fido2 = made.collect::<Option<Vec<_>>>();
+        let fido2 = fido2.ok_or("a credential id, a salt or a secret is not of a size a fido2 key gives")?;
+        let with = Record { fido2, ..self.clone() };
+        with.order().map(drop)?;
+        let kept = |record: &Record| {
+            let text = record.text();
+            let peers = text.lines().find_map(|line| line.strip_prefix("peers:"));
+            peers.map_or(0, |peers| peers.split_whitespace().count())
+        };
+        if kept(&with) < self.peers.len() {
+            eprintln!(
+                "kithd: the lock record has room for {} of this node's {} peers once its fido2 keys are in: the rest are found again, as they are when the record is full",
+                kept(&with),
+                self.peers.len()
+            );
+        }
+        Ok(with)
+    }
+
+    /// This record without its fido2 keys, both: one alone is not removed. Refused until the
+    /// recovery key was shown, so the record is never left with only a lost key's way in.
+    fn without_fido2(&self) -> Result<Record, String> {
+        if self.fido2.is_empty() {
+            return Err("this node holds no fido2 keys".into());
+        }
+        if !self.seen {
+            return Err(
+                "the recovery key was not shown yet: it is, before the keys that open the state are removed".into(),
+            );
+        }
+        Ok(Record {
+            fido2: Vec::new(),
+            ..self.clone()
+        })
+    }
+
+    /// Whether each of `secrets` opens one of the fido2 lines to `key`: what a record read
+    /// back must do, with the secrets still in memory, before a key is said to be enrolled.
+    fn fido2_proves(&self, key: &[u8], secrets: &[&[u8]]) -> bool {
+        secrets.len() == FIDO2_KEYS
+            && self.fido2.len() == FIDO2_KEYS
+            && self
+                .fido2
+                .iter()
+                .zip(secrets)
+                .all(|(line, secret)| line.open(secret).is_some_and(|opened| opened[..] == *key))
     }
 
     /// What the cluster knows this disk by: says nothing of the secret it is made from.
@@ -563,6 +735,7 @@ pub fn seal(image: &File, disk: &Path) -> Result<String, String> {
         seen: false,
         duress: None,
         duress_all: None,
+        fido2: Vec::new(),
     };
     record.write(&disk, config + AT)?;
     Ok(shown(&recovery))
@@ -1070,7 +1243,7 @@ fn renewed(record: &Record, opened: &[u8]) -> (Record, String) {
 }
 
 /// The ways in `record` the cluster's word leaves: the TPM's seal while it says `seal`; a
-/// passphrase and a PIN until the node is locked or forgotten (`shut`). The storage key's
+/// passphrase, a PIN and the fido2 keys until the node is locked or forgotten (`shut`). The storage key's
 /// name stays while either seal it checks may: a PIN's seal is checked by it as well. The
 /// seals made ahead for the next system go as the ones they stand for do.
 fn ways_left(record: &Record, seal: bool, shut: bool) -> Record {
@@ -1082,9 +1255,21 @@ fn ways_left(record: &Record, seal: bool, shut: bool) -> Record {
         pin_next: record.pin_next.clone().filter(|_| pin.is_some()),
         parent: record.parent.clone().filter(|_| seal || pin.is_some()),
         pass: record.pass.clone().filter(|_| !shut),
+        // (A key touched is a way in with no node asked, as a passphrase is.)
+        fido2: if shut { Vec::new() } else { record.fido2.clone() },
         pin,
         ..record.clone()
     }
+}
+
+/// Whether none of `record`'s ways in is left that opens the state with no node asked: a
+/// node locked while one is, restarted, would open by it.
+fn opens_nothing_asked(record: &Record) -> bool {
+    record.tpm.is_none()
+        && record.next.is_none()
+        && record.pass.is_none()
+        && record.pin.is_none()
+        && record.fido2.is_empty()
 }
 
 /// `left` (written) is now the record in memory, its peers (which are kept apart) aside: a
@@ -1660,17 +1845,16 @@ pub async fn keep(
                             "kithd: the cluster no longer hands this node's key out: its PIN no longer opens its state"
                         );
                     }
+                    if left.fido2 != record.fido2 {
+                        eprintln!(
+                            "kithd: the cluster no longer hands this node's key out: its fido2 keys no longer open its state"
+                        );
+                    }
                     adopt(&mut record, left);
                 }
                 // (A seal that could not be dropped is tried again: restarted beside it,
                 // the node would open by its TPM, locked or not. And so a passphrase.)
-                if locked
-                    && was_locked == Some(false)
-                    && record.tpm.is_none()
-                    && record.next.is_none()
-                    && record.pass.is_none()
-                    && record.pin.is_none()
-                {
+                if locked && was_locked == Some(false) && opens_nothing_asked(&record) {
                     // (This node's store may be behind, just after an unlock: a peer that
                     // still hands the key out says it is not locked, or not yet.)
                     let mut stale = false;
@@ -3405,6 +3589,7 @@ mod tests {
             seen: true,
             duress: Some(vec![6; 32]),
             duress_all: Some(vec![8; 32]),
+            fido2: Vec::new(),
             pin: Some(PinSeal {
                 k1: vec![1; 200],
                 k2: vec![2; 200],
@@ -4169,5 +4354,400 @@ mod tests {
         wiped.spec = json!({ "id": "c", "wiped": true });
         assert!(unseen(&stored(&[held("a", Value::Null), wiped.clone()])).is_some());
         assert_eq!(unseen(&stored(&[wiped])), None);
+    }
+}
+
+/// What the fido2 tests share: a record that has every other line, each as long as it
+/// is likely to be, and two keys of the largest sizes a `fido2:` line has.
+#[cfg(test)]
+mod fido2_fixture {
+    use super::*;
+
+    pub const KEY: [u8; 64] = [9; 64];
+
+    pub fn every_other_way() -> Record {
+        Record {
+            secret: vec![7; 32],
+            recovery: wrap(&[1; 16], &KEY),
+            key: Some(KEY.to_vec()),
+            // (The PIN's way and its next seal are the longest; a plain seal is beside no PIN.)
+            tpm: None,
+            parent: Some(vec![6; 34]),
+            pass: Some(Pass {
+                cost: COST,
+                salt: vec![3; 16],
+                wrapped: vec![4; 92],
+            }),
+            seen: true,
+            duress: Some(vec![6; 32]),
+            duress_all: Some(vec![8; 32]),
+            pin: Some(PinSeal {
+                k1: vec![1; 200],
+                k2: vec![2; 200],
+                wrapped: vec![3; 92],
+            }),
+            next: None,
+            pin_next: Some(vec![5; 200]),
+            fido2: Vec::new(),
+            peers: (0..40).map(|n| format!("10.0.{n}.1:7443")).collect(),
+        }
+    }
+
+    /// (credential id, salt, hmac-secret) of key `n`: the id 128 bytes, as long as CTAP2 has one.
+    pub fn key(n: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        (vec![n; 128], vec![n + 10; 32], vec![n + 20; 32])
+    }
+
+    pub fn two(record: &Record) -> Record {
+        let (a, b) = (key(1), key(2));
+        let new = [(&a.0[..], &a.1[..], &a.2[..]), (&b.0[..], &b.1[..], &b.2[..])];
+        record.with_fido2(&KEY, &new).unwrap()
+    }
+
+    pub fn said(bytes: &[u8]) -> (Option<Record>, Vec<String>) {
+        let mut said = Vec::new();
+        let read = Record::parse_said(bytes, &mut |line| said.push(line.to_string()));
+        (read, said)
+    }
+}
+
+/// Two `fido2:` lines go through the record's writer and reader, within its room beside
+/// every other line, and are written in an order a cut cannot take a line out of.
+#[cfg(test)]
+mod fido2_line {
+    use super::fido2_fixture::*;
+    use super::*;
+
+    #[test]
+    fn fido2_line_two_round_trip_beside_every_other_way() {
+        let old = every_other_way();
+        let new = two(&old);
+        let text = new.text();
+        let lines: Vec<&str> = text.lines().filter(|line| line.starts_with("fido2: ")).collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        // (The ADR sizes a line at about 520 characters at its worst.)
+        assert!(lines.iter().all(|line| line.len() <= 520), "{lines:?}");
+        let [(_, copy), (_, record)] = new.order().unwrap();
+        assert_eq!((copy.len(), record.len()), (ROOM, ROOM));
+        assert!(
+            text.len() < ROOM,
+            "two lines and every other way take {} of {ROOM}",
+            text.len()
+        );
+        let path = std::env::temp_dir().join(format!("kith-fido2-line-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + 2 * ROOM]).unwrap();
+        let disk = File::options().read(true).write(true).open(&path).unwrap();
+        new.write(&disk, AT).unwrap();
+        let read = Record::read(&path).unwrap().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read, new);
+        assert_eq!(read.fido2.len(), 2);
+        // Every other line is as it was.
+        assert_eq!(
+            Record {
+                fido2: Vec::new(),
+                ..read
+            },
+            old
+        );
+        // Not as a Vec in another order: the first key stays the first.
+        assert_eq!(Record::parse(&record).unwrap().fido2[0], new.fido2[0]);
+    }
+
+    #[test]
+    fn fido2_line_refuses_what_would_not_fit_before_a_write() {
+        // A record that fits as it is, and does not once two keys are in: the keys do not
+        // fit, and it is said which line would be cut; nothing was written.
+        let long = Record {
+            tpm: Some(vec![5; 500]),
+            ..every_other_way()
+        };
+        assert!(long.order().is_ok(), "the record fits without its fido2 lines");
+        let (a, b) = (key(1), key(2));
+        let new = [(&a.0[..], &a.1[..], &a.2[..]), (&b.0[..], &b.1[..], &b.2[..])];
+        let refused = long.with_fido2(&KEY, &new).unwrap_err();
+        assert!(refused.contains("would not fit"), "{refused}");
+        // One key alone, the same key twice (by its id, or by what it gave) and a salt or a
+        // secret of the wrong size are not enrolled.
+        let held = every_other_way();
+        assert!(held.with_fido2(&KEY, &new[..1]).is_err());
+        assert!(held.with_fido2(&KEY, &[new[0], new[0]]).is_err());
+        assert!(
+            held.with_fido2(&KEY, &[new[0], (&b.0[..], &b.1[..], &a.2[..])])
+                .unwrap_err()
+                .contains("same key")
+        );
+        assert!(
+            held.with_fido2(&KEY, &[new[0], (&a.0[..], &b.1[..], &b.2[..])])
+                .unwrap_err()
+                .contains("same key")
+        );
+        assert!(
+            held.with_fido2(&KEY, &[new[0], (&b.0[..], &b.1[..], &b.2[..16])])
+                .is_err()
+        );
+        assert!(
+            held.with_fido2(&KEY, &[new[0], (&b.0[..], &b.1[..8], &b.2[..])])
+                .is_err()
+        );
+    }
+
+    /// The new record goes over the old in the order pinned here (the copy at ROOM, then the
+    /// record at 0), cut at some 70 places of the 8192 bytes: the region not being written
+    /// is whole, and what is read is the old record or the new, both seen. This is a write
+    /// cut short, not a disk that puts sectors down in another order
+    /// (`lock_record_cut_at_any_sector_reads_as_old_or_new` is the one near it).
+    #[test]
+    fn fido2_line_cut_anywhere_leaves_the_old_record_or_the_new() {
+        let without = every_other_way();
+        let with = two(&without);
+        let path = std::env::temp_dir().join(format!("kith-fido2-cut-{}", std::process::id()));
+        assert_eq!(with.without_fido2().unwrap(), without);
+        for (old, new) in [(&without, &with), (&with, &without)] {
+            let disk = {
+                std::fs::write(&path, vec![0; AT as usize + 2 * ROOM]).unwrap();
+                File::options().read(true).write(true).open(&path).unwrap()
+            };
+            old.write(&disk, AT).unwrap();
+            // (The order is pinned here, from a literal: the copy at ROOM, then the record at
+            // 0. `order` must say the same, or the cuts below are not the writes made.)
+            let (before, after) = (old.order().unwrap(), new.order().unwrap());
+            assert_eq!((before[0].0, before[1].0, after[0].0, after[1].0), (ROOM, 0, ROOM, 0));
+            let (old_bytes, new_bytes) = (&before[1].1, &after[1].1);
+            let (mut total, mut seen) = (0, [false; 2]);
+            for cut in (0..=2 * ROOM).step_by(61).chain([ROOM - 1, ROOM, ROOM + 1, 2 * ROOM]) {
+                // Back to the old on the disk, then the new put over it up to `cut` bytes.
+                disk.write_all_at(old_bytes, AT + ROOM as u64).unwrap();
+                disk.write_all_at(old_bytes, AT).unwrap();
+                let mut left = cut;
+                for to in [ROOM, 0] {
+                    let part = left.min(ROOM);
+                    disk.write_all_at(&new_bytes[..part], AT + to as u64).unwrap();
+                    left -= part;
+                }
+                let mut regions = vec![0; 2 * ROOM];
+                disk.read_exact_at(&mut regions, AT).unwrap();
+                let (record, copy) = regions.split_at(ROOM);
+                // The region not being written is whole: the record while the copy is, and
+                // the copy while the record is.
+                if cut <= ROOM {
+                    assert_eq!(Record::parse(record).as_ref(), Some(old), "cut at {cut}");
+                }
+                if cut >= ROOM {
+                    assert_eq!(Record::parse(copy).as_ref(), Some(new), "cut at {cut}");
+                }
+                let read = Record::read(&path).unwrap().unwrap();
+                assert!(
+                    &read == old || &read == new,
+                    "cut at {cut} read a record that is neither"
+                );
+                // (Where the new record is read whole, it is the new; where it is not, the old.)
+                total += 1;
+                assert_eq!(read.fido2.len(), if read == with { 2 } else { 0 });
+                seen[usize::from(&read == new)] = true;
+            }
+            assert!(
+                total > 100 && seen == [true, true],
+                "a cut left the old at times, and the new at others"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// One region torn (a byte flipped in it) while the other is whole: read falls back to
+    /// the whole one, with its two keys; both torn is a damaged record, not an empty one.
+    #[test]
+    fn fido2_line_torn_record_is_read_from_the_copy_and_the_other_way() {
+        let with = two(&every_other_way());
+        let path = std::env::temp_dir().join(format!("kith-fido2-torn-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + 2 * ROOM]).unwrap();
+        let disk = File::options().read(true).write(true).open(&path).unwrap();
+        with.write(&disk, AT).unwrap();
+        let tear = |region: usize| {
+            let at = AT + (region * ROOM) as u64 + 300;
+            let mut byte = [0];
+            disk.read_exact_at(&mut byte, at).unwrap();
+            disk.write_all_at(&[byte[0] ^ 1], at).unwrap();
+        };
+        tear(0);
+        let read = Record::read(&path).unwrap().unwrap();
+        assert_eq!(
+            (read.fido2.len(), &read),
+            (2, &with),
+            "the record is torn, the copy is whole"
+        );
+        tear(0);
+        tear(1);
+        let read = Record::read(&path).unwrap().unwrap();
+        assert_eq!(read, with, "the copy is torn, the record is whole again");
+        tear(0);
+        assert!(Record::read(&path).unwrap_err().contains("damaged"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn fido2_line_come_off_both_and_after_the_recovery_key_was_shown() {
+        let with = two(&every_other_way());
+        let without = with.without_fido2().unwrap();
+        assert!(without.fido2.is_empty() && !without.text().contains("fido2"));
+        assert!(
+            Record { seen: false, ..with }
+                .without_fido2()
+                .unwrap_err()
+                .contains("recovery key")
+        );
+        assert!(without.without_fido2().is_err());
+    }
+}
+
+/// A `fido2:` line that cannot be read is dropped and said, and a third is refused.
+#[cfg(test)]
+mod fido2_bad {
+    use super::fido2_fixture::*;
+    use super::*;
+
+    const HEAD: &str = "kith-lock v1\nsecret: 0707070707070707070707070707070707070707070707070707070707070707\n"; // pragma: allowlist secret
+
+    fn line(n: u8) -> String {
+        let (id, salt, wrapped) = (vec![n + 1; 64], vec![n + 5; 32], vec![n + 9; 92]);
+        format!("fido2: {}\n", Fido2 { id, salt, wrapped }.text())
+    }
+
+    #[test]
+    fn fido2_bad_line_is_dropped_and_said_and_the_rest_stands() {
+        let good = line(0);
+        let id = hex(&[1; 8]);
+        let salt = hex(&[2; 32]);
+        let wrapped = hex(&[3; 92]);
+        for bad in [
+            format!("fido2: zz {salt} {wrapped}\n"),
+            format!("fido2: {id} {salt}\n"),
+            format!("fido2: {id} {} {wrapped}\n", hex(&[2; 31])),
+            format!("fido2: {} {salt} {wrapped}\n", hex(&[1; 129])),
+            format!("fido2: {id} {salt} {}\n", hex(&[3; 20])),
+            format!("fido2: {} {salt} {wrapped}\n", ""),
+            "fido2: 0\n".to_string(),
+            "fido2: \n".to_string(),
+            "fido2:\n".to_string(),
+        ] {
+            let (read, said) = said(format!("{HEAD}{bad}passphrase: 1 1 00 00\nseen: yes\n{good}").as_bytes());
+            let read = read.unwrap_or_else(|| panic!("a bad line made the record damaged: {bad:?}"));
+            assert_eq!(read.fido2.len(), 1, "{bad:?}");
+            assert!(read.seen, "the rest of the record stands");
+            let said: Vec<_> = said.iter().filter(|said| said.contains("fido2:")).collect();
+            assert_eq!(said.len(), 1, "{bad:?}: {said:?}");
+            assert!(said[0].contains("dropped"), "{said:?}");
+        }
+        // Said as the lines before are: a good record says nothing.
+        let (read, said) = said(format!("{HEAD}{good}{}", line(1)).as_bytes());
+        assert_eq!((read.unwrap().fido2.len(), said), (2, Vec::new()));
+    }
+
+    #[test]
+    fn fido2_bad_third_line_is_refused_not_kept_and_not_silent() {
+        let three = format!("{HEAD}{}{}{}", line(0), line(1), line(0));
+        let (read, said) = said(three.as_bytes());
+        let read = read.unwrap();
+        assert_eq!(read.fido2.len(), 2, "a record holds two");
+        assert_eq!(read.fido2[0].text(), line(0).trim_start_matches("fido2: ").trim_end());
+        let said: Vec<_> = said.iter().filter(|said| said.contains("fido2:")).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("more than 2"), "{said:?}");
+        // And not enrolled: a record that holds two refuses two more, and one that holds one.
+        let held = two(&every_other_way());
+        let (a, b) = (key(3), key(4));
+        let new = [(&a.0[..], &a.1[..], &a.2[..]), (&b.0[..], &b.1[..], &b.2[..])];
+        assert!(held.with_fido2(&KEY, &new).unwrap_err().contains("already holds"));
+        let one = Record {
+            fido2: held.fido2[..1].to_vec(),
+            ..held
+        };
+        assert!(one.with_fido2(&KEY, &new).unwrap_err().contains("already holds"));
+        assert!(one.with_fido2(&KEY, &new[..1]).is_err());
+    }
+}
+
+/// A cluster that locks or forgets a node takes its fido2 keys off, as it does a passphrase.
+#[cfg(test)]
+mod fido2_shut {
+    use super::fido2_fixture::*;
+    use super::*;
+
+    #[test]
+    fn fido2_shut_node_loses_its_keys_and_is_restarted_without_them() {
+        let record = Record {
+            // (A TPM seal beside the keys, as the console keeps one.)
+            tpm: Some(vec![5; 40]),
+            pin: None,
+            ..two(&every_other_way())
+        };
+        // Not shut: kept, sealed or not.
+        for seal in [false, true] {
+            assert_eq!(ways_left(&record, seal, false).fido2, record.fido2);
+        }
+        // Locked or forgotten: gone, with the seal or without it.
+        for seal in [false, true] {
+            assert!(ways_left(&record, seal, true).fido2.is_empty(), "seal {seal}");
+        }
+        // A node locked with a key left restarts to wait (it would open by the key's touch); with
+        // none left, it has nothing that opens it.
+        assert!(!opens_nothing_asked(&record));
+        let only_keys = Record {
+            tpm: None,
+            next: None,
+            pass: None,
+            pin: None,
+            ..record.clone()
+        };
+        assert!(
+            !opens_nothing_asked(&only_keys),
+            "a record with only its keys has a way in"
+        );
+        assert!(opens_nothing_asked(&ways_left(&only_keys, false, true)));
+        assert!(opens_nothing_asked(&Record {
+            fido2: Vec::new(),
+            ..only_keys
+        }));
+    }
+}
+
+/// The state's key wrapped under a key's derived secret opens with that secret only.
+#[cfg(test)]
+mod fido2_wrap {
+    use super::fido2_fixture::*;
+    use super::*;
+
+    #[test]
+    fn fido2_wrap_opens_with_its_secret_and_not_with_another() {
+        let (a, b) = (key(1), key(2));
+        let line = Fido2::new(&a.0, &a.1, &a.2, &KEY).unwrap();
+        let kept = |opened: Option<zeroize::Zeroizing<Vec<u8>>>| opened.map(|key| key.to_vec());
+        assert_eq!(kept(line.open(&a.2)), Some(KEY.to_vec()));
+        assert_eq!(kept(line.open(&b.2)), None);
+        assert_eq!(kept(line.open(&[0; 32])), None);
+        assert_eq!(kept(line.open(&[])), None);
+        // A secret that is not the 32 bytes hmac-secret gives is not wrapped under.
+        assert_eq!(Fido2::new(&a.0, &a.1, &a.2[..16], &KEY), None);
+        assert_eq!(Fido2::new(&a.0, &a.1, &[a.2.clone(), vec![0]].concat(), &KEY), None);
+        // The key is not in the line, and the same secret wraps to another line each time.
+        assert!(!line.text().contains(&hex(&KEY)));
+        assert_ne!(line, Fido2::new(&a.0, &a.1, &a.2, &KEY).unwrap());
+        // Through the record: each of the two lines opens with its own key's secret.
+        let record = two(&every_other_way());
+        let (first, second) = (&record.fido2[0], &record.fido2[1]);
+        assert_eq!(
+            (kept(first.open(&a.2)), kept(second.open(&b.2))),
+            (Some(KEY.to_vec()), Some(KEY.to_vec()))
+        );
+        assert_eq!((kept(first.open(&b.2)), kept(second.open(&a.2))), (None, None));
+        // What is read back proves the enrolment with the secrets still in memory, and a
+        // line that stood for another key's does not.
+        let mut read = Record::parse(record.text().as_bytes()).unwrap();
+        assert!(read.fido2_proves(&KEY, &[&a.2, &b.2]));
+        assert!(!read.fido2_proves(&KEY, &[&b.2, &a.2]));
+        assert!(!read.fido2_proves(&[1; 64], &[&a.2, &b.2]));
+        assert!(!read.fido2_proves(&KEY, &[&a.2]));
+        read.fido2.pop();
+        assert!(!read.fido2_proves(&KEY, &[&a.2, &b.2]));
     }
 }

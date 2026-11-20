@@ -280,20 +280,48 @@ fn good(slot: char, esp: &Path) -> bool {
     entries(esp).iter().any(is)
 }
 
-/// The ESP's directory of kernel images, mounted for as long as `with` runs.
+/// The ESP's directory of kernel images, mounted for as long as `with` runs. One caller at a
+/// time (there is one mount point): a second waits, and a `with` that panics still unmounts.
+/// Not for a runtime's thread while an update (`into_slot`) runs: it holds the mount as long as the download.
 pub fn esp<T>(with: impl FnOnce(&Path) -> T) -> Result<T, String> {
     use nix::mount::{MsFlags, mount, umount};
     let device = crate::init::labelled("esp").ok_or("no partition is labelled esp")?;
-    let _ = std::fs::create_dir_all(ESP);
-    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
-    mount(Some(&device), ESP, Some("vfat"), flags, None::<&str>)
-        .map_err(|e| format!("mounting {}: {e}", device.display()))?;
-    let out = with(&Path::new(ESP).join("EFI/Linux"));
+    let mounting = || {
+        let _ = std::fs::create_dir_all(ESP);
+        let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+        mount(Some(&device), ESP, Some("vfat"), flags, None::<&str>)
+            .map_err(|e| format!("mounting {}: {e}", device.display()))
+    };
     // (What was done there is done; left mounted, it is written out when the node stops.)
-    if let Err(e) = umount(ESP) {
-        eprintln!("kithd: init: unmounting the ESP: {e}");
+    let unmounting = || {
+        if let Err(e) = umount(ESP) {
+            eprintln!("kithd: init: unmounting the ESP: {e}");
+        }
+    };
+    mounted(mounting, unmounting, || with(&Path::new(ESP).join("EFI/Linux")))
+}
+
+/// `with`, between `mount` and `unmount`, one caller at a time. The lock is held for as long
+/// as the mount is, and a panic in `with` unmounts on the way out (the lock is not poisoned
+/// for later callers: what it guards is the mount, which is let go of).
+fn mounted<T>(
+    mount: impl FnOnce() -> Result<(), String>,
+    unmount: impl FnOnce(),
+    with: impl FnOnce() -> T,
+) -> Result<T, String> {
+    struct Unmount<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Unmount<F> {
+        fn drop(&mut self) {
+            if let Some(unmount) = self.0.take() {
+                unmount();
+            }
+        }
     }
-    Ok(out)
+    static MOUNTED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = MOUNTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    mount()?;
+    let _mounted = Unmount(Some(unmount));
+    Ok(with())
 }
 
 /// `kith.update=DEVICE`: the update on that disk (a stick, a second disk) goes into the
@@ -731,10 +759,58 @@ mod tests {
     }
 
     #[test]
+    fn os_esp_is_mounted_by_one_caller_at_a_time_and_a_panic_unmounts() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        // (Mounts stacked: the most there were at once; a count of mounts not yet unmounted.)
+        let (now, most) = (AtomicU32::new(0), AtomicU32::new(0));
+        let mount = || {
+            most.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+            Ok(())
+        };
+        let unmount = || {
+            now.fetch_sub(1, SeqCst);
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    mounted(mount, unmount, || {
+                        std::thread::sleep(std::time::Duration::from_millis(20))
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(
+            (now.load(SeqCst), most.load(SeqCst)),
+            (0, 1),
+            "no two were mounted together"
+        );
+        // A panic while mounted: unmounted, and the next caller is not refused.
+        let panicked = std::thread::spawn(|| {
+            let _ = mounted(|| Ok(()), || UNMOUNTED.store(true, SeqCst), || panic!("settle"));
+        })
+        .join();
+        assert!(panicked.is_err() && UNMOUNTED.load(SeqCst), "the panic unmounted");
+        assert_eq!(mounted(|| Ok(()), || (), || 7), Ok(7));
+        // A mount that fails is the caller's error, and the lock is let go.
+        assert_eq!(mounted(|| Err("no".into()), || (), || 7), Err("no".into()));
+        assert_eq!(mounted(|| Ok(()), || (), || 8), Ok(8));
+    }
+
+    static UNMOUNTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[test]
     fn os_counts_failed_starts_on_the_esp_until_one_comes_up() {
         let places = places("counts");
-        assert_eq!([failed(&places.esp), failed(&places.esp)], [1, 2]);
-        assert_eq!(failed(&places.esp), 3);
+        // A start that fails three times in a row (what init::end does each time: count it,
+        // then wait by the count): the count rises and the wait grows.
+        let starts: Vec<(u32, u64)> = (0..3)
+            .map(|_| {
+                let count = failed(&places.esp);
+                (count, wait(count).as_secs())
+            })
+            .collect();
+        assert_eq!(starts, [(1, 10), (2, 20), (3, 40)]);
         assert!(places.esp.join("kith.failed").is_file());
         // Not a kernel image: the boot loader does not start from it.
         assert_eq!(names(&places.esp), ["kith-1-a.efi"]);

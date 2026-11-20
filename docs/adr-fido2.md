@@ -1,6 +1,12 @@
 # A FIDO2 key as a way into a node's state
 
-Status: design, nothing built (T-0863). This record settles what [adr-unlock.md](adr-unlock.md)
+Status: design (T-0863); built so far, and called by nothing: the client's wire half (T-0966:
+CTAPHID framing, the CBOR subset) and its second half (T-0968: AES-256-CBC, ECDH, `hmac-secret`,
+`makeCredential` and `getAssertion`), all tested on a scripted key and never yet on a real one;
+and the software key of section 2's test build (T-0970: `crates/kithd/src/fido2_test.rs`, the
+cargo feature `fido2-test`, with its four release guards in `os/build.sh`, `ci/vm/tests.sh` and
+`ci/musl.sh`; its VM test is not yet built).
+This record settles what [adr-unlock.md](adr-unlock.md)
 left as "FIDO2: deferred", item by item, so that the build can be cut into slices that each
 stand alone. Where the code differs from a line here, the code is the word. A decision here
 that a build finds wrong is changed here, in the same commit.
@@ -195,7 +201,9 @@ and a node can do, and no part of it needs a typed line at a console that is not
 
 The record's lines follow `passphrase:` (`Record::text`, `crypt.rs:387-437`; `parse_said`,
 `crypt.rs:326-385`): `fido2: <credential id hex> <salt hex> <wrapped key hex>`, one line a key.
-A line that cannot be read is dropped and said, never "damaged". An older kithd ignores
+A line that cannot be read is dropped and said, never "damaged"; a third line is dropped and said
+at read and refused at enrolment (`Record::with_fido2`, T-0971, with the order of writes `Record::order`
+and the read-back proof `fido2_proves`). An older kithd ignores
 the lines it does not know, and loses them when it writes the record again, since `text()` writes
 only what `Record` holds (an inference from `text()`; the downgrade is stated in section 8).
 
@@ -245,7 +253,7 @@ longer true. Options:
   needs it, not by this record.
 
 **Slice T-0956 measures**, before and after, and puts both in its commit; a budget raise without
-the number is refused in review. It is not slice T-0954: that slice's code is called by nothing,
+the number is refused in review. It is not slice T-0954 (T-0966, T-0968): that slice's code is called by nothing,
 and a linker may drop it, so what it adds is not what the feature costs.
 
 ## 6. Build slices
@@ -255,7 +263,7 @@ Each is one task and stands alone: it merges and passes its gates without the ne
 | Task | Slice |
 |---|---|
 | T-0953 | **Kernel.** `CONFIG_HIDRAW=y`, `CONFIG_USB_HID=y` in `os/kernel.config`; `CONFIG_UHID` in the test-only `os/features/uhid-test.config`; the check on the **built `.config`** (section 3), with `# CONFIG_UHID is not set` asserted for a shipped build; the image size and the second kernel's build time measured. |
-| T-0954 | **The client.** `crates/kithd/src/fido2.rs`: CTAPHID framing and the CBOR subset, ECDH, `hmac-secret` with the hand-written CBC, behind a trait of the device so tests use a pipe; tested on NIST's CBC vectors, the x-coordinate derivation and bad frames (short, a wrong channel, an oversize length, a keep-alive storm). **No size measure and no budget raise here:** nothing calls the code yet, and the linker may drop it, so a number taken now is not the number the feature costs. |
+| T-0954 (carved: T-0966 the wire half, T-0968 the rest) | **The client.** `crates/kithd/src/fido2.rs`: CTAPHID framing and the CBOR subset (T-0966), then ECDH (T-0968), `hmac-secret` with the hand-written CBC, behind a trait of the device so tests use a pipe; tested on NIST's CBC vectors, the x-coordinate derivation and bad frames (short, a wrong channel, an oversize length, a keep-alive storm). **No size measure and no budget raise here:** nothing calls the code yet, and the linker may drop it, so a number taken now is not the number the feature costs. |
 | T-0955 | **The stand-in, and the client against it.** The `fido2-test` feature with the uhid authenticator and the four release guards of section 2 (`os/build.sh:98-103`, `ci/vm/tests.sh:22`, `ci/musl.sh`'s case table and grep, a loud startup line). Its VM test is **the client against the stand-in through uhid and hidraw, and nothing more**: a `fido2-test` subcommand of the test build that runs `makeCredential` and `getAssertion` with a known salt on the stand-in and prints the `hmac-secret`, which the test compares with what the seed says it must be; a second stand-in with another seed gives another secret, and a touch withheld times out. It needs no record, no console prompt and no verb. |
 | T-0956 | **The record, the verbs and the state opened by touch.** The `fido2:` lines (two), the console's "touch your key" beside its typed lines (judged after the passphrase, with the same two seconds before an answer, `crypt.rs:726-757`, so a wrong key is answered as every wrong line), `kith node key add` and `remove` with the order of writes above, the audit log; the VM test of enrolling two keys and **opening the state by touching one of two stand-ins** (the other opens it too, a key it was not enrolled with is refused) and of losing one. **kithd's size is measured here, before and after, with the feature called, and the budget raised with the number if it must be** (section 5). |
 
@@ -299,6 +307,12 @@ record, so only T-0956 can open a state by touch and measure the size of what is
   `fido2:` lines it does not know. adr-unlock's rule for passphrase lines is the same; a
   guard is for the slice that writes them (the node refuses an OS slot older than the one that
   wrote them, if `os.rs` has the means).
+- **`remove` does not rotate the state's key.** It takes both `fido2:` lines off the record, but
+  the state's key under them is the same one: an old copy of the config partition (a backup, a
+  disk image, a replaced disk) together with the lost key still opens the state. A key lost is
+  to be treated as that, until the state's key is changed (a rekey, which no verb of this
+  record does). The cluster's lock or forget does drop the lines of the node it reaches
+  (`ways_left`, T-0971), but not a copy of the partition taken before.
 - **Swapping one of two keys**, and more than two keys enrolled at once (the record's room
   allows two lines, section 4).
 - **A hardware token the kernel does not give a hidraw** (a Bluetooth or NFC key): out of scope.
