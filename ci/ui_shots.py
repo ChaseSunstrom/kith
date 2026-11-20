@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Screenshots of the web UI (crates/kithd/ui) over a real cluster: three kithds on this machine.
 
-    python3 ci/ui_shots.py OUT            the board with a Workload open, at 1440 and 390 px, light
+    python3 ci/ui_shots.py OUT            the overview (the dashboard), at 1440, 768 and 360 px, light
+                                          and dark, as OUT/ui-dash-WIDTH-SCHEME.png, its figures
+                                          crates/kithd/ui/fixture.mjs's (see SHIM); the board with a
+                                          Workload open, at 1440 and 390 px, light
                                           and dark, as OUT/ui-WIDTH-SCHEME.png; and its other tabs
                                           the review of a change and a kind with nothing in it,
                                           as OUT/ui-SCENE-SCHEME.png; the Install part and a join
@@ -37,7 +40,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 UI = ROOT / "crates/kithd/ui"
 TARGET = pathlib.Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target")  # (a lane builds in a folder of its own)
 HOLD = 5  # seconds the page is given to connect and draw before it is photographed
-KINDS = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".woff2": "font/woff2"}
+KINDS = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".woff2": "font/woff2"}
 POLICY = re.sub(r"\\\n\s*", "", re.search(r'const POLICY: &str = "(.*?)";', (ROOT / "crates/kithd/src/ui.rs").read_text(), re.S).group(1))
 # What the photographed page is given besides its own files: a hand, for the scenes that need a click.
 DRIVE = """
@@ -69,8 +72,21 @@ if (scene === 'Peer' || scene === 'Qr') {
     if (scene === 'Qr' && !document.querySelector('canvas.qr')) throw new Error('no QR code is drawn');
   });
 }
+if (scene === 'Dash') {
+  // The overview: every chart drawn, a line per node, and no sideways scroll at any width; and the
+  // first load, which SHIM fails part way, drawn on its retry (not left waiting for a change).
+  step(3500, () => {
+    if (document.querySelectorAll('#kinds li').length === 0) throw new Error('the kinds were not drawn after a first load that failed');
+    if (document.getElementById('link').textContent !== 'live') throw new Error(`the link says ${document.getElementById('link').textContent}`);
+    if (!/^updated \\d\\d:\\d\\d:\\d\\d$/.test(document.getElementById('updated').textContent)) throw new Error('no updated time');
+    if (document.getElementById('dash').hidden) throw new Error('the overview is not in view');
+    if (document.querySelectorAll('#charts .chart-panel').length < 6) throw new Error('not every chart is there');
+    if (!document.querySelector('#charts .series')) throw new Error('no chart has a line');
+    if (document.documentElement.scrollWidth > innerWidth) throw new Error(`sideways overflow: ${document.documentElement.scrollWidth} > ${innerWidth}`);
+  });
+}
 step(1500, () => {
-  if (['Install', 'Token', 'Peer', 'Qr'].includes(scene)) return;
+  if (['Install', 'Token', 'Peer', 'Qr', 'Dash'].includes(scene)) return;
   if (scene !== 'Review') return scene && scene !== 'Empty' && tab(scene);
   const replicas = [...document.querySelectorAll('.field')].find((field) => field.querySelector('label')?.textContent.startsWith('replicas')).querySelector('input');
   replicas.value = '5';
@@ -81,8 +97,26 @@ step(1500, () => {
 # The Peer and Qr scenes: these nodes have no people device (that takes root, and a kernel's WireGuard), so
 # what the page asks of kithd is answered here: alpha says it has one, and a peer is made with
 # the documentation's own sample key. Nothing else is touched, and it is for photographs only.
+# The Dash scene: nodes this young have kept no history, so /v1/metrics is answered from the
+# fixture the tests use (crates/kithd/ui/fixture.mjs), ending now; its nodes are this cluster's.
 SHIM = """\
 const scene = new URLSearchParams(location.search).get('scene');
+if (scene === 'Dash') {
+  const real = window.fetch;
+  let failed = false;
+  window.fetch = async (url, init = {}) => {
+    const asked = new URL(String(url), location.href);
+    // (The first load fails part way, after the watch answered: the page must draw on its retry.)
+    if (asked.pathname.endsWith('/v1/schemas') && !failed) {
+      failed = true;
+      throw new TypeError('Failed to fetch');
+    }
+    if (!asked.pathname.endsWith('/v1/metrics')) return real(url, init);
+    const { fixture } = await import('./fixture.mjs');
+    const body = fixture(asked.searchParams.get('range') ?? '1h', Math.floor(Date.now() / 1000));
+    return new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } });
+  };
+}
 if (scene === 'Peer' || scene === 'Qr') {
   const real = window.fetch;
   const config = ['[Interface]', 'PrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=', 'Address = 100.89.2.3/32, fd8a:1c3f:5b9d:2::3/128',
@@ -250,18 +284,19 @@ def main():
         found = sorted(glob.glob(os.path.expanduser("~/.cache/ms-playwright/chromium_headless_shell-*/*/chrome-headless-shell")))
         chrome = os.environ.get("CHROME") or (found[-1] if found else sys.exit("no Chromium: set CHROME"))
         views = [(1440, 900, scheme, "") for scheme in ("light", "dark")] + [(390, 2200, scheme, "") for scheme in ("light", "dark")]
+        views += [(width, height, scheme, "Dash") for width, height in ((1440, 1400), (768, 2300), (360, 3300)) for scheme in ("light", "dark")]
         views += [(1440, 900, scheme, scene) for scene in ("YAML", "Status", "History", "Logs", "Review", "Empty") for scheme in ("light", "dark")]
         # (The Install part, and a join token shown once, at both widths.)
         views += [(width, height, scheme, scene) for scene in ("Install", "Token") for width, height in ((1440, 1500), (390, 2400)) for scheme in ("light", "dark")]
         # (Add a peer: its question, and the configuration it shows once, at both widths.)
         views += [(width, height, scheme, scene) for scene in ("Peer", "Qr") for width, height in ((1440, 900), (390, 1500)) for scheme in ("light", "dark")]
         for width, height, scheme, scene in views:
-            shot = out / (f"ui-{scene.lower()}-{width}-{scheme}.png" if scene in ("Install", "Token", "Peer", "Qr") else f"ui-{scene.lower() or width}-{scheme}.png")
+            shot = out / (f"ui-{scene.lower()}-{width}-{scheme}.png" if scene in ("Install", "Token", "Peer", "Qr", "Dash") else f"ui-{scene.lower() or width}-{scheme}.png")
             flags = ["--no-sandbox", "--disable-gpu", "--hide-scrollbars", f"--window-size={width},{height}", f"--screenshot={shot}"]
             if scheme == "dark":
                 flags.append("--blink-settings=preferredColorScheme=0")
             # (Empty: a kind the scene has none of, open with nothing in it.)
-            opened = {"Empty": "#/Secret", "Install": "#/install", "Token": "#/install", "Peer": "#/RemotePeer", "Qr": "#/RemotePeer"}.get(scene)
+            opened = {"Dash": "#/", "Empty": "#/Secret", "Install": "#/install", "Token": "#/install", "Peer": "#/RemotePeer", "Qr": "#/RemotePeer"}.get(scene)
             url = address.replace("scene=", f"scene={scene}")
             if opened:
                 url = url.replace("#/Workload/default/web", opened)

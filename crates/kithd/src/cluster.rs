@@ -27,7 +27,7 @@ use axum::{Json, Router};
 use kith_store::Command;
 use kith_store::openraft::error::{CheckIsLeaderError, RaftError};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -280,8 +280,34 @@ impl Drop for Place {
     }
 }
 
-pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::Result<TlsListener> {
+/// Whether a connection that came in to `local` on a socket bound to every address is one this
+/// node answers: to an IPv4 address (or an IPv4 one in IPv6's clothes), to loopback, or to its own
+/// address on the mesh (`mesh`). Not to another IPv6 address of the machine: a global one that
+/// the router forwards to it has not been opened to the world by the IPv4 NAT it sat behind.
+pub fn may_answer(local: SocketAddr, mesh: Ipv6Addr) -> bool {
+    match local.ip().to_canonical() {
+        IpAddr::V4(_) => true,
+        IpAddr::V6(ip) => ip.is_loopback() || ip == mesh,
+    }
+}
+
+/// Whether a connection is hung up on at once: the address it called (asked of the socket, not
+/// the peer) is one [`may_answer`] refuses, or is not known, which is a no too. Never when
+/// `mesh` is `None`: the socket is bound to one address.
+fn hung_up_on(called: std::io::Result<SocketAddr>, mesh: Option<Ipv6Addr>) -> bool {
+    mesh.is_some_and(|mesh| !called.is_ok_and(|to| may_answer(to, mesh)))
+}
+
+/// Listens for the node API, hanging up at once on a connection to an address of this machine that
+/// [`may_answer`] refuses, when the socket is bound to every address and `mesh` is this node's
+/// address on the mesh (`None`: no filter).
+pub fn listen_on(
+    tcp: TcpListener,
+    config: Arc<rustls::ServerConfig>,
+    mesh: Option<Ipv6Addr>,
+) -> std::io::Result<TlsListener> {
     let local = tcp.local_addr()?;
+    let mesh = mesh.filter(|_| local.ip().is_unspecified());
     let (tx, ready) = mpsc::channel(GUESTS);
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
     let slots = Arc::new(Semaphore::new(GUESTS));
@@ -296,6 +322,10 @@ pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::R
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
+            // (Asked of the socket, not the peer: which of this machine's addresses it called.)
+            if hung_up_on(stream.local_addr(), mesh) {
+                continue;
+            }
             // An address that holds its share already is hung up on: it waits for itself.
             let Some(place) = crowd.place(addr.ip()) else {
                 continue;
@@ -364,6 +394,10 @@ fn cluster(shared: &Shared) -> Result<&Cluster, Refusal> {
 
 pub const EVICTED: &str = "this certificate is not a node of this cluster's any more: its Node was deleted, or the \
      name has joined again with another";
+
+/// Set when the node API listens on every IPv6 address (the mesh's too): the node says so under
+/// `status.mesh.api`, and the leader may then move its address onto the mesh (`raft::to_mesh`).
+pub static SERVES_MESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Set by `--admit-deleted-nodes`: [`admitted`] says yes to every node certificate.
 pub static ADMIT_DELETED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1390,7 +1424,8 @@ async fn join(
         }
         let peer = |node: &kith_api::Resource| {
             let status = node.status.as_ref()?;
-            let at: SocketAddr = status["address"].as_str()?.parse().ok()?;
+            // (Its LAN address when the leader has moved `address` onto the mesh: a mesh peer is not called through the mesh.)
+            let at: SocketAddr = node.node_addresses().next()?.parse().ok()?;
             let port = u16::try_from(status["mesh"]["port"].as_u64()?).ok()?;
             let (name, key) = (&node.metadata.name, status["mesh"]["key"].as_str()?);
             let stays = node.spec["roaming"] != true;
@@ -1549,6 +1584,12 @@ pub async fn request_join(
 }
 
 /// What the tests of a call to one node need: nodes of one CA, and one that counts what it is sent.
+/// [`listen_on`] with no filter: a socket of one address.
+#[cfg(test)]
+pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::Result<TlsListener> {
+    listen_on(tcp, config, None)
+}
+
 #[cfg(test)]
 pub(crate) mod pinned_peer {
     use super::*;
@@ -2370,6 +2411,34 @@ mod tests {
     use std::collections::BTreeMap;
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn a_node_bound_to_every_address_answers_only_the_ones_it_means_to() {
+        let mesh = kith_mesh::node_address(kith_mesh::prefix(b"test"), "alpha");
+        let to = |ip: &str| SocketAddr::new(ip.parse().unwrap(), 7443);
+        assert!(may_answer(to("10.9.0.1"), mesh), "an IPv4 address");
+        assert!(may_answer(to("::ffff:10.9.0.1"), mesh), "an IPv4 one in IPv6's clothes");
+        assert!(may_answer(to("::1"), mesh), "loopback");
+        assert!(
+            may_answer(SocketAddr::new(mesh.into(), 7443), mesh),
+            "its own mesh address"
+        );
+        let other = kith_mesh::node_address(kith_mesh::prefix(b"test"), "beta");
+        assert!(
+            !may_answer(SocketAddr::new(other.into(), 7443), mesh),
+            "another node's mesh address"
+        );
+        assert!(!may_answer(to("2001:db8::7"), mesh), "a global IPv6 address");
+        assert!(!may_answer(to("fe80::1"), mesh), "a link-local address");
+        assert!(hung_up_on(Ok(to("2001:db8::7")), Some(mesh)));
+        assert!(!hung_up_on(Ok(to("10.9.0.1")), Some(mesh)));
+        assert!(!hung_up_on(Ok(to("2001:db8::7")), None), "a socket of one address");
+        let unknown = Err(std::io::Error::other("no local address"));
+        assert!(
+            hung_up_on(unknown, Some(mesh)),
+            "not knowing which address it called is a no"
+        );
+    }
     use std::task::Poll;
 
     /// A node that restarts in the term it left (a leader comes back as leader at once, in the same

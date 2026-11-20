@@ -2305,7 +2305,8 @@ fn status_summary(resource: &Resource) -> String {
             (Some(state), Some(why), _) if state != "succeeded" => format!("{state}: {}", clean(why)),
             // A Node: its address, which is its LAN address unless it roams (then a mesh address), and what it serves.
             (Some(state), _, Some(address)) if resource.kind == "Node" => {
-                let mesh = if resource.spec["roaming"] == true {
+                // (A node the leader has moved onto the mesh keeps its LAN address in `status.lan`.)
+                let mesh = if resource.spec["roaming"] == true || status["lan"].is_string() {
                     " (mesh)"
                 } else {
                     ""
@@ -2682,6 +2683,16 @@ mod drain_tests {
         );
         assert_eq!(lan.lan_address().map(|ip| ip.to_string()).as_deref(), Some("192.0.2.7"));
         assert_eq!(table_row(&lan)[4], "ready at 192.0.2.7:7443; serves dns 53, ingress");
+        // Moved onto the mesh by the leader: its LAN address is the one it was moved from.
+        let moved = node(
+            json!({}),
+            json!({ "address": "[fd00::7]:7443", "lan": "192.0.2.7:7443", "state": "ready" }),
+        );
+        assert_eq!(
+            moved.lan_address().map(|ip| ip.to_string()).as_deref(),
+            Some("192.0.2.7")
+        );
+        assert_eq!(table_row(&moved)[4], "ready at [fd00::7]:7443 (mesh)");
         let roaming = node(
             json!({ "roaming": true }),
             json!({ "address": "10.8.0.4:7443", "state": "ready" }),
