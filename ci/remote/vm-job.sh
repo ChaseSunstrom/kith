@@ -47,7 +47,15 @@ EOF
     cd "$cache/src" || exit 1
     # (Root here is the Job's user, the one uid this namespace maps: tar, as root, would give a file
     # its owner in the archive, a uid not mapped, and fail on it. TAR_OPTIONS keeps the files ours.)
-    exec env LD_PRELOAD="$shim" TAR_OPTIONS=--no-same-owner HOME="$work" TMPDIR=/tmp CARGO_HOME="$cache/cargo" CARGO_TARGET_DIR="$cache/target" KITH_OS_CACHE="$cache/os" sh ci/vm.sh --test "$TEST" ;;
+    export LD_PRELOAD="$shim" TAR_OPTIONS=--no-same-owner HOME="$work" TMPDIR=/tmp CARGO_HOME="$cache/cargo" \
+        CARGO_TARGET_DIR="$cache/target" KITH_OS_CACHE="$cache/os" XDG_CACHE_HOME="$cache/xdg"
+    # (What a machine of one's own has: rollout signs with the checkout's kith from target/debug;
+    # kube wants kubectl and helm, which ci/kube.sh --vm fetches, checked by their hashes.)
+    case $TEST in
+    rollout) cargo build -q -p kith-cli --bin kith --target-dir target || exit 1 ;;
+    kube) exec sh ci/kube.sh --vm ;;
+    esac
+    exec sh ci/vm.sh --test "$TEST" ;;
 esac
 mkdir -p "$cache" "$work" && exec 9>"$cache/lock" && flock 9 || exit 1
 t0=$(date +%s)
@@ -68,6 +76,6 @@ fi
 code=0
 unshare -r -m sh -c "$SCRIPT" vm mounts run >"$work/out.txt" 2>&1 || code=$?
 tail -200 "$work/out.txt"
-why=$(grep -m1 "^skipped: " "$work/out.txt" || true)
+why=$(grep -m1 -E "^(kube\.sh: )?skipped: " "$work/out.txt" || true)
 [ -z "$why" ] || code=3
 end "$code" "${why:+why=$why}"

@@ -96,7 +96,7 @@ volume_json() {
 }
 
 # --vm: what the VM tests need that the image lacks; apt puts it into a copy of the image's root.
-pkgs='qemu-system-x86 qemu-utils ovmf socat openssl curl python3 cpio zstd xz-utils flex bison bc libelf-dev libssl-dev mtools dosfstools fdisk e2fsprogs squashfs-tools cryptsetup-bin systemd-repart systemd-boot-efi musl-tools swtpm bubblewrap kmod xxd'
+pkgs='qemu-system-x86 qemu-utils ovmf socat openssl curl python3 cpio zstd xz-utils flex bison bc libelf-dev libssl-dev mtools dosfstools fdisk e2fsprogs squashfs-tools cryptsetup-bin systemd-repart systemd-boot-efi musl-tools swtpm bubblewrap kmod xxd iproute2 wireguard-tools'
 
 # What a node runs for one VM test, as its Job's command (ci/remote/vm-job.sh says what it takes).
 here=$(dirname "$0")

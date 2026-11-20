@@ -21,6 +21,8 @@ self_test() {
     mkdir "$t/w/ci"
     # shellcheck disable=SC2016 # (the stub's)
     printf '%s\n' '[ "$1" = --test ] || exit 9' 'case $2 in alone) [ "${TAR_OPTIONS-}" = --no-same-owner ] || { echo "vm.sh: FAIL: tar keeps owners"; exit 1; }; echo "vm.sh: ok: alone" ;; skipme) echo "skipped: no KVM"; exit 0 ;; *) echo "vm.sh: FAIL: $2"; exit 1 ;; esac' >"$t/w/ci/vm.sh"
+    # shellcheck disable=SC2016 # (the stub's)
+    printf '%s\n' 'echo "kube.sh $*" >>"$FAKE_RAN"' 'echo "kube.sh: skipped: could not fetch kubectl" >&2' >"$t/w/ci/kube.sh"
     echo three >"$t/w/f" && echo x >"$t/w/g" && git -C "$t/w" add g ci && git -C "$t/w" commit -qam three
     c=$(git -C "$t/w" rev-parse HEAD)
     git -C "$t/gh.git" cat-file -e "$c" 2>/dev/null && die "the test's commit is on GitHub"
@@ -190,6 +192,21 @@ EOF
     done
     ! echo "$rep" | grep -q '^FAILED: n1' || die "the test that passed is named failed: $rep"
     ok "--vm: a skipped test fails the run as a failed one does, named with its node; the tools installed once and kept; tar leaves owners be"
+    # rollout and kube: what a machine of one's own has, the Job makes first
+    # shellcheck disable=SC2016 # (the stub's)
+    printf '#!/bin/sh\necho "cargo $*" >>"$FAKE_RAN"\n' >"$t/bin/cargo" && chmod +x "$t/bin/cargo"
+    for x in rollout kube; do
+        # shellcheck disable=SC2030,SC2031 # (as above)
+        (
+            export CACHE="$t/vc" WORK="$t/vw$x" REPO="file://$t/gh.git" COMMIT="$c" BASES="$bases" TEST="$x" PKGS="qemu socat" \
+                FROM="$t/from" SCRIPT="$vm_script" PATH="$t/bin:$PATH" FAKE_RAN="$t/ran"
+            sh -c "$SCRIPT"
+        ) >"$t/vm/$x.log" 2>&1 || true
+    done
+    grep -qx 'cargo build -q -p kith-cli --bin kith --target-dir target' "$t/ran" || die "rollout's kith was not built where its test runs it: $(cat "$t/ran")"
+    grep -qx 'kube.sh --vm' "$t/ran" || die "kube did not go by ci/kube.sh --vm (which fetches kubectl and helm): $(cat "$t/ran")"
+    grep -q '^SUMMARY exit=3 test=kube .*why=kube.sh: skipped: could not fetch kubectl$' "$t/vm/kube.log" || die "ci/kube.sh's skip is not a failure: $(cat "$t/vm/kube.log")"
+    ok "--vm: rollout has the checkout's kith built in its target folder; kube goes by ci/kube.sh --vm, whose skip fails too"
     # the local fallback: no KITH_REMOTE, or a cluster that does not answer, runs cargo test with the same args and exit
     cat >"$t/bin/cargo" <<'EOF'
 #!/bin/sh
