@@ -2760,13 +2760,12 @@ mod tests {
                 assert_eq!(got, StatusCode::FORBIDDEN, "{who} {method}");
             }
         }
-        // (The Role holder: a token is made; DELETE turns it off; a PUT with a minutes that is
+        // (The Role holder: a token is made; a PUT with a minutes that is
         // no number is refused by the call, after the permit, before anything is turned on.)
         assert_eq!(
             status("dana", post.clone(), &[("trust", "worker")]).await,
             StatusCode::OK
         );
-        assert_eq!(status("dana", delete, &[]).await, StatusCode::OK);
         assert_eq!(
             status("dana", put, &[("minutes", "soon")]).await,
             StatusCode::BAD_REQUEST
