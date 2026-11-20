@@ -8,6 +8,8 @@ import { readFileSync } from 'node:fs';
 import { at, blank, diffLines, entriesCheck, health, keyOf, lamps, prune, resolve, resourceOf, shape, summary, written } from './forms.js';
 import { installPart } from './install.js';
 import { MOST, draw as drawCode, qr } from './qr.js';
+import { PANELS, RANGES, busiest, dashPart, format, hues, line, rangeOf, scale, tiles, times } from './dash.js';
+import { STEPS, fixture } from './fixture.mjs';
 
 // ── The QR code: the matrix a reference encoder makes ─────────────────────────────────
 // Each fixture is `qrencode -8 -l L -m 0` (qrencode 4.1, ISO 18004 byte mode, the lowest
@@ -176,8 +178,284 @@ const filled = (name, node, level) => (body, find) => {
   assert.deepEqual(calls, []);
 }
 
+// ── The dashboard (dash.js): its lines, scales, sums and order, over T-1111's /v1/metrics ──
+const GiB = 2 ** 30;
+const MiB = 2 ** 20;
+const END = 1_800_000_000;
+
+// The fixture is the contract's shape: every series of a node as long as the others, aligned to
+// `end`, a gap a null, a node that did not answer `missing` with the whole shape of nothing
+// (its arrays null, its sizes 0) and none of its Workloads.
+for (const range of RANGES) {
+  const metrics = fixture(range, END, { missing: ['gamma'] });
+  assert.deepEqual(Object.keys(metrics).sort(), ['end', 'nodes', 'range', 'step', 'workloads']);
+  assert.equal(metrics.range, range);
+  assert.equal(metrics.step, STEPS[range]);
+  const length = metrics.nodes.alpha.cpu.length;
+  const { gamma } = metrics.nodes;
+  assert.equal(gamma.missing, true);
+  assert.deepEqual([gamma.cpus, gamma.memTotal, gamma.diskTotal], [0, 0, 0]);
+  for (const series of ['cpu', 'mem', 'disk', 'diskRead', 'diskWrite', 'rx', 'tx', 'load1']) {
+    assert.ok(gamma[series].length === length && gamma[series].every((value) => value === null), `gamma.${series}`);
+  }
+  assert.ok(Object.values(metrics.workloads).every((one) => one.node !== 'gamma'));
+  assert.ok(length > 50, `${range}: a line, not a dot`);
+  for (const [name, node] of Object.entries(metrics.nodes).filter(([, node]) => !node.missing)) {
+    assert.ok(Number.isInteger(node.cpus) && node.memTotal > 0 && node.diskTotal > 0, name);
+    for (const series of ['cpu', 'mem', 'disk', 'diskRead', 'diskWrite', 'rx', 'tx', 'load1']) {
+      assert.equal(node[series].length, length, `${range} ${name}.${series}`);
+      assert.ok(node[series].every((value) => value === null || (typeof value === 'number' && value >= 0)), `${name}.${series}`);
+    }
+    assert.ok(node.cpu.every((value) => value === null || value <= 1), 'cpu is a fraction of the node');
+    assert.ok(node.mem.every((value) => value === null || value <= node.memTotal));
+  }
+  assert.ok(metrics.nodes.alpha.cpu.includes(null), 'alpha has a gap (a restart)');
+  for (const [key, one] of Object.entries(metrics.workloads)) {
+    // (`NS/NAME` on the first node by name, `NS/NAME@NODE` on each other.)
+    assert.match(key, /^[^/@]+\/[^/@]+(@[^/@]+)?$/);
+    if (key.includes('@')) assert.equal(key.split('@')[1], one.node);
+    assert.ok(one.node in metrics.nodes && one.cpu.length === length && one.mem.length === length, key);
+  }
+  const at = times(metrics);
+  assert.equal(at.length, length);
+  assert.equal(at.at(-1), END);
+  assert.equal(at[1] - at[0], metrics.step);
+}
+// (Ten-second points for an hour, five-minute ones for a day: T-1111's rings.)
+assert.deepEqual([STEPS['1h'], STEPS['24h']], [10, 300]);
+
+// The range control: four ranges, an hour unless another is asked for.
+assert.deepEqual(RANGES, ['15m', '1h', '6h', '24h']);
+assert.equal(rangeOf('6h'), '6h');
+assert.equal(rangeOf('7d'), '1h');
+assert.equal(rangeOf(undefined), '1h');
+
+// A series as an SVG path: oldest on the left, newest at the right edge, top the most; a null
+// lifts the pen, and a point with no neighbour is still drawn (a dot of the line's cap).
+assert.equal(line([0, 1, null, 0.5], { width: 30, height: 10, max: 1 }), 'M0 10L10 0M30 5h0');
+assert.equal(line([0.25, 0.5, 0.75], { width: 100, height: 40, max: 1 }), 'M0 30L50 20L100 10');
+assert.equal(line([2, -1], { width: 10, height: 10, max: 1 }), 'M0 0L10 10', 'what is past the scale is drawn at its edge');
+assert.equal(line([0.3], { width: 50, height: 10, max: 1 }), 'M50 7h0', 'one point is the newest');
+assert.equal(line([null, null], { width: 50, height: 10, max: 1 }), '');
+assert.equal(line([], { width: 50, height: 10, max: 1 }), '');
+assert.equal(line([1, 2, 3], { width: 3, height: 3, min: 1, max: 3 }), 'M0 3L1.5 1.5L3 0');
+
+// An axis: a fraction is 0 to 100 % in quarters; bytes and rates in whole binary units, in
+// steps of 1, 2, 2.5 or 5 of them; nothing at all still has a scale.
+assert.deepEqual(scale(0.42, 'pct'), { top: 1, ticks: [0, 0.25, 0.5, 0.75, 1] });
+assert.deepEqual(scale(7.3 * GiB, 'bytes'), { top: 8 * GiB, ticks: [0, 2, 4, 6, 8].map((n) => n * GiB) });
+assert.deepEqual(scale(1500, 'rate'), { top: 1536, ticks: [0, 512, 1024, 1536] });
+assert.deepEqual(scale(3.1, 'num'), { top: 4, ticks: [0, 1, 2, 3, 4] });
+assert.deepEqual(scale(0.37, 'num'), { top: 0.4, ticks: [0, 0.1, 0.2, 0.3, 0.4] });
+assert.deepEqual(scale(0, 'rate'), { top: 1024, ticks: [0, 1024] });
+assert.deepEqual(scale(null, 'num'), { top: 1, ticks: [0, 1] });
+assert.deepEqual(scale(9 * MiB, 'rate').ticks.map((n) => format(n, 'rate')), ['0 B/s', '2.5 MiB/s', '5 MiB/s', '7.5 MiB/s', '10 MiB/s']);
+
+// Units: the way a person says them.
+assert.equal(format(0.423, 'pct'), '42%');
+assert.equal(format(0.004, 'pct'), '0.4%');
+assert.equal(format(1, 'pct'), '100%');
+assert.equal(format(1.5 * GiB, 'bytes'), '1.5 GiB');
+assert.equal(format(12 * MiB, 'bytes'), '12 MiB');
+assert.equal(format(512, 'bytes'), '512 B');
+assert.equal(format(0, 'bytes'), '0 B');
+assert.equal(format(2.5 * MiB, 'rate'), '2.5 MiB/s');
+assert.equal(format(0.25, 'num'), '0.25');
+assert.equal(format(12.345, 'num'), '12.3');
+for (const unit of ['pct', 'bytes', 'rate', 'num']) {
+  assert.equal(format(null, unit), '–');
+  assert.equal(format(undefined, unit), '–');
+}
+
+// Each node keeps its colour: in the order of their names, six hues, never one twice; a seventh
+// node is drawn dim, not in the first's colour. A node that did not answer keeps its place.
+{
+  const names = ['beta', 'alpha', 'gamma', 'delta', 'eps', 'zeta', 'eta', 'theta'];
+  const metrics = { nodes: Object.fromEntries(names.map((name) => [name, { missing: name === 'beta' }])) };
+  assert.deepEqual(Object.fromEntries(hues(metrics)), { alpha: 1, beta: 2, delta: 3, eps: 4, eta: 5, gamma: 6, theta: 0, zeta: 0 });
+}
+
+// The tiles: nodes and workloads from the cluster's resources, CPU and memory from the metrics.
+const resource = (kind, name, status) => ({ kind, metadata: { name, namespace: kind === 'Workload' ? 'default' : undefined }, status });
+const RESOURCES = [
+  resource('Node', 'alpha', { state: 'ready' }),
+  resource('Node', 'beta', { state: 'ready' }),
+  resource('Node', 'gamma', { state: 'unreachable' }),
+  resource('Workload', 'web', { ready: 3, replicas: 3 }),
+  resource('Workload', 'queue', { ready: 2, replicas: 2 }),
+  resource('Workload', 'mail', { ready: 0, replicas: 2, notes: ['restarting'] }),
+  resource('ConfigMap', 'site'),
+];
+{
+  const metrics = fixture('1h', END, { missing: ['gamma'] });
+  const { alpha, beta } = metrics.nodes;
+  const sum = tiles(RESOURCES, metrics);
+  assert.deepEqual(sum.nodes, { ready: 2, total: 3 });
+  assert.deepEqual(sum.workloads, { ready: 2, total: 3 });
+  assert.deepEqual(sum.replicas, { ready: 5, total: 7 });
+  // (Of the nodes that answered: one that did not has no CPU to count, used or free.)
+  assert.equal(sum.cpu.total, alpha.cpus + beta.cpus);
+  assert.equal(sum.mem.total, alpha.memTotal + beta.memTotal);
+  const last = alpha.cpu.length - 1;
+  assert.ok(Math.abs(sum.cpu.used - (alpha.cpu[last] * alpha.cpus + beta.cpu[last] * beta.cpus)) < 1e-9);
+  assert.equal(sum.mem.used, alpha.mem[last] + beta.mem[last]);
+  assert.equal(sum.cpu.series.length, alpha.cpu.length);
+  // (Where alpha has a gap, the sum is beta's alone: a dip that says so, not a hole.)
+  const hole = alpha.cpu.indexOf(null);
+  assert.ok(Math.abs(sum.cpu.series[hole] - beta.cpu[hole] * beta.cpus) < 1e-9);
+  assert.deepEqual(sum.reporting.slice(hole - 1, hole + 1), [2, 1], 'how many nodes answered, point by point');
+  // Without metrics: what the resources say, and no number made up.
+  const none = tiles(RESOURCES, null);
+  assert.deepEqual(none.nodes, { ready: 2, total: 3 });
+  assert.deepEqual(none.cpu, { used: null, total: null, series: [] });
+  assert.deepEqual(none.mem, { used: null, total: null, series: [] });
+  assert.deepEqual(tiles([], { nodes: {}, workloads: {} }).cpu, { used: null, total: null, series: [] });
+  // A node whose memory kithd could not read (null points, T-1111): not counted as 0 used of its
+  // total, but left out of the memory tile; its CPU still counts.
+  const blind = { ...metrics, nodes: { ...metrics.nodes, beta: { ...beta, mem: beta.mem.map(() => null) } } };
+  const partly = tiles(RESOURCES, blind);
+  assert.equal(partly.mem.total, alpha.memTotal);
+  assert.equal(partly.mem.used, alpha.mem[last]);
+  assert.equal(partly.cpu.total, alpha.cpus + beta.cpus);
+  const unread = { ...blind, nodes: { beta: blind.nodes.beta } };
+  assert.deepEqual(tiles(RESOURCES, unread).mem, { used: null, total: null, series: [] });
+}
+
+// The workloads, busiest first: by CPU now (the latest point that has one), then memory, then
+// name. A Workload on several nodes (`NS/NAME@NODE`) is one row: its nodes' use summed.
+{
+  const workloads = {
+    'a/x': { node: 'n', cpu: [0.9, 0.1, null], mem: [1, 2, null] },
+    'a/y': { node: 'n', cpu: [0.5], mem: [1] },
+    'a/z': { node: 'n', cpu: [0.5], mem: [9] },
+    'a/w': { node: 'n', cpu: [null], mem: [null] },
+    'a/v': { node: 'n', cpu: [0.5], mem: [9] },
+  };
+  const sorted = busiest({ workloads });
+  assert.deepEqual(sorted.map((one) => one.key), ['a/v', 'a/z', 'a/y', 'a/x', 'a/w']);
+  assert.deepEqual(sorted[3], { key: 'a/x', nodes: ['n'], cpu: 0.1, mem: 2, series: [0.9, 0.1, null] });
+  assert.deepEqual(busiest(null), []);
+  const spread = busiest({ workloads: {
+    'a/s': { node: 'm', cpu: [0.2, null], mem: [5, null] },
+    'a/s@n': { node: 'n', cpu: [0.3, 0.1], mem: [1, 2] },
+  } });
+  assert.deepEqual(spread, [{ key: 'a/s', nodes: ['m', 'n'], cpu: 0.1, mem: 2, series: [0.5, 0.1] }]);
+  const rows = busiest(fixture('1h', END));
+  assert.deepEqual(rows.map((one) => one.key), ['default/web', 'default/queue', 'default/mail']);
+  assert.deepEqual(rows[0].nodes, ['alpha', 'beta']);
+}
+
+// The dashboard drawn into a page of fakes, against a kithd that keeps metrics and one that does not.
+const dashboard = async (answer, { audit = [] } = {}) => {
+  const made = (tag, props = {}, ...children) => ({
+    tag,
+    props,
+    hidden: false,
+    textContent: '',
+    clientWidth: 640,
+    children: children.flat(3).filter((child) => child != null && child !== false),
+    setAttribute(name, value) { this.props[name] = value; },
+    removeAttribute(name) { delete this.props[name]; },
+    replaceChildren(...children) { this.children = children.flat(3).filter((child) => child != null && child !== false); this.textContent = ''; },
+    append(...children) { this.children.push(...children.flat(3)); },
+    addEventListener() {},
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 160 }),
+    style: { setProperty() {} },
+  });
+  const ids = new Map();
+  const $ = (id) => ids.get(id) ?? ids.set(id, made('div', { id })).get(id);
+  const words = (node) => (typeof node === 'string' ? node : [node.textContent, ...node.children.map(words)].join(' '));
+  const find = (node, test, found = []) => {
+    if (typeof node === 'string') return found;
+    if (test(node)) found.push(node);
+    node.children.forEach((child) => find(child, test, found));
+    return found;
+  };
+  const calls = [];
+  const api = async (method, what) => {
+    calls.push([method, what]);
+    if (what.startsWith('audit')) return audit;
+    return answer(what);
+  };
+  const part = dashPart({ $, h: made, api, state: { resources: RESOURCES }, still: () => true });
+  await part.refresh();
+  return { $, part, calls, words, find };
+};
+const missingEndpoint = async () => { throw Object.assign(new Error('not found'), { status: 404 }); };
+{
+  // No /v1/metrics (a kithd from before T-1111): one calm line, the tiles kithd can still fill, no
+  // red but what is down (the tiles' lamps of a node that is gone).
+  const { $, calls, words, find } = await dashboard(missingEndpoint);
+  assert.deepEqual(calls[0], ['GET', 'metrics?range=1h']);
+  assert.match(words($('charts')), /no metrics yet/i);
+  assert.equal(find($('charts'), (one) => one.tag === 'path').length, 0);
+  assert.match(words($('tiles')), /2 of 3/);
+  assert.match(words($('tiles')), /–/);
+  for (const id of ['charts', 'busiest', 'dash-said']) {
+    assert.equal(find($(id), (one) => /\bbad\b/.test(one.props.class ?? '')).length, 0, `${id}: nothing red`);
+  }
+}
+{
+  // Not allowed to read Nodes: said as calmly, with why.
+  const { $, words } = await dashboard(async () => { throw Object.assign(new Error('forbidden'), { status: 403 }); });
+  assert.match(words($('charts')), /may read Nodes/);
+}
+{
+  // An identity that may read no namespace's Workloads gets `workloads: {}`: an empty table said
+  // calmly, not an error; and memory or disk points kithd could not read are gaps, never 0.
+  const metrics = fixture('1h', END);
+  const { beta } = metrics.nodes;
+  const holes = (values) => values.map((value, i) => (i % 7 === 3 ? null : value));
+  const narrow = { ...metrics, workloads: {}, nodes: { ...metrics.nodes, beta: { ...beta, mem: holes(beta.mem), disk: holes(beta.disk) } } };
+  const { $, words, find } = await dashboard(async () => narrow);
+  assert.equal(find($('busiest'), (one) => one.tag === 'tr').length, 0);
+  assert.match(words($('busiest')), /no workload you may see/i);
+  assert.equal(find($('busiest'), (one) => /\bbad\b/.test(one.props.class ?? '')).length, 0);
+  for (const id of ['mem', 'disk']) {
+    const panel = find($('charts'), (one) => one.props['data-panel'] === id)[0];
+    const drawn = find(panel, (one) => one.tag === 'path' && /\bs2\b/.test(one.props.class ?? ''))[0];
+    // (Drawn as 0, a gap would be one unbroken line: one M.)
+    assert.ok(drawn.props.d.split('M').length - 1 > 10, `${id}: beta's line lifts the pen at each gap`);
+  }
+}
+{
+  const metrics = fixture('1h', END, { missing: ['gamma'] });
+  const audit = [
+    { at: END - 600, who: 'alice', verb: 'apply', what: ['Workload/default/web'], ok: true },
+    { at: END - 300, who: 'bob', verb: 'delete', what: ['ConfigMap/default/old'], ok: false, error: 'not yours' },
+  ];
+  const { $, part, calls, words, find } = await dashboard(async (what) => (what.startsWith('metrics') ? { ...metrics, range: what.split('=')[1] } : null), { audit });
+  // A panel each, a line per node that answered (two in the panels of two: read and write, in and out).
+  const panels = find($('charts'), (one) => one.tag === 'section');
+  assert.deepEqual(panels.map((one) => one.props['data-panel']), PANELS.map((panel) => panel.id));
+  for (const [panel, { id, series }] of panels.map((one, i) => [one, PANELS[i]])) {
+    const drawn = find(panel, (one) => one.tag === 'path' && /\bseries\b/.test(one.props.class ?? ''));
+    assert.equal(drawn.length, 2 * series.length, `${id}: alpha's and beta's`);
+    assert.ok(drawn.every((one) => /\bs[12]\b/.test(one.props.class) && one.props.d.startsWith('M')), id);
+    // (gamma is in the legend, said to be missing, and has no line.)
+    assert.match(words(panel), /gamma.*no answer/);
+  }
+  assert.match(words($('charts')), /100%/, 'the CPU axis');
+  // The tiles: sums of what answered.
+  const { cpu } = tiles(RESOURCES, metrics);
+  assert.match(words($('tiles')), new RegExp(format(cpu.used / cpu.total, 'pct')));
+  // The workloads table: busiest first, each with its node.
+  const rows = find($('busiest'), (one) => one.tag === 'tr').slice(1);
+  assert.deepEqual(rows.map((row) => words(row.children[0]).trim()), ['default/web', 'default/queue']);
+  // Recent events: newest first, a failed one said with its error.
+  const recent = words($('recent'));
+  assert.ok(recent.indexOf('bob') < recent.indexOf('alice'));
+  assert.match(recent, /not yours/);
+  // Another range: asked for, and drawn.
+  const button = find($('ranges'), (one) => one.tag === 'button' && words(one).trim() === '6h')[0];
+  await button.props.onclick();
+  assert.deepEqual(calls.filter(([, what]) => what.startsWith('metrics')).map(([, what]) => what), ['metrics?range=1h', 'metrics?range=6h']);
+  assert.equal(find($('ranges'), (one) => one.props['aria-pressed'] === 'true').map(words).join().trim(), '6h');
+  part.show(false);
+}
+
 if (!process.argv[2]) {
-  console.log('qr and the Add a peer dialog: ok');
+  console.log('qr, the Add a peer dialog and the dashboard: ok');
   process.exit(0);
 }
 const kinds = JSON.parse(readFileSync(process.argv[2], 'utf8'));
