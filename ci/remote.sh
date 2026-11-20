@@ -19,8 +19,9 @@
 # KITH_REMOTE_REPO (the GitHub clone URL), KITH_REMOTE_TIMEOUT (a Job's seconds, 3600) and
 # KITH_REMOTE_CACHE_MB (the size at which a node's target folder is dropped, 30000) are settable.
 # --vm runs each named test of ci/vm.sh (sh ci/vm.sh --test TEST) in a Job of its own, one at a
-# time on each node, with the node's /dev/kvm: a Device kvm-NODE of it and a shared DeviceClaim
-# kvm-NODE, applied each run (the same each time), named by the Job. The tools the tests need are
+# time on each node, with the node's /dev/kvm: a Device ci-kvm-NODE of it, granted to namespace ci
+# alone, and a shared DeviceClaim ci-kvm-NODE, applied each run (the same each time), named by the
+# Job. Everything this applies (Volumes, Jobs, claims) is in namespace ci. The tools the tests need are
 # installed by apt into a copy of the image's root in the node's Volume, once; there too stay the
 # OS build's cache and cargo's. A test that ci/vm.sh skips (no KVM, a tool missing) counts as
 # failed. One merged result names the node and test of each failure; it exits 0 when all passed.
@@ -28,6 +29,8 @@ set -eu
 repo=${KITH_REMOTE_REPO:-https://github.com/ChaseSunstrom/kith}
 timeout=${KITH_REMOTE_TIMEOUT:-3600}
 cache_mb=${KITH_REMOTE_CACHE_MB:-30000}
+# (CI's namespace: its Volumes, Jobs and claims, and the one /dev/kvm is granted to.)
+ns=ci
 
 # The partition: a test goes to the node whose index is its name's hash mod N. The same awk runs
 # here (the self-test) and on each node, so they agree. Hashing by name keeps a test's place
@@ -76,8 +79,8 @@ api() {
 job_json() {
     jq -n --arg name "$1" --arg vol "ci-$2" --arg idx "$3" --arg n "$4" --arg commit "$5" --arg bases "$6" \
         --arg args "$7" --arg script "$job_script" --arg repo "$repo" --arg part "$part" \
-        --arg cap "$cache_mb" --argjson timeout "$timeout" '[{
-  apiVersion: "kith.dev/v1", kind: "Job", metadata: {name: $name},
+        --arg cap "$cache_mb" --argjson timeout "$timeout" --arg ns "$ns" '[{
+  apiVersion: "kith.dev/v1", kind: "Job", metadata: {name: $name, namespace: $ns},
   spec: {retries: 0, timeoutSeconds: $timeout, template: {pod: true, containers: [{
     name: "test", image: "docker.io/library/rust:1.99.1", runAsUser: 1000, userNamespaces: true,
     env: [{name: "RUSTUP_TOOLCHAIN", value: "1.99.1"}, {name: "ARGS", value: $args}, {name: "REPO", value: $repo},
@@ -88,8 +91,8 @@ job_json() {
 }
 
 volume_json() {
-    jq -n --arg vol "ci-$1" --arg node "$1" \
-        '[{apiVersion: "kith.dev/v1", kind: "Volume", metadata: {name: $vol}, spec: {node: $node, path: "ci-cache"}}]'
+    jq -n --arg vol "ci-$1" --arg node "$1" --arg ns "$ns" \
+        '[{apiVersion: "kith.dev/v1", kind: "Volume", metadata: {name: $vol, namespace: $ns}, spec: {node: $node, path: "ci-cache"}}]'
 }
 
 # --vm: what the VM tests need that the image lacks; apt puts it into a copy of the image's root.
@@ -99,20 +102,20 @@ pkgs='qemu-system-x86 qemu-utils ovmf socat openssl curl python3 cpio zstd xz-ut
 here=$(dirname "$0")
 vm_script=$(cat "$here/remote/vm-job.sh")
 
-# dev_json NODE: the Device of NODE's /dev/kvm, which namespace default may claim, and its shared claim.
+# dev_json NODE: the Device of NODE's /dev/kvm, which namespace ci alone may claim, and its shared claim.
 dev_json() {
-    jq -n --arg name "kvm-$1" --arg node "$1" '[
-  {apiVersion: "kith.dev/v1", kind: "Device", metadata: {name: $name, labels: {"kith.dev/node": $node, class: "other", "kith.dev/namespaces": "default"}},
+    jq -n --arg name "ci-kvm-$1" --arg node "$1" --arg ns "$ns" '[
+  {apiVersion: "kith.dev/v1", kind: "Device", metadata: {name: $name, labels: {"kith.dev/node": $node, class: "other", "kith.dev/namespaces": $ns}},
    spec: {node: $node, class: "other", path: "/dev/kvm"}},
-  {apiVersion: "kith.dev/v1", kind: "DeviceClaim", metadata: {name: $name}, spec: {device: $name, access: "shared"}}]'
+  {apiVersion: "kith.dev/v1", kind: "DeviceClaim", metadata: {name: $name, namespace: $ns}, spec: {device: $name, access: "shared"}}]'
 }
 
 # vm_job_json NAME NODE TEST COMMIT BASES: the Job of one VM test on NODE, with its claim of /dev/kvm.
 vm_job_json() {
     jq -n --arg name "$1" --arg node "$2" --arg test "$3" --arg commit "$4" --arg bases "$5" --arg script "$vm_script" \
-        --arg repo "$repo" --arg pkgs "$pkgs" --argjson timeout "$timeout" '[{
-  apiVersion: "kith.dev/v1", kind: "Job", metadata: {name: $name},
-  spec: {retries: 0, timeoutSeconds: $timeout, template: {pod: true, deviceClaims: [("kvm-" + $node)], containers: [{
+        --arg repo "$repo" --arg pkgs "$pkgs" --argjson timeout "$timeout" --arg ns "$ns" '[{
+  apiVersion: "kith.dev/v1", kind: "Job", metadata: {name: $name, namespace: $ns},
+  spec: {retries: 0, timeoutSeconds: $timeout, template: {pod: true, deviceClaims: [("ci-kvm-" + $node)], containers: [{
     name: "test", image: "docker.io/library/rust:1.99.1", runAsUser: 1000, userNamespaces: true,
     env: [{name: "RUSTUP_TOOLCHAIN", value: "1.99.1"}, {name: "REPO", value: $repo}, {name: "COMMIT", value: $commit},
           {name: "BASES", value: $bases}, {name: "TEST", value: $test}, {name: "PKGS", value: $pkgs}, {name: "SCRIPT", value: $script}],
@@ -190,7 +193,7 @@ one() {
     if [ -d "$dir/in" ]; then
         tries=0
         # (A Volume just made takes a moment to be there.)
-        until tar -cf - -C "$dir" in | api "volumes/default/ci-$node/files" -m 900 -X PUT \
+        until tar -cf - -C "$dir" in | api "volumes/$ns/ci-$node/files" -m 900 -X PUT \
             -H 'content-type: application/x-tar' --data-binary @- >"$answer" 2>&1 && ! grep -qE '"error"|^curl:' "$answer"; do
             tries=$((tries + 1))
             [ "$tries" -lt 10 ] || { cp "$answer" "$dir/$i.log"; echo "bundle put refused" >"$dir/$i.state"; return 0; }
@@ -207,11 +210,11 @@ one() {
         [ "$waited" -lt $((timeout + 600)) ] || { echo "no end after $waited s" >"$dir/$i.log"; break; }
         sleep 15
         waited=$((waited + 15))
-        state=$(api "resources/Job/default/$name" | jq -r '.status.state // "pending"') || state=pending
+        state=$(api "resources/Job/$ns/$name" | jq -r '.status.state // "pending"') || state=pending
         echo "$state" >"$dir/$i.state"
     done
-    api "logs/Job/default/$name" | jq -r .data >"$dir/$i.log" || true
-    api "resources/Job/default/$name" -X DELETE >/dev/null || true
+    api "logs/Job/$ns/$name" | jq -r .data >"$dir/$i.log" || true
+    api "resources/Job/$ns/$name" -X DELETE >/dev/null || true
 }
 
 # find_nodes: sets creds, addr and port for api, and nodes: the cluster's ready, schedulable
@@ -226,7 +229,7 @@ find_nodes() {
 # start COMMIT: the run's folder (its Jobs deleted and it removed at the end) and the bundle.
 start() {
     dir=$(mktemp -d)
-    trap 'for j in $(cat "$dir/jobs" 2>/dev/null); do api "resources/Job/default/$j" -X DELETE >/dev/null 2>&1 || true; done; rm -rf "$dir"' EXIT
+    trap 'for j in $(cat "$dir/jobs" 2>/dev/null); do api "resources/Job/$ns/$j" -X DELETE >/dev/null 2>&1 || true; done; rm -rf "$dir"' EXIT
     trap 'exit 130' INT TERM
     : >"$dir/failures.txt"
     bases=$(bundle "$1" "$dir")

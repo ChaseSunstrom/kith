@@ -92,14 +92,36 @@ EOF
     echo "$rep" | grep -qE '^FAILED: n[123]: mod::case_2$' || die "the report does not name node and test: $rep"
     [ "$(echo "$rep" | grep -c '^FAILED: ')" = 1 ] || die "the report names more than the one failure"
     ok "one merged report names the node and test of the failure, and fails"
-    # --vm: a Device of the node's /dev/kvm the namespace may claim, a shared claim of it, and a Job
-    # that names the claim and runs as 1000 with no field of the Job's security beyond fan's
+    # --vm: a Device of the node's /dev/kvm that namespace ci alone may claim, a shared claim of it,
+    # and a Job that names the claim and runs as 1000 with no field of the Job's security beyond fan's
     d=$(dev_json n1)
-    echo "$d" | jq -e '.[0] | .kind == "Device" and .metadata.name == "kvm-n1" and .spec == {node: "n1", class: "other", path: "/dev/kvm"} and .metadata.labels["kith.dev/node"] == "n1" and .metadata.labels["kith.dev/namespaces"] == "default"' >/dev/null || die "no Device of n1's /dev/kvm: $d"
-    echo "$d" | jq -e '.[1] | .kind == "DeviceClaim" and .metadata.name == "kvm-n1" and .spec == {device: "kvm-n1", access: "shared"}' >/dev/null || die "no shared claim of it: $d"
+    echo "$d" | jq -e '.[0] | .kind == "Device" and .metadata.name == "ci-kvm-n1" and .spec == {node: "n1", class: "other", path: "/dev/kvm"} and .metadata.labels["kith.dev/node"] == "n1" and .metadata.labels["kith.dev/namespaces"] == "ci"' >/dev/null || die "no Device of n1's /dev/kvm for ci alone: $d"
+    echo "$d" | jq -e '.[1] | .kind == "DeviceClaim" and .metadata.name == "ci-kvm-n1" and .spec == {device: "ci-kvm-n1", access: "shared"}' >/dev/null || die "no shared claim of it: $d"
     j=$(vm_job_json j n1 alone "$c" "$bases")
-    echo "$j" | jq -e '.[0].spec.template | .deviceClaims == ["kvm-n1"] and (.containers[0] | .runAsUser == 1000 and (keys - ["name", "image", "runAsUser", "userNamespaces", "env", "volumeMounts", "command"]) == [] and (.volumeMounts | map(.volume) | index("ci-n1")) != null and (.env | map(select(.name == "TEST" and .value == "alone")) | length == 1))' >/dev/null || die "the Job does not claim kvm-n1 as 1000: $j"
+    echo "$j" | jq -e '.[0].spec.template | .deviceClaims == ["ci-kvm-n1"] and (.containers[0] | .runAsUser == 1000 and (keys - ["name", "image", "runAsUser", "userNamespaces", "env", "volumeMounts", "command"]) == [] and (.volumeMounts | map(.volume) | index("ci-n1")) != null and (.env | map(select(.name == "TEST" and .value == "alone")) | length == 1))' >/dev/null || die "the Job does not claim ci-kvm-n1 as 1000: $j"
     ok "--vm: a Device of each node's /dev/kvm, a shared claim, and a Job that names it, as 1000"
+    # all that a run applies and asks for, fan's and --vm's, is in namespace ci: the API stubbed
+    : >"$t/applied" && : >"$t/paths" && mkdir "$t/ns"
+    # shellcheck disable=SC2030,SC2034,SC2317 # (the stubs are the subshell's)
+    (
+        api() {
+            echo "$1" >>"$t/paths"
+            case $1 in
+            apply) cat >>"$t/applied" ;;
+            volumes/*) cat >/dev/null ;;
+            resources/*) echo '{"status": {"state": "succeeded"}}' ;;
+            logs/*) echo '{"data": "SUMMARY exit=0"}' ;;
+            esac
+        }
+        sleep() { :; }
+        timeout=1
+        mkdir "$t/ns/in" && : >"$t/ns/in/x.bundle"
+        one n1 0 2 "$c" "$bases" --workspace "$t/ns"
+        one n2 1 2 "$c" "$bases" "" "$t/ns" alone
+    ) || die "one, its API stubbed, failed"
+    jq -s -e 'add | length == 6 and all(if .kind == "Device" then .metadata.labels["kith.dev/namespaces"] == "ci" and .metadata.namespace == null else .metadata.namespace == "ci" end)' "$t/applied" >/dev/null || die "an object applied outside namespace ci: $(cat "$t/applied")"
+    ! grep -vE '^(apply|(resources/Job|logs/Job|volumes)/ci/.)' "$t/paths" || die "an API path outside namespace ci"
+    ok "every object a run applies (Volume, Job, claim) is in namespace ci; the Device is granted to ci alone"
     # one test per node at a time, each test once: the cluster's answers and each test's Job stubbed
     : >"$t/sched"
     # shellcheck disable=SC2030,SC2034,SC2317 # (the stubs and names are the subshell's)
