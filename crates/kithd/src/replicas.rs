@@ -52,7 +52,21 @@ const HANDOVER_WAIT: u64 = 900;
 /// again: 60 s, 5 min, 25 min, then 30 min (one that cannot succeed, such as data above the
 /// Volume's `size`, is tried twice an hour, not for ever at once). It starts over once it works.
 pub fn retry_after(failures: u32) -> Duration {
-    Duration::from_secs((60 * 5u64.saturating_pow(failures.saturating_sub(1))).min(1800))
+    // (Past the fourth the limit holds, so the power stays small whatever the count.)
+    Duration::from_secs(
+        60u64
+            .saturating_mul(5u64.saturating_pow(failures.saturating_sub(1).min(4)))
+            .min(1800),
+    )
+}
+/// A node's word that the ask `to`/`at` failed: the ask itself, so that a late word of an ask long
+/// gone is known for what it is; `why` is cut at 1 KiB.
+pub fn handover_error(to: &str, at: u64, why: &str) -> Value {
+    let end = (0..=1024.min(why.len()))
+        .rev()
+        .find(|&i| why.is_char_boundary(i))
+        .unwrap_or(0);
+    json!({ "to": to, "at": at, "why": &why[..end] })
 }
 /// How often a node looks at what it should bring up to date.
 const ROUND: Duration = Duration::from_secs(5);
@@ -256,7 +270,9 @@ pub fn handover_writes(
         let fields = match (to, at) {
             (Some(to), Some(at)) => {
                 let replicas = names(&status["replicas"]);
-                if status["handover-error"].is_string() || target.map(String::as_str) != Some(to) {
+                // (An error of an older ask, arrived late, is not this ask's.)
+                if status["handover-error"]["at"] == status["handover"]["at"] || target.map(String::as_str) != Some(to)
+                {
                     nulled(&["handover", "handover-done"])
                 } else if status["handover-done"] == status["handover"] && replicas.iter().any(|r| r == to) {
                     // ponytail: no freeze of the Workload, so what it writes between that sync and
@@ -275,7 +291,7 @@ pub fn handover_writes(
                 } else if now > at + HANDOVER_WAIT {
                     let mut fields = nulled(&["handover", "handover-done"]);
                     let why = format!("node {to} did not say its copy was current within {HANDOVER_WAIT} s");
-                    fields.insert("handover-error".into(), why.into());
+                    fields.insert("handover-error".into(), handover_error(to, at, &why));
                     fields
                 } else {
                     Map::new()
@@ -297,6 +313,22 @@ pub fn handover_writes(
             writes.push((key, fields));
         }
     }
+    // A Volume no longer kept on several nodes (its replicas lowered, or it is refused) keeps no
+    // handover field: the leader looks at those while any is left.
+    let kept: BTreeSet<&str> = volumes.iter().map(|(key, ..)| key.as_str()).collect();
+    for volume in store
+        .list(Some("Volume"))
+        .filter(|volume| !kept.contains(volume.key().as_str()))
+    {
+        let status = volume.status.as_ref();
+        let there = FIELDS[3..]
+            .iter()
+            .filter(|field| status.is_some_and(|status| !status[**field].is_null()));
+        let fields: Map<String, Value> = there.map(|field| (field.to_string(), Value::Null)).collect();
+        if !fields.is_empty() {
+            writes.push((volume.key(), fields));
+        }
+    }
     writes
 }
 
@@ -304,7 +336,7 @@ pub fn handover_writes(
 pub fn failed(store: &Store) -> BTreeMap<String, String> {
     let said = |(key, ..): (String, Dir, u32)| {
         let status = store.get(&key)?.status.as_ref()?;
-        Some((key, status["handover-error"].as_str()?.to_string()))
+        Some((key, status["handover-error"]["why"].as_str()?.to_string()))
     };
     crate::volumes::replicated(store).into_iter().filter_map(said).collect()
 }
@@ -315,7 +347,8 @@ pub fn asked(store: &Store, me: &str) -> Vec<(String, Dir, u64)> {
     let mine = |(key, dir, _): (String, Dir, u32)| {
         let status = store.get(&key)?.status.as_ref()?;
         let at = status["handover"]["at"].as_u64()?;
-        let open = status["handover-done"] != status["handover"] && status["handover-error"].is_null();
+        let open =
+            status["handover-done"] != status["handover"] && status["handover-error"]["at"] != status["handover"]["at"];
         let replica = names(&status["replicas"]).iter().any(|r| r == me);
         (status["handover"]["to"] == me && dir.node != me && open && replica).then_some((key, dir, at))
     };
@@ -572,10 +605,13 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
     let mut answered: BTreeMap<String, u64> = BTreeMap::new();
     // (What a stop in the middle of a sync left behind.)
     clear_unfinished(&state);
+    let mut hurry = false;
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(ROUND) => {}
-            _ = stopping.changed() => return,
+        if !std::mem::take(&mut hurry) {
+            tokio::select! {
+                _ = tokio::time::sleep(ROUND) => {}
+                _ = stopping.changed() => return,
+            }
         }
         let Some(cluster) = &shared.cluster else { continue };
         let now = kith_api::store::now();
@@ -638,7 +674,7 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
                 }
                 Err(e) => {
                     // (The leader lets the ask go, with this said in the plan.)
-                    fields.extend(ask.map(|_| ("handover-error".to_string(), Value::from(e.clone()))));
+                    fields.extend(ask.map(|at| ("handover-error".to_string(), handover_error(&me, at, &e))));
                     let saying = format!("not brought up to date from node {}: {e}", dir.node);
                     if said.get(&key) != Some(&saying) {
                         eprintln!("kithd: volume {key}: the copy here was {saying}");
@@ -654,6 +690,20 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
                 if let Err(e) = shared.submit(Command::Patch { statuses }).await {
                     eprintln!("kithd: volume {key}: that its copy is up to date was not said: {e}");
                 }
+            }
+            // An ask made while this round ran goes now, not after the rest of it (each may take
+            // 600 s, the ask's wait is 900): the round is made again at once, asks first.
+            // ponytail: an ask this node cannot run (no way to its primary) makes a round at once
+            // for each sync that happens, no more: the others are not due again.
+            let waiting = {
+                let state = shared.store.lock().expect("a handler panicked holding the store");
+                asked(&state.store, &me)
+                    .iter()
+                    .any(|(key, _, at)| answered.get(key) != Some(at))
+            };
+            if waiting {
+                hurry = true;
+                break;
             }
         }
     }
@@ -1155,6 +1205,53 @@ mod tests {
         assert!(handover_writes(&two, &plan, 1001, &|_| false).is_empty());
         let secs: Vec<u64> = (1..=5).map(|n| retry_after(n).as_secs()).collect();
         assert_eq!(secs, [60, 300, 1500, 1800, 1800]);
+        // (However many failures: no overflow, still the limit.)
+        for many in [100, u32::MAX] {
+            assert_eq!(retry_after(many).as_secs(), 1800);
+        }
+    }
+
+    /// An error says which ask it is of, and is cut at 1 KiB (a copy's own words are not trusted).
+    #[test]
+    fn a_handover_error_names_its_ask_and_is_cut_short() {
+        let error = handover_error("b", 1000, "no");
+        assert_eq!(error, json!({ "to": "b", "at": 1000, "why": "no" }));
+        let long = "é".repeat(2000);
+        let cut = handover_error("b", 1000, &long);
+        let why = cut["why"].as_str().unwrap();
+        assert!(
+            why.len() <= 1024 && !why.is_empty() && long.starts_with(why),
+            "{}",
+            why.len()
+        );
+    }
+
+    /// A late error of an ask long gone does not end the ask made since; a Volume that is no longer
+    /// kept on several nodes keeps nothing of a handover (or the leader asks about it for ever).
+    #[test]
+    fn drain_ignores_a_late_error_and_cleans_a_volume_no_longer_replicated() {
+        let live = json!({ "primary": "a", "replicas": ["b"], "handover": { "to": "b", "at": 2000 },
+            "handover-error": { "to": "b", "at": 1000, "why": "late" } });
+        let late = store(live);
+        assert!(handover_writes(&late, &to_b(), 2001, &|_| false).is_empty());
+        assert_eq!(wanted(&late, "b"), Some((KEY.to_string(), 2000)));
+        // `alone` is on one node (its replicas were lowered): what a handover left on it goes.
+        let mut lowered = store(json!({ "primary": "a", "replicas": ["b"] }));
+        let left = json!({ "handover": { "to": "b", "at": 1 }, "handover-done": { "to": "b", "at": 1 },
+            "handover-error": { "to": "b", "at": 1, "why": "x" } });
+        patch(
+            &mut lowered,
+            vec![("Volume/default/alone".into(), left.as_object().unwrap().clone())],
+        );
+        let writes = handover_writes(&lowered, &BTreeMap::new(), 5, &|_| false);
+        let alone: Vec<_> = writes.iter().filter(|(key, _)| key == "Volume/default/alone").collect();
+        assert_eq!(alone.len(), 1, "{writes:?}");
+        assert!(
+            alone[0].1.values().all(Value::is_null) && alone[0].1.len() == 3,
+            "{writes:?}"
+        );
+        patch(&mut lowered, writes);
+        assert!(handover_writes(&lowered, &BTreeMap::new(), 6, &|_| false).is_empty());
     }
 
     /// What this node is asked to bring up to date now: the Volume and the ask's time.
@@ -1169,7 +1266,10 @@ mod tests {
         let asked = json!({ "primary": "a", "replicas": ["b"], "handover": { "to": "b", "at": 1000 } });
         // b says its sync failed: the ask is let go, the error stays to be shown, a is the primary.
         let mut failed = store(asked.clone());
-        let error = Map::from_iter([("handover-error".to_string(), json!("nothing came for 30 s"))]);
+        let error = Map::from_iter([(
+            "handover-error".to_string(),
+            handover_error("b", 1000, "nothing came for 30 s"),
+        )]);
         patch(&mut failed, vec![(KEY.to_string(), error)]);
         let fields = handover_writes(&failed, &to_b(), 1001, &|_| false).pop().unwrap().1;
         assert!(
@@ -1194,7 +1294,7 @@ mod tests {
             .1;
         assert!(!fields.contains_key("primary"), "{fields:?}");
         assert!(fields["handover"].is_null());
-        assert!(fields["handover-error"].as_str().unwrap().contains("node b"));
+        assert!(fields["handover-error"]["why"].as_str().unwrap().contains("node b"));
         // The plan no longer names b (it went down, or the drain ended): the ask is let go.
         let fields = handover_writes(&silent, &BTreeMap::new(), 1001, &|_| false)
             .pop()
@@ -1220,7 +1320,8 @@ mod tests {
         patch(&mut other, vec![(KEY.into(), said)]);
         assert!(handover_writes(&other, &to_b(), 1001, &|_| false).is_empty());
         // A Volume that is on a node that is not drained is not touched, whatever its status says.
-        let calm = store(json!({ "primary": "a", "replicas": ["b"], "handover-error": "old" }));
+        let calm =
+            store(json!({ "primary": "a", "replicas": ["b"], "handover-error": { "to": "b", "at": 1, "why": "old" } }));
         let fields = handover_writes(&calm, &BTreeMap::new(), 1, &|_| false).pop().unwrap().1;
         assert!(fields["handover-error"].is_null() && fields.len() == 1, "{fields:?}");
         // The target: a replica that is down or drained is no target, and says why.

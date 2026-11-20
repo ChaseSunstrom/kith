@@ -431,7 +431,7 @@ pub(crate) fn handovers(
             continue;
         }
         let status = store.get(&key).and_then(|volume| volume.status.as_ref());
-        let error = status.and_then(|status| status["handover-error"].as_str());
+        let error = status.and_then(|status| status["handover-error"]["why"].as_str());
         let idle = status.is_none_or(|status| status["handover"].is_null());
         let target = crate::replicas::handover_target(store, &key, &dir, &|node| away.contains(node), &lost);
         let target = match (target, error) {
@@ -1860,7 +1860,7 @@ spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volum
     #[test]
     fn drain_handover_that_fails_changes_nothing() {
         let there = |_: &str| (Some((4.0, 8e9)), None);
-        let said = json!({ "primary": "a", "replicas": ["b"], "handover-error": "nothing came for 30 s" });
+        let said = json!({ "primary": "a", "replicas": ["b"], "handover-error": { "to": "b", "at": 1, "why": "nothing came for 30 s" } });
         let store = mounted(&[("Volume/default/data", said)]);
         let lines = drain_lines(&store, &there, Duration::from_secs(300), "a");
         let db = line_of(&lines, "Workload/default/db");
