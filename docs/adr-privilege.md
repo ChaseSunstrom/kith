@@ -288,14 +288,21 @@ mount namespace is made) and mounts the clone (`mount_setattr` for an id-mapped 
 the OCI bind source is that staged clone, not the path; and `give` walks the held directory by
 descriptor, `fchownat` with `AT_SYMLINK_NOFOLLOW` on each entry, so a link is given as a link and
 never followed, and a file with another hard link is left as it is (it may be one outside the
-volume; a hard link inside a volume is therefore not given). A check between the stat and the
+volume; a hard link inside a volume is therefore not given, and the start logs how many files it
+left). The walk holds one descriptor for each directory it is inside, at most 128 deep, and
+all the gives of a process together at most 4 x 130 (more fails the start, not the node's other
+creates). A check between the stat and the
 chown of one entry is still a race; `protected_hardlinks` limits what it gains. In `--split` the
 descriptor follows the unit across the socket (`Call::Create.volumes` names the mounts, their
 descriptors ride after the output and error files as `SCM_RIGHTS`), and `check_mount` refuses one
 that is not the directory its path names (device and inode). Still by path, and raceable: a
 subPath of a Volume (it is opened beneath the held directory, but needs the id-mapped mount, and
-is refused without it); a kithd that is not root (the OCI bind source is the path: there is no
-boundary to cross); a restore's and a replica's new copy, whose `read_dir`, `canonicalize` and
+is refused without it); a kithd that is not root (the OCI bind source is the path, resolved by the
+container's init in its own namespaces: `still_held` refuses a path whose device and inode are not
+the held directory's, just before the init is forked, but a swap after that check binds what the
+link names, anything kithd's own user can reach; the tenant and that user are the two sides of
+a boundary here, and only a root kithd's clone closes it); a container's scratch directory, map
+files, identity, seat and pod files; a restore's and a replica's new copy, whose `read_dir`, `canonicalize` and
 rename into place name the directory by path (`backups.rs`, `replicas.rs`); and an NFS export
 (`share.rs`), which exports by path. A node's own `hostPaths` directory refuses a link at its last
 component (`O_NOFOLLOW`, `O_DIRECTORY`), but an ancestor link is followed as before. The by-path
@@ -368,8 +375,11 @@ and sysfs, as one process cannot:**
   part trusted, that is the same hands; across the socket it is a hole. The root part must open
   each mount source itself with `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`) beneath the
   directory it derived, and pass the descriptor on (`SCM_RIGHTS`, mounted through `/proc/self/fd`
-  or `open_tree`), never the path again. Not done: a Volume's directory is opened so (the Volumes
-  paragraph below the table), but a container's mount sources still reach the runtime by path.
+  or `open_tree`), never the path again. Done for a Volume's directory (T-0986, T-1113: the Volumes
+  paragraph below the table). Still by path: a Volume's subPath, a restore's or a replica's new copy,
+  an NFS export, a container's scratch directory, map files, identity, seat and pod files, and a
+  Volume's bind where kithd is not root (checked against the held descriptor just before, not
+  bound from it).
 - *The pod's network.* The pod's address in the mesh /80, its exit tunnel and its DNS are what
   the asker says and are not verified; the root part must derive them from its own `--pod-range`,
   tunnels and gateway.

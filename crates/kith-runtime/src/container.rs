@@ -956,11 +956,19 @@ impl Runtime {
             // (A volume is its user's on disk as it is in the container: an id-mapped mount
             // shows its owners as they are. A new one is root's until given.)
             for volume in unit.mounts.iter().filter(|volume| volume.give && user.uid() != 0) {
-                give_volume(volume, user.uid(), user.gid()).ctx(format!(
+                let left = give_volume(volume, user.uid(), user.gid()).ctx(format!(
                     "{what}: giving {} to user {}",
                     volume.host.display(),
                     user.uid()
                 ))?;
+                if left > 0 {
+                    eprintln!(
+                        "kith: container `{id}`: {left} files of {} have another name too and were not given to user {}: \
+                         the workload may find them not its own",
+                        volume.host.display(),
+                        user.uid()
+                    );
+                }
             }
         }
         fs::create_dir_all(&bundle).ctx(&what)?;
@@ -1001,6 +1009,10 @@ impl Runtime {
                 .as_init(&bundle)
                 .with_systemd(false)
                 .with_detach(true);
+            // (Where the bind is by path: see `still_held`.)
+            if !uid.is_root() {
+                still_held(unit).ctx(&what)?;
+            }
             // In a child of `fork`, with one thread: see the module doc's "Clone".
             let log = bundle.join("init.log");
             let said = {
@@ -1844,75 +1856,168 @@ impl Executor for Entry {
 // users on one volume walk it at every start. (A container's range of ids never walks one:
 // its volumes are id-mapped, see `stage`.) A mount that maps the volume's owner to the
 // container's user, when a volume is big enough for that to hurt.
-fn give_volume(volume: &Mount, uid: u32, gid: u32) -> io::Result<()> {
+fn give_volume(volume: &Mount, uid: u32, gid: u32) -> io::Result<u32> {
     match &volume.held {
-        Some(held) => give_fd(held.reopen()?, uid, gid),
+        Some(held) => give_fd(held.reopen()?, uid, gid, &GIVING, GIVE_FDS),
         None => give_path(&volume.host, uid, gid),
     }
 }
 
+/// Refuses a held volume whose path is no longer the directory held: where kithd is not root
+/// there is no clone to bind from (`stage_held` needs the mount namespace and privilege of
+/// root), so the bind source is `host`, which the container's init opens in its own namespaces.
+/// This is the check made just before that init is forked, on the device and inode of the
+/// descriptor and of what the path is now (a link is not followed, so one put there is no match).
+///
+/// What stays: a tenant that swaps `host` for a link in the time between this check and the
+/// init's bind is bound to what the link names. The init is in a user namespace of kithd's own
+/// user, so that bind reaches only what that user can reach: a tenant that can do this is
+/// bound to a directory of kithd's user and no more, and nothing is raised (a kithd that is
+/// root has no such window: it binds from a clone of the descriptor).
+//
+// ponytail: a check, not a bind from the descriptor: the init takes a path in its own
+// namespaces, and a clone of the tree cannot be mounted into the mount namespace it makes.
+fn still_held(unit: &Unit) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for volume in unit.mounts.iter() {
+        let Some(held) = &volume.held else { continue };
+        let (held, named) = (held.reopen()?.metadata()?, fs::symlink_metadata(&volume.host)?);
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(io::Error::other(format!(
+                "{} is no longer the directory it was taken as: it was changed after it was opened",
+                volume.host.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The most directories a volume is given through: a tree deeper is refused whole.
+const GIVE_DEEP: u32 = 128;
+/// The most descriptors all the gives of this process hold open together (one for each
+/// directory a walk is inside, so a tree [`GIVE_DEEP`] deep costs that many): a give that would
+/// pass it fails, and the creates beside it keep descriptors to open their own files with.
+const GIVE_FDS: usize = 4 * (GIVE_DEEP as usize + 2);
+/// How many of those are open now.
+static GIVING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A descriptor of the walk of a give, counted in `used` until it is dropped.
+struct Level<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> Level<'a> {
+    /// Counts one more, unless that is more than `most`.
+    fn take(used: &'a std::sync::atomic::AtomicUsize, most: usize) -> io::Result<Level<'a>> {
+        if used.fetch_add(1, Ordering::AcqRel) >= most {
+            used.fetch_sub(1, Ordering::AcqRel);
+            return Err(io::Error::other(format!(
+                "more than {most} directories are being given at once: try again"
+            )));
+        }
+        Ok(Level(used))
+    }
+}
+
+impl Drop for Level<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// [`give_volume`] for a directory named by path (a volume that is not held, one file of a map).
-fn give_path(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
+fn give_path(dir: &Path, uid: u32, gid: u32) -> io::Result<u32> {
     use std::os::unix::fs::OpenOptionsExt;
     // (One file of a map, mounted alone.)
     if fs::symlink_metadata(dir)?.is_file() {
         let flags = nix::libc::O_NOFOLLOW | nix::libc::O_PATH;
         let file = fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)?;
-        return std::os::unix::fs::chown(format!("/proc/self/fd/{}", file.as_raw_fd()), Some(uid), Some(gid));
+        std::os::unix::fs::chown(format!("/proc/self/fd/{}", file.as_raw_fd()), Some(uid), Some(gid))?;
+        return Ok(0);
     }
     let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW;
     give_fd(
         fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)?,
         uid,
         gid,
+        &GIVING,
+        GIVE_FDS,
     )
 }
 
-/// [`give_volume`] for the directory `top` is open on.
-fn give_fd(top: File, uid: u32, gid: u32) -> io::Result<()> {
+/// [`give_volume`] for the directory `top` is open on, holding at most `most` descriptors of
+/// the walk at once, counted in `used`: how many files it did not give (see below).
+///
+/// A file with another name too is not given, in this directory or in one outside it (a volume is
+/// one file system, so a link a program made to a file of the node's is one of these): what is
+/// written beside it must not change its owner. The workload may then find such a file not its
+/// own, and the count is what the caller says of it.
+fn give_fd(top: File, uid: u32, gid: u32, used: &std::sync::atomic::AtomicUsize, most: usize) -> io::Result<u32> {
     use nix::sys::stat::{SFlag, fstatat};
     use nix::unistd::{Gid, Uid, fchownat};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    fn walk(dir: File, (uid, gid): (u32, u32), deeper: u32) -> io::Result<()> {
+    /// One directory: its files are given as they are listed, and the directories of it are
+    /// entered after, one at a time, with no listing of its own open: a walk holds one descriptor
+    /// for each directory it is inside, and never a second (a directory's listing is read to its
+    /// end before any directory below it is opened).
+    //
+    // ponytail: the names of a directory's subdirectories are held while they are walked, as
+    // many as it has; a listing kept open instead would hold a second descriptor for each level.
+    fn walk(
+        dir: File,
+        (uid, gid): (u32, u32),
+        deeper: u32,
+        (used, most): (&std::sync::atomic::AtomicUsize, usize),
+        skipped: &mut u32,
+    ) -> io::Result<()> {
         let at = dir.as_raw_fd();
-        for entry in fs::read_dir(format!("/proc/self/fd/{at}"))? {
-            let name = entry?.file_name();
-            // (Its type now, from the directory that holds it: what a program swapped it for
-            // since it was listed is what is seen.)
-            let seen = fstatat(Some(at), name.as_os_str(), nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW)?;
-            let kind = SFlag::from_bits_truncate(seen.st_mode) & SFlag::S_IFMT;
-            if kind == SFlag::S_IFDIR {
-                if deeper == 0 {
-                    return Err(io::Error::other("directories more than 128 deep"));
+        let mut subs = Vec::new();
+        {
+            // (Its descriptor too is counted, while the listing is read.)
+            let _listing = Level::take(used, most)?;
+            for entry in fs::read_dir(format!("/proc/self/fd/{at}"))? {
+                let name = entry?.file_name();
+                // (Its type now, from the directory that holds it: what a program swapped it for
+                // since it was listed is what is seen.)
+                let seen = fstatat(Some(at), name.as_os_str(), nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW)?;
+                let kind = SFlag::from_bits_truncate(seen.st_mode) & SFlag::S_IFMT;
+                if kind == SFlag::S_IFDIR {
+                    subs.push(name);
+                } else if kind == SFlag::S_IFLNK || seen.st_nlink <= 1 {
+                    // (A link is given as the link it is, and no more.)
+                    fchownat(
+                        Some(at),
+                        name.as_os_str(),
+                        Some(Uid::from_raw(uid)),
+                        Some(Gid::from_raw(gid)),
+                        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+                    )?;
+                } else {
+                    *skipped += 1;
                 }
-                let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW;
-                let sub = fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(flags)
-                    .open(Path::new(&format!("/proc/self/fd/{at}")).join(&name))?;
-                walk(sub, (uid, gid), deeper - 1)?;
-            } else if kind == SFlag::S_IFLNK || seen.st_nlink <= 1 {
-                // (A link is given as the link it is, and no more.)
-                fchownat(
-                    Some(at),
-                    name.as_os_str(),
-                    Some(Uid::from_raw(uid)),
-                    Some(Gid::from_raw(gid)),
-                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
-                )?;
             }
-            // Else: a file with another name too, in this directory or one outside it (a
-            // volume is one file system, so a link a program made to a file of the node's is
-            // one of these): its owner is not changed by what is written beside it.
+        }
+        for name in subs {
+            if deeper == 0 {
+                return Err(io::Error::other(format!("directories more than {GIVE_DEEP} deep")));
+            }
+            let _level = Level::take(used, most)?;
+            let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW;
+            let sub = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(flags)
+                .open(Path::new(&format!("/proc/self/fd/{at}")).join(&name))?;
+            walk(sub, (uid, gid), deeper - 1, (used, most), skipped)?;
         }
         // (Last, the top of all included: a walk that was cut short is done again.)
         std::os::unix::fs::fchown(&dir, Some(uid), Some(gid))
     }
     let has = top.metadata()?;
     if (has.uid(), has.gid()) == (uid, gid) {
-        return Ok(());
+        return Ok(0);
     }
-    walk(top, (uid, gid), 128)
+    let _top = Level::take(used, most)?;
+    let mut skipped = 0;
+    walk(top, (uid, gid), GIVE_DEEP, (used, most), &mut skipped)?;
+    Ok(skipped)
 }
 
 #[cfg(test)]
@@ -3191,6 +3296,161 @@ mod tests {
                 "{ids:?} {shift:?}"
             );
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Where kithd is not root a held volume is bound by its path, so a path that is not the
+    /// directory held is refused before the bind: a link put there, and the directory moved off.
+    #[test]
+    fn held_volume_by_path_is_refused_when_its_path_was_swapped() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("kith-held-still-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside, moved) = (dir.join("volume"), dir.join("outside"), dir.join("moved"));
+        fs::create_dir_all(&volume).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let unit = Unit {
+            mounts: vec![bind("/srv/plain", "/plain", false), held_mount(&volume, "/data", false)],
+            ..Unit::default()
+        };
+        still_held(&unit).unwrap();
+        fs::rename(&volume, &moved).unwrap();
+        symlink(&outside, &volume).unwrap();
+        let said = still_held(&unit).unwrap_err().to_string();
+        assert!(said.contains("no longer the directory"), "{said}");
+        // A directory of the same name that is another one is no more the one held.
+        fs::remove_file(&volume).unwrap();
+        fs::create_dir(&volume).unwrap();
+        assert!(still_held(&unit).is_err());
+        // And nothing there at all.
+        fs::remove_dir(&volume).unwrap();
+        assert!(still_held(&unit).is_err());
+        fs::rename(&moved, &volume).unwrap();
+        still_held(&unit).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A create by a kithd that is not root, of a unit whose held volume's path was swapped for a
+    /// link after it was opened, fails and names it; the same create with the path intact gets as
+    /// far as the rootfs it cannot mount (it is a file).
+    #[test]
+    fn create_by_a_user_refuses_a_held_volume_swapped_for_a_link() {
+        use std::os::unix::fs::symlink;
+        if nix::unistd::getuid().is_root() || !delegated_or_skip() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("kith-create-held-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        let rootfs = root.join("rootfs-is-a-file");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&rootfs, "").unwrap();
+        let (volume, outside, moved) = (root.join("volume"), root.join("outside"), root.join("moved"));
+        fs::create_dir_all(&volume).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let image = Image {
+            rootfs,
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let unit = Unit {
+            mounts: vec![held_mount(&volume, "/data", false)],
+            ..Unit::default()
+        };
+        let create = |id: &str| {
+            let (out, err) = (
+                File::create(root.join(format!("{id}.out"))).unwrap(),
+                File::create(root.join(format!("{id}.err"))).unwrap(),
+            );
+            runtime.create(id, &image, &unit, out, err).err().map(|e| e.to_string())
+        };
+        let intact = create("intact").expect("a rootfs that is a file makes no container");
+        if let Some(line) = cgroup_skip(&intact) {
+            let _ = fs::remove_dir_all(&root);
+            return report_skip(&line);
+        }
+        assert!(!intact.contains("no longer the directory"), "{intact}");
+        fs::rename(&volume, &moved).unwrap();
+        symlink(&outside, &volume).unwrap();
+        let said = create("swapped").expect("a swapped volume makes no container");
+        assert!(said.contains("no longer the directory"), "{said}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A tree 128 directories deep is given, one 129 deep is refused with nothing left counted
+    /// as open, and a walk is refused where the descriptors it would hold are more than the budget.
+    #[test]
+    fn give_nofollow_bounds_the_depth_and_the_descriptors_it_holds() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::sync::atomic::AtomicUsize;
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-deep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let nested = |levels: usize| dir.join(vec!["d"; levels].join("/"));
+        let open = |path: &Path| {
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_DIRECTORY)
+                .open(path)
+                .unwrap()
+        };
+        let used = AtomicUsize::new(0);
+
+        fs::create_dir_all(nested(128)).unwrap();
+        assert_eq!(give_fd(open(&dir), uid, other, &used, GIVE_FDS).unwrap(), 0);
+        assert_eq!(fs::metadata(nested(128)).unwrap().gid(), other);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+
+        // One level more: nothing of it deeper is given, and what the walk opened is closed.
+        fs::create_dir_all(nested(129)).unwrap();
+        nix::unistd::chown(&dir, None, Some(gid.into())).unwrap();
+        let said = give_fd(open(&dir), uid, other, &used, GIVE_FDS)
+            .unwrap_err()
+            .to_string();
+        assert!(said.contains("128 deep"), "{said}");
+        assert_eq!(
+            used.load(Ordering::Relaxed),
+            0,
+            "a walk that failed left descriptors counted"
+        );
+
+        // A budget of descriptors that is less than a tree needs: refused, and the same tree is
+        // given when there is room.
+        nix::unistd::chown(&dir, None, Some(gid.into())).unwrap();
+        let said = give_fd(open(&nested(100)), uid, gid, &used, 10)
+            .unwrap_err()
+            .to_string();
+        assert!(said.contains("at once"), "{said}");
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+        assert!(give_fd(open(&nested(100)), uid, gid, &used, 110).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A volume with files that have another name too says how many it left: the count is what
+    /// the create logs.
+    #[test]
+    fn give_nofollow_counts_the_files_it_leaves() {
+        use std::os::unix::fs::MetadataExt;
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-count-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside) = (dir.join("volume"), dir.join("outside"));
+        fs::create_dir_all(volume.join("a")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("one"), "x").unwrap();
+        fs::write(outside.join("two"), "x").unwrap();
+        fs::write(volume.join("own"), "x").unwrap();
+        fs::hard_link(outside.join("one"), volume.join("hard")).unwrap();
+        fs::hard_link(outside.join("two"), volume.join("a/hard")).unwrap();
+        assert_eq!(
+            give_volume(&held_mount(&volume, "/data", false), uid, other).unwrap(),
+            2
+        );
+        assert_eq!(fs::metadata(outside.join("one")).unwrap().gid(), gid);
         fs::remove_dir_all(&dir).unwrap();
     }
 

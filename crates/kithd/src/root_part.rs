@@ -68,8 +68,9 @@ const OWN_PORTS: [u16; 3] = [7443, 5000, 51820];
 const MOST_SOCKETS: u8 = 16;
 /// The most name servers a pod's `resolv.conf` is given (the C library reads three).
 const MOST_NAMESERVERS: usize = 8;
-/// The most layers an image is unpacked from.
-const MOST_LAYERS: usize = 256;
+/// The most layers an image is unpacked from: each crosses the socket as a descriptor, so no
+/// more than one message carries ([`kith_dm_sys::MOST_FDS`]); one number, not two that differ.
+const MOST_LAYERS: usize = kith_dm_sys::MOST_FDS;
 /// The most memory one unit may be guaranteed (4 TiB), and the most CPU (1024 of them, in
 /// thousandths): a request for more is for what no node has.
 const MOST_GUARANTEED: u64 = 1 << 42;
@@ -4468,8 +4469,10 @@ mod tests {
             let dir = std::fs::File::open(state.parent().unwrap()).unwrap();
             let device = null();
             let (pipe, _held) = UnixStream::pair().unwrap();
-            let create = json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain(), "volumes": []}});
-            let held = json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain(), "volumes": [0]}});
+            let create =
+                json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain(), "volumes": []}});
+            let held =
+                json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain(), "volumes": [0]}});
             let exec = json!({"Exec": {"id": "w_a_b_0_x", "unit": plain()}});
             let cases: [(Value, Vec<BorrowedFd>, &str); 11] = [
                 // More files than the call takes is refused as it is read, before it is queued...

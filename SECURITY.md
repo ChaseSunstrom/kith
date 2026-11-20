@@ -422,9 +422,16 @@ Only the newest version is fixed. There are no security releases of older ones.
   it to the runtime (over the socket, in `--split`), which as root mounts, gives and binds
   the volume from it and never names the path again, so swapping the directory for a link
   after it is opened gets no bind or chown of what the link points at; the chown does not
-  follow a link and leaves a file with another hard link alone. Still by path, and not
-  closed by this: a subPath without the id-mapped mount (refused) and a kithd that is not
-  root; a restore's
+  follow a link and leaves a file with another hard link alone (the start logs how many
+  files it left, as it is not given them). A kithd that is not root has no clone to bind
+  from: it refuses the start when the path is no longer the directory held (device and
+  inode, checked just before the container's init binds it), but a tenant that swaps the
+  directory for a link in the short time after that check is bound what the link names,
+  which is anything kithd's own user can reach: here the tenant and kithd's user are two
+  sides of a boundary, and only a kithd that is root closes it fully. Still by path, and not
+  closed by this: a subPath without the id-mapped mount (refused); a container's scratch
+  directory, its map files, its identity, seat and pod files, which kithd makes and the
+  runtime reads by path; a restore's
   and a replica's new copy, whose directory is read with `read_dir` and renamed into place
   by path; and an NFS export, which is by path. A node's own `hostPaths` directory refuses
   a link at its last component. A workload that can swap a directory on one of these
