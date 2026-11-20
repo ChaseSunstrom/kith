@@ -50,7 +50,14 @@ case "${KITHD_FEATURES:-}" in
         echo "$dir/disk-test/$target/release"
         exit 0
         ;;
-    *) echo "musl.sh: KITHD_FEATURES knows: forge, fido2-test, disk-test" >&2; exit 1 ;;
+    # confine-probe: the one with `kithd confine-probe DIR` (crates/kithd/src/confine.rs, docs/adr-privilege.md),
+    # for the privilege VM test alone; its folder is its own too.
+    confine-probe)
+        CARGO_TARGET_DIR="$dir/confine-probe" cargo build --release --quiet --target "$target" -p kithd -p kith-cli --features kithd/confine-probe >&2
+        echo "$dir/confine-probe/$target/release"
+        exit 0
+        ;;
+    *) echo "musl.sh: KITHD_FEATURES knows: forge, fido2-test, disk-test, confine-probe" >&2; exit 1 ;;
 esac
 out="$dir/$target/release"
 # kith with TLS to a node (cargo feature remote) is built first and kept as kith-remote, beside
@@ -79,6 +86,12 @@ fi
 # else (data_disk/boot.rs).
 if grep -aq 'built with disk-test: ' "$out/kithd"; then
     echo "musl.sh: $out/kithd has the disk-test hook in it: a build that ships has none" >&2
+    exit 1
+fi
+# And no confinement probe, which makes a directory as root: the name of its subcommand, in the
+# message it ends with, is in nothing else (confine.rs).
+if grep -aq 'kithd: confine-probe: ' "$out/kithd"; then
+    echo "musl.sh: $out/kithd has the confine-probe in it: a build that ships has none" >&2
     exit 1
 fi
 # cargo reads a relative CARGO_TARGET_DIR from here; the line printed is absolute (order.py

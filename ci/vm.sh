@@ -201,9 +201,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    not know to an outside resolver (ci/outside-dns.py, on this machine); a pod
                    on the first finds outside.example.test through both. KITH_POD_NOUPSTREAM=1
                    starts neither with an upstream: the control, where the name is not found
-  --test privilege instead: one node on the mesh with --split: `kithd confine-probe` (as an exec
-                   unit) confines itself as the serving part does and says its status, its mounts and
-                   what it tried and was refused, with the filter and with --no-filter; then kithd
+  --test privilege instead: one node on the mesh with --split, the image of a kithd built with the
+                   cargo feature confine-probe (target/os-probe, never shipped): `kithd confine-probe`
+                   (as an exec unit) confines itself as the serving part does and says its status,
+                   its mounts and what it tried and was refused, with the filter and with
+                   --no-filter (and holding a directory open: refused); then kithd
                    killed under a pod: started again, the pod the same process
   --test nested    instead: one node with an image that holds bash, bubblewrap and kithd; a Job in it for
                    kith's defaults, then five variants: unconfined seccomp, userNamespaces, both, runAsUser 0;

@@ -16,6 +16,9 @@ mod blobs;
 mod blocklist;
 mod claims;
 mod cluster;
+// The serving part's confinement: in unit tests and in the `confine-probe` build, in no release.
+// Nothing applies it to a live serving part yet (docs/adr-privilege.md, "Built so far").
+#[cfg(any(test, feature = "confine-probe"))]
 mod confine;
 mod controller;
 mod controllers;
@@ -372,6 +375,7 @@ fn main() -> ExitCode {
     // Started again to render a package's templates? Then this never returns either.
     releases::render_shim();
     // Started again to hold the serving part's confinement to what it says? Never returns either.
+    #[cfg(feature = "confine-probe")]
     confine::probe_shim();
     // Then, before the runtime and its listeners, the limit of open files they share.
     raise_nofile();

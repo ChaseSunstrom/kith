@@ -531,7 +531,7 @@ pub fn send_fds(socket: BorrowedFd, bytes: &[u8], fds: &[BorrowedFd]) -> Result<
             std::ptr::copy_nonoverlapping(raw.as_ptr().cast::<u8>(), libc::CMSG_DATA(cmsg), data as usize);
         }
     }
-    let began = std::time::Instant::now();
+    let until = timeout_end(socket, libc::SO_SNDTIMEO);
     loop {
         // SAFETY: `header` points at `iov` (the bytes) and `control`, alive for the call, which
         // only reads them.
@@ -540,17 +540,45 @@ pub fn send_fds(socket: BorrowedFd, bytes: &[u8], fds: &[BorrowedFd]) -> Result<
             n if n as usize == bytes.len() => return Ok(()),
             n if n >= 0 => return Err(Error::other("a message sent in part")),
             _ => match Error::last_os_error() {
-                // (A signal restarts the socket's timeout: the retries are bounded as a whole.)
-                e if e.kind() == std::io::ErrorKind::Interrupted && began.elapsed() < EINTR_LIMIT => continue,
-                e if e.kind() == std::io::ErrorKind::Interrupted => return Err(std::io::ErrorKind::TimedOut.into()),
+                e if e.kind() == std::io::ErrorKind::Interrupted => interrupted(until)?,
                 e => return Err(e),
             },
         }
     }
 }
 
-/// How long a send or a receive on a socket goes on being started again after a signal.
-const EINTR_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// When a send or a receive on `socket` that a signal interrupts must stop being started again: the
+/// end of the socket's own timeout (`SO_SNDTIMEO` or `SO_RCVTIMEO`), counted from now (a signal
+/// restarts the kernel's count, so a stream of them would wait for ever). `None` for a socket with no
+/// timeout, whose caller waits as long as it takes.
+fn timeout_end(socket: BorrowedFd, option: libc::c_int) -> Option<std::time::Instant> {
+    let mut timeout = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut size = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `size` bytes, the size of the `timeval` it is given.
+    let got = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&raw mut timeout).cast(),
+            &raw mut size,
+        )
+    };
+    let wait = std::time::Duration::new(
+        timeout.tv_sec.max(0) as u64,
+        timeout.tv_usec.clamp(0, 999_999) as u32 * 1000,
+    );
+    (got == 0 && !wait.is_zero()).then(|| std::time::Instant::now() + wait)
+}
+
+/// A signal interrupted the call: go on, unless the socket's timeout (`until`) is over, which says
+/// `WouldBlock` as the call itself would have.
+fn interrupted(until: Option<std::time::Instant>) -> Result<()> {
+    match until {
+        Some(end) if std::time::Instant::now() >= end => Err(std::io::ErrorKind::WouldBlock.into()),
+        _ => Ok(()),
+    }
+}
 
 /// One message of `socket` read into `buf`, and the descriptors that came with it (at most
 /// `most`, itself at most [`MOST_FDS`]; close-on-exec): how many bytes, and the descriptors. Zero
@@ -572,7 +600,7 @@ pub fn recv_fds(socket: BorrowedFd, buf: &mut [u8], most: usize) -> Result<(usiz
     header.msg_iovlen = 1;
     header.msg_control = control.as_mut_ptr().cast();
     header.msg_controllen = space as _;
-    let began = std::time::Instant::now();
+    let until = timeout_end(socket, libc::SO_RCVTIMEO);
     let got = loop {
         // SAFETY: `header` points at `iov` (`buf`) and `control`, alive and writable for the call,
         // which writes no more than their lengths.
@@ -581,8 +609,7 @@ pub fn recv_fds(socket: BorrowedFd, buf: &mut [u8], most: usize) -> Result<(usiz
             break got as usize;
         }
         match Error::last_os_error() {
-            e if e.kind() == std::io::ErrorKind::Interrupted && began.elapsed() < EINTR_LIMIT => continue,
-            e if e.kind() == std::io::ErrorKind::Interrupted => return Err(std::io::ErrorKind::TimedOut.into()),
+            e if e.kind() == std::io::ErrorKind::Interrupted => interrupted(until)?,
             e => return Err(e),
         }
     };
@@ -781,8 +808,7 @@ fn serving_calls() -> Vec<i64> {
         libc::SYS_inotify_init1,
         libc::SYS_inotify_add_watch,
         libc::SYS_inotify_rm_watch,
-        libc::SYS_socket,
-        libc::SYS_socketpair,
+        // (`socket` and `socketpair` are rules: only the families the part uses.)
         libc::SYS_bind,
         libc::SYS_listen,
         libc::SYS_accept,
@@ -814,8 +840,16 @@ fn serving_calls() -> Vec<i64> {
         libc::SYS_sigaltstack,
         libc::SYS_kill,
         libc::SYS_tgkill,
-        libc::SYS_execve,
+        // (No `execve`: nothing in the part's root, a state directory and `/proc`, both mounted
+        // no-exec, can run, and the part starts no program.)
         libc::SYS_wait4,
+        // What a store that maps its file, a runtime that waits for signals and the allocator ask:
+        libc::SYS_msync,
+        libc::SYS_fadvise64,
+        libc::SYS_signalfd4,
+        libc::SYS_rt_sigtimedwait,
+        libc::SYS_epoll_pwait2,
+        libc::SYS_getcpu,
         libc::SYS_exit,
         libc::SYS_exit_group,
         libc::SYS_futex,
@@ -906,9 +940,22 @@ fn serving_calls() -> Vec<i64> {
 pub fn try_call(call: Try) -> Result<()> {
     // SAFETY: each is a raw call with no pointer in it (a null for the `clone3` arguments with
     // a size of 0, which the kernel refuses); a child of `clone` leaves with `_exit` before it
-    // returns into anything of this program, and the parent waits for it.
+    // returns into anything of this program, and the parent waits for it; a socket made is
+    // closed at once.
     let got = unsafe {
         match call {
+            Try::Socket(family) => {
+                let fd = libc::syscall(
+                    libc::SYS_socket,
+                    libc::c_long::from(family),
+                    libc::c_long::from(libc::SOCK_DGRAM),
+                    0 as libc::c_long,
+                );
+                if fd >= 0 {
+                    libc::close(fd as libc::c_int);
+                }
+                fd
+            }
             Try::Clone(flags) => {
                 let pid = libc::syscall(libc::SYS_clone, flags | libc::SIGCHLD as u64, 0, 0, 0, 0);
                 if pid == 0 {
@@ -928,6 +975,8 @@ pub fn try_call(call: Try) -> Result<()> {
 
 /// What [`try_call`] tries.
 pub enum Try {
+    /// `socket(family, SOCK_DGRAM, 0)`, closed if made.
+    Socket(i32),
     Clone(u64),
     Clone3,
     Tiocsti,
@@ -949,7 +998,12 @@ fn seccomp_install(mut program: Vec<libc::sock_filter>) -> Result<()> {
     // `len` instructions it points to, both alive for the call; the kernel copies them.
     match unsafe { libc::syscall(libc::SYS_seccomp, 1, 1, &raw const fprog) } {
         0 => Ok(()),
-        _ => Err(Error::last_os_error()),
+        // (With TSYNC, a thread that cannot take the filter is answered by its id, not by -1: errno
+        // says nothing then.)
+        -1 => Err(Error::last_os_error()),
+        tid => Err(Error::other(format!(
+            "thread {tid} could not take the seccomp filter (it has one that the new cannot follow)"
+        ))),
     }
 }
 
@@ -971,6 +1025,15 @@ enum Rule {
     Only(u32, &'static [u32]),
 }
 
+/// The architecture the filter lets through (`AUDIT_ARCH_X86_64`, `AUDIT_ARCH_AARCH64`): the
+/// numbers of the calls are this one's, and another's are killed. A third has none yet.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: u32 = 0xC000_003E;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: u32 = 0xC000_00B7;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("the seccomp filter knows the audit architecture of x86_64 and aarch64 only");
+
 /// Offsets of `struct seccomp_data`: the first argument, and the second.
 const ARG0: u32 = 16;
 const ARG1: u32 = 24;
@@ -988,9 +1051,17 @@ const SERVING_IOCTLS: &[u32] = &[0x5421, 0x541B, 0x5451, 0x5450, 0x5401, 0x5413]
 /// mode as read, the timer slack, `PR_SET_VMA` (the allocator names its maps) and the thread's
 /// address as read.
 const SERVING_PRCTLS: &[u32] = &[1, 2, 3, 4, 15, 16, 21, 23, 29, 30, 38, 39, 40, 0x5356_4d41];
+/// The families a serving part makes a socket of (the domain is the first argument): Unix, IPv4 and
+/// IPv6. Not netlink, the kernel's crypto (`AF_ALG`), vsock, packet, keys ...: each of those reaches
+/// kernel code a network server has no use for.
+const SERVING_SOCKETS: &[u32] = &[1, 2, 10];
+/// A pair is of the Unix family (the only one the kernel makes pairs of that it is let).
+const SERVING_PAIRS: &[u32] = &[1];
 
 fn serving_rules() -> Vec<(i64, Rule)> {
     vec![
+        (libc::SYS_socket, Rule::Only(ARG0, SERVING_SOCKETS)),
+        (libc::SYS_socketpair, Rule::Only(ARG0, SERVING_PAIRS)),
         (libc::SYS_clone, Rule::NoNewSpace),
         (libc::SYS_clone3, Rule::Absent),
         (libc::SYS_ioctl, Rule::Only(ARG1, SERVING_IOCTLS)),
@@ -1007,11 +1078,7 @@ fn serving_program() -> Vec<libc::sock_filter> {
 /// call with a rule a compare and its block (which always ends in an answer, so the number of
 /// the call is still in the accumulator where a block is jumped over), then `EPERM`.
 fn allow_program(allowed: &[i64], rules: &[(i64, Rule)]) -> Vec<libc::sock_filter> {
-    let arch = if cfg!(target_arch = "x86_64") {
-        0xC000_003E
-    } else {
-        0xC000_00B7
-    }; // AUDIT_ARCH_X86_64 / _AARCH64
+    let arch = AUDIT_ARCH;
     let op = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
     let mut program = vec![
         op(0x20, 0, 0, 4),           // A = the architecture
@@ -1562,15 +1629,7 @@ mod tests {
         0x0005_0000 | errno as u32
     }
     fn ours(nr: i64, args: [u64; 2]) -> u32 {
-        filtered(
-            if cfg!(target_arch = "x86_64") {
-                0xC000_003E
-            } else {
-                0xC000_00B7
-            },
-            nr,
-            args,
-        )
+        filtered(AUDIT_ARCH, nr, args)
     }
 
     #[test]
@@ -1656,6 +1715,148 @@ mod tests {
                 "prctl {option}"
             );
         }
+    }
+
+    #[test]
+    fn serving_filter_lets_socket_make_only_the_families_the_serving_part_uses() {
+        // Unix, IPv4 and IPv6 pass (whatever the type's flags say); netlink, the kernel's crypto,
+        // vsock, packet and the rest are refused, for socket and socketpair alike.
+        for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
+            let args = [family as u64, (libc::SOCK_STREAM | libc::SOCK_NONBLOCK) as u64];
+            assert_eq!(ours(libc::SYS_socket, args), ALLOW, "socket {family}");
+        }
+        for family in [
+            libc::AF_NETLINK,
+            libc::AF_ALG,
+            libc::AF_VSOCK,
+            libc::AF_PACKET,
+            libc::AF_KEY,
+            libc::AF_BLUETOOTH,
+        ] {
+            assert_eq!(
+                ours(libc::SYS_socket, [family as u64, libc::SOCK_RAW as u64]),
+                refused(libc::EPERM),
+                "socket {family}"
+            );
+            assert_eq!(
+                ours(libc::SYS_socketpair, [family as u64, libc::SOCK_DGRAM as u64]),
+                refused(libc::EPERM),
+                "socketpair {family}"
+            );
+        }
+        assert_eq!(
+            ours(libc::SYS_socketpair, [libc::AF_UNIX as u64, libc::SOCK_DGRAM as u64]),
+            ALLOW
+        );
+        assert_eq!(
+            ours(libc::SYS_socketpair, [libc::AF_INET as u64, libc::SOCK_STREAM as u64]),
+            refused(libc::EPERM),
+            "a pair is of the Unix family only"
+        );
+    }
+
+    #[test]
+    fn serving_filter_refuses_a_call_numbered_as_the_x32_ones_are() {
+        // The x32 calls have the x86-64 architecture and bit 30 set in their number: none of the
+        // list's numbers has it, so each, even of an allowed call, falls to the refusal.
+        for nr in [libc::SYS_read, libc::SYS_openat, libc::SYS_socket, libc::SYS_clone] {
+            assert_eq!(
+                ours(nr | 0x4000_0000, [0; 2]),
+                refused(libc::EPERM),
+                "call {nr} as an x32 call"
+            );
+        }
+    }
+
+    #[test]
+    fn serving_filter_lets_a_real_serving_part_make_the_calls_it_needs() {
+        for nr in [
+            libc::SYS_msync,
+            libc::SYS_fadvise64,
+            libc::SYS_signalfd4,
+            libc::SYS_rt_sigtimedwait,
+            libc::SYS_epoll_pwait2,
+            libc::SYS_getcpu,
+        ] {
+            assert_eq!(ours(nr, [0; 2]), ALLOW, "call {nr}");
+        }
+        // Nothing in the serving part's root can run, so nothing is made to run.
+        assert_eq!(ours(libc::SYS_execve, [0; 2]), refused(libc::EPERM));
+    }
+
+    extern "C" fn nothing(_: libc::c_int) {}
+
+    /// A signal (SIGUSR1, no restart of the call) sent to the calling thread every 50 ms until the
+    /// guard drops.
+    struct Pester(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        Option<std::thread::JoinHandle<()>>,
+    );
+
+    fn pester() -> Pester {
+        // SAFETY: a handler that does nothing, set without SA_RESTART, so a blocked call is
+        // ended with EINTR.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = nothing as extern "C" fn(libc::c_int) as usize;
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()), 0);
+        }
+        // SAFETY: pthread_self has no precondition.
+        let target = unsafe { libc::pthread_self() };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                // SAFETY: the target thread is the test's, which outlives this guard.
+                unsafe { libc::pthread_kill(target, libc::SIGUSR1) };
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        Pester(stop, Some(thread))
+    }
+
+    impl Drop for Pester {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(thread) = self.1.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[test]
+    fn recv_fds_interrupted_again_and_again_still_ends_at_the_sockets_timeout() {
+        let (a, _b) = socketpair().unwrap();
+        let socket = std::os::unix::net::UnixDatagram::from(a);
+        socket.set_read_timeout(Some(Duration::from_millis(600))).unwrap();
+        let _pester = pester();
+        let began = std::time::Instant::now();
+        let mut buf = [0u8; 16];
+        let got = recv_fds(socket.as_fd(), &mut buf, 0);
+        assert_eq!(got.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        let waited = began.elapsed();
+        assert!(
+            waited >= Duration::from_millis(550) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn recv_fds_interrupted_after_a_long_wait_goes_on_to_the_message() {
+        // A receive interrupted over and over, with time left of the socket's timeout, goes on
+        // waiting for it (3 s), and gets what is sent at 900 ms.
+        let (a, b) = socketpair().unwrap();
+        let socket = std::os::unix::net::UnixDatagram::from(a);
+        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(900));
+            send_fds(b.as_fd(), b"late", &[]).unwrap();
+        });
+        let _pester = pester();
+        let mut buf = [0u8; 16];
+        let (n, fds) = recv_fds(socket.as_fd(), &mut buf, 0).unwrap();
+        assert_eq!((&buf[..n], fds.len()), (&b"late"[..], 0));
+        sender.join().unwrap();
     }
 
     #[test]

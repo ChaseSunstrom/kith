@@ -237,36 +237,63 @@ T-0811 moves the unit's handle to the other process. Confinement is built (see "
 rest behind it, up to their deadline (T-0812 measures it before it is changed); a caller waiting for the
 lock waits as long as its call may (T-0811: it gives up at its own deadline, and the call is made on the
 calling thread, so an async caller is held for that long at most; `spawn_blocking` at each caller is not
-done); `send_fds` and `recv_fds` take up a call a signal cut short (`EINTR`) for 60 s at most
-altogether (T-0811); more than 253 layers cannot be sent in one `Unpack` though the
+done); `send_fds` and `recv_fds` take up a call a signal cut short (`EINTR`) until the end of the
+socket's own timeout, counted from the start of the call (the kernel restarts that timeout at each
+signal, so it alone does not bound it); a socket with no timeout is retried as long as the signals
+come, and the caller's own timeouts (`ask`: one deadline for the lock and the wait) are what bound it (T-0811); more than 253 layers cannot be sent in one `Unpack` though the
 limit on layers is 256; a caller that gives up after a `Create` leaves the unit held by the root
 part, to be taken by `Adopt` or deleted; a layer that is a FIFO is refused; the root part's thread is
 not started again if it ends: kithd ends with it (T-0811), for the keeper to start both again.
 
 ## Built so far (confined)
 
+**What is enforced today: nothing on a live node.** The confinement below is built and held to what
+it says by a probe (`kithd confine-probe`, in a test build, in no release, run by `sh ci/vm.sh --test
+privilege`) and by unit tests; no serving part calls it, because there is no serving process yet (see
+"Not done"). The module is compiled in unit tests and the `confine-probe` build alone. **What stays
+open even when it is applied**: the serving part keeps the node's network namespace, so it reaches the
+host's loopback and every abstract `AF_UNIX` socket of the node (the filter allows `AF_UNIX`, `AF_INET`
+and `AF_INET6` and no other family, but a name in the abstract space is no file of a mount); a
+`CLONE_NEWNET` after the listeners are open closes both, if the part makes no outbound connection,
+and is not done. Nothing beyond what this section lists is claimed closed.
+
 T-0811, `crates/kithd/src/confine.rs` and the wrappers in `kith-dm-sys`. `confine::serving` takes
 the steps in this order, after the listeners and the store are open (a failed step ends it, and the
-part serves nothing): its own mount namespace holding only its state directory (and `/proc`,
-unrecursive), a user and group that are not 0 and no other group (`setgroups`, `setresgid`,
+part serves nothing): its own mount namespace holding only its state directory (mounted `nosuid`,
+`nodev`, `noexec`: the filter has no `execve` for the part either; the new root is read only) and a
+fresh `/proc` mounted `hidepid=invisible,subset=pid` (the part sees its own process and no other, and
+none of `/proc/sys`, `kcore` and the like; not a bind of the node's `/proc`). A process that holds a
+directory open or an `O_PATH` descriptor is refused before the first step, since after `pivot_root` such a
+descriptor (`fchdir`, then `..` or a relative open) still reaches the node's tree: the part that
+confines holds none, and the check lists them (not closed from here: they are not this code's to close).
+The state directory is a plain absolute path (no `..`, not `/`). Then a user and group that are not 0 and no other group (`setgroups`, `setresgid`,
 `setresuid`, with `PR_SET_KEEPCAPS` so what the next step drops is still held), no capability in
 any set (effective raised from permitted, the bounding set dropped one by one, ambient cleared,
 `capset` to nothing, then read back and refused if anything is left), `no_new_privs`, and last a
 seccomp filter: an allow-list by call number, `EPERM` for the rest, and the process killed on a
-foreign architecture. Four calls are allowed in part (the arguments decide): `clone` is refused
+foreign architecture (the x32 ABI, the same architecture with bit 30 of the number set, answers `EPERM`
+like any call not listed; the architecture is a named constant for x86-64 and aarch64 and a compile
+error elsewhere; a thread that cannot take the filter is reported by thread, not as a stale errno).
+Five calls are allowed in part (the arguments decide): `socket` and `socketpair` make `AF_UNIX`,
+`AF_INET` and `AF_INET6` only (no netlink, packet or vsock socket; `socketpair` `AF_UNIX`
+alone), `clone` is refused
 when its flags hold any `CLONE_NEW*` bit (so no namespace is made, though `unshare` and `setns`
 are left out), `clone3` answers `ENOSYS` (its flags are behind a pointer a filter cannot read, and
 the C libraries fall back to `clone`), and `ioctl` and `prctl` pass only the requests and options
 the serving part makes (non-blocking, close-on-exec, bytes waiting, `TCGETS`; a thread's name,
 `no_new_privs` and dumpable as read or set): not `TIOCSTI`, `TIOCLINUX`, a terminal's settings,
 `PR_SET_MM` or `PR_CAP_AMBIENT`. A request the part meets that is not in the list is refused with
-`EPERM`: the list is read off the code and the VM run, and widened by a line when a run shows one.
+`EPERM`: the list is read off the code and the VM run, and widened by a line when a run shows one
+(`msync`, `fadvise64`, `signalfd4`, `rt_sigtimedwait`, `epoll_pwait2` and `getcpu` are in it because a
+real serving part, a tokio server over a store file, makes them; `execve` and the fork family are not).
 `Plan::filter` off leaves the filter out and nothing else (the filter is the
 step most likely to meet a call the list lacks); it is `--no-filter` on the probe, and no kithd
 flag until the serving part is a process. `kithd confine-probe DIR` does the same steps on
 itself and reports its own `/proc` status and mountinfo and what it tried and was refused (setuid,
-a capability, the node's disk, a mount, a call outside the filter, a namespace made by `clone`
-of each kind, `clone3`, `TIOCSTI`), and `sh ci/vm.sh --test
+a capability, the node's disk, a mount, a process of another user in `/proc`, a call outside the
+filter, a namespace made by `clone` of each kind (each with `CLONE_NEWUSER`, which an unprivileged
+process may make: the `--no-filter` run shows they are made without the filter), `clone3`, `TIOCSTI`,
+a netlink socket, a directory held open when it confines), and `sh ci/vm.sh --test
 privilege` holds the node to it, then kills kithd under a pod.
 
 **Not done, said here** (the first is the reason `--split` stays off): confinement is per thread

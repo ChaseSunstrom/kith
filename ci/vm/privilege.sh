@@ -13,6 +13,8 @@
   {"name":"probe","command":["/proc/1/exe","confine-probe","/var/lib/kith/confined"]}]}}},
  {"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"unfiltered"},"spec":{"retries":0,"template":{"exec":[
   {"name":"probe","command":["/proc/1/exe","confine-probe","/var/lib/kith/unfiltered","--no-filter"]}]}}},
+ {"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"holding"},"spec":{"retries":0,"template":{"exec":[
+  {"name":"probe","command":["/proc/1/exe","confine-probe","/var/lib/kith/holding","--hold-dir"]}]}}},
  {"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"ticker"},"spec":{"replicas":1,"template":{"pod":true,"containers":[
   {"name":"tick","image":"kith.test/pod:1","command":["/bin/pod","tick"]}]}}}]
 EOF
@@ -40,20 +42,32 @@ EOF
                 # (Its mounts: its root, its state directory and /proc, and no other.)
                 mounts=$(grep -o 'confine: mountinfo .*' "$work/$job.said" | awk '{print $7}' | sort | tr '\n' ' ')
                 [ "$mounts" = "/ /proc /var/lib/kith/$job " ] || fail "$job: its mounts are not its own state directory's alone: $mounts"
-                for held in 'serves ok' 'setuid refused' 'capability refused' 'disk refused' 'mount refused'; do
+                # (Its state directory's mount: nosuid, nodev, noexec.)
+                grep "confine: mountinfo .* /var/lib/kith/$job " "$work/$job.said" | awk '{print $8}' | grep -q 'noexec' || fail "$job: its state directory is mounted with exec: $(grep "mountinfo .* /var/lib/kith/$job " "$work/$job.said")"
+                for held in 'serves ok' 'setuid refused' 'capability refused' 'disk refused' 'mount refused' 'procs refused \[\]' 'proc-global refused'; do
                     grep -q "confine: $held" "$work/$job.said" || fail "$job: not '$held': $(grep -a 'confine: ' "$work/$job.said" | grep -v 'mountinfo\|status')"
                 done
             done
+            # (A directory of the node open when it confines: refused, before anything is changed.)
+            waited=0
+            until probed holding | grep -q 'confine: hold'; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the probe holding did not finish: $(probed holding | head -n 20) $(units Job holding)"
+                sleep 1
+            done
+            probed holding | grep -q 'confine: hold refused' || fail "holding: a directory held open was not refused: $(probed holding | head -n 20)"
             [ "$(grep -o 'confine: status Seccomp: [0-9]' "$work/confined.said" | cut -d ' ' -f 4)" = 2 ] || fail "confined: the filter is not on"
             grep -q 'confine: filter refused' "$work/confined.said" || fail "confined: a call outside the filter was not refused"
             # (The calls it lets through in part: a clone that makes a namespace of each kind, clone3, TIOCSTI.)
-            for held in 'clone refused' 'clone3 refused' 'ioctl refused'; do
-                grep -q "confine: $held" "$work/confined.said" || fail "confined: not '$held': $(grep -a 'confine: ' "$work/confined.said" | grep 'clone\|ioctl')"
+            for held in 'clone refused' 'clone3 refused' 'ioctl refused' 'socket refused'; do
+                grep -q "confine: $held" "$work/confined.said" || fail "confined: not '$held': $(grep -a 'confine: ' "$work/confined.said" | grep 'clone\|ioctl\|socket')"
             done
-            grep -q 'confine: clone off' "$work/unfiltered.said" || fail "unfiltered: it did not say the filter is off for clone"
+            # (Without the filter the same clones are made, each with a user namespace: so the filter
+            # is what refused them above, not a kernel that refuses a process with no capability.)
+            grep -q 'confine: clone made' "$work/unfiltered.said" || fail "unfiltered: the namespaces were not made without the filter, so the refusal above shows nothing: $(grep -a 'confine: clone' "$work/unfiltered.said")"
             [ "$(grep -o 'confine: status Seccomp: [0-9]' "$work/unfiltered.said" | cut -d ' ' -f 4)" = 0 ] || fail "unfiltered: a filter is on with --no-filter"
             grep -q 'confine: filter off' "$work/unfiltered.said" || fail "unfiltered: it did not say the filter is off"
-            echo "vm.sh: the confined process: $(grep -o 'confine: \(setuid\|capability\|disk\|mount\|filter\|clone3\|clone\|ioctl\) [a-z]*' "$work/confined.said" | cut -d ' ' -f 2- | tr '\n' ';')" >&2
+            echo "vm.sh: the confined process: $(grep -o 'confine: \(setuid\|capability\|disk\|mount\|filter\|clone3\|clone\|ioctl\|socket\|procs\|proc-global\) [a-z]*' "$work/confined.said" | cut -d ' ' -f 2- | tr '\n' ';')" >&2
             # kithd ended under a pod (--split): it is started again, and the pod goes on as the same process.
             said() { any GET "/v1/logs/$1/default/$2${3:+?unit=$3}" 2>/dev/null; }
             waited=0

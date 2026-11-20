@@ -2,20 +2,40 @@
 //! reaches once its listeners and its store are open is its own state directory, and nothing that
 //! makes the machine different.
 //!
+//! WHAT HOLDS TODAY: the confinement is built and held to what it says by `kithd confine-probe`
+//! (a test build, ci/vm/privilege.sh) and by the unit tests. NO LIVE SERVING PART IS CONFINED: the
+//! root part is still a thread of kithd, and `--split` does not yet start a serving process that
+//! calls [`serving`]. This module is in no release build.
+//!
 //! The steps are [`Steps`], run by [`serving`] in this order, each after the one before: a mount
-//! namespace holding only the state directory (and `/proc`), a user and group id that are not 0
-//! (no supplementary group), every capability set emptied (the bounding set included), no_new_privs
-//! and, last, a seccomp allow-list ([`Plan::filter`] off is `--no-filter`, for a call the list
-//! misses). A step that fails ends the confinement there with an error, and the caller ends: a
-//! serving part half confined serves nothing.
+//! namespace holding only the state directory (no exec) and a `/proc` of its own that shows its own
+//! process alone, a user and group id that are not 0 (no supplementary group), every capability set
+//! emptied (the bounding set included), no_new_privs and, last, a seccomp allow-list
+//! ([`Plan::filter`] off is `--no-filter`, for a call the list misses). A step that fails ends the
+//! confinement there with an error, and the caller ends: a serving part half confined serves
+//! nothing. A process that holds a directory open (or an O_PATH descriptor) is refused before the
+//! first step: such a descriptor reaches the node's tree past the pivot.
 //!
 //! All five are the calling thread's (the filter and the user ids every thread's). A thread made
 //! before keeps the mount namespace and the bounding set it had, so the serving part runs this
 //! while it is one thread, and what it starts after, it starts confined.
 //!
+//! WHAT STAYS OPEN: the serving part keeps the node's network namespace, so it reaches the host's
+//! loopback and every abstract AF_UNIX socket of the node (the filter allows AF_UNIX, INET and
+//! INET6 only, but a name in the abstract space is not a file of a mount). Closing it is a
+//! `CLONE_NEWNET` after the listeners are open, which holds only if the part makes no outbound
+//! connection. Nothing beyond what is listed here is claimed closed.
+//!
 //! `kithd confine-probe DIR` is the process this is held to: it opens a listener and a file in `DIR`
 //! as root, confines itself, then says what it is (its status, its mounts) and what it still can do.
 //! (ci/vm/privilege.sh reads it.)
+#![cfg_attr(
+    not(feature = "confine-probe"),
+    allow(
+        dead_code,
+        reason = "the steps are run by the probe build alone until the serving process calls them"
+    )
+)]
 
 use std::path::{Path, PathBuf};
 
@@ -57,12 +77,7 @@ pub fn serving<L, S, T: Steps>(
     if plan.uid == 0 || plan.gid == 0 {
         return Err("the serving part runs as a user and a group that are not 0".into());
     }
-    if !plan.state.is_absolute() {
-        return Err(format!(
-            "the state directory {} is not an absolute path",
-            plan.state.display()
-        ));
-    }
+    plain(&plan.state)?;
     let opened = (listeners()?, store()?);
     let named = |what: &str, done: Result<(), String>| done.map_err(|e| format!("confining: {what}: {e}"));
     named("the mount namespace", steps.mount_namespace(&plan.state))?;
@@ -73,6 +88,67 @@ pub fn serving<L, S, T: Steps>(
         named("the seccomp filter", steps.seccomp())?;
     }
     Ok(opened)
+}
+
+/// `at` without its root: an absolute path of names alone, which is where it lies in a new root.
+/// Not `..` (it would put the bind outside the new root), not a relative path, not `/` itself (the
+/// state would be the root).
+fn plain(at: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let mut names = PathBuf::new();
+    for part in at.components() {
+        match part {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => names.push(name),
+            _ => {
+                return Err(format!(
+                    "the state directory {} has `..` or no root in it",
+                    at.display()
+                ));
+            }
+        }
+    }
+    if !at.is_absolute() || names.as_os_str().is_empty() {
+        return Err(format!(
+            "the state directory {} is not an absolute path to a directory of its own",
+            at.display()
+        ));
+    }
+    Ok(names)
+}
+
+/// Whether the text of `/proc/self/fdinfo/N` says the descriptor was opened with O_PATH.
+fn opened_for_path(fdinfo: &str) -> bool {
+    const O_PATH: u32 = 0o10_000_000;
+    fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .and_then(|flags| u32::from_str_radix(flags.trim(), 8).ok())
+        .is_some_and(|flags| flags & O_PATH != 0)
+}
+
+/// The descriptors this process holds that reach the node's tree whatever the pivot: a directory
+/// (`fchdir`, then `..` or a relative open) and an O_PATH descriptor (the same, through its mount)
+/// keep the mount they were opened on, which the new namespace unmounts and they do not. Each as
+/// "fd N (where it points)". The confinement ends before it begins when this is not empty: a
+/// descriptor is no part of the process's own that can be closed from here without the owner knowing.
+fn held_directories() -> Result<Vec<String>, String> {
+    // (Listed first and the listing closed, so its own descriptor is not among them.)
+    let names: Vec<String> = std::fs::read_dir("/proc/self/fd")
+        .map_err(|e| format!("its descriptors are not listed: {e}"))?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect();
+    let mut held = Vec::new();
+    for name in names {
+        let at = format!("/proc/self/fd/{name}");
+        let directory = std::fs::metadata(&at).is_ok_and(|m| m.is_dir());
+        let by_path = std::fs::read_to_string(format!("/proc/self/fdinfo/{name}")).is_ok_and(|t| opened_for_path(&t));
+        if directory || by_path {
+            let to = std::fs::read_link(&at).map_or("?".to_string(), |p| p.display().to_string());
+            held.push(format!("fd {name} ({to})"));
+        }
+    }
+    Ok(held)
 }
 
 /// The steps on this process.
@@ -89,28 +165,44 @@ impl Steps for System {
             move |e: &dyn std::fmt::Display| format!("{what}: {e}")
         };
         let none = None::<&str>;
+        // (Before anything is changed: a descriptor of a directory outlives the pivot.)
+        let held = held_directories()?;
+        if !held.is_empty() {
+            return Err(format!(
+                "it holds directories open that reach past the new root ({}): the part that confines holds none",
+                held.join(", ")
+            ));
+        }
         kith_dm_sys::unshare_mounts().map_err(|e| said("unshare")(&e))?;
         // What the node mounts after this must not reach in, nor what is done here reach out.
         mount(none, "/", none, MsFlags::MS_REC | MsFlags::MS_PRIVATE, none).map_err(|e| said("private")(&e))?;
         let root = Path::new(ROOT);
         std::fs::create_dir_all(root).map_err(|e| said("the new root")(&e))?;
-        let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+        // (No exec anywhere: the serving part runs what it is, and the filter has no execve for it.)
+        let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
         mount(Some("tmpfs"), root, Some("tmpfs"), flags, Some("size=1m,mode=0755")).map_err(|e| said("tmpfs")(&e))?;
-        let inside = |at: &Path| root.join(at.strip_prefix("/").unwrap_or(at));
-        // (`/proc` alone, not what is mounted under it: the mounts of this namespace are the two.)
-        let bind = |from: &Path, tree: MsFlags, extra: MsFlags| -> Result<(), String> {
-            let to = inside(from);
+        let made = |at: &Path| -> Result<PathBuf, String> {
+            let to = root.join(plain(at)?);
             std::fs::create_dir_all(&to).map_err(|e| said("a mount point")(&e))?;
-            mount(Some(from), &to, none, MsFlags::MS_BIND | tree, none).map_err(|e| said("bind")(&e))?;
-            let again = MsFlags::MS_BIND | MsFlags::MS_REMOUNT | flags | extra;
-            mount(none, &to, none, again, none).map_err(|e| said("remount")(&e))
+            Ok(to)
         };
-        bind(keep, MsFlags::MS_REC, MsFlags::empty())?;
-        bind(
-            Path::new("/proc"),
-            MsFlags::empty(),
-            MsFlags::MS_RDONLY | MsFlags::MS_NOEXEC,
-        )?;
+        // The state directory, the tree of it (what is mounted under it too: nothing).
+        let to = made(keep)?;
+        mount(Some(keep), &to, none, MsFlags::MS_BIND | MsFlags::MS_REC, none).map_err(|e| said("bind")(&e))?;
+        let again = MsFlags::MS_BIND | MsFlags::MS_REMOUNT | flags;
+        mount(none, &to, none, again, none).map_err(|e| said("remount")(&e))?;
+        // A /proc of its own, not a bind of the node's: it shows no process that is not the part's
+        // (hidepid=invisible: another user's are not listed or opened) and nothing but processes
+        // (subset=pid: not /proc/sys, kcore, the node's mounts and the rest).
+        let to = made(Path::new("/proc"))?;
+        mount(
+            Some("proc"),
+            &to,
+            Some("proc"),
+            flags | MsFlags::MS_RDONLY,
+            Some("hidepid=invisible,subset=pid"),
+        )
+        .map_err(|e| said("proc")(&e))?;
         let old = root.join(".old");
         std::fs::create_dir(&old).map_err(|e| said("the old root")(&e))?;
         nix::unistd::pivot_root(root, &old).map_err(|e| said("pivot_root")(&e))?;
@@ -164,15 +256,20 @@ impl Steps for System {
     }
 }
 
-/// Started as `kithd confine-probe DIR [--no-filter]`? Then this never returns: the confinement
-/// held to what it says (see the top of this file).
+/// Started as `kithd confine-probe DIR [--no-filter] [--hold-dir]`? Then this never returns: the
+/// confinement held to what it says (see the top of this file). `--hold-dir`: a directory of the
+/// node is open when it confines, which it must refuse (it says so, and ends well).
+#[cfg(feature = "confine-probe")]
 pub fn probe_shim() {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(std::ffi::OsStr::new("confine-probe")) {
         return;
     }
     let state = args.next().map(PathBuf::from).unwrap_or_default();
-    let filter = args.next().as_deref() != Some(std::ffi::OsStr::new("--no-filter"));
+    let rest: Vec<_> = args.collect();
+    let has = |flag: &str| rest.iter().any(|a| a == flag);
+    let filter = !has("--no-filter");
+    let hold = has("--hold-dir").then(|| std::fs::File::open("/etc"));
     let plan = Plan {
         state: state.clone(),
         uid: SERVING_ID,
@@ -186,8 +283,17 @@ pub fn probe_shim() {
     let store = || std::fs::File::create(state.join("store")).map_err(|e| format!("the store: {e}"));
     let done = given
         .map_err(|e| format!("the state directory's owner: {e}"))
-        .and_then(|()| serving(&mut System, &plan, listeners, store))
-        .and_then(|(listener, store)| report(&plan, listener, store));
+        .and_then(|()| serving(&mut System, &plan, listeners, store));
+    if let Some(dir) = hold {
+        // (Refused, with the directory still open and nothing done: not a half-made confinement.)
+        let refused = matches!(&done, Err(e) if e.contains("holds directories open"));
+        println!(
+            "confine: hold {}",
+            if dir.is_ok() && refused { "refused" } else { "ALLOWED" }
+        );
+        std::process::exit(0);
+    }
+    let done = done.and_then(|(listener, store)| report(&plan, listener, store));
     if let Err(e) = done {
         eprintln!("kithd: confine-probe: {e}");
         std::process::exit(1);
@@ -196,6 +302,7 @@ pub fn probe_shim() {
 }
 
 /// One line each: what the process is, and each thing it must not do, tried.
+#[cfg(feature = "confine-probe")]
 fn report(plan: &Plan, listener: std::net::TcpListener, mut store: std::fs::File) -> Result<(), String> {
     use std::io::Write;
     let say = |line: String| println!("confine: {line}");
@@ -230,6 +337,16 @@ fn report(plan: &Plan, listener: std::net::TcpListener, mut store: std::fs::File
     let on_disk = std::fs::File::open("/etc/passwd").is_ok() || std::fs::read_dir("/dev").is_ok();
     say(format!("root {names:?}"));
     say(format!("disk {}", word(!on_disk)));
+    // (Its /proc: no process of another user listed, and nothing of the node's that is no process's.)
+    let me = std::process::id().to_string();
+    let others: Vec<_> = std::fs::read_dir("/proc")
+        .map_err(|e| format!("proc: {e}"))?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.bytes().all(|b| b.is_ascii_digit()) && *n != me)
+        .collect();
+    say(format!("procs {} {others:?}", word(others.is_empty())));
+    let global = ["sys", "kcore", "mounts", "net", "modules"].map(|n| Path::new("/proc").join(n).exists());
+    say(format!("proc-global {} {global:?}", word(global.iter().all(|g| !g))));
     let mounted = nix::mount::mount(
         Some("tmpfs"),
         &plan.state,
@@ -245,13 +362,17 @@ fn report(plan: &Plan, listener: std::net::TcpListener, mut store: std::fs::File
         if plan.filter { word(call.is_err()) } else { "off" }
     ));
     // What a filter alone must refuse in the calls it allows in part: a namespace made by clone
-    // (each flag), clone3 (not there), and a push of input into a terminal.
+    // (each flag), clone3 (not there), a push of input into a terminal, a socket of a family the
+    // part has no use for (netlink).
     use kith_dm_sys::Try;
     use nix::errno::Errno;
     let is = |t: Try, errno: Errno| kith_dm_sys::try_call(t).is_err_and(|e| e.raw_os_error() == Some(errno as i32));
-    // (CLONE_NEWUSER, NEWNS, NEWNET, NEWPID, NEWIPC, NEWUTS, NEWCGROUP.)
-    let namespaces: [u64; 7] = [
-        0x1000_0000,
+    // CLONE_NEWUSER, and each other kind of namespace with it: with the user namespace a process
+    // with no capability makes any of them, so the kernel lets every one through and only the filter
+    // is what refuses (the run with --no-filter shows it: they are `made` there).
+    const NEWUSER: u64 = 0x1000_0000;
+    // (NEWNS, NEWNET, NEWPID, NEWIPC, NEWUTS, NEWCGROUP.)
+    let kinds: [u64; 6] = [
         0x0002_0000,
         0x4000_0000,
         0x2000_0000,
@@ -259,10 +380,19 @@ fn report(plan: &Plan, listener: std::net::TcpListener, mut store: std::fs::File
         0x0400_0000,
         0x0200_0000,
     ];
+    let namespaces = std::iter::once(NEWUSER).chain(kinds.iter().map(|f| NEWUSER | f));
+    let clone = if plan.filter {
+        word(namespaces.clone().all(|f| is(Try::Clone(f), Errno::EPERM)))
+    } else if namespaces.clone().all(|f| kith_dm_sys::try_call(Try::Clone(f)).is_ok()) {
+        "made"
+    } else {
+        "NOT_MADE"
+    };
+    say(format!("clone {clone}"));
     let tries = [
-        ("clone", namespaces.iter().all(|f| is(Try::Clone(*f), Errno::EPERM))),
         ("clone3", is(Try::Clone3, Errno::ENOSYS)),
         ("ioctl", is(Try::Tiocsti, Errno::EPERM)),
+        ("socket", is(Try::Socket(16), Errno::EPERM)),
     ];
     for (name, refused) in tries {
         say(format!("{name} {}", if plan.filter { word(refused) } else { "off" }));
@@ -391,12 +521,58 @@ mod tests {
     }
 
     #[test]
+    fn confine_keeps_only_a_directory_named_plainly() {
+        assert_eq!(plain(Path::new("/var/lib/kith/a")), Ok(PathBuf::from("var/lib/kith/a")));
+        assert_eq!(plain(Path::new("/var/./lib")), Ok(PathBuf::from("var/lib")));
+        // (`..` would put the bind outside the new root; "/" would make the state the root.)
+        for refused in ["/var/../etc", "/..", "/", "", "var/lib", "/var/lib/.."] {
+            assert!(plain(Path::new(refused)).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn confine_finds_the_directories_and_o_path_descriptors_a_process_holds() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::fs::File::open("/").expect("the root");
+        // (O_PATH on a file that is no directory: a way to a directory's tree all the same, through
+        // the descriptor's mount.)
+        let path = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0o10_000_000)
+            .open(std::env::current_exe().expect("this test's file"))
+            .expect("O_PATH");
+        let plain_file = std::fs::File::open(std::env::current_exe().expect("this test's file")).expect("a file");
+        let held = held_directories().expect("the descriptors are listed");
+        let has = |fd: i32| held.iter().any(|h| h.starts_with(&format!("fd {fd} ")));
+        assert!(has(dir.as_raw_fd()), "{held:?}");
+        assert!(has(path.as_raw_fd()), "{held:?}");
+        assert!(!has(plain_file.as_raw_fd()), "a file read is no way out: {held:?}");
+    }
+
+    #[test]
+    fn confine_reads_o_path_from_the_flags_of_a_descriptor() {
+        assert!(opened_for_path("pos:\t0\nflags:\t010000000\nmnt_id:\t26\n"));
+        assert!(opened_for_path("pos:\t0\nflags:\t012000000\nmnt_id:\t26\n"));
+        assert!(!opened_for_path("pos:\t0\nflags:\t02000000\nmnt_id:\t26\n"));
+        assert!(!opened_for_path("nothing of the kind"));
+    }
+
+    #[test]
     fn confine_refuses_to_stay_root_or_to_keep_a_relative_directory() {
         for plan in [
             Plan { uid: 0, ..plan(true) },
             Plan { gid: 0, ..plan(true) },
             Plan {
                 state: "state".into(),
+                ..plan(true)
+            },
+            Plan {
+                state: "/state/../etc".into(),
+                ..plan(true)
+            },
+            Plan {
+                state: "/".into(),
                 ..plan(true)
             },
         ] {
