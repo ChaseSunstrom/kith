@@ -1377,6 +1377,11 @@ spec! {
         /// Empty means every namespace.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub namespaces: Vec<String>,
+        /// Empty means every resource of those kinds. Else only the resources of these exact
+        /// names: a request that names none (a list is shown only these; one that cannot say
+        /// which it reaches) is not covered. (An older kithd refuses the field, never ignores it.)
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub names: Vec<String>,
     }
 
     pub enum Verb { Get, List, Watch, Apply, Delete, Exec }
@@ -1679,9 +1684,21 @@ no_checks!(
     RepositorySpec,
     UpdatePlanSpec,
     NodeKeySpec,
-    RoleSpec,
     RoleBindingSpec,
 );
+
+impl Spec for RoleSpec {
+    /// A name in a rule is a resource's name, as a resource has one: `*` or a pattern is no
+    /// wildcard here, it is refused rather than left to name nothing.
+    fn check(&self) -> Result<(), String> {
+        for (at, rule) in self.rules.iter().enumerate() {
+            for name in &rule.names {
+                crate::check_name(name).map_err(|e| format!("rules[{at}].names: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+}
 
 impl Spec for IdentitySpec {
     fn check(&self) -> Result<(), String> {
@@ -2950,6 +2967,56 @@ mod access_tests {
             .and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>())
             .map(drop)
             .map_err(|e| e.msg)
+    }
+
+    /// A kithd from before `names` reads a Role with it as an error, not as a rule for every
+    /// name of its kinds: that is what keeps a Role narrowed by name from widening on a node
+    /// that has not been updated yet.
+    #[test]
+    fn rule_names_unknown_to_old() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct Old {
+            kinds: Vec<String>,
+            verbs: Vec<String>,
+            #[serde(default)]
+            namespaces: Vec<String>,
+        }
+        let with = serde_json::json!({"kinds": ["OSRelease"], "verbs": ["apply"], "names": ["canary"]});
+        let refused = serde_json::from_value::<Old>(with.clone()).unwrap_err().to_string();
+        assert!(refused.contains("unknown field `names`"), "{refused}");
+        // This build reads it, and keeps it when it writes it again; without it, nothing is written.
+        let rule: super::AccessRule = serde_json::from_value(with).unwrap();
+        assert_eq!(rule.names, ["canary"]);
+        let again = serde_json::to_value(&rule).unwrap();
+        assert_eq!(again["names"], serde_json::json!(["canary"]));
+        let plain: super::AccessRule =
+            serde_json::from_value(serde_json::json!({"kinds": ["*"], "verbs": ["get"]})).unwrap();
+        assert!(plain.names.is_empty() && serde_json::to_value(&plain).unwrap().get("names").is_none());
+        // It still refuses a field it does not know, and its schema says so.
+        let odd = serde_json::json!({"kinds": ["*"], "verbs": ["get"], "name": ["canary"]});
+        assert!(serde_json::from_value::<super::AccessRule>(odd).is_err());
+        let role = read(
+            "Role",
+            "{ rules: [{ kinds: [OSRelease], verbs: [apply], names: [canary], nmaes: [x] }] }",
+        );
+        assert!(role.is_err(), "{role:?}");
+        assert!(
+            read(
+                "Role",
+                "{ rules: [{ kinds: [OSRelease], verbs: [apply], names: [canary] }] }"
+            )
+            .is_ok()
+        );
+        // A wildcard is not a name: refused, not left to match nothing (or, one day, everything).
+        for odd in ["'*'", "'can*'", "Canary", "''"] {
+            let refused = read(
+                "Role",
+                &format!("{{ rules: [{{ kinds: [OSRelease], verbs: [apply], names: [{odd}] }}] }}"),
+            );
+            assert!(refused.unwrap_err().contains("rules[0].names"), "{odd}");
+        }
     }
 
     #[test]

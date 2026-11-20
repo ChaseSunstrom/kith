@@ -1450,6 +1450,13 @@
             "type": "string"
           },
           "description": "Empty means every namespace."
+        },
+        "names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Empty means every resource of those kinds. Else only the resources of these exact\nnames: a request that names none (a list is shown only these; one that cannot say\nwhich it reaches) is not covered. (An older kithd refuses the field, never ignores it.)"
         }
       },
       "required": [

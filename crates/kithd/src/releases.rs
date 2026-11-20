@@ -565,7 +565,7 @@ fn live(
     let get = |grants: &Option<Grants>, kind: &str| {
         grants
             .as_ref()
-            .is_some_and(|grants| grants.may(&Verb::Get, kind, Some(&home)))
+            .is_some_and(|grants| grants.may(&Verb::Get, kind, Some(&home), None))
     };
     let mut size = 0;
     for resource in store.list(None) {
@@ -1139,7 +1139,7 @@ pub fn writer_may(store: &Store, owner: &Resource, resources: &[Resource], gone:
     };
     same_writer(store, owner, &caller)?;
     let grants = Grants::of(&caller, store);
-    let short = |(at, (verb, kind, namespace)): (String, crate::api::Right)| {
+    let short = |(at, (verb, kind, namespace, _)): (String, crate::api::Right)| {
         let place = namespace.map_or(String::new(), |namespace| format!(" in namespace {namespace}"));
         let why = match &caller {
             Caller::Identity(name) if store.get(&format!("Identity/{name}")).is_none() => {
@@ -1154,12 +1154,13 @@ pub fn writer_may(store: &Store, owner: &Resource, resources: &[Resource], gone:
         let rights = crate::api::takes(store, std::slice::from_ref(resource));
         rights.into_iter().map(|right| (resource.key(), right))
     });
-    let taken = gone.iter().map(|at| {
-        let (kind, namespace) = crate::api::place_of(at);
-        (at.clone(), (Verb::Delete, kind, namespace))
-    });
+    let taken = gone
+        .iter()
+        .map(|at| (at.clone(), crate::api::right_of(Verb::Delete, at)));
     let mut asked = made.chain(taken);
-    match asked.find(|(_, (verb, kind, namespace))| !grants.may(verb, kind, namespace.as_deref())) {
+    match asked
+        .find(|(_, (verb, kind, namespace, name))| !grants.may(verb, kind, namespace.as_deref(), name.as_deref()))
+    {
         Some(refused) => Err(short(refused)),
         None => Ok(()),
     }
@@ -1183,7 +1184,7 @@ pub fn supplied(store: &Store, release: &Resource) -> Result<(), String> {
         ));
     };
     same_writer(store, release, &caller)?;
-    if Grants::of(&caller, store).may(&kith_api::kinds::Verb::Apply, "Package", None) {
+    if Grants::of(&caller, store).may(&kith_api::kinds::Verb::Apply, "Package", None, None) {
         return Ok(());
     }
     Err(format!(

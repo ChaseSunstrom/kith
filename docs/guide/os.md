@@ -359,7 +359,10 @@ address on the node itself or its own networks (loopback, private, shared, link-
 multicast) is refused. `--lan-releases` (`lanReleases: true` at install) allows the private
 ranges for a release server on the LAN; then whoever may write an OSRelease can have every node
 ask any host on them and read in the plan's status whether it answered. Give OSRelease and
-UpdatePlan to nobody but the cluster's admin in any case: they decide when nodes restart.
+UpdatePlan to nobody but the cluster's admin in any case: they decide when nodes restart. A
+release agent that rolls only the canary ring is the exception a Role can name: `{ kinds:
+[OSRelease, UpdatePlan], verbs: [get, list, apply, delete], names: [canary] }` (see Access); it
+cannot touch a release or plan of any other name.
 
 **Handing over to other keys.** `handover` in a release names the keys that count once a node
 runs it (its own among them, if it is to go on counting), signed by the release's key and by one
