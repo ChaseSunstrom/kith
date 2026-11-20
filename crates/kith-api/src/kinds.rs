@@ -856,8 +856,14 @@ spec! {
         /// (`PrivateKey`, `Address`, `DNS`; one `[Peer]` with `PublicKey`, `Endpoint`,
         /// `PresharedKey`, `PersistentKeepalive`). kithd reads it; no container mounts it.
         pub secret: String,
-        /// The namespaces whose pods may name this exit.
+        /// The namespaces whose pods may name this exit. At least one of this and `levels`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub namespaces: Vec<String>,
+        /// The people's levels (AccessLevels) whose peers may leave by this exit, when the level
+        /// names it (its `exit`) and this node, which holds the tunnel, is the one they come to.
+        /// Whoever writes the Exit says who spends its provider's key.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub levels: Vec<String>,
         /// Where its pods' names are asked, through the tunnel (IPv4). Without it: the file's `DNS`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub dns: Vec<String>,
@@ -2370,11 +2376,16 @@ impl Spec for ExitSpec {
     fn check(&self) -> Result<(), String> {
         crate::check_name(&self.node).map_err(|e| format!("node: {e}"))?;
         crate::check_name(&self.secret).map_err(|e| format!("secret: {e}"))?;
-        if self.namespaces.is_empty() {
-            return Err("namespaces: at least one (the namespaces whose pods may leave by it)".into());
+        if self.namespaces.is_empty() && self.levels.is_empty() {
+            return Err(
+                "namespaces: at least one (the namespaces whose pods may leave by it), or levels (the people's)".into(),
+            );
         }
         for namespace in &self.namespaces {
             crate::check_name(namespace).map_err(|e| format!("namespaces: {e}"))?;
+        }
+        for level in &self.levels {
+            crate::check_name(level).map_err(|e| format!("levels: {e}"))?;
         }
         // (Asked through the tunnel, which carries IPv4 alone.)
         if let Some(bad) = self.dns.iter().find(|a| a.parse::<std::net::Ipv4Addr>().is_err()) {

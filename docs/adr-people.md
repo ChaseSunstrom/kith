@@ -514,7 +514,7 @@ RemotePeers, their AccessLevels and Services) and makes what the kernel holds ma
   `networks` may hold: a level's network outside them, or overlapping the mesh /48, the people
   /64, 100.89.0.0/16, 100.88.0.0/16 or the pods' range (`--pod-range`), is left out with a note (condition 7: narrows, never widens). A Service reached only on UDP
   is left out (an empty port list means all ports). A level that names an `exit` has no internet
-  until slice E2 ("exit X is not held yet").
+  in this slice ("exit X is not held yet"; slice E2a below gives it one).
 - Two peers with one address or key are both left out, as is an address that is the range's first
   two or its last (condition 5). A level the store does not
   have leaves its people out. What was left out, and why, is the Node's `peopleNotes` (up to 16
@@ -523,7 +523,35 @@ RemotePeers, their AccessLevels and Services) and makes what the kernel holds ma
 Not built: a conntrack flush for a peer deleted while kithd was down; the node's own IPv6 links
 in the table's link list (IPv4 only); the kithd resolver's own `may_forward` check that a people
 prefix may be forwarded to (condition 8's other half); a start failure's reason beyond stderr;
-exit levels, the Service listener and per-peer limits (slice E2).
+exit levels (slice E2a, below), the Service listener and per-peer limits (slice E2).
+
+## Built: slice E2a
+
+A level that names an `exit` leaves by that Exit, on the node that holds it:
+
+- `Exit.levels` (the levels whose peers may leave by it) is in the kind, beside `namespaces`; the
+  check asks for one of the two (`namespaces: []` alone is still refused), and each level is a
+  name. `exits.rs` keeps them on its `Up`, and a change of levels alone keeps the tunnel.
+- `levels.rs` takes a snapshot of the Exits held (`Exits::held`: number and levels when up, why
+  not when failed) before it takes the store's lock. A level's `internet` is `Exit(number)` only
+  while its Exit is held here and lists the level; else it has none, and the note says which:
+  "does not list level X", the Exit's own failure, or "is not held on this node" (no such Exit,
+  another node's, or no tunnel yet).
+- `Wanted.internet` maps a peer's IPv4 to the table of rule 9011: 254 for the home's internet,
+  `0x6b78_0000 | number` for an Exit's (`kith_mesh::exit::table`). `people_rules` reads the table
+  of each rule, and a rule counts as held only with the table wanted. A pass takes away a rule
+  9011 whose table is not the wanted one before it makes the right one (a peer never has two, and
+  between them falls to 9012), and the steps say `rule 9011 + ADDRESS to table 0x6b780007`. An
+  Exit that goes (or stops listing the level) loses the rule within 10 s: the peer is held, with
+  no internet.
+- `inet kith-pods`, with its guard (policy drop), passes what comes in by `kwg0` and what goes
+  out by it, by the whole name; the people table's own chains still decide what a peer may
+  reach. Without it the guard would drop a peer's packets on their way to `kx<number>`. The
+  masquerade out by the tunnel is the people table's `post` chain (any link but kwg0), and its
+  `-out` chain lets the internet out only by `kx<number>`: a named range never goes out an
+  Exit's link (condition 3, tested for an Exit level too).
+
+Not built: IPv6 through an Exit, the Exit of another node, the API or DNS through an Exit.
 
 ## Open
 

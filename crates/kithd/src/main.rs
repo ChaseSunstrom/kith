@@ -210,6 +210,10 @@ struct Args {
         default_missing_value = "https://acme-v02.api.letsencrypt.org/directory"
     )]
     acme: Option<String>,
+    /// Ask the root part for sockets, pods, the mesh, images and volumes over a socket pair, as
+    /// the process it is to become (docs/adr-privilege.md); off, it is asked in this process
+    #[arg(long, env = "KITH_SPLIT")]
+    split: bool,
 }
 
 /// The ports kithd serves on at this node, and what for: none of them is published for a pod.
@@ -982,6 +986,15 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     ))?;
     // (An exit's pods pass on to the mesh by its link alone.)
     shared.pods.lock().expect("nothing panics holding the pods").mesh = args.mesh_interface.clone();
+    // The root part on the far end of a socket pair, a thread of this process for now (T-0811).
+    if args.split {
+        let end = root_part::split().map_err(|e| fail("splitting the root part", &e))?;
+        let held = shared.clone();
+        std::thread::Builder::new()
+            .name("root-part".into())
+            .spawn(move || root_part::serve_split(&held.pods, end))
+            .map_err(|e| fail("starting the root part", &e))?;
+    }
     // A viewed worker serves ingress only where its Node says so (as the join of a token for
     // an ingress worker wrote it): only then is its view sent the hosts' certificates. (Its
     // Node not in the view yet: its first view is still to come, and says.)
@@ -1357,6 +1370,14 @@ mod tests {
         assert_eq!(parse("[fd00::1]:7443").unwrap().advertise.unwrap().port(), 7443);
         assert!(parse("10.0.0.5:7443").is_ok());
         assert!(parse("node-b.example.org:7443").is_err() && parse("10.0.0.5").is_err());
+    }
+
+    /// The root part is a socket of its own only when asked (T-0812 flips the default).
+    #[test]
+    fn the_split_flag_is_off_unless_asked() {
+        use clap::Parser;
+        assert!(!super::Args::try_parse_from(["kithd"]).unwrap().split);
+        assert!(super::Args::try_parse_from(["kithd", "--split"]).unwrap().split);
     }
 
     /// The ports this node serves on are the ones a pod may not publish here.

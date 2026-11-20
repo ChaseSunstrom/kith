@@ -1,6 +1,9 @@
 # A FIDO2 key as a way into a node's state
 
-Status: design (T-0863); built so far, and called by nothing: the client's wire half (T-0966:
+Status: design (T-0863); built so far: the console's "touch your key" (T-0974: `crypt.rs`'s
+`console` tries the keys plugged in on `/dev/hidraw*`, `fido2.rs`'s `hidraw`, after what is typed,
+a key not enrolled answered as a wrong line is, and no key looked for after a duress code); the
+rest of it called by nothing yet: the client's wire half (T-0966:
 CTAPHID framing, the CBOR subset) and its second half (T-0968: AES-256-CBC, ECDH, `hmac-secret`,
 `makeCredential` and `getAssertion`), all tested on a scripted key and never yet on a real one;
 and the software key of section 2's test build (T-0970: `crates/kithd/src/fido2_test.rs`, the
@@ -176,11 +179,11 @@ and a node can do, and no part of it needs a typed line at a console that is not
 
 1. **The verb.** `kith node key add NAME` (`POST /v1/lock/NAME/fido2 {"keys": 2}`), for who
    may apply a NodeKey, by the route and the permit that `crypt::pass` uses
-   (`crates/kithd/src/crypt.rs:2386-2425`: the verb is answered by that node alone, another node
+   (`crates/kithd/src/crypt.rs`, `pass`: the verb is answered by that node alone, another node
    asks it as itself having checked the caller, and the audit log records that it was done,
    never a secret). One request enrols two keys or none. One key alone is not enrolled.
 2. **At the node**, which is running and so holds the state's key in memory
-   (`crypt::open` returns it with `By`, `crypt.rs:991`): its console says "touch key 1 of 2".
+   (`crypt::open` returns it with `By`): its console says "touch key 1 of 2".
    The person plugs in key 1. The node makes a credential for the relying party `kith.local` with
    `hmac-secret`, and one touch. It then asks for an assertion with a random 32-byte salt, and a second touch
    returns the `hmac-secret`: `makeCredential` does not return the secret, only that the key has it.
@@ -189,21 +192,20 @@ and a node can do, and no part of it needs a typed line at a console that is not
    key") rather than enrolled twice.
 4. **Written, read back, opened once, in that order** (the rule of adr-unlock's order of writes,
    which keeps the recovery key's line): the state key is wrapped under each `hmac-secret`
-   by `wrap` (`crypt.rs:228`), both `fido2:` lines go into the record in one write, the copy first
-   (`crypt.rs:464-493`), the record is read back by `Record::read` (`crypt.rs:442-459`), and
-   `unwrap` (`crypt.rs:237`) of the line read back with the secret still in memory must give the
+   by `wrap`, both `fido2:` lines go into the record in one write, the copy first
+   (`Record::order`), the record is read back by `Record::read`, and
+   `unwrap` of the line read back with the secret still in memory must give the
    state's key. Only then does the verb answer. A cut at any point leaves the record as it
    was, or whole with the new lines; no old line goes at any point.
 5. **Status** says "FIDO2: 2 keys"; a key's credential id is not secret and is shown by its first
    8 hex digits, so two keys can be told apart.
 6. **Remove**: `kith node key remove NAME` removes both lines (one alone is refused: a node with one
    key is the state the request guards against), after the recovery key has been shown once
-   (`seen`, `crypt.rs:130`), so the record is never left with a way in only a lost key held.
+   (`seen`, in `Record`), so the record is never left with a way in only a lost key held.
    Replacing a lost key is `remove` then `add` with two keys, which needs the node running and one
    other way in; swapping one key of two is open (section 8).
 
-The record's lines follow `passphrase:` (`Record::text`, `crypt.rs:387-437`; `parse_said`,
-`crypt.rs:326-385`): `fido2: <credential id hex> <salt hex> <wrapped key hex>`, one line a key.
+The record's lines follow `passphrase:` (`Record::text`; `Record::parse_said`): `fido2: <credential id hex> <salt hex> <wrapped key hex>`, one line a key.
 A line that cannot be read is dropped and said, never "damaged"; a third line is dropped and said
 at read and refused at enrolment (`Record::with_fido2`, T-0971, with the order of writes `Record::order`
 and the read-back proof `fido2_proves`). An older kithd ignores
@@ -212,18 +214,18 @@ only what `Record` holds (an inference from `text()`; the downgrade is stated in
 
 **The size of the record.** A line is about 520 characters at its worst (a credential id of up to
 128 bytes in hex, the salt, a wrapped key of 92 bytes), so two take about 1.1 KB of the 4 KiB
-`ROOM` (`crypt.rs:100`), and four 2.2 KB. A node that has every other way in carries the lines
-of `Record::text` (`crypt.rs:387-437`): `secret`, `recovery`, `key`, `tpm`, `tpm-parent`,
+`ROOM` (`crypt.rs`), and four 2.2 KB. A node that has every other way in carries the lines
+of `Record::text`: `secret`, `recovery`, `key`, `tpm`, `tpm-parent`,
 `passphrase`, `tpm-pin`, `tpm-next`, `tpm-pin-next`, the two `duress` keys, `seen`. Those are
 estimated at about 1.9 KB all together (an estimate from the line formats; not measured), so
 **two fido2 lines bring the record to about 3 KB, and four would not fit in 4 KiB.** So the
 verb enrols exactly two keys and **v1 holds two lines, not four**; the `peers:` line, which is
-last and already gives way when the room is short (`crypt.rs:421-433`), gives way first, and
+last and already gives way when the room is short (in `Record::text`), gives way first, and
 the write fails and says so, before anything is written, when the lines other than `peers:`
 would not fit. T-0956 has a test with a record that has every other line.
 
 **A node in no cluster.** `pass` answers "this node is in no cluster" there
-(`crypt.rs:2413`), since it needs the cluster to say who the node is. The key verbs have the
+(in `pass`), since it needs the cluster to say who the node is. The key verbs have the
 same route and the same permit, so **on a node with no cluster they are refused the same way**
 over the API. This record does not check whether the tree has a local, owner-only route a verb
 could use instead (unverified). **T-0956 decides:** either the verb has a local route for such
@@ -268,7 +270,7 @@ Each is one task and stands alone: it merges and passes its gates without the ne
 | T-0953 | **Kernel.** `CONFIG_HIDRAW=y`, `CONFIG_USB_HID=y` in `os/kernel.config`; `CONFIG_UHID` in the test-only `os/features/uhid-test.config`; the check on the **built `.config`** (section 3), with `# CONFIG_UHID is not set` asserted for a shipped build; the image size and the second kernel's build time measured. |
 | T-0954 (carved: T-0966 the wire half, T-0968 the rest) | **The client.** `crates/kithd/src/fido2.rs`: CTAPHID framing and the CBOR subset (T-0966), then ECDH (T-0968), `hmac-secret` with the hand-written CBC, behind a trait of the device so tests use a pipe; tested on NIST's CBC vectors, the x-coordinate derivation and bad frames (short, a wrong channel, an oversize length, a keep-alive storm). **No size measure and no budget raise here:** nothing calls the code yet, and the linker may drop it, so a number taken now is not the number the feature costs. |
 | T-0955 | **The stand-in, and the client against it.** The `fido2-test` feature with the uhid authenticator and the four release guards of section 2 (`os/build.sh`'s feature rule, `ci/vm/tests.sh`, `ci/musl.sh`'s case table and grep, a loud startup line). Its VM test (`ci/vm/fido2.sh`, T-0973) is **the client against the stand-in through uhid and hidraw, and nothing more**: a `fido2-test` word on the kernel's command line, read by the test build alone, that runs `makeCredential` and `getAssertion` with a known salt on the stand-in and prints the `hmac-secret`, which the test compares with what the seed says it must be; a second stand-in with another seed gives another secret, and a touch withheld times out. It needs no record, no console prompt and no verb. |
-| T-0956 | **The record, the verbs and the state opened by touch.** The `fido2:` lines (two), the console's "touch your key" beside its typed lines (judged after the passphrase, with the same two seconds before an answer, `crypt.rs:726-757`, so a wrong key is answered as every wrong line), `kith node key add` and `remove` with the order of writes above, the audit log; the VM test of enrolling two keys and **opening the state by touching one of two stand-ins** (the other opens it too, a key it was not enrolled with is refused) and of losing one. **kithd's size is measured here, before and after, with the feature called, and the budget raised with the number if it must be** (section 5). |
+| T-0956 | **The record, the verbs and the state opened by touch.** The `fido2:` lines (two), the console's "touch your key" beside its typed lines (judged after the passphrase, with the same two seconds before an answer, in `console`, timed from the start of the attempt, so a wrong key is answered as every wrong line), `kith node key add` and `remove` with the order of writes above, the audit log; the VM test of enrolling two keys and **opening the state by touching one of two stand-ins** (the other opens it too, a key it was not enrolled with is refused) and of losing one. **kithd's size is measured here, before and after, with the feature called, and the budget raised with the number if it must be** (section 5). |
 
 The order is 1, 2, 3, 4; slices 1 and 2 are independent of each other. Only T-0956 needs the
 record, so only T-0956 can open a state by touch and measure the size of what is linked.
@@ -328,5 +330,9 @@ Self-review of this record as an adversary: the size figure (13.17) is the brief
 measured here, so a number that moves it moves section 5 and nothing else; the two
 absent QEMU devices are facts about one machine's QEMU, not about QEMU; the `hmac-secret` flow
 (two touches, no secret from `makeCredential`) is from the CTAP2 specification and is
-unverified against a real key; and the stand-in agreeing with a client written beside it is
+unverified against a real key; the console's touch for a key not enrolled (T-0974) relies on the
+key answering `NO_CREDENTIALS` at once, with no touch asked, when asked for a credential it does not
+hold (`up: true` in the request, the same: **unverified against a real key**, which may ask for a
+touch first, and then the refusal waits on it as long as a touch does); a key that holds none of
+the lines' credentials is not told apart in the log from one that opened nothing (accepted); and the stand-in agreeing with a client written beside it is
 named in section 2 as the thing the specification's vectors and a real key check.

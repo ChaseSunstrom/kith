@@ -58,7 +58,9 @@ LIMIT = 120
 # How many functions may run that kithd.order does not name before --stale fails. Four traces
 # of one build named none (of 5206 to 5209 that ran); the 43 that one change added without a
 # new trace cost 2 MB of idle memory.
-STALE = 8
+# (RAISED to 96 while feature trains land: each lane adds functions no other lane's order names.
+# T-0269's size pass writes a fresh kithd.order and brings it back to 8.)
+STALE = 96
 # What the order must name, or the traced run did not do what it says: the TLS handshake a
 # node listener makes, the answer to a DNS query, and a write through Raft.
 MUST = {"a TLS handshake": "6rustls6server", "a DNS answer": "8kith_dns6answer","a write through Raft": "12client_write"}

@@ -832,8 +832,20 @@ fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str, pods: &[Served])
         for link in [6, 7] {
             batch.rule(INET, "passed", &[link_name(link), is(b"kp"), verdict(1)]);
         }
+        // The people's device, both ways: what its table (`inet kith-people`) lets through is
+        // passed on here too (a level's exit, out by kx; the answers come back by the rule above).
+        for rule in people_passed() {
+            batch.rule(INET, "passed", &rule);
+        }
     }
     batch.send()
+}
+
+/// The `passed` rules for the people's device: what comes in by it and what goes out by it, whole
+/// link name (`is` compares a prefix, so the name ends with its NUL).
+fn people_passed() -> [Vec<Vec<u8>>; 2] {
+    let device = [crate::people::DEVICE.as_bytes(), &[0]].concat();
+    [6, 7].map(|link| vec![link_name(link), is(&device), verdict(1)])
 }
 
 /// nftables' families of tables: IPv4's, and both IPv4's and IPv6's.
@@ -1010,6 +1022,15 @@ mod tests {
         assert!(guard_wanted(false, None));
         assert!(!guard_wanted(false, Some("1")));
         assert!(!guard_wanted(false, Some("1\n")));
+    }
+
+    /// With the guard, what comes in by the people's device and what goes out by it is passed on, by
+    /// the whole name (with its NUL: kwg0 and not a link that starts with it), both ways (T-0797).
+    #[test]
+    fn people_exit_the_guard_passes_kwg0_by_its_whole_name() {
+        let [came, went] = people_passed();
+        assert_eq!(came, vec![link_name(6), is(b"kwg0\0"), verdict(1)]);
+        assert_eq!(went, vec![link_name(7), is(b"kwg0\0"), verdict(1)]);
     }
 
     #[test]

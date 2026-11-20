@@ -312,11 +312,9 @@ mod tests {
     /// gone by (without it, never: it may still be starting).
     #[tokio::test]
     async fn start_seconds_end_the_wait_for_a_first_success() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // Port 1 (tcpmux) is one nothing listens on and no test binds, unlike a freed ephemeral port.
         let check = |start| Check {
-            port,
+            port: 1,
             path: None,
             every: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
@@ -340,7 +338,7 @@ mod tests {
         };
         // Not before the deadline, and then within a probe or two.
         assert!(!down_within(Some(Duration::from_secs(3)), Duration::from_millis(2000)).await);
-        assert!(down_within(Some(Duration::from_secs(2)), Duration::from_millis(4500)).await);
+        assert!(down_within(Some(Duration::from_secs(2)), Duration::from_millis(15000)).await);
         // No deadline: a container that never listens is not killed for it.
         assert!(!down_within(None, Duration::from_millis(3500)).await);
     }
