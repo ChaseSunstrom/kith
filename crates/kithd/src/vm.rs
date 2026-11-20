@@ -184,6 +184,27 @@ pub fn command(vm: &VmUnit, pci: &[String], guard: Option<Guard>) -> Vec<String>
     line
 }
 
+/// The name of a machine's control socket in its replica's private runtime directory.
+#[allow(dead_code)] // (slice C of T-1135 starts the machine with it)
+pub const CONTROL: &str = "qmp.sock";
+
+/// Gives QEMU's command `line` its control socket at `socket` (QMP, for [`crate::qmp`]; the
+/// directory is the replica's alone, mode 0700, and the client makes the socket 0600) and, if
+/// `incoming`, an incoming mode that waits to be told where from. Another hypervisor's is left as it is.
+#[allow(dead_code)]
+pub fn control(line: &mut Vec<String>, socket: &Path, incoming: bool) {
+    if !line.first().is_some_and(|binary| binary.starts_with("qemu-system-")) {
+        return;
+    }
+    // (A comma in an option's value is doubled.)
+    let at = socket.to_string_lossy().replace(',', ",,");
+    let mut flags = vec!["-qmp".to_string(), format!("unix:{at},server=on,wait=off")];
+    if incoming {
+        flags.extend(["-incoming".to_string(), "defer".to_string()]);
+    }
+    line.splice(1..1, flags);
+}
+
 /// `vm` as the exec unit that runs it.
 pub fn exec(vm: &VmUnit, devices: &[PathBuf], guard: Option<Guard>) -> ExecUnit {
     ExecUnit {
