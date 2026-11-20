@@ -5,10 +5,13 @@
 //! `/v1.NN/` prefix) and says 501 with a JSON `{"message": ...}` to anything else: never a hang.
 //! The server is plain `std`: a thread per connection, a cap on connections, on the head of a
 //! request and on its body, keep-alive and HEAD. Nothing here is in kithd.
+//!
+//! A socket left by a process that was killed (SIGTERM included) is not cleaned up: the next
+//! `listen` on that path finds nobody answering and replaces it.
 
 use ring::digest;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -23,10 +26,14 @@ const MAX_CONNECTIONS: usize = 64;
 /// The request line and headers together, and a request's body (step 2's create call is a few KiB).
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: u64 = 1 << 20;
-/// A connection that is silent this long is closed (a waiting keep-alive too); a head that takes
-/// longer than HEAD_DEADLINE to arrive is dropped.
+/// A connection that is silent this long is closed (a waiting keep-alive too); a head, from its
+/// first byte, or a body, from the end of the head, that takes longer than these to arrive is
+/// dropped, however steadily it trickles in.
 const IDLE: Duration = Duration::from_secs(30);
 const HEAD_DEADLINE: Duration = Duration::from_secs(30);
+const BODY_DEADLINE: Duration = Duration::from_secs(60);
+/// A socket's path, in bytes, is at most this (sun_path is 108 with its NUL).
+const MAX_SOCKET_PATH: usize = 107;
 
 fn sha256_hex(parts: &[&[u8]]) -> String {
     let mut context = digest::Context::new(&digest::SHA256);
@@ -60,11 +67,16 @@ pub fn listen(path: &Path) -> io::Result<UnixListener> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => {
-            if UnixStream::connect(path).is_ok() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!("{} is served by another process", path.display()),
-                ));
+            // Stale only if nobody is there to be refused by; any other failure is not ours to guess at.
+            match UnixStream::connect(path) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!("{} is served by another process", path.display()),
+                    ));
+                }
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(_) => {
@@ -76,19 +88,63 @@ pub fn listen(path: &Path) -> io::Result<UnixListener> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
+    // Where a stranger could plant a name for us to trip on, we do not go: `parent` is ours and
+    // nobody else's to write in (a sticky directory of another's, like /tmp, is not).
+    let meta = std::fs::metadata(parent)?;
+    let me = std::fs::metadata("/proc/self")?.uid();
+    if meta.uid() != me || meta.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} must be owned by you and writable by no one else: put the socket in a directory of your own",
+                parent.display()
+            ),
+        ));
+    }
+    // A name no one can guess, made here or not at all: nothing already there is ever touched.
     // (Short: a socket's path is at most about 100 bytes.)
-    let private = parent.join(format!(".kd-{}", std::process::id()));
-    // (A run with this pid that died left this, empty or with its socket in it.)
-    let _ = std::fs::remove_file(private.join("s"));
-    let _ = std::fs::remove_dir(&private);
-    std::fs::DirBuilder::new().mode(0o700).create(&private)?;
+    let too_long = |p: &Path| {
+        let n = p.as_os_str().len();
+        (n > MAX_SOCKET_PATH).then(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is {n} bytes: a Unix socket's path is at most {MAX_SOCKET_PATH}, so use a shorter --listen",
+                    p.display()
+                ),
+            )
+        })
+    };
+    let mut private = None;
+    for _ in 0..4 {
+        let mut random = [0u8; 6];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+        let name = format!(
+            ".kd-{}-{}",
+            std::process::id(),
+            random.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        if let Some(e) = too_long(path).or_else(|| too_long(&parent.join(&name).join("s"))) {
+            return Err(e);
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(parent.join(&name)) {
+            Ok(()) => {
+                private = Some(parent.join(name));
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let private = private.ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "no free private name"))?;
     let made = (|| {
         let listener = UnixListener::bind(private.join("s"))?;
         std::fs::set_permissions(private.join("s"), std::fs::Permissions::from_mode(0o600))?;
         std::fs::rename(private.join("s"), path)?;
         Ok(listener)
     })();
-    // (After the rename it is empty; after a failure the socket may still be in it.)
+    // Only what this call made: after the rename the directory is empty; after a failure the
+    // socket may still be in it.
     let _ = std::fs::remove_file(private.join("s"));
     let _ = std::fs::remove_dir(&private);
     made
@@ -111,8 +167,7 @@ pub fn serve(listener: UnixListener) {
         };
         let _ = std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
             let _slot = slot;
-            let _ = stream.set_read_timeout(Some(IDLE));
-            handle(stream);
+            handle(stream, HEAD_DEADLINE, BODY_DEADLINE);
         });
     }
 }
@@ -161,16 +216,37 @@ fn message(status: u16, text: impl AsRef<str>) -> Reply {
     json_reply(status, format!(r#"{{"message":{}}}"#, q(text.as_ref())))
 }
 
-/// Requests and replies on one connection until it closes (a stream with a read timeout, in `serve`).
-fn handle<S: Read + Write>(stream: S) {
-    let mut reader = BufReader::new(stream);
+/// A stream whose every read ends at `until`: the clock is the stream's, not each read's, so a peer
+/// sending a byte a second cannot hold a connection past it.
+struct Clocked {
+    stream: UnixStream,
+    until: Instant,
+}
+
+impl Read for Clocked {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
+/// Requests and replies on one connection until it closes.
+fn handle(stream: UnixStream, head: Duration, body: Duration) {
+    let mut reader = BufReader::new(Clocked {
+        stream,
+        until: Instant::now(),
+    });
     loop {
-        let (reply, head_only, close) = match read_request(&mut reader) {
+        let (reply, head_only, close) = match read_request(&mut reader, head, body) {
             Ok(None) => return,
             Ok(Some(request)) => (route(&request), request.method == "HEAD", request.close),
             Err(reply) => (reply, false, true),
         };
-        if write_reply(reader.get_mut(), &reply, head_only, close).is_err() || close {
+        if write_reply(&reader.get_ref().stream, &reply, head_only, close).is_err() || close {
             return;
         }
     }
@@ -204,7 +280,7 @@ fn write_reply(mut out: impl Write, reply: &Reply, head_only: bool, close: bool)
 }
 
 /// One line of the head without its line end. `None`: the peer went away, went quiet or was too slow.
-fn head_line<S: Read>(reader: &mut BufReader<S>, used: &mut usize, start: Instant) -> Result<Option<String>, Reply> {
+fn head_line(reader: &mut BufReader<Clocked>, used: &mut usize) -> Result<Option<String>, Reply> {
     let mut line = String::new();
     let room = (MAX_HEAD - (*used).min(MAX_HEAD)) as u64 + 1;
     let n = match reader.by_ref().take(room).read_line(&mut line) {
@@ -216,7 +292,7 @@ fn head_line<S: Read>(reader: &mut BufReader<S>, used: &mut usize, start: Instan
     if *used > MAX_HEAD {
         return Err(message(431, "kith: the request head is too large"));
     }
-    if !line.ends_with('\n') || start.elapsed() > HEAD_DEADLINE {
+    if !line.ends_with('\n') {
         return Ok(None);
     }
     Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
@@ -224,9 +300,16 @@ fn head_line<S: Read>(reader: &mut BufReader<S>, used: &mut usize, start: Instan
 
 /// The next request, its body read and dropped (no endpoint here takes one). `Err`: the reply to
 /// send before closing; `None`: close without one.
-fn read_request<S: Read>(reader: &mut BufReader<S>) -> Result<Option<Request>, Reply> {
-    let (start, mut used) = (Instant::now(), 0);
-    let Some(first) = head_line(reader, &mut used, start)? else {
+fn read_request(reader: &mut BufReader<Clocked>, head: Duration, body: Duration) -> Result<Option<Request>, Reply> {
+    // Waiting for the first byte of a request is the idle time of a keep-alive; the head's clock
+    // starts when that byte is here.
+    reader.get_mut().until = Instant::now() + IDLE;
+    if !reader.fill_buf().is_ok_and(|b| !b.is_empty()) {
+        return Ok(None);
+    }
+    reader.get_mut().until = Instant::now() + head;
+    let mut used = 0;
+    let Some(first) = head_line(reader, &mut used)? else {
         return Ok(None);
     };
     let mut parts = first.split(' ');
@@ -239,7 +322,7 @@ fn read_request<S: Read>(reader: &mut BufReader<S>) -> Result<Option<Request>, R
     }
     let (mut length, mut chunked, mut close) = (None, false, version == "HTTP/1.0");
     loop {
-        let Some(line) = head_line(reader, &mut used, start)? else {
+        let Some(line) = head_line(reader, &mut used)? else {
             return Ok(None);
         };
         if line.is_empty() {
@@ -279,6 +362,7 @@ fn read_request<S: Read>(reader: &mut BufReader<S>) -> Result<Option<Request>, R
             format!("kith: a request body is at most {MAX_BODY} bytes"),
         ));
     }
+    reader.get_mut().until = Instant::now() + body;
     if io::copy(&mut reader.by_ref().take(length), &mut io::sink()).is_ok_and(|n| n == length) {
         Ok(Some(Request {
             method: method.to_string(),
@@ -418,7 +502,7 @@ mod tests {
         fn new() -> Client {
             let (client, server) = UnixStream::pair().unwrap();
             client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            std::thread::spawn(move || handle(server));
+            std::thread::spawn(move || handle(server, HEAD_DEADLINE, BODY_DEADLINE));
             Client(BufReader::new(client))
         }
 
@@ -658,6 +742,92 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         assert_eq!(listen(&file).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Feed `bytes` to `handle` one every 40 ms; how long until it hung up (None: it never did in 5 s).
+    fn trickle(head: &'static [u8], rest: &'static [u8]) -> Option<Duration> {
+        let (client, server) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || handle(server, Duration::from_millis(400), Duration::from_millis(400)));
+        let start = Instant::now();
+        let mut writer = client.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let _ = writer.write_all(head);
+            for b in rest {
+                if writer.write_all(&[*b]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let mut client = client;
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut sink = Vec::new();
+        client.read_to_end(&mut sink).ok().map(|_| start.elapsed())
+    }
+
+    #[test]
+    fn a_head_or_a_body_that_trickles_in_is_cut_off_at_its_deadline() {
+        // A head: every read arrives in time, the head as a whole does not.
+        let cut = trickle(b"GET /_ping HTTP/1.1\r\nX-Slow: ", &[b'a'; 200]).expect("a slow head was never cut");
+        assert!(cut < Duration::from_secs(2), "cut after {cut:?}");
+        // A body.
+        let cut = trickle(b"POST /x HTTP/1.1\r\nContent-Length: 1000\r\n\r\n", &[b'a'; 200])
+            .expect("a slow body was never cut");
+        assert!(cut < Duration::from_secs(2), "cut after {cut:?}");
+    }
+
+    #[test]
+    fn an_idle_keep_alive_is_not_on_the_head_clock() {
+        let (client, server) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || handle(server, Duration::from_millis(300), Duration::from_millis(300)));
+        let mut c = Client(BufReader::new(client));
+        assert_eq!(c.ask(&get("/_ping")).0, 200);
+        // Longer than the head deadline, with no byte in flight: the next request still works.
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(c.ask(&get("/_ping")).0, 200);
+    }
+
+    #[test]
+    fn a_too_long_socket_path_says_so_and_any_other_connect_error_is_returned() {
+        let dir = scratch("long");
+        let long = dir.join("x".repeat(100)).join("docker.sock");
+        let err = listen(&long).unwrap_err();
+        assert!(err.to_string().contains("at most 107"), "{err}");
+        assert!(!dir.join("x".repeat(100)).join("docker.sock").exists());
+        // A socket this user cannot connect to is not "stale".
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("docker.sock");
+        let held = listen(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // (root connects regardless; there the socket is simply live.)
+        let kind = listen(&path).unwrap_err().kind();
+        assert!(
+            matches!(kind, io::ErrorKind::PermissionDenied | io::ErrorKind::AddrInUse),
+            "{kind:?}"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_planted_private_name_is_not_followed_and_a_shared_parent_is_refused() {
+        let dir = scratch("planted");
+        let (elsewhere, path) = (dir.join("elsewhere"), dir.join("docker.sock"));
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("s"), "keep").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The name the first version made: a stranger's symlink there led to a file of ours.
+        std::os::unix::fs::symlink(&elsewhere, dir.join(format!(".kd-{}", std::process::id()))).unwrap();
+        let listener = listen(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(elsewhere.join("s")).unwrap(), "keep");
+        drop(listener);
+        // A directory others can write in (and not sticky) is no place for it.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = listen(&dir.join("other.sock")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!dir.join("other.sock").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
