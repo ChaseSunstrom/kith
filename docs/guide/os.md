@@ -323,7 +323,10 @@ its key. A release signed by any other key is refused, and so is one older than 
 unless the plan says `allowDowngrade: true`. A new image built with another key does not move
 running nodes.
 
-**Where the file comes from.** Only the address the release names: no redirect, no proxy. An
+**Where the file comes from.** The address the release names, or where it redirects to (up to 5
+redirects, as a GitHub release's download address does to its asset host): each address is
+checked and held as the first is, nothing is sent but the request, https never goes back to
+http, and a loop or a user and password in an address is refused. No proxy. An
 address on the node itself or its own networks (loopback, private, shared, link-local,
 multicast) is refused. `--lan-releases` (`lanReleases: true` at install) allows the private
 ranges for a release server on the LAN; then whoever may write an OSRelease can have every node
