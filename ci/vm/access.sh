@@ -187,8 +187,10 @@ for r in sorted(found, key=lambda r: r["metadata"]["name"]):
             applied first
             applied second
             agreed ConfigMap 'ConfigMap/genuine=.*"n": "2"'
-            # The audit log's refusals are held to a number a minute: begin a minute of our own.
-            sleep $((61 - $(date +%s) % 60))
+            # The audit log's refusals are held to a number a minute, by each node's own clock (a VM's runs
+            # some seconds off the host's, so the host's minute proves nothing): let a whole minute pass, so
+            # the writers' refusals above cannot be in the minute the forged ones are counted in.
+            sleep 61
             # (1) a bare RoleBinding, which no one signed.
             printf '{"Apply":{"resources":[{"apiVersion":"kith.dev/v1","kind":"RoleBinding","metadata":{"name":"forged-bare"},"spec":{"role":"cluster-admin","subjects":["mallory"]}}],"at":0}}' >"$work/bare.entry"
             forge bare
