@@ -280,15 +280,26 @@ root, which may be the mount of an encrypted Volume) and `beneath` (below it): `
 the root, so a mount under the Volume is refused. A missing step is made as its parent's owner.
 The answer is the descriptor with its path beside it (in process, `VolumeDir`; across the socket,
 `Answer::Dir` with one descriptor). Content reads and writes go through the held descriptor: a
-share, a backup, a replica, the volume files, an image, and the controller's check. Still by path,
-and raceable: the controller's start path handed to `kith_runtime::Mount.host` (its descriptor is
-dropped there, and runc, the container's stage and `open_tree`, the `give` chown and the OCI bind
-resolve the path again); a restore's and a replica's new copy, whose `read_dir`, `canonicalize` and
+share, a backup, a replica, the volume files, an image, the controller's check, and (T-1113) the
+container's start. The controller hands the runtime the held descriptor in `kith_runtime::Mount.held`
+(`Held`), and as root the runtime never names the path again: the stage clones the tree from the
+descriptor (`open_tree` on the descriptor, `CLONE | RECURSIVE | EMPTY_PATH`, before the stage's
+mount namespace is made) and mounts the clone (`mount_setattr` for an id-mapped one, `move_mount`);
+the OCI bind source is that staged clone, not the path; and `give` walks the held directory by
+descriptor, `fchownat` with `AT_SYMLINK_NOFOLLOW` on each entry, so a link is given as a link and
+never followed, and a file with another hard link is left as it is (it may be one outside the
+volume; a hard link inside a volume is therefore not given). A check between the stat and the
+chown of one entry is still a race; `protected_hardlinks` limits what it gains. In `--split` the
+descriptor follows the unit across the socket (`Call::Create.volumes` names the mounts, their
+descriptors ride after the output and error files as `SCM_RIGHTS`), and `check_mount` refuses one
+that is not the directory its path names (device and inode). Still by path, and raceable: a
+subPath of a Volume (it is opened beneath the held directory, but needs the id-mapped mount, and
+is refused without it); a kithd that is not root (the OCI bind source is the path: there is no
+boundary to cross); a restore's and a replica's new copy, whose `read_dir`, `canonicalize` and
 rename into place name the directory by path (`backups.rs`, `replicas.rs`); and an NFS export
 (`share.rs`), which exports by path. A node's own `hostPaths` directory refuses a link at its last
-component (`O_NOFOLLOW`, `O_DIRECTORY`), but an ancestor link is followed as before. None of the
-by-path steps is closed by this; passing the descriptors to the runtime and the export is the
-open work of T-0810.
+component (`O_NOFOLLOW`, `O_DIRECTORY`), but an ancestor link is followed as before. The by-path
+steps of this list are not closed by this.
 
 About thirty requests. That is more than the plan guessed (ten to fifteen), and the
 study says why: API handlers reach into volumes and containers in more places than the

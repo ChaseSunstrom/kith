@@ -56,7 +56,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -335,8 +335,12 @@ fn unmappable<'a>(image: &'a Image, unit: &'a Unit) -> Option<&'a Path> {
     let xfs = FsType(0x5846_5342 as _);
     let kinds = [EXT4_SUPER_MAGIC, TMPFS_MAGIC, xfs, BTRFS_SUPER_MAGIC];
     let mappable = |path: &Path| statfs(path).is_ok_and(|fs| kinds.contains(&fs.filesystem_type()));
-    let paths = std::iter::once(&image.rootfs).chain(unit.mounts.iter().map(|volume| &volume.host));
-    paths.map(PathBuf::as_path).find(|path| !mappable(path))
+    if !mappable(&image.rootfs) {
+        return Some(&image.rootfs);
+    }
+    // (A held volume is asked of by its descriptor: what is at its path now is not it.)
+    let volume = unit.mounts.iter().find(|volume| !mappable(&volume.source()));
+    volume.map(|volume| volume.host.as_path())
 }
 
 /// Mounts, in the calling thread's own mount namespace, what a container whose ids start at
@@ -344,23 +348,14 @@ fn unmappable<'a>(image: &'a Image, unit: &'a Unit) -> Option<&'a Path> {
 /// id-mapped to its range (a file of the image's root is its root's, and one a volume's user
 /// owns on disk is that user's in it), and its bundle at `STAGE/bundle`. The container's mount
 /// namespace is made as a copy of this one; the node's never has them, and they go with it.
+///
+/// A volume that comes held ([`Mount::held`]) is cloned from its descriptor, and never opened by
+/// its path: see [`clone_held`].
 fn stage(image: &Image, unit: &Unit, bundle: &Path, base: u32) -> io::Result<()> {
     use kith_dm_sys::{NODEV, NOSUID, RDONLY, mount_mapped};
     use nix::mount::{MsFlags, mount};
-    use std::os::fd::AsFd;
-    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
-    mount(
-        None::<&str>,
-        "/",
-        None::<&str>,
-        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
-        None::<&str>,
-    )?;
-    let stage = Path::new(STAGE);
-    fs::create_dir_all(stage)?;
-    // (Its root may pass through, to what is its own: nothing else of the node's is on the way.)
-    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
-    mount(Some("tmpfs"), stage, Some("tmpfs"), flags, Some("mode=0711"))?;
+    let mut held = clone_held(unit)?;
+    let stage = unshare_stage()?;
     let users = kith_dm_sys::user_namespace(base, RANGE)?;
     fs::create_dir(stage.join("root"))?;
     // (Writable until the container's root is made read-only, after its mount points are made
@@ -380,6 +375,11 @@ fn stage(image: &Image, unit: &Unit, bundle: &Path, base: u32) -> io::Result<()>
     for (n, volume) in unit.mounts.iter().enumerate() {
         let at = stage.join(format!("v{n}"));
         let only = if volume.read_only { RDONLY } else { 0 };
+        if let Some((tree, is_dir)) = held[n].take() {
+            mountpoint(&at, is_dir)?;
+            kith_dm_sys::mount_tree(tree.as_fd(), &at, Some(users.as_fd()), NOSUID | NODEV | only)?;
+            continue;
+        }
         let Some(part) = &volume.part else {
             match fs::metadata(&volume.host)?.is_dir() {
                 true => fs::create_dir(&at)?,
@@ -402,6 +402,72 @@ fn stage(image: &Image, unit: &Unit, bundle: &Path, base: u32) -> io::Result<()>
         nix::sched::setns(File::open(netns)?, nix::sched::CloneFlags::CLONE_NEWNET)?;
     }
     Ok(())
+}
+
+/// [`stage`] for a container that keeps the node's users (no ranges to map to): only its held
+/// volumes are staged, each at `STAGE/v<n>` as it is, for the spec to bind from there.
+fn stage_held(unit: &Unit) -> io::Result<()> {
+    let mut held = clone_held(unit)?;
+    let stage = unshare_stage()?;
+    for (n, tree) in held.iter_mut().enumerate() {
+        if let Some((tree, is_dir)) = tree.take() {
+            let at = stage.join(format!("v{n}"));
+            mountpoint(&at, is_dir)?;
+            kith_dm_sys::mount_tree(tree.as_fd(), &at, None, 0)?;
+        }
+    }
+    Ok(())
+}
+
+/// The calling thread's mount namespace made its own, with a tmpfs at `STAGE` in it.
+fn unshare_stage() -> io::Result<&'static Path> {
+    use nix::mount::{MsFlags, mount};
+    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )?;
+    let stage = Path::new(STAGE);
+    fs::create_dir_all(stage)?;
+    // (Its root may pass through, to what is its own: nothing else of the node's is on the way.)
+    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+    mount(Some("tmpfs"), stage, Some("tmpfs"), flags, Some("mode=0711"))?;
+    Ok(stage)
+}
+
+/// Where a mount is made: a directory, or an empty file for one that is a file.
+fn mountpoint(at: &Path, is_dir: bool) -> io::Result<()> {
+    match is_dir {
+        true => fs::create_dir(at),
+        false => File::create(at).map(drop),
+    }
+}
+
+/// What each held volume of `unit` (the part of it, if it has one) is as a tree of its own, and
+/// whether it is a directory: `None` for a volume that is not held. Taken before the thread's
+/// mount namespace is unshared: a descriptor opened in the node's is not one a bind made in
+/// another namespace may name, and a detached tree is one that goes where it is moved. The part
+/// is opened beneath the held directory, with no link followed.
+fn clone_held(unit: &Unit) -> io::Result<Vec<Option<(OwnedFd, bool)>>> {
+    let one = |volume: &Mount| -> io::Result<Option<(OwnedFd, bool)>> {
+        let Some(held) = &volume.held else { return Ok(None) };
+        let part;
+        let from = match &volume.part {
+            None => held.fd(),
+            Some(name) => {
+                part = kith_dm_sys::beneath(&held.path(), name).map_err(|e| {
+                    io::Error::new(e.kind(), format!("subPath `{name}` of {}: {e}", volume.host.display()))
+                })?;
+                part.as_fd()
+            }
+        };
+        let is_dir = File::from(from.try_clone_to_owned()?).metadata()?.is_dir();
+        Ok(Some((kith_dm_sys::clone_tree(from)?, is_dir)))
+    };
+    unit.mounts.iter().map(one).collect()
 }
 
 /// The words of the refusal of a `no_node_root` unit that would be root, by which whoever
@@ -444,6 +510,57 @@ pub struct Mount {
     /// link followed and mounted as opened ([`kith_dm_sys::beneath`]): only where the
     /// container has users of its own, as an id-mapped mount; elsewhere it is not created.
     pub part: Option<String>,
+    /// The directory `host` is, held open by whoever took it beneath its root. Where it is set
+    /// the runtime mounts, binds and gives what the descriptor is and never names `host` again
+    /// (a path of a Volume is the tenant's to re-point: a link put there between the check and
+    /// the use would be a host directory bound, or given, as root). `host` is then only what
+    /// names it in a message. Not serialized: it crosses a socket as a descriptor.
+    #[serde(skip)]
+    pub held: Option<Held>,
+}
+
+/// A directory held open, shared by the clones of the [`Mount`] it is in.
+#[derive(Debug, Clone)]
+pub struct Held(std::sync::Arc<OwnedFd>);
+
+impl Held {
+    pub fn new(fd: OwnedFd) -> Held {
+        Held(std::sync::Arc::new(fd))
+    }
+
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+
+    /// The directory as a path of this process only: it names what the descriptor is, whatever
+    /// is at the place it was taken.
+    fn path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.0.as_raw_fd()))
+    }
+
+    /// The directory opened again for reading (the descriptor held may be `O_PATH`, which reads
+    /// nothing): the same directory, as a `/proc` link of a descriptor leads to its own.
+    fn reopen(&self) -> io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY)
+            .open(self.path())
+    }
+}
+
+impl PartialEq for Held {
+    fn eq(&self, other: &Held) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Mount {
+    /// What names the directory for a use that takes a path (a file system's kind): the held
+    /// descriptor's, else `host`.
+    fn source(&self) -> PathBuf {
+        self.held.as_ref().map_or_else(|| self.host.clone(), Held::path)
+    }
 }
 
 /// A unit an earlier kithd left running, found by [`Runtime::cleanup_but`]: its cgroup still has
@@ -816,6 +933,9 @@ impl Runtime {
             limited.to_mut().dmem.clear();
         }
         let unit = &*limited;
+        // (A held volume of a container that keeps the node's users is bound from its own
+        // clone too: see `stage_held`.)
+        let staged_held = uid.is_root() && shift.is_none() && unit.mounts.iter().any(|volume| volume.held.is_some());
         let spec = spec_shifted(id, image, unit, &cgroup, &bundle, (uid, gid), shift).ctx(&what)?;
         // (The spec names a user only where kithd is root: see `spec_shifted`.)
         let user = spec.process().as_ref().map(|process| process.user());
@@ -829,7 +949,7 @@ impl Runtime {
             // (A volume is its user's on disk as it is in the container: an id-mapped mount
             // shows its owners as they are. A new one is root's until given.)
             for volume in unit.mounts.iter().filter(|volume| volume.give && user.uid() != 0) {
-                give(&volume.host, user.uid(), user.gid()).ctx(format!(
+                give_volume(volume, user.uid(), user.gid()).ctx(format!(
                     "{what}: giving {} to user {}",
                     volume.host.display(),
                     user.uid()
@@ -860,6 +980,8 @@ impl Runtime {
             File::open(&bundle).and_then(|dir| dir.sync_all()).ctx(&what)?;
             if let Some(base) = shift {
                 stage(image, unit, &bundle, base).ctx(format!("{what}: mounting its image and volumes id-mapped"))?;
+            } else if staged_held {
+                stage_held(unit).ctx(format!("{what}: mounting its volumes from their descriptors"))?;
             }
             let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
                 .with_root_path(self.root.join("state"))
@@ -918,10 +1040,10 @@ impl Runtime {
             }
         };
         let built = match shift {
-            None => build(),
+            None if !staged_held => build(),
             // (In a thread of its own, whose mount namespace `stage` makes its own: the
             // container's is made from the thread's, and the node's stays as it was.)
-            Some(_) => std::thread::scope(|scope| scope.spawn(build).join())
+            _ => std::thread::scope(|scope| scope.spawn(build).join())
                 .unwrap_or_else(|_| err(format!("{what}: its making panicked"))),
         };
         if built.is_err() {
@@ -1705,45 +1827,85 @@ impl Executor for Entry {
 /// volume, one written by root before containers had users, one restored, one whose
 /// workload changed its user).
 ///
-/// Each directory is opened as an entry of the one that holds it and never through a link,
-/// so a program writing the volume meanwhile cannot have something outside it given away.
+/// Each directory is opened as an entry of the one that holds it and never through a link, and
+/// each other entry is given by `fchownat` with no link followed, under the descriptor of the
+/// directory that holds it: a program writing the volume meanwhile cannot have something
+/// outside it given away. A volume that is held ([`Mount::held`]) starts from its descriptor,
+/// and its path is never named; one that is not, from its path.
 //
 // ponytail: a walk of the whole volume when its user changes, and two workloads with two
 // users on one volume walk it at every start. (A container's range of ids never walks one:
 // its volumes are id-mapped, see `stage`.) A mount that maps the volume's owner to the
 // container's user, when a volume is big enough for that to hurt.
-fn give(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    fn held(dir: &Path) -> io::Result<File> {
-        let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW;
-        fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)
+fn give_volume(volume: &Mount, uid: u32, gid: u32) -> io::Result<()> {
+    match &volume.held {
+        Some(held) => give_fd(held.reopen()?, uid, gid),
+        None => give_path(&volume.host, uid, gid),
     }
+}
+
+/// [`give_volume`] for a directory named by path (a volume that is not held, one file of a map).
+fn give_path(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     // (One file of a map, mounted alone.)
     if fs::symlink_metadata(dir)?.is_file() {
         let flags = nix::libc::O_NOFOLLOW | nix::libc::O_PATH;
         let file = fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)?;
         return std::os::unix::fs::chown(format!("/proc/self/fd/{}", file.as_raw_fd()), Some(uid), Some(gid));
     }
-    fn walk(dir: File, uid: u32, gid: u32, deeper: u32) -> io::Result<()> {
-        for entry in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                std::os::unix::fs::lchown(entry.path(), Some(uid), Some(gid))?;
-            } else if deeper == 0 {
-                return Err(io::Error::other("directories more than 128 deep"));
-            } else {
-                walk(held(&entry.path())?, uid, gid, deeper - 1)?;
+    let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW;
+    give_fd(
+        fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)?,
+        uid,
+        gid,
+    )
+}
+
+/// [`give_volume`] for the directory `top` is open on.
+fn give_fd(top: File, uid: u32, gid: u32) -> io::Result<()> {
+    use nix::sys::stat::{SFlag, fstatat};
+    use nix::unistd::{Gid, Uid, fchownat};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    fn walk(dir: File, (uid, gid): (u32, u32), deeper: u32) -> io::Result<()> {
+        let at = dir.as_raw_fd();
+        for entry in fs::read_dir(format!("/proc/self/fd/{at}"))? {
+            let name = entry?.file_name();
+            // (Its type now, from the directory that holds it: what a program swapped it for
+            // since it was listed is what is seen.)
+            let seen = fstatat(Some(at), name.as_os_str(), nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW)?;
+            let kind = SFlag::from_bits_truncate(seen.st_mode) & SFlag::S_IFMT;
+            if kind == SFlag::S_IFDIR {
+                if deeper == 0 {
+                    return Err(io::Error::other("directories more than 128 deep"));
+                }
+                let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW;
+                let sub = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(flags)
+                    .open(Path::new(&format!("/proc/self/fd/{at}")).join(&name))?;
+                walk(sub, (uid, gid), deeper - 1)?;
+            } else if kind == SFlag::S_IFLNK || seen.st_nlink <= 1 {
+                // (A link is given as the link it is, and no more.)
+                fchownat(
+                    Some(at),
+                    name.as_os_str(),
+                    Some(Uid::from_raw(uid)),
+                    Some(Gid::from_raw(gid)),
+                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+                )?;
             }
+            // Else: a file with another name too, in this directory or one outside it (a
+            // volume is one file system, so a link a program made to a file of the node's is
+            // one of these): its owner is not changed by what is written beside it.
         }
         // (Last, the top of all included: a walk that was cut short is done again.)
         std::os::unix::fs::fchown(&dir, Some(uid), Some(gid))
     }
-    let top = held(dir)?;
     let has = top.metadata()?;
     if (has.uid(), has.gid()) == (uid, gid) {
         return Ok(());
     }
-    walk(top, uid, gid, 128)
+    walk(top, (uid, gid), 128)
 }
 
 #[cfg(test)]
@@ -2122,7 +2284,14 @@ fn spec_shifted(
             options.push("ro".into());
         }
         let bind = MountBuilder::default().destination(&volume.container).typ("bind");
-        let source = shift.map_or(volume.host.clone(), |_| staged(&format!("v{n}")));
+        // (A held volume is bound from its own clone in `STAGE`, never from its path: see
+        // `stage_held`. Where kithd is not root a path is the one it has.)
+        let staged_volume = shift.is_some() || (root && volume.held.is_some());
+        let source = if staged_volume {
+            staged(&format!("v{n}"))
+        } else {
+            volume.host.clone()
+        };
         mounts.push(bind.source(source).options(options).build()?);
     }
     spec.set_mounts(Some(mounts));
@@ -2576,6 +2745,7 @@ mod tests {
             read_only,
             give: false,
             part: None,
+            held: None,
         }
     }
 
@@ -2788,7 +2958,7 @@ mod tests {
         symlink(&outside, volume.join("a/to-dir")).unwrap();
         let group = |path: &str| fs::symlink_metadata(dir.join(path)).unwrap().gid();
 
-        give(&volume, uid, other).unwrap();
+        give_path(&volume, uid, other).unwrap();
         for given in [
             "volume",
             "volume/top",
@@ -2804,11 +2974,269 @@ mod tests {
         }
         // Theirs already: nothing is walked (what is under it is as it was left).
         nix::unistd::chown(&volume.join("a/b/file"), None, Some(gid.into())).unwrap();
-        give(&volume, uid, other).unwrap();
+        give_path(&volume, uid, other).unwrap();
         assert_eq!(group("volume/a/b/file"), gid);
         // A volume that is itself a link is not a volume.
-        assert!(give(&volume.join("a/to-dir"), uid, other).is_err());
+        assert!(give_path(&volume.join("a/to-dir"), uid, other).is_err());
         assert_eq!(group("outside"), gid);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A volume held open, as the controller makes one: `host` names it in a message only.
+    fn held_mount(dir: &Path, at: &str, path_only: bool) -> Mount {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = if path_only { nix::libc::O_PATH } else { 0 };
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags | nix::libc::O_DIRECTORY)
+            .open(dir)
+            .unwrap();
+        Mount {
+            give: true,
+            held: Some(Held::new(OwnedFd::from(file))),
+            ..bind(dir.to_str().unwrap(), at, false)
+        }
+    }
+
+    /// A second group of this user, to give files to (only root can give them to another user);
+    /// `None`, with a line, for a user with one.
+    fn second_group() -> Option<(u32, u32, u32)> {
+        let (uid, gid) = (nix::unistd::getuid().as_raw(), nix::unistd::getgid().as_raw());
+        let other = nix::unistd::getgroups()
+            .unwrap()
+            .iter()
+            .map(|g| g.as_raw())
+            .find(|g| *g != gid);
+        if other.is_none() {
+            eprintln!("skipped: this user has one group, so nothing can be given");
+        }
+        other.map(|other| (uid, gid, other))
+    }
+
+    /// A volume that is held is given from its descriptor, whatever its path became: a link
+    /// put there after it was opened, even to a directory of the node's, is given nothing, nor
+    /// is what is below it.
+    #[test]
+    fn held_volume_swapped_for_a_symlink_is_given_as_opened() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-held-swap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside, moved) = (dir.join("volume"), dir.join("outside"), dir.join("moved"));
+        fs::create_dir_all(volume.join("sub")).unwrap();
+        fs::create_dir_all(outside.join("sub")).unwrap();
+        for file in ["volume/sub/f", "outside/f", "outside/sub/f"] {
+            fs::write(dir.join(file), "x").unwrap();
+        }
+        for path_only in [false, true] {
+            let mount = held_mount(&volume, "/data", path_only);
+            // The swap, after the descriptor was taken and before the use.
+            fs::rename(&volume, &moved).unwrap();
+            symlink(&outside, &volume).unwrap();
+
+            give_volume(&mount, uid, other).unwrap();
+            let group = |path: &str| fs::symlink_metadata(dir.join(path)).unwrap().gid();
+            for given in ["moved", "moved/sub", "moved/sub/f"] {
+                assert_eq!(group(given), other, "{given} (path only: {path_only})");
+            }
+            for kept in ["outside", "outside/f", "outside/sub", "outside/sub/f"] {
+                assert_eq!(group(kept), gid, "{kept} (path only: {path_only})");
+            }
+            // And what a unit's own questions of it are asked of it, not of the link.
+            assert_eq!(
+                mount.source().metadata().unwrap().ino(),
+                fs::metadata(&moved).unwrap().ino()
+            );
+
+            fs::remove_file(&volume).unwrap();
+            fs::rename(&moved, &volume).unwrap();
+            nix::unistd::chown(&volume, None, Some(gid.into())).unwrap();
+            nix::unistd::chown(&volume.join("sub"), None, Some(gid.into())).unwrap();
+            nix::unistd::chown(&volume.join("sub/f"), None, Some(gid.into())).unwrap();
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A program swapping the volume's directory for a link and back, over and over, while it is
+    /// given: nothing of the directory it is swapped for is ever given.
+    #[test]
+    fn held_volume_swap_thread_never_reaches_what_it_is_swapped_for() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        use std::sync::atomic::AtomicBool;
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-held-thread-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside, moved) = (dir.join("volume"), dir.join("outside"), dir.join("moved"));
+        fs::create_dir_all(&volume).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("f"), "x").unwrap();
+        fs::write(volume.join("f"), "x").unwrap();
+        let mount = held_mount(&volume, "/data", false);
+        // The held directory is moved off its name once, and the name is a link and a
+        // directory in turn (made in a hurry, as a program would).
+        fs::rename(&volume, &moved).unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = symlink(&outside, &volume);
+                    let _ = fs::remove_file(&volume);
+                    let _ = fs::create_dir(&volume);
+                    let _ = fs::remove_dir(&volume);
+                }
+            });
+            for round in 0..200 {
+                // (Given back to the group it had, then given again.)
+                nix::unistd::chown(&moved, None, Some(gid.into())).unwrap();
+                nix::unistd::chown(&moved.join("f"), None, Some(gid.into())).unwrap();
+                give_volume(&mount, uid, other).unwrap();
+                assert_eq!(fs::metadata(moved.join("f")).unwrap().gid(), other, "round {round}");
+                for kept in [&outside, &outside.join("f")] {
+                    assert_eq!(
+                        fs::metadata(kept).unwrap().gid(),
+                        gid,
+                        "round {round}: {}",
+                        kept.display()
+                    );
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A held volume is bound from its own clone beneath `STAGE`, where kithd is root, whether or
+    /// not it has a range of ids of its own; never by its path, which is what a program may have
+    /// swapped. Where kithd is not root, no such clone can be made, and the path is the bind's.
+    #[test]
+    fn held_volume_is_bound_from_its_clone_and_never_its_path() {
+        use nix::unistd::{Gid, Uid};
+        let dir = std::env::temp_dir().join(format!("kith-held-bind-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let unit = Unit {
+            mounts: vec![bind("/srv/plain", "/plain", false), held_mount(&dir, "/data", false)],
+            ..Unit::default()
+        };
+        let source = |spec: &Spec, at: &str| {
+            let mounts = spec.mounts().clone().unwrap();
+            let found = mounts.iter().find(|m| m.destination() == Path::new(at)).unwrap();
+            found.source().clone().unwrap()
+        };
+        let root = (Uid::from_raw(0), Gid::from_raw(0));
+        let user = (Uid::from_raw(1000), Gid::from_raw(1000));
+        for (ids, shift) in [(root, None), (root, Some(100_000)), (user, None)] {
+            let made = spec_shifted("a", &image, &unit, "/kith/a", Path::new("/b"), ids, shift).unwrap();
+            let (plain, data) = (source(&made, "/plain"), source(&made, "/data"));
+            let staged = ids == root;
+            assert_eq!(
+                data,
+                if staged {
+                    Path::new(STAGE).join("v1")
+                } else {
+                    dir.clone()
+                },
+                "{ids:?} {shift:?}"
+            );
+            assert_eq!(
+                plain,
+                if shift.is_some() {
+                    Path::new(STAGE).join("v0")
+                } else {
+                    PathBuf::from("/srv/plain")
+                },
+                "{ids:?} {shift:?}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A volume that is held is cloned from its descriptor, a volume that is not is not cloned:
+    /// nothing is taken from a path here.
+    #[test]
+    fn held_volume_clones_only_what_is_held() {
+        let unit = Unit {
+            mounts: vec![bind("/srv/plain", "/plain", false)],
+            ..Unit::default()
+        };
+        assert!(clone_held(&unit).unwrap().iter().all(Option::is_none));
+    }
+
+    /// A link in the volume is given as a link (not what it names, a file or a directory), and
+    /// a file that has a second name is not given: a name made outside the volume for a file of
+    /// the node's is how a program would have that given away.
+    #[test]
+    fn give_nofollow_gives_a_link_as_a_link_and_leaves_a_hardlinked_file() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-nofollow-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside) = (dir.join("volume"), dir.join("outside"));
+        fs::create_dir_all(volume.join("a")).unwrap();
+        fs::create_dir_all(outside.join("deep")).unwrap();
+        for file in ["volume/a/own", "outside/file", "outside/deep/file"] {
+            fs::write(dir.join(file), "x").unwrap();
+        }
+        symlink(outside.join("file"), volume.join("a/to-file")).unwrap();
+        symlink(&outside, volume.join("a/to-dir")).unwrap();
+        symlink("/proc/self/fd/0", volume.join("to-proc")).unwrap();
+        fs::hard_link(outside.join("file"), volume.join("a/hard")).unwrap();
+        let group = |path: &str| fs::symlink_metadata(dir.join(path)).unwrap().gid();
+
+        give_volume(&held_mount(&volume, "/data", false), uid, other).unwrap();
+        for given in [
+            "volume",
+            "volume/a",
+            "volume/a/own",
+            "volume/a/to-file",
+            "volume/a/to-dir",
+            "volume/to-proc",
+        ] {
+            assert_eq!(group(given), other, "{given}");
+        }
+        for kept in [
+            "outside",
+            "outside/file",
+            "outside/deep",
+            "outside/deep/file",
+            "volume/a/hard",
+        ] {
+            assert_eq!(group(kept), gid, "{kept}");
+        }
+        assert_eq!(fs::metadata(outside.join("file")).unwrap().nlink(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An entry swapped for a link after the directory was listed, in the walk of it, is given as
+    /// a link; what it names is not: the walk is under the descriptor of each directory.
+    #[test]
+    fn give_nofollow_entry_that_is_a_directory_no_longer_is_not_entered() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside) = (dir.join("volume"), dir.join("outside"));
+        fs::create_dir_all(volume.join("d")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("file"), "x").unwrap();
+        // `d` is a link to a directory, not a directory: it is not entered.
+        fs::remove_dir(volume.join("d")).unwrap();
+        symlink(&outside, volume.join("d")).unwrap();
+        give_volume(&held_mount(&volume, "/data", false), uid, other).unwrap();
+        assert_eq!(fs::metadata(outside.join("file")).unwrap().gid(), gid);
+        assert_eq!(fs::metadata(&outside).unwrap().gid(), gid);
+        assert_eq!(fs::symlink_metadata(volume.join("d")).unwrap().gid(), other);
         fs::remove_dir_all(&dir).unwrap();
     }
 

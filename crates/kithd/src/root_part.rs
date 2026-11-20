@@ -560,6 +560,20 @@ fn check_mount(mount: &Mount, ground: &Ground, id: &str) -> Result<(), String> {
     let Ok(real) = host.canonicalize() else {
         return refused("a path that does not resolve");
     };
+    // A volume that comes held is mounted, given and bound from its descriptor, and the path
+    // above is only what was judged: the descriptor must be that directory (T-1113).
+    if let Some(held) = &mount.held {
+        use std::os::unix::fs::MetadataExt;
+        let held = held
+            .fd()
+            .try_clone_to_owned()
+            .map(std::fs::File::from)
+            .and_then(|file| file.metadata());
+        match (held, std::fs::metadata(&real)) {
+            (Ok(held), Ok(named)) if (held.dev(), held.ino()) == (named.dev(), named.ino()) => {}
+            _ => return refused("the descriptor it is mounted from is not the directory it names"),
+        }
+    }
     let (pod, container) = id.rsplit_once('_').unwrap_or((id, ""));
     let replica = pod.strip_suffix('b').unwrap_or(pod);
     let given = "not a directory the node gives to a container's user: it may not be given";
@@ -2032,6 +2046,9 @@ mod tests {
 
         fn create(&self, create: Create) -> Result<String, String> {
             self.said("create");
+            if create.unit.mounts.iter().any(|mount| mount.held.is_some()) {
+                self.said("create_held");
+            }
             Ok(create.id.into())
         }
 
@@ -2156,6 +2173,7 @@ mod tests {
             read_only: false,
             give: false,
             part: None,
+            held: None,
         }
     }
 
@@ -2311,6 +2329,31 @@ mod tests {
             ..ground(&state, "no-host-paths")
         };
         assert!(refused(&with(&inside, "/data"), &none).is_some());
+    }
+
+    /// A volume's mount named by the path `host` and held by the directory `dir` (T-1113).
+    fn held_mount(host: &Path, dir: &Path) -> Mount {
+        Mount {
+            held: Some(kith_runtime::Held::new(OwnedFd::from(File::open(dir).unwrap()))),
+            ..mount(host, "/data")
+        }
+    }
+
+    #[test]
+    fn a_held_volume_is_the_directory_its_mount_names_or_is_refused() {
+        let (_, state) = book("held-mounts");
+        let off = ground(&state, "no-host-paths");
+        let data = on_disk(state.join("volumes").join("ns").join("data"));
+        let other = on_disk(state.join("volumes").join("ns").join("other"));
+        let with = |mount: Mount| Unit {
+            mounts: vec![mount],
+            ..plain()
+        };
+        // Held by the directory it names: made.
+        assert_eq!(refused(&with(held_mount(&data, &data)), &off), None);
+        // Named one directory and held another (a swap, or a caller that lies): refused.
+        let why = refused(&with(held_mount(&data, &other)), &off).expect("a held other directory was mounted");
+        assert!(why.contains("not the directory it names"), "{why}");
     }
 
     /// Make `path` a directory (or, with a file name that has a dot, a file) and say it.
@@ -4277,6 +4320,35 @@ mod tests {
     }
 
     #[test]
+    fn a_held_volume_crosses_the_socket_with_its_descriptor_and_only_where_named() {
+        let (book, state) = book("socket-held");
+        let root = Direct::with(Fake::default(), &book).under(policy("no-host-paths"));
+        let data = on_disk(state.join("volumes").join("ns").join("data"));
+        let other = on_disk(state.join("volumes").join("ns").join("other"));
+        over_socket(&root, &Limits::default(), |socket| {
+            let image = Image::default();
+            let create = |id: &str, held: &Path| {
+                socket.create(Create {
+                    id,
+                    image: &image,
+                    unit: &Unit {
+                        mounts: vec![held_mount(&data, held)],
+                        ..plain()
+                    },
+                    out: regular(),
+                    err: regular(),
+                })
+            };
+            // The descriptor arrives and is the directory the mount names.
+            assert!(create("w_a_b_0_c", &data).is_ok());
+            // One that is another directory is refused at the root part, whatever the unit says.
+            let why = create("w_a_b_1_c", &other).unwrap_err();
+            assert!(why.contains("not the directory it names"), "{why}");
+        });
+        assert_eq!(root.hands.reached(), ["create", "create_held"]);
+    }
+
+    #[test]
     fn root_part_socket_holds_a_unit_by_its_id() {
         let (book, _) = book("socket-units");
         book.claim([PathBuf::from(INPUT)]);
@@ -4396,9 +4468,10 @@ mod tests {
             let dir = std::fs::File::open(state.parent().unwrap()).unwrap();
             let device = null();
             let (pipe, _held) = UnixStream::pair().unwrap();
-            let create = json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain()}});
+            let create = json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain(), "volumes": []}});
+            let held = json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain(), "volumes": [0]}});
             let exec = json!({"Exec": {"id": "w_a_b_0_x", "unit": plain()}});
-            let cases: [(Value, Vec<BorrowedFd>, &str); 9] = [
+            let cases: [(Value, Vec<BorrowedFd>, &str); 11] = [
                 // More files than the call takes is refused as it is read, before it is queued...
                 (
                     as_call(ask("127.0.0.1", 0, Proto::Tcp)),
@@ -4411,6 +4484,9 @@ mod tests {
                 (create.clone(), vec![file.as_fd()], "two files"),
                 (create.clone(), vec![], "two files"),
                 (exec.clone(), vec![file.as_fd()], "two files"),
+                // A held volume needs its directory beside the two, and a mount the unit has.
+                (held.clone(), vec![file.as_fd(); 2], "two files"),
+                (held.clone(), vec![file.as_fd(); 3], "has 0 mounts"),
                 (create.clone(), vec![dir.as_fd(), file.as_fd()], "not a file, a pipe"),
                 (exec.clone(), vec![file.as_fd(), device.as_fd()], "not a file, a pipe"),
                 // A layer that is no regular file would be read for ever.

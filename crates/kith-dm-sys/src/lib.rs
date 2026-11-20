@@ -14,7 +14,7 @@
 
 use std::fs::File;
 use std::io::{Error, Result};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 /// `struct dm_ioctl`: version, sizes, flags, the device's number, its name and uuid.
@@ -950,6 +950,19 @@ pub fn mount_mapped_fd(from: BorrowedFd, to: &Path, users: BorrowedFd, flags: u6
     )
 }
 
+/// What `from` is open on (a directory, a file), cloned with every mount under it into a tree
+/// of its own that is in no mount namespace: for [`mount_tree`]. Taken in the namespace the
+/// descriptor was opened in, it stays what it was when the caller's namespace is unshared after.
+pub fn clone_tree(from: BorrowedFd) -> Result<OwnedFd> {
+    cloned(from.as_raw_fd(), c"", libc::AT_EMPTY_PATH as libc::c_uint)
+}
+
+/// [`mount_mapped`] of a tree from [`clone_tree`], seen through `users` if there are any (none:
+/// the tree is mounted as it is, with `flags`).
+pub fn mount_tree(tree: BorrowedFd, to: &Path, users: Option<BorrowedFd>, flags: u64) -> Result<()> {
+    attached(tree, to, users, flags)
+}
+
 fn mapped(
     at: libc::c_int,
     from: &std::ffi::CStr,
@@ -958,13 +971,13 @@ fn mapped(
     users: BorrowedFd,
     flags: u64,
 ) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let to = std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(Error::other)?;
+    let tree = cloned(at, from, empty)?;
+    attached(tree.as_fd(), to, Some(users), flags)
+}
+
+fn cloned(at: libc::c_int, from: &std::ffi::CStr, empty: libc::c_uint) -> Result<OwnedFd> {
     const OPEN_TREE_CLONE: libc::c_uint = 1;
     const AT_RECURSIVE: libc::c_uint = 0x8000;
-    const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
-    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
-    let flags = flags & (RDONLY | NOSUID | NODEV);
     // SAFETY: open_tree reads the string `from`, which lives through the call.
     let tree = unsafe {
         libc::syscall(
@@ -978,9 +991,21 @@ fn mapped(
         return Err(Error::last_os_error());
     }
     // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
-    let tree = unsafe { OwnedFd::from_raw_fd(tree as libc::c_int) };
+    Ok(unsafe { OwnedFd::from_raw_fd(tree as libc::c_int) })
+}
+
+fn attached(tree: BorrowedFd, to: &Path, users: Option<BorrowedFd>, flags: u64) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(Error::other)?;
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
+    const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
+    let flags = flags & (RDONLY | NOSUID | NODEV);
     // struct mount_attr: what to set, what to clear, the propagation, the user namespace.
-    let attr: [u64; 4] = [MOUNT_ATTR_IDMAP | flags, 0, 0, users.as_raw_fd() as u64];
+    let attr: [u64; 4] = match users {
+        Some(users) => [MOUNT_ATTR_IDMAP | flags, 0, 0, users.as_raw_fd() as u64],
+        None => [flags, 0, 0, 0],
+    };
     // SAFETY: mount_setattr reads the empty string and `attr`, whose size it is told; both
     // live through the call.
     let set = unsafe {

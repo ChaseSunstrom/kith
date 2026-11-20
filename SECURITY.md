@@ -416,9 +416,13 @@ Only the newest version is fixed. There are no security releases of older ones.
   openat2 (no link out of it, no `..`, and no mount below the root; the root itself may be
   the mount of an encrypted Volume), and a share, a backup, a replica, the volume files, an
   image and the controller's check read and write its contents through that held
-  descriptor. Still by path, and not closed by this: the controller's start path, which
-  is handed to the container runtime after the descriptor is dropped, and which runc, the
-  container's stage and the OCI bind resolve again in their own processes; a restore's
+  descriptor. A container's start works from the held descriptor too: the controller hands
+  it to the runtime (over the socket, in `--split`), which as root mounts, gives and binds
+  the volume from it and never names the path again, so swapping the directory for a link
+  after it is opened gets no bind or chown of what the link points at; the chown does not
+  follow a link and leaves a file with another hard link alone. Still by path, and not
+  closed by this: a subPath without the id-mapped mount (refused) and a kithd that is not
+  root; a restore's
   and a replica's new copy, whose directory is read with `read_dir` and renamed into place
   by path; and an NFS export, which is by path. A node's own `hostPaths` directory refuses
   a link at its last component. A workload that can swap a directory on one of these

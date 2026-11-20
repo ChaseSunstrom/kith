@@ -64,14 +64,26 @@ struct Ask {
 }
 
 /// What is asked. The files beside the message: a `Create` and an `Exec` bring the unit's output
-/// and error (two), an `Unpack` its layers, and nothing else any.
+/// and error (two), a `Create` also the descriptor of each volume it holds (`volumes`: which of
+/// the unit's mounts, in order, each after the two), an `Unpack` its layers, and nothing else any.
 #[derive(Serialize, Deserialize)]
 enum Call {
     Request(Request),
-    Create { id: String, image: Box<Image>, unit: Unit },
-    Exec { id: String, unit: Unit },
+    Create {
+        id: String,
+        image: Box<Image>,
+        unit: Unit,
+        volumes: Vec<usize>,
+    },
+    Exec {
+        id: String,
+        unit: Unit,
+    },
     Adopt,
-    Start { id: String, mark: String },
+    Start {
+        id: String,
+        mark: String,
+    },
 }
 
 /// The root part's word on one call. `kept`: a `Delete` that failed and left the unit, which the
@@ -251,12 +263,31 @@ impl Root for Socket {
             out,
             err,
         } = create;
+        // A held volume's descriptor goes beside the unit (it is no JSON): the root part is handed
+        // the directory itself, and the path in the unit is only a name for it.
+        let held: Vec<(usize, BorrowedFd)> = unit
+            .mounts
+            .iter()
+            .enumerate()
+            .filter_map(|(n, mount)| mount.held.as_ref().map(|held| (n, held.fd())))
+            .collect();
+        if held.len() > MOST_FDS - 2 {
+            return Err(format!(
+                "a unit holds {} volumes, more than one call may bring",
+                held.len()
+            ));
+        }
         let call = Call::Create {
             id: id.into(),
             image: Box::new(image.clone()),
             unit: unit.clone(),
+            volumes: held.iter().map(|(n, _)| *n).collect(),
         };
-        self.made(call, &[out.as_fd(), err.as_fd()], id)
+        let fds: Vec<BorrowedFd> = [out.as_fd(), err.as_fd()]
+            .into_iter()
+            .chain(held.iter().map(|(_, fd)| *fd))
+            .collect();
+        self.made(call, &fds, id)
     }
 
     fn exec(&self, id: &str, unit: &Unit, out: File, err: File) -> Result<Held, String> {
@@ -498,11 +529,44 @@ fn two(fds: Vec<OwnedFd>) -> Result<(File, File), String> {
     Ok((out, err))
 }
 
-/// How many descriptors a call may come with: two for a unit's output and error, a layer each for
-/// an unpack, none for the rest.
+/// The directories that came with a `Create`, one for each mount of `volumes` (strictly rising,
+/// each a mount the unit has), put in the mounts as what they are held by. Each is a directory:
+/// anything else is not a volume. Whether it is the directory its mount names is `check_mount`'s.
+fn take_held(unit: &mut Unit, volumes: &[usize], dirs: Vec<OwnedFd>) -> Result<(), String> {
+    if volumes.len() != dirs.len() {
+        return Err(format!(
+            "a unit names {} held volumes and brings {} directories",
+            volumes.len(),
+            dirs.len()
+        ));
+    }
+    let mut last = None;
+    for (n, dir) in volumes.iter().zip(dirs) {
+        if last.is_some_and(|last| last >= *n) {
+            return Err("a unit's held volumes are not each a mount of its own, in order".into());
+        }
+        last = Some(*n);
+        let Some(mount) = unit.mounts.get_mut(*n) else {
+            return Err(format!("a unit holds volume {n} and has {} mounts", unit.mounts.len()));
+        };
+        let file = File::from(dir);
+        if !file.metadata().map_err(|e| format!("a held volume: {e}"))?.is_dir() {
+            return Err(format!(
+                "the held volume at `{}` is not a directory",
+                mount.container.escape_debug()
+            ));
+        }
+        mount.held = Some(kith_runtime::Held::new(file.into()));
+    }
+    Ok(())
+}
+
+/// How many descriptors a call may come with: two for a unit's output and error (and a directory
+/// for each volume a create holds), a layer each for an unpack, none for the rest.
 fn most_fds(call: &Call) -> usize {
     match call {
-        Call::Create { .. } | Call::Exec { .. } => 2,
+        Call::Create { volumes, .. } => 2 + volumes.len(),
+        Call::Exec { .. } => 2,
         Call::Request(Request::Unpack { .. }) => MOST_LAYERS,
         _ => 0,
     }
@@ -511,11 +575,27 @@ fn most_fds(call: &Call) -> usize {
 /// One call done by `root`, which holds the units it made (by id) in `held`.
 fn handle<H: Hands>(root: &Direct<H>, held: &mut BTreeMap<String, H::Made>, call: Call, fds: Vec<OwnedFd>) -> Out {
     match call {
-        Call::Create { id, image, unit } => {
+        Call::Create {
+            id,
+            image,
+            mut unit,
+            volumes,
+        } => {
+            let mut fds = fds;
+            if fds.len() < 2 + volumes.len() {
+                return Out::err(format!(
+                    "a unit comes with two files and a directory for each held volume, not {}",
+                    fds.len()
+                ));
+            }
+            let dirs = fds.split_off(2);
             let (out, err) = match two(fds) {
                 Ok(files) => files,
                 Err(why) => return Out::err(why),
             };
+            if let Err(why) = take_held(&mut unit, &volumes, dirs) {
+                return Out::err(why);
+            }
             if held.contains_key(&id) {
                 return Out::err(format!("`{id}` is a unit held here already"));
             }

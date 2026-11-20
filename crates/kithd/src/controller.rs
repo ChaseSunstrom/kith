@@ -3152,6 +3152,14 @@ fn node_root_refusal(said: String) -> String {
     }
 }
 
+/// A volume directory as the runtime is given it: the path it was taken at (what names it in a
+/// message) and the descriptor it is held by, which the runtime's mount, give and bind all go
+/// through, and the path never again.
+fn held_volume(volume: crate::volumes::VolumeDir) -> (PathBuf, Option<kith_runtime::Held>) {
+    let (fd, real) = volume.into_parts();
+    (real, Some(kith_runtime::Held::new(fd)))
+}
+
 /// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
 async fn start(
     shared: &Shared,
@@ -3190,15 +3198,19 @@ async fn start(
     let state = logs.parent().unwrap_or(logs);
     for (dir, at, read_only) in &slot.volumes {
         // (Only a shared volume of another node ever gets here: `volumes::mounts`.)
-        let host = match mesh.filter(|(_, me)| *me != dir.node) {
-            Some((prefix, me)) => crate::share::mount(state, dir, prefix, me).await,
-            // (The path it was taken at: the container's mount and its OCI bind name a path, so
-            // the descriptor is not kept past this point.)
-            None => crate::root_part::volume(state, dir).map(|held| held.real().to_path_buf()),
+        let taken = match mesh.filter(|(_, me)| *me != dir.node) {
+            // (Another node's is a mount of this one's own making, a path no tenant writes.)
+            Some((prefix, me)) => crate::share::mount(state, dir, prefix, me)
+                .await
+                .map(|host| (host, None)),
+            // The descriptor goes with the path it was taken at: the runtime mounts, gives and
+            // binds from it, and never opens that path again (T-1113).
+            None => crate::root_part::volume(state, dir).map(held_volume),
         };
-        let host = host.map_err(|e| format!("volume {}: {e}", dir.name))?;
+        let (host, held) = taken.map_err(|e| format!("volume {}: {e}", dir.name))?;
         unit.mounts.push(kith_runtime::Mount {
             host,
+            held,
             container: at.clone(),
             read_only: *read_only,
             // (Not a directory of the host's that an admin named: that one is theirs. Nor
@@ -3231,6 +3243,7 @@ async fn start(
             };
             unit.mounts.push(kith_runtime::Mount {
                 host,
+                held: None,
                 container: mount.path.clone(),
                 // (A map's files are kithd's to write, never the container's.)
                 read_only: mount.read_only == Some(true) || mount.scratch.is_none(),
@@ -3258,6 +3271,7 @@ async fn start(
             let host = crate::workload_identity::files(shared, &pod, container, &identity).await?;
             unit.mounts.push(kith_runtime::Mount {
                 host,
+                held: None,
                 container: crate::workload_identity::MOUNTED_AT.into(),
                 read_only: true,
                 // (Made the container's user's: its mode lets nobody else read them.)
@@ -3275,6 +3289,7 @@ async fn start(
         made.map_err(|e| format!("seat {seat}: {e}"))?;
         unit.mounts.push(kith_runtime::Mount {
             host,
+            held: None,
             container: "/run/seat".into(),
             read_only: *client,
             give: !*client,
@@ -3317,6 +3332,7 @@ async fn start(
             for (file, at) in given.files.into_iter().zip(["/etc/resolv.conf", "/etc/hosts"]) {
                 unit.mounts.push(kith_runtime::Mount {
                     host: file,
+                    held: None,
                     container: at.into(),
                     read_only: true,
                     give: false,
@@ -4444,6 +4460,30 @@ mod tests {
         let left = wait_for_storage(jobs, Duration::from_millis(50)).await;
         assert_eq!(left, ["the removal of pod b"]);
         assert!(wait_for_storage(Vec::new(), Duration::from_millis(50)).await.is_empty());
+    }
+
+    /// The runtime is handed the descriptor a volume directory is held by, and the path it was
+    /// taken at only as a name: the held directory is the one the path named when it was taken,
+    /// whatever the path names after (T-1113).
+    #[test]
+    fn a_volume_dir_goes_to_the_runtime_as_its_held_descriptor() {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!("kith-held-volume-{}", std::process::id()));
+        let (dir, away) = (root.join("data"), root.join("away"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&away).unwrap();
+        let fd = std::os::fd::OwnedFd::from(std::fs::File::open(&dir).unwrap());
+        let (host, held) = held_volume(crate::volumes::VolumeDir::from_parts(fd, dir.clone()));
+        assert_eq!(host, dir);
+        let held = held.expect("a volume dir is held by its descriptor");
+        // The path is swapped for a link to somewhere else: the descriptor is still the directory.
+        let before = std::fs::metadata(&dir).unwrap();
+        std::fs::rename(&dir, root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&away, &dir).unwrap();
+        let got = std::fs::metadata(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&held.fd()))).unwrap();
+        assert_eq!((got.dev(), got.ino()), (before.dev(), before.ino()));
+        assert_ne!(got.ino(), std::fs::metadata(&dir).unwrap().ino());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A Volume made for a claim that is gone has its directory removed by its own node once no
