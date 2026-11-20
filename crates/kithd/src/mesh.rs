@@ -357,11 +357,45 @@ fn rotated_path(key: &std::path::Path) -> PathBuf {
     key.with_extension("rotated")
 }
 
-/// `ended` kept: `{"done": id, "key": the new public key}` or `{"failed": id}`, whole or not at all.
-/// A done one is kept before the commit that makes it so, so no crash leaves a done rotation unkept.
+/// A rotation given up, with the last one that was done (a node's status may not say it any more).
+fn failure(id: &str, done: Option<&String>) -> Value {
+    match done {
+        Some(done) => json!({ "failed": id, "was": done }),
+        None => json!({ "failed": id }),
+    }
+}
+
+/// `ended` kept: `{"done": id, "key": the new public key}` or `failure`'s (`was`: the last done), whole or not at all, and
+/// not written again when it is what is there. A done one is kept before the commit that makes it so,
+/// so no crash leaves a done rotation unkept. A directory that will not sync is said, and is no
+/// failure once the file is renamed (as `write_key`).
 fn record(key: &std::path::Path, ended: Value) -> Result<(), String> {
+    use std::io::Write;
     let path = rotated_path(key);
-    crate::pki::write_whole(&path, ended.to_string().as_bytes()).map_err(|e| format!("keeping {}: {e}", path.display()))
+    let text = ended.to_string();
+    if std::fs::read(&path).is_ok_and(|had| had == text.as_bytes()) {
+        return Ok(());
+    }
+    let new = path.with_extension("rotated.new");
+    let wrote = (|| {
+        let mut file = std::fs::File::create(&new)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&new, &path)
+    })();
+    wrote.map_err(|e| format!("keeping {}: {e}", path.display()))?;
+    let dir = key
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let synced = || std::fs::File::open(dir)?.sync_all();
+    if let Err(e) = synced().or_else(|_| synced()) {
+        eprintln!(
+            "kithd: mesh: {} is written, but its directory is not synced: {e}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// The rotations that were ended before this start, as (given up, done). A done one counts only if
@@ -380,7 +414,8 @@ fn recorded(key: &std::path::Path, public: &Key) -> (Option<String>, Option<Stri
     match (id("done"), id("failed")) {
         (Some(id), _) if kept.as_ref().is_some_and(|k| k["key"] == hex(public)) => (None, Some(id)),
         (Some(id), _) => (Some(id), None),
-        (None, failed) => (failed, None),
+        // (A given-up one carries the last done: that one was committed.)
+        (None, failed) => (failed, id("was")),
     }
 }
 
@@ -659,8 +694,8 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             .collect();
         let step = |step| crate::root_part::mesh_key_step(&root, &options.interface, step);
         // A rotation given up is kept (a failure to keep it is said: it may be tried again after a restart).
-        let give_up = |id: &str| {
-            if let Err(e) = record(&options.key, json!({ "failed": id })) {
+        let give_up = |id: &str, done: Option<&String>| {
+            if let Err(e) = record(&options.key, failure(id, done)) {
                 eprintln!("kithd: mesh: {e}");
             }
         };
@@ -696,13 +731,13 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
                             eprintln!(
                                 "kithd: mesh: not replacing the key ({id}): no peer is reached to take the new one"
                             );
-                            give_up(&id);
+                            // (Not kept: no handshake has happened yet on the first pass after a start.)
                             failed = Some(id);
                         }
                         (false, made) => {
                             let why = made.err().unwrap_or_default();
                             eprintln!("kithd: mesh: not replacing the key ({id}): {why}");
-                            give_up(&id);
+                            give_up(&id, done.as_ref());
                             failed = Some(id);
                         }
                     }
@@ -742,7 +777,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
                     // (Kept first, as the commit is: a revert that fails is tried every pass, and a start in
                     // between gives up. The old key back before the others are told to forget the new one.)
                     Err(why) => {
-                        give_up(&active.id);
+                        give_up(&active.id, done.as_ref());
                         match step(KeyStep::Revert) {
                             Ok(_) => {
                                 eprintln!(
@@ -1587,8 +1622,6 @@ mod tests {
         assert!(said(start + ROTATE_WAIT).is_empty());
     }
 
-    /// A key is exactly 64 lower-case hex digits: one text per key, so that comparing the texts
-    /// of two keys is comparing the keys.
     /// A rotation ended is kept beside `mesh.key` (T-1056): a node that starts again, with
     /// `spec.mesh.rotate` still naming it, does not rotate again, whether or not its status said so.
     #[test]
@@ -1612,6 +1645,19 @@ mod tests {
         // Given up stays so, and a later end replaces the earlier one.
         record(&key, json!({ "failed": "r2" })).unwrap();
         assert_eq!(read(&old), (Some("r2".to_string()), None));
+        // A given-up one keeps the last done name too: it is still skipped when the status is gone.
+        record(&key, failure("r2", Some(&"r1".to_string()))).unwrap();
+        assert_eq!(read(&old), (Some("r2".to_string()), Some("r1".to_string())));
+        // The same text again is not written again (a revert that fails is tried every pass).
+        // (A write is a rename: a new file. The one that is there stays.)
+        let inode = || std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(rotated_path(&key)).unwrap());
+        let had = inode();
+        record(&key, failure("r2", Some(&"r1".to_string()))).unwrap();
+        assert_eq!(inode(), had);
+        record(&key, failure("r3", None)).unwrap();
+        assert_ne!(inode(), had);
+        // (No leftover temp file.)
+        assert!(!dir.join("mesh.rotated.new").exists());
         // What was asked is not asked again when it ended either way; a new name still is.
         let (r1, r2, r3) = ("r1".to_string(), "r2".to_string(), "r3".to_string());
         assert_eq!(to_rotate(Some(r1.clone()), Some(&r1), None), None);
@@ -1621,6 +1667,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A key is exactly 64 lower-case hex digits: one text per key, so that comparing the texts
+    /// of two keys is comparing the keys.
     #[test]
     fn a_key_is_64_lower_case_hex_digits_and_nothing_else() {
         let good = "ab".repeat(32);
