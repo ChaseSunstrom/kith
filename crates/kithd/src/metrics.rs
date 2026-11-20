@@ -284,6 +284,17 @@ pub struct Local {
 }
 
 impl Local {
+    /// Only the Workloads (`NS/NAME`) `grants` lets its holder list or get in their namespace:
+    /// the names of another namespace's, and what they use, are not for it.
+    fn keep_readable(&mut self, grants: &crate::access::Grants) {
+        self.workloads.retain(|key, _| {
+            let namespace = key.split_once('/').map(|(namespace, _)| namespace);
+            [Verb::List, Verb::Get]
+                .iter()
+                .any(|verb| grants.may(verb, "Workload", namespace))
+        });
+    }
+
     /// Whether it is what was asked for: `points` in each series, and no more Workloads than a
     /// node keeps (what another node sent is not taken on trust for its size).
     fn fits(&self, points: usize) -> bool {
@@ -386,6 +397,15 @@ pub async fn serve(
     });
     let mut all = futures_util::future::join_all(asked).await;
     all.push((me, Some(mine)));
+    // (Whoever may list Nodes sees every node's series, but a Workload's only in a namespace it
+    // may read; the asked node decides, as the nodes' own answers are for the cluster.)
+    {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let grants = crate::access::Grants::of(&caller, &state.store);
+        for local in all.iter_mut().filter_map(|(_, local)| local.as_mut()) {
+            local.keep_readable(&grants);
+        }
+    }
     Ok(Json(merge(range, step, points, end, all)))
 }
 
@@ -967,6 +987,52 @@ mod tests {
         let Local { node, .. } = fed().local("alpha", 10, 7, 1040);
         assert_eq!(node.cpu[..2], [None, None]);
         assert_eq!(node.cpu[2], Some(0.0));
+    }
+
+    #[test]
+    fn metrics_series_of_workloads_are_the_callers_namespaces_only() {
+        use crate::access::Grants;
+        use kith_api::kinds::AccessRule;
+        let mut rings = fed();
+        rings.work(1040, "b/db", [1.0, 5.0]);
+        rings.work(1040, "a/api", [1.0, 5.0]);
+        let local = |name: &str| rings.local(name, 10, 3, 1040);
+        let rule = |kinds: &[&str], verbs: Vec<Verb>, namespaces: &[&str]| AccessRule {
+            kinds: kinds.iter().map(|kind| kind.to_string()).collect(),
+            verbs,
+            namespaces: namespaces.iter().map(|ns| ns.to_string()).collect(),
+        };
+        let keys = |grants: &Grants| {
+            let all = vec![
+                ("n1".to_string(), Some(local("n1"))),
+                ("n2".to_string(), Some(local("n2"))),
+            ];
+            let mut all = all;
+            for (_, local) in &mut all {
+                local.as_mut().unwrap().keep_readable(grants);
+            }
+            let answer = merge("15m", 10, 3, 1040, all);
+            answer["workloads"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // Nodes in every namespace, Workloads in `a` only: the Node series are all there, `b` is not.
+        let in_a = Grants::of_rules(vec![
+            rule(&["Node"], vec![Verb::List], &[]),
+            rule(&["Workload"], vec![Verb::List], &["a"]),
+        ]);
+        assert_eq!(keys(&in_a), ["a/api", "a/api@n2"]);
+        // A right to get one counts as much as one to list; no right to Workloads shows none.
+        let get_b = Grants::of_rules(vec![rule(&["Workload"], vec![Verb::Get], &["b"])]);
+        assert_eq!(keys(&get_b), ["b/db", "b/db@n2"]);
+        let nodes_only = Grants::of_rules(vec![rule(&["Node"], vec![Verb::List], &[])]);
+        assert!(keys(&nodes_only).is_empty());
+        // The admin (no rules to apply) keeps everything.
+        let admin = Grants::of(&Caller::Admin, &kith_api::store::Store::default());
+        assert_eq!(keys(&admin).len(), 6);
     }
 
     #[test]

@@ -36,6 +36,7 @@ browser), `ca.crt` trusted, and the name `kith` pointing at a node (a line in `/
   second, every interface but `lo`) and 1-minute load, and each Workload's CPU (cores) and
   memory, as arrays oldest first (`null` where nothing was sampled), the last point at `end`
   and `step` seconds apart. It takes the right to list Nodes. A node that does not answer in
-  3 seconds is `"missing": true` and the rest comes back. The page itself that draws them is
-  not here yet.
+  3 seconds is `"missing": true` and the rest comes back. A Workload's series show only for
+  the namespaces you may list or get Workloads in. The page itself that draws them is not here
+  yet.
 - Not yet: logging in without a certificate (OIDC), secrets hidden until asked for.

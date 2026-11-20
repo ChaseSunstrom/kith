@@ -222,6 +222,11 @@ spec: { role: configs, subjects: [alice] }
         alpha.get_as("alice", "alice", "/v1/metrics?range=15m").0 == 200
     });
 
+    // The nodes' own route (every Workload's series, unfiltered) is for nodes, not for an Identity.
+    let (status, body) = alpha.get_as("alice", "alice", "/v1/node-metrics?range=15m");
+    assert_ne!(status, 200, "{body}");
+    assert!(body.get("workloads").is_none(), "{body}");
+
     // A node that does not answer is marked missing, and the others still come back, in time.
     beta.stop();
     let started = Instant::now();
