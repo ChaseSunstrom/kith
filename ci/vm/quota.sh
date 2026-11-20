@@ -329,7 +329,7 @@ EOF
             cp "$(sh "$root/ci/musl.sh" --tests)" "$work/unitrd/kithd-tests"
             (cd "$work/unitrd" && find . | cpio -o -H newc --quiet) >"$work/unit.cpio"
             number=$(sfdisk -d "$work/n1.raw" | sed -n 's/^[^ ]*[^0-9]\([0-9][0-9]*\) :.*name="state".*/\1/p')
-            timeout 600 qemu-system-x86_64 -enable-kvm -cpu host -m 1024 -smp 2 -display none -no-reboot -machine q35 \
+            timeout --foreground 600 qemu-system-x86_64 -enable-kvm -cpu host -m 1024 -smp 2 -display none -no-reboot -machine q35 \
                 -kernel "$base/vmlinuz" -initrd "$work/unit.cpio" -append "console=ttyS0 panic=-1 -- tests /dev/vda$number" \
                 -drive "file=$work/n1.raw,format=raw,if=virtio" -serial "file:$work/unit.log" -monitor none </dev/null >/dev/null 2>&1 8>&- &
             vms="$vms $!"
