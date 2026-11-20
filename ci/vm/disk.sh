@@ -30,8 +30,8 @@
     said 'kithd: built with disk-test: adding the disk with serial '"$known" || fail "the disk-test build did not add the disk it was told to"
     heard 'kithd: data disks: '
     said "kithd: disk-test: added " || fail "the disk was not added: the mapping, the seed or the header failed"
-    said "kithd: data disks: known: [^;]*serial $known[^;]*mounted" || fail "the disk added at start was not mounted by the scan after the state opened"
-    said "unknown: [^;]*serial $unknown[^;]* left alone" || fail "the disk nobody added is not listed as left alone"
+    said "kithd: data disks: known: [^;]*serial ${known}[^;]*mounted" || fail "the disk added at start was not mounted by the scan after the state opened"
+    said "unknown: [^;]*serial ${unknown}[^;]* left alone" || fail "the disk nobody added is not listed as left alone"
     ! said 'kithd: the data disk .* is not closed' || fail "a data disk was not closed"
     restart
     ! said 'kithd: the data disk .* is not closed' || fail "a data disk was not closed at the restart"
@@ -45,9 +45,9 @@
     boot $drives
     up
     heard 'kithd: data disks: '
-    said "kithd: data disks: known: [^;]*serial $known[^;]*mounted" || fail "the known disk was not mounted at the second start, from its header and key"
+    said "kithd: data disks: known: [^;]*serial ${known}[^;]*mounted" || fail "the known disk was not mounted at the second start, from its header and key"
     ! said 'kithd: built with disk-test' || fail "the second start was told to add the disk again"
-    said "unknown: [^;]*serial $unknown[^;]* left alone" || fail "the unknown disk is not left alone at the second start"
+    said "unknown: [^;]*serial ${unknown}[^;]* left alone" || fail "the unknown disk is not left alone at the second start"
     restart
     ! said 'kithd: the data disk .* is not closed' || fail "a data disk was not closed at the second restart"
     [ "$(sha256sum <"$work/other.raw")" = "$before" ] || fail "the disk nobody added was written to at the second start"
