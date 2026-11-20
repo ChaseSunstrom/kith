@@ -270,6 +270,7 @@ pub fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .write(true)
         .create(true)
         .truncate(true)
+        .mode(0o600)
         .open(&new)?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -379,12 +380,17 @@ pub fn served(ca: &str, live: Arc<Live>, revoked: Option<Revoked>) -> Fallible<A
         .allow_unauthenticated()
         .build();
     let verifier = Refusing(tls("setting up TLS", verifier)?, revoked);
-    let config = tls(
+    let mut config = tls(
         "setting up TLS",
         ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions(),
     )?
     .with_client_cert_verifier(Arc::new(verifier))
     .with_cert_resolver(live);
+    // No sessions to resume (and so no tickets sent): a resumed connection takes the client's
+    // certificate from its session and does not verify it again, so a certificate revoked after
+    // its first handshake would go on getting in. (The server's default is a cache of 256.)
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     Ok(Arc::new(config))
 }
 
@@ -1298,6 +1304,69 @@ mod tests {
         };
         let (served, called) = tokio::join!(serving, calling);
         (served.map(|(cert, _)| cert), called.and_then(|(cert, _)| cert))
+    }
+
+    /// A client that was let in and is revoked after is refused on its next connection, though it
+    /// holds the session of the first to resume: a server that kept sessions would take the
+    /// certificate back from the session and not ask `Revoked` again.
+    #[tokio::test]
+    async fn a_revoked_certificate_cannot_resume_a_session() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ca = Ca::create().unwrap();
+        let identity = |name: &str| {
+            let (cert, key) = ca.issue(name).unwrap();
+            Identity {
+                name: name.into(),
+                ca: ca.cert.clone(),
+                cert,
+                key,
+            }
+        };
+        let (a, b) = (identity("a"), identity("b"));
+        let gone = Arc::new(AtomicBool::new(false));
+        let flag = gone.clone();
+        let revoked: Revoked = Arc::new(move |_| flag.load(Ordering::SeqCst));
+        let server = served(&a.ca, Live::new(&a).unwrap(), Some(revoked)).unwrap();
+        // (One configuration for both: it is what keeps the session between the connections.)
+        let client = Arc::new(client_config(&b.ca, Some(Live::new(&b).unwrap()), None).unwrap());
+        let connect = || async {
+            let (near, far) = tokio::io::duplex(1 << 16);
+            let acceptor = tokio_rustls::TlsAcceptor::from(server.clone());
+            let connector = tokio_rustls::TlsConnector::from(client.clone());
+            let serving = async {
+                let mut stream = acceptor.accept(far).await.map_err(|e| e.to_string())?;
+                stream.write_all(b"x").await.map_err(|e| e.to_string())?;
+                stream.flush().await.map_err(|e| e.to_string())?;
+                drop(stream.read_to_end(&mut Vec::new()).await);
+                Ok::<(), String>(())
+            };
+            let calling = async {
+                let name = ServerName::try_from("kith").unwrap();
+                let mut stream = connector.connect(name, near).await.map_err(|e| e.to_string())?;
+                // (The session comes with what the server sends after the handshake.)
+                stream.read_exact(&mut [0u8; 1]).await.map_err(|e| e.to_string())?;
+                stream.shutdown().await.map_err(|e| e.to_string())
+            };
+            tokio::join!(serving, calling)
+        };
+        let (served, called) = connect().await;
+        assert_eq!((served, called), (Ok(()), Ok(())));
+        gone.store(true, Ordering::SeqCst);
+        let (served, _) = connect().await;
+        let said = served.unwrap_err();
+        assert!(said.contains("Revoked"), "{said}");
+    }
+
+    /// The file that holds a certificate is made private, as the key beside it is, whatever the umask.
+    #[test]
+    fn write_whole_makes_a_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kithd-whole-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.crt");
+        write_whole(&path, b"x").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[tokio::test]

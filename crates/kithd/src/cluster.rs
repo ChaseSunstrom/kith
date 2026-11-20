@@ -458,7 +458,7 @@ pub fn revoked(shared: &Shared, cert: &rustls::pki_types::CertificateDer<'_>) ->
 }
 
 /// [`admitted`], asked of a store, for the key whose print is `print`.
-fn stands(store: &kith_api::store::Store, name: &str, print: &str) -> bool {
+pub(crate) fn stands(store: &kith_api::store::Store, name: &str, print: &str) -> bool {
     let node = store.get(&node_key(name));
     let Some(status) = node.and_then(|node| node.status.as_ref()) else {
         return false;

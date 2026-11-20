@@ -1277,7 +1277,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     decided by the store the node has, and only on what it positively shows: a node
     still catching up, or an Identity it has not heard of, is not refused here, and
     each request is asked again as before. A node started with
-    `--admit-deleted-nodes` does not refuse at the handshake. A Workload's pod
+    `--admit-deleted-nodes` does not refuse at the handshake (and still signs no
+    certificate for a node its store has no Node for). A node resumes no TLS session, so
+    each connection shows the certificate again and is checked. A Workload's pod
     certificate is checked at each request only. There is no CRL and no OCSP service:
     the store is the list.
 - **A Release and a Source act with their writer's rights, as far as these go:**

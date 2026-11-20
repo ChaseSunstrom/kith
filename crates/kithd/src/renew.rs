@@ -43,6 +43,15 @@ pub async fn issue(State(shared): State<Arc<Shared>>, ConnectInfo(peer): Connect
     let Some(ca) = shared.cluster.as_ref().and_then(|cluster| cluster.ca.as_ref()) else {
         return (StatusCode::CONFLICT, crate::cluster::CA_ELSEWHERE).into_response();
     };
+    // (`members_only` let this link in, but `--admit-deleted-nodes` turns its check off: a
+    // certificate is made only for a node whose Node this node's store has, whatever the flag.)
+    let stands = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        crate::cluster::stands(&state.store, node, &pki::key_print(key))
+    };
+    if !stands {
+        return (StatusCode::FORBIDDEN, "no Node of this name and key stands here").into_response();
+    }
     let now = kith_api::store::now();
     if !due(node, WHAT, now) {
         return (StatusCode::TOO_MANY_REQUESTS, "one certificate a minute for one node").into_response();
@@ -90,10 +99,17 @@ where
     }
     let pem = ask().await?;
     let new = live.parse(&pem)?;
+    let Some((begins, ends)) = new.cert.first().and_then(|cert| pki::validity(cert)) else {
+        return Err("the certificate it was sent has no dates".into());
+    };
     // (Only one that ends later: a CA holder that answers with an older one does no harm.)
-    let later = new.cert.first().and_then(|cert| pki::validity(cert)).map(|(_, to)| to);
-    if later.is_none_or(|later| later <= to) {
+    if ends <= to {
         return Err("the certificate it was sent does not end later than this one".into());
+    }
+    // (One that begins after this node's now, a CA node whose clock is ahead, is refused by every
+    // peer until then: the old one stays shown and this is asked again at the next round.)
+    if begins > now {
+        return Err("the certificate it was sent is not valid yet: this node's clock is behind its signer's".into());
     }
     pki::write_whole(&dir.join("node.crt"), pem.as_bytes()).map_err(|e| format!("{}: {e}", dir.display()))?;
     live.show(new);
@@ -223,5 +239,89 @@ mod tests {
         // (A second round has nothing to do.)
         let again = renew_if_due(&live, &dir, now, || async { panic!("asked again") }).await;
         assert_eq!(again, Ok(Renewed::NotYet));
+    }
+
+    /// A certificate that begins after this node's now (its signer's clock is ahead) is not taken:
+    /// the old one stays shown and written, and the next round asks again.
+    #[tokio::test]
+    async fn a_certificate_that_is_not_valid_yet_is_not_taken() {
+        let ca = Ca::create().unwrap();
+        let now = kith_api::store::now();
+        let (me, public, dir) = node(&ca, 500);
+        let live = pki::Live::new(&me).unwrap();
+        let old = std::fs::read_to_string(dir.join("node.crt")).unwrap();
+        // (Made as of an hour from now: it begins at 59 minutes from now.)
+        let ahead = ca.renew_node("b", None, &public, now + 3600, pki::NODE_LIFE).unwrap();
+        let taken = renew_if_due(&live, &dir, now, || async { Ok(ahead) }).await;
+        assert!(taken.unwrap_err().contains("not valid yet"));
+        assert_eq!(pki::validity(&live.current().cert[0]).unwrap().1, now + 500);
+        assert_eq!(std::fs::read_to_string(dir.join("node.crt")).unwrap(), old);
+        // One made 60 s behind its signer's clock, as `renew_node` does, is taken at once.
+        let fresh = ca.renew_node("b", None, &public, now, pki::NODE_LIFE).unwrap();
+        let taken = renew_if_due(&live, &dir, now, || async { Ok(fresh) }).await;
+        assert_eq!(taken, Ok(Renewed::Done));
+    }
+
+    /// The CA node answers a node that asks as itself and stands in its store, once a minute, and
+    /// no other: a deleted node's certificate (whatever `--admit-deleted-nodes` lets in), one for
+    /// another key than the Node names, an Identity's, and a node with no CA key get none.
+    #[tokio::test]
+    async fn the_ca_node_makes_one_for_the_node_that_asks_and_stands_and_no_other() {
+        use crate::cluster::pinned_peer::{at, node, shared_of, shared_with};
+        use crate::cluster::{Cluster, Peer};
+        use rustls::pki_types::pem::PemObject;
+        let ca = Ca::create().unwrap();
+        let alpha = node(&ca, "renew-alpha");
+        let (standing, replaced, gone) = (
+            ca.issue("renew-b").unwrap().0,
+            ca.issue("renew-c").unwrap().0,
+            ca.issue("renew-gone").unwrap().0,
+        );
+        let user = ca.issue_user("renew-alice").unwrap().0;
+        let rejoined = ca.issue("renew-c").unwrap().0;
+        let print = |pem: &str| Some(pki::print_of(pem).unwrap());
+        let nodes = [
+            at("renew-alpha", "127.0.0.1:1", print(&alpha.cert)),
+            at("renew-b", "127.0.0.1:2", print(&standing)),
+            at("renew-c", "127.0.0.1:3", print(&rejoined)),
+        ];
+        let without = node(&ca, "renew-alpha");
+        let shared = shared_of("renew-issue", Cluster::new(alpha, Some(ca)).unwrap(), &nodes).await;
+        let ask = |shared: &Arc<Shared>, pem: Option<&str>| {
+            let subject = pem.and_then(|pem| {
+                pki::subject_of(&rustls::pki_types::CertificateDer::from_pem_slice(pem.as_bytes()).unwrap())
+            });
+            let peer = Peer {
+                addr: "127.0.0.1:9".parse().unwrap(),
+                subject,
+            };
+            let shared = shared.clone();
+            async move {
+                let answer = issue(State(shared), ConnectInfo(peer)).await;
+                let status = answer.status();
+                let body = axum::body::to_bytes(answer.into_body(), 1 << 20).await.unwrap();
+                (status, String::from_utf8(body.to_vec()).unwrap())
+            }
+        };
+        assert_eq!(ask(&shared, None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(ask(&shared, Some(&user)).await.0, StatusCode::FORBIDDEN);
+        // A certificate whose Node is gone, or names another key now.
+        assert_eq!(ask(&shared, Some(&gone)).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(ask(&shared, Some(&replaced)).await.0, StatusCode::FORBIDDEN);
+        // The standing one: a certificate for its key that ends later, and one a minute.
+        let (status, pem) = ask(&shared, Some(&standing)).await;
+        assert_eq!(status, StatusCode::OK, "{pem}");
+        let der = rustls::pki_types::CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        assert_eq!(pki::print_of(&pem), pki::print_of(&standing));
+        let now = kith_api::store::now();
+        assert!(pki::validity(&der).unwrap().1 > now + pki::NODE_LIFE.as_secs() - 100);
+        assert_eq!(ask(&shared, Some(&standing)).await.0, StatusCode::TOO_MANY_REQUESTS);
+        // A node that holds no CA key sends the asker elsewhere.
+        let elsewhere = shared_with("renew-no-ca", without, &nodes).await;
+        let (status, said) = ask(&elsewhere, Some(&standing)).await;
+        assert_eq!(
+            (status, said.as_str()),
+            (StatusCode::CONFLICT, crate::cluster::CA_ELSEWHERE)
+        );
     }
 }
