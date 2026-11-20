@@ -4867,6 +4867,37 @@ spec: {role: writer, subjects: [carol]}
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A Deployment whose replica names `NAME-N` pass 63 characters is refused by name through
+    /// the Kubernetes API (it applies through `submitted`), and one that fits is made.
+    #[tokio::test]
+    async fn a_deployment_with_a_replica_name_over_63_characters_is_refused_by_name() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-long-name-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let named = |name: &str| {
+            let mut body = deployment_of("example.org/web");
+            body["metadata"]["name"] = json!(name);
+            body
+        };
+        let long = "a".repeat(63);
+        let (code, said) = sent_as(&shared, "POST", "application/json", DEPLOYMENTS, &[], named(&long)).await;
+        assert_ne!(code, StatusCode::CREATED, "{said}");
+        assert!(
+            said.to_string().contains(&long) && said.to_string().contains("replica name"),
+            "{said}"
+        );
+        let (code, said) = sent_as(
+            &shared,
+            "POST",
+            "application/json",
+            DEPLOYMENTS,
+            &[],
+            named(&"a".repeat(60)),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The JSON patch `kubectl rollout undo` sends for the ReplicaSet `set`: its template
     /// without the hash label, and the Deployment's annotations (it has none: an empty map).
     fn undo_patch(set: &Value) -> Value {
