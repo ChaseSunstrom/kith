@@ -42,9 +42,14 @@ spec:
 - The container sees a bind mount (`readOnly: true` for read-only) of
   `<state>/volumes/<namespace>/<name>/<path>`. `path` must be relative, with no `..` or symbolic
   link in it (in `kith-system`, an absolute host path). A container path that is relative, has
-  `..`, or is `/`, `/proc`, `/sys` or `/dev` (or under them) stops the unit.
+  `..`, or is `/`, `/proc`, `/sys` or `/dev` (or under them) stops the unit. A mount at `/etc`
+  stops it too, since it would hide the `resolv.conf` kith binds there: mount under `/etc`, or
+  add a mount at `/etc/resolv.conf`.
+- A Volume named like a claim is what the claim's workloads mount, even if the claim is bound to
+  another Volume. The claim's `status.message` says so, naming the Volume.
 - Not yet: `subvolume: true` makes a plain directory; `size` is no quota; an `exec` unit and a
-  NodeWorkload mount nothing.
+  NodeWorkload mount nothing (the unit says so); a writable overlay per container; moving a
+  Volume's data when its node changes.
 
 ### A claim for each replica
 
