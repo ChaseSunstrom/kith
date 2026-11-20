@@ -331,6 +331,9 @@ at any restart of kithd. A staged kithd that fails within a minute is given up f
 running; that end counts toward the ten failures in a minute, a hand-over does not. The root still
 says the old version (it is read-only), so the node says the new one from a note in `/run` that holds
 only for the kithd it names: a reboot starts the slot that was written, which has the new release whole.
+`sh ci/vm.sh --test handover` (it runs at the end of `--test update`) takes a release that differs in
+kithd alone and sees the machine keep its boot id and a pod its process, then takes one with another
+kernel and sees the restart into the other slot. All on disk files.
 
 **Which keys a node takes.** Its own only, whatever key an OSRelease names. Give them before the
 first release:
@@ -361,7 +364,11 @@ address on the node itself or its own networks (loopback, private, shared, link-
 multicast) is refused. `--lan-releases` (`lanReleases: true` at install) allows the private
 ranges for a release server on the LAN; then whoever may write an OSRelease can have every node
 ask any host on them and read in the plan's status whether it answered. Give OSRelease and
-UpdatePlan to nobody but the cluster's admin in any case: they decide when nodes restart.
+UpdatePlan to nobody but the cluster's admin in any case: they decide when nodes restart. A
+release agent for the canary ring is the exception a Role can name: `{ kinds: [OSRelease],
+verbs: [get, list, apply, delete], names: [canary] }` (see Access), with the plan `canary`
+(its selector is the ring) kept by the admin: the agent cannot write any UpdatePlan or any
+other release, and a changed release `canary` rolls that plan again.
 
 **Handing over to other keys.** `handover` in a release names the keys that count once a node
 runs it (its own among them, if it is to go on counting), signed by the release's key and by one

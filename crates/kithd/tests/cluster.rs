@@ -2382,6 +2382,127 @@ fn a_workload_runs_as_an_identity() {
     );
 }
 
+/// A Role of OSRelease that names `canary`: the Identity bound to it rolls a release to the
+/// canary ring through the API (the operator owns the UpdatePlan `canary`, whose selector is
+/// the ring: a plan rolls again when its OSRelease changes), and is refused, 403, any
+/// UpdatePlan write and an OSRelease of another name: to apply, get or delete (a list shows
+/// it the canary alone), the same for a name that is stored and one that is not.
+#[test]
+fn role_names_canary_only() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let alpha = Node::start("rolenames", "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let apply = |text: &str| {
+        std::fs::write(alpha.dir.join("apply.yaml"), text).unwrap();
+        alpha.ok(&["apply", "-f", "apply.yaml"]);
+    };
+    let release = |name: &str, version: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: OSRelease\nmetadata: {{ name: {name} }}\n\
+             spec: {{ version: '{version}', image: 'http://127.0.0.1:1/{name}.kos' }}\n---\n"
+        )
+    };
+    let plan = |name: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: UpdatePlan\nmetadata: {{ name: {name} }}\n\
+             spec: {{ release: {name}, selector: {{ ring: canary }}, paused: true }}\n---\n"
+        )
+    };
+    // Stored by the operator: a release and a plan of another name, and the plan of the canary
+    // ring (its release is not there yet): none of them is the agent's to write.
+    apply(&format!(
+        "{}{}{}",
+        release("stable", "1.0"),
+        plan("stable"),
+        plan("canary")
+    ));
+    std::fs::create_dir_all(alpha.dir.join("agent")).unwrap();
+    alpha.ok(&["identity", "cert", "agent", "--out", "agent"]);
+    for (from, to) in [("agent.crt", "node.crt"), ("agent.key", "node.key")] {
+        std::fs::copy(alpha.dir.join("agent").join(from), alpha.dir.join("agent").join(to)).unwrap();
+    }
+    apply(
+        "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: canary-roller }\n\
+         spec: { rules: [{ kinds: [OSRelease], verbs: [get, list, apply, delete], names: [canary] }] }\n---\n\
+         apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: agent-canary-roller }\n\
+         spec: { role: canary-roller, subjects: [agent] }\n",
+    );
+    let agent = alpha.dir.join("agent");
+    let call = |method: &str, path: &str, body: Option<&str>| ask_as_node(&alpha.address(), &agent, method, path, body);
+    let as_json = |text: &str| {
+        let yaml = text.trim_end_matches("---\n").trim_end();
+        let one = kith_api::Resource::from_source(yaml).unwrap().remove(0).unwrap();
+        serde_json::to_string(&vec![one]).unwrap()
+    };
+
+    // The canary release: the agent writes it (and a plan of the same name is not its to write).
+    let (code, said) = call("POST", "/v1/apply", Some(&as_json(&release("canary", "1.0"))));
+    assert_eq!(code, "200", "{said}");
+    assert_eq!(call("GET", "/v1/resources/OSRelease/canary", None).0, "200");
+    // It cannot widen the ring: no UpdatePlan write at all, the canary's own plan included
+    // (its selector is the operator's), and no read of one either.
+    for name in ["canary", "stable", "ghost"] {
+        let (code, said) = call("POST", "/v1/apply", Some(&as_json(&plan(name))));
+        assert!(code == "403" && said.contains("may not apply"), "{name}: {code} {said}");
+        let (code, said) = call("DELETE", &format!("/v1/resources/UpdatePlan/{name}"), None);
+        assert_eq!(code, "403", "{name}: {said}");
+    }
+    assert_eq!(call("GET", "/v1/resources?kind=UpdatePlan", None).0, "403");
+    // Any other release, stored or not, is the same refusal.
+    for name in ["stable", "ghost"] {
+        let (code, said) = call("POST", "/v1/apply", Some(&as_json(&release(name, "1.1"))));
+        assert!(code == "403" && said.contains("may not apply"), "{name}: {code} {said}");
+        assert_eq!(
+            call("DELETE", &format!("/v1/resources/OSRelease/{name}"), None).0,
+            "403"
+        );
+    }
+    let refusals: Vec<(String, String)> = ["stable", "ghost"]
+        .iter()
+        .map(|name| {
+            let (code, said) = call("GET", &format!("/v1/resources/OSRelease/{name}"), None);
+            (code, said.replace(name, "NAME"))
+        })
+        .collect();
+    assert_eq!(refusals[0].0, "403", "{refusals:?}");
+    assert_eq!(refusals[0], refusals[1], "a stored name and one that is not read alike");
+    assert_eq!(call("DELETE", "/v1/resources/Secret/default/canary", None).0, "403");
+    // A list shows it the canary release and not the stable one.
+    let (code, said) = call("GET", "/v1/resources?kind=OSRelease", None);
+    assert_eq!(code, "200", "{said}");
+    let listed: Vec<serde_json::Value> = serde_json::from_str(&said).unwrap();
+    let listed: Vec<&str> = listed.iter().map(|r| r["metadata"]["name"].as_str().unwrap()).collect();
+    assert_eq!(listed, ["canary"]);
+    // What was refused is untouched: the operator's plans are as they were, the stable release is there.
+    let kept = alpha.ok(&["get", "updateplan", "-o", "json"]);
+    assert!(
+        kept.contains("stable") && kept.contains("canary") && kept.contains("ring"),
+        "{kept}"
+    );
+    assert!(alpha.ok(&["get", "osrelease", "-o", "json"]).contains("stable"));
+    // And the plan rolls again when its release is changed: its status says which release it is
+    // about (`of`, NAME@REVISION), and a new revision of the OSRelease is a new one.
+    let of = || {
+        let plan = alpha.ok(&["get", "updateplan/canary", "-o", "json"]);
+        let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        plan["status"]["of"].as_str().map(str::to_string)
+    };
+    wait_for("the canary plan to see its release", || {
+        of().is_some_and(|of| of.starts_with("canary@"))
+    });
+    let first = of().unwrap();
+    let (code, said) = call("POST", "/v1/apply", Some(&as_json(&release("canary", "1.1"))));
+    assert_eq!(code, "200", "{said}");
+    wait_for("the canary plan to roll the changed release", || {
+        of().is_some_and(|of| of != first)
+    });
+}
+
 /// A worker's own units are still said to run, and what is not a worker's to write is
 /// refused on the route nodes write by, whatever its certificate is admitted to; the other
 /// node routes hand it no blob nothing on it names and no Volume it is no replica of.
@@ -3065,6 +3186,185 @@ fn workloads_move_off_a_lost_node() {
     assert_eq!(status(&alpha)["ready"], 3);
     // (What gamma reads is its own copy, which catches up.)
     wait_for("gamma to have caught up", || status(&gamma) == status(&alpha));
+}
+
+/// The recipe of docs/guide/workloads.md for a workload that outlives its node (a replicated
+/// home Volume, its key in a Secret, long commands as Jobs), run on three kithds: the node that
+/// has the Volume is lost, and the Workload that mounts it comes up
+/// on the node whose copy takes over, with the files as of the last sync and the Secret in its
+/// env, within the lost-after and one reconcile (the scheduler's pass, every 5 s) of the loss.
+/// (Behind KITH_E2E, as it starts three kithds. Nothing is pulled: the container has an image
+/// that never is, so it only says where the Workload is placed; the exec unit beside it is
+/// what runs, and writes the key it was given where the test reads it.)
+#[test]
+fn session_survives_its_node() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    // (Lost is lost after ten seconds without a word, whatever smaller number is given.)
+    const LOST_AFTER: u64 = 10;
+    const RECONCILE: u64 = 5;
+    let test = "session";
+    let lost_after = LOST_AFTER.to_string();
+    let quick = ["--lost-after", lost_after.as_str()];
+    let mut alpha = Node::start(test, "alpha", &quick);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let join = |name: &str| {
+        let token = alpha.ok(&["node", "token"]);
+        let args = ["--join", &alpha.address(), "--token", token.trim(), quick[0], quick[1]];
+        Node::start(test, name, &args)
+    };
+    let (beta, gamma) = (join("beta"), join("gamma"));
+    wait_for("three ready nodes", || {
+        alpha.kith(&["get", "node"]).1.matches("ready at").count() == 3
+    });
+
+    // The home: files on alpha before the Volume is made, as the volume test does.
+    let home = |node: &Node| node.dir.join("state/volumes/default/home/home");
+    std::fs::create_dir_all(home(&alpha)).unwrap();
+    std::fs::write(home(&alpha).join("notes"), "first").unwrap();
+    // Where each node's unit says what key it was started with.
+    let seen = alpha.dir.parent().unwrap().join("seen");
+    std::fs::create_dir_all(&seen).unwrap();
+    let key = "s3cr3t-session-key";
+    let recipe = format!(
+        "apiVersion: kith.dev/v1\nkind: Volume\nmetadata: {{ name: home }}\nspec: {{ node: alpha, path: home, replicas: 2, sync: 10s }}\n---\n\
+         apiVersion: kith.dev/v1\nkind: Secret\nmetadata: {{ name: session-key }}\nspec: {{ data: {{ SESSION_KEY: {key} }} }}\n---\n\
+         apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {{ name: session }}\nspec:\n  replicas: 1\n  template:\n    \
+           containers: [{{ name: home, image: img, volumeMounts: [{{ volume: home, path: /home/dev }}] }}]\n    \
+           exec:\n      - name: run\n        command: [sh, -c, 'echo \"$SESSION_KEY\" > {seen}/$NODE; exec sleep 300']\n        \
+           env: [{{ name: SESSION_KEY, secret: {{ name: session-key, key: SESSION_KEY }} }}, {{ name: NODE, field: node }}]\n",
+        seen = seen.display()
+    );
+    std::fs::write(beta.dir.join("recipe.yaml"), recipe).unwrap();
+    beta.ok(&["apply", "-f", "recipe.yaml"]);
+
+    // (Null while the node cannot answer: after the loss the store may be between leaders.)
+    let status = |node: &Node, key: &str| -> serde_json::Value {
+        let out = node.kith(&["get", key, "-o", "json"]).1;
+        let found: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+        found.as_array().map_or(found.clone(), |found| found[0].clone())["status"].clone()
+    };
+    let bound = |node: &Node, key: &str| status(node, key)["nodes"]["0"].as_str().map(str::to_string);
+    let said = |node: &str| {
+        std::fs::read_to_string(seen.join(node))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+
+    // It starts where the Volume is, with the Secret in its env.
+    wait_for("the session to run on alpha with its key", || said("alpha") == key);
+    // (What beta reads is its own copy of the store, which catches up.)
+    wait_for("the Workload to be placed on alpha", || {
+        bound(&beta, "workload/session").as_deref() == Some("alpha")
+    });
+    wait_for("a copy to be picked", || {
+        status(&beta, "volume/home")["replicas"][0].is_string()
+    });
+    let picked = status(&beta, "volume/home")["replicas"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let replica = if picked == "beta" { &beta } else { &gamma };
+    let has =
+        |node: &Node, text: &str| std::fs::read_to_string(home(node).join("notes")).is_ok_and(|file| file == text);
+    wait_for("the copy to have the first file", || has(replica, "first"));
+    std::fs::write(home(&alpha).join("notes"), "second").unwrap();
+    wait_for("the copy to have the file as it became", || has(replica, "second"));
+
+    // alpha is lost: within the lost-after and one reconcile the Workload is on the node whose
+    // copy took over, which has the last-synced file, and the unit there has its key.
+    alpha.stop();
+    let lost_at = Instant::now();
+    // The silence, a Raft election if alpha led, the pass that moves the Volume and the pass that
+    // places the Workload (two reconciles), and slack.
+    let by = deadline_for(Duration::from_secs(LOST_AFTER + 2 * RECONCILE + 15));
+    while bound(replica, "workload/session").as_deref() != Some(picked.as_str()) {
+        assert!(
+            lost_at.elapsed() < by,
+            "the Workload is not on {picked} {:?} after its node was lost: {}",
+            lost_at.elapsed(),
+            status(replica, "workload/session")
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(status(replica, "volume/home")["primary"], picked.as_str());
+    assert!(has(replica, "second"), "the new primary has the last-synced file");
+    while said(&picked) != key {
+        assert!(
+            lost_at.elapsed() < by,
+            "the unit on {picked} has not got the key {:?} after the loss",
+            lost_at.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("session up on {picked} {:?} after its node was lost", lost_at.elapsed());
+}
+
+/// The same recipe under a planned drain of the node that has the Volume: the copy is brought up
+/// to date and handed the Volume, and the Workload starts on that node with every file written
+/// before the drain (not only those of the last sync), in seconds and not a lost-after.
+#[test]
+fn session_moves_on_a_drain_with_nothing_lost() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "session-drain";
+    let mut alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let join = |name: &str| {
+        let token = alpha.ok(&["node", "token"]);
+        Node::start(test, name, &["--join", &alpha.address(), "--token", token.trim()])
+    };
+    let (beta, gamma) = (join("beta"), join("gamma"));
+    wait_for("three ready nodes", || {
+        alpha.kith(&["get", "node"]).1.matches("ready at").count() == 3
+    });
+    let home = |node: &Node| node.dir.join("state/volumes/default/home/home");
+    std::fs::create_dir_all(home(&alpha)).unwrap();
+    std::fs::write(home(&alpha).join("notes"), "first").unwrap();
+    let recipe = "apiVersion: kith.dev/v1\nkind: Volume\nmetadata: { name: home }\nspec: { node: alpha, path: home, replicas: 2, sync: 10s }\n---\n\
+         apiVersion: kith.dev/v1\nkind: Workload\nmetadata: { name: session }\nspec:\n  replicas: 1\n  template:\n    \
+           containers: [{ name: home, image: img, volumeMounts: [{ volume: home, path: /home/dev }] }]\n";
+    std::fs::write(beta.dir.join("recipe.yaml"), recipe).unwrap();
+    beta.ok(&["apply", "-f", "recipe.yaml"]);
+    let status = |node: &Node, key: &str| -> serde_json::Value {
+        let found: serde_json::Value = serde_json::from_str(&node.ok(&["get", key, "-o", "json"])).unwrap();
+        found.as_array().map_or(found.clone(), |found| found[0].clone())["status"].clone()
+    };
+    wait_for("the session to be placed on alpha", || {
+        status(&beta, "workload/session")["nodes"]["0"] == "alpha"
+    });
+    wait_for("a copy to be picked", || {
+        status(&beta, "volume/home")["replicas"][0].is_string()
+    });
+    let picked = status(&beta, "volume/home")["replicas"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let replica = if picked == "beta" { &beta } else { &gamma };
+    let has = |text: &str| std::fs::read_to_string(home(replica).join("notes")).is_ok_and(|file| file == text);
+    wait_for("the copy to have the first file", || has("first"));
+
+    // Written after that sync, and the drain at once: the handover syncs first.
+    std::fs::write(home(&alpha).join("notes"), "second").unwrap();
+    let drained_at = Instant::now();
+    alpha.ok(&["node", "drain", "alpha"]);
+    wait_for("the Workload to be placed on the copy's node", || {
+        status(replica, "workload/session")["nodes"]["0"] == picked.as_str()
+    });
+    assert_eq!(status(replica, "volume/home")["primary"], picked.as_str());
+    assert!(has("second"), "the copy was current when it took the Volume");
+    // (No bound of its own: wait_for's, 30 s scaled, is far under the default --lost-after of 300 s.)
+    eprintln!("session handed to {picked} {:?} after the drain", drained_at.elapsed());
+    alpha.stop();
 }
 
 /// (Not behind KITH_E2E: it pulls nothing.)

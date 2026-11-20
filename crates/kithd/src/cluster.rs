@@ -1624,6 +1624,11 @@ pub(crate) mod pinned_peer {
     /// Serves, on a loopback port, as the node `me`: whatever is asked is counted, and answered `{}`.
     /// The address, and how many requests got through.
     pub async fn answering_as(me: &Identity) -> (String, Arc<AtomicUsize>) {
+        answering_as_saying(me, serde_json::json!({})).await
+    }
+
+    /// [`answering_as`], answering `said` instead of `{}`.
+    pub async fn answering_as_saying(me: &Identity, said: serde_json::Value) -> (String, Arc<AtomicUsize>) {
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = tcp.local_addr().unwrap().to_string();
         let listener = listen(tcp, pki::server_config(me).unwrap()).unwrap();
@@ -1631,7 +1636,7 @@ pub(crate) mod pinned_peer {
         let counted = sent.clone();
         let app = Router::new().fallback(move || {
             counted.fetch_add(1, Ordering::SeqCst);
-            std::future::ready(Json(serde_json::json!({})))
+            std::future::ready(Json(said.clone()))
         });
         tokio::spawn(async move { drop(axum::serve(listener, app.into_make_service()).await) });
         (address, sent)
@@ -2714,6 +2719,109 @@ mod tests {
             )
             .await;
             assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    /// `who` may apply `kinds`, by a Role of its own and a binding.
+    fn grant(shared: &Shared, who: &str, kinds: &[&str]) {
+        let text = format!(
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{name: r-{who}}}\nspec: {{rules: [{{kinds: [{}], verbs: [apply]}}]}}\n\
+             ---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{name: b-{who}}}\nspec: {{role: r-{who}, subjects: [{who}]}}\n\
+             ---\napiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{name: {who}}}\nspec: {{}}\n",
+            kinds.join(", ")
+        );
+        let mut state = shared.store.lock().unwrap();
+        for resource in kith_api::Resource::from_source(&text).unwrap() {
+            state.store.apply(resource.unwrap()).unwrap();
+        }
+    }
+
+    /// The Install part's three writes (a join token, netboot on, netboot off) are for an
+    /// Identity bound to a Role that may apply Nodes, Roles and RoleBindings: one without a
+    /// binding, or with a Role that lacks one of the three kinds, gets a 403 from each (and
+    /// from a node), and the one with the Role is let through to the call itself.
+    #[tokio::test]
+    async fn install_part_refuses_tokens_and_netboot_without_the_role() {
+        use super::pinned_peer::{node, shared_of};
+        let ca = pki::Ca::create().unwrap();
+        let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
+        let shared = shared_of("install-part", cluster, &[]).await;
+        grant(&shared, "dana", &["Node", "Role", "RoleBinding"]);
+        grant(&shared, "erin", &["Node", "Role"]);
+        let status = |caller: &str, method: axum::http::Method, query: &[(&str, &str)]| {
+            let caller = match caller {
+                "node" => Caller::Node("b".into()),
+                who => Caller::Identity(who.into()),
+            };
+            let asked: BTreeMap<String, String> = query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            let (shared, caller) = (shared.clone(), axum::Extension(caller));
+            async move {
+                match method {
+                    axum::http::Method::POST => token(State(shared), caller, Query(asked)).await.status(),
+                    method => netboot(State(shared), caller, method, Query(asked), Body::empty())
+                        .await
+                        .status(),
+                }
+            }
+        };
+        let (post, put, delete) = (
+            axum::http::Method::POST,
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+        );
+        for who in ["carol", "erin", "node"] {
+            for method in [&post, &put, &delete] {
+                let got = status(who, method.clone(), &[]).await;
+                assert_eq!(got, StatusCode::FORBIDDEN, "{who} {method}");
+            }
+        }
+        // (The Role holder: a token is made; a PUT with a minutes that is
+        // no number is refused by the call, after the permit, before anything is turned on.)
+        assert_eq!(
+            status("dana", post.clone(), &[("trust", "worker")]).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status("dana", put, &[("minutes", "soon")]).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// A new recovery key, read as the web UI reads it (the answer of `POST /v1/lock/NAME/recovery`
+    /// from the node that made it), says `no-store`; so does the refusal of one who may not
+    /// apply NodeKeys, and a Role of Nodes alone is no such right.
+    #[tokio::test]
+    async fn recovery_no_store_on_the_key_the_page_shows() {
+        use super::pinned_peer::{answering_as_saying, at, node, shared_with};
+        let ca = pki::Ca::create().unwrap();
+        let (a, b) = (node(&ca, "a"), node(&ca, "b"));
+        let (home, _) = answering_as_saying(&b, serde_json::json!({ "recovery": "AAAA-BBBB" })).await;
+        let there = at("b", &home, Some(pki::print_of(&b.cert).unwrap()));
+        let shared = shared_with("recovery-no-store-ui", a, &[there]).await;
+        grant(&shared, "dana", &["NodeKey"]);
+        grant(&shared, "erin", &["Node"]);
+        let ask = |caller: Caller| {
+            crate::crypt::recovery(
+                State(shared.clone()),
+                axum::Extension(caller),
+                axum::extract::Path("b".to_string()),
+            )
+        };
+        for (who, status) in [
+            (Caller::Admin, StatusCode::OK),
+            (Caller::Identity("dana".into()), StatusCode::OK),
+            (Caller::Identity("erin".into()), StatusCode::FORBIDDEN),
+            (Caller::Identity("carol".into()), StatusCode::FORBIDDEN),
+        ] {
+            let answer = ask(who.clone()).await;
+            assert_eq!(answer.status(), status, "{who}");
+            let kept = answer.headers().get(axum::http::header::CACHE_CONTROL);
+            assert_eq!(kept.map(|kept| kept.to_str().unwrap()), Some("no-store"), "{who}");
+            let body = axum::body::to_bytes(answer.into_body(), 4096).await.unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&body).contains("AAAA-BBBB"),
+                status == StatusCode::OK
+            );
         }
     }
 

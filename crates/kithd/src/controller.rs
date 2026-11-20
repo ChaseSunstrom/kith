@@ -581,9 +581,7 @@ pub async fn run(
         }
     }
     controller.stop.store(true, Ordering::Relaxed);
-    for (id, slot) in &mut controller.slots {
-        stop(id, slot).await;
-    }
+    stop_all(&mut controller.slots, crate::init::handing_over()).await;
     // A count or removal holds directories of the state disk open: it is waited for, a little,
     // so the disk can be unmounted once kithd is gone.
     let counts = controller
@@ -609,6 +607,18 @@ pub async fn run(
             "kithd: gave up waiting after 2 s for {}: the state disk may be busy; what a removal left (the scratch and the scratch.* levels beside it, each listed once, at most four directories open, never `..`, never across a file system) goes as trees of their own at its pod's next count, or with its replica directory once the pod is gone; an image half removed is out of the images already, and goes at the next look at them",
             left.join(", ")
         );
+    }
+}
+
+/// Every unit stopped at kithd's end; but a hand-over to the next kithd (update.rs) stops none:
+/// they run on, and it takes them back.
+async fn stop_all(slots: &mut BTreeMap<String, Slot>, handing_over: bool) {
+    if handing_over {
+        eprintln!("kithd: handing over: units left running for the next kithd");
+        return;
+    }
+    for (id, slot) in slots {
+        stop(id, slot).await;
     }
 }
 
@@ -4420,6 +4430,19 @@ mod tests {
             !slots.contains_key(id),
             "a replaced unit goes, and what is wanted starts afresh"
         );
+    }
+
+    /// The stop at kithd's end stops every unit, but not on a hand-over to the next kithd. (A slot
+    /// that is `leaving` with no handle is the unit stand-in: a stop clears the mark, a hand-over does not.)
+    #[tokio::test]
+    async fn a_hand_over_stops_no_unit() {
+        let mut ended = slot_of("Workload/a/b", &[], "app");
+        ended.leaving = true;
+        let mut slots = BTreeMap::from([("w_a_b_0_app".to_string(), ended)]);
+        stop_all(&mut slots, true).await;
+        assert!(slots["w_a_b_0_app"].leaving, "a hand-over leaves the unit as it is");
+        stop_all(&mut slots, false).await;
+        assert!(!slots["w_a_b_0_app"].leaving, "any other end stops it");
     }
 
     /// An input device plugged into a running container is no reason to start it over, so the device

@@ -1294,8 +1294,8 @@ mod tests {
         assert!(console("GET") && console("HEAD"));
         assert!(!console("POST") && !console("DELETE") && !console("PUT"));
         let grants = crate::access::Grants::of(&Caller::Console("n1".into()), &Store::default());
-        assert!(grants.may(&kith_api::kinds::Verb::Get, "Secret", Some("default")));
-        assert!(!grants.may(&kith_api::kinds::Verb::Apply, "Workload", Some("default")));
+        assert!(grants.may(&kith_api::kinds::Verb::Get, "Secret", Some("default"), Some("a")));
+        assert!(!grants.may(&kith_api::kinds::Verb::Apply, "Workload", Some("default"), Some("a")));
         assert!(!grants.anywhere(&kith_api::kinds::Verb::Exec, None));
     }
 
