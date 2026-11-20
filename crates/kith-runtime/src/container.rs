@@ -2001,7 +2001,14 @@ fn spec_shifted(
     process.set_terminal(Some(false));
     // The open-file limit: the spec's default is 1024 soft and hard, which an app cannot raise.
     let (soft, hard) = match nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE) {
-        Ok((_, hard)) => container_nofile(hard),
+        Ok((_, hard)) => {
+            // (The kernel refuses a hard limit above fs.nr_open: an unlimited one is capped to it.)
+            let cap = fs::read_to_string("/proc/sys/fs/nr_open")
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            container_nofile(hard.min(cap))
+        }
         Err(_) => (1024, 1024),
     };
     process.set_rlimits(Some(vec![

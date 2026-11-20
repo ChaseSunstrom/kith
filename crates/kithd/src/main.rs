@@ -364,11 +364,19 @@ fn raise_nofile() {
             } else {
                 hard
             };
+            if nr_open == 0 && nix::unistd::getuid().is_root() {
+                said(&"/proc/sys/fs/nr_open is not readable, so the hard limit is not raised");
+            }
             let want = nofile_soft(soft, top);
             if (want, top) != (soft, hard)
                 && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, want, top)
             {
                 said(&e);
+                // (A root without CAP_SYS_RESOURCE may not raise the hard limit, but may the soft one.)
+                let soft_only = nofile_soft(soft, hard);
+                if top != hard && soft_only != soft {
+                    let _ = setrlimit(Resource::RLIMIT_NOFILE, soft_only, hard);
+                }
             }
         }
         Err(e) => said(&e),

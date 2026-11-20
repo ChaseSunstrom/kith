@@ -266,7 +266,8 @@ Only the newest version is fixed. There are no security releases of older ones.
   hard kithd's own (524288), as containerd gives, so an app can raise its own soft limit
   and a program that sizes a select() bitmap from the soft limit is not handed a file at
   or above 1024; an exec unit, a plain process of the node, inherits kithd's 65536 soft.
-  There is no per-container limit in the spec. A port another
+  There is no per-container limit in the spec: a container's open files are bounded only
+  by its memory limit and the node's fs.file-max. A port another
   namespace's Workload or Job publishes is refused when written, and so is a pod through
   an Exit that does not list its namespace: both are asked of every writer (a person's
   apply, a Release, a Source, kithd's own controllers), where the write goes into the
