@@ -929,34 +929,71 @@ pub fn fork_start(f: impl FnOnce() -> Vec<u8>) -> Result<Forked> {
     Ok(Forked { pid: child, read })
 }
 
-/// Every process under `root` (its children, theirs, ...) as `/proc` lists them now.
-// ponytail: a process that forks while this reads may escape it, and a number may be reused
-// between the read and the kill; `collect` stops the child first, which closes the first
-// for its own children, and the second needs a number to wrap within microseconds. A cgroup
-// kill, where the caller has the cgroup, when either hurts.
-fn descendants(root: i32) -> Vec<i32> {
+/// The parent of process `pid`, as `/proc` says now.
+fn parent_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // (The name in `stat` may hold spaces and `)`: the fields follow the last one.)
+    let (_, rest) = stat.rsplit_once(") ")?;
+    rest.split(' ').nth(1)?.parse::<i32>().ok()
+}
+
+/// A process to kill: by descriptor where the kernel gave one (it names that process for as long
+/// as it is held, whatever its number becomes), else by number.
+struct Victim {
+    pid: i32,
+    held: Option<OwnedFd>,
+}
+
+impl Victim {
+    /// Process `pid`, if it is still `parent`'s child: a descriptor is opened first and the
+    /// parent read after, so that a match is of the process the descriptor names.
+    fn pin(pid: i32, parent: i32) -> Option<Victim> {
+        // SAFETY: pidfd_open takes a process id and flags, and gives a descriptor or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
+        let held = (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) });
+        // (No pidfd: a kernel before 5.3, or no descriptor left. By its number, then.)
+        (parent_of(pid)? == parent).then_some(Victim { pid, held })
+    }
+
+    fn kill(&self) {
+        match &self.held {
+            // SAFETY: pidfd_send_signal on a descriptor this holds, with no info.
+            Some(fd) => unsafe {
+                libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), libc::SIGKILL, 0, 0);
+            },
+            // SAFETY: kill takes a number and a signal.
+            None => unsafe {
+                libc::kill(self.pid, libc::SIGKILL);
+            },
+        }
+    }
+}
+
+/// Every process under `root` (its children, theirs, ...) as `/proc` lists them now, each held
+/// by descriptor and checked to be still its parent's child once held.
+// ponytail: a process that forks while this reads may escape it, and one reparented away
+// mid-scan (its parent ended) is dropped by the check; `collect` stops the child first, which
+// closes the first for its own children. A cgroup kill, where the caller has the cgroup,
+// catches both.
+fn descendants(root: i32) -> Vec<Victim> {
     let mut parents = std::collections::HashMap::<i32, Vec<i32>>::new();
     for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
         let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<i32>().ok()) else {
             continue;
         };
-        // (The name in `stat` may hold spaces and `)`: the fields follow the last one.)
-        let parent = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| {
-                let (_, rest) = stat.rsplit_once(") ")?;
-                rest.split(' ').nth(1)?.parse::<i32>().ok()
-            });
-        if let Some(parent) = parent {
+        if let Some(parent) = parent_of(pid) {
             parents.entry(parent).or_default().push(pid);
         }
     }
     let mut found = Vec::new();
     let mut next = vec![root];
-    while let Some(pid) = next.pop() {
-        for &child in parents.get(&pid).into_iter().flatten() {
-            found.push(child);
-            next.push(child);
+    while let Some(parent) = next.pop() {
+        for &child in parents.get(&parent).into_iter().flatten() {
+            if let Some(victim) = Victim::pin(child, parent) {
+                found.push(victim);
+                next.push(child);
+            }
         }
     }
     found
@@ -992,15 +1029,13 @@ impl Forked {
                 // SAFETY: kill and waitpid on this process's own child.
                 unsafe { libc::kill(self.pid, libc::SIGSTOP) };
                 let tree = descendants(self.pid);
-                // SAFETY: kill and waitpid on this process's own child and its descendants'
-                // numbers (a number that ended since is at worst another's: see `descendants`).
+                // SAFETY: kill and waitpid on this process's own child.
                 unsafe {
                     libc::kill(self.pid, libc::SIGKILL);
-                    for pid in tree {
-                        libc::kill(pid, libc::SIGKILL);
-                    }
-                    libc::waitpid(self.pid, std::ptr::null_mut(), 0);
                 }
+                tree.iter().for_each(Victim::kill);
+                // SAFETY: waitpid on this process's own child.
+                unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
                 return Err(Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
@@ -1336,6 +1371,24 @@ mod tests {
 
     /// What the helper made (a tenant, an init) is the one that may hang, and it outlives the
     /// helper that is killed: at the deadline the whole tree under the child goes, not only it.
+    #[test]
+    fn a_victim_is_held_only_while_its_parent_is_the_one_listed() {
+        let me = std::process::id() as i32;
+        // SAFETY: getppid takes nothing.
+        let parent = unsafe { libc::getppid() };
+        // (A number whose parent is not the one it was listed under, as a reused one is: dropped.)
+        assert!(Victim::pin(me, parent + 1).is_none());
+        assert!(Victim::pin(i32::MAX, parent).is_none());
+        let mine = Victim::pin(me, parent).expect("this process is its parent's child");
+        assert!(mine.held.is_some(), "a kernel with pidfd_open gives a descriptor");
+        // The signal goes by descriptor to the process it names.
+        let mut sleeper = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+        Victim::pin(sleeper.id() as i32, me)
+            .expect("the sleeper is this process's child")
+            .kill();
+        assert!(!sleeper.wait().unwrap().success());
+    }
+
     #[test]
     fn forked_kills_what_the_child_started_too() {
         let _children = children();
