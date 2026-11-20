@@ -486,8 +486,10 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
   does](os.md#rolling-a-release-through-the-cluster)): it drains the node, restarts it once each replica the
   plan says moves runs on another node (a replica that stays holds nothing), and lifts the drain
   when the node is done, the plan is paused or changed, its OSRelease is gone, or the node leaves
-  its selector. It waits at most `drainSeconds` (300 unless said, 3600 at most). It lifts only a
-  drain it put on: yours, put on first, stays until you undrain.
+  its selector, or the plan is deleted. It waits at most `drainSeconds` (300 unless said, 3600 at
+  most). It lifts only a drain it put on: yours, put on first, stays until you undrain. The plan's
+  name is in the value of its taints (`plan:NAME`), which is how a deleted plan's drain and cordon
+  are found and lifted; a taint without it is never lifted by a plan.
 
 ### Checkpointing a long GPU Job
 

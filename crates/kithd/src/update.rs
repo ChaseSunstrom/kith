@@ -471,10 +471,54 @@ fn drained_spec(spec: &Value, on: bool) -> Option<Value> {
     (next != *spec).then_some(next)
 }
 
+/// Stamps the plan on the record under `key`, in its taint's value (`plan:NAME`, after `owner;`
+/// when an owner cordoned the node first): the Taint has no other field to name it in. A record
+/// an operator put on has no stamp, so no plan's end lifts it.
+fn stamp(spec: &mut Value, key: &str, plan: &str) {
+    let Some(taint) = spec["taints"]
+        .as_array_mut()
+        .and_then(|taints| taints.iter_mut().find(|taint| taint["key"] == key))
+    else {
+        return;
+    };
+    let owner = if taint["value"] == "owner" { "owner;" } else { "" };
+    taint["value"] = format!("{owner}plan:{plan}").into();
+}
+
+/// The cordon records on Nodes that an UpdatePlan which is gone put on: (node, record key).
+/// `live` says whether a plan of that name exists.
+fn orphans<'a>(
+    nodes: impl Iterator<Item = (&'a str, &'a Value)>,
+    live: impl Fn(&str) -> bool,
+) -> Vec<(String, &'static str)> {
+    let mut found = Vec::new();
+    for (name, spec) in nodes {
+        for key in [kith_sched::DRAIN, crate::sched::UPDATE_CORDON] {
+            let taint = spec["taints"]
+                .as_array()
+                .and_then(|taints| taints.iter().find(|taint| taint["key"] == key));
+            let value = taint.and_then(|taint| taint["value"].as_str()).unwrap_or_default();
+            let plan = value.strip_prefix("owner;").unwrap_or(value).strip_prefix("plan:");
+            if plan.is_some_and(|plan| !live(plan)) {
+                found.push((name.to_string(), key));
+            }
+        }
+    }
+    found
+}
+
 /// Set or lift the update's cordon (`what` is `cordoned_spec`) or drain (`drained_spec`) on
-/// `name`. Each try re-reads the Node, so a try that lost a race to another write (a Conflict)
+/// `name`; `record` is its taint's key, and a record put on is stamped with `plan`. Each try
+/// re-reads the Node, so a try that lost a race to another write (a Conflict)
 /// is finished by the next one; a bounded number of tries.
-async fn write_cordon(shared: &Shared, name: &str, on: bool, what: fn(&Value, bool) -> Option<Value>) {
+async fn write_cordon(
+    shared: &Shared,
+    name: &str,
+    on: bool,
+    what: fn(&Value, bool) -> Option<Value>,
+    record: &str,
+    plan: &str,
+) {
     const TRIES: usize = 3;
     let key = format!("Node/{name}");
     for _ in 0..TRIES {
@@ -483,9 +527,12 @@ async fn write_cordon(shared: &Shared, name: &str, on: bool, what: fn(&Value, bo
             state.store.get(&key).cloned()
         };
         let Some(mut node) = found else { return };
-        let Some(spec) = what(&node.spec, on) else {
+        let Some(mut spec) = what(&node.spec, on) else {
             return;
         };
+        if on && !crate::sched::has_record(&node.spec, record) {
+            stamp(&mut spec, record, plan);
+        }
         node.spec = spec;
         let at = kith_api::store::now();
         let sent = shared
@@ -584,8 +631,20 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                     let statuses = vec![(plan.key(), decided.status)];
                     commands.push(Command::Patch { statuses });
                 }
-                cordons.extend(decided.cordon);
-                drains.extend(decided.drain);
+                let by = |(name, on)| (name, on, plan.metadata.name.clone());
+                cordons.extend(decided.cordon.into_iter().map(by));
+                drains.extend(decided.drain.into_iter().map(by));
+            }
+            // What a plan that is gone put on is lifted (written again each round until it is).
+            let nodes = store
+                .list(Some("Node"))
+                .map(|node| (node.metadata.name.as_str(), &node.spec));
+            for (name, record) in orphans(nodes, |plan| store.get(&format!("UpdatePlan/{plan}")).is_some()) {
+                if record == kith_sched::DRAIN {
+                    drains.push((name, false, String::new()));
+                } else {
+                    cordons.push((name, false, String::new()));
+                }
             }
         }
         for command in commands {
@@ -593,11 +652,19 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 eprintln!("kithd: writing down an update plan's step: {e}");
             }
         }
-        for (name, cordoned) in cordons {
-            write_cordon(&shared, &name, cordoned, cordoned_spec).await;
+        for (name, cordoned, plan) in cordons {
+            write_cordon(
+                &shared,
+                &name,
+                cordoned,
+                cordoned_spec,
+                crate::sched::UPDATE_CORDON,
+                &plan,
+            )
+            .await;
         }
-        for (name, drained) in drains {
-            write_cordon(&shared, &name, drained, drained_spec).await;
+        for (name, drained, plan) in drains {
+            write_cordon(&shared, &name, drained, drained_spec, kith_sched::DRAIN, &plan).await;
         }
     }
 }
@@ -2690,6 +2757,92 @@ mod tests {
         assert_eq!(done.drain, [("a".to_string(), false)]);
         assert_eq!(done.cordon, [("a".to_string(), false)]);
         assert_eq!(done.status["drained"], json!([]));
+    }
+
+    /// A node as the plan leaves it: the drain (and the update's cordon) it put on, stamped with it.
+    fn put_on_by(spec: &Value, plan: &str, drain: bool) -> Value {
+        let mut next = if drain {
+            drained_spec(spec, true)
+        } else {
+            cordoned_spec(spec, true)
+        }
+        .expect("a record to put on");
+        stamp(
+            &mut next,
+            if drain {
+                kith_sched::DRAIN
+            } else {
+                crate::sched::UPDATE_CORDON
+            },
+            plan,
+        );
+        next
+    }
+
+    /// What the sweep would lift from these nodes when only the plans in `live` exist.
+    fn swept(nodes: &[(&str, &Value)], live: &[&str]) -> Vec<(String, &'static str)> {
+        orphans(nodes.iter().map(|(name, spec)| (*name, *spec)), |plan| {
+            live.contains(&plan)
+        })
+    }
+
+    #[test]
+    fn update_delete_lifts_the_drain_and_cordon_the_plan_put_on_and_no_operators() {
+        let (drain, cordon) = (kith_sched::DRAIN, crate::sched::UPDATE_CORDON);
+        // The plan's own drain, its own cordon, a drain on a node an owner had cordoned first.
+        let drained = put_on_by(&json!({}), "p", true);
+        let cordoned = put_on_by(&json!({}), "p", false);
+        let owned = put_on_by(&json!({ "unschedulable": true }), "p", true);
+        // The operator's: a drain with no stamp, one an owner cordoned over, a cordon of theirs,
+        // and a drain the operator re-put after the plan's was lifted.
+        let mut theirs = json!({});
+        crate::sched::drain_on(&mut theirs);
+        let mut theirs_owned = json!({ "unschedulable": true });
+        crate::sched::drain_on(&mut theirs_owned);
+        let cordon_only = json!({ "unschedulable": true });
+        let nodes = [
+            ("drained", &drained),
+            ("cordoned", &cordoned),
+            ("owned", &owned),
+            ("theirs", &theirs),
+            ("theirs-owned", &theirs_owned),
+            ("cordon-only", &cordon_only),
+        ];
+        // The plan is there: nothing is lifted.
+        assert!(swept(&nodes, &["p"]).is_empty());
+        // The plan is deleted: its records, and only those.
+        let lifted = swept(&nodes, &[]);
+        assert_eq!(
+            lifted,
+            [
+                ("drained".to_string(), drain),
+                ("cordoned".to_string(), cordon),
+                ("owned".to_string(), drain)
+            ]
+        );
+        // Another plan's records stay while that plan is there.
+        assert_eq!(swept(&nodes, &["q"]), lifted);
+        // Lifting leaves no taint and no cordon, except the owner's cordon.
+        assert_eq!(drained_spec(&drained, false).expect("a lift")["taints"], json!([]));
+        assert!(drained_spec(&drained, false).unwrap().get("unschedulable").is_none());
+        assert!(cordoned_spec(&cordoned, false).unwrap().get("unschedulable").is_none());
+        let kept = drained_spec(&owned, false).expect("a lift");
+        assert_eq!(
+            (kept["taints"].clone(), kept["unschedulable"].clone()),
+            (json!([]), json!(true))
+        );
+        // A lift that was lost is asked for again: the nodes are the same, so is the sweep.
+        assert_eq!(swept(&nodes, &[]), lifted);
+        // The plan's stamp survives the drain and the update cordon on one node, and an owner
+        // record gone from under it.
+        let both = put_on_by(&drained, "p", false);
+        assert_eq!(
+            swept(&[("n", &both)], &[]),
+            [("n".to_string(), drain), ("n".to_string(), cordon)]
+        );
+        let after_drain = drained_spec(&both, false).expect("a lift");
+        assert_eq!(swept(&[("n", &after_drain)], &[]), [("n".to_string(), cordon)]);
+        assert_eq!(after_drain["unschedulable"], true);
     }
 
     #[test]
