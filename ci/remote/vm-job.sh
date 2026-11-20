@@ -24,8 +24,28 @@ tools)
     apt-get "$@" -y install --no-install-recommends $PKGS && rustup target add x86_64-unknown-linux-musl
     exit ;;
 run)
+    # kith's pod seccomp answers EPERM to FS_IOC_SETFLAGS, and systemd-repart (--empty=create sets
+    # NOCOW) gives up on any error but "not supported": this shim says that, as tmpfs would.
+    shim=$cache/ci-nocow.so
+    [ -f "$shim" ] || gcc -shared -fPIC -x c -o "$shim" - <<'EOF' || exit 1
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <linux/fs.h>
+int ioctl(int fd, unsigned long req, ...) {
+    static int (*real)(int, unsigned long, ...);
+    va_list ap;
+    va_start(ap, req);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+    if (req == FS_IOC_SETFLAGS) { errno = EOPNOTSUPP; return -1; }
+    if (!real) real = (int (*)(int, unsigned long, ...))dlsym(RTLD_NEXT, "ioctl");
+    return real(fd, req, arg);
+}
+EOF
     cd "$cache/src" || exit 1
-    exec env HOME="$work" TMPDIR=/tmp CARGO_HOME="$cache/cargo" CARGO_TARGET_DIR="$cache/target" KITH_OS_CACHE="$cache/os" sh ci/vm.sh --test "$TEST" ;;
+    exec env LD_PRELOAD="$shim" HOME="$work" TMPDIR=/tmp CARGO_HOME="$cache/cargo" CARGO_TARGET_DIR="$cache/target" KITH_OS_CACHE="$cache/os" sh ci/vm.sh --test "$TEST" ;;
 esac
 mkdir -p "$cache" "$work" && exec 9>"$cache/lock" && flock 9 || exit 1
 t0=$(date +%s)
