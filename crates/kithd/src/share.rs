@@ -655,6 +655,8 @@ async fn report(shared: &Arc<crate::Shared>, me: &str, names: &[String], told: &
     let statuses = vec![(key, serde_json::Map::from_iter([("shares".to_string(), want)]))];
     if let Err(e) = shared.submit(kith_store::Command::Patch { statuses }).await {
         eprintln!("kithd: shared volumes: saying which Shares this node serves: {e}");
+        // (Refused or no leader yet, or an old leader: tried again next round.)
+        *told = None;
     }
 }
 
