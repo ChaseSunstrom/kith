@@ -571,7 +571,9 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
     let units: Vec<Value> = units.as_ref().and_then(Value::as_array).cloned().unwrap_or_default();
     // (`hostUsers`: whether a container keeps the node's users, which the node says of its own unit.)
     // (`gen`: which generation of a replica it is, the second where a rolling update started it beside the old.)
-    const UNIT: [&str; 11] = [
+    // (`pull`: how far the pull of its image is, which the node says while it goes on.)
+    const UNIT: [&str; 12] = [
+        "pull",
         "gen",
         "name",
         "replica",
@@ -586,7 +588,29 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
     ];
     for unit in &units {
         match unit.as_object() {
-            Some(unit) => only(key, unit, &UNIT)?,
+            Some(unit) => {
+                only(key, unit, &UNIT)?;
+                if let Some(pull) = unit.get("pull") {
+                    // Four counts, each a small number: it is shown as it is.
+                    let counts = pull.as_object().filter(|p| p.len() == 4);
+                    let sane = |field: &str, most: u64| {
+                        counts
+                            .and_then(|p| p.get(field))
+                            .and_then(Value::as_u64)
+                            .is_some_and(|n| n <= most)
+                    };
+                    if !(sane("layers", 1 << 16)
+                        && sane("layersTotal", 1 << 16)
+                        && sane("bytes", 1 << 50)
+                        && sane("bytesTotal", 1 << 50))
+                    {
+                        return Err(refused(
+                            key,
+                            "`pull` is four counts: layers, layersTotal, bytes, bytesTotal",
+                        ));
+                    }
+                }
+            }
             None => return Err(refused(key, "a unit is an object")),
         }
     }
@@ -1356,6 +1380,26 @@ spec: { volume: there, every: 1d }
         let store = store();
         let said = json!({ "state": "running", "succeeded": 0, "failed": 0, "containers": [], "notes": ["restartPolicy is ignored"] });
         assert!(try_as(&store, "a", report_of("a", "Job/default/once", said)).is_ok());
+    }
+
+    #[test]
+    fn a_report_may_carry_how_far_a_pull_is_and_nothing_else_in_its_place() {
+        let store = store();
+        let pull = json!({ "layers": 1, "layersTotal": 2, "bytes": 5, "bytesTotal": 10 });
+        let said = |pull: Value| json!({ "containers": [unit(0, json!({ "pull": pull }))] });
+        let try_pull = |pull: Value| try_as(&store, "w", report_of("w", "Workload/default/web", said(pull)));
+        let taken = reported(try_pull(pull.clone()).unwrap()).unwrap();
+        assert_eq!(taken["containers"][0]["pull"], pull);
+        for bad in [
+            json!("lots"),
+            json!({ "layers": 1 }),
+            json!({ "layers": -1, "layersTotal": 2, "bytes": 5, "bytesTotal": 10 }),
+            json!({ "layers": 1, "layersTotal": 2, "bytes": 5, "bytesTotal": 1e30 }),
+            json!({ "layers": 1, "layersTotal": 2, "bytes": 5, "bytesTotal": 10, "more": 1 }),
+            json!({ "layers": 1, "layersTotal": 2, "bytes": "5", "bytesTotal": 10 }),
+        ] {
+            assert!(try_pull(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]

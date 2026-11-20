@@ -718,9 +718,15 @@ impl ImageStore {
                 fetch.push((layer, blob));
             }
         }
-        let todo: i64 = fetch.iter().map(|(layer, _)| layer.size.max(0)).sum();
+        // (A registry's sizes are its word: summed so that none overflows.)
+        let todo: i64 = fetch
+            .iter()
+            .fold(0, |sum, (layer, _)| sum.saturating_add(layer.size.max(0)));
         // What is stored already counts as done.
-        let bytes_total: u64 = manifest.layers.iter().map(|l| u64::try_from(l.size).unwrap_or(0)).sum();
+        let bytes_total: u64 = manifest
+            .layers
+            .iter()
+            .fold(0, |sum, l| sum.saturating_add(u64::try_from(l.size).unwrap_or(0)));
         let counts = Arc::new(Counts {
             layers: AtomicUsize::new(manifest.layers.len() - fetch.len()),
             layers_total: manifest.layers.len(),
@@ -733,8 +739,9 @@ impl ImageStore {
             .insert(asked.clone(), counts.clone());
         let _listed = Listed(&self.pulls, asked, counts.clone());
         // Side by side, so a slow one is not waited for by the rest. (They share the link: each is
-        // given the time all of them take at the slowest rate, not its own.)
-        let wait = layer_wait(self.patience.metadata, todo);
+        // given the time its own size takes at the slowest rate, for as many sharing it as there are.)
+        let sharing = LAYERS_AT_ONCE.min(fetch.len());
+        let metadata = self.patience.metadata;
         let downloaded = fetch.len();
         at_once(
             LAYERS_AT_ONCE,
@@ -747,6 +754,7 @@ impl ImageStore {
                     let mut file = tokio::fs::File::create(&partial.0).await.ctx("storing a layer")?;
                     let what = format!("pulling layer {} of {reference} ({} bytes)", layer.digest, layer.size);
                     let mut into = Capped::new(&mut file, layer.size, counts.bytes.clone());
+                    let wait = layer_wait(metadata, layer.size, sharing);
                     within(wait, what, remote.oci.pull_blob(reference, layer, &mut into)).await?;
                     // On disk before it gets its final name: a crash must not leave half a layer there.
                     file.sync_all().await.ctx("storing a layer")?;

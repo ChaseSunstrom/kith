@@ -53,9 +53,11 @@ const ERROR_LIMIT: usize = 64 << 10;
 /// pull for ever without this.)
 const LAYER_FLOOR: f64 = (100 << 10) as f64;
 
-/// The most time a layer of `size` bytes may take to arrive: `metadata` and its size at [`LAYER_FLOOR`].
-pub(crate) fn layer_wait(metadata: Duration, size: i64) -> Duration {
-    metadata + Duration::from_secs_f64(size.max(0) as f64 / LAYER_FLOOR)
+/// The most time a layer of `size` bytes may take to arrive, `at_once` layers sharing the link:
+/// `metadata` and its size at [`LAYER_FLOOR`] a share. (Its own size, not the image's: a stalled small
+/// layer is not waited for as long as the biggest takes.)
+pub(crate) fn layer_wait(metadata: Duration, size: i64, at_once: usize) -> Duration {
+    metadata + Duration::from_secs_f64(size.max(0) as f64 * at_once.max(1) as f64 / LAYER_FLOOR)
 }
 
 /// What a registry said of a thing asked for: the thing, or that it has no such thing (or refused),
@@ -350,5 +352,22 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Capped<W> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod layer_wait_tests {
+    use super::*;
+
+    #[test]
+    fn a_small_layer_is_not_given_the_time_of_a_big_one() {
+        let metadata = Duration::from_secs(30);
+        let small = layer_wait(metadata, 1 << 20, 4);
+        let big = layer_wait(metadata, 500 << 20, 4);
+        assert!(small < Duration::from_secs(30 + 50), "{small:?}");
+        assert!(big > small * 10, "{big:?}");
+        // Alone on the link, a layer has its own size's time; none or negative is the metadata wait.
+        assert_eq!(layer_wait(metadata, 100 << 10, 1), metadata + Duration::from_secs(1));
+        assert_eq!(layer_wait(metadata, -5, 0), metadata);
     }
 }
