@@ -25,6 +25,8 @@ const STROKE: usize = 3;
 const FIRST_STOP_Y: usize = 240;
 const STOP_GAP: usize = 56;
 const MIN_GAP: usize = STOP + 8;
+/// The clear space, a footer line, between the rail's last stop and the footer.
+const FOOT_GAP: usize = LINE_H * LABEL_SCALE;
 const QUESTION_SCALE: usize = 3;
 const LABEL_SCALE: usize = 2;
 /// A glyph's rows (the font's `[u8; 9]`): `CAP_H` down to the baseline, then two below it for
@@ -234,34 +236,73 @@ fn layout_at(question: &str, width: usize, top: usize) -> Vec<(String, usize)> {
     lines
 }
 
-/// Draw the install question `question` with the rail of `stops`, `current` being the stop
-/// it belongs to: the stops before it in ink, it in the accent, the ones after it outlined,
-/// and `footer` at the foot. Only the colours of the site's tokens are used. The rail starts
-/// below the text (at `FIRST_STOP_Y`, or lower for a long question); a long question is set in
-/// a smaller size until the rail fits under it, and with none that fits (a screen too short
-/// for the text even at the smallest size) the rail is left out, not drawn over the text.
-pub fn draw_question(frame: &mut Frame, stops: &[&str], current: usize, question: &str, footer: &str) {
-    frame.rect(0, 0, frame.width, frame.height, SITE_BG);
-    let mut chosen = None;
+/// What the question screen shows of the rail: all the stops, one line saying where the
+/// install is (`Compact`, when the stops do not fit under a long question), or nothing.
+#[derive(Debug, PartialEq)]
+enum Rail {
+    Full,
+    Compact,
+    None,
+}
+
+/// The question's lines (each with its scale), the rail it leaves room for, and the middle of
+/// the rail's first stop (or of the compact line). The question's legibility wins: it is kept at
+/// the largest size at which the full rail or else the compact line fits under it, and is set
+/// smaller only when neither does; with no size that fits, the rail is left out.
+fn question_plan(width: usize, height: usize, count: usize, question: &str) -> (Vec<(String, usize)>, Rail, usize) {
+    let mut plan = None;
     for top in [QUESTION_SCALE, LABEL_SCALE, 1] {
-        let lines = layout_at(question, frame.width, top);
+        let lines = layout_at(question, width, top);
         let bottom = MARGIN + lines.iter().map(|(_, scale)| LINE_H * scale).sum::<usize>();
         let first = FIRST_STOP_Y.max(bottom + STOP + STOP / 2);
-        let fits = rail_gap(frame.height, stops.len(), first) >= MIN_GAP;
-        chosen = Some((lines, first, fits));
-        if fits {
+        let compact = bottom + STOP;
+        let (rail, centre) = if rail_gap(height, count, first) >= MIN_GAP {
+            (Rail::Full, first)
+        } else if compact + STOP / 2 + FOOT_GAP <= height.saturating_sub(MARGIN) {
+            (Rail::Compact, compact)
+        } else {
+            (Rail::None, first)
+        };
+        let done = rail != Rail::None;
+        plan = Some((lines, rail, centre));
+        if done {
             break;
         }
     }
-    let (lines, first, fits) = chosen.expect("a size was tried");
+    plan.expect("a size was tried")
+}
+
+/// Draw the install question `question` with the rail of `stops`, `current` being the stop
+/// it belongs to: the stops before it in ink, it in the accent, the ones after it outlined,
+/// and `footer` at the foot. Only the colours of the site's tokens are used. The rail starts
+/// below the text (at `FIRST_STOP_Y`, or lower for a long question); where the stops do not fit
+/// under a long question, one line stands for them (the current stop's square and "Disk - step
+/// 1 of 6"), and the question is set smaller only if that does not fit either.
+pub fn draw_question(frame: &mut Frame, stops: &[&str], current: usize, question: &str, footer: &str) {
+    frame.rect(0, 0, frame.width, frame.height, SITE_BG);
+    let (lines, rail, first) = question_plan(frame.width, frame.height, stops.len(), question);
     let mut y = MARGIN;
     for (line, scale) in lines {
         frame.text(MARGIN, y, scale, &line, SITE_TEXT);
         y += LINE_H * scale;
     }
-    if fits {
-        let rail: Vec<(&str, &str)> = stops.iter().map(|&label| (label, "")).collect();
-        draw_rail(frame, &rail, current, first);
+    match rail {
+        Rail::Full => {
+            let rail: Vec<(&str, &str)> = stops.iter().map(|&label| (label, "")).collect();
+            draw_rail(frame, &rail, current, first);
+        }
+        Rail::Compact => {
+            frame.rect(RAIL_X, first - STOP / 2, STOP, STOP, SITE_ACCENT);
+            let said = format!(
+                "{} - step {} of {}",
+                stops.get(current).unwrap_or(&""),
+                current + 1,
+                stops.len()
+            );
+            let y = first - CAP_H * LABEL_SCALE / 2;
+            frame.text(RAIL_X + 2 * STOP, y, LABEL_SCALE, &said, SITE_TEXT);
+        }
+        Rail::None => {}
     }
     frame.text(
         MARGIN,
@@ -295,7 +336,7 @@ const BAR_H: usize = 14;
 /// `STOP_GAP`, closer where that many would run off a short screen. Under `MIN_GAP` the stops
 /// crowd each other, and the rail is not drawn there.
 fn rail_gap(height: usize, count: usize, first: usize) -> usize {
-    let room = height.saturating_sub(MARGIN + first + STOP);
+    let room = height.saturating_sub(MARGIN + FOOT_GAP + first + STOP / 2);
     STOP_GAP.min(room / count.saturating_sub(1).max(1))
 }
 
@@ -867,9 +908,22 @@ mod tests {
     #[test]
     fn fb_a_long_question_never_runs_into_the_rail_or_off_the_screen() {
         let ink = [site("text"), site("accent"), site("hair")];
-        // 1400: room for the question at its full size (3); 600: the screen of the VM tests,
-        // where it is set smaller; 300: too short for the rail at any size, so it is left out.
-        for height in [1400, 600, 300] {
+        // 1400: the question at its full size (3) over the full rail; 600: the screen of the VM
+        // tests, where the question keeps size 2 and one compact line stands for the rail; 300:
+        // too short for the compact line under size 2, so the question is set at 1; 200: too
+        // short for any rail, which is left out.
+        for (height, scale, kind) in [
+            (1400, 3, Rail::Full),
+            (600, 2, Rail::Compact),
+            (300, 1, Rail::Compact),
+            (200, 1, Rail::None),
+        ] {
+            let (lines, rail, _) = question_plan(800, height, STOPS.len(), &disk_question(8));
+            assert_eq!(rail, kind, "{height}: the rail drawn");
+            assert!(
+                lines.iter().all(|&(_, s)| s == scale),
+                "{height}: the question is not all at size {scale}"
+            );
             let mut frame = Frame::new(
                 Geometry {
                     width: 800,
@@ -896,19 +950,34 @@ mod tests {
                         !has_ink_of(&frame, RAIL_X, top, STOP, height - top, site("text")),
                         "{height}: text ink in the rail's column"
                     );
-                    let last = stop_centre(height, STOPS.len(), top + STOP / 2, STOPS.len() - 1);
-                    assert!(
-                        last + STOP / 2 <= height - MARGIN,
-                        "{height}: the rail runs past the footer"
+                    // The rail (the full one, or the compact line) is told from the line down
+                    // the stops (hair), and ends a footer line clear of the footer.
+                    assert_eq!(
+                        has_ink_of(&frame, 0, top, 800, height - top, site("hair")),
+                        kind == Rail::Full,
+                        "{height}: the full rail is drawn only as the full rail"
                     );
+                    for y in height - MARGIN - 2 * LINE_H..height - MARGIN {
+                        for x in 0..800 {
+                            let at = frame.pixel(x, y);
+                            assert!(
+                                !ink.contains(&at) && at != site("dim"),
+                                "{height}: ink at {x},{y}, less than a line above the footer"
+                            );
+                        }
+                    }
                 }
-                None => assert_eq!(height, 300, "{height}: the rail is dropped only where it cannot fit"),
+                None => assert_eq!(
+                    kind,
+                    Rail::None,
+                    "{height}: the rail is dropped only where it cannot fit"
+                ),
             }
             // Nothing but the footer (dim) is in the bottom margin, and no ink of the rail or text.
             for y in height.saturating_sub(MARGIN)..height {
                 for x in 0..800 {
                     assert!(
-                        height == 300 || !ink.contains(&frame.pixel(x, y)),
+                        kind == Rail::None || !ink.contains(&frame.pixel(x, y)),
                         "{height}: ink at {x},{y} in the bottom margin"
                     );
                 }
