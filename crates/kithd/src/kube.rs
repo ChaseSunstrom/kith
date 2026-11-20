@@ -909,8 +909,8 @@ fn shadowed(store: &Store, namespace: Option<&str>, runs: &str, name: &str) -> b
                 .unwrap_or(kith_api::DEFAULT_NAMESPACE)
                 == namespace;
             let pod = &held.metadata.name;
-            here && held_bare(store, Some(namespace), pod).is_some()
-                && pod_owner(pod).is_some_and(|(of, owner, _)| of == runs && owner == name)
+            here && pod_owner(pod).is_some_and(|(of, owner, _)| of == runs && owner == name)
+                && held_bare(store, Some(namespace), pod).is_some()
         })
     })
 }
@@ -2673,8 +2673,10 @@ async fn write(
         }
         let was = before.as_ref().map(|(_, object)| object.clone());
         // A Pod shares its name space with the Job and the Workload it might have been, and with the
-        // pods of what owns one. (ponytail: read and written under two calls for the other kind's key,
-        // so a Job and an Always Pod of one name made at once may both be made; a same-kind one cannot.)
+        // pods of what owns one. (ponytail: each check reads under its own lock before `api::applied`
+        // writes, so a Pod and a Job or Workload of one name, or of a colliding pod name, made at once
+        // may both be made, in either order; a same-kind one cannot. A Job a CronJob spawns and any
+        // resource written by `api::applied` itself are not checked: `shadowed` is asked only here.)
         if kind.kind == "Pod"
             && (how == How::Create || (how == How::Apply && !there))
             && taken(&state.store, namespace, &name)
@@ -2867,7 +2869,15 @@ async fn delete(
             held_bare(&state.store, namespace, name)
         };
         match held {
-            Some(row) => kind = row,
+            // (A caller with no right on its holder, though one on another, is told 404, as of a nothing.)
+            Some(row)
+                if [Verb::Delete, Verb::Apply]
+                    .into_iter()
+                    .any(|verb| call.allowed(row, place, verb).is_ok()) =>
+            {
+                kind = row;
+            }
+            Some(_) => return Err(not_found(kind, name)),
             None => return delete_pod(call, kind, namespace, name, hints).await,
         }
     }
@@ -2982,7 +2992,14 @@ async fn delete_pod(
             let state = call.shared.store.lock().expect("a handler panicked holding the store");
             state.store.get(&format!("{holder}/{namespace}/{owner}")).is_some()
         };
-        if !owned.is_some_and(|(holder, owner, _)| held(holder, owner)) {
+        // (And only for a caller who may delete or restart what holds it: any other is told 404, as of a nothing.)
+        let may = |holder: &str| {
+            [Verb::Delete, Verb::Apply].into_iter().any(|verb| {
+                let place = vec![(holder.to_string(), Some(namespace.to_string()))];
+                api::permit(&call.shared, &call.caller, verb, |_| place).is_ok()
+            })
+        };
+        if !owned.is_some_and(|(holder, owner, _)| may(holder) && held(holder, owner)) {
             return Err(not_found(kind, name));
         }
         let why = format!(
@@ -3348,7 +3365,10 @@ fn pod_run(call: &Call, namespace: &str, pod: &str, verb: Verb) -> Result<(Strin
         held_bare(&state.store, Some(namespace), pod).map(holder)
     };
     if let Some(holder) = bare {
-        may(holder)?;
+        // (A caller with a right on some other holder only is told 404, as of a name that is nothing.)
+        if may(holder).is_err() {
+            return Err(not_found(&KINDS[0], pod));
+        }
         return Ok((format!("{holder}/{namespace}/{pod}"), 0));
     }
     let (holder, owner, replica) = pod_owner(pod).ok_or_else(|| not_found(&KINDS[0], pod))?;
@@ -4916,6 +4936,95 @@ spec: {role: writer, subjects: [carol]}
             }
             assert!(answers.windows(2).all(|two| two[0] == two[1]), "{verb}: {answers:?}");
         }
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A caller with a right on one holder kind and not on another is told 404, as of a name that is
+    /// nothing, of a pod the other kind holds (a bare one, or a Job's or a DaemonSet's replica): log,
+    /// exec and delete tell nothing of what exists beyond what the caller's own rights reach.
+    #[tokio::test]
+    async fn bare_pod_of_a_holder_without_the_right_is_not_found() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-holder-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let mut roles = String::new();
+        for (who, kind, verbs) in [
+            ("jobber", "Job", "get, exec, apply, delete"),
+            ("wk", "Workload", "apply"),
+        ] {
+            roles += &format!(
+                "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{name: {who}}}\nspec: {{}}\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: {{name: {who}-role}}\nspec: {{rules: [{{kinds: [{kind}], verbs: [{verbs}]}}]}}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{name: {who}-binding}}\nspec: {{role: {who}-role, subjects: [{who}]}}\n---\n"
+            );
+        }
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(&roles).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        for (name, policy) in [("once", Some("Never")), ("always", None)] {
+            let (code, said) = send_pod(&shared, Caller::Admin, a_pod(name, policy)).await;
+            assert_eq!(code, StatusCode::CREATED, "{name}: {said}");
+        }
+        let job = json!({ "apiVersion": "batch/v1", "kind": "Job", "metadata": { "name": "foo" },
+            "spec": { "template": { "spec": { "restartPolicy": "Never", "containers": [{ "name": "main", "image": "i" }] } } } });
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "POST",
+            "batch",
+            "namespaces/default/jobs",
+            job,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let set = json!({ "apiVersion": "apps/v1", "kind": "DaemonSet", "metadata": { "name": "foo" },
+            "spec": { "selector": { "matchLabels": { "a": "foo" } }, "template": { "metadata": { "labels": { "a": "foo" } }, "spec": { "containers": [{ "name": "main", "image": "i" }] } } } });
+        let (code, said) = answer_as(
+            shared.clone(),
+            Caller::Admin,
+            "POST",
+            "apps",
+            "namespaces/default/daemonsets",
+            set,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        // The Job-only caller: the Workload-held bare pod and a nothing are alike, 404, in every verb.
+        let jobber = || Caller::Identity("jobber".into());
+        for verb in ["log", "exec"] {
+            let mut codes = Vec::new();
+            for name in ["always", "ghost"] {
+                let rest = format!("namespaces/default/pods/{name}/{verb}");
+                let (code, said) = answer_as(shared.clone(), jobber(), "GET", "", &rest, Value::Null).await;
+                codes.push((name, code, said.contains("not found")));
+            }
+            assert_eq!(codes[0].1, StatusCode::NOT_FOUND, "{verb}: {codes:?}");
+            assert_eq!(codes[0].2, codes[1].2, "{verb}: {codes:?}");
+            assert_eq!(codes[0].1, codes[1].1, "{verb}: {codes:?}");
+        }
+        for name in ["always", "ghost"] {
+            let (code, said) = delete_pod_named(&shared, jobber(), name).await;
+            assert_eq!(code, StatusCode::NOT_FOUND, "{name}: {said}");
+        }
+        assert!(
+            shared
+                .store
+                .lock()
+                .unwrap()
+                .store
+                .get("Workload/default/always")
+                .is_some()
+        );
+        // A caller with the right on Workloads only: a Job's or a DaemonSet's pod and a nothing are alike.
+        let wk = || Caller::Identity("wk".into());
+        for name in ["foo-j0", "foo-n0", "ghost-j0", "ghost-n0"] {
+            let (code, said) = delete_pod_named(&shared, wk(), name).await;
+            assert_eq!(code, StatusCode::NOT_FOUND, "{name}: {said}");
+        }
+        // And the one with the right still finds its own.
+        let (code, said) = delete_pod_named(&shared, jobber(), "once").await;
+        assert_eq!(code, StatusCode::OK, "{said}");
         drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
     }
