@@ -11,6 +11,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Modules tried before the others a device's alias matches. NVIDIA's open `nvidia` and
+/// `nouveau` match the same cards: `nvidia` refuses a card older than Turing, and `nouveau`
+/// (the next in the plan) then binds it. (No blacklist: both are loaded.)
+const LOAD_FIRST: [&str; 1] = ["nvidia"];
+
 /// `modules.alias`, `modules.dep` and `modules.builtin` of one kernel's modules directory.
 #[derive(Debug, Default)]
 pub struct Tree {
@@ -165,7 +170,15 @@ impl Tree {
     /// Not what `skip` holds (loaded, tried, built in) nor what is already in the plan.
     fn plan(&self, modalias: &str, skip: &HashSet<String>) -> Vec<(String, PathBuf)> {
         let mut out: Vec<(String, PathBuf)> = Vec::new();
-        for (_, module) in self.aliases.iter().filter(|(pattern, _)| glob(pattern, modalias)) {
+        let mut matched: Vec<&String> = self
+            .aliases
+            .iter()
+            .filter(|(pattern, _)| glob(pattern, modalias))
+            .map(|(_, module)| module)
+            .collect();
+        // (Stable: the rest stay in modules.alias order.)
+        matched.sort_by_key(|m| LOAD_FIRST.iter().position(|f| f == m).unwrap_or(LOAD_FIRST.len()));
+        for module in matched {
             let Some((_, needs)) = self
                 .deps
                 .get(module)
@@ -363,6 +376,24 @@ mod tests {
         );
         // (A module built into the kernel is not loaded.)
         assert!(!plan.contains(&"in_kernel".to_string()));
+    }
+
+    #[test]
+    fn modalias_nvidia_is_planned_before_nouveau() {
+        // (modules.alias is sorted by alias, then name: nouveau's line comes first.)
+        let alias = "alias pci:v000010DEd00002204sv*sd*bc03sc*i* nouveau\n\
+            alias pci:v000010DEd00002204sv*sd*bc03sc*i* nvidia\n\
+            alias pci:v000010DEd00002204sv*sd*bc03sc*i* nvidia_drm\n";
+        let dep = "kernel/drivers/gpu/drm/nouveau/nouveau.ko:\n\
+            extra/nvidia.ko:\n\
+            extra/nvidia-drm.ko: extra/nvidia.ko\n";
+        let t = Tree::parse(Path::new("/m"), alias, dep, "");
+        let plan: Vec<String> = t
+            .plan("pci:v000010DEd00002204sv00001043sd000087D6bc03sc00i00", &HashSet::new())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(plan, ["nvidia", "nouveau", "nvidia_drm"]);
     }
 
     #[test]
