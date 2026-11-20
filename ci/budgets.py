@@ -48,7 +48,15 @@ RUNS = 5  # each time is the median of this many runs
 # Raised to 13.40 for one train of features (T-0810 socketpair Root +139 KB, T-0838/T-0842
 # kubectl port-forward/exec/attach/cp, T-0797 exits, T-0849 own writes): the end-of-run size
 # pass brings it back down.
-KITHD_SIZE = 13.40
+# RAISE, kithd 13.40 to 13.55 (T-1113 for train BF): the tree of T-1118 + T-1111 + main 0258d2e8
+# + T-0986 + T-1113 measures 14,074,912 B (13.423 MiB) with the musl build and stat; T-1083 (GUI
+# installer fb.rs and font), T-1155 (FIDO2 PIN protocol) and T-1076 (mesh) land on main ahead of
+# BF and add more; the end-of-run size pass brings it back down.
+# RAISE, kithd 13.55 to 13.79 (T-1192 for train B): main 76101487 with T-1074, T-0976, T-0190,
+# T-1130, T-1136, T-1157, T-1039 and T-1129 merged builds kithd at 14,447,936 B (13.779 MiB; main
+# alone 14,148,736 B); 13.79, not 13.78, for the 4 KiB page another folder may add (T-0900).
+# T-0269 brings it back down.
+KITHD_SIZE = 13.79
 KITHD_IDLE_RSS = 9 * MB
 # binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
 # 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.
@@ -69,7 +77,12 @@ KITHD_IDLE_RSS = 9 * MB
 # tree is over 3.02 in every folder.
 # RAISE, kith-remote 3.64 to 3.66 (T-0990): kith package push|render and lint parse a kithVersion
 # range with the semver crate, new to the kith binaries (3.65 MB measured on fa6816d6 merged in).
-SIZE_BUDGETS = {"kith": int(3.03 * MB), "kith-remote": int(3.66 * MB), "kithd": int(KITHD_SIZE * MB)}
+# RAISED, kith 3.03 to 3.04 (T-1187): main 5326ba9f with T-1113 merged builds kith at 3,179,864 B
+# (2.6 KB over 3.03), and with T-0976 and T-1076 too at 3,183,960 B; T-0269 brings it back down.
+# RAISE, kith 3.04 to 3.05 and kith-remote 3.66 to 3.67 (T-1192 for train B): main 76101487 with
+# train B's eight lanes builds kith at 3,192,184 B and kith-remote at 3,843,512 B (main alone
+# 3,179,864 B and 3,831,160 B); T-0269 brings them back down.
+SIZE_BUDGETS = {"kith": int(3.05 * MB), "kith-remote": int(3.67 * MB), "kithd": int(KITHD_SIZE * MB)}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
@@ -88,7 +101,9 @@ TIME_BUDGETS = {
     # RAISED 10 -> 20 ms (T-1096): under a 25+ load it read 16.1 and 18.0 ms and refused closes and prechecks;
     # bring it back to 10 ms once the trains are done and the host is quiet.
     "a status change reaching a second kithd": 0.020,
-    "one DNS answer from kithd": 0.007,
+    # RAISED 7 -> 15 ms (T-1175): under a 20+ load it read 12.3 ms and refused closes; bring it back
+    # to 7 ms once the trains are done and the host is quiet.
+    "one DNS answer from kithd": 0.015,
 }
 # A local image (no registry): a rootfs holding the static kithd, which runs until stopped.
 IMAGE = "local.test/timing:1"
