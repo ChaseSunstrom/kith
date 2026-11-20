@@ -134,6 +134,18 @@ pub fn range() -> kith_mesh::pod::Range {
     RANGE.get().copied().unwrap_or_default()
 }
 
+/// The range the Services' IPv4 addresses come from on this node (`--service-range`), set once at
+/// start; none when IPv4 for Services is off for the node.
+static SERVICE_RANGE: std::sync::OnceLock<Option<kith_mesh::pod::Range>> = std::sync::OnceLock::new();
+
+pub fn set_service_range(range: Option<kith_mesh::pod::Range>) {
+    let _ = SERVICE_RANGE.set(range);
+}
+
+pub fn service_range() -> Option<kith_mesh::pod::Range> {
+    SERVICE_RANGE.get().copied().flatten()
+}
+
 /// Removes a gone pod's directory. Not `remove_dir_all`, which holds a descriptor per level
 /// and fails on a tree thousands deep (a container may have made one).
 fn forget(dir: &Path) {
@@ -462,7 +474,13 @@ impl Pods {
                 egress: pod.egress.clone(),
             })
             .collect();
-        kith_mesh::pod::node(range(), Path::new(GUARDED).exists(), &self.mesh, &served)
+        kith_mesh::pod::node(
+            range(),
+            service_range(),
+            Path::new(GUARDED).exists(),
+            &self.mesh,
+            &served,
+        )
     }
 }
 

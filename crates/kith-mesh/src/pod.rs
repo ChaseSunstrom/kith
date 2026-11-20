@@ -177,6 +177,50 @@ impl Range {
         let held = held_addresses().map_err(|e| format!("reading this node's addresses: {e}"))?;
         self.refuse_held(&held)
     }
+
+    /// Whether `ip` is in the range.
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        u32::from(ip) & self.mask() == self.network
+    }
+
+    /// The number of `ip` in the range ([`Range::address`] the other way round), if it is
+    /// one of [`Range::numbers`]: not the range's own, the node's, nor its broadcast.
+    pub fn number_of(&self, ip: Ipv4Addr) -> Option<u16> {
+        let number = u16::try_from(u32::from(ip).checked_sub(self.network)?).ok();
+        number.filter(|number| self.contains(ip) && self.numbers().contains(number))
+    }
+
+    /// What this range, as the Services', overlaps: the pods' range `pods`, the people's
+    /// `100.89.0.0/16` (with `--people` or not: the people may come later), or a network on
+    /// a link of `held` other than the loopback (which holds the Services' own addresses).
+    /// The complaint names the clash.
+    pub fn service_clash(&self, pods: &Range, held: &[Held]) -> Option<String> {
+        let mine = (self.network, self.bits);
+        if overlap(mine, (pods.network, pods.bits)) {
+            return Some(format!("the Services' range {self} overlaps the pods' range {pods}"));
+        }
+        if overlap(mine, PEOPLE) {
+            return Some(format!(
+                "the Services' range {self} overlaps the people's 100.89.0.0/16"
+            ));
+        }
+        let clash = held
+            .iter()
+            .filter(|held| held.link != LOOPBACK)
+            .find(|held| overlap((u32::from(held.address), held.bits), mine))?;
+        let Held {
+            address, bits, name, ..
+        } = clash;
+        Some(format!(
+            "this node has {address}/{bits} on {name}, which overlaps the Services' range {self}"
+        ))
+    }
+
+    /// [`Range::service_clash`] for the addresses this machine has now (read, not changed).
+    pub fn service_clash_in_use(&self, pods: &Range) -> std::result::Result<Option<String>, String> {
+        let held = held_addresses().map_err(|e| format!("reading this node's addresses: {e}"))?;
+        Ok(self.service_clash(pods, &held))
+    }
 }
 
 /// The people's range, `100.89.0.0/16` (`--people`).
@@ -418,8 +462,11 @@ pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>, exit: Option<u16>) 
 /// [`crate::exit::guard`]'s, made before the tunnel is.)
 /// What comes by each of `pods`' links is passed only from that pod's own addresses; the
 /// caller makes this again whenever the pods change.
-pub fn node(range: Range, guarded: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
-    node_with(range, guarded, true, mesh, pods)
+///
+/// `services`, if the node serves Services' IPv4 addresses, is their range: any pod reaches TCP
+/// there, as it does a Service's IPv6 address.
+pub fn node(range: Range, services: Option<Range>, guarded: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
+    node_with(range, services, guarded, true, mesh, pods)
 }
 
 /// A pod this node serves: its number, whether it leaves by an exit (its link is then
@@ -445,11 +492,18 @@ pub struct Egress {
     pub ports: Vec<u16>,
 }
 
-fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
+fn node_with(
+    range: Range,
+    services: Option<Range>,
+    guarded: bool,
+    masquerade: bool,
+    mesh: &str,
+    pods: &[Served],
+) -> Result<bool> {
     crate::gateway4(1, range.gateway())?;
     let passes = "/proc/sys/net/ipv6/conf/all/forwarding";
     let guard = guard_wanted(guarded, std::fs::read_to_string(passes).ok().as_deref());
-    nat(range, guard, masquerade, mesh, pods)?;
+    nat(range, services, guard, masquerade, mesh, pods)?;
     // A machine that passes packets on stops listening to its router's advertisements,
     // unless told to go on (2): the node's own way out must not be lost to this.
     for link in std::fs::read_dir("/proc/sys/net/ipv6/conf")?.flatten() {
@@ -610,7 +664,7 @@ pub(crate) fn l4proto(protocol: u8) -> Vec<u8> {
 /// IPv6's neighbour discovery (not tracked). A pod with egress rules (see [`Egress`]) jumps
 /// to its own chain from `passed` and, after the first rule, from `in`: so its DNS and
 /// Services are held to its rules too.
-fn pod_guard_rules(range: Range, pods: &[Served]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
+fn pod_guard_rules(range: Range, services: Option<Range>, pods: &[Served]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
     let gateway = range.gateway().octets();
     let dns = |protocol: u8| {
         vec![
@@ -666,8 +720,16 @@ fn pod_guard_rules(range: Range, pods: &[Served]) -> Vec<(&'static str, Vec<Vec<
                 verdict(1),
             ],
         ),
-        ("in", vec![came_by(b"kp"), verdict(0)]),
     ]);
+    // A Service's IPv4 address (the range's /32s on the loopback), TCP only, as its IPv6 one.
+    if let Some(services) = services {
+        let (network, bits) = services.network();
+        let mut rule = vec![came_by(b"kp")];
+        rule.extend(towards(network.into(), bits));
+        rule.extend([l4proto(6), verdict(1)]);
+        rules.push(("in", rule));
+    }
+    rules.push(("in", vec![came_by(b"kp"), verdict(0)]));
     rules
 }
 
@@ -774,7 +836,14 @@ fn egress_rules(pods: &[Served]) -> Vec<(String, Vec<Vec<Vec<u8>>>)> {
 /// The tables: `ip kith-pods` sends what comes from a pod's IPv4 address out as the
 /// node's (masquerade); with `guard`, `inet kith-pods` lets nothing be passed on but what
 /// comes in from or goes out to a pod's link. Whole, for `pods` as they are now.
-fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str, pods: &[Served]) -> Result<()> {
+fn nat(
+    range: Range,
+    services: Option<Range>,
+    guard: bool,
+    masquerade: bool,
+    mesh: &str,
+    pods: &[Served],
+) -> Result<()> {
     let mut batch = Batch::new("kith-pods");
     batch.table(IP);
     // After routing (hook 4), where addresses are changed on the way out (priority 100).
@@ -810,7 +879,7 @@ fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str, pods: &[Served])
     for (name, _) in &held {
         batch.plain(INET, name);
     }
-    for (chain, rule) in pod_guard_rules(range, pods) {
+    for (chain, rule) in pod_guard_rules(range, services, pods) {
         batch.rule(INET, chain, &rule);
     }
     for (name, rules) in &held {
@@ -1153,6 +1222,49 @@ mod tests {
         );
     }
 
+    /// The Services' range (`--service-range`) is a `Range` too: what is in it, which
+    /// number an address is, and what it may not overlap.
+    #[test]
+    fn service_range_knows_its_addresses_and_what_it_overlaps() {
+        let services = range("100.87.0.0/16").unwrap();
+        let addr = |text: &str| text.parse::<Ipv4Addr>().unwrap();
+        assert!(services.contains(addr("100.87.4.9")) && !services.contains(addr("100.88.0.2")));
+        assert_eq!(services.number_of(addr("100.87.0.2")), Some(2));
+        assert_eq!(services.number_of(addr("100.87.255.254")), Some(65534));
+        // (The network's own, the node's, the broadcast, and what is outside it, are no number.)
+        for text in [
+            "100.87.0.0",
+            "100.87.0.1",
+            "100.87.255.255",
+            "100.86.255.255",
+            "100.88.0.2",
+        ] {
+            assert_eq!(services.number_of(addr(text)), None, "{text}");
+        }
+        assert_eq!(services.address(7), addr("100.87.0.7"));
+        let on = |address: &str, bits, link, name: &str| Held {
+            address: address.parse().unwrap(),
+            bits,
+            link,
+            name: name.into(),
+        };
+        let pods = Range::default();
+        assert_eq!(services.service_clash(&pods, &[on("100.87.0.5", 32, 1, "lo")]), None);
+        assert_eq!(services.service_clash(&pods, &[on("192.168.1.2", 24, 2, "eth0")]), None);
+        let said = |range: &str, held: &[Held]| range.parse::<Range>().unwrap().service_clash(&pods, held);
+        assert!(
+            said("100.88.0.0/16", &[])
+                .unwrap()
+                .contains("overlaps the pods' range 100.88.0.0/16")
+        );
+        assert!(said("100.89.0.0/16", &[]).unwrap().contains("people's 100.89.0.0/16"));
+        let on_eth = said("100.87.0.0/16", &[on("100.87.3.4", 24, 2, "eth0")]).unwrap();
+        assert!(
+            on_eth.contains("100.87.3.4/24 on eth0") && on_eth.contains("Services' range"),
+            "{on_eth}"
+        );
+    }
+
     /// docs/adr-people.md, Review 4: with `--people`, neither the pods' range nor a network this
     /// node is on may overlap the people's 100.89.0.0/16 (kwg0's own address and the loopback aside).
     #[test]
@@ -1270,7 +1382,7 @@ mod tests {
                 egress: None,
             },
         ];
-        let check: Vec<Vec<u8>> = pod_guard_rules(range, &pods)
+        let check: Vec<Vec<u8>> = pod_guard_rules(range, None, &pods)
             .iter()
             .filter(|(chain, _)| *chain == "check")
             .map(|(_, rule)| rule.concat())
@@ -1301,7 +1413,7 @@ mod tests {
     #[test]
     fn pods_reach_only_dns_and_the_services_of_their_node() {
         let range = range("198.18.16.0/20").unwrap();
-        let input: Vec<Vec<u8>> = pod_guard_rules(range, &[])
+        let input: Vec<Vec<u8>> = pod_guard_rules(range, None, &[])
             .into_iter()
             .filter(|(chain, _)| *chain == "in")
             .map(|(_, rule)| rule.concat())
@@ -1362,7 +1474,7 @@ mod tests {
             },
         ];
         let pods = [served_with(2, Some(rules)), served_with(3, None)];
-        let all = pod_guard_rules(range, &pods);
+        let all = pod_guard_rules(range, None, &pods);
         let chain = |name: &str| -> Vec<Vec<u8>> {
             let of = all.iter().filter(|(chain, _)| *chain == name);
             of.map(|(_, rule)| rule.concat()).collect()
@@ -1459,7 +1571,7 @@ mod tests {
         };
         let served = [served(12, Some(egress)), served(13, None), served(14, None)];
         // (Without masquerade: a kernel may have none in a namespace.)
-        assert!(node_with(range, true, false, "kith0", &served).unwrap());
+        assert!(node_with(range, None, true, false, "kith0", &served).unwrap());
         let connect = |from: usize, to: IpAddr, port: u16| {
             let to = SocketAddr::from((to, port));
             within(&pods[from].0, || {
@@ -1478,7 +1590,7 @@ mod tests {
         // Others are not held, and the held pod answers what comes to it.
         assert!(connect(1, host(pods[0].3), 80) && connect(1, third, 81));
         // A second time changes nothing.
-        assert!(node_with(range, true, false, "kith0", &served).unwrap());
+        assert!(node_with(range, None, true, false, "kith0", &served).unwrap());
         assert!(connect(0, second, 80) && !connect(0, third, 81));
     }
 
@@ -1497,13 +1609,13 @@ mod tests {
         // (A range that is not the default, and not whole bytes: the masquerade matches its bits.)
         let range = range("198.18.16.0/20").unwrap();
         // (A kernel whose masquerade is a module nobody loaded has none in a namespace.)
-        let masquerade = match node(range, false, "kith0", &[]) {
+        let masquerade = match node(range, None, false, "kith0", &[]) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             guarded => guarded.unwrap(),
         };
         if !masquerade {
             eprintln!("this kernel has no masquerade here: without");
-            assert!(node_with(range, false, false, "kith0", &[]).unwrap());
+            assert!(node_with(range, None, false, false, "kith0", &[]).unwrap());
         }
         let net = crate::node_net(crate::prefix(b"test"), "alpha");
         let pods: Vec<_> = [2, 3]
@@ -1523,7 +1635,7 @@ mod tests {
                 egress: None,
             })
             .into();
-        assert!(node_with(range, true, masquerade, "kith0", &served).unwrap());
+        assert!(node_with(range, None, true, masquerade, "kith0", &served).unwrap());
         // Each says who it is to whoever connects, and who that was.
         let serve = |listener: &TcpListener, says: &str| {
             let (mut stream, from) = listener.accept().unwrap();
@@ -1615,7 +1727,91 @@ mod tests {
         assert!(connect(0, (range.gateway(), 53).into()).is_ok(), "DNS at the gateway");
         assert!(connect(0, (service, 80).into()).is_ok(), "a Service's address");
         // A second time changes nothing (what the first left is taken away and made again).
-        assert!(node_with(range, true, masquerade, "kith0", &served).unwrap());
+        assert!(node_with(range, None, true, masquerade, "kith0", &served).unwrap());
         assert!(tables().unwrap());
+    }
+
+    /// A pod whose namespace has IPv6 off (no inet6 address at all) asks its node's resolver at
+    /// the gateway and reaches a Service's IPv4 address (a /32 on the node's loopback in the
+    /// Services' range) by TCP; an address of the loopback outside that range, and the node's
+    /// other ports, it does not (`KITH_E2E=1 unshare -Urn cargo test -p kith-mesh ipv6_off`).
+    #[test]
+    fn a_pod_with_ipv6_off_reaches_the_resolver_and_a_service_by_ipv4() {
+        if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
+            return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh ipv6_off");
+        }
+        let _lo = crate::netlink::LO.lock().unwrap_or_else(|e| e.into_inner());
+        up(1).unwrap();
+        let range = range("198.18.16.0/20").unwrap();
+        let services: Range = "100.87.0.0/16".parse().unwrap();
+        let net = crate::node_net(crate::prefix(b"test"), "alpha");
+        let (v4, v6) = addresses(range, Some(net), 20);
+        let namespace = make(range, 20, v6, None).unwrap();
+        let (off, inet6) = within(&namespace, || {
+            let sysctl = "/proc/sys/net/ipv6/conf/all/disable_ipv6";
+            std::fs::write(sysctl, "1").unwrap();
+            (
+                std::fs::read_to_string(sysctl).unwrap(),
+                // (This thread's view: /proc/net is the process's, not the thread's that joined.)
+                std::fs::read_to_string("/proc/thread-self/net/if_inet6").unwrap(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            (off.trim(), inet6.as_str()),
+            ("1", ""),
+            "no inet6 address, the sysctl 1"
+        );
+        let served = [Served {
+            v6,
+            ..served_with(20, None)
+        }];
+        assert!(node_with(range, Some(services), true, false, "kith0", &served).is_ok());
+        let within_pod = |f: fn(Ipv4Addr, Ipv4Addr) -> std::io::Result<String>, to: Ipv4Addr| {
+            within(&namespace, move || f(v4, to)).unwrap()
+        };
+        // DNS at the gateway, by UDP: a question out and an answer back (the node's socket
+        // answers where it was asked from).
+        let resolver = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 53)).unwrap();
+        resolver.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let answering = std::thread::spawn(move || {
+            let mut asked = [0u8; 16];
+            let (size, from) = resolver.recv_from(&mut asked).unwrap();
+            resolver.send_to(&asked[..size], from).unwrap();
+        });
+        let said = within_pod(
+            |own, to| {
+                let socket = UdpSocket::bind((own, 0))?;
+                socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                socket.send_to(b"question", (to, 53))?;
+                let mut answer = [0u8; 16];
+                let size = socket.recv(&mut answer)?;
+                Ok(String::from_utf8_lossy(&answer[..size]).into_owned())
+            },
+            range.gateway(),
+        );
+        answering.join().unwrap();
+        assert_eq!(said.unwrap(), "question", "the resolver at the gateway answers by IPv4");
+        // A Service's IPv4 address: a /32 on the loopback, a listener on it.
+        let service = Ipv4Addr::new(100, 87, 0, 5);
+        let elsewhere = Ipv4Addr::new(100, 86, 0, 5);
+        crate::netlink::address4(1, service, 32, None).unwrap();
+        crate::netlink::address4(1, elsewhere, 32, None).unwrap();
+        let listeners = [service, elsewhere].map(|at| TcpListener::bind((at, 80)).unwrap());
+        let _open = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 8080)).unwrap();
+        let connect = |to: Ipv4Addr, port: u16| {
+            let to = SocketAddr::from((to, port));
+            within(&namespace, move || {
+                TcpStream::connect_timeout(&to, Duration::from_secs(3)).is_ok()
+            })
+            .unwrap()
+        };
+        assert!(connect(service, 80), "a Service's IPv4 address");
+        assert!(
+            !connect(elsewhere, 80),
+            "an address outside the Services' range is dropped"
+        );
+        assert!(!connect(range.gateway(), 8080), "so is another port of the node");
+        drop(listeners);
     }
 }

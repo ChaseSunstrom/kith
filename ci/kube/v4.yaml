@@ -1,0 +1,40 @@
+# The Service's IPv4 address (ci/vm/kube.sh): three replicas that say which address each
+# connection came from, and their Service. Its clients are in v4clients.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo4
+  labels:
+    app: echo4
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: echo4
+  template:
+    metadata:
+      labels:
+        app: echo4
+    spec:
+      containers:
+        - name: peer
+          image: kith.test/pod:1
+          command: ["/bin/pod", "peer"]
+          ports:
+            - name: http
+              containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo4
+spec:
+  selector:
+    app: echo4
+  ports:
+    - port: 80
+      targetPort: http

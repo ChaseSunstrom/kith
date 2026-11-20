@@ -144,6 +144,8 @@ fn zones_made_of(store: &Store) -> Vec<(String, Value, Option<Value>)> {
                         .map(|unit| json!([unit["replica"], unit["node"], unit["ready"], unit["address"]]))
                         .collect();
                     json!([r.metadata.labels, units])
+                } else if r.kind == "Service" {
+                    json!([s["address"], s["addressV4"]])
                 } else {
                     s["address"].clone()
                 }
@@ -160,7 +162,18 @@ fn one_label(resource: &Resource) -> bool {
     !resource.metadata.name.contains('.') && !crate::services::namespace(resource).contains('.')
 }
 
+#[cfg(test)]
 pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTreeMap<String, Value>) {
+    zones_serving(store, mesh, Some(crate::services::v4::default_range()))
+}
+
+/// [`zones_of`] for a node whose Services' IPv4 range is `v4` (none: it serves no Service IPv4
+/// address, so it answers no A for one: a client would be sent to an address this node does not hold).
+pub fn zones_serving(
+    store: &Store,
+    mesh: Option<std::net::Ipv6Addr>,
+    v4: Option<kith_mesh::pod::Range>,
+) -> (Zones, BTreeMap<String, Value>) {
     let mut status = BTreeMap::new();
     let served = || json!({ "state": "served" });
     let failed = |why: String| json!({ "state": "error", "message": why });
@@ -236,12 +249,25 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
                 .into_iter()
                 .collect()
         };
+        // A client with no IPv6 asks for A: the address the leader gave the Service (none for a
+        // headless one, or while there is none: NODATA to A).
+        let held = |address: &std::net::Ipv4Addr| v4.is_some_and(|range| range.contains(*address));
+        let v4 = crate::services::v4::address_of(service)
+            .filter(|_| spec.headless != Some(true))
+            .filter(held);
         for named in [
             format!("{name}.{namespace}.kith"),
             format!("{name}.{namespace}.svc.cluster.local"),
         ] {
             // The Service's name is there with no address: NODATA, as Kubernetes answers an empty headless one.
             empty.push(named.clone());
+            if let Some(v4) = v4 {
+                own.push(Record {
+                    name: named.clone(),
+                    ttl: NODE_TTL,
+                    data: Rdata::A(v4),
+                });
+            }
             for address in &addresses {
                 own.push(Record {
                     name: named.clone(),
@@ -651,7 +677,7 @@ pub async fn run(
                         .cluster
                         .as_ref()
                         .map(|cluster| crate::mesh::prefix(&cluster.me.ca));
-                    let (mut built, reports) = zones_of(&state.store, mesh);
+                    let (mut built, reports) = zones_serving(&state.store, mesh, crate::pods::service_range());
                     built.blocks = lists_now.borrow().to_vec();
                     zones.send_replace(Arc::new(built));
                     let stale = |(key, report): &(String, Value)| {

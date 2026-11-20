@@ -504,6 +504,45 @@ pub fn hold(index: u32, held: &mut BTreeSet<Ipv6Addr>, wanted: &BTreeSet<Ipv6Add
     failed
 }
 
+/// The IPv4 addresses of 32 bits the interface `index` has.
+pub fn addresses4(index: u32) -> Result<Vec<Ipv4Addr>> {
+    let all = lo_addresses4(index)?;
+    Ok(all
+        .into_iter()
+        .filter(|(_, bits, _)| *bits == 32)
+        .map(|(a, ..)| a)
+        .collect())
+}
+
+/// [`hold`] for IPv4 addresses (each a /32): make the further ones of the interface `index`
+/// `wanted`, taking off only what `held` says this caller put there.
+pub fn hold4(index: u32, held: &mut BTreeSet<Ipv4Addr>, wanted: &BTreeSet<Ipv4Addr>) -> Result<()> {
+    let silent = |tried: &Result<()>| matches!(tried, Err(e) if e.kind() == ErrorKind::TimedOut);
+    let mut failed = Ok(());
+    for gone in held.clone().difference(wanted) {
+        let tried = drop_address4(index, *gone, 32);
+        if silent(&tried) {
+            return tried;
+        }
+        match tried {
+            // (One that would not go is tried again at the next call.)
+            Ok(()) => drop(held.remove(gone)),
+            Err(e) => failed = failed.and(Err(e)),
+        }
+    }
+    for new in wanted.difference(&held.clone()) {
+        let tried = address4(index, *new, 32, None);
+        if silent(&tried) {
+            return tried;
+        }
+        match tried {
+            Ok(()) => drop(held.insert(*new)),
+            Err(e) => failed = failed.and(Err(e)),
+        }
+    }
+    failed
+}
+
 /// The machine's network cards, in the kernel's order, and the loopback's index.
 pub fn cards() -> Result<(Vec<Card>, Option<u32>)> {
     use netlink_packet_route::link::LinkLayerType;

@@ -202,6 +202,15 @@ ready replica in turn, wherever it runs: kithd relays it, over the mesh if neede
 replica's port on `127.0.0.1` (or `::1`). TCP only; a named `targetPort` is a container port of
 that name. A kithd restart drops the connections through it.
 
+A Service also has an IPv4 address, `status.addressV4`, for a client with no IPv6: the leader gives
+it the first free address of the Service range (`--service-range ADDRESS/BITS` or
+`KITH_SERVICE_RANGE`, default `100.87.0.0/16`; give every node the same one), and the Service's name
+answers it as an A record beside the AAAA. kithd holds it on the loopback as a /32 and relays a
+connection to it as it does one to the mesh address. The range is
+refused if it overlaps the pod range or the people ranges (a default that overlaps is dropped with
+a warning: that node serves no IPv4 for Services and answers no A record, the others do). The address
+of a deleted Service is free again for the next one.
+
 A Service with `headless: true` (`clusterIP: None` in Kubernetes) has no address of its own: its
 name answers the addresses of its ready replicas, and it cannot be `expose`d. Each ready replica
 is also named `NAME-N.SERVICE.NAMESPACE.svc.cluster.local` (a StatefulSet's pod names) under every
