@@ -1044,7 +1044,8 @@ pub async fn netboot(
             let minutes = minutes.map_err(|_| "minutes is a number")?;
             let disk = asked.get("disk").map_or("only", String::as_str);
             let encrypt = asked.get("encrypt").is_some_and(|encrypt| encrypt == "true");
-            netboot::on(image.to_vec(), machines, minutes, disk, encrypt, || {
+            let mesh = shared.mesh_port.borrow().is_some();
+            netboot::on(image.to_vec(), machines, minutes, disk, encrypt, mesh, || {
                 cluster.tokens.mint(&ca.cert, Some(&cluster.me), pki::Lets::Control)
             })
             .await

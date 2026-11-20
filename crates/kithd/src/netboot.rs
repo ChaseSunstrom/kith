@@ -46,6 +46,8 @@ struct Active {
     encrypt: bool,
     /// The serving node's release keys and LAN releases, as they were when netboot was turned on.
     releases: (Vec<String>, bool),
+    /// The serving node's mesh was on when netboot was turned on: the machines start with it on too.
+    mesh: bool,
     machines: BTreeMap<Mac, Machine>,
     until: Instant,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -221,8 +223,16 @@ fn releases() -> Result<(Vec<String>, bool), String> {
 
 /// A machine's answers, as long as the room the file has for them. `keys` and `lan` are the
 /// serving node's release keys and LAN releases (`releases`); keys the install parser would
-/// refuse are no answers.
-fn answers(disk: &str, encrypt: bool, join: SocketAddr, token: &str, keys: &[String], lan: bool) -> Option<Vec<u8>> {
+/// refuse are no answers. `mesh` is whether that node's WireGuard mesh is on (`mesh: true`).
+fn answers(
+    disk: &str,
+    encrypt: bool,
+    join: SocketAddr,
+    token: &str,
+    keys: &[String],
+    lan: bool,
+    mesh: bool,
+) -> Option<Vec<u8>> {
     if keys.len() > 8 || keys.iter().any(|key| crate::release_key(key).is_err()) {
         return None;
     }
@@ -233,8 +243,9 @@ fn answers(disk: &str, encrypt: bool, join: SocketAddr, token: &str, keys: &[Str
         format!("releaseKey: '{}'\n", keys.join(","))
     };
     let lan = if lan { "lanReleases: true\n" } else { "" };
+    let mesh = if mesh { "mesh: true\n" } else { "" };
     let mut text =
-        format!("disk: {disk}\n{encrypt}{keys}{lan}join:\n  address: {join}\n  token: {token}\n").into_bytes();
+        format!("disk: {disk}\n{encrypt}{keys}{lan}{mesh}join:\n  address: {join}\n  token: {token}\n").into_bytes();
     (text.len() <= ROOM).then(|| {
         text.resize(ROOM, b'\n');
         text
@@ -351,7 +362,12 @@ async fn tftp(socket: UdpSocket) {
                 mac,
                 active.image.clone(),
                 active.at,
-                (active.disk.clone(), active.encrypt, active.releases.clone()),
+                (
+                    active.disk.clone(),
+                    active.encrypt,
+                    active.releases.clone(),
+                    active.mesh,
+                ),
                 machine.token.clone(),
             ))
         });
@@ -373,7 +389,7 @@ async fn tftp(socket: UdpSocket) {
                 return;
             };
             let join = SocketAddr::new(us.ip(), *port);
-            let Some(answers) = answers(&disk.0, disk.1, join, &token, &disk.2.0, disk.2.1) else {
+            let Some(answers) = answers(&disk.0, disk.1, join, &token, &disk.2.0, disk.2.1, disk.3) else {
                 eprintln!(
                     "kithd: netboot: the answers for {} do not fit in {ROOM} bytes (or hold a key that is none): it is sent nothing",
                     written(&mac)
@@ -462,6 +478,7 @@ pub async fn on(
     minutes: u64,
     disk: &str,
     encrypt: bool,
+    mesh: bool,
     token: impl Fn() -> Result<String, String>,
 ) -> Result<serde_json::Value, String> {
     let places = image.windows(MARKER.len()).filter(|window| *window == MARKER);
@@ -529,6 +546,7 @@ pub async fn on(
         disk: disk.to_string(),
         encrypt,
         releases,
+        mesh,
         machines: held,
         until: Instant::now() + Duration::from_secs(minutes * 60),
         tasks,
@@ -672,7 +690,7 @@ mod tests {
         image.extend(vec![b'#'; ROOM - MARKER.len()]);
         image.extend(vec![b'z'; 50]);
         let join = "10.0.2.15:7443".parse().unwrap();
-        let answers = answers("only", false, join, "kith1.ab.cd", &[], false).unwrap(); // (made up) pragma: allowlist secret
+        let answers = answers("only", false, join, "kith1.ab.cd", &[], false, false).unwrap(); // (made up) pragma: allowlist secret
         assert_eq!(answers.len(), ROOM);
         let text = String::from_utf8(answers.clone()).unwrap();
         let told = crate::install::answers(&text).unwrap();
@@ -691,7 +709,10 @@ mod tests {
         }
         assert!(read(&image, 100, &answers, image.len(), 512).is_empty());
         // Answers longer than the room are none.
-        assert_eq!(super::answers(&"x".repeat(ROOM), true, join, "t", &[], false), None);
+        assert_eq!(
+            super::answers(&"x".repeat(ROOM), true, join, "t", &[], false, false),
+            None
+        );
     }
 
     /// The serving node's release keys and `lanReleases` are in the answers, read back by the
@@ -701,15 +722,15 @@ mod tests {
     fn netboot_answers_name_the_release_keys_and_lan_releases_of_the_serving_node() {
         let join: SocketAddr = "10.0.2.15:7443".parse().unwrap();
         let keys = ["a".repeat(64), "0B".repeat(32)];
-        let made = answers("only", true, join, "kith1.ab.cd", &keys, true).unwrap(); // (made up) pragma: allowlist secret
+        let made = answers("only", true, join, "kith1.ab.cd", &keys, true, false).unwrap(); // (made up) pragma: allowlist secret
         assert_eq!(made.len(), ROOM);
         let told = crate::install::answers(&String::from_utf8(made).unwrap()).unwrap();
         assert_eq!(told.release_key.as_deref(), Some(keys.join(",").as_str()));
         assert!(told.lan_releases && told.encrypt && told.join.is_some());
         // Neither: the answers say neither.
-        let bare = answers("only", false, join, "t", &[], false).unwrap();
+        let bare = answers("only", false, join, "t", &[], false, false).unwrap();
         let told = crate::install::answers(&String::from_utf8(bare).unwrap()).unwrap();
-        assert!(told.release_key.is_none() && !told.lan_releases);
+        assert!(told.release_key.is_none() && !told.lan_releases && !told.mesh);
         // What the install parser refuses (more than 8, not a key, a way to add a line) is not sent.
         let nine = vec!["a".repeat(64); 9];
         for bad in [
@@ -717,12 +738,34 @@ mod tests {
             vec!["abc".into()],
             vec![format!("{}'\nencrypt: true", "a".repeat(64))],
         ] {
-            assert_eq!(answers("only", false, join, "t", &bad, false), None, "{bad:?}");
+            assert_eq!(answers("only", false, join, "t", &bad, false, false), None, "{bad:?}");
         }
         // Eight keys fit the room; a disk name that fills it with the keys does not.
-        assert!(answers("only", false, join, "t", &vec!["a".repeat(64); 8], true).is_some());
+        assert!(answers("only", false, join, "t", &vec!["a".repeat(64); 8], true, true).is_some());
         let long = "d".repeat(ROOM - 8 * 65);
-        assert_eq!(answers(&long, false, join, "t", &vec!["a".repeat(64); 8], true), None);
+        assert_eq!(
+            answers(&long, false, join, "t", &vec!["a".repeat(64); 8], true, true),
+            None
+        );
+    }
+
+    /// A serving node with its mesh on has the machines start with theirs: `mesh: true` in
+    /// the answers, read back by the install parser and on the new node's command line.
+    #[test]
+    fn netboot_answers_carry_the_mesh_of_the_serving_node() {
+        let join: SocketAddr = "10.0.2.15:7443".parse().unwrap();
+        let on = answers("only", false, join, "t", &[], false, true).unwrap();
+        let told = crate::install::answers(&String::from_utf8(on).unwrap()).unwrap();
+        assert!(told.mesh && told.join.is_some());
+        let disks = [crate::install::Disk {
+            name: "sda".into(),
+            bytes: 8 << 30,
+            model: String::new(),
+            serial: String::new(),
+            removable: false,
+        }];
+        let (_, config) = crate::install::plan(&told, &disks, 300 << 20, 1 << 20).unwrap();
+        assert!(crate::init::configured(&config).1.contains(&"--mesh".to_string()));
     }
 
     /// What the node holds is what the answers carry: the given keys over the kept ones, 8 at
@@ -802,6 +845,7 @@ mod tests {
             disk: "only".into(),
             encrypt: false,
             releases: (vec!["c".repeat(64)], true),
+            mesh: false,
             machines: [CARD, SMALL]
                 .map(|card| {
                     let token = "kith1.ab.cd".to_string(); // (made up) pragma: allowlist secret
@@ -862,10 +906,24 @@ mod tests {
         // boot file, or a card that is not one, costs no token.
         let token = || Ok("kith1.ab.cd".to_string()); // (made up) pragma: allowlist secret
         let none = || -> Result<String, String> { panic!("a token for a refusal") };
-        assert!(on(vec![0; 64], vec![CARD], 5, "only", false, none).await.is_err());
-        assert!(on(image.clone(), vec![CARD], 5, "../x", false, none).await.is_err());
-        if on(image.clone(), vec![CARD], 5, "only", true, token).await.is_ok() {
-            assert_eq!(on(image, vec![CARD], 5, "only", true, token).await.unwrap()["on"], true);
+        assert!(
+            on(vec![0; 64], vec![CARD], 5, "only", false, false, none)
+                .await
+                .is_err()
+        );
+        assert!(
+            on(image.clone(), vec![CARD], 5, "../x", false, false, none)
+                .await
+                .is_err()
+        );
+        if on(image.clone(), vec![CARD], 5, "only", true, false, token)
+            .await
+            .is_ok()
+        {
+            assert_eq!(
+                on(image, vec![CARD], 5, "only", true, false, token).await.unwrap()["on"],
+                true
+            );
         }
         for task in off() {
             assert!(task.await.unwrap_err().is_cancelled());
@@ -888,6 +946,7 @@ mod tests {
             disk: "only".into(),
             encrypt: false,
             releases: Default::default(),
+            mesh: false,
             machines: BTreeMap::from([(CARD, machine(false)), (SMALL, machine(true))]),
             until: Instant::now() + Duration::from_secs(60),
             tasks: vec![serving],
@@ -944,7 +1003,7 @@ mod tests {
         image.extend(MARKER);
         let none = || -> Result<String, String> { panic!("a token for a refusal") };
         for minutes in [0, MINUTES + 1] {
-            let refused = on(image.clone(), vec![CARD], minutes, "only", false, none).await;
+            let refused = on(image.clone(), vec![CARD], minutes, "only", false, false, none).await;
             assert!(refused.is_err(), "{minutes} minutes");
         }
         assert_eq!(status()["on"], false);
@@ -955,6 +1014,7 @@ mod tests {
             disk: "only".into(),
             encrypt: false,
             releases: Default::default(),
+            mesh: false,
             machines: BTreeMap::new(),
             until: Instant::now() + Duration::from_secs(MINUTES * 30),
             tasks: vec![],

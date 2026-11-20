@@ -514,7 +514,8 @@ when the node restarts, or with `--off`.
 The machine is installed with this node's release keys (as the node holds them when netboot is
 turned on) and `--lan-releases`, if the node has them: it takes kith OS releases from the same
 keys, not from the first release's. The answers hold 8 keys at most: a node with more, or with
-keys it cannot read, does not turn netboot on and says which.
+keys it cannot read, does not turn netboot on and says which. A node with its mesh on (by
+`--mesh` or the Cluster's `spec.mesh`) has the machine start with `mesh: true` as well.
 
 The node must be the one that started the cluster (it holds the CA, which makes the join tokens)
 and run with `--listen`. An Identity that may apply Nodes, Roles and RoleBindings sends the same
