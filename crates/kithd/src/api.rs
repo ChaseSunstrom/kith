@@ -719,17 +719,19 @@ async fn rollback(
     Path(key): Path<String>,
     Query(options): Query<RollbackOptions>,
 ) -> Reply<Change> {
-    rolled_back(&shared, &caller, key, options.to).await.map(Json)
+    rolled_back(&shared, &caller, key, options.to, None).await.map(Json)
 }
 
 /// Going back to revision `to` of `key`, with every check the route makes: what applying that
 /// revision takes, a NodeKey not rolled back, who acts for a writer, a Node's control staying.
-/// (The Kubernetes API's `kubectl rollout undo` goes through here as well.)
+/// (The Kubernetes API's `kubectl rollout undo` goes through here as well, with the `base` it
+/// read the head at: an Apply of that revision over `base`, a conflict if the head moved.)
 pub(crate) async fn rolled_back(
     shared: &Arc<Shared>,
     caller: &Caller,
     key: String,
     to: u64,
+    base: Option<u64>,
 ) -> Result<Change, ApiError> {
     allowed(shared, caller, |store| back_takes(store, &key, to))?;
     let at = kith_api::store::now();
@@ -741,9 +743,14 @@ pub(crate) async fn rolled_back(
     }
     // Going back to a revision of what is acted on for its writer (a Release, a Source, a
     // KindDefinition, a Package) is applying it: as whoever goes back.
-    if ["Release/", "Source/", "KindDefinition/", "Package/"]
-        .iter()
-        .any(|kind| key.starts_with(kind))
+    // And so is going back from a head that was read (`base`): the Apply says which revision it
+    // is laid over, and every build's store refuses it as a conflict if the head moved since;
+    // a Rollback entry names no revision, so it cannot say that (and a new field on it is one
+    // an old build would not know).
+    if base.is_some()
+        || ["Release/", "Source/", "KindDefinition/", "Package/"]
+            .iter()
+            .any(|kind| key.starts_with(kind))
     {
         let Json(was) = read(shared, |store| {
             let history = store.history(&key)?;
@@ -752,7 +759,7 @@ pub(crate) async fn rolled_back(
                 .ok_or_else(|| Error::NotFound(format!("{key} revision {to}")))?
                 .resource
                 .clone();
-            was.metadata.revision = None;
+            was.metadata.revision = base;
             Ok(was)
         })?;
         let mut changes = applied(shared, caller, vec![was]).await?;
@@ -1190,6 +1197,44 @@ spec: {size: 1Gi}
         assert!(said.contains("may not apply Volume in namespace default"), "{said}");
         assert_eq!(refused(&state.store, &carol, &command(plain)), None);
         drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rollback that says the head it read (`base`) is an Apply of the old revision over it:
+    /// a head that moved since is a conflict and nothing changes, one that did not goes back
+    /// as the rollback does (the same resource, as a new revision).
+    #[tokio::test]
+    async fn rolled_back_with_a_base() {
+        let dir = std::env::temp_dir().join(format!("kithd-rollback-base-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let key = "ConfigMap/default/c";
+        let put = |value: &str| {
+            let text = format!(
+                "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: {{name: c}}\nspec: {{data: {{v: \"{value}\"}}}}\n"
+            );
+            kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap()
+        };
+        for value in ["1", "2", "3"] {
+            applied(&shared, &Caller::Admin, vec![put(value)]).await.ok().unwrap();
+        }
+        let head = |shared: &Arc<Shared>| shared.store.lock().unwrap().store.get(key).cloned().unwrap();
+        // Read at 3; a writer lands 4; the undo to 1 that was decided on 3 is refused.
+        applied(&shared, &Caller::Admin, vec![put("4")]).await.ok().unwrap();
+        let before = head(&shared);
+        let no = rolled_back(&shared, &Caller::Admin, key.into(), 1, Some(3)).await;
+        assert!(matches!(no, Err(ApiError::Store(Error::Conflict(_)))));
+        assert_eq!(head(&shared), before, "a refused undo changes nothing");
+        // Read at 4: it goes back as the store's rollback does, to a new revision 5.
+        let done = rolled_back(&shared, &Caller::Admin, key.into(), 1, Some(4))
+            .await
+            .ok()
+            .unwrap();
+        let first = shared.store.lock().unwrap().store.history(key).unwrap()[0]
+            .resource
+            .clone();
+        assert_eq!(done.after.metadata.revision, Some(5));
+        assert_eq!(done.after.spec, first.spec);
+        assert_eq!(head(&shared).metadata.revision, Some(5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
