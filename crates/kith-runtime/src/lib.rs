@@ -19,7 +19,7 @@ mod seccomp;
 pub mod signed;
 
 pub use container::*;
-pub use image::{Image, ImageStore, Local, PullPolicy, Unpacking, registry, repository, sha256_hex};
+pub use image::{Image, ImageStore, Local, Progress, PullPolicy, Unpacking, registry, repository, sha256_hex};
 pub use outside::{Patience, read_capped};
 pub use seccomp::REFUSED;
 

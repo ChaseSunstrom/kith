@@ -14,6 +14,8 @@ use reqwest::header::ACCEPT;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::io::AsyncWrite;
@@ -307,15 +309,18 @@ pub(crate) struct Capped<W> {
     inner: W,
     left: u64,
     size: u64,
+    /// Where the bytes written are added up, for a pull's progress.
+    seen: Arc<AtomicU64>,
 }
 
 impl<W> Capped<W> {
-    pub(crate) fn new(inner: W, size: i64) -> Capped<W> {
+    pub(crate) fn new(inner: W, size: i64, seen: Arc<AtomicU64>) -> Capped<W> {
         let size = u64::try_from(size).unwrap_or(0);
         Capped {
             inner,
             left: size,
             size,
+            seen,
         }
     }
 }
@@ -332,6 +337,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Capped<W> {
         match Pin::new(&mut this.inner).poll_write(cx, buf) {
             Poll::Ready(Ok(n)) => {
                 this.left -= n as u64;
+                this.seen.fetch_add(n as u64, Ordering::Relaxed);
                 Poll::Ready(Ok(n))
             }
             other => other,

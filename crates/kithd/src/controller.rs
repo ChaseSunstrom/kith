@@ -1007,6 +1007,33 @@ fn unit_status(slot: &Slot) -> Value {
     json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts, "revision": slot.revision })
 }
 
+/// How often the status says how far a pull is.
+const PULL_SAID: Duration = Duration::from_secs(1);
+
+/// The status of a workload while this node pulls the image of `unit`: what `live` says of the
+/// units of this node, the pulling one with `pull` (layers and bytes, done and in all) added.
+fn pulling(live: Option<&Value>, node: &str, unit: &Value, pull: kith_runtime::Progress) -> Value {
+    let mut status = live.cloned().unwrap_or_else(|| json!({}));
+    let same = |other: &Value| other["name"] == unit["name"] && other["replica"] == unit["replica"];
+    let mut ours: Vec<Value> = status["containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|other| other["node"].as_str().is_none_or(|n| n == node) && !same(other))
+        .cloned()
+        .collect();
+    let mut pulling = unit.clone();
+    pulling["pull"] = json!({
+        "layers": pull.layers,
+        "layersTotal": pull.layers_total,
+        "bytes": pull.bytes,
+        "bytesTotal": pull.bytes_total,
+    });
+    ours.push(pulling);
+    status["containers"] = json!(ours);
+    status
+}
+
 /// Every unit of the generation `b` of the replica is ready: it answers for the replica.
 fn second_is_live(slots: &BTreeMap<String, Slot>, owner: &str, replica: u32, b: bool) -> bool {
     let units: Vec<&Slot> = slots
@@ -2250,8 +2277,17 @@ impl Controller {
                         continue;
                     }
                 };
-                let started = tokio::select! {
-                    started = async {
+                // While it pulls, the status says how far (the pass waits for the start).
+                let (unit, owner) = (unit_status(slot), slot.owner.clone());
+                let image = match &slot.run {
+                    Run::Container(c) => Some(c.image.clone()),
+                    Run::Exec(_) => None,
+                };
+                let started = {
+                    let mut reported: Option<tokio::task::JoinHandle<()>> = None;
+                    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + PULL_SAID, PULL_SAID);
+                    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let mut starting = std::pin::pin!(async {
                         if let Some((handle, _)) = taken {
                             eprintln!("kithd: {id}: taken back, as it ran");
                             if let Some((pod, _)) = slot.pod.as_ref().filter(|_| nix::unistd::getuid().is_root()) {
@@ -2270,9 +2306,36 @@ impl Controller {
                         }
                         let project = given.transpose()?;
                         start(shared, &self.runtime, &self.logs, mesh, id, slot, project).await
-                    } => started,
-                    // A pull can take minutes; shutting down does not wait for it.
-                    _ = stop_now.changed() => return TICK,
+                    });
+                    loop {
+                        tokio::select! {
+                            started = &mut starting => break started,
+                            // A pull can take minutes; shutting down does not wait for it.
+                            _ = stop_now.changed() => return TICK,
+                            _ = ticks.tick() => {
+                                let pull = image.as_deref().and_then(|i| self.runtime.images.pull_progress(i));
+                                let Some(pull) = pull else { continue };
+                                // Not waited for, and one at a time: a report that is late is not stacked.
+                                if reported.as_ref().is_some_and(|r| !r.is_finished()) {
+                                    continue;
+                                }
+                                let node = shared.members.me().to_string();
+                                let status = {
+                                    let held = shared.store.lock().expect("a handler panicked holding the store");
+                                    let Some(live) = held.store.get(&owner) else { continue };
+                                    pulling(live.status.as_ref(), &node, &unit, pull)
+                                };
+                                let (shared, owner) = (shared.clone(), owner.clone());
+                                reported = Some(tokio::spawn(async move {
+                                    for report in crate::raft::in_parts(&node, vec![(owner, Some(status))]) {
+                                        if let Err(e) = shared.submit(report).await {
+                                            eprintln!("kithd: saving status: {e}");
+                                        }
+                                    }
+                                }));
+                            }
+                        }
+                    }
                 };
                 // A cached image starts without ever waiting; let the API answer between starts.
                 tokio::task::yield_now().await;
@@ -3626,6 +3689,46 @@ fn signers(rules: &[(String, Vec<String>)], image: &str, template: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// While a pull goes on the status carries its layers and bytes on the unit that pulls, keeps
+    /// the other units of this node, and leaves those of other nodes alone.
+    #[test]
+    fn pull_progress_goes_in_the_status_of_the_unit_that_pulls() {
+        let unit = json!({ "name": "web", "replica": 1, "state": "starting", "ready": false, "restarts": 0 });
+        let live = json!({ "replicas": 3, "containers": [
+            { "name": "web", "replica": 0, "ready": true, "node": "a" },
+            { "name": "web", "replica": 1, "ready": false, "node": "a", "state": "pending" },
+            { "name": "side", "replica": 1, "ready": true, "node": "a" },
+            { "name": "web", "replica": 2, "ready": true, "node": "b" },
+        ]});
+        let pull = kith_runtime::Progress {
+            layers: 3,
+            layers_total: 7,
+            bytes: 12_000_000,
+            bytes_total: 40_000_000,
+        };
+        let status = pulling(Some(&live), "a", &unit, pull);
+        let said: Vec<&Value> = status["containers"].as_array().unwrap().iter().collect();
+        assert_eq!(said.len(), 3, "{status}");
+        assert!(
+            said.iter().all(|u| u["node"] != "b"),
+            "another node's unit was taken: {status}"
+        );
+        let mine = said.iter().find(|u| u["name"] == "web" && u["replica"] == 1).unwrap();
+        assert_eq!(mine["state"], "starting");
+        assert_eq!(
+            mine["pull"],
+            json!({ "layers": 3, "layersTotal": 7, "bytes": 12_000_000, "bytesTotal": 40_000_000 })
+        );
+        assert!(said.iter().filter(|u| u.get("pull").is_some()).count() == 1);
+        assert_eq!(status["replicas"], 3);
+        // Nothing said yet: the unit is all there is.
+        let first = pulling(None, "a", &unit, pull);
+        assert_eq!(first["containers"].as_array().unwrap().len(), 1);
+        // And once the store merges it, the other node's units are still there, with this one's pull.
+        let merged = kith_store::reported(Some(live), "a", Some(status));
+        assert_eq!(merged["containers"].as_array().unwrap().len(), 4, "{merged}");
+    }
 
     #[test]
     fn a_look_is_kept_for_its_time_and_made_again_after() {
