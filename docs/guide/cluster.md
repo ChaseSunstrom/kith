@@ -460,9 +460,12 @@ kithd logs when it starts or stops resolving, not on each try.
 ## Restarting a node on purpose
 
 Drain a node before restarting or upgrading it. A drain cordons it and adds the `kith.dev/drain`
-taint (`NoExecute`): movable replicas start elsewhere; ones pinned by a Volume, a Device or
-placement stay, as does a running Job (a drain never stops one), and the plan says why, before
-anything changes.
+taint (`NoExecute`): movable replicas start elsewhere, and so do those pinned only by a
+[replicated Volume](storage.md#replicas) with a copy on another node (the drain hands the Volume
+over to that copy, once it is current, and the plan says it moves); ones pinned by a Volume with
+no other copy (or a `shared` or `kith-system` one), a Device or placement stay, as does a running
+Job (a drain never stops one), and the plan says why, before anything changes. A copy that
+cannot be brought up to date leaves the Volume and what mounts it where they are.
 
 ```sh
 kith node drain n1 --dry-run   # says what moves and what stays, and why; changes nothing
