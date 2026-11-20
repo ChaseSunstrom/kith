@@ -326,10 +326,11 @@ impl Session {
             Frame::Data { id, fin, data } => {
                 // (Data on an error stream is ignored: kubectl FINs it as soon as it is open.)
                 if let Some(request) = self.requests.values_mut().find(|request| request.data == Some(id)) {
-                    if let Some(input) = &request.input {
-                        if !data.is_empty() && input.send(data).await.is_err() {
-                            request.input = None;
-                        }
+                    if let Some(input) = &request.input
+                        && !data.is_empty()
+                        && input.send(data).await.is_err()
+                    {
+                        request.input = None;
                     }
                     if fin {
                         request.input = None;
@@ -340,10 +341,10 @@ impl Session {
             Frame::Reset { id } => {
                 let found = self.requests.iter().find(|(_, r)| r.error == id || r.data == Some(id));
                 let found = found.map(|(request, _)| request.clone());
-                if let Some(request) = found.and_then(|request| self.requests.remove(&request)) {
-                    if let Some(abort) = request.abort {
-                        abort.abort();
-                    }
+                if let Some(request) = found.and_then(|request| self.requests.remove(&request))
+                    && let Some(abort) = request.abort
+                {
+                    abort.abort();
                 }
                 Ok(())
             }
@@ -469,10 +470,10 @@ async fn connection(
         }
     };
     // (Each is given up on after the idle time, and a client that took none of them is not asked the next.)
-    if let Some(why) = said {
-        if send(error, false, why.as_bytes()).await.is_err() {
-            return request;
-        }
+    if let Some(why) = said
+        && send(error, false, why.as_bytes()).await.is_err()
+    {
+        return request;
     }
     if send(data, true, &[]).await.is_ok() {
         let _ = send(error, true, &[]).await;
@@ -546,13 +547,16 @@ async fn reach(shared: &Shared, owner: &Owner, port: u16) -> Result<Box<dyn Io>,
 
 /// The Exec right of `who` on what owns `key`, a Workload's or a Job's replica and nothing else: the key is parsed,
 /// never trusted as a path.
-fn may_exec(shared: &Shared, who: &Caller, key: &str) -> Result<(), Response> {
+fn may_exec(shared: &Shared, who: &Caller, key: &str) -> Result<(), Box<Response>> {
     let mut parts = key.splitn(3, '/');
     let (Some(kind @ ("Workload" | "Job")), Some(namespace)) = (parts.next(), parts.next()) else {
-        return Err(say(StatusCode::BAD_REQUEST, format!("{key:?} is no Workload or Job")));
+        return Err(Box::new(say(
+            StatusCode::BAD_REQUEST,
+            format!("{key:?} is no Workload or Job"),
+        )));
     };
     let held = vec![(kind.to_string(), Some(namespace.to_string()))];
-    crate::api::permit(shared, who, Verb::Exec, |_| held).map_err(|refused| refused.into_response())
+    crate::api::permit(shared, who, Verb::Exec, |_| held).map_err(|refused| Box::new(refused.into_response()))
 }
 
 fn say(code: StatusCode, why: impl std::fmt::Display) -> Response {
