@@ -1262,11 +1262,14 @@ fn probes_gate_ready_and_restart() {
         daemon.log("w_default_stuck_0_main").starts_with("up\nup\n")
     });
 
-    // An exec probe is run in the container, and is no problem for the status to say.
+    // A probe that cannot run says so and holds nothing back.
     let probes = "        readiness: { exec: [\"true\"] }\n";
     daemon.apply(&boxed("plain", 1, "rolling", "sleep 300", probes));
     wait_for("plain to be ready", || daemon.status("Workload/plain")["ready"] == 1);
-    assert!(daemon.status("Workload/plain")["notes"][0].is_null());
+    assert_eq!(
+        daemon.status("Workload/plain")["notes"][0],
+        "main: readiness probe: exec probes are not run yet"
+    );
 }
 
 /// A busybox pod whose main process is `httpd` in the foreground, as the default user, stays up:
