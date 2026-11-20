@@ -1300,11 +1300,13 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
     let own = File::open("/proc/self/ns/user").ctx(&what)?;
     let user = (own.metadata().ctx(&what)?.ino() != owner.metadata().ctx(&what)?.ino()).then_some(owner);
     let log = root.join(format!("enter-{}.log", nix::unistd::gettid()));
+    // FORKING first, then the list, as a create takes them: held the other way round, one thread
+    // holding each and waiting for the other, they wait for ever.
+    let forking = FORKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dispatch = init_dispatch(&log)?;
     // (Held until the tenant is listed: it is no orphan the reaper may take before that.)
     let mut awaited = AWAITED.lock().expect("nothing panics holding the list");
     let said = {
-        let forking = FORKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dispatch = init_dispatch(&log)?;
         let forked = kith_dm_sys::fork_start(|| {
             let refused = AtomicBool::new(false);
             let built = || {
@@ -3780,6 +3782,32 @@ mod tests {
         };
         handle.start().unwrap();
         let state = root.join("runtime");
+        // A create takes FORKING and then the awaited list; so `enter` must too, and never hold
+        // the list while it waits for FORKING (two threads, one holding each, wait for ever).
+        // Here a thread is held at FORKING, and the list must be free while it waits.
+        let forking = FORKING.lock().unwrap();
+        let waiting = std::thread::spawn({
+            let state = state.clone();
+            move || enter(&state, "enter1", &["/bin/cat".into()]).map(drop)
+        });
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < until
+            && !fs::read_dir(&state)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(SCRATCH))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // (Past the scratch copy, the next thing `enter` does is take its locks.)
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let list_free = AWAITED.try_lock().is_ok();
+        drop(forking);
+        let _ = waiting.join();
+        assert!(
+            list_free,
+            "enter holds the awaited list while it waits for FORKING: a create holding FORKING waits for the list, and neither goes on"
+        );
         let run = |argv: &[&str], input: &str| {
             let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
             let mut entered = enter(&state, "enter1", &argv)?;
