@@ -12,7 +12,9 @@
 # journal says. Expected: the node is the one it was (its identity is in the state), the state's file
 # system is no longer readable from the host, and the marker is gone; a third start does no pass.
     [ "$time" -gt 120 ] || time=240
-    command -v od >/dev/null 2>&1 || skip "no od to read the disk with"
+    for tool in od sfdisk socat debugfs python3; do
+        command -v "$tool" >/dev/null 2>&1 || skip "no $tool to read and cut the disk with"
+    done
     cp "$osdir/kith-os.raw" "$work/disk.raw"
     # (A disk a gigabyte longer than the image: the state partition is made to end where it does at
     # the first start, and the pass runs over all of it: a few thousand chunks, a cut has room.)
@@ -39,10 +41,19 @@
     # What the verb will do: the lock record (the key of the state on the disk, as a node with no TPM
     # and no other node holds it) twice, as the node writes it, and the marker.
     hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
-    printf 'kith-lock v1\nsecret: %s\nrecovery: %s\nkey: %s\n' "$(hex 32)" "$(hex 16)" "$(hex 64)" >"$work/lock"
+    key=$(hex 64)
+    printf 'kith-lock v1\nsecret: %s\nrecovery: %s\nkey: %s\n' "$(hex 32)" "$(hex 16)" "$key" >"$work/lock"
     truncate -s 4096 "$work/lock"
     printf 'kith-inplace pending v1\n' >"$work/marker"
     truncate -s 4096 "$work/marker"
+    # A file of known bytes in the state, big enough to span where the cut falls (the pass is cut a few
+    # dozen chunks in, a chunk is 256 KiB): after the pass the host decrypts it from the disk and
+    # compares, so a chunk lost or doubled at the resume shows. Where its blocks are is read while the
+    # state is still plain (the ext4 is not readable after).
+    head -c 67108864 /dev/urandom >"$work/blob"
+    debugfs -w -R "write $work/blob blob" "$work/disk.raw?offset=$((state_at * 512))" >/dev/null 2>&1 || fail "debugfs could not write the blob into the plain state"
+    debugfs -R 'ex blob' "$work/disk.raw?offset=$((state_at * 512))" 2>/dev/null | awk 'NF >= 11 && $6 == "-" && $9 == "-" { print $5, $8, $11 }' >"$work/extents"
+    [ -s "$work/extents" ] || fail "debugfs gave no extents for the blob"
     dd if="$work/lock" of="$work/disk.raw" bs=512 seek=$((config_at + 1024)) conv=notrunc status=none
     dd if="$work/lock" of="$work/disk.raw" bs=512 seek=$((config_at + 1032)) conv=notrunc status=none
     dd if="$work/marker" of="$work/disk.raw" bs=512 seek=$((config_at + 128)) conv=notrunc status=none
@@ -62,6 +73,7 @@
     boot
     heard 'kithd: init: encrypting the state in place, resumed at chunk '
     up
+    cp "$work/log" "$work/log.resumed"
     said 'kithd: init: the state is encrypted in place' || fail "the pass did not end at the resumed start"
     said "kithd: init: the key of this node's encrypted state is still on its disk" || fail "the node was not opened as an encrypted one"
     ! said 'the state is not opened' || fail "init refused the resumed pass"
@@ -71,6 +83,9 @@
     restart
     [ "$first" = "$second" ] || fail "the node came back as another: its data did not survive the pass ($first, then $second)"
     [ "$(ext4_magic)" != 53ef ] || fail "the state's file system can still be read from the host: it was not encrypted"
+    resumed=$(grep -o 'resumed at chunk [0-9]*' "$work/log.resumed" | tail -n 1 | tr -dc 0-9)
+    [ -n "$resumed" ] || fail "the log of the resumed start does not say at which chunk"
+    python3 -I "$root/ci/vm/xts_check.py" "$work/disk.raw" "$state_at" "$key" "$work/extents" "$work/blob" $((resumed * 512)) || fail "the blob in the state is not what was written: the resume lost or doubled a chunk"
     [ "$(dd if="$work/disk.raw" bs=1 skip=$((config_at * 512 + 65536)) count=24 status=none | tr -d '\0')" != 'kith-inplace pending v1' ] || fail "the marker is still on the config partition after the pass"
 
     # A third start: no marker, no journal to resume, the same node.

@@ -375,7 +375,12 @@ pub fn finished(journal: &impl Disk) -> io::Result<bool> {
 /// So not before the node's lock record (T-1137) says the partition is encrypted and is on the
 /// disk: until then "no journal" and "a pass never begun" are the same to this engine.
 pub fn forget(journal: &impl Disk) -> io::Result<()> {
-    journal.write_at(&[0; 2 * ROOM], HEAD1)?;
+    // (The second header first, each to the disk before the next: a cut in the first's write leaves
+    // it torn beside a second that is zero, which reads as a pass never begun, not as a damaged one.)
+    journal.write_at(&[0; ROOM], HEAD2)?;
+    journal.sync()?;
+    journal.write_at(&[0; ROOM], HEAD1)?;
+    journal.sync()?;
     journal.write_at(&vec![0; SLOT_ROOM], SLOT)?;
     journal.sync()
 }
@@ -1281,6 +1286,64 @@ mod boot {
         assert_eq!(go(&rig).unwrap(), Outcome::Cleaned);
         assert!(raw == rig.raw.on_disk() && forgotten(&rig));
         rig.assert_encrypted("a finished journal");
+    }
+
+    /// A journal's `forget` cut at each of its writes and syncs (the operation itself not done),
+    /// the unsynced writes then lost, kept, torn or cut to a sliver: the marker was cleared before,
+    /// so the next start must not find an error in a state that is fully encrypted. It ends with
+    /// no pass in the journal, whatever was torn.
+    #[test]
+    fn a_forget_that_is_cut_never_leaves_a_journal_the_next_start_refuses() {
+        /// Fails the `at`th write or sync it is asked for.
+        struct Cutting<'a>(&'a Lossy, Cell<usize>);
+        impl Cutting<'_> {
+            fn step(&self) -> io::Result<()> {
+                let left = self.1.get();
+                self.1.set(left.wrapping_sub(1));
+                if left == 0 {
+                    Err(io::Error::other("cut"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl Disk for Cutting<'_> {
+            fn read_at(&self, buf: &mut [u8], at: u64) -> io::Result<()> {
+                self.0.read_at(buf, at)
+            }
+            fn write_at(&self, buf: &[u8], at: u64) -> io::Result<()> {
+                self.step()?;
+                self.0.write_at(buf, at)
+            }
+            fn sync(&self) -> io::Result<()> {
+                self.step()?;
+                self.0.sync()
+            }
+        }
+        let mut cuts = 0;
+        for at in 0..8 {
+            for how in CRASHES {
+                let rig = Rig::new(THREE);
+                rig.run(&mut |_| Ok(())).unwrap();
+                rig.journal.sync().unwrap();
+                let cut = forget(&Cutting(&rig.journal, Cell::new(at))).is_err();
+                cuts += usize::from(cut);
+                rig.crash(how);
+                let why = format!("a forget cut at step {at} ({how:?})");
+                let done = go(&rig).unwrap_or_else(|e| panic!("{why}: the next start refuses it: {e}"));
+                assert!(matches!(done, Outcome::Nothing | Outcome::Cleaned), "{why}: {done:?}");
+                rig.assert_encrypted(&why);
+                // (A first header torn beside a zero second is what a cut leaves: a pass never begun.)
+                assert!(
+                    !begun(&rig.journal).unwrap(),
+                    "{why}: the journal is still a pass after it"
+                );
+            }
+        }
+        assert!(
+            cuts >= 6 * CRASHES.len(),
+            "the forget was cut {cuts} times: it has six steps"
+        );
     }
 
     /// A journal that is not finished and no marker: the state is part encrypted and no

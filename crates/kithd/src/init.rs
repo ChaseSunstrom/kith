@@ -508,6 +508,13 @@ fn widen() {
     }
 }
 
+/// Whether this start has an encrypted node's state to open (and so a pass to finish first): not
+/// the installer's, and not a kithd started again over a state the one before mounted. One started
+/// again with the state NOT mounted is the one that follows a kithd that died before it was.
+fn opens_sealed(installing: bool, again: bool, state_mounted: bool) -> bool {
+    !installing && !(again && state_mounted)
+}
+
 /// Encrypt the state partition in place if the node's config partition says it is due (a marker,
 /// or a pass the last start did not finish: in_place.rs), under the key the lock record holds,
 /// through the mapping `kith-inplace`. After `widen` and before the state is mounted or opened:
@@ -537,6 +544,9 @@ fn encrypt_in_place(config: &std::path::Path, record: &crate::crypt::Record) -> 
     // (The mapping is the whole partition, as the one that opens the state is: what is written
     // through it here is what that one reads.)
     let open = |key: &[u8; 64], run: &mut dyn FnMut(&dyn in_place::Disk) -> std::io::Result<()>| {
+        // (One a kithd that died mid-pass left: the pass is resumed from the journal, not the mapping.
+        // None is the usual answer, and is not an error.)
+        let _ = kith_dm_sys::remove("kith-inplace");
         let mapped = kith_dm_sys::crypt("kith-inplace", &device, 0, total / 512, key)?;
         let through = crate::crypt::opened(&mapped).and_then(|through| run(&through));
         let closed = crate::crypt::unmap("kith-inplace");
@@ -830,6 +840,23 @@ fn mounts() -> [(&'static str, &'static str, MsFlags, &'static str); 9] {
 }
 
 #[cfg(test)]
+mod again {
+    use super::opens_sealed;
+
+    /// A kithd started again before the state was mounted (the one before died mid-pass, or before
+    /// it opened the state) opens the sealed state, so the pass runs first; one started again over
+    /// a mounted state, and the installer, leave it alone.
+    #[test]
+    fn a_kithd_started_again_before_the_state_is_mounted_finishes_the_pass() {
+        assert!(opens_sealed(false, false, false), "the first start");
+        assert!(opens_sealed(false, true, false), "started again, nothing mounted");
+        assert!(!opens_sealed(false, true, true), "started again over a mounted state");
+        assert!(!opens_sealed(true, false, false), "the installer");
+        assert!(!opens_sealed(true, true, false), "the installer, again");
+    }
+}
+
+#[cfg(test)]
 mod mounts {
     use super::*;
 
@@ -923,7 +950,7 @@ pub fn early(again: bool) -> Boot {
     }
     // (An encrypted state waits for its key, and that for the network: see `main`.)
     // (Started again: an encrypted state was opened by the kithd before, and is mounted.)
-    let sealed = labelled("config").filter(|_| !installing && !(again && mounted(STATE)));
+    let sealed = labelled("config").filter(|_| opens_sealed(installing, again, mounted(STATE)));
     let sealed = sealed.and_then(|device| match crate::crypt::Record::read(&device) {
         Ok(record) => Some((record?, device)),
         Err(e) => {
@@ -943,8 +970,10 @@ pub fn early(again: bool) -> Boot {
         widen();
     }
     // (A node with a lock record whose state is to be encrypted in place, before that state is
-    // opened under the key the record holds: see `encrypt_in_place`.)
-    if let (Some((record, config)), false, false) = (&sealed, installing, again)
+    // opened under the key the record holds: see `encrypt_in_place`. Also when started again: a
+    // kithd that died mid-pass leaves the pass to this one, and the state is not mounted until
+    // the pass is done, or the node is off.)
+    if let Some((record, config)) = &sealed
         && let Err(e) = encrypt_in_place(config, record)
     {
         eprintln!("kithd: init: {e}: the state is not opened, and its journal is kept");
