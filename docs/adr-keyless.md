@@ -92,10 +92,15 @@ signature, payload and log entry are read from. Each refusal names its reason.
      The signature over them, `signedEntryTimestamp` (ASN.1 ECDSA, P-256, SHA-256), must
      verify with the rule's `log` key.
    - Two cases are refused, each naming what it is:
-     - an entry with no promise (Rekor v2 gives an inclusion proof and a time from a
-       separate timestamp service);
+     - an entry with no promise, under a rule with no `tsa` (Rekor v2 gives an inclusion
+       proof and a time from a separate timestamp service: the rule must name that
+       service's root as `tsa`);
      - any other kind.
-3. **The time** is the promise's `integratedTime`, never the node's clock. The ten-minute
+3. **The time** is the promise's `integratedTime` when the entry has a promise, never the
+   node's clock. For an entry with no promise (Rekor v2), under a rule with `tsa`, it is the
+   time of the RFC 3161 timestamp, once that verifies against the rule's `tsa`. Under a rule
+   with `tsa`, a v1 bundle needs the timestamp to be present and to verify, but its time
+   is not used: the check still takes the promise's time (presence-only for v1). The ten-minute
    certificate is good only then.
 4. **The chain.**
    - `webpki::EndEntityCert::verify_for_usage` is called with:

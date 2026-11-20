@@ -245,9 +245,12 @@ pub fn bundle(bytes: &[u8]) -> std::result::Result<Signed, String> {
                     signature: base64(promise)?,
                 })
             };
-            Some(read().ok_or(match promise.is_null() {
-                true => "its log entry has no promise from the log, nor has the bundle a timestamp (a log of Rekor v2)",
-                false => "its log entry is not one kith can read",
+            Some(read().ok_or(match (promise.is_null(), stamp.is_some()) {
+                (true, true) => "its log entry's promise is not one kith can read (and the bundle has a timestamp)",
+                (true, false) => {
+                    "its log entry has no promise from the log, nor has the bundle a timestamp (a log of Rekor v2)"
+                }
+                (false, _) => "its log entry is not one kith can read",
             })?)
         }
     };
@@ -1559,11 +1562,19 @@ pub(crate) mod tests {
             let said = verdict(bundle, &other).unwrap_err();
             assert!(said.contains("not from the authority named"), "{said}");
         }
+        // The authority's own leaf given as the root is no root: its timestamp is refused.
+        let said = verdict(&v2, &with_tsa(&who, &[&cert])).unwrap_err();
+        assert!(said.contains("not from the authority named"), "{said}");
+        // An unreadable promise next to a timestamp is said so, not "no timestamp".
+        let mut broken = v2.clone();
+        broken["verificationMaterial"]["tlogEntries"][0]["inclusionPromise"] = serde_json::json!({});
+        let said = super::bundle(broken.to_string().as_bytes()).err().unwrap();
+        assert!(said.contains("promise is not one kith can read"), "{said}");
         // Any of up to four roots may be the authority's.
         let roots = with_tsa(&who, &[&Authority::new().root, &tsa.root]);
         assert_eq!(verdict(&v2, &roots), Ok(()));
-        // What one rule found is not carried to the next: a bundle timed for one identity is
-        // not timed for another that names no tsa.
+        // `verify` resets what a previous identity found (this alone does not pin that: the
+        // no-tsa branch never reads `stamped`, so the reset is belt and braces).
         let mut signed = super::bundle(v2.to_string().as_bytes()).unwrap();
         assert_eq!(verify(&mut signed, DIGEST, &identity(&with).unwrap()), Ok(()));
         let said = verify(&mut signed, DIGEST, &identity(&without).unwrap()).unwrap_err();
@@ -1592,6 +1603,14 @@ pub(crate) mod tests {
             ),
             (
                 with_tsa(&who, &[&CertificateDer::from(&b"not a certificate"[..])]),
+                "`tsa` holds what is no certificate",
+            ),
+            // A certificate with bytes after it is no certificate.
+            (
+                with_tsa(
+                    &who,
+                    &[&CertificateDer::from([tsa.root.as_ref(), &b"junk"[..]].concat())],
+                ),
                 "`tsa` holds what is no certificate",
             ),
         ] {
