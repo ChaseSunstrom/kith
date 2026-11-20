@@ -519,7 +519,11 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
             at: kith_api::store::now(),
         });
         for command in gone.chain(made) {
-            if let Err(e) = shared.submit(command).await {
+            let said = match command {
+                Command::Apply { .. } => shared.submit_node(command).await,
+                _ => shared.submit(command).await,
+            };
+            if let Err(e) = said {
                 eprintln!("kithd: a Volume for a claim: {e}");
             }
         }

@@ -2758,7 +2758,12 @@ async fn write(
     };
     let ((mut resources, hints), revision) = read.map_err(|refused| invalid(refused.join("; ")))?;
     if let Some(to) = undo {
-        let back = api::rolled_back(&call.shared, &call.caller, primary, to).await;
+        // Sent back to what was read: a write that lands after the lock was let go is not
+        // written over, the store answers a conflict (kubectl shows a 409).
+        #[cfg(test)]
+        tests::pause_before_undo(&call.shared).await;
+        let base = Some(revision.unwrap_or(0));
+        let back = api::rolled_back(&call.shared, &call.caller, primary, to, base).await;
         let object = back.map_err(refusal)?.after;
         return Ok(Written(
             StatusCode::OK,
@@ -3457,6 +3462,23 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+    /// Where a test holds an undo (by its `Shared`) between its read of the head and its apply:
+    /// it says it is there, then waits to be let go.
+    type Hold = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
+    static HELD: std::sync::Mutex<Vec<(usize, Hold)>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) async fn pause_before_undo(shared: &Arc<crate::Shared>) {
+        let me = Arc::as_ptr(shared) as usize;
+        let hold = {
+            let mut held = HELD.lock().unwrap();
+            held.iter().position(|(of, _)| *of == me).map(|at| held.remove(at).1)
+        };
+        if let Some((there, go)) = hold {
+            let _ = there.send(());
+            let _ = go.await;
+        }
+    }
 
     /// The next frame the server sends, read from `client` with what `buf` already holds.
     async fn frame(client: &mut DuplexStream, buf: &mut Vec<u8>) -> websocket::Frame {
@@ -5362,6 +5384,37 @@ spec: {role: writer, subjects: [carol]}
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A Deployment whose replica names `NAME-N` pass 63 characters is refused by name through
+    /// the Kubernetes API (it applies through `submitted`), and one that fits is made.
+    #[tokio::test]
+    async fn a_deployment_with_a_replica_name_over_63_characters_is_refused_by_name() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-long-name-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let named = |name: &str| {
+            let mut body = deployment_of("example.org/web");
+            body["metadata"]["name"] = json!(name);
+            body
+        };
+        let long = "a".repeat(63);
+        let (code, said) = sent_as(&shared, "POST", "application/json", DEPLOYMENTS, &[], named(&long)).await;
+        assert_ne!(code, StatusCode::CREATED, "{said}");
+        assert!(
+            said.to_string().contains(&long) && said.to_string().contains("replica name"),
+            "{said}"
+        );
+        let (code, said) = sent_as(
+            &shared,
+            "POST",
+            "application/json",
+            DEPLOYMENTS,
+            &[],
+            named(&"a".repeat(60)),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The JSON patch `kubectl rollout undo` sends for the ReplicaSet `set`: its template
     /// without the hash label, and the Deployment's annotations (it has none: an empty map).
     fn undo_patch(set: &Value) -> Value {
@@ -5445,6 +5498,55 @@ spec: {role: writer, subjects: [carol]}
         let (code, done) = sent_as(&shared, "PATCH", "application/json-patch+json", &rest, &[], again).await;
         assert_eq!(code, StatusCode::OK, "{done}");
         assert_eq!(done["metadata"]["generation"], 4, "{done}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write that lands between `kubectl rollout undo` reading the Deployment and its rollback
+    /// being applied is not written over: the undo is a 409 Conflict and changes nothing.
+    #[tokio::test]
+    async fn rollout_undo_head_moved() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-undo-moved-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        revised(&shared, "v1", &["v2", "v3"]).await;
+        let rest = format!("{DEPLOYMENTS}/x");
+        let v1 = replica_sets(&shared).await.remove(0).3;
+        let (there, reached) = tokio::sync::oneshot::channel();
+        let (go, wait) = tokio::sync::oneshot::channel();
+        HELD.lock()
+            .unwrap()
+            .push((Arc::as_ptr(&shared) as usize, (there, wait)));
+        let undo = tokio::spawn({
+            let (shared, rest) = (shared.clone(), rest.clone());
+            async move {
+                sent_as(
+                    &shared,
+                    "PATCH",
+                    "application/json-patch+json",
+                    &rest,
+                    &[],
+                    undo_patch(&v1),
+                )
+                .await
+            }
+        });
+        reached.await.unwrap();
+        // The undo has read revision 3. Another writer lands 4 before its rollback is applied.
+        let v4 = json!({ "spec": { "replicas": 5 } });
+        let (code, done) = sent_as(&shared, "PATCH", "application/merge-patch+json", &rest, &[], v4).await;
+        assert_eq!(code, StatusCode::OK, "{done}");
+        go.send(()).unwrap();
+        let (code, said) = undo.await.unwrap();
+        assert_eq!(code, StatusCode::CONFLICT, "{said}");
+        assert!(said.to_string().contains("is at revision 4"), "{said}");
+        let state = shared.store.lock().unwrap();
+        let head = state.store.get("Workload/default/x").unwrap();
+        assert_eq!(
+            head.metadata.revision,
+            Some(4),
+            "the writer's revision is the head still"
+        );
+        assert_eq!(head.spec["replicas"], 5);
+        drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

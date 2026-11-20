@@ -494,9 +494,12 @@ assemble() { # DIR
     # slots by it, and a node told to go to an older release would never start it. The
     # order is the N in the file's name, which the node gives it: crates/kithd/src/os.rs.)
     printf 'NAME="kith OS"\nID=kith\nPRETTY_NAME="kith OS"\n' >"$w/osrel"
+    cmdline() { # SLOT BLOCKS HASH
+        table="root,,,ro,0 $(($2 * 8)) verity 1 PARTLABEL=root-$1 PARTLABEL=verity-$1 4096 4096 $2 1 sha256 $3 $salt"
+        printf '%s' "console=ttyS0 console=tty0 dm-mod.create=\"$table\" dm-mod.waitfor=PARTLABEL=root-$1,PARTLABEL=verity-$1 root=/dev/dm-0 ro rootwait kith.slot=$1"
+    }
     for slot in a b; do
-        table="root,,,ro,0 $((blocks * 8)) verity 1 PARTLABEL=root-$slot PARTLABEL=verity-$slot 4096 4096 $blocks 1 sha256 $hash $salt"
-        printf '%s' "console=ttyS0 console=tty0 dm-mod.create=\"$table\" dm-mod.waitfor=PARTLABEL=root-$slot,PARTLABEL=verity-$slot root=/dev/dm-0 ro rootwait kith.slot=$slot" >"$w/cmdline-$slot"
+        cmdline "$slot" "$blocks" "$hash" >"$w/cmdline-$slot"
         objcopy \
             --add-section .osrel="$w/osrel" --change-section-vma .osrel=0x14dfc0000 \
             --add-section .cmdline="$w/cmdline-$slot" --change-section-vma .cmdline=0x14dfd0000 \
@@ -512,8 +515,17 @@ assemble() { # DIR
         --add-section .linux="$kernel" --change-section-vma .linux=0x14e000000 \
         "$efi/linuxx64.efi.stub" "$w/kith-install.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-install.efi"
+    # What tells a node a kithd-only update from a full one (the header's `kithd` object,
+    # crates/kithd/src/os.rs): the digests of kithd; of the boot file but for the root's own
+    # hash (the kernel, the stub, its os-release and the command line with no hash or size
+    # in it); and of the root but for kithd (/sbin/init) and its os-release, which names the
+    # version (sorted, owner and time fixed, as the squashfs is).
+    kithd_sum=$(sha256sum "$bin/kithd" | cut -d ' ' -f 1)
+    kernel_sum=$({ cmdline a 0 0; cat "$kernel" "$efi/linuxx64.efi.stub" "$w/osrel"; } | sha256sum | cut -d ' ' -f 1)
+    rest_sum=$(tar -C "$r" --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+        --exclude=./sbin/init --exclude=./etc/os-release -cf - . | sha256sum | cut -d ' ' -f 1)
     # What a node of an older version is given to become this one (os/update.sh).
-    sh "$root/os/update.sh" "$version" "$hash" "$w/root.squashfs" "$w/root.verity" "$w/kith-a.efi" "$w/kith-b.efi" >"$w/kith-os.update"
+    sh "$root/os/update.sh" "$version" "$hash" "$w/root.squashfs" "$w/root.verity" "$w/kith-a.efi" "$w/kith-b.efi" "$kithd_sum" "$kernel_sum" "$rest_sum" >"$w/kith-os.update"
 
     # The ESP, made here and not by repart: FAT16 at 64 MB, where repart insists on 260.
     # The installer's is the same with its own kernel image.

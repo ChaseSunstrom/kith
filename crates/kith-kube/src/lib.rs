@@ -1581,12 +1581,15 @@ fn service(cx: &mut Cx, root: &mut Map, meta: Metadata, out: Out) {
     if let Some(ip) = cx.text(&mut spec, "clusterIP", "spec") {
         match ip.as_str() {
             "None" => headless = true,
+            // Helm's "allocate one": what kith does for every Service.
+            "" => {}
             _ => cx.note("spec.clusterIP", "is an address kith gives: not translated"),
         }
     }
     let ips = cx.strs(&mut spec, "clusterIPs", "spec");
     match ips.as_slice() {
         [] => {}
+        [one] if one.is_empty() => {}
         [one] if one == "None" => headless = true,
         _ => cx.note("spec.clusterIPs", "is an address kith gives: not translated"),
     }
@@ -2425,6 +2428,22 @@ spec: { clusterIP: 10.96.0.9, selector: { app: db }, ports: [{ port: 80 }] }
             !report.iter().any(|line| line.contains("web") || line.contains("api")),
             "{report:?}"
         );
+    }
+
+    /// Helm sends `clusterIP: ""` for a Service that is to be given an address: that is what kith
+    /// does for any Service, so it is taken whole, not headless, and nothing is said of it.
+    #[test]
+    fn cluster_ip_empty_string_is_taken_as_an_address_to_give() {
+        let (all, report) = run(r#"
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: default }
+spec: { clusterIP: "", clusterIPs: [""], selector: { app: web }, ports: [{ port: 80 }] }
+"#);
+        let web = find(&all, "Service", "web");
+        assert!(web.spec.get("headless").is_none(), "{:?}", web.spec);
+        assert_eq!(web.spec["selector"]["app"], "web");
+        assert!(report.is_empty(), "{report:?}");
     }
 
     #[test]

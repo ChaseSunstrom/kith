@@ -990,7 +990,8 @@ async fn put(shared: &Shared, key: &str, data: Value) -> Result<(), String> {
         resources: vec![a_secret(key, data)?],
         at: now(),
     };
-    shared.submit(command).await.map(drop).map_err(|e| e.to_string())
+    // (The ACME account's and the certificates' Secrets: this node's own writes, signed by its key.)
+    shared.submit_node(command).await.map(drop).map_err(|e| e.to_string())
 }
 
 /// Say in the Service's status how its certificate is coming along.

@@ -46,7 +46,7 @@ const ON_SUFFIX: &str = ".on.kith";
 pub const WORKLOAD_LIFE: Duration = Duration::from_secs(2 * 3600);
 /// A P-256 public key's SubjectPublicKeyInfo (DER) up to its point, as `KeyPair::generate`
 /// makes them: the one kind of key a node may send for a Workload's certificate.
-const P256_SPKI: [u8; 26] = [
+pub(crate) const P256_SPKI: [u8; 26] = [
     0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce,
     0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
 ];

@@ -525,7 +525,7 @@ fn held(
                 false => Err(format!("{WORKER} names {worker}, which is no worker here")),
             }
         }
-        None => crate::own_writes::checked(shared, &node, command).map(Some),
+        None => crate::own_writes::edge(shared, &node, command).map(Some),
     };
     checked.inspect_err(|why| {
         match headers.contains_key(WORKER) {
@@ -603,6 +603,14 @@ async fn write(
                 Command::Mark if format < 2 => Some("the store's format: only the leader changes it"),
                 Command::MarkSigned if format < 3 => Some("the store's format: only the leader changes it"),
                 Command::MarkChecked if format < 4 => Some("the store's format: only the leader changes it"),
+                // (A node's own write, signed by its key: every node checks it at apply.)
+                Command::Signed { ref header, .. }
+                    if who.is_none()
+                        && kith_store::header(header)
+                            .is_ok_and(|said| said.who.strip_prefix("node:") == Some(sent_by(&peer).as_str())) =>
+                {
+                    None
+                }
                 Command::Signed { .. } => {
                     Some("a signed entry: only the leader writes them, from the request it checked")
                 }
@@ -615,10 +623,13 @@ async fn write(
             audit(&shared, &sent_by(&peer), why.clone());
             return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
         }
-        let command = match held(&shared, &peer, &headers, who.as_ref(), command) {
-            Ok(Some(command)) => command,
-            Ok(None) => return Json(None::<(Reply, u64)>).into_response(),
-            Err(why) => return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response(),
+        let command = match command {
+            signed @ Command::Signed { .. } => signed,
+            command => match held(&shared, &peer, &headers, who.as_ref(), command) {
+                Ok(Some(command)) => command,
+                Ok(None) => return Json(None::<(Reply, u64)>).into_response(),
+                Err(why) => return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response(),
+            },
         };
         let signed = match signer(&shared, &peer, &headers, &uri, &bytes, who.as_ref()) {
             Ok(signed) => signed,
@@ -725,6 +736,11 @@ async fn passed(shared: &Shared, name: &str, command: Command) -> Option<(Reply,
 /// How long a change waits for a leader and a majority.
 const PATIENCE: Duration = Duration::from_secs(10);
 
+tokio::task_local! {
+    /// Set while a node's own write is made (`Shared::submit_node`).
+    static OWN: ();
+}
+
 fn unavailable(why: impl std::fmt::Display) -> Error {
     Error::Io(format!("the store cannot take changes now: {why}"))
 }
@@ -739,6 +755,12 @@ impl Shared {
     // state machine are the fix when that matters.
     pub async fn submit(&self, command: Command) -> Result<Done, Error> {
         self.submit_as(command, None).await
+    }
+
+    /// [`Shared::submit`] for this node's own write of what only it makes (a Volume it
+    /// provisions, a cron Job, an ACME secret, its own Node): signed by its key, where callers sign.
+    pub async fn submit_node(&self, command: Command) -> Result<Done, Error> {
+        OWN.scope((), self.submit(command)).await
     }
 
     /// [`Shared::submit`] for `who`: an Identity's write is decided again where it is put in
@@ -851,28 +873,39 @@ impl Shared {
         // the others'): its header, method, path and body with it, which every node checks
         // before it applies the change (`access_sign::admit`). (Sent on to a leader, it is sent
         // bare.)
-        let entry = {
-            let checking = self
-                .store
-                .lock()
-                .expect("a handler panicked holding the store")
-                .store
-                .checking();
-            let relay = access_sign::current().and_then(|signed| Some((signed.header, signed.relay?)));
-            match relay {
-                Some((header, relay)) if checking && relay.signs(&command) => Command::Signed {
-                    header,
-                    method: relay.method,
-                    path: relay.path,
-                    body: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &relay.body),
-                    command: Box::new(command.clone()),
-                },
-                _ => command.clone(),
-            }
+        let (checking, required) = {
+            let state = self.store.lock().expect("a handler panicked holding the store");
+            (state.store.checking(), access_sign::required(&state.store))
+        };
+        // A node's own write (`submit_node`) is signed by its key where callers sign, and goes
+        // to the leader so (`own_writes`): signed afresh at each try below (a nonce is taken once,
+        // and a try whose answer was lost may have taken it), and refused where it cannot be
+        // signed (a bare Volume, Job or Secret is refused at apply).
+        let own = OWN.try_with(|_| ()).is_ok() && checking && required;
+        let own = self.cluster.as_ref().filter(|_| own);
+        let relay = access_sign::current().and_then(|signed| Some((signed.header, signed.relay?)));
+        let plain = match relay {
+            Some((header, relay)) if checking && relay.signs(&command) => Command::Signed {
+                header,
+                method: relay.method,
+                path: relay.path,
+                body: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &relay.body),
+                command: Box::new(command.clone()),
+            },
+            _ => command.clone(),
         };
         let deadline = Instant::now() + PATIENCE;
         let mut refused = None;
         loop {
+            let signed = own.map(|cluster| {
+                let id = pki::fingerprint(&cluster.me.ca).ok();
+                id.and_then(|id| crate::own_writes::sign(&cluster.me, &id, &command))
+            });
+            let own_signed = signed.is_some();
+            let entry = match signed {
+                Some(entry) => entry.ok_or_else(|| unavailable("this node cannot sign its own write"))?,
+                None => plain.clone(),
+            };
             let turn = self.turn(&command, who).await?;
             let written = tokio::time::timeout(PATIENCE, self.raft.client_write(entry.clone())).await;
             // (Let go before the leader is asked: it holds its own.)
@@ -884,7 +917,10 @@ impl Shared {
                 Err(_) => return Err(no_majority(refused)),
             };
             if let Some((id, leader)) = leader {
-                match self.forward(id, &leader, &command, who).await {
+                match self
+                    .forward(id, &leader, if own_signed { &entry } else { &command }, who)
+                    .await
+                {
                     Forward::Done(reply, index) => return reply.map(|done| (done, index)),
                     Forward::Failed(e) => return Err(e),
                     Forward::Again(why) => refused = why.or(refused),
@@ -2270,6 +2306,38 @@ mod tests {
         HEARD.lock().unwrap().insert(id, (4, Instant::now()));
         mark(&shared, &mut said).await.unwrap();
         assert_eq!(format(&shared), 4);
+    }
+
+    /// Under `required` a node's own write that cannot be signed fails at once: written bare, a
+    /// Volume, Job or Secret is refused at apply, and the caller would be told nothing of it.
+    #[tokio::test]
+    async fn a_node_that_cannot_sign_its_own_write_fails_it_under_required() {
+        use crate::cluster::pinned_peer::{node, shared_of};
+        let ca = pki::Ca::create().unwrap();
+        // (A cluster whose node key was read, then lost: `Cluster::new` reads it, so it is spoilt after.)
+        let mut cluster = crate::cluster::Cluster::new(node(&ca, "cannot-sign-c"), None).unwrap();
+        cluster.me.key = "not a key".into();
+        let shared = shared_of("cannot-sign", cluster, &[]).await;
+        let text = format!(
+            "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{name: home}}\nspec: {{adminKey: '{}', signing: required}}\n\
+             ---\napiVersion: kith.dev/v1\nkind: Secret\nmetadata: {{name: acme-account, namespace: kith-system}}\nspec: {{data: {{}}}}\n",
+            "a".repeat(64)
+        );
+        let mut resources = kith_api::Resource::from_source(&text)
+            .unwrap()
+            .into_iter()
+            .map(Result::unwrap);
+        {
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(resources.next().unwrap()).unwrap();
+            kith_store::run(store, Command::MarkChecked).unwrap();
+        }
+        let command = Command::Apply {
+            resources: resources.collect(),
+            at: 0,
+        };
+        let said = shared.submit_node(command).await.unwrap_err().to_string();
+        assert!(said.contains("cannot sign its own write"), "{said}");
     }
 
     #[test]

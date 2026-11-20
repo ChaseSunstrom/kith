@@ -18,11 +18,12 @@ What is built, where the code is the word where this record differs:
   it is, never for who asks; `Bind` refuses kithd's own ports 7443, 5000, 51820 and
   multicast addresses), and the `Root` trait with its in-process `Direct`.
 - **`Bind`** is used by `share.rs`'s NFS listener (`share.rs:397`).
-- There is no socket and no second process yet.
+- There is a socket since T-0810 (`root_part/socket.rs`, `--split`, off by default) and still no
+  second process: the root part is a thread of kithd that answers on it.
 
 The carve of the rest, one task each: T-0808 pods and Services behind `Root`, with a
 counter of crossings; T-0809 mesh (done: `MeshUp`, `Mesh`, `MeshSeen` and `MeshDown`, in process, each checked and counted), then images, units, volumes and node; T-0810 the socket
-pair transport, `--split` off by default; T-0811 confinement of the serving part, tied
+pair transport (done: see "The transport"), `--split` off by default; T-0811 confinement of the serving part, tied
 lifetimes of the two parts, and the VM test of privilege; T-0812 the before and after
 runs, the budgets, and `--split` on by default.
 
@@ -193,6 +194,55 @@ process has them as root's).
 A node kithd runs on as a user (agent mode) has no root and no split, as today. A kithd
 run as root on another OS takes the split by the same flag.
 
+## The transport
+
+Built by T-0810, behind `--split` (or `KITH_SPLIT`), which is off by default; T-0812 flips it.
+With it on, kithd makes a `SOCK_SEQPACKET` socket pair (`root_part::split`) and a thread, "root-part",
+serves one end with the node's `Direct` (`root_part::serve_split`); `Direct::new` and `today` ask
+the other end (a `Socket`, which is a `Root`), so a request that needs no handle crosses it, and
+every check and every count is the root part's, once (a `Book` is shared, so there is no second
+count). The controller's own `Create`, `Start`, `Kill` and the rest of a unit's verbs stay local until
+T-0811 moves the unit's handle to the other process. Nothing is confined yet: no uid or
+capability drop, no `no_new_privs`, no filter, no tied lives (T-0811).
+
+- **Wrappers.** `kith-dm-sys` is the one crate with the unsafe code: `socketpair`, `send_fds`
+  and `recv_fds` (`SCM_RIGHTS`; `MSG_NOSIGNAL`; descriptors arrive close-on-exec; a message or a
+  control part cut short, or more than `MOST_FDS` = 253 descriptors, is an error and never a
+  partial answer), and, for T-0811, `no_new_privs`, `setresuid`, `capget` and `capset`. kithd
+  has no libc and no unsafe code.
+- **Wire.** One message is one JSON text of at most `MAX_REQUEST`, `{seq, call}` one way and
+  `{seq, kept, said}` back, with the descriptors beside it: a `Create` and an `Exec` bring the
+  unit's output and error (exactly two), an `Unpack` its layers (regular files only: a pipe would
+  be read for ever), a `Bind` or `Sockets` gets its sockets back. A file beside anything else is
+  refused whole. A unit the root part made is held by it under its id, and the caller's handle
+  (`Held`) is the id; a handle is checked against the id it is used with before anything is sent.
+- **A slow or hostile peer is bounded** by one reader thread that decodes each message and puts it
+  in a queue of 16 (`Limits::queue`; the brief said 64, and 16 is what is built: a queued message
+  holds its descriptors open, up to 256 for an unpack, so the queue is what bounds the root part's
+  open files, and one worker with a 30 s wait does not need a deeper one; a call is refused at read,
+  before it is queued, when it has more files than its kind takes: two for a `Create` or an `Exec`,
+  a layer each for an `Unpack`, none otherwise; and the two of a unit must be regular files,
+  pipes or sockets: a directory or a device node is refused); a request that finds the queue full is told so at once, by its
+  `seq`, and never waits; a request that waited more than 30 s (`wait`) in it is refused unread; a
+  reply that the peer does not take in 10 s (`reply`) closes the socket; and 8 messages in a row that
+  are no request (`bad`) close it too (a good one resets the count). The one worker does the
+  requests one at a time.
+- **The caller** has one call in flight (a lock), and a deadline for it, 30 s (ten times that for
+  an `Unpack`): a call that gives up says so, and an answer that comes late is read past by the
+  next call (its `seq` is not that call's, and its descriptors are closed). A request over
+  `MAX_REQUEST` is refused before it is sent. A `Delete` that is not answered keeps the handle,
+  since it may not have been done.
+
+**Not done, said here**: a single worker serializes the requests, and a long one (an unpack) holds the
+rest behind it, up to their deadline (T-0812 measures it before it is changed); a caller waiting for the
+lock has no deadline of its own; `send_fds` and `recv_fds` take up a call a signal cut short
+(`EINTR`) but wait the socket's whole timeout again, rather than what was left of it (kithd takes few
+signals; an absolute deadline is T-0811's, with the worker thread's restart); more than 253 layers cannot be sent in one `Unpack` though the
+limit on layers is 256; a caller that gives up after a `Create` leaves the unit held by the root
+part, to be taken by `Adopt` or deleted; a layer that is a FIFO is refused; the serving thread is
+not started again if the peer ends (the root part is a thread of kithd until T-0811 makes it a
+process, so the two end together).
+
 ## The requests
 
 A request is one datagram: an enum in JSON (`serde`, unknown fields refused), at most
@@ -220,8 +270,8 @@ what it is, never for who asked.
 | Services | `ServiceTable(entries)` | the root part builds the BPF program itself; every entry inside the cluster's Service range, sent to this node only |
 | Images | `Unpack(image digest, manifest text, layers as file handles)`, `Drop(image digest, before)` | the root part checks the manifest is the image digest (sha256 of its bytes), that the files are exactly the manifest's layers in order, that no file is larger than the size the manifest gives it, and hashes each layer itself as it reads it (under the decompression, and the rest of the file after the tar's end), refusing one that is not the digest the manifest names and publishing nothing (done in process: `root_part::Request::Unpack`, the pulling code still fetching and choosing the digest); the same containment as `unpack_layer` today (nothing outside the image's root, what it refuses today refused). The store is the node's own, `<state>/runtime` from the Book and canonical, never a path the asker names; the image's path is derived from its digest. A Drop refuses an image a container's bundle names whatever `before` says, and a `before` that is no time. This is integrity, not authority: the asker picks the image; a manifest over the request's 256 KiB cannot be unpacked this way |
 | Units | `Create(unit)`, `Start(id)`, `Kill(id)`, `Delete(id)`, `Tune(id, limits)`, `Plug`/`Unplug(id, device)`, `Exec(id, argv, tty)` → handles, `Usage` → sizes of all units | the image by digest (one it unpacked), mounts by Volume name and sub-path or as file contents, devices by inventory name, the pod by number, the cgroup and log files derived from the id. A VM's disks, kernel, initrd and firmware by Volume name and a path beneath it, or a name in a fixed list in the signed root; its program from that list; its arguments built here from typed fields. Each thing of the list in "What the split does not change" only where the node's own policy allows it, a path on the node for a VM among them |
-| Volumes | `Volume(name, size, key?)`, `VolumeGone(name)`, `Open(volume, path, how, owner)` → a file, `Restore(volume, archive)`, `Share`, `Unshare`, `Remote(volume, node)` | the name's form; every path beneath the volume's root; an owner that is not 0 unless policy allows |
-| Node | `Update(artifact)`, `Reboot(how)`, `Lock(what the NodeKey says)` → what to write in its status, `Run(via, argv)` | `Update`: the keys kept after a handover (`os-release-keys`) and the floor no release goes below (`os-release-floor`) are files of the state directory today, read before the signed root's own keys (`update.rs`); both move to the root part's side, where the serving part cannot write them, and a handover is taken only signed by a key already held. `Lock`: the whole loop that keeps the lock record (`crypt.rs`, `keep`) runs in the root part, so the state's key and the record's secret never cross; what it is sent is the NodeKey's fields, and a wipe or a new duress key from them is taken only where policy allows (`wipe`). `Run` only where policy allows |
+| Volumes | `Volume(name, size, key?)`, `VolumeGone(name)`, `Open(volume, path, how, owner)` → a file, `Restore(volume, archive)`, `Share`, `Unshare`, `Remote(volume, node)` | the name's form; every path beneath the volume's root; an owner that is not 0 unless policy allows. Built in process (`root_part::Request`): `Volume(volume)` (what mounts, backs up, replicates from or downloads a Volume: the directory, made if it is not there), `Open(volume)` (what writes into one: an upload, a replica's copy), `Restore(volume)` (a backup restored into one) and `VolumeGone(namespace, name)`; each answers with the directory, derived by `volumes::host_dir_under` from the state directory the Book has and the Volume's `spec.path`, never a path the asker gives. The namespace and the name are in the store's own form (lowercase letters, digits, `-` and `.`, at most 63, a letter or digit at both ends) before any path is made from them; the path has no empty part, `.`, `..` or NUL (for a directory of the node's own too, which is an absolute path and only where policy has `hostPaths`), and a link met on the way is refused. **A gap, not closed**: the root part answers with a path, not a descriptor, so a path is checked and then used by the caller, and a part swapped for a symbolic link between the two is followed (the same as `check_mount` above); the upgrade is an `openat2` descriptor with `RESOLVE_BENEATH`, passed on, as T-0810 says. The files an `Open` or a `Restore` makes take the owner the Volume's directory has (the request has no owner of its own: a caller's owner stays in the serving part, as an unpack's does). `VolumeGone` removes `<state>/volumes/<namespace>/<name>` and nothing else, and never a directory of the node's own. **Not built yet**: `Volume(name, size, key?)` (the encrypted file's make, `encrypted.rs`), `Share`, `Unshare` and `Remote`, which stay as they are |
+| Node | `Update(artifact)`, `Reboot(how)`, `Lock(what the NodeKey says)` → what to write in its status, `Run(via, argv)` | `Update`: the keys kept after a handover (`os-release-keys`) and the floor no release goes below (`os-release-floor`) are files of the state directory today, read before the signed root's own keys (`update.rs`); both move to the root part's side, where the serving part cannot write them, and a handover is taken only signed by a key already held. `Lock`: the whole loop that keeps the lock record (`crypt.rs`, `keep`) runs in the root part, so the state's key and the record's secret never cross; what it is sent is the NodeKey's fields, and a wipe or a new duress key from them is taken only where policy allows (`wipe`). `Run` only where policy allows: built in process (`root_part::Request::Run`, asked by `POST /v1/run` before it starts the program): refused where `run` is off, with no program, no argument list, an argument with a NUL, more than 1024 arguments or more than 64 KiB of them; the serving part still starts the program, as it holds the connection it is joined to. **Not built yet**: `Update`, `Reboot` and `Lock`, which wait on the key and floor files moving (T-0811), pid 1's keeper and the keep loop of `crypt.rs` |
 
 About thirty requests. That is more than the plan guessed (ten to fifteen), and the
 study says why: API handlers reach into volumes and containers in more places than the
@@ -243,7 +293,7 @@ process is not in this task (said as open below).
 | A Service connection into a pod on this node | a thread started and ended, `setns`, per connection | none per connection: the serving part holds up to 16 sockets per pod made ahead by the root part and asks for 16 more when 8 are left; at most N/8 + 1 requests for N connections, and no thread per connection |
 | The bytes of any connection | none | none |
 | A probe into a pod | as a connection | as a connection (from the same sockets); an `exec` probe is one `Exec` per run |
-| A container started | in process | at most 3 requests: `Pod` (the first container of a pod only), `Create`, `Start`; `Unpack` once per image |
+| A container started | in process | at most 3 requests: `Pod` (the first container of a pod only), `Create`, `Start`; `Unpack` once per image; and one `Volume` for each Volume it mounts (the controller asks the directory before it makes the unit, so the three are the unit's own and the Volumes are counted apart: `crossings` tests) |
 | A change of the Service table | BPF attach in process | one `ServiceTable`; one `Bind` per new port under 1024 |
 | The mesh every 10 s | netlink when something changed | compared in the serving part; one `Mesh` only when something changed |
 | Storage accounting | reads in process | one `Usage` per pod per period (built: T-0844) |
