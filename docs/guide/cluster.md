@@ -112,6 +112,9 @@ the building, a node taken apart), or on whatever schedule you keep for keys. No
 you, and nothing about it is timed. Name the rotation on the node's Node, and apply it:
 
 ```yaml
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: n1 }
 spec:
   mesh: { rotate: 2026-q4 }   # any name, up to 64 characters, that this node has not rotated under
 ```
