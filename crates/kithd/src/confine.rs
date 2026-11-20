@@ -127,6 +127,26 @@ fn opened_for_path(fdinfo: &str) -> bool {
         .is_some_and(|flags| flags & O_PATH != 0)
 }
 
+/// The line of `/proc/self/mountinfo` for the mount at `at`, when its options lack one of `want`
+/// (or there is no such mount): what a remount said it did, read back from the kernel.
+fn lacking(mountinfo: &str, at: &Path, want: &[&str]) -> Option<String> {
+    let line = mountinfo
+        .lines()
+        .rev()
+        .find(|l| l.split(' ').nth(4).is_some_and(|p| Path::new(p) == at));
+    match line {
+        Some(l)
+            if want
+                .iter()
+                .all(|w| l.split(' ').nth(5).is_some_and(|o| o.split(',').any(|o| o == *w))) =>
+        {
+            None
+        }
+        Some(l) => Some(l.to_string()),
+        None => Some(format!("no mount at {}", at.display())),
+    }
+}
+
 /// The descriptors this process holds that reach the node's tree whatever the pivot: a directory
 /// (`fchdir`, then `..` or a relative open) and an O_PATH descriptor (the same, through its mount)
 /// keep the mount they were opened on, which the new namespace unmounts and they do not. Each as
@@ -191,6 +211,13 @@ impl Steps for System {
         mount(Some(keep), &to, none, MsFlags::MS_BIND | MsFlags::MS_REC, none).map_err(|e| said("bind")(&e))?;
         let again = MsFlags::MS_BIND | MsFlags::MS_REMOUNT | flags;
         mount(none, &to, none, again, none).map_err(|e| said("remount")(&e))?;
+        // (Read back: the kernel's word for what the remount did, not ours.)
+        let seen = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| said("mountinfo")(&e))?;
+        if let Some(line) = lacking(&seen, &to, &["nosuid", "nodev", "noexec"]) {
+            return Err(format!(
+                "the state directory's mount is not nosuid,nodev,noexec: {line}"
+            ));
+        }
         // A /proc of its own, not a bind of the node's: it shows no process that is not the part's
         // (hidepid=invisible: another user's are not listed or opened) and nothing but processes
         // (subset=pid: not /proc/sys, kcore, the node's mounts and the rest).
@@ -518,6 +545,18 @@ mod tests {
         );
         assert_eq!(done, Err("in use".to_string()));
         assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn confine_reads_back_the_options_of_a_mount() {
+        let at = Path::new("/run/s/var/lib/kith/a");
+        let info = "40 30 8:1 / /run/s rw - tmpfs tmpfs rw\n\
+                    45 40 8:1 /a /run/s/var/lib/kith/a rw,nosuid,nodev,noexec,noatime - ext4 /dev/x rw";
+        assert_eq!(lacking(info, at, &["nosuid", "nodev", "noexec"]), None);
+        let bare = info.replace(",noexec", "");
+        assert!(lacking(&bare, at, &["noexec"]).is_some_and(|l| l.contains("/run/s/var/lib/kith/a")));
+        // (A mount not there is not one that holds.)
+        assert!(lacking(info, Path::new("/run/s/other"), &["noexec"]).is_some());
     }
 
     #[test]
