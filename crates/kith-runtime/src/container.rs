@@ -1756,7 +1756,7 @@ fn probe(root: &Path, parent: &str) -> Option<String> {
 const MAX_PIDS: i64 = 4096;
 
 /// Who a container's process is where neither its template nor its image says.
-pub const NOBODY: u32 = 65534;
+pub(crate) const NOBODY: u32 = 65534;
 
 /// The lines of the image's own `/etc/FILE`, split at the colons. Never through a link:
 /// an image says where its own files are, not where the host's are.
@@ -1827,7 +1827,7 @@ const CALLS: &str = "dev.kith.seccomp";
 /// The refused calls a sandbox makes to build namespaces of its own and a root inside them:
 /// those for namespaces, and all those that mount (bubblewrap sets a mount's flags with
 /// `mount_setattr`, and takes "not permitted" for an answer where "no such call" would do).
-pub const NESTED: &[&str] = &[
+pub(crate) const NESTED: &[&str] = &[
     "unshare",
     "setns",
     "clone",
