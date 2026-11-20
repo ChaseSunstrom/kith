@@ -1515,7 +1515,37 @@ fn cgroup_parent() -> Result<String> {
         return Ok("/kith".into());
     }
     let own = fs::read_to_string("/proc/self/cgroup").ctx("reading /proc/self/cgroup")?;
-    parent_of_own(&own)
+    let parent = parent_of_own(&own)?;
+    #[cfg(test)]
+    let parent = test_parent(Path::new("/sys/fs/cgroup"), &parent);
+    Ok(parent)
+}
+
+/// Tests only (T-1185): this process's own child of the delegated parent, so two test runs at once
+/// (a merge gate and a builder's) never share a container's `kith-ID` cgroup and kill each other's
+/// containers. Its controllers are handed down one by one; empty ones of ended runs are removed
+/// here, since a test run has no end to remove its own at.
+#[cfg(test)]
+fn test_parent(root: &Path, parent: &str) -> String {
+    let dir = root.join(parent.trim_start_matches('/'));
+    for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        if let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("kith-test-"))
+            && !Path::new("/proc").join(pid).exists()
+        {
+            let _ = fs::remove_dir(entry.path()); // (refused while it has containers: left)
+        }
+    }
+    let name = format!("kith-test-{}", std::process::id());
+    match fs::create_dir(dir.join(&name)) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return parent.to_string(), // (as before)
+        _ => {}
+    }
+    let given = fs::read_to_string(dir.join(&name).join("cgroup.controllers")).unwrap_or_default();
+    for controller in given.split_whitespace() {
+        let _ = fs::write(dir.join(&name).join("cgroup.subtree_control"), format!("+{controller}"));
+    }
+    format!("{parent}/{name}")
 }
 
 /// Whether [`Runtime::new`] can find a cgroup to put containers in here (the same question as
