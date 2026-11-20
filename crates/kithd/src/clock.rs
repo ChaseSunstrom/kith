@@ -320,7 +320,12 @@ fn set_rtc_under(policy: &crate::policy::Policy, us: i64) -> std::io::Result<()>
     if *policy == crate::policy::Policy::hardened() {
         return Err(std::io::Error::other("this node's policy is hardened"));
     }
-    kith_dm_sys::set_rtc(us.div_euclid(1_000_000))
+    kith_dm_sys::set_rtc(whole_seconds(us))
+}
+
+/// `us` microseconds as the nearest whole second (the hardware clock counts no less).
+fn whole_seconds(us: i64) -> i64 {
+    (us + 500_000).div_euclid(1_000_000)
 }
 
 /// The status of a check that found `sample` at `server` and `stepped` (or why it did not), and
@@ -423,9 +428,14 @@ async fn ask(
         let done = set_to(to).map_err(|e| e.to_string());
         if done.is_ok() {
             *spent = if corroborated { 0 } else { *spent + off };
-            // (The hardware clock follows the step, so the next boot starts from it: a failed
-            // write is said beside the step, which counts.)
-            rtc_error = set_rtc(to).err().map(|e| e.to_string());
+            // (The hardware clock follows a step that was vouched for, so the next boot starts from
+            // it: the operator's server, the leader over mTLS, or a server the leader agrees with.
+            // The first answer of an unsynced clock may be a plain-UDP network's alone, and a
+            // reboot would take what was written for a clock that was set: that one is kept off
+            // the hardware clock. A failed write is said beside the step, which counts.)
+            if trusted || told || agrees {
+                rtc_error = set_rtc(to).err().map(|e| e.to_string());
+            }
         }
         Some(done)
     };
@@ -444,6 +454,30 @@ fn begin_at(now: i64) -> bool {
     let synced = now > FLOOR_US;
     UNSET.store(!synced, Ordering::Relaxed);
     synced
+}
+
+/// What the log says of a check's `now` status (nothing: an empty line). `first`: no check was said yet,
+/// and it says where it stands even when there was nothing to do. A step says when the hardware clock was
+/// not set beside it: the next check's status replaces `rtcError`, the log keeps it.
+fn log_line(now: &Value, first: bool) -> String {
+    match (now["error"].as_str(), now["server"].as_str()) {
+        (Some(why), _) => format!("kithd: clock: {why}"),
+        (None, Some(server)) => {
+            let seconds = now["offsetMs"].as_i64().unwrap_or_default() as f64 / 1000.0;
+            if now["stepped"] == true {
+                let line = format!("kithd: clock: stepped {seconds:+.3} s to the time of {server}");
+                match now["rtcError"].as_str() {
+                    Some(why) => format!("{line} (the hardware clock was not set: {why})"),
+                    None => line,
+                }
+            } else if first {
+                format!("kithd: clock: {seconds:+.3} s from the time of {server}: kept")
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
 }
 
 /// Keep the clock as long as kithd runs: once the network has said something (or a while
@@ -481,21 +515,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
             // (A server that answered and was not followed is asked again in an hour, not a minute.)
             let again = if now["server"].is_string() { EVERY } else { RETRY };
             // (Said in the log when it changes, so an hour of the same does not fill it.)
-            let line = match (now["error"].as_str(), now["server"].as_str()) {
-                (Some(why), _) => format!("kithd: clock: {why}"),
-                (None, Some(server)) => {
-                    let seconds = now["offsetMs"].as_i64().unwrap_or_default() as f64 / 1000.0;
-                    if now["stepped"] == true {
-                        format!("kithd: clock: stepped {seconds:+.3} s to the time of {server}")
-                    } else if said.is_empty() {
-                        // (The first check says where it stands even when there was nothing to do.)
-                        format!("kithd: clock: {seconds:+.3} s from the time of {server}: kept")
-                    } else {
-                        String::new()
-                    }
-                }
-                _ => String::new(),
-            };
+            let line = log_line(&now, said.is_empty());
             if !line.is_empty() && line != said {
                 eprintln!("{line}");
                 said = line;
@@ -936,7 +956,14 @@ mod tests {
     /// `ask` with a server `skew` microseconds ahead and a setter pair that records what each was
     /// given (`None`: not called): the system clock's, the hardware clock's, and the status.
     /// `rtc_fails` makes the hardware clock's write fail; `system_fails` the system clock's.
-    async fn written(skew: i64, system_fails: bool, rtc_fails: bool) -> (Option<i64>, Option<i64>, Value) {
+    /// `told`: the server is the operator's; `leader`: the cluster's leader says its offset.
+    async fn written(
+        skew: i64,
+        system_fails: bool,
+        rtc_fails: bool,
+        told: bool,
+        leader: Option<i64>,
+    ) -> (Option<i64>, Option<i64>, Value) {
         let (system, rtc) = (std::cell::Cell::new(None), std::cell::Cell::new(None));
         let set_to = |us: i64| {
             system.set(Some(us));
@@ -952,15 +979,51 @@ mod tests {
             }
             Ok(())
         };
-        let never = async { Err::<Sample, _>("not asked".to_string()) };
+        let leader = async move {
+            leader
+                .map(|offset_us| Sample {
+                    offset_us,
+                    delay_us: 1_000,
+                })
+                .ok_or("not in a cluster".to_string())
+        };
         let server = fake(skew, |_| {}).await;
-        let said = super::ask(&[server], SOON, never, set_to, set_rtc, false, false, &mut 0).await;
+        let said = super::ask(&[server], SOON, leader, set_to, set_rtc, false, told, &mut 0).await;
         (system.get(), rtc.get(), said)
     }
 
     #[tokio::test]
+    async fn clock_a_network_named_first_answer_steps_but_writes_no_hardware_clock() {
+        // Before the first sync one unvouched answer (DHCP's, the gateway's: plain UDP) is enough
+        // for the system clock; a reboot would take it for a synced clock, so it is not kept.
+        let (system, rtc, said) = written(28_800_000_000, false, false, false, None).await;
+        assert!(system.is_some() && said["stepped"] == true, "{said}");
+        assert_eq!(rtc, None, "{said}");
+        assert!(said.get("rtcError").is_none(), "{said}");
+    }
+
+    #[tokio::test]
+    async fn clock_a_step_the_leader_told_writes_the_hardware_clock() {
+        // The leader alone (no server answers a leader this far off the server's time) ...
+        let (system, rtc, said) = written(4_000_000, false, false, false, Some(28_800_000_000)).await;
+        assert!(system.is_some(), "{said}");
+        assert_eq!(rtc, system, "{said}");
+        // ... or agreeing with the network's server.
+        let (system, rtc, said) = written(28_800_000_000, false, false, false, Some(28_800_100_000)).await;
+        assert!(system.is_some(), "{said}");
+        assert_eq!(rtc, system, "{said}");
+    }
+
+    #[test]
+    fn clock_the_hardware_clock_is_set_to_the_nearest_second() {
+        assert_eq!(whole_seconds(1_500_000), 2);
+        assert_eq!(whole_seconds(1_499_999), 1);
+        assert_eq!(whole_seconds(0), 0);
+    }
+
+    #[tokio::test]
     async fn clock_a_step_writes_the_hardware_clock_with_the_same_time() {
-        let (system, rtc, said) = written(28_800_000_000, false, false).await;
+        let (system, rtc, said) = written(28_800_000_000, false, false, true, None).await;
         assert!(system.is_some(), "{said}");
         assert_eq!(
             rtc, system,
@@ -969,13 +1032,13 @@ mod tests {
         assert_eq!(said["stepped"], true);
         assert!(said.get("rtcError").is_none() && said.get("error").is_none(), "{said}");
         // Under two seconds nothing is stepped, and nothing is written.
-        let (system, rtc, said) = written(750_000, false, false).await;
+        let (system, rtc, said) = written(750_000, false, false, true, None).await;
         assert_eq!((system, rtc, said["stepped"].clone()), (None, None, false.into()));
     }
 
     #[tokio::test]
     async fn clock_a_failed_hardware_write_is_said_and_the_step_still_counts() {
-        let (system, rtc, said) = written(28_800_000_000, false, true).await;
+        let (system, rtc, said) = written(28_800_000_000, false, true, true, None).await;
         assert_eq!(rtc, system);
         assert_eq!(said["stepped"], true);
         assert_eq!(said["rtcError"], "no such device");
@@ -984,11 +1047,25 @@ mod tests {
 
     #[tokio::test]
     async fn clock_a_step_that_is_refused_writes_no_hardware_clock() {
-        let (system, rtc, said) = written(28_800_000_000, true, false).await;
+        let (system, rtc, said) = written(28_800_000_000, true, false, true, None).await;
         assert!(system.is_some());
         assert_eq!(rtc, None);
         assert_eq!(said["stepped"], false);
         assert!(said.get("rtcError").is_none(), "{said}");
+    }
+
+    #[test]
+    fn clock_the_log_line_of_a_step_says_when_the_hardware_clock_was_not_set() {
+        let stepped = json!({ "server": "a:1", "offsetMs": 28_800_000, "stepped": true });
+        assert_eq!(
+            log_line(&stepped, true),
+            "kithd: clock: stepped +28800.000 s to the time of a:1"
+        );
+        let failed = json!({ "server": "a:1", "offsetMs": 28_800_000, "stepped": true, "rtcError": "no rtc" });
+        assert_eq!(
+            log_line(&failed, true),
+            "kithd: clock: stepped +28800.000 s to the time of a:1 (the hardware clock was not set: no rtc)"
+        );
     }
 
     #[test]

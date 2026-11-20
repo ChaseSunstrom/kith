@@ -129,12 +129,18 @@ fn rtc_time_of(secs: i64) -> [i32; 9] {
 /// expects of a machine that has no other OS (RTC_SET_TIME, which needs CAP_SYS_TIME). What
 /// a machine boots with, when nothing sets its clock at start.
 pub fn set_rtc(secs: i64) -> Result<()> {
-    const RTC_SET_TIME: u32 = 0x4024_700a; // _IOW('p', 0x0a, struct rtc_time)
-    let mut bytes = Vec::with_capacity(36);
-    for field in rtc_time_of(secs) {
-        bytes.extend_from_slice(&field.to_ne_bytes());
-    }
-    ioctl(&File::open("/dev/rtc0")?, RTC_SET_TIME, &mut bytes).map(drop)
+    let named = |e: Error| Error::new(e.kind(), format!("/dev/rtc0: {e}"));
+    let file = File::open("/dev/rtc0").map_err(named)?;
+    ioctl(&file, RTC_SET_TIME, &mut rtc_bytes(secs))
+        .map(drop)
+        .map_err(named)
+}
+
+const RTC_SET_TIME: u32 = 0x4024_700a; // _IOW('p', 0x0a, struct rtc_time)
+
+/// `struct rtc_time` for `secs`: nine native-endian ints, 36 bytes.
+fn rtc_bytes(secs: i64) -> Vec<u8> {
+    rtc_time_of(secs).iter().flat_map(|field| field.to_ne_bytes()).collect()
 }
 
 /// The bit each of the red, green and blue channels starts at in a pixel of the framebuffer
@@ -1224,6 +1230,27 @@ mod tests {
         assert_eq!(rtc_time_of(1_795_182_359), [59, 45, 13, 20, 10, 126, 0, 0, 0]);
         assert_eq!(rtc_time_of(951_782_400), [0, 0, 0, 29, 1, 100, 0, 0, 0]);
         assert_eq!(rtc_time_of(1_798_761_599), [59, 59, 23, 31, 11, 126, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rtc_set_time_is_the_kernels_number_and_a_struct_of_nine_ints() {
+        // _IOW('p', 0x0a, struct rtc_time): direction 1, size 36, type 'p', number 10.
+        assert_eq!(RTC_SET_TIME, (1 << 30) | (36 << 16) | (u32::from(b'p') << 8) | 0x0a);
+        assert_eq!(RTC_SET_TIME, 0x4024_700a);
+        let bytes = rtc_bytes(1_795_182_359);
+        assert_eq!(bytes.len(), 36);
+        // (tm_sec first, tm_year the sixth int.)
+        assert_eq!(i32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 59);
+        assert_eq!(i32::from_ne_bytes(bytes[20..24].try_into().unwrap()), 126);
+    }
+
+    #[test]
+    fn rtc_without_a_device_names_it() {
+        // (Only where the machine has no /dev/rtc0: any other result says nothing of the message.)
+        if !Path::new("/dev/rtc0").exists() {
+            let said = set_rtc(0).unwrap_err().to_string();
+            assert!(said.contains("/dev/rtc0"), "{said}");
+        }
     }
 
     /// Held by each test here that has a child, so the one that looks for any ended child
