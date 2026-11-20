@@ -90,6 +90,7 @@ sh ci/vm.sh --test image                                # kith OS's image: UEFI,
 sh ci/vm.sh --test update                               # and its two slots: an update, marked good; a broken one, gone back from
 sh ci/vm.sh --test chaos                                # three nodes: each cut off in turn, each reset in turn, all reset at once, while writes go on
 sh ci/vm.sh --test access                               # three nodes: a RoleBinding deleted while one is cut off; no write after it is kept
+sh ci/vm.sh --test fido2                                # a test-build kithd's FIDO2 client against its software key (uhid, hidraw): the hmac-secret each seed says, a withheld touch timed out
 sh ci/vm.sh --test pods                                 # two nodes: pods with a network, an address and a root each
 sh ci/vm.sh --test quota                                # pods' storage limits held at the write, across a restart
 sh ci/kube.sh                                           # the real kubectl and helm (fetched once, by hash) against kithd
