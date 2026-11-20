@@ -112,7 +112,7 @@ const ROOT_READ_ONLY: &str =
 
 /// What to run. Everything is already resolved: the controller turns a
 /// `Workload`'s container (quantities, secrets, config maps) into this.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Unit {
     /// Replaces the image's entrypoint when not empty.
     pub command: Vec<String>,
@@ -428,7 +428,7 @@ pub const ROOTS: [Capability; 14] = [
 ];
 
 /// A host directory bound into a container: where it is, where the container sees it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Mount {
     /// An absolute path on the host.
     pub host: PathBuf,

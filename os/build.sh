@@ -95,10 +95,18 @@ root=$(cd "$here/.." && pwd)
 # (Absolute: systemd-repart ignores a relative CopyBlocks= path and leaves the partition empty.)
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
-# KITHD_FEATURES (ci/musl.sh) builds a kithd with test-only routes: only into the folder
+# KITHD_FEATURES (ci/musl.sh) builds a kithd with test-only code: only into the folder
 # ci/vm.sh gives that image, so one left in the environment never makes an image that ships.
-if [ -n "${KITHD_FEATURES:-}" ] && [ "$out" != "$root/target/os-forge" ]; then
-    echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): only for --out target/os-forge, not $out (unset it)" >&2
+# (forge: a route a leader appends an unchecked entry by; fido2-test: a software security key
+# on /dev/uhid, docs/adr-fido2.md section 2.)
+case "${KITHD_FEATURES:-}" in
+    '') ;;
+    forge) want=$root/target/os-forge ;;
+    fido2-test) want=$root/target/os-fido2 ;;
+    *) echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): it knows forge and fido2-test (unset it)" >&2; exit 2 ;;
+esac
+if [ -n "${KITHD_FEATURES:-}" ] && [ "$out" != "$want" ]; then
+    echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): only for --out ${want#"$root"/}, not $out (unset it)" >&2
     exit 2
 fi
 cache=${KITH_OS_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/kith-os}
@@ -192,6 +200,10 @@ if [ -n "$spec" ]; then
         case $f in *[!a-z0-9-]*) die "--spec: '$f' is not a feature's name" ;; esac
         [ -r "$root/os/features/$f.config" ] ||
             die "--spec: no feature '$f' (os/features has: $(cd "$root/os/features" && ls | sed 's/\.config$//' | tr '\n' ' '))"
+        # (uhid-test puts /dev/uhid in the kernel: only for the image of the fido2 test, which
+        # has the software key that opens it, and which ships nowhere.)
+        [ "$f" != uhid-test ] || [ "$out" = "$root/target/os-fido2" ] ||
+            die "--spec: the feature uhid-test (CONFIG_UHID) is for --out target/os-fido2 only, not $out"
         { echo "# --spec: $f"; cat "$root/os/features/$f.config"; } >>"$kconfig"
         globs="$globs
 $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
@@ -325,6 +337,22 @@ if ! [ -r "$kernel" ]; then
     # (The tree is 2.6 GB; the kernel is what is kept.)
     find "$tree" -delete
     mv "$cache/kernel-$key/vmlinuz.part" "$kernel"
+fi
+# What the kernel was built with, not what was asked of it: the merge fragments never show an
+# option that is off, and a defconfig may give one on of its own. A key and an HID device
+# node for it in every build; /dev/uhid (which lets root make an input device out of nothing)
+# in none that ships: that build must say '# CONFIG_UHID is not set', so a missing line (an
+# option the tree does not know) fails too. Only the uhid-test spec has CONFIG_UHID=y.
+built=$cache/kernel-$key/config
+[ -r "$built" ] || die "no .config kept for the kernel ($built)"
+for want_on in CONFIG_HIDRAW=y CONFIG_USB_HID=y; do
+    grep -qxF "$want_on" "$built" || die "the kernel's .config has no $want_on"
+done
+if [ -n "$spec" ] && spec_list features | grep -qx uhid-test; then
+    grep -qxF 'CONFIG_UHID=y' "$built" || die "the uhid-test kernel's .config has no CONFIG_UHID=y"
+else
+    grep -qxF '# CONFIG_UHID is not set' "$built" ||
+        die "a shipped kernel's .config must say '# CONFIG_UHID is not set' (only --spec with the feature uhid-test has /dev/uhid): $(grep 'CONFIG_UHID' "$built" || echo 'no CONFIG_UHID line')"
 fi
 if [ -n "$modules" ]; then
     # What the modules ask for, from linux-firmware: the whole of it for `all`, and the files
@@ -466,9 +494,12 @@ assemble() { # DIR
     # slots by it, and a node told to go to an older release would never start it. The
     # order is the N in the file's name, which the node gives it: crates/kithd/src/os.rs.)
     printf 'NAME="kith OS"\nID=kith\nPRETTY_NAME="kith OS"\n' >"$w/osrel"
+    cmdline() { # SLOT BLOCKS HASH
+        table="root,,,ro,0 $(($2 * 8)) verity 1 PARTLABEL=root-$1 PARTLABEL=verity-$1 4096 4096 $2 1 sha256 $3 $salt"
+        printf '%s' "console=ttyS0 console=tty0 dm-mod.create=\"$table\" dm-mod.waitfor=PARTLABEL=root-$1,PARTLABEL=verity-$1 root=/dev/dm-0 ro rootwait kith.slot=$1"
+    }
     for slot in a b; do
-        table="root,,,ro,0 $((blocks * 8)) verity 1 PARTLABEL=root-$slot PARTLABEL=verity-$slot 4096 4096 $blocks 1 sha256 $hash $salt"
-        printf '%s' "console=ttyS0 console=tty0 dm-mod.create=\"$table\" dm-mod.waitfor=PARTLABEL=root-$slot,PARTLABEL=verity-$slot root=/dev/dm-0 ro rootwait kith.slot=$slot" >"$w/cmdline-$slot"
+        cmdline "$slot" "$blocks" "$hash" >"$w/cmdline-$slot"
         objcopy \
             --add-section .osrel="$w/osrel" --change-section-vma .osrel=0x14dfc0000 \
             --add-section .cmdline="$w/cmdline-$slot" --change-section-vma .cmdline=0x14dfd0000 \
@@ -484,8 +515,17 @@ assemble() { # DIR
         --add-section .linux="$kernel" --change-section-vma .linux=0x14e000000 \
         "$efi/linuxx64.efi.stub" "$w/kith-install.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-install.efi"
+    # What tells a node a kithd-only update from a full one (the header's `kithd` object,
+    # crates/kithd/src/os.rs): the digests of kithd; of the boot file but for the root's own
+    # hash (the kernel, the stub, its os-release and the command line with no hash or size
+    # in it); and of the root but for kithd (/sbin/init) and its os-release, which names the
+    # version (sorted, owner and time fixed, as the squashfs is).
+    kithd_sum=$(sha256sum "$bin/kithd" | cut -d ' ' -f 1)
+    kernel_sum=$({ cmdline a 0 0; cat "$kernel" "$efi/linuxx64.efi.stub" "$w/osrel"; } | sha256sum | cut -d ' ' -f 1)
+    rest_sum=$(tar -C "$r" --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+        --exclude=./sbin/init --exclude=./etc/os-release -cf - . | sha256sum | cut -d ' ' -f 1)
     # What a node of an older version is given to become this one (os/update.sh).
-    sh "$root/os/update.sh" "$version" "$hash" "$w/root.squashfs" "$w/root.verity" "$w/kith-a.efi" "$w/kith-b.efi" >"$w/kith-os.update"
+    sh "$root/os/update.sh" "$version" "$hash" "$w/root.squashfs" "$w/root.verity" "$w/kith-a.efi" "$w/kith-b.efi" "$kithd_sum" "$kernel_sum" "$rest_sum" >"$w/kith-os.update"
 
     # The ESP, made here and not by repart: FAT16 at 64 MB, where repart insists on 260.
     # The installer's is the same with its own kernel image.

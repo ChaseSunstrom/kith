@@ -198,6 +198,29 @@ fn replies_compress_names() {
     assert_eq!(r.raw[r.raw.len() - 4 - 10 - 2..][..2], [0xC0, 12]);
 }
 
+/// A Service's name: NODATA where the name is there and the type is not (or the Service has no
+/// address yet: a name added bare), NXDOMAIN where the name is missing; both with the SOA.
+#[test]
+fn a_service_name_answers_nodata_and_nxdomain() {
+    let mut z = zones();
+    z.records.add_name("empty.default.kith").unwrap();
+    for (name, qtype, rcode) in [
+        ("web.default.kith", 15, 0),
+        ("empty.default.kith", 28, 0),
+        ("empty.default.kith", A, 0),
+        ("nope.default.kith", A, 3),
+    ] {
+        let r = ask(&z, name, qtype);
+        assert_eq!(
+            (r.rcode(), r.an.len(), r.ns.len()),
+            (rcode, 0, 1),
+            "{name} type {qtype}"
+        );
+        assert_eq!(r.ns[0].ty, 6, "{name}: the SOA");
+    }
+    assert_eq!(ask(&z, "web.default.kith", A).an.len(), 1);
+}
+
 #[test]
 fn missing_names_get_nxdomain_or_nodata_with_the_soa() {
     let z = zones();

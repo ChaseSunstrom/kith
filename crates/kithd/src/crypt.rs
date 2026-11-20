@@ -131,7 +131,68 @@ pub struct Record {
     /// The public keys of the duress codes the cluster made for this node, and for all.
     duress: Option<Vec<u8>>,
     duress_all: Option<Vec<u8>>,
+    /// The state's key wrapped under what each FIDO2 key gives (`fido2:` lines, at most
+    /// [`FIDO2_KEYS`]; docs/adr-fido2.md section 4).
+    fido2: Vec<Fido2>,
     peers: Vec<String>,
+}
+
+/// How many `fido2:` lines a record holds: two keys, so a lost one does not lock the node
+/// out; four would not fit [`ROOM`] beside the other ways.
+const FIDO2_KEYS: usize = 2;
+/// What a wrapped key is made of (a nonce, the key, a tag), and what CTAP2 gives a
+/// `fido2:` line: a credential id of 128 bytes at most, a salt and a secret of 32.
+const NONCE: usize = aead::NONCE_LEN;
+const TAG: usize = aead::MAX_TAG_LEN;
+const CRED_ID_MAX: usize = 128;
+const SALT: usize = 32;
+/// A wrapped state key at most (a 64-byte key is 92; this leaves room for a longer one).
+const WRAPPED_MAX: usize = 128;
+
+/// A FIDO2 key's line: its credential id (not secret), the salt asked of its `hmac-secret`,
+/// and the state's key wrapped under what it gave.
+#[derive(Clone, Debug, PartialEq)]
+struct Fido2 {
+    id: Vec<u8>,
+    salt: Vec<u8>,
+    wrapped: Vec<u8>,
+}
+
+impl Fido2 {
+    /// A line of the sizes CTAP2 gives (an id of 128 bytes at most, a salt of 32) and a
+    /// wrapped key of a nonce, a key and a tag: one that is none is not written, as it
+    /// would be dropped when read.
+    fn shaped(self) -> Option<Fido2> {
+        let fits = (1..=CRED_ID_MAX).contains(&self.id.len())
+            && self.salt.len() == SALT
+            && (NONCE + 1 + TAG..=WRAPPED_MAX).contains(&self.wrapped.len());
+        fits.then_some(self)
+    }
+
+    /// A line for a key that gave `secret` (the 32 bytes `hmac-secret` gives: a shorter one
+    /// is not wrapped under).
+    fn new(id: &[u8], salt: &[u8], secret: &[u8], key: &[u8]) -> Option<Fido2> {
+        (secret.len() == SALT).then_some(())?;
+        let (id, salt, wrapped) = (id.to_vec(), salt.to_vec(), wrap(secret, key));
+        Fido2 { id, salt, wrapped }.shaped()
+    }
+
+    /// The state's key, if `secret` is what this key gave for the line's salt.
+    fn open(&self, secret: &[u8]) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        unwrap_kept(secret, &self.wrapped)
+    }
+
+    fn parse(line: &str) -> Option<Fido2> {
+        let mut words = line.split_whitespace().map(unhex);
+        let (id, salt, wrapped) = (words.next()??, words.next()??, words.next()??);
+        // (A fourth word is a line of another shape: dropped, not read as its first three.)
+        words.next().is_none().then_some(())?;
+        Fido2 { id, salt, wrapped }.shaped()
+    }
+
+    fn text(&self) -> String {
+        format!("{} {} {}", hex(&self.id), hex(&self.salt), hex(&self.wrapped))
+    }
 }
 
 /// The key wrapped under a passphrase: what drawing the wrapping key from it costs
@@ -193,7 +254,7 @@ fn chosen(passphrase: &str) -> bool {
 
 /// How a state was opened at a start: by its owner (the key was still on the disk, or its
 /// passphrase was typed), by the recovery key typed (so somebody has it), by the cluster's
-/// answer, by the machine's own TPM, or by its TPM and the PIN typed.
+/// answer, by the machine's own TPM, by its TPM and the PIN typed, or by a security key touched.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum By {
     Owner,
@@ -201,6 +262,8 @@ pub enum By {
     Cluster,
     Tpm,
     Pin,
+    /// A security key touched at the console (docs/adr-fido2.md), as a passphrase typed is.
+    Key,
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
@@ -226,20 +289,26 @@ fn sealing(secret: &[u8]) -> aead::LessSafeKey {
 /// `key` sealed under `secret` (ChaCha20-Poly1305, its key drawn from the secret): a
 /// nonce, then what only the secret opens.
 fn wrap(secret: &[u8], key: &[u8]) -> Vec<u8> {
-    let nonce: [u8; 12] = random();
-    let mut sealed = key.to_vec();
+    let nonce: [u8; NONCE] = random();
+    let mut sealed = zeroize::Zeroizing::new(key.to_vec());
     let nonced = aead::Nonce::assume_unique_for_key(nonce);
-    let done = sealing(secret).seal_in_place_append_tag(nonced, aead::Aad::empty(), &mut sealed);
+    let done = sealing(secret).seal_in_place_append_tag(nonced, aead::Aad::empty(), &mut *sealed);
     done.expect("a key is short enough to seal");
     [&nonce[..], &sealed].concat()
 }
 
 fn unwrap(secret: &[u8], wrapped: &[u8]) -> Option<Vec<u8>> {
-    let (nonce, sealed) = wrapped.split_at_checked(12)?;
-    let mut sealed = sealed.to_vec();
+    unwrap_kept(secret, wrapped).map(|key| key.to_vec())
+}
+
+/// The key `wrapped` holds, if `secret` opens it: kept in what wipes itself, as is the copy
+/// it was opened in.
+fn unwrap_kept(secret: &[u8], wrapped: &[u8]) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    let (nonce, sealed) = wrapped.split_at_checked(NONCE)?;
+    let mut sealed = zeroize::Zeroizing::new(sealed.to_vec());
     let nonce = aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
     let key = sealing(secret).open_in_place(nonce, aead::Aad::empty(), &mut sealed);
-    key.ok().map(|key| key.to_vec())
+    key.ok().map(|key| zeroize::Zeroizing::new(key.to_vec()))
 }
 
 fn drawn(passphrase: &str, salt: &[u8], (memory, passes): (u32, u32)) -> Option<[u8; 32]> {
@@ -337,9 +406,16 @@ impl Record {
             // (A seal line cut to its bare name is an unreadable one, not a damaged record.)
             let bare = |name: &'static str| line.strip_suffix(':').filter(|n| *n == name).map(|n| (n, ""));
             let (name, value) = line.split_once(": ").or_else(|| {
-                ["tpm-parent", "tpm-pin", "tpm-next", "tpm-pin-next", "passphrase"]
-                    .into_iter()
-                    .find_map(bare)
+                [
+                    "tpm-parent",
+                    "tpm-pin",
+                    "tpm-next",
+                    "tpm-pin-next",
+                    "passphrase",
+                    "fido2",
+                ]
+                .into_iter()
+                .find_map(bare)
             })?;
             match name {
                 "secret" => record.secret = unhex(value)?,
@@ -356,6 +432,25 @@ impl Record {
                     record.pass = Pass::parse(value);
                     unread(record.pass.is_some(), "passphrase", said);
                 }
+                // (One that cannot be read is dropped, and said; so is a third, which no
+                // kithd writes: a record's room holds two. Neither is a damaged record.)
+                "fido2" => match Fido2::parse(value) {
+                    // (A second line of one credential is no spare key: with_fido2 refuses it too.)
+                    Some(line)
+                        if record.fido2.len() < FIDO2_KEYS && record.fido2.iter().any(|have| have.id == line.id) =>
+                    {
+                        said(
+                            "kithd: init: the lock record has two fido2: lines of one key: the second is dropped (kith node key remove NAME takes the keys off, and kith node key add NAME enrols two again)",
+                        )
+                    }
+                    Some(line) if record.fido2.len() < FIDO2_KEYS => record.fido2.push(line),
+                    Some(_) => said(&format!(
+                        "kithd: init: the lock record has more than {FIDO2_KEYS} fido2: lines: the others are dropped (kith node key remove NAME takes both off, and kith node key add NAME enrols two again)"
+                    )),
+                    None => said(
+                        "kithd: init: the lock record's fido2: line cannot be read: it is dropped, and the rest of the record stands (kith node key remove NAME takes the keys off, and kith node key add NAME enrols two again)",
+                    ),
+                },
                 "tpm-pin" => {
                     let pin = PinSeal::parse(value);
                     unread(pin.is_some(), "tpm-pin", said);
@@ -401,6 +496,9 @@ impl Record {
         }
         if let Some(pass) = &self.pass {
             text += &format!("passphrase: {}\n", pass.text());
+        }
+        for line in &self.fido2 {
+            text += &format!("fido2: {}\n", line.text());
         }
         if let Some(pin) = &self.pin {
             text += &format!("tpm-pin: {}\n", pin.text());
@@ -462,6 +560,25 @@ impl Record {
     /// all of what was there, and read it back. One that would not fit its room but by
     /// peers left out is not written: the line it would cut is named.
     fn write(&self, disk: &File, at: u64) -> Result<(), String> {
+        let order = self.order()?;
+        let bytes = &order[1].1;
+        let mut back = vec![0; ROOM];
+        let wrote = order.iter().try_for_each(|(to, bytes)| {
+            let written = disk.write_all_at(bytes, at + *to as u64);
+            written.and_then(|()| disk.sync_all())
+        });
+        let read = wrote.and_then(|()| from_disk(disk, at).read_exact_at(&mut back, at));
+        read.map_err(|e| format!("writing the lock record: {e}"))?;
+        (back == *bytes)
+            .then_some(())
+            .ok_or("the lock record did not stay on the disk as written".into())
+    }
+
+    /// The writes that put this record on a disk, in their order: where each goes (from the
+    /// record's place) and its ROOM bytes. The copy is first, so the record stays the old one,
+    /// whole, until the copy holds the new; a cut after that is read as the new one (from the
+    /// copy, where the record was cut).
+    fn order(&self) -> Result<[(usize, Vec<u8>); 2], String> {
         let mut bytes = self.text().into_bytes();
         // (A zero ends it, so one byte less than the room.)
         if bytes.len() >= ROOM {
@@ -479,17 +596,86 @@ impl Record {
             ));
         }
         bytes.resize(ROOM, 0);
-        let mut back = vec![0; ROOM];
-        let wrote = disk
-            .write_all_at(&bytes, at + ROOM as u64)
-            .and_then(|()| disk.sync_all())
-            .and_then(|()| disk.write_all_at(&bytes, at))
-            .and_then(|()| disk.sync_all());
-        let read = wrote.and_then(|()| from_disk(disk, at).read_exact_at(&mut back, at));
-        read.map_err(|e| format!("writing the lock record: {e}"))?;
-        (back == bytes)
-            .then_some(())
-            .ok_or("the lock record did not stay on the disk as written".into())
+        Ok([(ROOM, bytes.clone()), (0, bytes)])
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the record's half of fido2 (T-0971): the verbs call it next (docs/adr-fido2.md section 6)"
+)]
+impl Record {
+    /// This record with `new` (a credential id, its salt and the secret the key gave for it)
+    /// as its two fido2 keys, the state's `key` wrapped under each secret. Two keys or none;
+    /// none held yet (a third line is refused); and it must fit its room, which is said here
+    /// and not when the write is begun. Every other line stays as it is.
+    fn with_fido2(&self, key: &[u8], new: &[(&[u8], &[u8], &[u8])]) -> Result<Record, String> {
+        if new.len() != FIDO2_KEYS {
+            return Err(format!(
+                "{FIDO2_KEYS} fido2 keys are enrolled together: not {}",
+                new.len()
+            ));
+        }
+        if !self.fido2.is_empty() {
+            return Err("this node already holds fido2 keys: they are removed before others are enrolled".into());
+        }
+        // (Two keys that gave one secret are one way in: the second would be no spare.)
+        if new[0].0 == new[1].0 || new[0].2 == new[1].2 {
+            return Err("that is the same key".into());
+        }
+        let made = new.iter().map(|(id, salt, secret)| Fido2::new(id, salt, secret, key));
+        let fido2 = made.collect::<Option<Vec<_>>>();
+        let fido2 = fido2.ok_or("a credential id, a salt or a secret is not of a size a fido2 key gives")?;
+        let mut with = Record { fido2, ..self.clone() };
+        // (The clone holds the plaintext `key:` if the record has one: wiped when it is refused.
+        // The other clones of a Record, as `ways_left` makes, are not: a Drop on Record would
+        // end the `..record.clone()` updates the module is built on. ponytail: wipe all clones, if Record is split from its key.)
+        if let Err(why) = with.order() {
+            zeroize::Zeroize::zeroize(&mut with.key);
+            return Err(why);
+        }
+        let kept = |record: &Record| {
+            let text = record.text();
+            let peers = text.lines().find_map(|line| line.strip_prefix("peers:"));
+            peers.map_or(0, |peers| peers.split_whitespace().count())
+        };
+        if kept(&with) < self.peers.len() {
+            eprintln!(
+                "kithd: the lock record has room for {} of this node's {} peers once its fido2 keys are in: the rest are found again, as they are when the record is full",
+                kept(&with),
+                self.peers.len()
+            );
+        }
+        Ok(with)
+    }
+
+    /// This record without its fido2 keys, both: one alone is not removed. Refused until the
+    /// recovery key was shown, so the record is never left with only a lost key's way in.
+    fn without_fido2(&self) -> Result<Record, String> {
+        if self.fido2.is_empty() {
+            return Err("this node holds no fido2 keys".into());
+        }
+        if !self.seen {
+            return Err(
+                "the recovery key was not shown yet: it is, before the keys that open the state are removed".into(),
+            );
+        }
+        Ok(Record {
+            fido2: Vec::new(),
+            ..self.clone()
+        })
+    }
+
+    /// Whether each of `secrets` opens one of the fido2 lines to `key`: what a record read
+    /// back must do, with the secrets still in memory, before a key is said to be enrolled.
+    fn fido2_proves(&self, key: &[u8], secrets: &[&[u8]]) -> bool {
+        secrets.len() == FIDO2_KEYS
+            && self.fido2.len() == FIDO2_KEYS
+            && self
+                .fido2
+                .iter()
+                .zip(secrets)
+                .all(|(line, secret)| line.open(secret).is_some_and(|opened| opened[..] == *key))
     }
 
     /// What the cluster knows this disk by: says nothing of the secret it is made from.
@@ -563,6 +749,7 @@ pub fn seal(image: &File, disk: &Path) -> Result<String, String> {
         seen: false,
         duress: None,
         duress_all: None,
+        fido2: Vec::new(),
     };
     record.write(&disk, config + AT)?;
     Ok(shown(&recovery))
@@ -650,7 +837,8 @@ const WRONG: &str = "kithd: init: that does not open this node's state";
 
 /// What a line typed at the waiting console is.
 enum Typed {
-    Opens(Vec<u8>, By),
+    /// (The key is wiped when this is dropped, as it is when the line did not stand.)
+    Opens(zeroize::Zeroizing<Vec<u8>>, By),
     Duress(ring::signature::Ed25519KeyPair),
     Wrong,
     /// Not tried: what is said instead of [`WRONG`] (the TPM refuses every PIN for now).
@@ -726,7 +914,7 @@ fn pin_way<T: std::io::Read + std::io::Write + Send + 'static>(
 fn judged(record: &Record, line: &str, pin: Option<&Pin>) -> Typed {
     let code = typed(line);
     if let Some(key) = code.as_ref().and_then(|recovery| unwrap(recovery, &record.recovery)) {
-        return Typed::Opens(key, By::Recovery);
+        return Typed::Opens(zeroize::Zeroizing::new(key), By::Recovery);
     }
     if let Some(pair) = code.map(|code| duress_key(&code)) {
         use ring::signature::KeyPair;
@@ -739,12 +927,12 @@ fn judged(record: &Record, line: &str, pin: Option<&Pin>) -> Typed {
     // (Only what can be a passphrase is tried.)
     let pass = record.pass.as_ref().filter(|_| chosen(line));
     if let Some(key) = pass.and_then(|pass| pass.open(line)) {
-        return Typed::Opens(key, By::Owner);
+        return Typed::Opens(zeroize::Zeroizing::new(key), By::Owner);
     }
     // (And a PIN last: a wrong one is counted. One the TPM refuses is said so, as the
     // right one is refused then too.)
     match pin.filter(|_| pin_shaped(line)).map(|pin| pin(line.as_bytes())) {
-        Some(Ok(key)) => Typed::Opens(key, By::Pin),
+        Some(Ok(key)) => Typed::Opens(zeroize::Zeroizing::new(key), By::Pin),
         Some(Err(why)) if why.starts_with(crate::tpm::LOCKED_OUT) => Typed::Refused(why),
         Some(Err(why)) if why != crate::tpm::NOT_THE_PIN => {
             // (Not the PIN's fault: the TPM failed. Said where the machine logs, not as
@@ -753,6 +941,164 @@ fn judged(record: &Record, line: &str, pin: Option<&Pin>) -> Typed {
             Typed::Wrong
         }
         _ => Typed::Wrong,
+    }
+}
+
+/// The security keys at the waiting console (docs/adr-fido2.md section 6): the `fido2:`
+/// lines of the record, and `plugged`, which hands out each key plugged in once.
+struct Touch {
+    lines: Vec<Fido2>,
+    /// The keys plugged in that were not tried yet, by name; asked with the names of those to
+    /// be tried again.
+    plugged: Finder,
+    /// Called each time keys are found: somebody is there (see [`touched`]).
+    present: Box<dyn Fn() + Send>,
+    /// The keys that timed out, by name, and when: tried again after [`RETRY_GAP`].
+    retry: Vec<(String, std::time::Instant)>,
+}
+
+/// A security key plugged in.
+type SecurityKey = Box<dyn crate::fido2::frame::Device + Send>;
+/// A security key with the name it was found under.
+type FoundKey = (String, SecurityKey);
+type Finder = Box<dyn FnMut(&[String]) -> Vec<FoundKey> + Send>;
+
+/// How long after a key timed out (or did not answer) it is tried again: no sooner, so a key
+/// that is stuck is not asked, and said of, every second.
+const RETRY_GAP: Duration = Duration::from_secs(5);
+
+/// A [`Touch`] for the node's record: none without `fido2:` lines, so a node that has no
+/// key never looks for one; the keys are those on this machine's hidraw devices.
+fn touch_of(record: &Record) -> Option<Arc<std::sync::Mutex<Touch>>> {
+    let mut tried = std::collections::HashSet::new();
+    let plugged = Box::new(move |again: &[String]| {
+        // (A key to be tried again is one that is not tried: it is handed out again.)
+        tried.retain(|name| !again.contains(name));
+        let keys = crate::fido2::hidraw::plugged_in(Path::new("/sys/class/hidraw"), Path::new("/dev"), &mut tried);
+        keys.into_iter()
+            .map(|(name, key)| (name, Box::new(key) as SecurityKey))
+            .collect()
+    });
+    let present = Box::new(|| TYPED.notify_one());
+    let lines = record.fido2.clone();
+    (!lines.is_empty()).then(|| {
+        Arc::new(std::sync::Mutex::new(Touch {
+            lines,
+            plugged,
+            present,
+            retry: Vec::new(),
+        }))
+    })
+}
+
+/// A security key that reads and writes until `stop` is set (the console is done with it).
+struct Stopping<'a>(
+    &'a mut (dyn crate::fido2::frame::Device + Send),
+    &'a std::sync::atomic::AtomicBool,
+);
+
+impl crate::fido2::frame::Device for Stopping<'_> {
+    fn write(&mut self, report: &[u8; crate::fido2::frame::REPORT]) -> std::io::Result<()> {
+        if self.1.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("the console is done with the key"));
+        }
+        self.0.write(report)
+    }
+
+    fn read(&mut self) -> std::io::Result<Vec<u8>> {
+        if self.1.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("the console is done with the key"));
+        }
+        self.0.read()
+    }
+}
+
+/// Said of a key that could not be used (where the machine logs, not as an answer: no secret
+/// is in `why`), and whether it is worth trying again: a touch not given in time or a key
+/// that said nothing is, a key that wants its PIN is not (and nothing but the PIN helps).
+fn unusable(name: &str, why: &str, stop: &std::sync::atomic::AtomicBool) -> bool {
+    use crate::fido2::frame;
+    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if why.contains(frame::PIN_REQUIRED) {
+        eprintln!(
+            "kithd: init: the security key {name} needs its PIN: kith asks for none at the console; use another way in"
+        );
+        return false;
+    }
+    let again = why.contains(frame::USER_ACTION_TIMEOUT) || why.contains("timed out");
+    let then = if again {
+        "it is tried again"
+    } else {
+        "unplug it and plug it in to try again"
+    };
+    eprintln!("kithd: init: the security key {name} could not be used: {why}: {then}");
+    again
+}
+
+/// Each key plugged in that was not tried yet, asked for its secret under each line (a
+/// touch, if the key holds the line's credential: one that does not says so at once), and
+/// the state's key from the first line it opens. None where no key is there (or `stop`);
+/// a key that opens nothing is [`Typed::Wrong`], as is a line that opens nothing. A key
+/// that timed out is asked again after [`RETRY_GAP`], and each time keys are found the
+/// wait of a system on trial starts over (a key plugged in and never touched, for good,
+/// holds that off: somebody is there, or something is stuck).
+/// (Off the thread that asks the cluster: a key waits for a touch.)
+fn touched(touch: &mut Touch, stop: &std::sync::atomic::AtomicBool) -> Option<Typed> {
+    use crate::fido2::{flow, frame};
+    let (due, waiting) = std::mem::take(&mut touch.retry)
+        .into_iter()
+        .partition::<Vec<_>, _>(|(_, at)| at.elapsed() >= RETRY_GAP);
+    touch.retry = waiting;
+    let again: Vec<String> = due.into_iter().map(|(name, _)| name).collect();
+    let keys = (touch.plugged)(&again);
+    if keys.is_empty() {
+        return None;
+    }
+    (touch.present)();
+    eprintln!("kithd: init: a security key is plugged in: touch it, if it is this node's");
+    for (name, mut key) in keys {
+        let mut key = Stopping(&mut *key, stop);
+        let channel = match frame::init(&mut key, random()) {
+            Ok(channel) => channel,
+            Err(why) => {
+                if unusable(&name, &why, stop) {
+                    touch.retry.push((name, std::time::Instant::now()));
+                }
+                continue;
+            }
+        };
+        for line in &touch.lines {
+            let Ok(salt) = <[u8; crate::fido2::hmac::SALT]>::try_from(&line.salt[..]) else {
+                continue;
+            };
+            match flow::get_assertion(&mut key, channel.cid, flow::RP_ID, &line.id, &salt) {
+                Ok(secret) => {
+                    if let Some(opened) = line.open(&secret[..]) {
+                        return Some(Typed::Opens(opened, By::Key));
+                    }
+                }
+                Err(why) if why.contains(frame::NO_CREDENTIALS) => {}
+                Err(why) => {
+                    if unusable(&name, &why, stop) {
+                        touch.retry.push((name, std::time::Instant::now()));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    // (A key let go of, mid-attempt, is no wrong answer: nobody is left to hear it.)
+    (!stop.load(std::sync::atomic::Ordering::Relaxed)).then_some(Typed::Wrong)
+}
+
+/// Sets the flag it holds when dropped: [`touched`] stops at its key's next report.
+struct StopKeys(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopKeys {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -765,7 +1111,10 @@ type Duressed = tokio::sync::watch::Sender<Option<Arc<ring::signature::Ed25519Ke
 /// wait behind the answer to a wrong key. For a duress code the record is `erase`d
 /// first (whether it is: tried again for as long as it is not) and `forget` is given its
 /// key; nothing typed opens from then on. A PIN is tried by `pin`, if this node has one;
-/// what was typed is zeroed once judged.
+/// what was typed is zeroed once judged. A security key plugged in is tried by `touch`
+/// (beside the lines, after what was typed in the same pass: a key that waits for its
+/// touch holds no line), and one that opens nothing is answered as a wrong line is,
+/// [`ANSWER`] after it was found. After a duress code no key is looked for.
 async fn console(
     mut record: Record,
     lines: std::sync::mpsc::Receiver<String>,
@@ -773,8 +1122,15 @@ async fn console(
     erase: impl Fn() -> bool,
     forget: &Duressed,
     mut pin: Option<Pin>,
+    mut touch: Option<Arc<std::sync::Mutex<Touch>>>,
 ) -> (Vec<u8>, By) {
     let (mut answers, mut erased) = (std::collections::VecDeque::new(), true);
+    // The key being tried (off this thread), when it began, and when the keys are looked for next.
+    let mut trying: Option<(tokio::time::Instant, tokio::task::JoinHandle<Option<Typed>>)> = None;
+    let mut looked = tokio::time::Instant::now();
+    // (Set when this returns, or is dropped because the cluster gave the key first: a key
+    // being tried is let go of at its next report, not at its touch timeout.)
+    let stop = StopKeys(Arc::new(std::sync::atomic::AtomicBool::new(false)));
     loop {
         while let Ok(line) = lines.try_recv() {
             let line = zeroize::Zeroizing::new(line);
@@ -788,11 +1144,13 @@ async fn console(
             let judged = tokio::task::spawn_blocking(move || judged(&judge, &line, by.as_ref())).await;
             let gone = forget.borrow().is_some();
             let answer = match judged.unwrap_or(Typed::Wrong) {
-                Typed::Opens(key, by) if !gone => return (key, by),
+                Typed::Opens(mut key, by) if !gone => return (std::mem::take(&mut *key), by),
                 Typed::Duress(pair) if !gone => {
                     erased = erase();
                     // (And from memory: what was typed before no longer opens either.)
                     (record.recovery, record.pass, pin) = (Vec::new(), None, None);
+                    // (And no security key opens it either: its lines go, and none is looked for.)
+                    (record.fido2, touch) = (Vec::new(), None);
                     forget.send_replace(Some(Arc::new(pair)));
                     WRONG.to_string()
                 }
@@ -800,6 +1158,34 @@ async fn console(
                 _ => WRONG.to_string(),
             };
             answers.push_back((due, answer));
+        }
+        // A key, after the lines: tried off this thread (it waits for a touch, and a line typed
+        // meanwhile is judged all the same), looked at when it is done, looked for each second.
+        if let Some((started, handle)) = trying.take_if(|(_, handle)| handle.is_finished()) {
+            let gone = forget.borrow().is_some();
+            let found = handle.await.unwrap_or_else(|why| {
+                // (A thread that failed: said, and the keys are looked for again.)
+                eprintln!("kithd: init: a security key could not be tried: {why}");
+                None
+            });
+            match found {
+                Some(Typed::Opens(mut key, by)) if !gone => return (std::mem::take(&mut *key), by),
+                Some(_) => answers.push_back((started + ANSWER, WRONG.to_string())),
+                None => {}
+            }
+        }
+        let now = tokio::time::Instant::now();
+        match &touch {
+            Some(shared) if trying.is_none() && now >= looked => {
+                let (shared, stop) = (Arc::clone(shared), Arc::clone(&stop.0));
+                let attempt = tokio::task::spawn_blocking(move || {
+                    // (A thread that failed while it held this left nothing half-done in it.)
+                    let mut touch = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    touched(&mut touch, &stop)
+                });
+                (trying, looked) = (Some((now, attempt)), now + Duration::from_secs(1));
+            }
+            _ => {}
         }
         erased = erased || erase();
         let next = tokio::time::Instant::now() + Duration::from_millis(100);
@@ -846,7 +1232,15 @@ async fn fetched(record: &Record, config: &Path, join: Option<&String>, pin: Opt
     // that did not take it is written again, ten times a second, while this node waits.)
     let erased = || erase(config).is_ok();
     // (Read all the while: a peer that does not answer takes its time to say so.)
-    let console = console(record.clone(), lines, |said| eprintln!("{said}"), erased, &forget, pin);
+    let console = console(
+        record.clone(),
+        lines,
+        |said| eprintln!("{said}"),
+        erased,
+        &forget,
+        pin,
+        touch_of(record),
+    );
     let cluster = async {
         let (mut said, mut told) = (String::new(), false);
         loop {
@@ -878,6 +1272,9 @@ async fn fetched(record: &Record, config: &Path, join: Option<&String>, pin: Opt
         }
     };
     eprintln!("kithd: init: this node's state is encrypted: asking the cluster for its key. (Or type {asks}.)");
+    if !record.fido2.is_empty() {
+        eprintln!("kithd: init: (Or plug in a security key of this node's, and touch it when it blinks.)");
+    }
     // (A passphrase or a PIN is not for whoever looks at the screen.)
     if hidden {
         echo(false);
@@ -888,6 +1285,7 @@ async fn fetched(record: &Record, config: &Path, join: Option<&String>, pin: Opt
             let with = match by {
                 By::Recovery => "the recovery key",
                 By::Pin => "its PIN",
+                By::Key => "its security key",
                 _ => "its passphrase",
             };
             eprintln!("kithd: init: opened with {with}");
@@ -1070,7 +1468,7 @@ fn renewed(record: &Record, opened: &[u8]) -> (Record, String) {
 }
 
 /// The ways in `record` the cluster's word leaves: the TPM's seal while it says `seal`; a
-/// passphrase and a PIN until the node is locked or forgotten (`shut`). The storage key's
+/// passphrase, a PIN and the fido2 keys until the node is locked or forgotten (`shut`). The storage key's
 /// name stays while either seal it checks may: a PIN's seal is checked by it as well. The
 /// seals made ahead for the next system go as the ones they stand for do.
 fn ways_left(record: &Record, seal: bool, shut: bool) -> Record {
@@ -1082,9 +1480,21 @@ fn ways_left(record: &Record, seal: bool, shut: bool) -> Record {
         pin_next: record.pin_next.clone().filter(|_| pin.is_some()),
         parent: record.parent.clone().filter(|_| seal || pin.is_some()),
         pass: record.pass.clone().filter(|_| !shut),
+        // (A key touched is a way in with no node asked, as a passphrase is.)
+        fido2: if shut { Vec::new() } else { record.fido2.clone() },
         pin,
         ..record.clone()
     }
+}
+
+/// Whether none of `record`'s ways in is left that opens the state with no node asked: a
+/// node locked while one is, restarted, would open by it.
+fn opens_nothing_asked(record: &Record) -> bool {
+    record.tpm.is_none()
+        && record.next.is_none()
+        && record.pass.is_none()
+        && record.pin.is_none()
+        && record.fido2.is_empty()
 }
 
 /// `left` (written) is now the record in memory, its peers (which are kept apart) aside: a
@@ -1565,7 +1975,7 @@ pub async fn keep(
     };
     // (Locked before this start: then it was opened with the recovery key, by its owner,
     // and stays open.)
-    let mut was_locked = (!matches!(by, By::Owner | By::Recovery)).then_some(false);
+    let mut was_locked = (!matches!(by, By::Owner | By::Recovery | By::Key)).then_some(false);
     // Whether the record's seal is one this system opens, and why none could be made.
     let (mut fits, mut unsealed) = (matches!(by, By::Tpm | By::Pin), None::<(Instant, String)>);
     let (chosen, mut chosen_here) = tokio::sync::mpsc::channel::<Chosen>(1);
@@ -1660,17 +2070,16 @@ pub async fn keep(
                             "kithd: the cluster no longer hands this node's key out: its PIN no longer opens its state"
                         );
                     }
+                    if left.fido2 != record.fido2 {
+                        eprintln!(
+                            "kithd: the cluster no longer hands this node's key out: its fido2 keys no longer open its state"
+                        );
+                    }
                     adopt(&mut record, left);
                 }
                 // (A seal that could not be dropped is tried again: restarted beside it,
                 // the node would open by its TPM, locked or not. And so a passphrase.)
-                if locked
-                    && was_locked == Some(false)
-                    && record.tpm.is_none()
-                    && record.next.is_none()
-                    && record.pass.is_none()
-                    && record.pin.is_none()
-                {
+                if locked && was_locked == Some(false) && opens_nothing_asked(&record) {
                     // (This node's store may be behind, just after an unlock: a peer that
                     // still hands the key out says it is not locked, or not yet.)
                     let mut stale = false;
@@ -3114,7 +3523,7 @@ mod tests {
         let Tpm(wire) = tpm;
         let way = pin_way(&seal, None, with.parent.as_deref(), || Ok(Tpm(wire))).unwrap();
         let opens = |line: &str| judged(&with, line, Some(&way));
-        assert!(matches!(opens(pin), Typed::Opens(opened, By::Pin) if opened == key));
+        assert!(matches!(opens(pin), Typed::Opens(opened, By::Pin) if *opened == key));
         assert!(matches!(opens("40917254"), Typed::Wrong));
         // (Not a PIN's shape: not tried, not counted.)
         assert!(matches!(opens("40917"), Typed::Wrong) && matches!(opens("4091725x"), Typed::Wrong));
@@ -3123,7 +3532,7 @@ mod tests {
             Typed::Refused(why) => assert_eq!(why, format!("{LOCKED_OUT}: the next is taken within 40 seconds")),
             _ => panic!("the right PIN opened while the TPM refused every PIN"),
         }
-        assert!(matches!(opens(&shown(&recovery)), Typed::Opens(opened, By::Recovery) if opened == key));
+        assert!(matches!(opens(&shown(&recovery)), Typed::Opens(opened, By::Recovery) if *opened == key));
         drop(way);
 
         // Another system (a PCR moved): no PIN is asked, so none is counted.
@@ -3175,7 +3584,7 @@ mod tests {
         for line in ["40917254", "40917253", "12345", "4091725x"] {
             type_it.send(line.to_string()).unwrap();
         }
-        let waiting = console(record.clone(), lines, &say, &|| true, &told, Some(pin.clone()));
+        let waiting = console(record.clone(), lines, &say, &|| true, &told, Some(pin.clone()), None);
         assert!(tokio::time::timeout(Duration::from_secs(60), waiting).await.is_err());
         let refused = format!(
             "kithd: init: {}: the next is taken within 40 seconds",
@@ -3185,7 +3594,7 @@ mod tests {
         assert_eq!(*tried.lock().unwrap(), ["40917254", "40917253"]);
         let (type_it, lines) = std::sync::mpsc::channel();
         type_it.send("11111111".to_string()).unwrap();
-        let opened = console(record, lines, &say, &|| true, &told, Some(pin)).await;
+        let opened = console(record, lines, &say, &|| true, &told, Some(pin), None).await;
         assert_eq!(opened, (key.to_vec(), By::Pin));
         for typed in ["40917254", "40917253", "11111111"] {
             assert!(
@@ -3405,6 +3814,7 @@ mod tests {
             seen: true,
             duress: Some(vec![6; 32]),
             duress_all: Some(vec![8; 32]),
+            fido2: Vec::new(),
             pin: Some(PinSeal {
                 k1: vec![1; 200],
                 k2: vec![2; 200],
@@ -3807,7 +4217,7 @@ mod tests {
         // A wrong key, the duress code, the recovery key itself, a wrong passphrase: all
         // typed before the first is answered.
         let (_open, lines) = keyboard(&[&wrong, &duress, &shown(&recovery), "correct horse batterz"]);
-        let waiting = console(record.clone(), lines, &say, &erase, &told, None);
+        let waiting = console(record.clone(), lines, &say, &erase, &told, None, None);
         let opened = tokio::time::timeout(Duration::from_secs(60), waiting).await;
         assert!(opened.is_err(), "after a duress code nothing typed opens the state");
         // Each is answered with the same words, ANSWER after it was read, the duress code
@@ -3832,7 +4242,7 @@ mod tests {
             std::future::pending::<()>().await
         };
         let opened = tokio::select! {
-            opened = console(record.clone(), lines, &say, &erase, &told, None) => opened,
+            opened = console(record.clone(), lines, &say, &erase, &told, None, None) => opened,
             () = later => unreachable!(),
         };
         assert_eq!(opened, (key.to_vec(), By::Recovery));
@@ -4136,9 +4546,9 @@ mod tests {
             recovery: wrap(&old, &key),
             ..Record::default()
         };
-        assert!(matches!(judged(&record, &shown(&old), None), Typed::Opens(opened, By::Recovery) if opened == key));
+        assert!(matches!(judged(&record, &shown(&old), None), Typed::Opens(opened, By::Recovery) if *opened == key));
         let (with, new) = renewed(&record, &key);
-        assert!(matches!(judged(&with, &new, None), Typed::Opens(opened, By::Recovery) if opened == key));
+        assert!(matches!(judged(&with, &new, None), Typed::Opens(opened, By::Recovery) if *opened == key));
         assert!(matches!(judged(&with, &shown(&old), None), Typed::Wrong));
         // Whoever asked was shown it; nothing else of the record changed, and the key
         // shown is not in it.
@@ -4169,5 +4579,929 @@ mod tests {
         wiped.spec = json!({ "id": "c", "wiped": true });
         assert!(unseen(&stored(&[held("a", Value::Null), wiped.clone()])).is_some());
         assert_eq!(unseen(&stored(&[wiped])), None);
+    }
+}
+
+/// What the fido2 tests share: a record that has every other line, each as long as it
+/// is likely to be, and two keys of the largest sizes a `fido2:` line has.
+#[cfg(test)]
+mod fido2_fixture {
+    use super::*;
+
+    pub const KEY: [u8; 64] = [9; 64];
+
+    pub fn every_other_way() -> Record {
+        Record {
+            secret: vec![7; 32],
+            recovery: wrap(&[1; 16], &KEY),
+            key: Some(KEY.to_vec()),
+            // (The PIN's way and its next seal are the longest; a plain seal is beside no PIN.)
+            tpm: None,
+            parent: Some(vec![6; 34]),
+            pass: Some(Pass {
+                cost: COST,
+                salt: vec![3; 16],
+                wrapped: vec![4; 92],
+            }),
+            seen: true,
+            duress: Some(vec![6; 32]),
+            duress_all: Some(vec![8; 32]),
+            pin: Some(PinSeal {
+                k1: vec![1; 200],
+                k2: vec![2; 200],
+                wrapped: vec![3; 92],
+            }),
+            next: None,
+            pin_next: Some(vec![5; 200]),
+            fido2: Vec::new(),
+            peers: (0..40).map(|n| format!("10.0.{n}.1:7443")).collect(),
+        }
+    }
+
+    /// (credential id, salt, hmac-secret) of key `n`: the id 128 bytes, as long as CTAP2 has one.
+    pub fn key(n: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        (vec![n; 128], vec![n + 10; 32], vec![n + 20; 32])
+    }
+
+    pub fn two(record: &Record) -> Record {
+        let (a, b) = (key(1), key(2));
+        let new = [(&a.0[..], &a.1[..], &a.2[..]), (&b.0[..], &b.1[..], &b.2[..])];
+        record.with_fido2(&KEY, &new).unwrap()
+    }
+
+    pub fn said(bytes: &[u8]) -> (Option<Record>, Vec<String>) {
+        let mut said = Vec::new();
+        let read = Record::parse_said(bytes, &mut |line| said.push(line.to_string()));
+        (read, said)
+    }
+}
+
+/// Two `fido2:` lines go through the record's writer and reader, within its room beside
+/// every other line, and are written in an order a cut cannot take a line out of.
+#[cfg(test)]
+mod fido2_line {
+    use super::fido2_fixture::*;
+    use super::*;
+
+    #[test]
+    fn fido2_line_two_round_trip_beside_every_other_way() {
+        let old = every_other_way();
+        let new = two(&old);
+        let text = new.text();
+        let lines: Vec<&str> = text.lines().filter(|line| line.starts_with("fido2: ")).collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        // (The ADR sizes a line at about 520 characters at its worst.)
+        assert!(lines.iter().all(|line| line.len() <= 520), "{lines:?}");
+        let [(_, copy), (_, record)] = new.order().unwrap();
+        assert_eq!((copy.len(), record.len()), (ROOM, ROOM));
+        assert!(
+            text.len() < ROOM,
+            "two lines and every other way take {} of {ROOM}",
+            text.len()
+        );
+        let path = std::env::temp_dir().join(format!("kith-fido2-line-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + 2 * ROOM]).unwrap();
+        let disk = File::options().read(true).write(true).open(&path).unwrap();
+        new.write(&disk, AT).unwrap();
+        let read = Record::read(&path).unwrap().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read, new);
+        assert_eq!(read.fido2.len(), 2);
+        // Every other line is as it was.
+        assert_eq!(
+            Record {
+                fido2: Vec::new(),
+                ..read
+            },
+            old
+        );
+        // Not as a Vec in another order: the first key stays the first.
+        assert_eq!(Record::parse(&record).unwrap().fido2[0], new.fido2[0]);
+    }
+
+    #[test]
+    fn fido2_line_refuses_what_would_not_fit_before_a_write() {
+        // A record that fits as it is, and does not once two keys are in: the keys do not
+        // fit, and it is said which line would be cut; nothing was written.
+        let long = Record {
+            tpm: Some(vec![5; 500]),
+            ..every_other_way()
+        };
+        assert!(long.order().is_ok(), "the record fits without its fido2 lines");
+        let (a, b) = (key(1), key(2));
+        let new = [(&a.0[..], &a.1[..], &a.2[..]), (&b.0[..], &b.1[..], &b.2[..])];
+        let refused = long.with_fido2(&KEY, &new).unwrap_err();
+        assert!(refused.contains("would not fit"), "{refused}");
+        // One key alone, the same key twice (by its id, or by what it gave) and a salt or a
+        // secret of the wrong size are not enrolled.
+        let held = every_other_way();
+        assert!(held.with_fido2(&KEY, &new[..1]).is_err());
+        assert!(held.with_fido2(&KEY, &[new[0], new[0]]).is_err());
+        assert!(
+            held.with_fido2(&KEY, &[new[0], (&b.0[..], &b.1[..], &a.2[..])])
+                .unwrap_err()
+                .contains("same key")
+        );
+        assert!(
+            held.with_fido2(&KEY, &[new[0], (&a.0[..], &b.1[..], &b.2[..])])
+                .unwrap_err()
+                .contains("same key")
+        );
+        assert!(
+            held.with_fido2(&KEY, &[new[0], (&b.0[..], &b.1[..], &b.2[..16])])
+                .is_err()
+        );
+        assert!(
+            held.with_fido2(&KEY, &[new[0], (&b.0[..], &b.1[..8], &b.2[..])])
+                .is_err()
+        );
+    }
+
+    /// The new record goes over the old in the order pinned here (the copy at ROOM, then the
+    /// record at 0), cut at some 70 places of the 8192 bytes: the region not being written
+    /// is whole, and what is read is the old record or the new, both seen. This is a write
+    /// cut short, not a disk that puts sectors down in another order
+    /// (`lock_record_cut_at_any_sector_reads_as_old_or_new` is the one near it).
+    #[test]
+    fn fido2_line_cut_anywhere_leaves_the_old_record_or_the_new() {
+        let without = every_other_way();
+        let with = two(&without);
+        let path = std::env::temp_dir().join(format!("kith-fido2-cut-{}", std::process::id()));
+        assert_eq!(with.without_fido2().unwrap(), without);
+        for (old, new) in [(&without, &with), (&with, &without)] {
+            let disk = {
+                std::fs::write(&path, vec![0; AT as usize + 2 * ROOM]).unwrap();
+                File::options().read(true).write(true).open(&path).unwrap()
+            };
+            old.write(&disk, AT).unwrap();
+            // (The order is pinned here, from a literal: the copy at ROOM, then the record at
+            // 0. `order` must say the same, or the cuts below are not the writes made.)
+            let (before, after) = (old.order().unwrap(), new.order().unwrap());
+            assert_eq!((before[0].0, before[1].0, after[0].0, after[1].0), (ROOM, 0, ROOM, 0));
+            let (old_bytes, new_bytes) = (&before[1].1, &after[1].1);
+            let (mut total, mut seen) = (0, [false; 2]);
+            for cut in (0..=2 * ROOM).step_by(61).chain([ROOM - 1, ROOM, ROOM + 1, 2 * ROOM]) {
+                // Back to the old on the disk, then the new put over it up to `cut` bytes.
+                disk.write_all_at(old_bytes, AT + ROOM as u64).unwrap();
+                disk.write_all_at(old_bytes, AT).unwrap();
+                let mut left = cut;
+                for to in [ROOM, 0] {
+                    let part = left.min(ROOM);
+                    disk.write_all_at(&new_bytes[..part], AT + to as u64).unwrap();
+                    left -= part;
+                }
+                let mut regions = vec![0; 2 * ROOM];
+                disk.read_exact_at(&mut regions, AT).unwrap();
+                let (record, copy) = regions.split_at(ROOM);
+                // The region not being written is whole: the record while the copy is, and
+                // the copy while the record is.
+                if cut <= ROOM {
+                    assert_eq!(Record::parse(record).as_ref(), Some(old), "cut at {cut}");
+                }
+                if cut >= ROOM {
+                    assert_eq!(Record::parse(copy).as_ref(), Some(new), "cut at {cut}");
+                }
+                let read = Record::read(&path).unwrap().unwrap();
+                assert!(
+                    &read == old || &read == new,
+                    "cut at {cut} read a record that is neither"
+                );
+                // (Where the new record is read whole, it is the new; where it is not, the old.)
+                total += 1;
+                assert_eq!(read.fido2.len(), if read == with { 2 } else { 0 });
+                seen[usize::from(&read == new)] = true;
+            }
+            assert!(
+                total > 100 && seen == [true, true],
+                "a cut left the old at times, and the new at others"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// One region torn (a byte flipped in it) while the other is whole: read falls back to
+    /// the whole one, with its two keys; both torn is a damaged record, not an empty one.
+    #[test]
+    fn fido2_line_torn_record_is_read_from_the_copy_and_the_other_way() {
+        let with = two(&every_other_way());
+        let path = std::env::temp_dir().join(format!("kith-fido2-torn-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + 2 * ROOM]).unwrap();
+        let disk = File::options().read(true).write(true).open(&path).unwrap();
+        with.write(&disk, AT).unwrap();
+        let tear = |region: usize| {
+            let at = AT + (region * ROOM) as u64 + 300;
+            let mut byte = [0];
+            disk.read_exact_at(&mut byte, at).unwrap();
+            disk.write_all_at(&[byte[0] ^ 1], at).unwrap();
+        };
+        tear(0);
+        let read = Record::read(&path).unwrap().unwrap();
+        assert_eq!(
+            (read.fido2.len(), &read),
+            (2, &with),
+            "the record is torn, the copy is whole"
+        );
+        tear(0);
+        tear(1);
+        let read = Record::read(&path).unwrap().unwrap();
+        assert_eq!(read, with, "the copy is torn, the record is whole again");
+        tear(0);
+        assert!(Record::read(&path).unwrap_err().contains("damaged"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn fido2_line_come_off_both_and_after_the_recovery_key_was_shown() {
+        let with = two(&every_other_way());
+        let without = with.without_fido2().unwrap();
+        assert!(without.fido2.is_empty() && !without.text().contains("fido2"));
+        assert!(
+            Record { seen: false, ..with }
+                .without_fido2()
+                .unwrap_err()
+                .contains("recovery key")
+        );
+        assert!(without.without_fido2().is_err());
+    }
+}
+
+/// A `fido2:` line that cannot be read is dropped and said, and a third is refused.
+#[cfg(test)]
+mod fido2_bad {
+    use super::fido2_fixture::*;
+    use super::*;
+
+    const HEAD: &str = "kith-lock v1\nsecret: 0707070707070707070707070707070707070707070707070707070707070707\n"; // pragma: allowlist secret
+
+    fn line(n: u8) -> String {
+        let (id, salt, wrapped) = (vec![n + 1; 64], vec![n + 5; 32], vec![n + 9; 92]);
+        format!("fido2: {}\n", Fido2 { id, salt, wrapped }.text())
+    }
+
+    #[test]
+    fn fido2_bad_line_is_dropped_and_said_and_the_rest_stands() {
+        let good = line(0);
+        let id = hex(&[1; 8]);
+        let salt = hex(&[2; 32]);
+        let wrapped = hex(&[3; 92]);
+        for bad in [
+            format!("fido2: zz {salt} {wrapped}\n"),
+            format!("fido2: {id} {salt}\n"),
+            format!("fido2: {id} {} {wrapped}\n", hex(&[2; 31])),
+            format!("fido2: {} {salt} {wrapped}\n", hex(&[1; 129])),
+            format!("fido2: {id} {salt} {}\n", hex(&[3; 20])),
+            format!("fido2: {} {salt} {wrapped}\n", ""),
+            "fido2: 0\n".to_string(),
+            "fido2: \n".to_string(),
+            "fido2:\n".to_string(),
+        ] {
+            let (read, said) = said(format!("{HEAD}{bad}passphrase: 1 1 00 00\nseen: yes\n{good}").as_bytes());
+            let read = read.unwrap_or_else(|| panic!("a bad line made the record damaged: {bad:?}"));
+            assert_eq!(read.fido2.len(), 1, "{bad:?}");
+            assert!(read.seen, "the rest of the record stands");
+            let said: Vec<_> = said.iter().filter(|said| said.contains("fido2:")).collect();
+            assert_eq!(said.len(), 1, "{bad:?}: {said:?}");
+            assert!(said[0].contains("dropped"), "{said:?}");
+        }
+        // Said as the lines before are: a good record says nothing.
+        let (read, said) = said(format!("{HEAD}{good}{}", line(1)).as_bytes());
+        assert_eq!((read.unwrap().fido2.len(), said), (2, Vec::new()));
+    }
+
+    #[test]
+    fn fido2_bad_third_line_is_refused_not_kept_and_not_silent() {
+        let three = format!("{HEAD}{}{}{}", line(0), line(1), line(0));
+        let (read, said) = said(three.as_bytes());
+        let read = read.unwrap();
+        assert_eq!(read.fido2.len(), 2, "a record holds two");
+        assert_eq!(read.fido2[0].text(), line(0).trim_start_matches("fido2: ").trim_end());
+        let said: Vec<_> = said.iter().filter(|said| said.contains("fido2:")).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("more than 2"), "{said:?}");
+        // And not enrolled: a record that holds two refuses two more, and one that holds one.
+        let held = two(&every_other_way());
+        let (a, b) = (key(3), key(4));
+        let new = [(&a.0[..], &a.1[..], &a.2[..]), (&b.0[..], &b.1[..], &b.2[..])];
+        assert!(held.with_fido2(&KEY, &new).unwrap_err().contains("already holds"));
+        let one = Record {
+            fido2: held.fido2[..1].to_vec(),
+            ..held
+        };
+        assert!(one.with_fido2(&KEY, &new).unwrap_err().contains("already holds"));
+        assert!(one.with_fido2(&KEY, &new[..1]).is_err());
+    }
+}
+
+/// A cluster that locks or forgets a node takes its fido2 keys off, as it does a passphrase.
+#[cfg(test)]
+mod fido2_shut {
+    use super::fido2_fixture::*;
+    use super::*;
+
+    #[test]
+    fn fido2_shut_node_loses_its_keys_and_is_restarted_without_them() {
+        let record = Record {
+            // (A TPM seal beside the keys, as the console keeps one.)
+            tpm: Some(vec![5; 40]),
+            pin: None,
+            ..two(&every_other_way())
+        };
+        // Not shut: kept, sealed or not.
+        for seal in [false, true] {
+            assert_eq!(ways_left(&record, seal, false).fido2, record.fido2);
+        }
+        // Locked or forgotten: gone, with the seal or without it.
+        for seal in [false, true] {
+            assert!(ways_left(&record, seal, true).fido2.is_empty(), "seal {seal}");
+        }
+        // A node locked with a key left restarts to wait (it would open by the key's touch); with
+        // none left, it has nothing that opens it.
+        assert!(!opens_nothing_asked(&record));
+        let only_keys = Record {
+            tpm: None,
+            next: None,
+            pass: None,
+            pin: None,
+            ..record.clone()
+        };
+        assert!(
+            !opens_nothing_asked(&only_keys),
+            "a record with only its keys has a way in"
+        );
+        assert!(opens_nothing_asked(&ways_left(&only_keys, false, true)));
+        assert!(opens_nothing_asked(&Record {
+            fido2: Vec::new(),
+            ..only_keys
+        }));
+    }
+}
+
+/// The state's key wrapped under a key's derived secret opens with that secret only.
+#[cfg(test)]
+mod fido2_wrap {
+    use super::fido2_fixture::*;
+    use super::*;
+
+    #[test]
+    fn fido2_wrap_opens_with_its_secret_and_not_with_another() {
+        let (a, b) = (key(1), key(2));
+        let line = Fido2::new(&a.0, &a.1, &a.2, &KEY).unwrap();
+        let kept = |opened: Option<zeroize::Zeroizing<Vec<u8>>>| opened.map(|key| key.to_vec());
+        assert_eq!(kept(line.open(&a.2)), Some(KEY.to_vec()));
+        assert_eq!(kept(line.open(&b.2)), None);
+        assert_eq!(kept(line.open(&[0; 32])), None);
+        assert_eq!(kept(line.open(&[])), None);
+        // A secret that is not the 32 bytes hmac-secret gives is not wrapped under.
+        assert_eq!(Fido2::new(&a.0, &a.1, &a.2[..16], &KEY), None);
+        assert_eq!(Fido2::new(&a.0, &a.1, &[a.2.clone(), vec![0]].concat(), &KEY), None);
+        // The key is not in the line, and the same secret wraps to another line each time.
+        assert!(!line.text().contains(&hex(&KEY)));
+        assert_ne!(line, Fido2::new(&a.0, &a.1, &a.2, &KEY).unwrap());
+        // Through the record: each of the two lines opens with its own key's secret.
+        let record = two(&every_other_way());
+        let (first, second) = (&record.fido2[0], &record.fido2[1]);
+        assert_eq!(
+            (kept(first.open(&a.2)), kept(second.open(&b.2))),
+            (Some(KEY.to_vec()), Some(KEY.to_vec()))
+        );
+        assert_eq!((kept(first.open(&b.2)), kept(second.open(&a.2))), (None, None));
+        // What is read back proves the enrolment with the secrets still in memory, and a
+        // line that stood for another key's does not.
+        let mut read = Record::parse(record.text().as_bytes()).unwrap();
+        assert!(read.fido2_proves(&KEY, &[&a.2, &b.2]));
+        assert!(!read.fido2_proves(&KEY, &[&b.2, &a.2]));
+        assert!(!read.fido2_proves(&[1; 64], &[&a.2, &b.2]));
+        assert!(!read.fido2_proves(&KEY, &[&a.2]));
+        read.fido2.pop();
+        assert!(!read.fido2_proves(&KEY, &[&a.2, &b.2]));
+    }
+}
+
+/// What the console's touch tests share: a node enrolled with two scripted security keys, and
+/// the keys the console finds plugged in.
+#[cfg(test)]
+mod touch_fixture {
+    use super::*;
+    use crate::fido2::frame::Device;
+    use crate::fido2::{flow, frame};
+    use crate::fido2_test::auth::Key;
+
+    pub const STATE: [u8; 64] = [5; 64];
+    pub const PASS: &str = "correct horse battery";
+    pub type Plugged = Box<dyn Device + Send>;
+
+    /// A node that opens by a passphrase, or by either of two keys (made as `kith` makes them).
+    pub fn enrolled() -> (Record, Key, Key) {
+        let (mut a, mut b) = (Key::new(), Key::new());
+        b.seed = 2;
+        let mut lines = Vec::new();
+        for key in [&mut a, &mut b] {
+            let cid = frame::init(key, [1; 8]).unwrap().cid;
+            let id = flow::make_credential(key, cid, flow::RP_ID, &[]).unwrap();
+            let salt: [u8; 32] = random();
+            let secret = flow::get_assertion(key, cid, flow::RP_ID, &id, &salt).unwrap();
+            lines.push((id, salt.to_vec(), secret.to_vec()));
+        }
+        let new = [
+            (&lines[0].0[..], &lines[0].1[..], &lines[0].2[..]),
+            (&lines[1].0[..], &lines[1].1[..], &lines[1].2[..]),
+        ];
+        let record = Record {
+            secret: vec![7; 32],
+            recovery: wrap(&[1; 16], &STATE),
+            pass: Pass::new(PASS, &STATE, (64, 1)),
+            ..Record::default()
+        };
+        (record.with_fido2(&STATE, &new).unwrap(), a, b)
+    }
+
+    /// A key this node was never enrolled with.
+    pub fn stranger() -> Key {
+        let mut key = Key::new();
+        key.seed = 3;
+        key
+    }
+
+    /// Each of `keys` handed out once, as a key is when it is plugged in.
+    pub fn once(keys: Vec<Plugged>) -> impl FnMut() -> Vec<Plugged> + Send {
+        let mut slot = Some(keys);
+        move || slot.take().unwrap_or_default()
+    }
+
+    pub fn touch(
+        record: &Record,
+        mut plugged: impl FnMut() -> Vec<Plugged> + Send + 'static,
+    ) -> Option<Arc<std::sync::Mutex<Touch>>> {
+        Some(Arc::new(std::sync::Mutex::new(Touch {
+            lines: record.fido2.clone(),
+            plugged: Box::new(move |_| {
+                let keys = plugged();
+                keys.into_iter()
+                    .enumerate()
+                    .map(|(n, key)| (format!("key{n}"), key))
+                    .collect()
+            }),
+            present: Box::new(|| ()),
+            retry: Vec::new(),
+        })))
+    }
+
+    /// `touched`, with nothing to stop it.
+    pub fn touch_once(touch: &mut Touch) -> Option<Typed> {
+        touched(touch, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// A key that waits for `release` (a message, or its sender dropped) before it answers, as
+    /// one waiting for a touch does; `started` is sent when it is first read, so a test goes
+    /// on when the key is waiting, not after a time. Gives up after ten seconds.
+    pub struct Gate {
+        pub key: Plugged,
+        pub started: std::sync::mpsc::Sender<()>,
+        pub release: std::sync::mpsc::Receiver<()>,
+        pub open: bool,
+    }
+
+    impl Device for Gate {
+        fn write(&mut self, report: &[u8; frame::REPORT]) -> std::io::Result<()> {
+            self.key.write(report)
+        }
+        fn read(&mut self) -> std::io::Result<Vec<u8>> {
+            if !std::mem::replace(&mut self.open, true) {
+                let _ = self.started.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(10));
+            }
+            self.key.read()
+        }
+    }
+
+    /// A `Gate` round `key`: the key, when it is first read, and what lets it go.
+    pub fn gated(key: Key) -> (Plugged, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let ((started, waiting), (release, go)) = (std::sync::mpsc::channel(), std::sync::mpsc::channel());
+        let gate = Gate {
+            key: Box::new(key),
+            started,
+            release: go,
+            open: false,
+        };
+        (Box::new(gate), waiting, release)
+    }
+
+    pub fn keyboard(lines: &[&str]) -> (std::sync::mpsc::Sender<String>, std::sync::mpsc::Receiver<String>) {
+        let (type_it, typed) = std::sync::mpsc::channel();
+        for line in lines {
+            type_it.send(line.to_string()).unwrap();
+        }
+        (type_it, typed)
+    }
+}
+
+/// A security key touched at the console opens the state, as a typed line does, and one that
+/// is not this node's is refused like a wrong line (docs/adr-fido2.md section 6).
+#[cfg(test)]
+mod touch {
+    use super::touch_fixture::*;
+    use super::*;
+
+    #[test]
+    fn each_enrolled_key_opens_the_state_through_its_line() {
+        let (record, a, b) = enrolled();
+        for key in [a, b] {
+            let touch = touch(&record, once(vec![Box::new(key)])).unwrap();
+            let opened = touch_once(&mut touch.lock().unwrap());
+            assert!(matches!(opened, Some(Typed::Opens(key, By::Key)) if *key == STATE));
+            // (And handed out once: nothing is plugged in the next time.)
+            assert!(touch_once(&mut touch.lock().unwrap()).is_none());
+        }
+    }
+
+    /// A key that says nothing.
+    struct Dead;
+    impl crate::fido2::frame::Device for Dead {
+        fn write(&mut self, _: &[u8; crate::fido2::frame::REPORT]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn read(&mut self) -> std::io::Result<Vec<u8>> {
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+    }
+
+    #[test]
+    fn a_key_that_timed_out_is_handed_out_again_after_the_gap() {
+        let (record, ..) = enrolled();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let log = Arc::clone(&asked);
+        let mut dead = Some(Box::new(Dead) as Plugged);
+        let mut touch = Touch {
+            lines: record.fido2.clone(),
+            plugged: Box::new(move |again| {
+                log.lock().unwrap().push(again.to_vec());
+                dead.take()
+                    .map(|key| vec![("hidraw9".to_string(), key)])
+                    .unwrap_or_default()
+            }),
+            present: Box::new(|| ()),
+            retry: Vec::new(),
+        };
+        // A key that says nothing is a key that was tried, and is said of.
+        assert!(matches!(touch_once(&mut touch), Some(Typed::Wrong)));
+        assert_eq!(touch.retry.len(), 1);
+        // Not asked for again at once, and then, after the gap, it is.
+        assert!(touch_once(&mut touch).is_none());
+        touch.retry[0].1 = std::time::Instant::now().checked_sub(RETRY_GAP).unwrap();
+        assert!(touch_once(&mut touch).is_none());
+        assert!(touch.retry.is_empty());
+        let none = Vec::<String>::new();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [none.clone(), none, vec!["hidraw9".to_string()]]
+        );
+    }
+
+    #[test]
+    fn each_find_of_keys_says_somebody_is_there_and_no_find_does_not() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (record, a, _) = enrolled();
+        let said = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&said);
+        let touch = touch(&record, once(vec![Box::new(a)])).unwrap();
+        touch.lock().unwrap().present = Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(touch_once(&mut touch.lock().unwrap()).is_some());
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+        assert!(touch_once(&mut touch.lock().unwrap()).is_none());
+        assert_eq!(said.load(Ordering::SeqCst), 1, "no key, nobody there");
+    }
+
+    #[test]
+    fn a_key_is_let_go_of_when_the_console_is_done_with_it() {
+        let (record, a, _) = enrolled();
+        let touch = touch(&record, once(vec![Box::new(a)])).unwrap();
+        let stopped = std::sync::atomic::AtomicBool::new(true);
+        assert!(touched(&mut touch.lock().unwrap(), &stopped).is_none());
+        assert!(
+            touch.lock().unwrap().retry.is_empty(),
+            "a key let go of is not tried again"
+        );
+    }
+
+    #[test]
+    fn a_key_that_wants_its_pin_is_not_tried_again() {
+        let running = std::sync::atomic::AtomicBool::new(false);
+        let said = "the key answered status 0x36 (PIN_REQUIRED)";
+        assert!(!unusable("hidraw0", said, &running));
+        assert!(unusable("hidraw0", "reading from the key: timed out", &running));
+        assert!(unusable(
+            "hidraw0",
+            "the key answered status 0x2f (USER_ACTION_TIMEOUT)",
+            &running
+        ));
+        assert!(!unusable("hidraw0", "a report of 3 bytes: 64 expected", &running));
+        let stopped = std::sync::atomic::AtomicBool::new(true);
+        assert!(!unusable("hidraw0", "reading from the key: timed out", &stopped));
+    }
+
+    #[test]
+    fn a_key_that_is_not_enrolled_opens_nothing() {
+        let (record, ..) = enrolled();
+        let touch = touch(&record, once(vec![Box::new(stranger())])).unwrap();
+        assert!(matches!(touch_once(&mut touch.lock().unwrap()), Some(Typed::Wrong)));
+        // None plugged in: nothing to say.
+        let none = super::touch_fixture::touch(&record, Vec::new).unwrap();
+        assert!(touch_once(&mut none.lock().unwrap()).is_none());
+        // A node with no fido2 lines looks for no key.
+        assert!(touch_of(&Record::default()).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_console_is_opened_by_the_key() {
+        let (record, _, b) = enrolled();
+        let said = std::cell::RefCell::new(Vec::new());
+        let say = |line: &str| said.borrow_mut().push(line.to_string());
+        let (told, _) = tokio::sync::watch::channel(None);
+        let (_open, lines) = keyboard(&[]);
+        let touch = touch(&record, once(vec![Box::new(b)]));
+        let opened = console(record, lines, &say, &|| true, &told, None, touch).await;
+        assert_eq!(opened, (STATE.to_vec(), By::Key));
+        assert!(said.borrow().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_not_enrolled_is_refused_after_the_delay_of_a_wrong_passphrase() {
+        let (record, ..) = enrolled();
+        let began = tokio::time::Instant::now();
+        let said = std::cell::RefCell::new(Vec::new());
+        let say = |line: &str| said.borrow_mut().push((began.elapsed(), line.to_string()));
+        let (told, _) = tokio::sync::watch::channel(None);
+        // A wrong passphrase, typed as the stranger's key is found.
+        let (_open, lines) = keyboard(&["correct horse batterz"]);
+        let touch = touch(&record, once(vec![Box::new(stranger())]));
+        let waiting = console(record, lines, &say, &|| true, &told, None, touch);
+        assert!(tokio::time::timeout(Duration::from_secs(60), waiting).await.is_err());
+        // Both answered ANSWER after they were found, in the same words; the key once.
+        let both: Vec<(Duration, String)> = (1..=2).map(|_| (ANSWER, WRONG.to_string())).collect();
+        assert_eq!(*said.borrow(), both);
+    }
+}
+
+/// The console tries what is typed before a key, and a key that is not there, or that waits,
+/// holds nothing up.
+#[cfg(test)]
+mod console_order {
+    use super::touch_fixture::*;
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn the_passphrase_is_tried_before_the_key() {
+        let (record, a, _) = enrolled();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        let mut keys = once(vec![Box::new(a) as Plugged]);
+        let touch = touch(&record, move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            keys()
+        });
+        let (told, _) = tokio::sync::watch::channel(None);
+        let (_open, lines) = keyboard(&["correct horse battery"]);
+        let opened = console(record, lines, &|_: &str| (), &|| true, &told, None, touch).await;
+        assert_eq!(opened, (STATE.to_vec(), By::Owner));
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no key was looked for"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wrong_line_then_the_key() {
+        let (record, a, _) = enrolled();
+        let said = std::cell::RefCell::new(Vec::new());
+        let say = |line: &str| said.borrow_mut().push(line.to_string());
+        let (told, _) = tokio::sync::watch::channel(None);
+        let (_open, lines) = keyboard(&["correct horse batterz"]);
+        let touch = touch(&record, once(vec![Box::new(a)]));
+        let opened = console(record, lines, &say, &|| true, &told, None, touch).await;
+        assert_eq!(opened, (STATE.to_vec(), By::Key));
+        assert!(said.borrow().is_empty(), "the key opened before the line was answered");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_key_does_not_stall_a_passphrase() {
+        let (record, ..) = enrolled();
+        let looked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = looked.clone();
+        let touch = touch(&record, move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Vec::new()
+        });
+        let (told, _) = tokio::sync::watch::channel(None);
+        let (type_it, lines) = keyboard(&[]);
+        let later = async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            type_it.send(PASS.to_string()).unwrap();
+            std::future::pending::<()>().await
+        };
+        let said = std::cell::RefCell::new(Vec::new());
+        let say = |line: &str| said.borrow_mut().push(line.to_string());
+        let opened = tokio::select! {
+            opened = console(record, lines, &say, &|| true, &told, None, touch) => opened,
+            () = later => unreachable!(),
+        };
+        assert_eq!(opened, (STATE.to_vec(), By::Owner));
+        assert!(said.borrow().is_empty(), "a missing key is not answered");
+        assert!(
+            looked.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "looked for each second"
+        );
+    }
+
+    /// (Real time, no margins: the passphrase is typed once the key is waiting for its touch, which
+    /// is not given until the console has opened.)
+    #[tokio::test]
+    async fn a_key_waiting_for_its_touch_does_not_hold_a_passphrase() {
+        let (record, a, _) = enrolled();
+        let (gated, waiting, _release) = gated(a);
+        let touch = touch(&record, once(vec![gated]));
+        let (told, _) = tokio::sync::watch::channel(None);
+        let (type_it, lines) = keyboard(&[]);
+        let typing = std::thread::spawn(move || {
+            waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+            type_it.send(PASS.to_string()).unwrap();
+        });
+        let opened = console(record, lines, &|_: &str| (), &|| true, &told, None, touch).await;
+        typing.join().unwrap();
+        assert_eq!(opened, (STATE.to_vec(), By::Owner));
+    }
+}
+
+/// After a duress code no security key opens the state: not one found later, not one being
+/// tried, and not one the record keeps.
+#[cfg(test)]
+mod touch_duress {
+    use super::touch_fixture::*;
+    use super::*;
+    use crate::fido2_test::auth::Key;
+
+    /// `enrolled()`, with a duress code that was made for it: the code typed, as it is shown.
+    fn with_duress() -> (Record, String, Key, Key) {
+        use ring::signature::KeyPair;
+        let (record, a, b) = enrolled();
+        let code: [u8; 16] = random();
+        let public = duress_key(&code).public_key().as_ref().to_vec();
+        (
+            Record {
+                duress: Some(public),
+                ..record
+            },
+            shown(&code),
+            a,
+            b,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_duress_code_leaves_no_key_to_look_for() {
+        let (record, duress, a, _) = with_duress();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        let mut keys = once(vec![Box::new(a) as Plugged]);
+        let touch = touch(&record, move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            keys()
+        });
+        let said = std::cell::RefCell::new(Vec::new());
+        let say = |line: &str| said.borrow_mut().push(line.to_string());
+        let (told, _) = tokio::sync::watch::channel(None);
+        let (_open, lines) = keyboard(&[&duress]);
+        let waiting = console(record, lines, &say, &|| true, &told, None, touch);
+        assert!(tokio::time::timeout(Duration::from_secs(60), waiting).await.is_err());
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no key was looked for"
+        );
+        assert_eq!(*said.borrow(), [WRONG], "the code is answered as a wrong line");
+        assert!(told.borrow().is_some());
+    }
+
+    /// (Real time, no margins: the code is typed once the key is waiting for its touch, and the key is
+    /// touched once the console has acted on the code, which it says by erasing the record. A
+    /// key in flight holds the paused clock still, so this one runs on the real one: two seconds.)
+    #[tokio::test]
+    async fn a_key_touched_after_a_duress_code_opens_nothing() {
+        let (record, duress, a, _) = with_duress();
+        let (gated, waiting_key, release) = gated(a);
+        let touch = touch(&record, once(vec![gated]));
+        let (say_it, said) = std::sync::mpsc::channel();
+        let say = move |line: &str| {
+            let _ = say_it.send(line.to_string());
+        };
+        let (told, _) = tokio::sync::watch::channel(None);
+        let (type_it, lines) = keyboard(&[]);
+        let (erased, erasing) = std::sync::mpsc::channel();
+        let typing = std::thread::spawn(move || {
+            waiting_key.recv_timeout(Duration::from_secs(10)).unwrap();
+            type_it.send(duress).unwrap();
+            erasing.recv_timeout(Duration::from_secs(10)).unwrap();
+            release.send(()).unwrap();
+            type_it
+        });
+        let erase = || {
+            let _ = erased.send(());
+            true
+        };
+        let waiting = console(record, lines, &say, &erase, &told, None, touch);
+        // The code is answered, and so is the key (as a wrong line is): nothing opened.
+        let heard = async {
+            let mut heard = Vec::new();
+            while heard.len() < 2 {
+                heard.extend(said.try_iter());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            heard
+        };
+        let heard = tokio::select! {
+            opened = waiting => panic!("opened: {opened:?}"),
+            heard = tokio::time::timeout(Duration::from_secs(20), heard) => heard.expect("two answers"),
+        };
+        let _kept = typing.join().unwrap();
+        assert!(told.borrow().is_some());
+        assert_eq!(heard, [WRONG, WRONG]);
+    }
+
+    #[test]
+    fn a_shut_node_keeps_no_key() {
+        let (record, ..) = with_duress();
+        assert!(!record.fido2.is_empty());
+        for seal in [false, true] {
+            assert!(ways_left(&record, seal, true).fido2.is_empty());
+        }
+    }
+}
+
+/// A `fido2:` line is read as written and no other: a fourth word drops it, and a second line
+/// of one credential is dropped, both said.
+#[cfg(test)]
+mod fido2_parse_strict {
+    use super::fido2_fixture::*;
+    use super::*;
+
+    const HEAD: &str = "kith-lock v1\nsecret: 0707070707070707070707070707070707070707070707070707070707070707\n"; // pragma: allowlist secret
+
+    fn line(n: u8) -> Fido2 {
+        Fido2 {
+            id: vec![n + 1; 64],
+            salt: vec![n + 5; 32],
+            wrapped: vec![n + 9; 92],
+        }
+    }
+
+    #[test]
+    fn a_trailing_word_drops_the_line() {
+        let good = line(0).text();
+        assert!(Fido2::parse(&good).is_some());
+        for bad in [format!("{good} 00"), format!("{good} zz"), format!("{good} {good}")] {
+            assert!(Fido2::parse(&bad).is_none(), "{bad}");
+            let record = format!("{HEAD}fido2: {bad}\nfido2: {}\n", line(1).text());
+            let (read, said) = said(record.as_bytes());
+            let read = read.unwrap();
+            assert_eq!(read.fido2.len(), 1, "only the line of three words stands");
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].contains("cannot be read") && said[0].contains("dropped"),
+                "{said:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_line_of_one_credential_is_dropped_and_said() {
+        let (first, second) = (
+            line(0),
+            Fido2 {
+                salt: vec![99; 32],
+                ..line(0)
+            },
+        );
+        let record = format!(
+            "{HEAD}fido2: {}\nfido2: {}\nfido2: {}\n",
+            first.text(),
+            second.text(),
+            line(1).text()
+        );
+        let (read, told) = said(record.as_bytes());
+        let read = read.unwrap();
+        assert_eq!(
+            read.fido2,
+            [first, line(1)],
+            "the spare is the other key's line, not a copy"
+        );
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("two fido2: lines of one key"), "{told:?}");
+        // As two keys are written, never two of one.
+        assert_eq!(
+            said(format!("{HEAD}fido2: {}\nfido2: {}\n", line(0).text(), line(1).text()).as_bytes()).1,
+            Vec::<String>::new()
+        );
     }
 }

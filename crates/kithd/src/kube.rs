@@ -756,6 +756,105 @@ fn replica_set(deployment: &Value, resource: &Resource) -> Value {
     })
 }
 
+/// What a pod template says, as two revisions are told apart by it: the whole blake3 of the
+/// template without its hash label, its nulls and its empty maps and lists (what kubectl's
+/// own encoding adds when it sends one back), and with its keys in order.
+/// ponytail: a quantity as `1` and as `"1"` still differ; normalise them if undo shows one.
+fn identity(template: &Value) -> String {
+    fn bare(value: &Value) -> Option<Value> {
+        match value {
+            Value::Null => None,
+            Value::Object(map) => {
+                let map: BTreeMap<_, _> = map.iter().filter_map(|(k, v)| Some((k.clone(), bare(v)?))).collect();
+                (!map.is_empty()).then(|| Value::Object(map.into_iter().collect()))
+            }
+            Value::Array(items) => {
+                let items: Vec<Value> = items.iter().map(|v| bare(v).unwrap_or(Value::Null)).collect();
+                (!items.is_empty()).then_some(Value::Array(items))
+            }
+            other => Some(other.clone()),
+        }
+    }
+    let mut template = template.clone();
+    if let Some(labels) = template.pointer_mut("/metadata/labels").and_then(Value::as_object_mut) {
+        labels.remove("pod-template-hash");
+    }
+    blake3::hash(bare(&template).unwrap_or_default().to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// A pod template a Deployment's kept revisions held.
+struct Kept {
+    id: String,
+    /// The newest revision that held it (a revision a scale made holds it too).
+    revision: u64,
+    /// When the oldest revision that held it was made.
+    at: u64,
+    /// The template as that newest revision was sent.
+    template: Value,
+}
+
+/// The templates the revisions the store kept of the Deployment `key` held, one for each
+/// ([`identity`]), by the revision that last held it. Only a revision made through this
+/// API says what it held (a `kith apply` of the same Workload does not): that one is passed over.
+/// ponytail: reads every kept revision's sent text (at most `HISTORY_LIMIT`) for each read of
+/// a Deployment's ReplicaSets; keep the result with the resource if that shows in a profile.
+fn kept(store: &Store, key: &str) -> Vec<Kept> {
+    let mut found: Vec<Kept> = Vec::new();
+    for old in store.history(key).into_iter().flatten() {
+        let Some((_, object)) = raw(&old.resource).filter(|(kind, _)| kind.kind == "Deployment") else {
+            continue;
+        };
+        let Some(revision) = old.resource.metadata.revision else {
+            continue;
+        };
+        let template = object["spec"]["template"].clone();
+        let id = identity(&template);
+        match found.iter_mut().find(|held| held.id == id) {
+            Some(held) => (held.revision, held.template) = (revision, template),
+            None => found.push(Kept {
+                id,
+                revision,
+                at: old.at,
+                template,
+            }),
+        }
+    }
+    found.sort_by_key(|held| held.revision);
+    found
+}
+
+/// Whether a read of the ReplicaSet `name` (any, for `None`) can find one of the Deployment
+/// `owner`'s earlier revisions: the names made of them are the Deployment's, a dash and
+/// [`short_hash`]'s ten hex digits. For any other name the history is not read.
+fn may_be_history(owner: &str, name: Option<&str>) -> bool {
+    let Some(name) = name else { return true };
+    let hash = name.strip_prefix(owner).and_then(|rest| rest.strip_prefix('-'));
+    hash.is_some_and(|hash| hash.len() == 10 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The ReplicaSets `kubectl rollout history` finds besides the live one: one for each
+/// template of an earlier revision of `owner` (the Deployment as it is, of `resource`), made
+/// up as the live one is, with no replicas and the number of the revision that last held it.
+fn history_sets(store: &Store, owner: &Value, resource: &Resource) -> Vec<Value> {
+    let live = identity(&owner["spec"]["template"]);
+    let old = kept(store, &resource.key()).into_iter().filter(|held| held.id != live);
+    old.map(|held| {
+        let mut was = owner.clone();
+        set(&mut was, "/spec/template", held.template);
+        set(&mut was, "/spec/replicas", 0.into());
+        set(&mut was, "/metadata/generation", held.revision.into());
+        set(&mut was, "/metadata/creationTimestamp", rfc3339(held.at).into());
+        set(&mut was, "/metadata/resourceVersion", (held.revision << 32).to_string().into());
+        let mut made = replica_set(&was, resource);
+        let none = json!({ "observedGeneration": 1, "replicas": 0, "fullyLabeledReplicas": 0, "readyReplicas": 0, "availableReplicas": 0 });
+        set(&mut made, "/status", none);
+        made
+    })
+    .collect()
+}
+
 /// The kinds that run pods, and the mark each puts before a replica's number in a pod's
 /// name: a Workload's pods are `NAME-N` (a StatefulSet's names are a contract), a Job's
 /// `NAME-jN` and a NodeWorkload's `NAME-nN`. A Job and a Workload may share a name, so the
@@ -1001,7 +1100,15 @@ fn made(
         let Some((_, owner)) = served(resource) else { continue };
         match kind.kind {
             "Pod" => found.extend(pods(&owner, resource).into_iter().map(|pod| (of.clone(), pod))),
-            _ if owner["kind"] == "Deployment" => found.push((of, replica_set(&owner, resource))),
+            _ if owner["kind"] == "Deployment" => {
+                let before = if may_be_history(&resource.metadata.name, name) {
+                    history_sets(store, &owner, resource)
+                } else {
+                    Vec::new()
+                };
+                found.extend(before.into_iter().map(|old| (of.clone(), old)));
+                found.push((of, replica_set(&owner, resource)));
+            }
             _ => {}
         }
     }
@@ -1998,6 +2105,12 @@ async fn serve(
         ("GET", Some(name), Some("log")) if kind.kind == "Pod" => {
             log(&call, namespace.unwrap_or_default(), name).await?
         }
+        // (A ReplicaSet is the Deployment's, made up for `kubectl rollout`: nothing of it is
+        // written, so what the answer says is the same of any name, and tells nothing of which are there.)
+        ("POST" | "PUT" | "PATCH" | "DELETE", ..) if kind.kind == "ReplicaSet" => {
+            let why = "a ReplicaSet is made up from its Deployment's revisions and is read only: change the Deployment (`kubectl rollout undo` goes back to an earlier revision)";
+            return Err(status(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", why.into()));
+        }
         ("POST", None, None) => write(&call, kind, namespace, None, How::Create, sent()?)
             .await?
             .into_response(),
@@ -2339,6 +2452,32 @@ pub fn from_files(objects: Vec<Value>, home: &str) -> Result<(Vec<Resource>, Vec
     Ok((store.list(None).map(plain).collect(), said))
 }
 
+/// The revision of the Deployment `key` that `sent` (a JSON patch laid over `was`, as served)
+/// goes back to, if it does only that: its template is not the live one but one a kept
+/// revision held, and nothing else of it is changed. That is what `kubectl rollout undo`
+/// sends, and the store goes back to that revision as `kith rollback` does (its checks
+/// too); a patch that is anything else, or the live template again, is written as a patch.
+fn going_back(store: &Store, key: &str, was: &Value, sent: &Value) -> Option<u64> {
+    let template = |object: &Value| identity(&object["spec"]["template"]);
+    let rest = |object: &Value| {
+        let mut object = object.clone();
+        set(&mut object, "/spec/template", Value::Null);
+        // (Its annotations are not the ReplicaSet's, which holds only the revision's number: what
+        // kubectl sends for them is empty for a Deployment `apply` or Helm made. The rollback
+        // brings back the revision's own.)
+        set(&mut object, "/metadata/annotations", Value::Null);
+        object
+    };
+    let now = template(sent);
+    if now == template(was) || rest(was) != rest(sent) {
+        return None;
+    }
+    kept(store, key)
+        .into_iter()
+        .find(|held| held.id == now)
+        .map(|held| held.revision)
+}
+
 /// What a write came to: its HTTP status, the object as it now is, and what is said of it.
 struct Written(StatusCode, Option<Value>, Vec<String>);
 
@@ -2422,6 +2561,8 @@ async fn write(
             format!("{} \"{name}\" already exists", kind.plural),
         )
     };
+    // The revision a Deployment is sent back to, where what is sent is `kubectl rollout undo`.
+    let mut undo = None;
     let read = {
         let state = call.shared.store.lock().expect("a handler panicked holding the store");
         let live = state.store.get(&primary);
@@ -2453,8 +2594,29 @@ async fn write(
                 before
             }
             // A refused operation refuses the whole patch: what is there is not written.
-            (How::JsonPatch, Some((_, before))) => json_patch(&before, &body).map_err(invalid)?,
+            (How::JsonPatch, Some((_, mut before))) => {
+                // `kubectl rollout undo` replaces a Deployment's annotations, which Kubernetes's
+                // always has: one with none has an empty map for the patch, and none again after.
+                let bare = kind.kind == "Deployment" && before.pointer("/metadata/annotations").is_none();
+                if bare {
+                    set(&mut before, "/metadata/annotations", json!({}));
+                }
+                let mut patched = json_patch(&before, &body).map_err(invalid)?;
+                let empty = patched.pointer("/metadata/annotations").and_then(Value::as_object);
+                if bare && empty.is_some_and(|annotations| annotations.is_empty()) {
+                    patched["metadata"]
+                        .as_object_mut()
+                        .map(|meta| meta.remove("annotations"));
+                }
+                patched
+            }
         };
+        // A dry run only says what the write would do: it is not sent back.
+        if how == How::JsonPatch && kind.kind == "Deployment" && !call.asked.contains_key("dryRun") {
+            undo = was
+                .as_ref()
+                .and_then(|was| going_back(&state.store, &primary, was, &sent));
+        }
         // A change of what was read is held to it: the revision, whatever its status did since.
         let based = sent.pointer("/metadata/resourceVersion").and_then(Value::as_str);
         let based = based
@@ -2509,9 +2671,26 @@ async fn write(
             (How::Replace | How::Patch { .. } | How::JsonPatch, Some(was)) => updated(&was, &mut sent),
             _ => {}
         }
-        held_as(&state.store, kind, place, &name, &sent).map(|held| (held, revision))
+        match undo {
+            Some(_) => Ok(((Vec::new(), Vec::new()), revision)),
+            None => held_as(&state.store, kind, place, &name, &sent).map(|held| (held, revision)),
+        }
     };
     let ((mut resources, hints), revision) = read.map_err(|refused| invalid(refused.join("; ")))?;
+    if let Some(to) = undo {
+        // Sent back to what was read: a write that lands after the lock was let go is not
+        // written over, the store answers a conflict (kubectl shows a 409).
+        #[cfg(test)]
+        tests::pause_before_undo(&call.shared).await;
+        let base = Some(revision.unwrap_or(0));
+        let back = api::rolled_back(&call.shared, &call.caller, primary, to, base).await;
+        let object = back.map_err(refusal)?.after;
+        return Ok(Written(
+            StatusCode::OK,
+            served(&object).map(|(_, object)| object),
+            hints,
+        ));
+    }
     // Made only if it is not there, changed only as it was read: the store holds to that
     // (an apply is laid over what is there, so it is read from that revision too).
     for resource in resources.iter_mut().filter(|resource| resource.key() == primary) {
@@ -3157,6 +3336,23 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+    /// Where a test holds an undo (by its `Shared`) between its read of the head and its apply:
+    /// it says it is there, then waits to be let go.
+    type Hold = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
+    static HELD: std::sync::Mutex<Vec<(usize, Hold)>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) async fn pause_before_undo(shared: &Arc<crate::Shared>) {
+        let me = Arc::as_ptr(shared) as usize;
+        let hold = {
+            let mut held = HELD.lock().unwrap();
+            held.iter().position(|(of, _)| *of == me).map(|at| held.remove(at).1)
+        };
+        if let Some((there, go)) = hold {
+            let _ = there.send(());
+            let _ = go.await;
+        }
+    }
 
     /// The next frame the server sends, read from `client` with what `buf` already holds.
     async fn frame(client: &mut DuplexStream, buf: &mut Vec<u8>) -> websocket::Frame {
@@ -4461,5 +4657,511 @@ spec: {role: writer, subjects: [carol]}
             serde_json::to_vec(&deployment(&["a", "b"])).unwrap().len(),
         );
         eprintln!("managedFields: {} bytes on {} of the object", with - without, without);
+    }
+
+    /// `serve` answers `caller` a request of `content_type` with `asked` in its query.
+    async fn sent_as(
+        shared: &Arc<crate::Shared>,
+        method: &str,
+        content_type: &str,
+        rest: &str,
+        asked: &[(&str, &str)],
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(())
+            .unwrap();
+        request.extensions_mut().insert(Caller::Admin);
+        let (parts, ()) = request.into_parts();
+        let asked: Asked = asked.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let group = if rest.contains("deployments") || rest.contains("replicasets") {
+            "apps"
+        } else {
+            ""
+        };
+        match serve(shared.clone(), parts, group, rest, asked, body.to_string().as_bytes()).await {
+            Ok(answer) => {
+                let (code, body) = (answer.status(), answer.into_body());
+                let text = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                (code, serde_json::from_slice(&text).unwrap_or(Value::Null))
+            }
+            Err(no) => (no.code, json!(no.why)),
+        }
+    }
+
+    const DEPLOYMENTS: &str = "namespaces/default/deployments";
+    const REPLICA_SETS: &str = "namespaces/default/replicasets";
+
+    /// A Deployment `x` of one replica of `image`, as kubectl would send it.
+    fn deployment_of(image: &str) -> Value {
+        json!({
+            "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "x" },
+            "spec": { "replicas": 1, "selector": { "matchLabels": { "app": "x" } }, "template": {
+                "metadata": { "labels": { "app": "x" } },
+                "spec": { "containers": [{ "name": "main", "image": image }] },
+            } },
+        })
+    }
+
+    /// Makes the Deployment `x` of `image` and changes its image to each of `then`: a revision each.
+    async fn revised(shared: &Arc<crate::Shared>, image: &str, then: &[&str]) {
+        let made = sent_as(
+            shared,
+            "POST",
+            "application/json",
+            DEPLOYMENTS,
+            &[],
+            deployment_of(image),
+        )
+        .await;
+        assert_eq!(made.0, StatusCode::CREATED, "{}", made.1);
+        for image in then {
+            let patch =
+                json!({ "spec": { "template": { "spec": { "containers": [{ "name": "main", "image": image }] } } } });
+            let rest = format!("{DEPLOYMENTS}/x");
+            let done = sent_as(shared, "PATCH", "application/merge-patch+json", &rest, &[], patch).await;
+            assert_eq!(done.0, StatusCode::OK, "{}", done.1);
+        }
+    }
+
+    /// The ReplicaSets of `x` as listed: (image, revision annotation, replicas), by revision.
+    async fn replica_sets(shared: &Arc<crate::Shared>) -> Vec<(String, String, u64, Value)> {
+        let (code, listed) = sent_as(shared, "GET", "application/json", REPLICA_SETS, &[], Value::Null).await;
+        assert_eq!(code, StatusCode::OK, "{listed}");
+        let mut sets: Vec<_> = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|set| {
+                let revision = set["metadata"]["annotations"]["deployment.kubernetes.io/revision"].as_str();
+                let image = set["spec"]["template"]["spec"]["containers"][0]["image"].as_str();
+                let replicas = set["spec"]["replicas"].as_u64();
+                (
+                    image.unwrap().to_string(),
+                    revision.unwrap().to_string(),
+                    replicas.unwrap(),
+                    set.clone(),
+                )
+            })
+            .collect();
+        sets.sort_by_key(|(_, revision, ..)| revision.parse::<u64>().unwrap());
+        sets
+    }
+
+    /// Two templates are one revision when they say the same, whatever hash label, null or
+    /// empty map kubectl's own encoding left in one; and not when any value differs.
+    #[test]
+    fn rollout_history_identity_ignores_the_hash_label_nulls_and_empty_maps_only() {
+        let plain = json!({ "metadata": { "labels": { "app": "x" } }, "spec": { "containers": [{ "name": "m", "image": "i" }] } });
+        let encoded = json!({
+            "metadata": { "creationTimestamp": null, "labels": { "pod-template-hash": "abc", "app": "x" } },
+            "spec": { "containers": [{ "image": "i", "name": "m", "resources": {} }] },
+        });
+        assert_eq!(identity(&plain), identity(&encoded));
+        assert_eq!(identity(&plain).len(), 64, "the whole hash, not a prefix");
+        let other = json!({ "metadata": { "labels": { "app": "y" } }, "spec": { "containers": [{ "name": "m", "image": "i" }] } });
+        assert_ne!(identity(&plain), identity(&other));
+        let (a, b) = (
+            json!({ "spec": { "x": ["1", "2"] } }),
+            json!({ "spec": { "x": ["2", "1"] } }),
+        );
+        assert_ne!(identity(&a), identity(&b), "the order of a list is its meaning");
+    }
+
+    /// `kubectl rollout history` lists a ReplicaSet for each template the Deployment's kept
+    /// revisions held, numbered as the revision that last held it; the live one is not twice.
+    #[tokio::test]
+    async fn rollout_history_lists_one_read_only_replica_set_per_kept_template() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-history-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        revised(&shared, "v1", &["v2", "v3"]).await;
+        let sets = replica_sets(&shared).await;
+        let seen: Vec<_> = sets
+            .iter()
+            .map(|(image, revision, replicas, _)| (image.as_str(), revision.as_str(), *replicas))
+            .collect();
+        assert_eq!(seen, [("v1", "1", 0), ("v2", "2", 0), ("v3", "3", 1)]);
+        let names: BTreeSet<_> = sets
+            .iter()
+            .map(|set| set.3["metadata"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 3, "a name each");
+        // Each is owned by the Deployment, which is what `kubectl rollout` finds them by.
+        let (_, owner) = sent_as(
+            &shared,
+            "GET",
+            "application/json",
+            &format!("{DEPLOYMENTS}/x"),
+            &[],
+            Value::Null,
+        )
+        .await;
+        for (.., set) in &sets {
+            assert_eq!(
+                set["metadata"]["ownerReferences"][0]["uid"], owner["metadata"]["uid"],
+                "{set}"
+            );
+            assert_eq!(set["metadata"]["ownerReferences"][0]["controller"], true);
+        }
+        // A kept one runs nothing: no replicas wanted, none counted.
+        for (_, _, _, set) in sets.iter().filter(|set| set.2 == 0) {
+            assert_eq!(
+                (&set["status"]["replicas"], &set["status"]["readyReplicas"]),
+                (&json!(0), &json!(0)),
+                "{set}"
+            );
+        }
+        // One is got by its name, as `kubectl rollout history --revision` does.
+        let name = sets[0].3["metadata"]["name"].as_str().unwrap();
+        let (code, one) = sent_as(
+            &shared,
+            "GET",
+            "application/json",
+            &format!("{REPLICA_SETS}/{name}"),
+            &[],
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{one}");
+        assert_eq!(one["spec"]["template"]["spec"]["containers"][0]["image"], "v1");
+        // Back to v2 (a revision 4) and a scale (5): v2 is the live one, with its newest
+        // number; v1 and v3 stay; and what a scale left is not a template of its own.
+        let rest = format!("{DEPLOYMENTS}/x");
+        let back = json!({ "spec": { "template": { "spec": { "containers": [{ "name": "main", "image": "v2" }] } } } });
+        sent_as(&shared, "PATCH", "application/merge-patch+json", &rest, &[], back).await;
+        let scale = json!({ "spec": { "replicas": 3 } });
+        sent_as(&shared, "PATCH", "application/merge-patch+json", &rest, &[], scale).await;
+        let sets = replica_sets(&shared).await;
+        let seen: Vec<_> = sets
+            .iter()
+            .map(|(image, revision, replicas, _)| (image.as_str(), revision.as_str(), *replicas))
+            .collect();
+        assert_eq!(seen, [("v1", "1", 0), ("v3", "3", 0), ("v2", "5", 3)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A history ReplicaSet is read: a write or a delete of one, or of any, is a
+    /// `MethodNotAllowed` Status that says to change the Deployment, and changes nothing.
+    #[tokio::test]
+    async fn rollout_history_replica_sets_are_refused_every_write() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-history-write-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        revised(&shared, "v1", &["v2"]).await;
+        let sets = replica_sets(&shared).await;
+        let name = sets[0].3["metadata"]["name"].as_str().unwrap().to_string();
+        let one = format!("{REPLICA_SETS}/{name}");
+        let body = sets[0].3.clone();
+        for (method, rest, kind) in [
+            ("PUT", one.as_str(), "application/json"),
+            ("PATCH", one.as_str(), "application/merge-patch+json"),
+            ("PATCH", one.as_str(), "application/json-patch+json"),
+            ("DELETE", one.as_str(), "application/json"),
+            ("POST", REPLICA_SETS, "application/json"),
+            ("PATCH", &format!("{one}/scale"), "application/merge-patch+json"),
+            (
+                "PUT",
+                &format!("{REPLICA_SETS}/nothing-by-this-name"),
+                "application/json",
+            ),
+        ] {
+            let (code, said) = sent_as(&shared, method, kind, rest, &[], body.clone()).await;
+            assert_eq!(code, StatusCode::METHOD_NOT_ALLOWED, "{method} {rest}: {said}");
+            assert!(
+                said.as_str().is_some_and(|why| why.contains("Deployment")),
+                "{method} {rest}: {said}"
+            );
+        }
+        // Nothing moved: the same ReplicaSets, and the Deployment at its revision.
+        let again = replica_sets(&shared).await;
+        assert_eq!(again.len(), 2);
+        let (_, owner) = sent_as(
+            &shared,
+            "GET",
+            "application/json",
+            &format!("{DEPLOYMENTS}/x"),
+            &[],
+            Value::Null,
+        )
+        .await;
+        assert_eq!(owner["metadata"]["generation"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Deployment whose replica names `NAME-N` pass 63 characters is refused by name through
+    /// the Kubernetes API (it applies through `submitted`), and one that fits is made.
+    #[tokio::test]
+    async fn a_deployment_with_a_replica_name_over_63_characters_is_refused_by_name() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-long-name-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let named = |name: &str| {
+            let mut body = deployment_of("example.org/web");
+            body["metadata"]["name"] = json!(name);
+            body
+        };
+        let long = "a".repeat(63);
+        let (code, said) = sent_as(&shared, "POST", "application/json", DEPLOYMENTS, &[], named(&long)).await;
+        assert_ne!(code, StatusCode::CREATED, "{said}");
+        assert!(
+            said.to_string().contains(&long) && said.to_string().contains("replica name"),
+            "{said}"
+        );
+        let (code, said) = sent_as(
+            &shared,
+            "POST",
+            "application/json",
+            DEPLOYMENTS,
+            &[],
+            named(&"a".repeat(60)),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The JSON patch `kubectl rollout undo` sends for the ReplicaSet `set`: its template
+    /// without the hash label, and the Deployment's annotations (it has none: an empty map).
+    fn undo_patch(set: &Value) -> Value {
+        let mut template = set["spec"]["template"].clone();
+        template["metadata"]["labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pod-template-hash");
+        // (kubectl's own encoding of a container adds an empty `resources`: captured, `-v=8`.)
+        template["spec"]["containers"][0]["resources"] = json!({});
+        json!([
+            { "op": "replace", "path": "/spec/template", "value": template },
+            { "op": "replace", "path": "/metadata/annotations", "value": {} },
+        ])
+    }
+
+    /// `kubectl rollout undo` (a JSON patch back to an old template) is the store's own
+    /// rollback to the newest revision that held it: its whole resource comes back as a new
+    /// revision (a patch would have kept the replicas), and the history shows it.
+    #[tokio::test]
+    async fn rollout_undo_goes_back_by_the_stores_rollback() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-undo-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        revised(&shared, "v1", &["v2"]).await;
+        // v3 at three replicas, so that a rollback to v2 is told from a patch of its template.
+        let rest = format!("{DEPLOYMENTS}/x");
+        let v3 = json!({ "spec": { "replicas": 3, "template": { "spec": { "containers": [{ "name": "main", "image": "v3" }] } } } });
+        sent_as(&shared, "PATCH", "application/merge-patch+json", &rest, &[], v3).await;
+        let sets = replica_sets(&shared).await;
+        let v2 = sets.iter().find(|set| set.0 == "v2").unwrap().3.clone();
+        let (code, done) = sent_as(
+            &shared,
+            "PATCH",
+            "application/json-patch+json",
+            &rest,
+            &[],
+            undo_patch(&v2),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{done}");
+        assert_eq!(
+            done["spec"]["template"]["spec"]["containers"][0]["image"], "v2",
+            "{done}"
+        );
+        assert_eq!(done["metadata"]["generation"], 4, "a new revision");
+        assert_eq!(done["spec"]["replicas"], 1, "what revision 2 held, replicas and all");
+        {
+            let state = shared.store.lock().unwrap();
+            let history = state.store.history("Workload/default/x").unwrap();
+            let [.., two, _, back] = history else {
+                panic!("{history:?}")
+            };
+            assert_eq!(back.resource.metadata.revision, Some(4));
+            assert_eq!(back.resource.spec, two.resource.spec);
+            assert_eq!(
+                back.resource.metadata.annotations.get(SENT),
+                two.resource.metadata.annotations.get(SENT)
+            );
+        }
+        // And the history says it: v2 is the live one at 4, v3 is kept at 3.
+        let seen: Vec<_> = replica_sets(&shared)
+            .await
+            .into_iter()
+            .map(|(image, revision, ..)| (image, revision))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("v1".into(), "1".into()),
+                ("v3".into(), "3".into()),
+                ("v2".into(), "4".into())
+            ]
+        );
+        // The same again is the live template: nothing is done, and no revision is made.
+        let live = replica_sets(&shared).await.pop().unwrap().3;
+        let mut again = undo_patch(&live);
+        again[0]["value"]["spec"]["containers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("resources");
+        let (code, done) = sent_as(&shared, "PATCH", "application/json-patch+json", &rest, &[], again).await;
+        assert_eq!(code, StatusCode::OK, "{done}");
+        assert_eq!(done["metadata"]["generation"], 4, "{done}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write that lands between `kubectl rollout undo` reading the Deployment and its rollback
+    /// being applied is not written over: the undo is a 409 Conflict and changes nothing.
+    #[tokio::test]
+    async fn rollout_undo_head_moved() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-undo-moved-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        revised(&shared, "v1", &["v2", "v3"]).await;
+        let rest = format!("{DEPLOYMENTS}/x");
+        let v1 = replica_sets(&shared).await.remove(0).3;
+        let (there, reached) = tokio::sync::oneshot::channel();
+        let (go, wait) = tokio::sync::oneshot::channel();
+        HELD.lock()
+            .unwrap()
+            .push((Arc::as_ptr(&shared) as usize, (there, wait)));
+        let undo = tokio::spawn({
+            let (shared, rest) = (shared.clone(), rest.clone());
+            async move {
+                sent_as(
+                    &shared,
+                    "PATCH",
+                    "application/json-patch+json",
+                    &rest,
+                    &[],
+                    undo_patch(&v1),
+                )
+                .await
+            }
+        });
+        reached.await.unwrap();
+        // The undo has read revision 3. Another writer lands 4 before its rollback is applied.
+        let v4 = json!({ "spec": { "replicas": 5 } });
+        let (code, done) = sent_as(&shared, "PATCH", "application/merge-patch+json", &rest, &[], v4).await;
+        assert_eq!(code, StatusCode::OK, "{done}");
+        go.send(()).unwrap();
+        let (code, said) = undo.await.unwrap();
+        assert_eq!(code, StatusCode::CONFLICT, "{said}");
+        assert!(said.to_string().contains("is at revision 4"), "{said}");
+        let state = shared.store.lock().unwrap();
+        let head = state.store.get("Workload/default/x").unwrap();
+        assert_eq!(
+            head.metadata.revision,
+            Some(4),
+            "the writer's revision is the head still"
+        );
+        assert_eq!(head.spec["replicas"], 5);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A JSON patch that is not a return to a template the Deployment kept is a patch: a new
+    /// template is written as one, a patch that dry-runs a return changes nothing, and one that
+    /// changes more than the template and annotations is not taken for an undo.
+    #[tokio::test]
+    async fn rollout_undo_is_only_a_return_to_a_kept_template() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-undo-not-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        revised(&shared, "v1", &["v2"]).await;
+        let rest = format!("{DEPLOYMENTS}/x");
+        let v1 = replica_sets(&shared).await.remove(0).3;
+        let patch = |value: Value| {
+            let mut ops = undo_patch(&v1);
+            ops.as_array_mut().unwrap().push(value);
+            ops
+        };
+        // A dry run of the return writes nothing.
+        let (code, done) = sent_as(
+            &shared,
+            "PATCH",
+            "application/json-patch+json",
+            &rest,
+            &[("dryRun", "All")],
+            undo_patch(&v1),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{done}");
+        let (_, now) = sent_as(&shared, "GET", "application/json", &rest, &[], Value::Null).await;
+        assert_eq!(now["metadata"]["generation"], 2, "{now}");
+        // The return and a change of replicas is a patch: replicas are what it says.
+        let both = patch(json!({ "op": "replace", "path": "/spec/replicas", "value": 4 }));
+        let (code, done) = sent_as(&shared, "PATCH", "application/json-patch+json", &rest, &[], both).await;
+        assert_eq!(code, StatusCode::OK, "{done}");
+        assert_eq!(
+            (done["spec"]["replicas"].clone(), done["metadata"]["generation"].clone()),
+            (json!(4), json!(3))
+        );
+        // A template none of the revisions held is written as a patch.
+        let mut new = undo_patch(&v1);
+        new[0]["value"]["spec"]["containers"][0]["image"] = json!("v9");
+        let (code, done) = sent_as(&shared, "PATCH", "application/json-patch+json", &rest, &[], new).await;
+        assert_eq!(code, StatusCode::OK, "{done}");
+        assert_eq!(done["spec"]["template"]["spec"]["containers"][0]["image"], "v9");
+        assert_eq!(done["spec"]["replicas"], 4, "a patch keeps what it does not say");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Deployment with annotations (`kubectl apply` leaves one, Helm several) is sent back
+    /// as well: kubectl's patch empties them (the ReplicaSet made up carries none of them),
+    /// and the rollback is the store's, bringing back what the revision held.
+    #[tokio::test]
+    async fn rollout_undo_of_an_annotated_deployment_is_still_the_rollback() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-undo-notes-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let mut first = deployment_of("v1");
+        first["metadata"]["annotations"] =
+            json!({ "meta.helm.sh/release-name": "x", "kubectl.kubernetes.io/last-applied-configuration": "{}" });
+        let made = sent_as(&shared, "POST", "application/json", DEPLOYMENTS, &[], first).await;
+        assert_eq!(made.0, StatusCode::CREATED, "{}", made.1);
+        let rest = format!("{DEPLOYMENTS}/x");
+        let v2 = json!({ "spec": { "replicas": 3, "template": { "spec": { "containers": [{ "name": "main", "image": "v2" }] } } } });
+        sent_as(&shared, "PATCH", "application/merge-patch+json", &rest, &[], v2).await;
+        let v1 = replica_sets(&shared).await.remove(0).3;
+        let (code, done) = sent_as(
+            &shared,
+            "PATCH",
+            "application/json-patch+json",
+            &rest,
+            &[],
+            undo_patch(&v1),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{done}");
+        assert_eq!(
+            done["spec"]["template"]["spec"]["containers"][0]["image"], "v1",
+            "{done}"
+        );
+        assert_eq!(
+            done["spec"]["replicas"], 1,
+            "the store's rollback: the whole revision, replicas too"
+        );
+        assert_eq!(
+            done["metadata"]["annotations"]["meta.helm.sh/release-name"], "x",
+            "{done}"
+        );
+        let state = shared.store.lock().unwrap();
+        let history = state.store.history("Workload/default/x").unwrap();
+        let [first, _, back] = history else {
+            panic!("{history:?}")
+        };
+        assert_eq!(
+            back.resource.spec, first.resource.spec,
+            "a rollback: the first revision again"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a name that is a Deployment's name and ten hex digits can be an earlier revision's
+    /// ReplicaSet: a get of any other name does not read the history.
+    #[test]
+    fn rollout_history_is_read_only_for_a_name_it_could_have_made() {
+        assert!(may_be_history("x", None));
+        assert!(may_be_history("x", Some("x-0123456789")));
+        assert!(!may_be_history("x", Some("x-0123456789ab")));
+        assert!(!may_be_history("x", Some("x-0123456xyz")));
+        assert!(!may_be_history("x", Some("x-y-0123456789")));
+        assert!(!may_be_history("x", Some("x")));
+        assert!(!may_be_history("x", Some("xy-0123456789")));
     }
 }

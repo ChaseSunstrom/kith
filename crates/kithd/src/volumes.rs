@@ -104,19 +104,20 @@ struct Vol {
     refused: Option<String>,
 }
 
-/// Whether `path` is one the namespace may use: any absolute path in `kith-system`, else a
-/// relative one with no `.`, `..` or empty part (so it stays inside the namespace's own directory).
-fn check_path(namespace: &str, path: &str) -> Result<(), String> {
+/// Whether `path` is one the namespace may use: an absolute path in `kith-system`, else a relative
+/// one; either with no `.`, `..` or empty part (so none climbs out of where it starts).
+pub(crate) fn check_path(namespace: &str, path: &str) -> Result<(), String> {
     if path.contains('\0') {
         return Err(format!("path `{path:?}` must be relative, with no NUL"));
     }
+    let mut parts = path.split('/');
     if namespace == SYSTEM {
-        let absolute = path.starts_with('/');
-        return absolute
-            .then_some(())
-            .ok_or(format!("path `{path}` must be absolute in {SYSTEM}"));
+        // (The first part of an absolute path is the empty one before its slash.)
+        if parts.next() != Some("") || path.len() < 2 {
+            return Err(format!("path `{path}` must be absolute in {SYSTEM}"));
+        }
     }
-    let plain = path.split('/').all(|part| !matches!(part, "" | "." | ".."));
+    let plain = parts.all(|part| !matches!(part, "" | "." | ".."));
     plain.then_some(()).ok_or(format!(
         "path `{path}` must be relative to the namespace's own directory, with no `..`, `.` or empty part"
     ))
@@ -270,6 +271,34 @@ fn bind(store: &Store, vols: &BTreeMap<String, Vol>) -> Bound {
 /// On a Volume: it was made for the claim of its name (one that says `provision`).
 pub const MADE_FOR_CLAIM: &str = "kith.dev/made-for-claim";
 
+/// The Volume [`provision`] makes for `claim` on `node`: all of it, so `own_writes::made` holds
+/// the leader's signed write to exactly this (a claim's namespace and name are its own).
+pub fn made_for(claim: &Resource, node: &str) -> Resource {
+    let mut spec = serde_json::json!({ "node": node, "path": "data", "size": claim.spec["size"] });
+    if claim.spec["shared"] == true {
+        spec["shared"] = true.into();
+    }
+    let mut annotations = BTreeMap::from([(MADE_FOR_CLAIM.into(), "true".into())]);
+    if claim.metadata.annotations.get(RECLAIM).is_some_and(|v| v == RETAIN) {
+        annotations.insert(RECLAIM.into(), RETAIN.into());
+    }
+    let key = claim.key();
+    let (namespace, name) = parts(&key);
+    Resource {
+        api_version: kith_api::API_VERSION.into(),
+        kind: "Volume".into(),
+        metadata: kith_api::Metadata {
+            name: name.into(),
+            namespace: Some(namespace.into()),
+            labels: BTreeMap::new(),
+            annotations,
+            revision: Some(0),
+        },
+        spec,
+        status: None,
+    }
+}
+
 /// What the claims that say `provision` ask for: a Volume to make for each that is bound to
 /// none and has none of its name, on the node with the fewest Volumes (of those `ready`
 /// whose labels the claim selects); and the Volumes made so whose claim is gone, to remove.
@@ -307,27 +336,7 @@ pub fn provision(store: &Store, ready: &dyn Fn(&str) -> bool) -> (Vec<Resource>,
             .min_by_key(|(name, (count, _))| (*count, **name));
         let Some((node, (count, _))) = fewest else { continue };
         *count += 1;
-        let mut spec = serde_json::json!({ "node": node, "path": "data", "size": claim.spec["size"] });
-        if claim.spec["shared"] == true {
-            spec["shared"] = true.into();
-        }
-        let mut annotations = BTreeMap::from([(MADE_FOR_CLAIM.into(), "true".into())]);
-        if claim.metadata.annotations.get(RECLAIM).is_some_and(|v| v == RETAIN) {
-            annotations.insert(RECLAIM.into(), RETAIN.into());
-        }
-        make.push(Resource {
-            api_version: kith_api::API_VERSION.into(),
-            kind: "Volume".into(),
-            metadata: kith_api::Metadata {
-                name: name.into(),
-                namespace: Some(namespace.into()),
-                labels: BTreeMap::new(),
-                annotations,
-                revision: Some(0),
-            },
-            spec,
-            status: None,
-        });
+        make.push(made_for(claim, node));
     }
     // What a claim says of keeping its data is said on its Volume, for the day the claim is gone
     // (and again when it says it later, or no longer).
@@ -693,7 +702,7 @@ pub fn host_dir(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
 
 /// [`host_dir`], under a node's policy: one that has `hostPaths` off makes and mounts no
 /// directory of the node's own that the store names.
-fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Policy) -> Result<PathBuf, String> {
+pub(crate) fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Policy) -> Result<PathBuf, String> {
     check_path(&dir.namespace, &dir.path)?;
     let made = |path: &Path, e: std::io::Error| format!("cannot make {}: {e}", path.display());
     if dir.namespace == SYSTEM {

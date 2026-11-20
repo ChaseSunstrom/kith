@@ -26,6 +26,15 @@ mod dhcp;
 mod dns;
 mod encrypted;
 mod exits;
+#[allow(
+    dead_code,
+    reason = "the CTAP2 client's wire half (T-0966): nothing calls it until the record slice (docs/adr-fido2.md section 6); its tests run"
+)]
+mod fido2;
+// A software security key: in unit tests and in the `fido2-test` build, in no release
+// (docs/adr-fido2.md section 2, T-0970).
+#[cfg(any(test, feature = "fido2-test"))]
+mod fido2_test;
 mod files;
 #[cfg(feature = "forge")]
 mod forge;
@@ -201,6 +210,10 @@ struct Args {
         default_missing_value = "https://acme-v02.api.letsencrypt.org/directory"
     )]
     acme: Option<String>,
+    /// Ask the root part for sockets, pods, the mesh, images and volumes over a socket pair, as
+    /// the process it is to become (docs/adr-privilege.md); off, it is asked in this process
+    #[arg(long, env = "KITH_SPLIT")]
+    split: bool,
 }
 
 /// The ports kithd serves on at this node, and what for: none of them is published for a pod.
@@ -365,6 +378,13 @@ fn main() -> ExitCode {
         &mut std::io::stderr(),
         b"kithd: built with forge: POST /v1/forge appends unchecked entries; never ship this\n",
     );
+    // The same for the software security key (the VM test, T-0955, looks for the line); started as
+    // `kithd fido2-authenticator` it then answers on /dev/uhid and never returns.
+    #[cfg(feature = "fido2-test")]
+    {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), fido2_test::STARTUP_LINE);
+        fido2_test::shim();
+    }
     // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
     if std::process::id() == 1 {
         keeper::keep();
@@ -451,6 +471,8 @@ fn installer(boot: init::Boot, source: String) -> ! {
                         _ = again.recv() => {}
                         () = init::BUTTON.notified() => {}
                     }
+                    // (A disk being written is finished first, then the machine stops.)
+                    install::stopped().await;
                     init::end(false)
                 });
             }
@@ -807,6 +829,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     if let Some(boot) = boot {
         let _in = rt.enter();
         early = stops().ok();
+        // (Also on a thread of its own: a stop heard from here on is kept for a failed start's `end`.)
+        init::hear_term();
         boot.network();
     }
     // Pods are made as root only; elsewhere the range is never used, so a clash is no matter.
@@ -959,6 +983,15 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     ))?;
     // (An exit's pods pass on to the mesh by its link alone.)
     shared.pods.lock().expect("nothing panics holding the pods").mesh = args.mesh_interface.clone();
+    // The root part on the far end of a socket pair, a thread of this process for now (T-0811).
+    if args.split {
+        let end = root_part::split().map_err(|e| fail("splitting the root part", &e))?;
+        let held = shared.clone();
+        std::thread::Builder::new()
+            .name("root-part".into())
+            .spawn(move || root_part::serve_split(&held.pods, end))
+            .map_err(|e| fail("starting the root part", &e))?;
+    }
     // A viewed worker serves ingress only where its Node says so (as the join of a token for
     // an ingress worker wrote it): only then is its view sent the hosts' certificates. (Its
     // Node not in the view yet: its first view is still to come, and says.)
@@ -1334,6 +1367,14 @@ mod tests {
         assert_eq!(parse("[fd00::1]:7443").unwrap().advertise.unwrap().port(), 7443);
         assert!(parse("10.0.0.5:7443").is_ok());
         assert!(parse("node-b.example.org:7443").is_err() && parse("10.0.0.5").is_err());
+    }
+
+    /// The root part is a socket of its own only when asked (T-0812 flips the default).
+    #[test]
+    fn the_split_flag_is_off_unless_asked() {
+        use clap::Parser;
+        assert!(!super::Args::try_parse_from(["kithd"]).unwrap().split);
+        assert!(super::Args::try_parse_from(["kithd", "--split"]).unwrap().split);
     }
 
     /// The ports this node serves on are the ones a pod may not publish here.

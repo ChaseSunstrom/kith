@@ -493,6 +493,20 @@ impl Keys {
         above(&self.floor, &version)
     }
 
+    /// How the update with header `block` is taken, against the system in `slot` that runs the
+    /// image `running`: kithd alone only when the header kept for that system is its own
+    /// (`signed_system`) and says the kernel and the rest of the root are the same. A missing,
+    /// unsigned, stale or older-style kept header is a full update.
+    pub fn way(&self, slot: char, running: &[u8], block: &[u8]) -> crate::os::Way {
+        let kept = self
+            .signed_system(slot, running)
+            .and_then(|()| crate::os::kept_signed(&self.state, slot));
+        match kept {
+            Ok((_, _, kept)) => crate::os::way(block, &kept),
+            Err(_) => crate::os::Way::Full,
+        }
+    }
+
     /// The keys this node takes releases from, and whose they are: `given`, `kept`,
     /// `image`, or `none` (no keys: the first release's is taken).
     fn mine(&self) -> Result<(Vec<String>, &'static str), String> {
@@ -887,6 +901,12 @@ async fn fetch(
                         let keep = crate::pki::write_whole(&kept, keys.first_kept(public).as_bytes());
                         keep.map_err(|e| format!("keeping the release's key ({}): {e}", kept.display()))?;
                     }
+                    // (Decided here, before a slot is written: the handover is not built yet,
+                    // so what is done is the full update either way.)
+                    let running_image = crate::os::running_image_here(slot).unwrap_or_default();
+                    if keys.way(slot, &running_image, header) == crate::os::Way::KithdOnly {
+                        eprintln!("kithd: update: {version} differs from this system in kithd alone");
+                    }
                     keys.pend(&release, version, header, &runs)?;
                     // (The header is kept for the slot it writes, with its signature: check 3 of
                     // docs/adr-unlock.md reads it there.)
@@ -1094,7 +1114,7 @@ mod tests {
     use super::*;
 
     /// An empty directory of this test's own.
-    fn scratch(name: &str) -> PathBuf {
+    pub(super) fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kithd-release-keys-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1423,7 +1443,7 @@ mod tests {
     }
 
     /// A release key: what signs with it, and its public half as an OSRelease names it.
-    fn pair() -> (impl Fn(&[u8]) -> String, String) {
+    pub(super) fn pair() -> (impl Fn(&[u8]) -> String, String) {
         use ring::signature::{Ed25519KeyPair, KeyPair};
         let made = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
         let pair = Ed25519KeyPair::from_pkcs8(made.as_ref()).unwrap();
@@ -2018,5 +2038,164 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&state).unwrap();
+    }
+}
+
+/// An update's header for the tests of the `kithd` object: version `version`, the piece for
+/// slot b the image `IMAGE`, and `kithd` (kithd, kernel, rest) as given, or not there.
+#[cfg(test)]
+mod kithd_made {
+    pub const IMAGE: &[u8] = b"the kernel image that runs";
+
+    pub fn block(version: &str, kithd: Option<[&str; 3]>) -> Vec<u8> {
+        let sum = |bytes: &[u8]| crate::pki::hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+        let mut header = serde_json::json!({
+            "format": 1, "version": version, "hash": "0".repeat(64),
+            "pieces": [
+                {"name": "root", "size": 0, "sha256": sum(&[])},
+                {"name": "verity", "size": 0, "sha256": sum(&[])},
+                {"name": "a", "size": 0, "sha256": sum(&[])},
+                {"name": "b", "size": IMAGE.len(), "sha256": sum(IMAGE)},
+            ],
+        });
+        if let Some([sha256, kernel, rest]) = kithd {
+            header["kithd"] = serde_json::json!({ "sha256": sha256, "kernel": kernel, "rest": rest });
+        }
+        let mut block = header.to_string().into_bytes();
+        block.resize(4096, b' ');
+        block
+    }
+
+    pub fn digest(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+}
+
+#[cfg(test)]
+mod kithd_header {
+    use super::kithd_made::{block, digest};
+
+    #[test]
+    fn parses_with_the_object_and_without_it() {
+        let (a, b, c) = (digest('a'), digest('B'), digest('c'));
+        let with = block("2", Some([&a, &b, &c]));
+        assert_eq!(crate::os::digests(&with), Some([a, digest('b'), c]));
+        // An older-style header is still a header, and says nothing of its parts.
+        let without = block("1", None);
+        assert_eq!(crate::os::digests(&without), None);
+        assert_eq!(crate::os::way(&with, &without), crate::os::Way::Full);
+    }
+
+    #[test]
+    fn a_malformed_object_is_none_not_a_refused_update() {
+        for bad in [
+            serde_json::json!("x"),
+            serde_json::json!({"sha256": digest('a')}),
+            serde_json::json!({"sha256": "short", "kernel": digest('a'), "rest": digest('a')}),
+            serde_json::json!({"sha256": 1, "kernel": digest('a'), "rest": digest('a')}),
+        ] {
+            let mut header: serde_json::Value = serde_json::from_slice(&block("2", None)).unwrap();
+            header["kithd"] = bad;
+            let mut text = header.to_string().into_bytes();
+            text.resize(4096, b' ');
+            assert_eq!(crate::os::digests(&text), None);
+        }
+    }
+
+    #[test]
+    fn a_tampered_field_fails_the_signature() {
+        let (sign, public) = super::tests::pair();
+        let (a, b, c) = (digest('a'), digest('b'), digest('c'));
+        let signed = block("2", Some([&a, &b, &c]));
+        let signature = sign(&signed);
+        let check = |block: &[u8]| crate::os::signed(Some(&signature), Some(&public))(block);
+        assert_eq!(check(&signed), Ok(()));
+        // The kernel's digest made the running system's: not the one that was signed.
+        let tampered = block("2", Some([&a, &digest('d'), &c]));
+        assert!(check(&tampered).is_err());
+        assert!(check(&block("2", None)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod kithd_only {
+    use super::kithd_made::{block, digest};
+    use crate::os::{Way, way};
+
+    #[test]
+    fn only_kithd_differing_is_kithd_only() {
+        let now = block("1", Some([&digest('a'), &digest('b'), &digest('c')]));
+        // Another kithd, the same kernel and the same rest of the root.
+        assert_eq!(
+            way(&block("2", Some([&digest('f'), &digest('b'), &digest('c')])), &now),
+            Way::KithdOnly
+        );
+    }
+
+    #[test]
+    fn a_kernel_or_the_rest_differing_is_full() {
+        let now = block("1", Some([&digest('a'), &digest('b'), &digest('c')]));
+        for next in [
+            [digest('a'), digest('d'), digest('c')],
+            [digest('a'), digest('b'), digest('d')],
+            [digest('f'), digest('d'), digest('d')],
+        ] {
+            assert_eq!(way(&block("2", Some([&next[0], &next[1], &next[2]])), &now), Way::Full);
+        }
+    }
+
+    #[test]
+    fn a_header_without_the_object_on_either_side_is_full() {
+        let some = block("1", Some([&digest('a'), &digest('b'), &digest('c')]));
+        let none = block("1", None);
+        assert_eq!(way(&some, &none), Way::Full);
+        assert_eq!(way(&none, &some), Way::Full);
+        assert_eq!(way(&none, &none), Way::Full);
+        assert_eq!(way(&some, b"not a header"), Way::Full);
+    }
+}
+
+#[cfg(test)]
+mod kithd_vouched {
+    use super::kithd_made::{IMAGE, block, digest};
+    use super::{Keys, tests::pair, tests::scratch};
+    use crate::os::Way;
+
+    /// A node whose slot b runs `IMAGE`, written by the update `kept` signed by its key.
+    fn node(name: &str, kept: &[u8]) -> (Keys, String) {
+        let state = scratch(name);
+        let (sign, public) = pair();
+        let signature = sign(kept);
+        crate::os::keep_signed(&state, 'b', Some(&signature), Some(&public), kept).unwrap();
+        (Keys::new(vec![public.clone()], &state), public)
+    }
+
+    #[test]
+    fn decides_by_the_kept_header_of_the_running_slot() {
+        let now = block("1", Some([&digest('a'), &digest('b'), &digest('c')]));
+        let (keys, _) = node("kithd-vouched", &now);
+        // (The kept header of the running slot is signed by a key the node takes.)
+        let same = block("2", Some([&digest('f'), &digest('b'), &digest('c')]));
+        let kernel = block("2", Some([&digest('f'), &digest('d'), &digest('c')]));
+        assert_eq!(keys.way('b', IMAGE, &same), Way::KithdOnly);
+        assert_eq!(keys.way('b', IMAGE, &kernel), Way::Full);
+        // Not the image the kept header names: the kept header is not the system's own.
+        assert_eq!(keys.way('b', b"another image", &same), Way::Full);
+        // No header kept for that slot (an older node).
+        assert_eq!(keys.way('a', IMAGE, &same), Way::Full);
+    }
+
+    #[test]
+    fn a_kept_header_without_the_object_or_not_signed_is_full() {
+        let old = block("1", None);
+        let (keys, _) = node("kithd-vouched-old", &old);
+        let next = block("2", Some([&digest('f'), &digest('b'), &digest('c')]));
+        assert_eq!(keys.way('b', IMAGE, &next), Way::Full);
+        // A signature that is not the kept header's.
+        let now = block("1", Some([&digest('a'), &digest('b'), &digest('c')]));
+        let (keys, public) = node("kithd-vouched-forged", &now);
+        let (forge, _) = pair();
+        crate::os::keep_signed(&keys.state, 'b', Some(&forge(&now)), Some(&public), &now).unwrap();
+        assert_eq!(keys.way('b', IMAGE, &next), Way::Full);
     }
 }

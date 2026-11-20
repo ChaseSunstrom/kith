@@ -105,6 +105,27 @@ fn schedule(cron: &Resource) -> Result<Schedule, String> {
     Schedule::parse(said).map_err(|e| format!("not run: its schedule {e}"))
 }
 
+/// The Job [`plan`] makes of `cron`, called `name`: all of it, so `own_writes::made` holds the
+/// leader's signed write to exactly this (but for the time a CronJob sent here is made at).
+pub fn job_for(cron: &Resource, name: String) -> Resource {
+    let mut annotations = crate::kube::job_of(cron, &name);
+    annotations.insert(OWNER.into(), cron.key());
+    Resource {
+        api_version: kith_api::API_VERSION.into(),
+        kind: "Job".into(),
+        metadata: Metadata {
+            name,
+            namespace: cron.metadata.namespace.clone(),
+            labels: cron.metadata.labels.clone(),
+            annotations,
+            // (Made, never changed: two nodes that both think they lead make one.)
+            revision: Some(0),
+        },
+        spec: cron.spec["job"].clone(),
+        status: None,
+    }
+}
+
 fn plan(store: &Store, at: u64) -> Step {
     let mut step = Step::default();
     // The Jobs that were made for something, by its key.
@@ -150,22 +171,7 @@ fn plan(store: &Store, at: u64) -> Step {
             Some("replace") => step.delete.extend(running.iter().map(|job| job.key())),
             _ => {}
         }
-        let mut annotations = crate::kube::job_of(cron, &name);
-        annotations.insert(OWNER.into(), key.clone());
-        step.make.push(Resource {
-            api_version: kith_api::API_VERSION.into(),
-            kind: "Job".into(),
-            metadata: Metadata {
-                name,
-                namespace: meta.namespace.clone(),
-                labels: meta.labels.clone(),
-                annotations,
-                // (Made, never changed: two nodes that both think they lead make one.)
-                revision: Some(0),
-            },
-            spec: cron.spec["job"].clone(),
-            status: None,
-        });
+        step.make.push(job_for(cron, name));
         let last = json!({ "last": rfc3339(minute * 60) });
         step.last.extend(last.as_object().map(|last| (key, last.clone())));
     }
@@ -197,8 +203,14 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
             at,
         });
         let last = (!step.last.is_empty()).then_some(Command::Patch { statuses: step.last });
+        // (The Jobs are this node's own writes, signed by its key: `own_writes`.)
+        // ponytail: a Job Apply signs per entry; the nonce book holds 4096 per node in 5 minutes.
         for command in deletes.chain(makes).chain(last) {
-            if let Err(e) = shared.submit(command).await {
+            let said = match command {
+                Command::Apply { .. } => shared.submit_node(command).await,
+                _ => shared.submit(command).await,
+            };
+            if let Err(e) = said {
                 eprintln!("kithd: a CronJob's Jobs: {e}");
             }
         }

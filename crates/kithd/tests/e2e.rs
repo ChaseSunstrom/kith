@@ -1702,7 +1702,7 @@ fn release_installs_a_package() {
 
     let release = |values: &str| {
         format!(
-            "apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: mine }}\nspec: {{ package: {{ name: maps }}, values: {values} }}\n"
+            "apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: mine }}\nspec: {{ package: {{ name: maps }}, autoUpgrade: true, values: {values} }}\n"
         )
     };
     let installed = |daemon: &Daemon, revision: u64| {
@@ -1732,9 +1732,24 @@ fn release_installs_a_package() {
     );
     assert!(!there("ConfigMap/mine-maps-extra"));
 
-    // Back to how it was: a rollback of the Release is a rollback of what it installed.
+    // A second version, followed (autoUpgrade), makes a map of its own.
+    std::fs::write(package.join("package.yaml"), "name: maps\nversion: 2.0.0\n").unwrap();
+    let two =
+        "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }}-two }\nspec: { data: { a: b } }\n";
+    std::fs::write(package.join("templates/two.yaml"), two).unwrap();
+    assert_eq!(daemon.ok(&["package", "push", "maps"]), "Package/maps-2.0.0 created\n");
+    wait_for("the release to follow 2.0.0", || {
+        daemon.status("Release/mine")["version"] == "2.0.0" && there("ConfigMap/mine-maps-two")
+    });
+
+    // Back to how it was: a rollback of the Release is a rollback of what it installed, the
+    // version too (not the newest, though it follows) and what that made.
     daemon.ok(&["rollback", "Release/mine", "--to", "1"]);
     installed(&daemon, 3);
+    wait_for("the release to be on 1.0.0 again", || {
+        daemon.status("Release/mine")["version"] == "1.0.0" && !there("ConfigMap/mine-maps-two")
+    });
+    assert_eq!(daemon.status("Release/mine")["pinned"], true);
     assert!(
         daemon
             .ok(&["get", "ConfigMap/mine-maps", "-o", "yaml"])
@@ -1754,6 +1769,51 @@ fn release_installs_a_package() {
         !there("ConfigMap/mine-maps") && !there("ConfigMap/mine-maps-extra")
     });
     assert!(there("Package/maps-1.0.0"));
+}
+
+/// A package with a pre-install and a post-install hook Job: each writes a line to a file, and
+/// the post one fails unless the pre one has. The Release is installed and both Jobs succeeded.
+#[test]
+fn release_hooks() {
+    if !e2e() {
+        return;
+    }
+    let daemon = Daemon::start("hooks");
+    let (order, package) = (daemon.dir.join("order"), daemon.dir.join("hooked"));
+    std::fs::create_dir_all(package.join("templates")).unwrap();
+    std::fs::write(package.join("package.yaml"), "name: hooked\nversion: 1.0.0\n").unwrap();
+    let job = |point: &str, script: String| {
+        format!(
+            "---\napiVersion: kith.dev/v1\nkind: Job\nmetadata: {{ name: {{{{ name }}}}-{point}, annotations: {{ 'kith.dev/hook': {point} }} }}\n\
+             spec:\n  template:\n    exec: [{{ name: main, command: [sh, -c, '{script}'] }}]\n"
+        )
+    };
+    let path = order.display();
+    let pre = job("pre-install", format!("echo pre >> {path}"));
+    let post = job("post-install", format!("grep -qx pre {path} && echo post >> {path}"));
+    let map = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }} }\nspec: { data: { a: b } }\n";
+    std::fs::write(package.join("templates/all.yaml"), format!("{map}{pre}{post}")).unwrap();
+    daemon.ok(&["package", "push", "hooked"]);
+    daemon.apply(
+        "apiVersion: kith.dev/v1\nkind: Release\nmetadata: { name: mine }\nspec: { package: { name: hooked } }\n",
+    );
+    wait_for("the release to be installed", || {
+        daemon.status("Release/mine")["state"] == "installed"
+    });
+    let said = |name: &str| daemon.status(&format!("Job/mine-hooked-{name}"))["state"].clone();
+    wait_for("the hooks to have succeeded", || {
+        said("pre-install") == "succeeded" && said("post-install") == "succeeded"
+    });
+    assert_eq!(std::fs::read_to_string(&order).unwrap(), "pre\npost\n");
+    assert_eq!(
+        daemon.status("Release/mine")["resources"],
+        serde_json::json!(["ConfigMap/default/mine-hooked"])
+    );
+    // Gone with the Release.
+    daemon.ok(&["delete", "Release/mine"]);
+    wait_for("the hooks to go", || {
+        daemon.kith(&["get", "Job/mine-hooked-pre-install"]).0 != 0
+    });
 }
 
 /// Stops a helper process when the test is over.
