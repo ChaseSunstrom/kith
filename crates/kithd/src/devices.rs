@@ -102,21 +102,38 @@ include!(concat!(env!("OUT_DIR"), "/os_features.rs"));
 
 /// The kith OS features whose `# pci:` ids a PCI device under `sys` (a `/sys`) has, by name and
 /// sorted: what this node's hardware wants of them, for its status (`os.wants`). A feature with
-/// no such line is never wanted by hardware: it is chosen by hand.
+/// no such line is never wanted by hardware: it is chosen by hand. A `vendor:*` id matches a
+/// display card (PCI class 03) of that vendor, not its audio function or any card whose class
+/// sysfs does not say. `all` is wanted alone: build.sh refuses it with `gpu-amd-phoenix` (the
+/// same driver, as modules and built in) and its modules cover that card.
 pub fn wants(sys: &Path) -> Vec<&'static str> {
     let pci = sys.join("bus/pci/devices");
-    let cards: BTreeSet<(String, String)> = names(&pci)
-        .iter()
-        .filter_map(|name| Some((id(&pci.join(name).join("vendor"))?, id(&pci.join(name).join("device"))?)))
-        .collect();
-    OS_FEATURES
+    let mut cards = BTreeSet::new();
+    let mut displays = BTreeSet::new();
+    for name in names(&pci) {
+        let dir = pci.join(name);
+        let (Some(vendor), Some(device)) = (id(&dir.join("vendor")), id(&dir.join("device"))) else {
+            continue;
+        };
+        if id(&dir.join("class")).is_some_and(|class| class.starts_with("03")) {
+            displays.insert(vendor.clone());
+        }
+        cards.insert((vendor, device));
+    }
+    let mut wanted: Vec<&'static str> = OS_FEATURES
         .iter()
         .filter(|(_, ids)| {
-            ids.iter()
-                .any(|(vendor, device)| cards.contains(&(vendor.to_string(), device.to_string())))
+            ids.iter().any(|(vendor, device)| match *device {
+                "*" => displays.contains(*vendor),
+                _ => cards.contains(&(vendor.to_string(), device.to_string())),
+            })
         })
         .map(|(name, _)| *name)
-        .collect()
+        .collect();
+    if wanted.contains(&"all") {
+        wanted.retain(|name| *name != "gpu-amd-phoenix");
+    }
+    wanted
 }
 
 /// `text` as a label value: letters, digits, `.`, `_` and `-`; anything else is `_`; 63 at most.
@@ -627,6 +644,11 @@ mod tests {
             gpu.1.to_vec(),
             vec![("1002", "15bf"), ("1002", "15c8"), ("1002", "1900"), ("1002", "1901")]
         );
+        let all = OS_FEATURES
+            .iter()
+            .find(|(name, _)| *name == "all")
+            .expect("all is in the table");
+        assert_eq!(all.1.to_vec(), vec![("10de", "*")]);
         assert!(OS_FEATURES.iter().all(|(_, ids)| !ids.is_empty()));
     }
 
@@ -655,6 +677,50 @@ mod tests {
         assert!(wants(&root).is_empty());
         cards(&root, &[("0x8086", "0x1234"), ("0x1002", "0x73bf")]);
         assert!(wants(&root).is_empty());
+    }
+
+    /// One PCI function under `root` with its PCI class as sysfs writes it (`0x030000`).
+    fn function(root: &Path, address: &str, vendor: &str, device: &str, class: &str) {
+        let dir = format!("bus/pci/devices/{address}");
+        put(root, &format!("{dir}/vendor"), &format!("{vendor}\n"));
+        put(root, &format!("{dir}/device"), &format!("{device}\n"));
+        put(root, &format!("{dir}/class"), &format!("{class}\n"));
+    }
+
+    #[test]
+    fn os_wants_all_for_an_nvidia_display_card_of_any_id() {
+        // A GTX 1060 (VGA, 0x1c03) and a 3D controller (0x0302), both class 03.
+        let root = tree("os-wants-nvidia");
+        function(&root, "0000:01:00.0", "0x10de", "0x1c03", "0x030000");
+        assert_eq!(wants(&root), ["all"]);
+        let root = tree("os-wants-nvidia-3d");
+        function(&root, "0000:01:00.0", "0x10de", "0x20b0", "0x030200");
+        assert_eq!(wants(&root), ["all"]);
+    }
+
+    #[test]
+    fn os_wants_not_all_for_an_nvidia_audio_function_alone_or_no_nvidia() {
+        let root = tree("os-wants-nvidia-audio");
+        function(&root, "0000:01:00.1", "0x10de", "0x10f1", "0x040300");
+        assert!(wants(&root).is_empty());
+        // A class that cannot be read does not make a wildcard match.
+        let root = tree("os-wants-nvidia-noclass");
+        cards(&root, &[("0x10de", "0x1c03")]);
+        assert!(wants(&root).is_empty());
+        // Another vendor's display card.
+        let root = tree("os-wants-intel-display");
+        function(&root, "0000:00:02.0", "0x8086", "0x1912", "0x030000");
+        assert!(wants(&root).is_empty());
+    }
+
+    #[test]
+    fn os_wants_all_alone_for_a_node_with_amd_phoenix_and_nvidia() {
+        // build.sh refuses all with gpu-amd-phoenix (one driver, modules and built in): all
+        // has the AMD driver as modules, so it alone covers both cards.
+        let root = tree("os-wants-both");
+        function(&root, "0000:01:00.0", "0x10de", "0x1c03", "0x030000");
+        function(&root, "0000:05:00.0", "0x1002", "0x15bf", "0x030000");
+        assert_eq!(wants(&root), ["all"]);
     }
 
     fn laptop(root: &Path) {

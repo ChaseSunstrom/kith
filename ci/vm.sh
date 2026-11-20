@@ -9,6 +9,7 @@
 #   sh ci/vm.sh --test init     kithd as the first process: up, serving, restarts when told
 #   sh ci/vm.sh --test image    kith OS's disk image (os/build.sh), booted under UEFI on a longer disk
 #   sh ci/vm.sh --test update   that image updating itself, and going back when it must
+#   sh ci/vm.sh --test disk     a disk file made a data disk and mounted, another left alone
 #   sh ci/vm.sh --test rollout  three nodes of it taking a release, one at a time
 #   sh ci/vm.sh --test install  the installer, onto virtual disks, and what it installed
 #   sh ci/vm.sh --test vps      the installer started from memory, as os/vps.sh starts it
@@ -40,6 +41,10 @@
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
 #                               kills in a minute restart the machine
+#   sh ci/vm.sh --test nested   one node: a container with kith's defaults, then with each opening in
+#                               turn, that starts a second runtime (bubblewrap) and kithd in agent mode and
+#                               says what refused each and the guest kernel's settings; the rows go to
+#                               $KITH_NESTED_OUT (ci/stress.sh --nested keeps them in ci/stress.txt)
 #   sh ci/vm.sh --test quota    one node whose state disk keeps project quotas: a pod's storage limit
 #                               holds at the write, in its root and its scratch, however it tries past it
 #   sh ci/vm.sh --test kube     two nodes: the real kubectl and helm against them, with manifests written
@@ -48,7 +53,7 @@
 #                               disk never has another's, and what it does with no control node in reach
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
 #                               in turn losing power, then all at once; what was acknowledged is on all three
-#   sh ci/vm.sh --test home     three nodes with a house address in the Cluster: one MAC answers for it
+#   sh ci/vm.sh --test home     three voters and a roaming fourth, with a house address in the Cluster: one MAC answers for it, and DNS, TCP 443 and WireGuard answer from it
 #                               and DNS answers from it; the holder reset, and the next stopped: another
 #                               announces it within 10 s and two are never heard at once
 #   sh ci/vm.sh --test access   three nodes: a write let through by a node that had not heard its
@@ -98,6 +103,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    audio device the monitor adds later, in the same boot; the same spec built
                    with one byte of snd-usb-audio changed is refused on one console line; same
                    needs as image, and the image is built twice
+  --test disk      instead: the image of a kithd built with the cargo feature disk-test
+                   (target/os-disk, never shipped), two more disks that are files: one the
+                   kernel command line makes a data disk at start (the mapping, the seed ext4
+                   grown to the disk, the mount after the state opens), one nobody added.
+                   Expected: the first mounted, again at the next start from its key; the
+                   second listed as left alone and unchanged byte for byte; same needs as image
   --test rollout   instead: three nodes on a network of their own, claimed and joined
                    over TLS, their image built with a release key; a first release by
                    another key (refused), one with another file's signature (refused), a signed
@@ -187,6 +198,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    not know to an outside resolver (ci/outside-dns.py, on this machine); a pod
                    on the first finds outside.example.test through both. KITH_POD_NOUPSTREAM=1
                    starts neither with an upstream: the control, where the name is not found
+  --test nested    instead: one node with an image that holds bash, bubblewrap and kithd; a Job in it for
+                   kith's defaults, then five variants: unconfined seccomp, userNamespaces, both, runAsUser 0;
+                   each starts a user namespace, bubblewrap and kithd in agent mode, and
+                   says what refused it, the guest kernel's settings and the smallest opening
+                   that let it run. It changes no default (KITH_NESTED_OUT: where the rows go)
   --test outlive   instead: one node on the mesh with ci/pod.rs as an image and on its
                    disk: kithd killed (SIGKILL) under a pod of two containers, an exec
                    unit and a Job; the machine stays up, kithd serves again within
@@ -261,11 +277,14 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    writes each time, a cut-off node acknowledges none, every write
                    that was acknowledged is on all three nodes at the end, and the
                    three hold the same; needs what --test rollout needs
-  --test home      instead: three nodes as for rollout, a house address (10.9.0.100/24)
+  --test home      instead: three voters as for rollout and a fourth that roams (a learner,
+                   reset by the hypervisor; its Node says spec.roaming), a house address (10.9.0.100/24)
                    in the Cluster, and a machine on their network (ci/lan_probe.py)
                    that asks who has it four times a second. Expected: one card
                    answers and announces it, the Cluster's status.home says whose
-                   it is (and the next holder's after a reset), DNS asked of it answers from it, with
+                   it is (and the next holder's after a reset), DNS and TCP 443 asked of it answer
+                   from it, a WireGuard handshake sent to it is answered from it (a reset roaming
+                   node dials it), with
                    the holder reset by the hypervisor and then (after it is back)
                    the next one stopped, another announces it within 10 s (the
                    seconds are printed), and two cards are never heard answering at
@@ -348,7 +367,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | alone) ;; *) echo "vm.sh: --test knows: init, image, update, modules, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | nested | alone | disk) ;; *) echo "vm.sh: --test knows: init, image, update, modules, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, nested" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -559,10 +578,10 @@ KITH_VM_RUN=$$.$(date +%s%N); export KITH_VM_RUN
 reap='for sig in TERM KILL; do pids=; for f in $(grep -lzx "KITH_VM_RUN=$1" /proc/[0-9]*/environ 2>/dev/null); do p=${f#/proc/}; pids="$pids ${p%/environ}"; done; [ -z "$pids" ] || { kill -$sig $pids 2>/dev/null; sleep 1; }; done; true'
 setsid=''; ! command -v setsid >/dev/null 2>&1 || setsid=setsid
 env -u KITH_VM_RUN $setsid sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 1; done; exec sh -c "$2" sh "$3"' sh $$ "$reap" "$KITH_VM_RUN" </dev/null >/dev/null 2>&1 8>&- &
-trap 'kill $vms $web 2>/dev/null || true; env -u KITH_VM_RUN sh -c "$reap" sh "$KITH_VM_RUN"; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
+trap 'st=$?; kill $vms $web 2>/dev/null || true; env -u KITH_VM_RUN sh -c "$reap" sh "$KITH_VM_RUN"; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$work"/wg "$work"/wg.err "$work"/arp "$work"/arp.err "$KITH_VM_LOGS"/ 2>/dev/null || true; if [ "$st" -ne 0 ] && [ -n "${KITH_VM_LOGS:-}" ] && [ ! -e "$KITH_VM_LOGS/fail" ]; then echo "vm.sh: FAIL: exit $st without a fail file: a failure that did not go through fail(), see the log" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; fi; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
 trap 'exit 1' INT TERM
 said() { said_in "$work/log" "$1"; }
-fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
+fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; [ -z "${KITH_VM_LOGS:-}" ] || echo "vm.sh: FAIL: $1" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; exit 1; }
 
 if [ -n "$test" ] && [ "$test" != init ]; then
     . "$root/ci/vm/tests.sh"

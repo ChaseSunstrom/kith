@@ -509,7 +509,7 @@ impl Keys {
 
     /// The keys this node takes releases from, and whose they are: `given`, `kept`,
     /// `image`, or `none` (no keys: the first release's is taken).
-    fn mine(&self) -> Result<(Vec<String>, &'static str), String> {
+    pub(crate) fn mine(&self) -> Result<(Vec<String>, &'static str), String> {
         if !self.given.is_empty() {
             return Ok((self.given.iter().map(|key| key.trim().to_string()).collect(), "given"));
         }
@@ -778,8 +778,7 @@ fn raise(file: &Path, version: &str) -> Result<(), String> {
 
 /// The client an update is fetched with: `host`'s vetted addresses are the ones connected
 /// to, through no proxy (which would look the name up again itself), and no redirect is
-/// followed (the address is the release's, and the release is what was applied: nowhere
-/// else).
+/// followed by it (a redirect's target is vetted, and gets a client of its own: [`get`]).
 fn client(host: &str, addresses: &[std::net::SocketAddr]) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .resolve_to_addrs(host, addresses)
@@ -829,6 +828,99 @@ async fn pinned(url: &reqwest::Url, lan: bool) -> Result<(String, Vec<std::net::
     }
 }
 
+/// Redirects an image's address may lead through before it answers.
+const HOPS: usize = 5;
+
+/// `url` as an error may say it: with no user or password, and no query (often a signature).
+fn shown(url: &reqwest::Url) -> reqwest::Url {
+    let mut url = url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    // (Only a URL that cannot have a host refuses these, and none here is one.)
+    url.set_username("").ok();
+    url.set_password(None).ok();
+    url
+}
+
+/// The longest [`pinned`] may take: a name that is not answered is not waited for.
+const VET: Duration = Duration::from_secs(30);
+
+/// The longest the image's address takes to answer, through its redirects (what it sends
+/// after the answer starts is the body's: each read of it has its own limit, `client`).
+const ANSWER: Duration = Duration::from_secs(300);
+
+/// Where a redirect from `from` goes, by its `Location`: an address of its own (a relative
+/// one is read against `from`), with no user or password in it, and not a lower scheme.
+/// What it is vetted as is for [`get`].
+fn hop(from: &reqwest::Url, location: Option<&reqwest::header::HeaderValue>) -> Result<reqwest::Url, String> {
+    let refused = |why: &str| format!("fetching {}: its redirect {why}", shown(from));
+    let location = location.ok_or_else(|| refused("names no Location"))?;
+    if location.len() > 2048 {
+        return Err(refused("has a Location over 2048 bytes"));
+    }
+    let location = location
+        .to_str()
+        .map_err(|_| refused("has a Location that is not text"))?;
+    // (Read against the address with no user or password: none is carried to another.)
+    let mut to = shown(from)
+        .join(location)
+        .map_err(|e| refused(&format!("has a Location that is no address ({e})")))?;
+    to.set_fragment(None);
+    if !to.username().is_empty() || to.password().is_some() {
+        return Err(refused(
+            "names a userinfo (a user or password in the address): none is sent",
+        ));
+    }
+    match (from.scheme(), to.scheme()) {
+        ("https", "https") | ("http", _) => Ok(to),
+        (from, to) => Err(refused(&format!("goes from {from} to {to}: a scheme is not lowered"))),
+    }
+}
+
+/// The answer of the image at `url`, after at most [`HOPS`] redirects. Each address, the first
+/// and every redirect's, is vetted by [`pinned`] and fetched from through a client of its own
+/// holding the addresses vetted (a client that followed would look the name up again): so
+/// an address that the first may not be is not a redirect's either. Says the address it
+/// came from too, for what is said of the body. All of it takes [`ANSWER`] at most.
+async fn get(first: reqwest::Url, lan: bool) -> Result<(reqwest::Response, reqwest::Url), String> {
+    let at = shown(&first);
+    let all = tokio::time::timeout(ANSWER, hops(first, lan));
+    all.await
+        .map_err(|_| format!("fetching {at}: no answer in {} seconds", ANSWER.as_secs()))?
+}
+
+async fn hops(first: reqwest::Url, lan: bool) -> Result<(reqwest::Response, reqwest::Url), String> {
+    let (mut url, mut seen) = (first.clone(), vec![first]);
+    loop {
+        let at = shown(&url);
+        let vetted = tokio::time::timeout(VET, pinned(&at, lan));
+        let vetted = vetted
+            .await
+            .map_err(|_| format!("looking up {at}: no answer in {} seconds", VET.as_secs()));
+        let (host, addresses) = vetted?.map_err(|why| match seen.len() {
+            1 => why,
+            _ => format!("after a redirect, {why}"),
+        })?;
+        let failed = |e: reqwest::Error| format!("fetching {at}: {}", e.without_url());
+        let response = client(&host, &addresses)?.get(url.clone()).send().await;
+        let response = response.and_then(|r| r.error_for_status()).map_err(failed)?;
+        if !response.status().is_redirection() {
+            return match response.status().is_success() {
+                true => Ok((response, url)),
+                false => Err(format!("fetching {at}: it answers {}", response.status())),
+            };
+        }
+        if seen.len() > HOPS {
+            return Err(format!("fetching {at}: more than {HOPS} redirects: the hop limit"));
+        }
+        url = hop(&url, response.headers().get(reqwest::header::LOCATION))?;
+        if seen.contains(&url) {
+            return Err(format!("fetching {at}: its redirects loop (to {})", shown(&url)));
+        }
+        seen.push(url.clone());
+    }
+}
+
 /// The update file at `url`, into this node's other slot, if it is the release's: signed
 /// by its key, and the version it says. Not from this node or its own networks (their
 /// private ranges only with `lan`, `--lan-releases`): an OSRelease is written by whoever
@@ -850,22 +942,10 @@ async fn fetch(
     let first = keys.refused(public.as_deref())?;
     let ahead = keys.seals_ahead(public.as_deref(), back);
     let (kept, runs, keys, release) = (keys.kept.clone(), runs.to_string(), keys.clone(), release.clone());
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("the release's image, {url}: {e}"))?;
-    let (host, addresses) = pinned(&parsed, lan).await?;
-    let client = client(&host, &addresses)?;
-    let failed = |e: reqwest::Error| format!("fetching {url}: {e}");
-    let mut response = client
-        .get(parsed)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(failed)?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "fetching {url}: it answers {}, and a redirect is not followed",
-            response.status()
-        ));
-    }
+    // (Said without the address: it may hold a password or a signed query.)
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("the release's image address: {e}"))?;
+    let (mut response, came_from) = get(parsed, lan).await?;
+    let failed = |e: reqwest::Error| format!("fetching {}: {}", shown(&came_from), e.without_url());
     // What arrives is written as it arrives: an update is tens of megabytes, a node may
     // have little memory, and the writer checks every piece against the signed header.
     let (send, mut pieces) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -1021,6 +1101,10 @@ pub async fn node(
         let mut said = report(&state, &version, slot, keys.whose());
         said["storage"] = json!(storage);
         said["wants"] = json!(wants);
+        // The data disks it looked at at the start (none before it has, and on a node that is not init).
+        if let Some(disks) = crate::data_disk::boot::said() {
+            said["disks"] = disks;
+        }
         // What the store has of this node, and a plan that says it is this node's turn.
         let (known, turn, named, back) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -1699,34 +1783,300 @@ mod tests {
         assert!(before("0.0.0-next", "0.0.1") && before("1.0", "1.1-rc1"));
     }
 
-    #[tokio::test]
-    async fn no_redirect_is_followed_for_an_update() {
+    /// A server on `listener` (an unbounded number of asks) that logs each request's path
+    /// and answers it with what `answer` says for that path.
+    fn serving(
+        listener: tokio::net::TcpListener,
+        answer: impl Fn(&str) -> String + 'static,
+    ) -> std::rc::Rc<std::cell::RefCell<Vec<String>>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let dir = scratch("redirect");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let to = elsewhere.local_addr().unwrap();
-        let url = format!("http://{}/kith-os.update", listener.local_addr().unwrap());
-        let answering = tokio::spawn(async move {
-            let (mut asked, _) = listener.accept().await.unwrap();
-            let _ = asked.read(&mut [0; 1024]).await;
-            let moved = format!("HTTP/1.1 302 Found\r\nLocation: http://{to}/x\r\nContent-Length: 0\r\n\r\n");
-            asked.write_all(moved.as_bytes()).await.unwrap();
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = log.clone();
+        // (Local to this test's thread, where the loopback-is-outside switch is too.)
+        tokio::task::spawn_local(async move {
+            loop {
+                let (mut asked, _) = listener.accept().await.unwrap();
+                let mut line = [0; 4096];
+                let got = asked.read(&mut line).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&line[..got]).to_string();
+                let path = text.split_whitespace().nth(1).unwrap_or_default().to_string();
+                let said = answer(&path);
+                seen.borrow_mut().push(path);
+                let _ = asked.write_all(said.as_bytes()).await;
+            }
         });
+        log
+    }
+
+    fn moved(to: &str) -> String {
+        format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    const IMAGE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd";
+
+    /// `fetch` as a node with `lan` does it, from a server that stands for one elsewhere
+    /// (this thread takes loopback for outside). The image never gets further than the
+    /// writer, which finds no slot here: that is what "followed to the image" says.
+    async fn fetched(url: &str, lan: bool) -> Result<String, String> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let keys = Keys::new(vec!["aa11".into()], &scratch("redirect"));
         let release = json!({ "publicKey": "aa11", "signature": "00" });
-        let keys = Keys::new(Vec::new(), &dir);
-        // (This thread takes loopback for outside: it stands for a release server elsewhere.)
         crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
-        let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, false).await;
+        let said = fetch(url, "2".into(), &release, 'a', &keys, "1", true, lan).await;
         crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
-        let said = said.unwrap_err();
-        assert!(said.contains("302") && said.contains("redirect"), "{said}");
-        answering.await.unwrap();
-        let asked = tokio::time::timeout(Duration::from_millis(200), elsewhere.accept()).await;
-        assert!(asked.is_err(), "the redirect was followed");
         // (And a key is kept only once it has signed the update asked for.)
         assert!(!keys.kept.exists());
+        said
+    }
+
+    /// Runs `test` where [`serving`] can spawn.
+    async fn locally<F: std::future::Future<Output = ()>>(test: F) {
+        tokio::task::LocalSet::new().run_until(test).await;
+    }
+
+    const NO_SLOT: &str = "no partition is labelled";
+
+    #[tokio::test]
+    async fn redirect_is_followed_to_the_image() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let log = serving(listener, move |path| match path {
+                "/kith-os.update" => moved("/second"),
+                "/second" => moved(&format!("http://{at}/image")),
+                _ => IMAGE.to_string(),
+            });
+            let said = fetched(&format!("http://{at}/kith-os.update"), false).await;
+            assert!(said.unwrap_err().contains(NO_SLOT));
+            assert_eq!(*log.borrow(), ["/kith-os.update", "/second", "/image"]);
+        })
+        .await;
+    }
+
+    /// GitHub's way: the file's address answers 302 to another host's, with a signed query.
+    #[tokio::test]
+    async fn redirect_to_another_host_with_a_query() {
+        locally(async {
+            let (first, second) = (
+                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            );
+            let (a, b) = (first.local_addr().unwrap(), second.local_addr().unwrap());
+            let to = format!("http://localhost:{}/asset/1?sig=ab%2Bc&exp=9", b.port());
+            let one = serving(first, move |_| moved(&to));
+            let two = serving(second, |_| IMAGE.to_string());
+            let said = fetched(&format!("http://{a}/releases/download/v1/kith-os.update"), false).await;
+            assert!(said.unwrap_err().contains(NO_SLOT));
+            assert_eq!(*one.borrow(), ["/releases/download/v1/kith-os.update"]);
+            // (The query goes to the second host as it was written.)
+            assert_eq!(*two.borrow(), ["/asset/1?sig=ab%2Bc&exp=9"]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn redirect_five_hops_are_followed_and_the_sixth_is_refused() {
+        locally(async {
+            for (hops, followed) in [(5, true), (6, false)] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let at = listener.local_addr().unwrap();
+                let log = serving(listener, move |path| {
+                    match path.trim_start_matches('/').parse::<usize>() {
+                        Ok(n) if n < hops => moved(&format!("/{}", n + 1)),
+                        _ => IMAGE.to_string(),
+                    }
+                });
+                // (Every answer, but the last, is a redirect to the next number.)
+                let said = fetched(&format!("http://{at}/0"), false).await.unwrap_err();
+                match followed {
+                    true => assert!(said.contains(NO_SLOT), "{said}"),
+                    false => assert!(said.contains("5 redirects") && said.contains("hop"), "{said}"),
+                }
+                // (Six asks either way: the sixth redirect is refused, not asked for.)
+                assert_eq!(log.borrow().len(), 6, "{:?}", log.borrow());
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn redirect_loop_is_refused() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let log = serving(listener, |path| moved(if path == "/a" { "/b#again" } else { "/a" }));
+            let said = fetched(&format!("http://{at}/a"), false).await.unwrap_err();
+            assert!(said.contains("loop"), "{said}");
+            assert_eq!(*log.borrow(), ["/a", "/b"]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn redirect_with_userinfo_or_no_location_is_refused() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let none = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let log = serving(listener, move |path| match path {
+                "/user" => moved(&format!("http://me:secret@{at}/image")),
+                "/name" => moved(&format!("http://me@{at}/image")),
+                "/none" => none.to_string(),
+                _ => IMAGE.to_string(),
+            });
+            for (path, words) in [("/user", "userinfo"), ("/name", "userinfo"), ("/none", "no Location")] {
+                let said = fetched(&format!("http://{at}{path}"), false).await.unwrap_err();
+                assert!(said.contains(words) && !said.contains("secret"), "{said}");
+            }
+            assert_eq!(*log.borrow(), ["/user", "/name", "/none"], "nothing was followed");
+        })
+        .await;
+    }
+
+    /// What an error says of an address is the address with no user, password, query or
+    /// fragment: a signed query and a password are secrets, and a status shows the error.
+    #[tokio::test]
+    async fn redirect_errors_say_no_userinfo_and_no_query() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let log = serving(listener, move |path| match path.split('?').next().unwrap() {
+                "/gone" => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                _ => moved("/gone?sig=secret"),
+            });
+            for path in ["/gone?sig=secret#secret", "/moved?sig=secret"] {
+                let said = fetched(&format!("http://me:hunter2@{at}{path}"), false)
+                    .await
+                    .unwrap_err();
+                assert!(said.contains("404") && said.contains(&at.to_string()), "{said}");
+                assert!(!said.contains("hunter2") && !said.contains("secret"), "{said}");
+            }
+            assert_eq!(log.borrow().len(), 3);
+        })
+        .await;
+    }
+
+    /// What a redirect may name is what the first address may: http or https, outside this
+    /// node, however it is written (a scheme-less `//host`, an IPv4 in an IPv6 address).
+    #[tokio::test]
+    async fn os_image_redirect_to_another_scheme_or_a_loopback_in_disguise_is_refused() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let log = serving(listener, |path| {
+                crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
+                moved(&path.trim_start_matches('/').replace("%2F", "/"))
+            });
+            for (target, words) in [
+                ("ftp:%2F%2Fx.example%2Fa", "fetched over http or https"),
+                ("file:%2F%2F%2Fx", "fetched over http or https"),
+                ("http:%2F%2F[::ffff:127.0.0.1]%2Fa", "not fetched from this node"),
+                ("%2F%2F127.0.0.1%2Fa", "not fetched from this node"),
+            ] {
+                let said = fetched(&format!("http://{at}/{target}"), false).await.unwrap_err();
+                assert!(
+                    said.starts_with("after a redirect, ") && said.contains(words),
+                    "{target}: {said}"
+                );
+            }
+            assert_eq!(log.borrow().len(), 4, "only the first address was asked");
+        })
+        .await;
+    }
+
+    /// Where a redirect goes is decided apart from the network: a scheme is never lowered.
+    #[test]
+    fn redirect_hop_never_lowers_the_scheme_and_reads_the_location_whole() {
+        let value = |text: &str| reqwest::header::HeaderValue::from_str(text).unwrap();
+        let at = |from: &str, location: &str| hop(&reqwest::Url::parse(from).unwrap(), Some(&value(location)));
+        let said = at("https://a.example/x", "http://b.example/y").unwrap_err();
+        assert!(said.contains("https") && said.contains("http"), "{said}");
+        assert!(at("https://a.example/x", "//b.example/y").unwrap().as_str() == "https://b.example/y");
+        assert_eq!(
+            at("http://a.example/x/y", "https://b.example/z?q=1#f")
+                .unwrap()
+                .as_str(),
+            "https://b.example/z?q=1"
+        );
+        assert_eq!(
+            at("http://a.example/x/y", "z").unwrap().as_str(),
+            "http://a.example/x/z"
+        );
+        assert!(at("https://a.example/x", "ftp://b.example/y").is_err());
+        let long = format!("/{}", "a".repeat(2048));
+        assert!(at("http://a.example/", &long).unwrap_err().contains("2048"));
+        assert!(hop(&reqwest::Url::parse("http://a.example/").unwrap(), None).is_err());
+    }
+
+    /// Each hop is vetted as the first address is: the redirect's target is named in the
+    /// refusal (and its query, which may be a signature, is not).
+    #[tokio::test]
+    async fn os_image_redirect_to_loopback_or_a_private_range_is_refused_with_lan_off() {
+        locally(async {
+            let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (a, b) = (first.local_addr().unwrap(), second.local_addr().unwrap());
+            let one = serving(first, move |path| {
+                // (The first answer is from "outside"; what it names is looked at as itself.)
+                crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
+                moved(&match path {
+                    "/loopback" => format!("http://{b}/x?sig=secret"),
+                    _ => "http://10.254.253.252/x?sig=secret".into(),
+                })
+            });
+            let two = serving(second, |_| IMAGE.to_string());
+            for (path, target, words) in [
+                ("/loopback", format!("{b}"), "not fetched from this node"),
+                ("/private", "10.254.253.252".into(), "--lan-releases"),
+            ] {
+                let said = fetched(&format!("http://{a}{path}"), false).await.unwrap_err();
+                assert!(said.contains(&target) && said.contains(words), "{said}");
+                assert!(said.contains("redirect") && !said.contains("secret"), "{said}");
+            }
+            // And with the LAN allowed, loopback is this node still.
+            let said = fetched(&format!("http://{a}/loopback"), true).await.unwrap_err();
+            assert!(said.contains("not fetched from this node"), "{said}");
+            assert!(two.borrow().is_empty(), "nothing was asked of it");
+            assert_eq!(one.borrow().len(), 3);
+        })
+        .await;
+    }
+
+    /// With `--lan-releases` a private range is followed to (the connection is tried: there
+    /// is no such host here, so it is not answered), but never the cluster's own mesh.
+    #[tokio::test]
+    async fn os_image_redirect_to_a_private_range_is_followed_with_lan_on_but_not_the_mesh() {
+        locally(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            let mesh = *MESH.get_or_init(|| kith_mesh::prefix(b"a cluster"));
+            let pod = kith_mesh::node_net(mesh, "n2");
+            let log = serving(listener, move |path| {
+                moved(&match path {
+                    "/mesh" => format!("http://[{pod}]/x"),
+                    _ => "http://10.254.253.252/x".into(),
+                })
+            });
+            let said = fetched(&format!("http://{at}/mesh"), true).await.unwrap_err();
+            assert!(said.contains("cluster's own mesh"), "{said}");
+            let tried = tokio::time::timeout(Duration::from_secs(2), fetched(&format!("http://{at}/lan"), true)).await;
+            crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
+            match tried {
+                // (No route, or refused: said of the address, never of the vetting.)
+                Ok(said) => {
+                    let said = said.unwrap_err();
+                    assert!(
+                        said.contains("10.254.253.252") && !said.contains("not fetched from"),
+                        "{said}"
+                    );
+                }
+                // (Or the connection is still being made, as on a host that routes it: the
+                // vetting passed, and the redirect was served once, as the log says.)
+                Err(_) => assert_eq!(log.borrow().iter().filter(|p| *p == "/lan").count(), 1),
+            }
+            assert_eq!(*log.borrow(), ["/mesh", "/lan"]);
+        })
+        .await;
     }
 
     fn plan(spec: Value, status: Option<&Decided>) -> Resource {

@@ -1080,6 +1080,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             }
             eprintln!("kithd: node {} serving other nodes on {address}", cluster.me.name);
             let _ = netboot::PORT.set(address.port());
+            let _ = netboot::RELEASES.set((args.release_key.clone(), state.clone(), args.lan_releases));
             if args.admit_deleted_nodes {
                 eprintln!("kithd: --admit-deleted-nodes: a deleted node's certificate is still taken here");
                 cluster::ADMIT_DELETED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1231,6 +1232,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let replicas = replicas::run(shared.clone(), state.clone(), stopping.clone());
         let images = images::run(shared.clone(), state.clone(), stopping.clone());
         let encrypted = encrypted::run(shared.clone(), state.clone(), stopping.clone());
+        // The second disk's known disks, mounted once, now that the state is open.
+        let data = data_disk::boot::run(state.clone());
         let identities = workload_identity::run(shared.clone(), stopping.clone());
         let registry = images::serve(shared.clone(), door, stopping.clone());
         let storage = async {
@@ -1242,6 +1245,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 apart(images),
                 apart(registry),
                 apart(encrypted),
+                apart(data),
                 apart(identities)
             )
         };
@@ -1271,6 +1275,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         served.map_err(|e| fail("serving", &e)).and(nodes)
     });
     let _ = std::fs::remove_file(&socket);
+    // (Not a plain drop: that waits for every thread `spawn_blocking` made, and a data disk that
+    // never answers has one stuck in the kernel for good.)
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
     served
 }
 

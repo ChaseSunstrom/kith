@@ -850,7 +850,7 @@ mod tests {
             let other = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
             let store = &mut shared.store.lock().unwrap().store;
             store.apply(other).unwrap();
-            let mesh = serde_json::json!({ "mesh": { "key": "QUFB", "port": 51820 } });
+            let mesh = serde_json::json!({ "mesh": { "key": "ab".repeat(32), "port": 51820 } });
             store.set_status("Node/mesh-o", Some(mesh)).unwrap();
         }
         let own = |key: &str| Command::Patch {
@@ -862,8 +862,63 @@ mod tests {
                     .clone(),
             )],
         };
-        assert!(checked(&shared, "mesh-c", own("QUFB")).is_err());
-        assert!(checked(&shared, "mesh-c", own("TkVX")).is_ok());
+        // (The same key in capitals, or any text that is no key, is refused too.)
+        for refused in ["ab".repeat(32), "AB".repeat(32), "ab".repeat(31), "zz".repeat(32)] {
+            assert!(checked(&shared, "mesh-c", own(&refused)).is_err(), "{refused}");
+        }
+        assert!(checked(&shared, "mesh-c", own(&"5a".repeat(32))).is_ok());
+        // What it says of a rotation is small: a name of up to 64 characters, and a few keys.
+        let says = |mesh: serde_json::Value| Command::Patch {
+            statuses: vec![(
+                "Node/mesh-c".to_string(),
+                serde_json::json!({ "mesh": mesh }).as_object().unwrap().clone(),
+            )],
+        };
+        let key = "5a".repeat(32);
+        for (field, value) in [
+            ("rotated", serde_json::json!("r".repeat(65))),
+            ("failed", serde_json::json!("line\nbreak")),
+            ("rotated", serde_json::json!(7)),
+            ("takes", serde_json::json!(vec![key.clone(); 65])),
+            ("takes", serde_json::json!([key.to_uppercase()])),
+            ("takes", serde_json::json!("not a list")),
+        ] {
+            let mesh = serde_json::json!({ "key": key, "port": 51820, (field): value });
+            assert!(checked(&shared, "mesh-c", says(mesh)).is_err(), "{field}");
+        }
+        let mesh = serde_json::json!({ "key": key, "port": 51820, "rotated": "r".repeat(64), "takes": [key] });
+        assert!(checked(&shared, "mesh-c", says(mesh)).is_ok());
+    }
+
+    /// The key a node is to take next (T-1017) may be neither another node's key nor its next one:
+    /// a node that says another's cannot make the others call that node by a key it does not hold.
+    #[tokio::test]
+    async fn own_writes_refuse_a_next_mesh_key_another_node_holds() {
+        let ca = pki::Ca::create().unwrap();
+        let shared: Arc<Shared> = shared_with("own-next", node(&ca, "next-c"), &[]).await;
+        {
+            let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: next-o}\nspec: {}\n";
+            let other = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(other).unwrap();
+            let mesh =
+                serde_json::json!({ "mesh": { "key": "ab".repeat(32), "next": "cd".repeat(32), "port": 51820 } });
+            store.set_status("Node/next-o", Some(mesh)).unwrap();
+        }
+        let own = |next: &str| Command::Patch {
+            statuses: vec![(
+                "Node/next-c".to_string(),
+                serde_json::json!({ "mesh": { "key": "43".repeat(32), "next": next, "port": 51820 } })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )],
+        };
+        // (Another node's key in capitals is that key still, to what reads it: refused too.)
+        for refused in ["ab".repeat(32), "cd".repeat(32), "AB".repeat(32), "Cd".repeat(32)] {
+            assert!(checked(&shared, "next-c", own(&refused)).is_err(), "{refused}");
+        }
+        assert!(checked(&shared, "next-c", own(&"5a".repeat(32))).is_ok());
     }
 
     /// The join a control node that holds the CA makes (`cluster.rs` `join` and `register`), not
