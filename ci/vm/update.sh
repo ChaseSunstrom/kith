@@ -58,5 +58,8 @@
         who
         [ "$first" = "$who" ] || fail "after going back the node is another node ($first, then $who)"
         kill "$vm"
-        echo "vm.sh: ok: a damaged update refused; an update written into slot b, started, marked good, the same node ($first); a release that cannot start tried three times, then slot b again"
+        # The updates of kithd alone, and of another kernel, on a node with a pod running: a test of its own
+        # (the lock this run holds is inherited, so the child waits for none).
+        KITH_VM_LOCK='' sh "$root/ci/vm.sh" --test handover || fail "the kithd-only hand-over test failed"
+        echo "vm.sh: ok: a damaged update refused; an update written into slot b, started, marked good, the same node ($first); a release that cannot start tried three times, then slot b again; a kithd-only release handed over to with no restart"
         exit 0
