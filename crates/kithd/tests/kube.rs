@@ -838,8 +838,121 @@ fn workflows_kubectl_delete_pod_restarts_that_replica() {
     assert_eq!(started("web-1"), second, "the other replica is not restarted");
     assert_eq!(pods(), "pod/web-0\npod/web-1\n", "the same names");
     assert_eq!(cluster.held("workload/web")["spec"]["replicas"], 2);
-    // A pod that no Workload runs is refused, and says its name.
-    cluster.refused(&["delete", "pod", "bare"], &["bare"]);
+    // A pod that is not there is not found, and says its name.
+    cluster.refused(&["delete", "pod", "bare"], &["NotFound", "bare"]);
+    // A Pod applied over a Deployment of its name is a name taken (AlreadyExists), not a Pod to delete first.
+    cluster.write(
+        "webpod.yaml",
+        "apiVersion: v1\nkind: Pod\nmetadata: { name: web }\nspec:\n  restartPolicy: Never\n  containers: [{ name: a, image: busybox:1.36 }]\n",
+    );
+    cluster.refused(&["apply", "--server-side", "-f", "webpod.yaml"], &["already exists"]);
+}
+
+/// A Pod sent alone is read back as the Pod that was sent, and `kubectl delete pod` deletes it (and
+/// does not restart it, as it does the pod of a Workload).
+#[track_caller]
+fn bare_pod_round_trip(cluster: &Cluster, name: &str, sent: &serde_json::Value, held: &str) {
+    let got = cluster.got(&["pod", name]);
+    assert_eq!(got["kind"], "Pod", "{got}");
+    assert_eq!(got["spec"]["restartPolicy"], "Never", "{got}");
+    if let Some(why) = lost(sent, &got, "") {
+        panic!("a Pod sent is not read back whole: {why}\n{got}");
+    }
+    assert_eq!(cluster.held(held)["metadata"]["annotations"]["kith.dev/pod"], "true");
+    says(
+        &cluster.ok(&["delete", "pod", name]),
+        &[&format!("pod \"{name}\" deleted")],
+    );
+    assert_eq!(cluster.ok(&["get", "pods", "-o", "name"]), "", "no pod is left");
+    cluster.refused(&["get", "pod", name], &["NotFound"]);
+}
+
+#[test]
+fn workflows_kubectl_run_never_is_a_pod_and_delete_pod_deletes_it() {
+    let Some(cluster) = Cluster::start("kube-run-never") else {
+        return;
+    };
+    let empty = cluster.holds();
+    let image = "--image=mirror.gcr.io/library/busybox:1.36";
+    let made = cluster.ok(&[
+        "run",
+        "one",
+        image,
+        "--restart=Never",
+        "--labels=app=one",
+        "--",
+        "sleep",
+        "3600",
+    ]);
+    says(&made, &["pod/one created"]);
+    // What kubectl sent, asked of it again without sending (what it adds that the server owns is dropped).
+    let args = [
+        "run",
+        "one",
+        image,
+        "--restart=Never",
+        "--labels=app=one",
+        "--dry-run=client",
+        "-o",
+        "json",
+    ];
+    let mut sent: serde_json::Value =
+        serde_json::from_str(&cluster.ok(&[&args[..], &["--", "sleep", "3600"]].concat())).unwrap();
+    sent.as_object_mut().unwrap().remove("status");
+    sent["metadata"].as_object_mut().unwrap().remove("creationTimestamp");
+    bare_pod_round_trip(&cluster, "one", &sent, "job/one");
+    assert_eq!(cluster.holds(), empty, "kith holds what it held before the pod");
+
+    // The default restart policy is Always: that pod is a Workload of one, and is deleted all the same.
+    says(
+        &cluster.ok(&["run", "always", image, "--", "sleep", "3600"]),
+        &["pod/always created"],
+    );
+    assert_eq!(cluster.ok(&["get", "pods", "-o", "name"]), "pod/always\n");
+    says(&cluster.ok(&["delete", "pod", "always"]), &["pod \"always\" deleted"]);
+    assert_eq!(cluster.holds(), empty);
+}
+
+#[test]
+fn workflows_helm_test_runs_the_chart_test_pod_and_delete_pod_deletes_it() {
+    for (n, helm) in helms().iter().enumerate() {
+        let Some(cluster) = Cluster::start(&format!("kube-helm-test-{n}")) else {
+            return;
+        };
+        let empty = cluster.holds();
+        let run = |args: &[&str]| cluster.run(helm, args);
+        let (ok, out, err) = run(&["create", "site"]);
+        assert!(ok, "{out}{err}");
+        let (ok, out, err) = run(&["install", "site", "./site"]);
+        assert!(ok, "{out}{err}");
+        // Nothing runs here (the images are empty), so the test is not passed: helm made the pod, which is
+        // what is asked, and gives up waiting for it.
+        let (_, out, err) = run(&["test", "site", "--timeout", "5s"]);
+        let said = out + &err;
+        assert!(
+            !said.contains("is invalid") && !said.contains("not found"),
+            "helm test: {said}"
+        );
+        let got = cluster.got(&["pod", "site-test-connection"]);
+        assert_eq!(got["kind"], "Pod", "{got}");
+        assert_eq!(got["metadata"]["annotations"]["helm.sh/hook"], "test", "{got}");
+        assert_eq!(got["spec"]["restartPolicy"], "Never", "{got}");
+        assert_eq!(got["spec"]["containers"][0]["image"], "busybox", "{got}");
+        assert_eq!(
+            cluster.held("job/site-test-connection")["metadata"]["annotations"]["kith.dev/pod"],
+            "true"
+        );
+        says(
+            &cluster.ok(&["delete", "pod", "site-test-connection"]),
+            &["pod \"site-test-connection\" deleted"],
+        );
+        cluster.refused(&["get", "pod", "site-test-connection"], &["NotFound"]);
+        // The chart's Deployment is still there, and its pod is the Workload's.
+        says(&cluster.ok(&["get", "pods", "-o", "name"]), &["pod/site-0"]);
+        let (ok, out, err) = run(&["uninstall", "site", "--wait", "--timeout", "30s"]);
+        assert!(ok, "{out}{err}");
+        assert_eq!(cluster.holds(), empty, "kith holds what it held before the chart");
+    }
 }
 
 /// The Deployment `web` of one replica whose image is `kith.test/box:1`, made and applied. Its
@@ -1377,12 +1490,8 @@ fn refused_is_said_with_the_field_and_nothing_is_dropped_in_silence() {
         &["apply", "-f", "never.yaml"],
         &["spec.schedule is no schedule", "`61` is not a minute"],
     );
-    // A pod alone says what to do instead; the ways into a running one ask first for the
-    // right to exec into what owns it, which alice has not.
-    cluster.refused(
-        &["run", "one", "--image=busybox:1.36"],
-        &["a pod is run by what owns it"],
-    );
+    // (A pod alone is run: `kubectl run` is proven in `workflows_kubectl_run_…`.) The ways into
+    // a running one ask first for the right to exec into what owns it, which alice has not.
     cluster.refused(&["exec", "web-0", "--", "true"], &["alice may not exec Workload"]);
     cluster.refused(&["attach", "web-0"], &["may not exec Workload"]);
     cluster.refused(&["cp", "web-0:/etc/hostname", "hostname"], &["may not exec Workload"]);
@@ -1585,6 +1694,12 @@ fn access_is_kiths_own_and_the_kubernetes_api_is_no_way_past_it() {
 /// may get alone, and carol may run in `team`. Asked with curl, so no kubectl is needed.
 #[test]
 fn access_first_exec_attach_and_cp_are_refused_before_any_upgrade() {
+    // Without a delegated cgroup kithd runs no workloads ("workloads will not run"), so the pods
+    // of the Deployment and the Job never appear.
+    if !kith_runtime::has_delegated_cgroup() {
+        eprintln!("skipped: no delegated cgroup here");
+        return;
+    }
     let cluster = Cluster::boot("kube-exec-access");
     cluster.kith(&["identity", "cert", "bob", "--out", "."]);
     cluster.kith(&["identity", "cert", "carol", "--out", "."]);
