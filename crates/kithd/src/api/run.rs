@@ -324,7 +324,7 @@ fn switch<F: Future<Output = ()> + Send + 'static>(
 }
 
 /// Copies both ways until both ends are done, either fails, or kithd is told to stop.
-async fn join(
+pub(crate) async fn join(
     mut stop: watch::Receiver<bool>,
     mut a: impl AsyncRead + AsyncWrite + Unpin,
     mut b: impl AsyncRead + AsyncWrite + Unpin,
@@ -437,7 +437,7 @@ impl Drop for App {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cluster::{self, Cluster};
     use crate::pki::{Ca, Identity};
@@ -486,11 +486,11 @@ sys.exit(subprocess.run(args[4:], stdin=s, stdout=s).returncode)
     /// Two kithds in this process, `a` and `b`, each serving the node API on a loopback
     /// port with its own certificate from one CA. Both have the Identities, Roles and Nodes,
     /// as two nodes of one store do.
-    struct World {
-        a: Arc<Shared>,
-        b: Arc<Shared>,
-        a_port: u16,
-        b_port: u16,
+    pub(crate) struct World {
+        pub(crate) a: Arc<Shared>,
+        pub(crate) b: Arc<Shared>,
+        pub(crate) a_port: u16,
+        pub(crate) b_port: u16,
         ca: Ca,
         /// Removed with the world.
         _dir: crate::scratch::Scratch,
@@ -524,7 +524,7 @@ spec: {role: other-jobber, subjects: [carol]}
 ";
 
     impl World {
-        async fn new(tag: &str) -> World {
+        pub(crate) async fn new(tag: &str) -> World {
             let dir = crate::scratch::Scratch::new(&format!("kithd-run-on-{tag}"));
             let ca = Ca::create().unwrap();
             let mut nodes = Vec::new();
@@ -593,7 +593,7 @@ spec: {role: other-jobber, subjects: [carol]}
         }
 
         /// A client that shows the certificate of the Identity `name` (made now, on `a`).
-        fn user(&self, name: &str) -> reqwest::Client {
+        pub(crate) fn user(&self, name: &str) -> reqwest::Client {
             let (cert, key, public) = self.ca.issue_user(name).unwrap();
             let identity = json!({
                 "apiVersion": kith_api::API_VERSION, "kind": "Identity",

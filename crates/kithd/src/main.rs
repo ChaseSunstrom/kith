@@ -42,6 +42,7 @@ mod forge;
 mod gpt;
 mod home;
 mod images;
+mod in_place;
 mod ingress;
 mod init;
 mod install;
@@ -58,6 +59,7 @@ mod os;
 mod own_writes;
 mod people;
 mod pki;
+mod pod_exec;
 mod pods;
 mod policy;
 mod predict;
@@ -74,6 +76,7 @@ mod seats;
 mod services;
 mod share;
 mod sources;
+mod spdy;
 mod tpm;
 mod ui;
 mod update;
@@ -486,6 +489,8 @@ fn main() -> ExitCode {
         eprintln!("kithd: {msg}");
     }
     if first {
+        // ponytail: a run that fails after a hand-over was begun takes the failure restart with the units
+        // unstopped (`end(true)` is no hand-over): the restart's boot ends them; no special case until seen.
         init::end(done.is_err());
     }
     if done.is_ok() {

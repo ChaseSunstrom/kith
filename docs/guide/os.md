@@ -331,6 +331,9 @@ at any restart of kithd. A staged kithd that fails within a minute is given up f
 running; that end counts toward the ten failures in a minute, a hand-over does not. The root still
 says the old version (it is read-only), so the node says the new one from a note in `/run` that holds
 only for the kithd it names: a reboot starts the slot that was written, which has the new release whole.
+`sh ci/vm.sh --test handover` (it runs at the end of `--test update`) takes a release that differs in
+kithd alone and sees the machine keep its boot id and a pod its process, then takes one with another
+kernel and sees the restart into the other slot. All on disk files.
 
 **Which keys a node takes.** Its own only, whatever key an OSRelease names. Give them before the
 first release:

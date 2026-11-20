@@ -170,6 +170,14 @@ Only the newest version is fixed. There are no security releases of older ones.
   a device does once open, and nothing of an `exec` unit, which is a process of the host.
   Where kithd is not root there is none: the user namespace a container is in there
   makes no device nodes.
+  A process entered into a pod (`kubectl exec`, `cp`, `attach`, `port-forward`) joins the
+  pod's namespaces, user namespace first, and runs as its init's user and groups with its
+  capabilities and seccomp filter. The container library refuses a spec with supplementary
+  groups once the process is in a user namespace, so it reads a private copy of the init's
+  state and spec made for that one entry (a directory of kithd's own user, mode 0700,
+  created without following a link, removed when the process has started or failed to, and
+  swept at the next start if kithd was killed in between); the copy differs from the
+  init's spec in `additionalGids` alone (and in the paths that name where the copy is kept), which the entered process is given as its own.
   A GPU share (`share: { vram }`) is a ceiling only where the Device has a `dmem` region
   and kithd can hand the dmem controller down: the kernel then keeps the container's use
   of that GPU's memory under the share (`dmem.max`). Elsewhere it is a count the scheduler
@@ -294,6 +302,18 @@ Only the newest version is fixed. There are no security releases of older ones.
   give nothing; a pod is given no token and no API to ask. `privileged`, the host's
   namespaces, `hostPath` and added capabilities have no field in kith, and an object
   that asks for one is refused by its name. Of a body in protobuf 50,000 fields are read.
+- **`kubectl exec`, `cp` and `port-forward` are one right, `exec`, on the Workload or Job that
+  owns the pod.** `get` alone reads a pod and is refused all three. A `port-forward` reaches
+  any port of the pod, whatever listens there and whatever a NetworkPolicy says: a policy holds
+  a pod's own packets going out, and this is a connection into it from its node, so it asks no
+  policy; the right to `exec` is the right to reach the pod's ports. The right is asked again
+  for each new connection of a session (a binding taken away refuses the next, and ends none
+  that is open). A replica on another node is reached by one route, `/v1/pod-hop`, which only a
+  control node may send (a worker is refused, not asked) and which carries the caller's name
+  with the sender's signature: the node that runs the replica checks the signature, the named
+  caller and the `exec` right on that node, from its own copy of the Roles, before it enters
+  the pod or opens a connection. A pod not yet made on its node is refused, never answered by
+  the host's own ports.
 - **What a resource makes for itself is asked for with it.** Whoever writes a CronJob
   must be allowed to write a Job, and whoever writes a claim that says `provision`
   (every PersistentVolumeClaim does, unless it names no storage class) a Volume.
