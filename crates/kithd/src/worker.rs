@@ -183,18 +183,52 @@ fn serving_shape(key: &str, serves: &Value) -> Result<(), String> {
 }
 
 /// Refused where the mesh key `fields` say is another node's: two nodes that say one key are both
-/// left out of the mesh, so saying another's cuts it off. (A Node's own patch, by a worker or a
-/// control node alike: `own_writes` calls it too.)
+/// left out of the mesh, so saying another's cuts it off. The key a node is to take next
+/// (`next`, T-1017) is the same: it may be neither another node's key nor its next one. (A Node's
+/// own patch, by a worker or a control node alike: `own_writes` calls it too.)
 pub(crate) fn mesh_key_elsewhere(store: &Store, node: &str, key: &str, fields: &Fields) -> Result<(), String> {
-    let said = fields.get("mesh").and_then(|mesh| mesh["key"].as_str());
-    let theirs = |other: &Resource| {
-        let has = other.status.as_ref().and_then(|status| status["mesh"]["key"].as_str());
-        other.metadata.name != node && has.is_some() && has == said
-    };
-    match store.list(Some("Node")).find(|other| theirs(other)) {
-        Some(other) => Err(refused(key, format!("the mesh key is node {}'s", other.metadata.name))),
-        None => Ok(()),
+    // (Keys, not their texts: what reads a key reads only the one text of it, `key_of`.)
+    let text = |field: &str| fields.get("mesh").and_then(|mesh| mesh[field].as_str());
+    for field in ["key", "next"] {
+        if text(field).is_some_and(|said| crate::mesh::key_of(said).is_none()) {
+            return Err(refused(key, format!("mesh.{field} is a key: 64 lower-case hex digits")));
+        }
     }
+    // (And what it says of a rotation is small: the name asked, and the new keys it holds.)
+    let mesh = fields.get("mesh");
+    for field in ["rotated", "failed"] {
+        let value = mesh.map(|mesh| &mesh[field]).filter(|value| !value.is_null());
+        if value.is_some_and(|value| !value.as_str().is_some_and(crate::mesh::rotate_name)) {
+            return Err(refused(key, format!("mesh.{field} is a short name")));
+        }
+    }
+    let takes = mesh.map(|mesh| &mesh["takes"]).filter(|takes| !takes.is_null());
+    let keys = |takes: &Value| {
+        let list = takes.as_array()?;
+        (list.len() <= 64
+            && list
+                .iter()
+                .all(|key| key.as_str().is_some_and(|k| crate::mesh::key_of(k).is_some())))
+        .then_some(())
+    };
+    if takes.is_some_and(|takes| keys(takes).is_none()) {
+        return Err(refused(key, "mesh.takes is up to 64 keys"));
+    }
+    let said = |field: &str| text(field).and_then(crate::mesh::key_of);
+    let has = |other: &Resource, field: &str| {
+        other
+            .status
+            .as_ref()
+            .and_then(|status| crate::mesh::key_of(status["mesh"][field].as_str()?))
+    };
+    for other in store.list(Some("Node")).filter(|other| other.metadata.name != node) {
+        // (The same field is another's, and so is the other's current key for a next.)
+        let same = |mine: &str, theirs: &str| said(mine).is_some() && has(other, theirs) == said(mine);
+        if same("key", "key") || same("next", "next") || same("next", "key") || same("key", "next") {
+            return Err(refused(key, format!("the mesh key is node {}'s", other.metadata.name)));
+        }
+    }
+    Ok(())
 }
 
 /// What a node says of its people's device (`status.people`): null, or the device's public key
@@ -778,11 +812,11 @@ spec: { volume: there, every: 1d }
         let mut set = |key: &str, status: Value| store.set_status(key, Some(status)).unwrap();
         set(
             "Node/a",
-            json!({ "address": "10.0.0.1:7443", "raftId": "1", "mesh": { "key": "QUFB", "port": 51820 } }),
+            json!({ "address": "10.0.0.1:7443", "raftId": "1", "mesh": { "key": "ab".repeat(32), "port": 51820 } }),
         );
         set(
             "Node/w",
-            json!({ "address": "10.0.0.2:7443", "raftId": "2", "mesh": { "key": "V1dX", "port": 51820 } }),
+            json!({ "address": "10.0.0.2:7443", "raftId": "2", "mesh": { "key": "bc".repeat(32), "port": 51820 } }),
         );
         set(
             "Workload/default/web",
@@ -904,7 +938,7 @@ spec: { volume: there, every: 1d }
         let store = store();
         assert!(try_as(&store, "w", Command::Patch { statuses: Vec::new() }).is_ok());
         assert!(try_as(&store, "w", patch_of("Node/w", json!({ "os": { "version": "1.0.1" } }))).is_ok());
-        let mesh = json!({ "mesh": { "key": "TkVX", "port": 51820, "reaches": ["a"] } });
+        let mesh = json!({ "mesh": { "key": "cd".repeat(32), "port": 51820, "reaches": ["a"] } });
         assert!(try_as(&store, "w", patch_of("Node/w", mesh)).is_ok());
     }
 
@@ -973,7 +1007,7 @@ spec: { volume: there, every: 1d }
             assert!(said.unwrap_err().contains(forged), "{forged}");
         }
         // Another node's mesh key: both would be left out of the mesh.
-        let copied = json!({ "mesh": { "key": "QUFB", "port": 51820 } });
+        let copied = json!({ "mesh": { "key": "ab".repeat(32), "port": 51820 } });
         assert!(
             try_as(&store, "w", patch_of("Node/w", copied))
                 .unwrap_err()
