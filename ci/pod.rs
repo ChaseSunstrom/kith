@@ -817,6 +817,11 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
+        ["bootid"] => {
+            // This boot of the machine (the kernel's, the same for every container on it).
+            let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+            println!("bootid: {}", id.trim());
+        }
         ["memory"] => {
             // Process 1 and kithd: "memory: PID COMM VmRSS RssAnon" (kB).
             for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {

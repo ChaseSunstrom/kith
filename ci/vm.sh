@@ -42,6 +42,8 @@
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
 #                               kills in a minute restart the machine
+#   sh ci/vm.sh --test handover one node: a kithd-only release taken with no restart (boot id and pod
+#                               process kept, the new version reported); a changed kernel restarts it
 #   sh ci/vm.sh --test nested   one node: a container with kith's defaults, then with each opening in
 #                               turn, that starts a second runtime (bubblewrap) and kithd in agent mode and
 #                               says what refused each and the guest kernel's settings; the rows go to
@@ -222,6 +224,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    unit and a Job; the machine stays up, kithd serves again within
                    2 s and takes each back as it ran; killed ten times in a minute,
                    the machine restarts
+  --test handover  instead: one node on the mesh with ci/pod.rs as an image: a release that
+                   differs from the running slot in kithd alone is handed over to with no
+                   restart (same boot id, same pod process, the new version reported), and
+                   a release with another kernel restarts into the other slot (the test
+                   `update` runs it too, after its own)
   --test services  instead: one node with no --mesh (as kith OS starts) with ci/pod.rs as a container image
                    already there: a pod that sends back every byte it is sent, its
                    Service, and a Job on the same node sending through that Service
@@ -388,7 +395,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | nested | nofile | alone | disk | clock | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, nested, nofile, fido2" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | nested | nofile | alone | disk | clock | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, nested, nofile, fido2" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1

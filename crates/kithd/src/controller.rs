@@ -579,8 +579,11 @@ pub async fn run(
         }
     }
     controller.stop.store(true, Ordering::Relaxed);
-    for (id, slot) in &mut controller.slots {
-        stop(id, slot).await;
+    // A hand-over to the next kithd (update.rs) stops no unit: they run on, and it takes them back.
+    if !crate::init::HANDING_OVER.load(Ordering::Relaxed) {
+        for (id, slot) in &mut controller.slots {
+            stop(id, slot).await;
+        }
     }
     // A count or removal holds directories of the state disk open: it is waited for, a little,
     // so the disk can be unmounted once kithd is gone.

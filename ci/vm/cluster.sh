@@ -46,9 +46,9 @@
         [ "$test" != home ] || { more='--mesh --ingress' others='2 3 4' nodes=four four=',[^,? ]+'; }
         # (access: the nodes run the image tests.sh built with the forge feature.)
         [ "$test" != access ] || base=$osdir
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = nofile ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ]; then
         others=2 more=--mesh project=''
-        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != nested ] && [ "$test" != nofile ] || others=''
+        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != nested ] && [ "$test" != nofile ] && [ "$test" != handover ] || others=''
         # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
         # as a node's state from before had none: kithd counts what their pods write.)
         [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
@@ -195,7 +195,8 @@
                 pods) truncate -s 512M "$1" ;;
             esac
         }
-      elif [ "$test" = rollout ]; then
+      fi
+      if [ "$test" = rollout ] || [ "$test" = handover ]; then
         # The nodes run an image built with the release key: the first release they take
         # is one it signed, whoever applies one. (They fetch from this machine, on the
         # network QEMU gives them: their own, so --lan-releases.)
@@ -207,18 +208,61 @@
         [ -z "${KITH_NODE_POLICY:-}" ] || lan="$lan --node-policy $(printf '%s' "$KITH_NODE_POLICY" | sed 's/,/,,/g')"
         # Two releases, both signed: one that runs, and one whose root is not the one its
         # verity tree was made for. The nodes fetch them from this machine.
-        KITH_OS_VERSION=9.0.0-next sh "$root/os/build.sh" --out "$work/next" >&2
         mkdir "$work/www"
-        cp "$work/next/kith-os.update" "$work/www/next.update"
-        cp "$work/next/root.squashfs" "$work/broken.root"
-        dd if=/dev/urandom of="$work/broken.root" bs=4096 count=8 conv=notrunc status=none
-        sh "$root/os/update.sh" 9.0.0-broken "$(sha256sum "$work/broken.root" | cut -d ' ' -f 1)" "$work/broken.root" \
-            "$work/next/root.verity" "$work/next/kith-a.efi" "$work/next/kith-b.efi" >"$work/www/broken.update"
+        if [ "$test" = handover ]; then
+            # Three releases of the one system, built here (a build takes the node's time otherwise):
+            # a, which the image has nothing kept to compare with, so a full update; b, which only
+            # kithd differs in (a byte more at the end of the static executable: another file, the
+            # same program; the same kernel and root otherwise); c, with another kernel, which is
+            # b's pieces under a kernel digest that says so (os/update.sh is how a header is made,
+            # and the node decides on the signed header's digests alone).
+            musl=$(sh "$root/ci/musl.sh")
+            mkdir "$work/bin"
+            cp "$musl/kith" "$musl/kithd" "$work/bin/"
+            printf '\0' >>"$work/bin/kithd"
+            # (The key the image has, as the nodes' own roots are built with it: the rest of the root is the same.)
+            KITH_RELEASE_KEY=$public KITH_OS_VERSION=9.0.0 sh "$root/os/build.sh" --out "$work/rel-a" >&2
+            KITH_RELEASE_KEY=$public KITH_OS_VERSION=9.0.1 KITH_OS_BIN=$work/bin sh "$root/os/build.sh" --out "$work/rel-b" >&2
+            KITH_RELEASE_KEY=$public KITH_OS_VERSION=9.0.2 sh "$root/os/build.sh" --out "$work/rel-c" >&2
+            digests() { head -c 4096 "$1" | sed -n 's/.*"kithd":{"sha256":"\([0-9a-f]\{64\}\)","kernel":"\([0-9a-f]\{64\}\)","rest":"\([0-9a-f]\{64\}\)"}.*/\1 \2 \3/p'; }
+            cp "$work/rel-a/kith-os.update" "$work/www/a.update"
+            cp "$work/rel-b/kith-os.update" "$work/www/b.update"
+            { head -c 4096 "$work/rel-c/kith-os.update" | sed "s/\"kernel\":\"[0-9a-f]\{64\}\"/\"kernel\":\"$(printf '%064d' 7)\"/"; tail -c +4097 "$work/rel-c/kith-os.update"; } >"$work/www/c.update"
+            [ "$(stat -c %s "$work/www/c.update")" = "$(stat -c %s "$work/rel-c/kith-os.update")" ] || fail "the header of release c was not rewritten in place"
+            # What the test is about: b differs from a in kithd alone, c from b in the kernel (and a node running a is told so).
+            read -r a_kithd a_kernel a_rest <<EOF
+$(digests "$work/www/a.update")
+EOF
+            read -r b_kithd b_kernel b_rest <<EOF
+$(digests "$work/www/b.update")
+EOF
+            read -r c_kithd c_kernel c_rest <<EOF
+$(digests "$work/www/c.update")
+EOF
+            # shellcheck disable=SC2015 # (a check: fail when any of them does not hold)
+            [ -n "$a_rest" ] && [ -n "$b_rest" ] && [ -n "$c_rest" ] || fail "a release's header holds no kithd digests"
+            # shellcheck disable=SC2015
+            [ "$a_kithd" != "$b_kithd" ] && [ "$a_kernel" = "$b_kernel" ] && [ "$a_rest" = "$b_rest" ] || fail "release b does not differ from a in kithd alone: $a_kithd $a_kernel $a_rest / $b_kithd $b_kernel $b_rest"
+            [ "$b_kithd" = "$(sha256sum "$work/bin/kithd" | cut -d ' ' -f 1)" ] || fail "release b's kithd digest is not the padded kithd's"
+            # shellcheck disable=SC2015
+            [ "$c_kernel" != "$a_kernel" ] && [ "$c_rest" = "$a_rest" ] || fail "release c does not differ from a in its kernel: $a_kernel $a_rest / $c_kernel $c_rest"
+            [ "$(sha256sum "$work/rel-a/root.squashfs" | cut -d ' ' -f 1)" != "$(sha256sum "$work/rel-b/root.squashfs" | cut -d ' ' -f 1)" ] || fail "releases a and b have the same root"
+            echo "vm.sh: releases: b differs from a in kithd alone ($a_kithd, $b_kithd), c in its kernel digest" >&2
+        fi
+        # (handover: its releases are the ones above.)
+        if [ "$test" = rollout ]; then
+            KITH_OS_VERSION=9.0.0-next sh "$root/os/build.sh" --out "$work/next" >&2
+            cp "$work/next/kith-os.update" "$work/www/next.update"
+            cp "$work/next/root.squashfs" "$work/broken.root"
+            dd if=/dev/urandom of="$work/broken.root" bs=4096 count=8 conv=notrunc status=none
+            sh "$root/os/update.sh" 9.0.0-broken "$(sha256sum "$work/broken.root" | cut -d ' ' -f 1)" "$work/broken.root" \
+                "$work/next/root.verity" "$work/next/kith-a.efi" "$work/next/kith-b.efi" >"$work/www/broken.update"
+        fi
         sign() { sh "$root/os/update.sh" --sign "$work/${2:-key}" "$work/www/$1.update"; }
         # A second key, which the first hands over to in the release every node takes.
         public2=$("$root/target/debug/kith" package keygen "$work/key2")
         handed() { sh "$root/os/update.sh" --handover "$work/$1" "$work/www/next.update" "$public2"; } # KEYFILE
-        by=$public more='' allow=''
+        by=$public allow='' # ($more: the nodes' arguments until a node starts, then a release's)
         web_up "$work/www" $((port + 9)) || fail "the web server on port $((port + 9)) did not start"
         # (The nodes' port 80 is this server: only where it runs, as a guest with no listener there cannot start.)
         # (cmd: each guest connection gets its own socat to that port.)
@@ -425,6 +469,9 @@ EOF
         fi
         if [ "$test" = quota ]; then
             . "$root/ci/vm/quota.sh"
+        fi
+        if [ "$test" = handover ]; then
+            . "$root/ci/vm/handover.sh"
         fi
         if [ "$test" = pods ]; then
             . "$root/ci/vm/pods.sh"
