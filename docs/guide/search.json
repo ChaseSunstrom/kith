@@ -22,6 +22,7 @@
 {"u":"guide/cluster.html#rolling-updates","t":"A cluster","h":"Rolling updates"},
 {"u":"guide/cluster.html#ingress-a-host-of-its-own-with-a-certificate","t":"A cluster","h":"Ingress: a host of its own, with a certificate"},
 {"u":"guide/cluster.html#one-address-for-the-house","t":"A cluster","h":"One address for the house"},
+{"u":"guide/cluster.html#usage-over-time","t":"A cluster","h":"Usage over time"},
 {"u":"guide/cluster.html#not-yet","t":"A cluster","h":"Not yet"},
 {"u":"guide/cluster.html#restarting-a-node-on-purpose","t":"A cluster","h":"Restarting a node on purpose"},
 {"u":"guide/cluster.html#checkpointing-a-long-gpu-job","t":"A cluster","h":"Checkpointing a long GPU Job"},

@@ -1547,6 +1547,14 @@ pub fn has_delegated_cgroup() -> bool {
     cgroup_parent().is_ok()
 }
 
+/// The directory (under the cgroup mount) that holds the cgroups of the units this runtime
+/// starts (`kith-ID` each), where [`Runtime::new`] puts them; for what reads their usage.
+/// None where there is no delegated cgroup.
+pub fn units_cgroup_dir() -> Option<PathBuf> {
+    let parent = cgroup_parent().ok()?;
+    Some(Path::new("/sys/fs/cgroup").join(parent.trim_start_matches('/')))
+}
+
 /// The delegated parent of the cgroup `/proc/self/cgroup` (`proc`) names: its parent, unless that is
 /// the root, which no user was given.
 fn parent_of_own(proc: &str) -> Result<String> {

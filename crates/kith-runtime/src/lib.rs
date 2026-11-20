@@ -20,7 +20,7 @@ pub mod signed;
 
 pub use container::{
     Awaited, Handle, Idle, Left, Mount, NODE_ROOT, ROOTS, Runtime, Undeleted, Unit, container_nofile, exec_shim,
-    has_delegated_cgroup, plugged, reap_orphans, spawn_awaited, started, tune,
+    has_delegated_cgroup, plugged, reap_orphans, spawn_awaited, started, tune, units_cgroup_dir,
 };
 pub use image::{Image, ImageStore, Local, PullPolicy, Unpacking, registry, repository, sha256_hex};
 pub use outside::{Patience, read_capped};

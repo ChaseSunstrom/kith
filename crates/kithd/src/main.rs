@@ -50,6 +50,7 @@ mod kubeproto;
 mod levels;
 mod members;
 mod mesh;
+mod metrics;
 mod modules;
 mod netboot;
 mod os;
@@ -1290,7 +1291,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         ];
         let saying = async {
             let format = raft::tend_format(shared.clone(), stopping.clone());
-            tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format);
+            let state = shared.logs.parent().unwrap_or(&shared.logs).to_path_buf();
+            let sampler = metrics::run(state, stopping.clone());
+            tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format, sampler);
         };
         let house = home::run(shared.clone(), stopping.clone());
         let (served, nodes, (), (), (), (), (), (), (), (), _) = tokio::join!(

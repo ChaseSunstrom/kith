@@ -753,6 +753,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
         .route("/v1/run-hop", post(api::run::hop))
         .route("/v1/raft/stands", get(standing))
         .route("/v1/view", get(crate::view::serve))
+        .route("/v1/node-metrics", get(crate::metrics::node))
         .route("/v1/blob-copy/{name}", get(crate::blobs::copy))
         .route("/v1/volume-copy/{namespace}/{name}", get(crate::replicas::copy))
         .route(

@@ -891,6 +891,15 @@ fn id_prefix(kind: &str, namespace: &str, name: &str) -> String {
     format!("{kind}_{namespace}_{name}_")
 }
 
+/// The Workload (`NS/NAME`) the unit with id `id` (`w_NS_NAME_REPLICA_UNIT`) is a unit of: what
+/// [`id_prefix`] made, read back. None for a Job's or a NodeWorkload's unit, and for what is no
+/// unit id.
+pub fn workload_of_unit(id: &str) -> Option<String> {
+    let mut parts = id.splitn(4, '_');
+    let (_, namespace, name, rest) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    (!rest.is_empty() && id.starts_with(&id_prefix("Workload", namespace, name))).then(|| format!("{namespace}/{name}"))
+}
+
 /// The id of the pod that replica `replica` of the resource with the store key `owner` is,
 /// where its template says `pod`: what its units' ids start with.
 pub fn pod_of(owner: &str, replica: u32) -> String {

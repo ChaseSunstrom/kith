@@ -93,7 +93,8 @@ Only the newest version is fixed. There are no security releases of older ones.
   Node) is not taken: what it passes on is refused whoever it names (see "A node that
   is taken").
 - **Node-to-node routes** (Raft, copies of blobs and volumes, a volume's key, running a
-  command on another node) take a node's certificate only, and, like the API, only
+  command on another node, a node's usage series for `GET /v1/metrics`, which the asked
+  node answers an Identity with only if its Role may list Nodes) take a node's certificate only, and, like the API, only
   while that node's Node is in the store: each request is asked again.
 - **What one node passes on to another is pinned to its name.** A passphrase, a Volume's
   key, a caller's Volume files, a restore, `kith run`, a unit's output, a Volume's copy,

@@ -9,6 +9,7 @@
 //! POST   /v1/rollback/<key>?to=N                 -> Change
 //! GET    /v1/logs/<key>[?unit=&replica=&stderr=true&previous=true&offset=N|tail=LINES]
 //!                                                -> {data, next, more}
+//! GET    /v1/metrics[?range=15m|1h|6h|24h]       -> {range, step, end, nodes, workloads} (`metrics.rs`)
 //! GET    /v1/watch[?after=G&kind=Kind&wait=S]    -> {generation, resources}
 //! GET    /v1/audit[?tail=LINES]                  -> [{at, who, verb, what, ok, error}]
 //! POST   /v1/run {on, via?, argv}                -> 101, then a byte tunnel (see `run.rs`)
@@ -60,6 +61,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/history/{*key}", get(history))
         .route("/v1/rollback/{*key}", post(rollback))
         .route("/v1/logs/{*key}", get(logs))
+        .route("/v1/metrics", get(crate::metrics::serve))
         .route("/v1/restart/{*key}", post(restart))
         .route("/v1/blobs", axum::routing::put(crate::blobs::put))
         .route("/v1/backups/{namespace}/{name}/restore", post(crate::backups::restore))
