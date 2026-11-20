@@ -465,12 +465,10 @@ impl App {
             std::io::ErrorKind::NotFound => format!("{via} is not installed on node {node} (kith does not ship it)"),
             _ => format!("cannot start {via} on node {node}: {e}"),
         })?;
-        if let (Some(leaf), Some(pid)) = (&leaf, child.id()) {
-            if let Err(e) = std::fs::write(leaf.0.join("cgroup.procs"), pid.to_string()) {
-                eprintln!(
-                    "kithd: run: could not put the app in its cgroup, the process group is all that ends it: {e}"
-                );
-            }
+        if let (Some(leaf), Some(pid)) = (&leaf, child.id())
+            && let Err(e) = std::fs::write(leaf.0.join("cgroup.procs"), pid.to_string())
+        {
+            eprintln!("kithd: run: could not put the app in its cgroup, the process group is all that ends it: {e}");
         }
         Ok(App {
             group: child.id().and_then(|pid| i32::try_from(pid).ok()),
@@ -1073,8 +1071,7 @@ spec: {role: other-jobber, subjects: [carol]}
         tokio::time::timeout(Duration::from_secs(20), asked)
             .await
             .expect("no answer")
-            .err()
-            .expect("a tunnel, for an ask that is wrong")
+            .expect_err("a tunnel, for an ask that is wrong")
     }
 
     #[tokio::test]
