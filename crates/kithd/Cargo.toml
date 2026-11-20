@@ -14,6 +14,10 @@ forge = []
 # that folder take it): `kithd fido2-authenticator` answers as a security key on /dev/uhid, so the
 # fido2 VM test can run the client against it (fido2_test.rs).
 fido2-test = []
+# Test only, in no release (ci/musl.sh builds it into a folder of its own, os/build.sh lets only
+# that folder take it): the word `kith.disk-add=SERIAL` on the command line makes the disk of that
+# serial a data disk at the start, until the add verb does (data_disk/boot.rs), for the disk VM test.
+disk-test = []
 
 [dependencies]
 # The same as kith-runtime pulls images with.
