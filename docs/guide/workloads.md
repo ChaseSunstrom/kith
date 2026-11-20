@@ -103,6 +103,46 @@ must be allowed to apply a Job.
 | `startingDeadlineSeconds` | Run, once, the latest minute missed since `status.last` no older than this (a week at most). Without it a missed minute is skipped. |
 | `timezone` not `UTC`, a schedule that cannot be read, a name over 54 characters | The CronJob does not run, and its status says why. |
 
+### Idle work
+
+A template that says `priority: idle` (a Workload's, a Job's or a CronJob's `job`; `normal` is the
+default and changes nothing) runs on what the node does not use. Each of its units gets:
+
+| File of its cgroup | Value | Effect |
+|---|---|---|
+| `cpu.idle` | `1` | The kernel's idle scheduling for the whole unit: it runs only on CPU nothing else wants. |
+| `io.weight` | `default 1` | The lowest disk weight. |
+| `memory.high` | the unit's `resources.memory`, if it states one | Its memory is reclaimed first; without an amount none is set. |
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: build-all }
+spec:
+  parallelism: 8                 # eight at a time, all on the one node the Job runs on
+  completions: 64
+  template:
+    priority: idle               # only spare cycles beside whatever else runs there
+    containers:
+      - name: build
+        image: registry.example/ci/build:1
+        resources: { memory: 2Gi }
+```
+
+- Nothing is made idle unless it says so: a Job or a Workload without `priority` runs as before.
+  A value other than `normal` or `idle` is refused (422).
+- Beside a seat's desktop, idle work takes what the desktop leaves and no more. The seat's
+  `reserve` still comes off the node, and `yieldTo` still holds a unit to a twentieth of a CPU
+  while the seat is busy: `priority: idle` goes under both (see
+  [what a seat keeps for itself](hardware.md#what-a-seat-keeps-for-itself)). A unit that is both
+  idle and held by a seat keeps the lowest weights.
+- Changing `priority` replaces the replica (its cgroup is made again), as changing its image does.
+- To run batch work across the cluster beside people's desktops, give it `priority: idle` and a
+  `resources.memory`, and no `yieldTo` is needed. A Job runs on one node, so spread the work over
+  several Jobs (one per slice of it), or run it as a Workload with `replicas`, which the leader
+  spreads over the nodes with room. Idle is not preemption: the scheduler places it as any unit
+  and nothing is evicted for a busier one.
+
 ### Not yet
 
 - `exec` probes are accepted and do nothing (the status says so). A container's `ports` only name
@@ -189,7 +229,11 @@ spec:
   ```
 
   The image runs only if a certificate from that authority names exactly that subject and issuer
-  and was valid when the log (under its key) saw the signature. What this proves and what it
+  and was valid when the log (under its key) saw the signature. A signature in a log of Rekor v2
+  (a time from a timestamp authority, no promise) is refused unless the identity also gives
+  `tsa: [ "-----BEGIN CERTIFICATE-----\n…" ]`, the authority's root (1 to 4), whose RFC 3161
+  timestamp then times it; with `tsa`, every signature of that identity needs the timestamp.
+  What this proves and what it
   does not: [SECURITY.md](../../SECURITY.md#what-is-not-defended) and
   [docs/adr-keyless.md](../../docs/adr-keyless.md).
 - **Keys named once, for the cluster.** A `Cluster`'s `spec.images` says which keys sign the
@@ -223,7 +267,7 @@ spec:
   `vms` unit is for.
 - **Not yet.** No AppArmor or SELinux profile. On kith OS, no user namespace for a container on
   the node's network, one given devices or one with a volume of another node. A call the kernel
-  gains later is let through until it is named in the filter. A log of Rekor v2 is not read. An
+  gains later is let through until it is named in the filter. A log of Rekor v2 is not read: its signatures are taken only by a timestamp (an identity's `tsa`). An
   `exec` unit is none of this: it is a process of the host.
 
 ### A replica as a pod

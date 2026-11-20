@@ -385,6 +385,11 @@ fn inputs<'a>(
 /// it is itself rendered from.
 fn render(job: &Job) -> Result<Output, String> {
     let package = Package::from_files(job.files.clone())?;
+    // (From the files themselves, which are what is rendered: a Package resource's own
+    // spec is only what its pusher wrote there.)
+    if let Some(why) = package.meta.kith_mismatch(env!("CARGO_PKG_VERSION")) {
+        return Err(why);
+    }
     let release = kith_packages::Release {
         name: &job.name,
         namespace: &job.namespace,
@@ -1377,8 +1382,16 @@ mod tests {
     }
 
     fn package(version: &str, templates: &[(&str, &str)]) -> Resource {
+        package_asking(version, "", templates)
+    }
+
+    /// `package(..)` with `kith` as its package.yaml lines (a `kithVersion`, say).
+    fn package_asking(version: &str, kith: &str, templates: &[(&str, &str)]) -> Resource {
         let mut files = BTreeMap::from([
-            ("package.yaml".to_string(), format!("name: maps\nversion: {version}\n")),
+            (
+                "package.yaml".to_string(),
+                format!("name: maps\nversion: {version}\n{kith}"),
+            ),
             ("values.yaml".to_string(), "colour: red\nextra: false\n".to_string()),
             ("NOTES".to_string(), "{{ name }} is {{ values.colour }}".to_string()),
         ]);
@@ -1770,6 +1783,37 @@ mod tests {
         assert!(refused.contains("there is no Release/shop/mine"), "{refused}");
         let release = Resource::from_source(RELEASE).unwrap().remove(0).unwrap();
         assert_eq!(claims(&store, &[copy, release]), Ok(()));
+    }
+
+    /// A Package that asks for a newer kithd than runs is the Release's error, naming
+    /// both, and installs nothing; one that fits, or asks for nothing, installs (T-0990).
+    #[test]
+    fn releases_kith_version_a_package_for_a_newer_kithd_is_not_installed() {
+        let running = env!("CARGO_PKG_VERSION");
+        let owned = |store: &Store| store.list(None).filter(|resource| owner(resource).is_some()).count();
+        for (asked, installs) in [
+            ("kithVersion: '>=99'\n", false),
+            ("kithVersion: nonsense\n", false),
+            ("kithVersion: '>=0.1'\n", true),
+            ("", true),
+        ] {
+            let (mut store, mut renders) = (Store::default(), Renders::new());
+            store
+                .apply(package_asking("1.0.0", asked, &[("map.yaml", MAP)]))
+                .unwrap();
+            apply(&mut store, RELEASE);
+            settle(&mut store, &mut renders);
+            let (state, message) = said(&store);
+            if installs {
+                assert_eq!((state, owned(&store)), (json!("installed"), 2), "{asked}: {message}");
+            } else {
+                assert_eq!((&state, owned(&store)), (&json!("error"), 0), "{asked}");
+                assert!(
+                    message.contains(&format!("this kith is {running}")) && message.contains("maps 1.0.0"),
+                    "{message}"
+                );
+            }
+        }
     }
 
     #[test]
