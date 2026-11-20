@@ -522,8 +522,19 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
   does](os.md#rolling-a-release-through-the-cluster)): it drains the node, restarts it once each replica the
   plan says moves runs on another node (a replica that stays holds nothing), and lifts the drain
   when the node is done, the plan is paused or changed, its OSRelease is gone, or the node leaves
-  its selector. It waits at most `drainSeconds` (300 unless said, 3600 at most). It lifts only a
-  drain it put on: yours, put on first, stays until you undrain.
+  its selector, or the plan is deleted. It waits at most `drainSeconds` (300 unless said, 3600 at
+  most). It lifts only a drain it put on: yours, put on first, stays until you undrain. The plan's
+  name is in the value of its taints (`plan:NAME`), which is how a deleted plan's drain and cordon
+  are found and lifted; a taint without it is never lifted by a plan. A plan that picks a node
+  whose drain a deleted plan left takes that drain over. Three things to know:
+  - The taint values `plan:NAME` and `owner;plan:NAME` are reserved for this; do not set them.
+  - The plan's name can be read by anyone who may read Nodes (`Node.spec.taints[].value`).
+  - During a rolling upgrade, an older kithd reads only the exact value `owner`, so on a node
+    with `owner;plan:NAME` it may lift a cordon that was an operator's, or leave one stuck until
+    `kith node uncordon`. Finish the upgrade before you run an UpdatePlan with `drain: true`.
+  - A plan lifts only a drain or cordon that carries its own stamp. One an older kithd put on
+    has none, so it stays after the plan ends or is deleted, until `kith node undrain` or
+    `kith node uncordon`.
 
 ### Checkpointing a long GPU Job
 

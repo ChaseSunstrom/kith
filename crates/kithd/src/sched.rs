@@ -144,6 +144,14 @@ pub(crate) fn cordon_on(spec: &mut Value, key: &str, effect: &str) {
     spec["taints"] = Value::Array(taints);
 }
 
+/// Does this cordon record say an owner set the cordon first? Its value is `owner`, or
+/// `owner;plan:NAME` when an update plan put the record on (`update.rs`).
+fn owner_set(taint: &Value) -> bool {
+    taint["value"]
+        .as_str()
+        .is_some_and(|value| value == "owner" || value.starts_with("owner;"))
+}
+
 /// Takes the cordon record under `key` off a Node's spec, and the cordon with it unless an
 /// owner set it. When the record set the cordon and another record still holds it, that other
 /// record now says it set it, so its own end takes the cordon off.
@@ -155,13 +163,19 @@ pub(crate) fn cordon_off(spec: &mut Value, key: &str) {
         return;
     };
     let taint = taints.remove(at);
-    let mut lift = taint["value"] != "owner";
+    let mut lift = !owner_set(&taint);
     let held = taints
         .iter_mut()
         .find(|taint| CORDON_RECORDS.contains(&taint["key"].as_str().unwrap_or_default()));
     if let Some(other) = held {
-        if lift && let Some(other) = other.as_object_mut() {
-            other.remove("value");
+        if lift && let Some(rest) = other["value"].as_str().and_then(|v| v.strip_prefix("owner")) {
+            // It no longer says an owner set the cordon; a plan stamp after it stays (`update.rs`).
+            match rest.strip_prefix(';') {
+                Some(stamp) => other["value"] = stamp.into(),
+                None => {
+                    other.as_object_mut().map(|other| other.remove("value"));
+                }
+            }
         }
         lift = false;
     }
