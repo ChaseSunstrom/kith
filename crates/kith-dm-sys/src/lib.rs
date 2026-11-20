@@ -460,6 +460,207 @@ pub fn bounding_drop(cap: u32) -> Result<()> {
     Ok(())
 }
 
+/// The most descriptors one message carries (the kernel's `SCM_MAX_FD`).
+pub const MOST_FDS: usize = 253;
+
+/// A connected pair of unix sockets, close-on-exec, of `SOCK_SEQPACKET`: a message is read whole
+/// or not at all (a datagram's boundary), it is not lost, and an end that is closed reads as end
+/// of file at the other (a datagram pair has none, so a reader of one would wait for ever). Each
+/// takes a message of 256 KiB and more at once (`SO_SNDBUF`, as far as the system allows).
+pub fn socketpair() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: socketpair writes two descriptors into `fds`, which holds two.
+    let made = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if made < 0 {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: both descriptors are new, and nothing else holds them.
+    let (a, b) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for end in [&a, &b] {
+        let size: libc::c_int = 1 << 19;
+        // SAFETY: SO_SNDBUF reads one int, `size`. (A refusal leaves the default.)
+        unsafe {
+            libc::setsockopt(
+                end.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    Ok((a, b))
+}
+
+/// Whole of `socket`'s message `bytes` sent, with the descriptors `fds` (at most [`MOST_FDS`])
+/// beside it (`SCM_RIGHTS`): the other end gets its own copies. Waits as long as the socket's send
+/// timeout allows (`SO_SNDTIMEO`), and then says `WouldBlock`.
+pub fn send_fds(socket: BorrowedFd, bytes: &[u8], fds: &[BorrowedFd]) -> Result<()> {
+    if fds.len() > MOST_FDS {
+        return Err(Error::other(format!("{} descriptors: at most {MOST_FDS}", fds.len())));
+    }
+    let raw: Vec<libc::c_int> = fds.iter().map(AsRawFd::as_raw_fd).collect();
+    let data = std::mem::size_of_val(raw.as_slice()) as libc::c_uint;
+    // SAFETY: CMSG_SPACE only computes a size.
+    let space = unsafe { libc::CMSG_SPACE(data) } as usize;
+    // (`u64`s: the control buffer is aligned for a `cmsghdr`.)
+    let mut control = vec![0u64; space.div_ceil(8)];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr().cast_mut().cast(),
+        iov_len: bytes.len(),
+    };
+    // SAFETY: an all-zero msghdr is a valid one (null pointers, zero lengths).
+    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+    header.msg_iov = &raw mut iov;
+    header.msg_iovlen = 1;
+    if !raw.is_empty() {
+        header.msg_control = control.as_mut_ptr().cast();
+        header.msg_controllen = space as _;
+        // SAFETY: the control buffer is `space` bytes, room for one header and `data` bytes after
+        // it, so CMSG_FIRSTHDR is inside it and CMSG_DATA has `data` bytes to write.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&header);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(data) as _;
+            std::ptr::copy_nonoverlapping(raw.as_ptr().cast::<u8>(), libc::CMSG_DATA(cmsg), data as usize);
+        }
+    }
+    loop {
+        // SAFETY: `header` points at `iov` (the bytes) and `control`, alive for the call, which
+        // only reads them.
+        let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &header, libc::MSG_NOSIGNAL) };
+        match sent {
+            n if n as usize == bytes.len() => return Ok(()),
+            n if n >= 0 => return Err(Error::other("a message sent in part")),
+            _ => match Error::last_os_error() {
+                e if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                e => return Err(e),
+            },
+        }
+    }
+}
+
+/// One message of `socket` read into `buf`, and the descriptors that came with it (at most
+/// `most`, itself at most [`MOST_FDS`]; close-on-exec): how many bytes, and the descriptors. Zero
+/// bytes is the other end closed (or an empty message). A message longer than `buf`, or with more
+/// descriptors than `most`, is refused whole, its descriptors closed. Waits as long as the receive
+/// timeout allows (`SO_RCVTIMEO`), and then says `WouldBlock`.
+pub fn recv_fds(socket: BorrowedFd, buf: &mut [u8], most: usize) -> Result<(usize, Vec<OwnedFd>)> {
+    let most = most.min(MOST_FDS);
+    // SAFETY: CMSG_SPACE only computes a size.
+    let space = unsafe { libc::CMSG_SPACE((most * std::mem::size_of::<libc::c_int>()) as libc::c_uint) } as usize;
+    let mut control = vec![0u64; space.div_ceil(8)];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: an all-zero msghdr is a valid one.
+    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+    header.msg_iov = &raw mut iov;
+    header.msg_iovlen = 1;
+    header.msg_control = control.as_mut_ptr().cast();
+    header.msg_controllen = space as _;
+    let got = loop {
+        // SAFETY: `header` points at `iov` (`buf`) and `control`, alive and writable for the call,
+        // which writes no more than their lengths.
+        let got = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut header, libc::MSG_CMSG_CLOEXEC) };
+        if got >= 0 {
+            break got as usize;
+        }
+        match Error::last_os_error() {
+            e if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            e => return Err(e),
+        }
+    };
+    // Every descriptor taken before anything is refused, so that none is left open.
+    let mut fds = Vec::new();
+    // SAFETY: the kernel filled `control` with `msg_controllen` bytes of well-formed headers; each
+    // SCM_RIGHTS payload is whole descriptors, which are ours now and nothing else's.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&header);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let bytes = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let data = libc::CMSG_DATA(cmsg).cast::<libc::c_int>();
+                for at in 0..bytes / std::mem::size_of::<libc::c_int>() {
+                    fds.push(OwnedFd::from_raw_fd(data.add(at).read_unaligned()));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&header, cmsg);
+        }
+    }
+    // (The control buffer is padded to eight bytes: room for one more than `most` can be left.)
+    if fds.len() > most || header.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        return Err(Error::new(
+            std::io::ErrorKind::InvalidData,
+            "a message longer than the room for it, or with more descriptors",
+        ));
+    }
+    Ok((got, fds))
+}
+
+/// `prctl(PR_SET_NO_NEW_PRIVS)`: no program this thread starts, or its children, has more
+/// privilege than it had (set-user-id bits and file capabilities do nothing). It cannot be
+/// undone.
+pub fn no_new_privs() -> Result<()> {
+    // SAFETY: PR_SET_NO_NEW_PRIVS takes its flag by value and reads no memory.
+    match unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// `setresuid(2)` of the process: real, effective and saved user id, `None` for one left as
+/// it is. (The C library sets it on every thread.)
+pub fn setresuid(real: Option<u32>, effective: Option<u32>, saved: Option<u32>) -> Result<()> {
+    let id = |id: Option<u32>| id.unwrap_or(u32::MAX);
+    // SAFETY: setresuid takes three ids by value; u32::MAX is "unchanged".
+    match unsafe { libc::setresuid(id(real), id(effective), id(saved)) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// The capabilities of the calling thread: `[effective, permitted, inheritable]`, as bit sets
+/// (capability `n` is bit `n`).
+pub fn capget() -> Result<[u64; 3]> {
+    let (header, mut data) = cap_header();
+    // SAFETY: capget reads the header and writes two `__user_cap_data_struct`s (version 3) to `data`.
+    match unsafe { libc::syscall(libc::SYS_capget, &raw const header, data.as_mut_ptr()) } {
+        0 => Ok([0, 1, 2].map(|set| u64::from(data[0][set]) | u64::from(data[1][set]) << 32)),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// `capset(2)` of the calling thread (per thread, as the kernel has it): `[effective, permitted,
+/// inheritable]` as bit sets. The kernel refuses what is not a subset of what the thread has.
+pub fn capset(sets: [u64; 3]) -> Result<()> {
+    let (header, mut data) = cap_header();
+    for (set, bits) in sets.into_iter().enumerate() {
+        data[0][set] = bits as u32;
+        data[1][set] = (bits >> 32) as u32;
+    }
+    // SAFETY: capset reads the header and two `__user_cap_data_struct`s (version 3) from `data`.
+    match unsafe { libc::syscall(libc::SYS_capset, &raw const header, data.as_ptr()) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// A version 3 `__user_cap_header_struct` (the calling thread: pid 0) and room for its two
+/// `{effective, permitted, inheritable}` data structs, as `[low, high][set]`.
+fn cap_header() -> ([u32; 2], [[u32; 3]; 2]) {
+    ([0x2008_0522, 0], [[0; 3]; 2])
+}
+
 /// Makes the part of this program that is written only while it starts (the addresses set
 /// right at its start: tables of functions, the table of its own addresses) read-only, as the
 /// loader of a program that is not static does. A static program of musl's sets those addresses
@@ -922,6 +1123,7 @@ pub fn relro_ranges(headers: impl Iterator<Item = (u32, usize, usize)> + Clone, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsFd;
     use std::time::Duration;
 
     /// Held by each test here that has a child, so the one that looks for any ended child
@@ -1355,5 +1557,125 @@ mod tests {
             looked != 0 || unsafe { info.si_pid() } == 0,
             "a child was left uncollected"
         );
+    }
+
+    fn timeout(end: &OwnedFd, option: libc::c_int, millis: i64) {
+        let at = libc::timeval {
+            tv_sec: millis / 1000,
+            tv_usec: (millis % 1000) * 1000,
+        };
+        // SAFETY: the option reads one timeval.
+        let set = unsafe {
+            libc::setsockopt(
+                end.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&raw const at).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0);
+    }
+
+    #[test]
+    fn a_message_and_a_descriptor_cross_a_socketpair() {
+        let (a, b) = socketpair().unwrap();
+        let file = tempfile_with(b"through the socket");
+        send_fds(a.as_fd(), b"hello", &[file.as_fd()]).unwrap();
+        let mut buf = [0u8; 64];
+        let (n, fds) = recv_fds(b.as_fd(), &mut buf, 4).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        assert_eq!(fds.len(), 1);
+        let mut copy = File::from(fds.into_iter().next().unwrap());
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut copy, &mut text).unwrap();
+        assert_eq!(text, "through the socket");
+    }
+
+    #[test]
+    fn a_big_message_crosses_whole_and_a_short_buffer_refuses_it() {
+        let (a, b) = socketpair().unwrap();
+        let big = vec![7u8; 256 * 1024];
+        send_fds(a.as_fd(), &big, &[]).unwrap();
+        let mut buf = vec![0u8; 256 * 1024];
+        let (n, fds) = recv_fds(b.as_fd(), &mut buf, 0).unwrap();
+        assert_eq!((n, fds.len()), (big.len(), 0));
+        send_fds(a.as_fd(), &big, &[]).unwrap();
+        let mut small = [0u8; 16];
+        let refused = recv_fds(b.as_fd(), &mut small, 0).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn more_descriptors_than_the_room_are_refused_and_closed() {
+        let (a, b) = socketpair().unwrap();
+        let file = tempfile_with(b"x");
+        send_fds(a.as_fd(), b"two", &[file.as_fd(), file.as_fd()]).unwrap();
+        let mut buf = [0u8; 8];
+        let refused = recv_fds(b.as_fd(), &mut buf, 1).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+        assert!(send_fds(a.as_fd(), b"", &vec![file.as_fd(); MOST_FDS + 1]).is_err());
+    }
+
+    #[test]
+    fn a_closed_end_reads_as_end_of_file_and_a_quiet_one_times_out() {
+        let (a, b) = socketpair().unwrap();
+        timeout(&b, libc::SO_RCVTIMEO, 50);
+        let mut buf = [0u8; 8];
+        let quiet = recv_fds(b.as_fd(), &mut buf, 0).unwrap_err();
+        assert_eq!(quiet.kind(), std::io::ErrorKind::WouldBlock);
+        drop(a);
+        // (Another test's fork may hold a copy of the closed end for a moment: wait it out.)
+        let end = (0..40).find_map(|_| match recv_fds(b.as_fd(), &mut buf, 0) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+            done => Some(done),
+        });
+        assert_eq!(end.expect("an end of file").unwrap().0, 0);
+    }
+
+    #[test]
+    fn a_full_socket_times_out_a_sender() {
+        let (a, _b) = socketpair().unwrap();
+        timeout(&a, libc::SO_SNDTIMEO, 50);
+        let chunk = vec![0u8; 64 * 1024];
+        let stuck = (0..10_000).find_map(|_| send_fds(a.as_fd(), &chunk, &[]).err());
+        assert_eq!(
+            stuck.expect("a socket that never fills").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn the_privilege_wrappers_keep_what_the_thread_has() {
+        // Own thread: capset and no_new_privs are per thread, and setresuid to what is already
+        // ours changes nothing.
+        std::thread::spawn(|| {
+            let [effective, permitted, inheritable] = capget().unwrap();
+            assert_eq!(effective & !permitted, 0);
+            capset([effective, permitted, inheritable]).unwrap();
+            let uid = unsafe { libc::getuid() };
+            setresuid(None, None, None).unwrap();
+            setresuid(Some(uid), Some(uid), Some(uid)).unwrap();
+            no_new_privs().unwrap();
+            no_new_privs().unwrap();
+            // Raising a capability the thread lacks is refused.
+            if permitted != u64::MAX {
+                assert!(capset([effective, u64::MAX, inheritable]).is_err());
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    fn tempfile_with(bytes: &[u8]) -> File {
+        let path = std::env::temp_dir().join(format!(
+            "kith-dm-sys-fd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file
     }
 }

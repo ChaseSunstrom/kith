@@ -2286,7 +2286,14 @@
           "items": {
             "type": "string"
           },
-          "description": "The namespaces whose pods may name this exit."
+          "description": "The namespaces whose pods may name this exit. At least one of this and `levels`."
+        },
+        "levels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The people's levels (AccessLevels) whose peers may leave by this exit, when the level\nnames it (its `exit`) and this node, which holds the tunnel, is the one they come to.\nWhoever writes the Exit says who spends its provider's key."
         },
         "dns": {
           "type": "array",
@@ -2298,8 +2305,7 @@
       },
       "required": [
         "node",
-        "secret",
-        "namespaces"
+        "secret"
       ],
       "description": "A WireGuard tunnel one node holds, which the pods there that name it (a template's\n`exit`) leave by and by nothing else: no container is given a capability, a sysctl or\na tun device for it. While the tunnel is down what they send to the world is\ndropped, IPv6 to anywhere but the mesh always is, and their names are asked of\n`dns` through the tunnel or not at all. They reach the cluster as other pods do."
     },

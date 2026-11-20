@@ -37,7 +37,7 @@ struct Pod {
 }
 
 /// What a container of a pod is given.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Given {
     /// The pod's network namespace, by a path any process of this machine can open.
     pub netns: PathBuf,
