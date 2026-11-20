@@ -57,6 +57,100 @@ fn every_guide_is_read() {
     );
 }
 
+/// The front page says how a compose stack becomes kith's and names each key the reader
+/// refuses: the names are read from compose.rs's REFUSED, so the list cannot drift from it.
+#[test]
+fn readme_says_how_a_compose_stack_becomes_kiths() {
+    let source = std::fs::read_to_string(root().join("crates/kith-kube/src/compose.rs")).unwrap();
+    let table = source.split("const REFUSED").nth(1).expect("compose.rs has no REFUSED");
+    let refused: Vec<&str> = table
+        .split("];")
+        .next()
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("(\"")?.split('"').next())
+        .collect();
+    assert!(refused.len() >= 8, "REFUSED was read as {refused:?}");
+    let page = DOCS[0].1;
+    let section = page
+        .split("\n## ")
+        .find(|s| s.to_lowercase().starts_with("coming from docker compose"))
+        .expect("README.md has no section on coming from docker compose");
+    for said in [
+        "Workload",
+        "Service",
+        "Volume",
+        "kith import compose",
+        "docs/guide/kubernetes.md#from-a-docker-compose-file",
+    ] {
+        assert!(section.contains(said), "the compose section does not say: {said}");
+    }
+    for key in refused {
+        assert!(
+            section.contains(&format!("`{key}`")),
+            "the compose section does not name `{key}`"
+        );
+    }
+}
+
+/// The media stack's apply-to-ready time is written beside `docker compose up`'s, in the
+/// front page and in the numbers guide, as the same two figures, and where kith is the slower
+/// the page says by how much and why.
+#[test]
+fn compose_timing_is_written_beside_docker() {
+    // "kith 12.345 s" / "docker 6.789 s": the figures ci/vm/compose.sh prints, as pages write them.
+    fn figure(page: &str, name: &str) -> f64 {
+        let tail = page
+            .split(&format!("{name} "))
+            .skip(1)
+            .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+            .unwrap_or_else(|| panic!("no `{name} N.N s` figure in the section"));
+        let number: String = tail.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        assert!(
+            tail[number.len()..].starts_with(" s"),
+            "`{name} {number}` is not in seconds"
+        );
+        number.parse().unwrap()
+    }
+    let mut seen = Vec::new();
+    for (path, page) in [DOCS[0], DOCS[12]] {
+        let section = page
+            .split("\n#")
+            .find(|s| {
+                s.trim_start_matches('#')
+                    .trim_start()
+                    .to_lowercase()
+                    .starts_with("the compose stack beside docker")
+            })
+            .unwrap_or_else(|| panic!("{path} has no section `The compose stack beside docker`"));
+        assert!(
+            section.contains("docker compose up"),
+            "{path}: the section does not name `docker compose up`"
+        );
+        assert!(
+            section.contains("ci/vm.sh --test compose"),
+            "{path}: the section does not say how to run it"
+        );
+        let (kith, docker) = (figure(section, "kith"), figure(section, "docker"));
+        assert!(kith > 0.0 && docker > 0.0, "{path}: a figure of 0 s");
+        if kith > docker {
+            assert!(
+                section.contains("slower"),
+                "{path}: kith is slower and the section does not say so"
+            );
+            assert!(
+                section.contains("because"),
+                "{path}: kith is slower and the section does not say why"
+            );
+        }
+        seen.push((kith, docker));
+    }
+    assert_eq!(
+        seen[0], seen[1],
+        "the front page and the numbers guide carry different figures"
+    );
+}
+
 fn root() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
 }
@@ -386,6 +480,74 @@ fn readme_carries_the_measured_comparison() {
             "README.md's table beside k3s has a row ci/compare.txt lacks: {row}"
         );
     }
+}
+
+/// The stress table under `## Under load` is the rows of ci/stress.txt: one row for each, in
+/// its order, with the cells ci/stress.txt's values give (not numbers typed in).
+#[test]
+fn readme_carries_the_stress_rows() {
+    let stress = std::fs::read_to_string(root().join("ci/stress.txt")).expect("ci/stress.txt");
+    let rows: Vec<&str> = stress
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    assert!(!rows.is_empty(), "ci/stress.txt has no rows");
+    let readme = DOCS[0].1;
+    let section = readme
+        .split("\n## Under load\n")
+        .nth(1)
+        .expect("README.md: ## Under load");
+    let section = section.split("\n## ").next().unwrap_or(section);
+    let table: Vec<&str> = section.lines().filter(|line| line.starts_with('|')).collect();
+    assert_eq!(
+        table.first().copied(),
+        Some(STRESS_HEADER),
+        "README.md's stress table has another header"
+    );
+    assert!(
+        table.get(1).is_some_and(|line| line.starts_with("| ---")),
+        "README.md's stress table has no separator line under its header"
+    );
+    let cells: Vec<Vec<String>> = table[2..]
+        .iter()
+        .map(|line| {
+            line.trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        cells.len(),
+        rows.len(),
+        "README.md's stress table and ci/stress.txt differ in rows"
+    );
+    for (row, said) in rows.iter().zip(&cells) {
+        assert_eq!(
+            said,
+            &stress_cells(row),
+            "README.md's stress table lacks the row of ci/stress.txt: {row}"
+        );
+    }
+}
+
+const STRESS_HEADER: &str = "| containers | nodes | system | max pods a node | ready (s) | memory each (MB) | Services (s) | answers | store | back (s) |";
+
+/// A row of ci/stress.txt, as the README's table shows it (`-` where the row has no such value).
+fn stress_cells(row: &str) -> Vec<String> {
+    // (A k3s row ends in its mark, `k3s max_pods=N`; a kith row has none.)
+    let (head, system, pods) = match row.rsplit_once(" k3s max_pods=") {
+        Some((head, pods)) => (head, "k3s", pods),
+        None => (row, "kith", "-"),
+    };
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let at = |i: usize| words.get(i).copied().unwrap_or("-");
+    // (A size that fails has `limit` in the fourth place, and nothing measured after it.)
+    let limit = at(3) == "limit";
+    let of = |i: usize| if limit { "-" } else { at(i) };
+    [at(0), at(1), system, pods, at(3), of(4), of(12), of(14), of(15), of(16)]
+        .map(str::to_string)
+        .to_vec()
 }
 
 #[test]

@@ -319,6 +319,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --selftest-kill  instead: start this script with a stand-in for QEMU, kill its shell from
                    outside (SIGKILL, then SIGTERM) and expect no QEMU left and the VM lock
                    free; needs no QEMU, KVM or kernel
+  --selftest-sweep instead: a run takes the VM lock and deletes the work folders of killed runs (the
+                   kith-vm-work-UID.* folders under TMPDIR), but no other folder and not the lock file;
+                   needs sh and mktemp, no QEMU, KVM or kernel
   --selftest-web   instead: web_up serves a directory on a port and returns once it answers; with
                    another process holding the port, it returns 1 with that server's own error;
                    needs python3 and curl, no QEMU, KVM or kernel
@@ -337,6 +340,7 @@ while [ $# -gt 0 ]; do
     --selftest-kill) selftest='kill'; shift ;;
     --selftest-said) selftest='said'; shift ;;
     --selftest-web) selftest='web'; shift ;;
+    --selftest-sweep) selftest='sweep'; shift ;;
     --kernel | --initrd | --disk | --append | --time | --test)
         [ $# -ge 2 ] || { echo "vm.sh: $1 needs a value" >&2; exit 2; }
         case $1 in
@@ -366,10 +370,11 @@ skip() { echo "skipped: $1"; exit 0; }
 # said_in FILE TEXT: the console FILE says TEXT (a grep pattern). A kernel stack-depth record (what a
 # task prints when it exits: "[ts] comm (pid) used greatest stack depth: N bytes left") can land in the
 # middle of a line the guest is writing, which then reads as two lines. TEXT is looked for as written;
-# failing that, with that one record taken out (and its newline) and nothing else.
+# failing that, with that one record taken out (and its newline) and nothing else. (The serial console
+# ends a line with CR LF, the kernel's and the guest's alike, so the newline may follow a CR.)
 said_in() {
     grep -aq "$2" "$1" 2>/dev/null && return 0
-    sed -z -E 's/\[ *[0-9]+\.[0-9]+\] [^ ()]+ \([0-9]+\) used greatest stack depth: [0-9]+ bytes left\n//g' "$1" | grep -aq "$2"
+    sed -z -E 's/\[ *[0-9]+\.[0-9]+\] [^ ()]+ \([0-9]+\) used greatest stack depth: [0-9]+ bytes left\r?\n//g' "$1" | grep -aq "$2"
 }
 
 # --selftest-said: said_in on fixture logs. A kernel stack-depth record can land in the middle of a
@@ -384,8 +389,10 @@ if [ "$selftest" = said ]; then
     printf 'reboot: Restarting %s\nkithd: serving\n' "$rec" >"$st/absent"
     printf 'kithd: init: restarting\n' >"$st/other"
     printf 'kithd: init: the state'"'"'s file system grown to 40[    2.926586] kithd (90) used greatest stack depth: 13224 bytes left\n709 MB\n' >"$st/grown"
+    printf 'kithd: init: sta[    1.208476] kithd (90) used greatest stack depth: 13224 bytes left\r\nte on /dev/vda7\r\n' >"$st/crlf"
     bad=0
     said_in "$st/grown" 'grown to 40709 MB' || { echo "vm.sh: selftest: FAIL: a line split by a record does not match" >&2; bad=1; }
+    said_in "$st/crlf" 'kithd: init: state on /dev/vda7' || { echo "vm.sh: selftest: FAIL: a line split by a record on a CR LF console does not match" >&2; bad=1; }
     said_in "$st/split" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: an interleaved line does not match" >&2; bad=1; }
     said_in "$st/whole" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: a whole line does not match" >&2; bad=1; }
     said_in "$st/beside" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: a line beside a record does not match" >&2; bad=1; }
@@ -409,7 +416,7 @@ if [ "$selftest" = kill ]; then
     bad=0 alive=''
     for sig in KILL TERM; do
         rm -f "$st/pid"
-        KITH_VM_STUB=1 KITH_VM_LOCK="$st/lock" PATH="$st/bin:$PATH" \
+        KITH_VM_STUB=1 KITH_VM_LOCK="$st/lock" TMPDIR="$st" PATH="$st/bin:$PATH" \
             sh "$0" --kernel "$st/kernel" --initrd "$st/initrd" --time 300 >/dev/null 2>&1 8>&- &
         shell=$!
         n=0
@@ -438,6 +445,31 @@ if [ "$selftest" = kill ]; then
     rm -rf "$st"
     [ "$bad" = 0 ] || exit 1
     echo "vm.sh: selftest ok: killed from outside (SIGKILL, SIGTERM), no QEMU left and the lock free"
+    exit 0
+fi
+
+# --selftest-sweep: the run takes the VM lock, then deletes the work folders a killed run left (SIGKILL runs
+# no EXIT trap): kith-vm-work-UID.* under TMPDIR. A folder under another name, and the lock file, stay. TMPDIR
+# is a folder of the selftest's own, so no real folder is touched. Needs sh and mktemp; no QEMU, KVM or kernel.
+if [ "$selftest" = sweep ]; then
+    st=$(mktemp -d)
+    uid=$(id -u)
+    mkdir "$st/bin" "$st/kith-vm-work-$uid.stale" "$st/kith-vm-work-${uid}0.keep"
+    : >"$st/kith-vm-work-$uid.stale/disk.raw"
+    printf '#!/bin/sh\nexit 0\n' >"$st/bin/qemu-system-x86_64"
+    chmod +x "$st/bin/qemu-system-x86_64"
+    : >"$st/kernel"; : >"$st/initrd"
+    # (The run ends with "nothing of kithd's": only what it left matters here.)
+    KITH_VM_STUB=1 KITH_VM_LOCK="$st/lock" TMPDIR="$st" PATH="$st/bin:$PATH" \
+        sh "$0" --kernel "$st/kernel" --initrd "$st/initrd" --time 5 >/dev/null 2>&1 8>&- || true
+    bad=0
+    [ ! -e "$st/kith-vm-work-$uid.stale" ] || { echo "vm.sh: selftest: FAIL: a work folder a killed run left was not swept" >&2; bad=1; }
+    [ -d "$st/kith-vm-work-${uid}0.keep" ] || { echo "vm.sh: selftest: FAIL: the sweep took a folder that is not under the prefix" >&2; bad=1; }
+    [ -f "$st/lock" ] || { echo "vm.sh: selftest: FAIL: the lock file was removed" >&2; bad=1; }
+    [ -z "$(ls -d "$st/kith-vm-work-$uid".* 2>/dev/null)" ] || { echo "vm.sh: selftest: FAIL: the run's own work folder was left behind" >&2; bad=1; }
+    rm -rf "$st"
+    [ "$bad" = 0 ] || exit 1
+    echo "vm.sh: selftest ok: a run swept the work folder a killed run left, under the lock, and nothing else"
     exit 0
 fi
 
@@ -506,10 +538,15 @@ lock=${KITH_VM_LOCK-/tmp/kith-vm-$(id -u).lock}
 if [ -n "$lock" ] && command -v flock >/dev/null 2>&1; then
     exec 8>>"$lock"
     flock -w 7200 8 || { echo "vm.sh: another VM test has held $lock for two hours" >&2; exit 1; }
+    # (Holding the lock, no other run is using a work folder: the folders under this prefix are those of
+    # runs killed with SIGKILL, which ran no EXIT trap, 2-3 GB of disk copies each. The lock file is not one.)
+    for old in "${TMPDIR:-/tmp}"/kith-vm-work-"$(id -u)".*; do
+        [ ! -d "$old" ] || rm -rf "$old" || true
+    done
 fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-work=$(mktemp -d)
+work=$(mktemp -d "${TMPDIR:-/tmp}/kith-vm-work-$(id -u).XXXXXX")
 vms='' web='' found=''
 # (What a test left running goes with it; its consoles' logs are kept where KITH_VM_LOGS
 # names a directory, for a failure that does not come again. Stopped, it ends there: a trap on
@@ -566,7 +603,7 @@ if [ "$test" = init ]; then
         told=$1 last=$2
         shift 2
         rm -f "$work/log" "$work/keys"
-        timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
+        timeout --foreground "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
             -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" "$@" </dev/null >/dev/null 2>&1 8>&- &
         vm=$!
         until said 'kithd: serving '; do
@@ -596,7 +633,8 @@ fi
 # panic=-1 reboots at once, -no-reboot turns that into QEMU exiting: a kithd that
 # stops (as init, it must not) ends the run; the timeout ends one that does not.
 # (In the background and waited for: a signal's trap waits for a command in the foreground.)
-timeout "$time" qemu-system-x86_64 "$@" </dev/null >"$work/log" 2>&1 8>&- &
+# (--foreground, here and at every QEMU start in ci/vm/: QEMU stays in this run's process group, so a SIGKILL to the group ends it too; a plain timeout moves it to a group of its own.)
+timeout --foreground "$time" qemu-system-x86_64 "$@" </dev/null >"$work/log" 2>&1 8>&- &
 vms=$!
 wait "$vms" || true
 cat "$work/log"

@@ -217,6 +217,51 @@ const CARRIED: &str = "/payload";
 
 static IN_MEMORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a disk is being written and sealed, and, until the recovery key has been shown,
+/// held after it: a stop (SIGTERM, the power button) waits for it to end (`stopped`), so that
+/// a disk is not cut off half written, nor a key powered off before it is read.
+static WRITING: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+/// Set once the installer is told to stop: a write that has not begun then does not.
+static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The hold of a write: a stop waits for it to be dropped. (Not a `MutexGuard`: it is sent
+/// out of the thread that writes.)
+struct Writing;
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        *WRITING.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        WRITING.1.notify_all();
+    }
+}
+
+/// The disk write begins: `Err` if a stop came first, else the hold on it, to be kept to its end.
+fn begin_write() -> Result<Writing, String> {
+    let mut busy = WRITING.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if STOPPED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("the installer was told to stop before the disk was written".into());
+    }
+    *busy = true;
+    Ok(Writing)
+}
+
+/// The installer was told to stop: returns once no disk is being written. (Not at once, and
+/// not for ever: a write ends, or fails, on its own; the stop is then the machine's.)
+pub async fn stopped() {
+    STOPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let waited = tokio::task::spawn_blocking(|| {
+        let mut busy = WRITING.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *busy {
+            eprintln!("kithd: install: told to stop: waiting for the disk write to end");
+        }
+        while *busy {
+            busy = WRITING.1.wait(busy).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    });
+    let _ = waited.await;
+}
+
 /// The port a node's kithd serves other nodes and its admins on.
 const PORT: u16 = 7443;
 
@@ -745,6 +790,8 @@ pub async fn run(source: String) -> ! {
     let device = Path::new("/dev").join(&disk.name);
     let planned = disk.clone();
     let wrote = tokio::task::spawn_blocking(move || {
+        // (Held through the seal, and handed out with the key: a stop waits for it.)
+        let writing = begin_write()?;
         // (Its size read again just before the open: a disk swapped since the plan is not the one chosen.)
         size_unchanged(Path::new("/sys/block"), &planned)?;
         let mut disk = exclusive(&device)?;
@@ -761,7 +808,10 @@ pub async fn run(source: String) -> ! {
         }
         // (The disk let go of first: the kernel takes it for the mapping.)
         drop(disk);
-        encrypt.then(|| sealed(&image, &device, crate::crypt::seal)).transpose()
+        let recovery = encrypt
+            .then(|| sealed(&image, &device, crate::crypt::seal))
+            .transpose()?;
+        Ok((recovery, writing))
     });
     // (A panic may come after the write began, so it is said the same way.)
     let wrote = match wrote.await {
@@ -772,7 +822,7 @@ pub async fn run(source: String) -> ! {
         }
     };
     match wrote {
-        Ok(recovery) => {
+        Ok((recovery, writing)) => {
             if let Some(recovery) = recovery {
                 // Answers given (a file, a URL) are for an install nobody watches: no screen waits
                 // for the key then. Asked, the Enters typed before now are dropped first, so that
@@ -808,6 +858,8 @@ pub async fn run(source: String) -> ! {
                     }
                 }
             }
+            // (The key is shown: a stop may power off now.)
+            drop(writing);
             // (Nothing to take out of a machine installed from its own memory: it starts at once.)
             let then = if memory {
                 "Starting it."
@@ -815,7 +867,10 @@ pub async fn run(source: String) -> ! {
                 "Take the installer out and start the machine."
             };
             eprintln!("kithd: install: kith OS is on {disk}. {then}");
-            crate::init::POWER_OFF.store(!memory, std::sync::atomic::Ordering::Relaxed);
+            // (A stop that came meanwhile has set it already: not undone.)
+            if !memory {
+                crate::init::POWER_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             crate::init::end(false)
         }
         Err(e) => stop(&e).await,
@@ -1531,6 +1586,47 @@ mod tests {
         let other = b"disk: nvme0n1\n";
         let refused = verified(&hash, other).unwrap_err();
         assert!(refused.contains(&hash) && refused.contains(&crate::pki::hex(&Sha256::digest(other))));
+    }
+
+    /// A stop raised during a (fake) disk write waits for it; one raised before it begins
+    /// stops the write from beginning.
+    #[tokio::test]
+    async fn install_a_stop_raised_during_a_disk_write_waits_for_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+        // (Restores what the test sets, whether it passes or not.)
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                STOPPED.store(false, SeqCst);
+            }
+        }
+        let _reset = Reset;
+        // (The fake write is a thread that ends with the hold, as the real one hands it out with the key.)
+        let (done, written) = std::sync::mpsc::channel::<()>();
+        let (began, begun) = std::sync::mpsc::channel::<()>();
+        let write = std::thread::spawn(move || {
+            let writing = begin_write().expect("no stop yet");
+            began.send(()).unwrap();
+            let _ = written.recv();
+            writing
+        });
+        begun.recv().unwrap();
+        let stop = tokio::spawn(stopped());
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(STOPPED.load(SeqCst), "the stop was heard");
+        assert!(!stop.is_finished(), "the stop waits while the disk is written");
+        done.send(()).unwrap();
+        let writing = write.join().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!stop.is_finished(), "and while the recovery key is not yet shown");
+        drop(writing);
+        tokio::time::timeout(std::time::Duration::from_secs(5), stop)
+            .await
+            .expect("the stop goes on once the key is shown")
+            .unwrap();
+        assert!(begin_write().is_err(), "no write begins after a stop");
+        STOPPED.store(false, SeqCst);
+        assert!(begin_write().is_ok());
     }
 
     #[tokio::test]

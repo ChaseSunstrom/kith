@@ -1,0 +1,5 @@
+# TEST ONLY, never a node that ships: the kernel of the fido2 VM test (ci/vm.sh --test fido2),
+# with CONFIG_UHID so the software security key in a fido2-test kithd (docs/adr-fido2.md
+# section 2) can make a HID device. os/build.sh builds it only for --out target/os-fido2.
+features: [uhid-test]
+firmware: []

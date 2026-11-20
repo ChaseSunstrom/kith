@@ -186,7 +186,7 @@
             [ -f "$work/n$1.raw" ] || { cp "$base/kith-os.raw" "$work/n$1.raw" && seed "$work/n$1.raw"; }
             lanport=$((port + 8))
             [ "$test$1" != home4 ] || lanport=$((port + 9)) # (the bridge's other side)
-            timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
+            timeout --foreground "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$lanport,localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
                 -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside${https:+,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:443}$guest${net_restrict-,restrict=on}" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $dumps \

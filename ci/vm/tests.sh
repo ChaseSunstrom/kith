@@ -20,6 +20,10 @@
     # (access: the image of a kithd built with the feature forge, whose leader can append an entry it
     # was not asked for (ci/vm/access.sh); in a folder of its own, so the plain image stays plain.)
     [ "$test" != access ] || { KITHD_FEATURES=forge osdir=$root/target/os-forge; export KITHD_FEATURES; }
+    # (fido2: the image of a kithd built with the cargo feature fido2-test, which answers as a security
+    # key on /dev/uhid (docs/adr-fido2.md section 2), and of a kernel with that device (the uhid-test
+    # spec); in a folder of its own, so the plain image stays plain, and no other test has either.)
+    [ "$test" != fido2 ] || { KITHD_FEATURES=fido2-test KITH_OS_SPEC=os/examples/fido2-test.yaml osdir=$root/target/os-fido2; export KITHD_FEATURES; }
     sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC"} --out "$osdir" >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
     if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
         . "$root/ci/vm/cluster.sh"
@@ -35,7 +39,7 @@
     more=$serve once=1
     boot() { # [more of QEMU's arguments]: $once empty lets the guest restart itself
         : >"$work/log"
-        timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none ${once:+-no-reboot} \
+        timeout --foreground "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none ${once:+-no-reboot} \
             -machine q35 -bios "$firmware" -drive "file=$work/disk.raw,format=raw,if=virtio" \
             -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:7443${net_restrict-,restrict=on}" -device virtio-net-pci,netdev=n0 \
             -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=$more" "$@" \

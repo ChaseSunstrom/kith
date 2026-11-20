@@ -2913,7 +2913,7 @@ fn due(store: &kith_api::store::Store, me: &str, held: &BTreeSet<String>) -> Vec
 fn wipe_all(state: &Path, dirs: Vec<crate::volumes::Dir>) -> Vec<String> {
     let mut removed = Vec::new();
     for dir in dirs {
-        match crate::volumes::wipe(state, &dir) {
+        match crate::root_part::volume_gone(state, &dir) {
             Ok(()) => removed.push(volume_key(&dir)),
             Err(e) => eprintln!("kithd: the data of {}: {e}", volume_key(&dir)),
         }
@@ -3131,7 +3131,7 @@ async fn start(
         // (Only a shared volume of another node ever gets here: `volumes::mounts`.)
         let host = match mesh.filter(|(_, me)| *me != dir.node) {
             Some((prefix, me)) => crate::share::mount(state, dir, prefix, me).await,
-            None => crate::volumes::host_dir(state, dir),
+            None => crate::root_part::volume(state, dir),
         };
         let host = host.map_err(|e| format!("volume {}: {e}", dir.name))?;
         unit.mounts.push(kith_runtime::Mount {

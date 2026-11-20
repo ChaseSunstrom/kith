@@ -283,6 +283,13 @@ checks it before it writes a byte, and each piece as it writes it. Refused: a re
 key, signed by another key, changed after signing, or of another version than it says. So the
 address may be plain HTTP.
 
+The header also carries a `kithd` object: the digests of kithd, of the boot file but for the root's
+hash, and of the root but for kithd and its os-release. It is signed with the rest. Before it writes,
+a node reads it against the header kept for the system it runs, and works out whether only kithd
+differs (the kernel and the rest of the root are the same) or the update is a full one. A header
+without it, or no kept header, is a full update. Nothing is done with a kithd-only answer yet: the
+update is still a full one.
+
 **Which keys a node takes.** Its own only, whatever key an OSRelease names. Give them before the
 first release:
 

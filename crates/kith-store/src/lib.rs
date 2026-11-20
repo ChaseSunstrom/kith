@@ -68,6 +68,8 @@ pub struct Header<'a> {
     pub expires: u64,
     pub nonce: &'a str,
     pub sig: &'a str,
+    /// A node's signature carries the P-256 point of its key (base64): the store keeps only its print.
+    pub key: Option<&'a str>,
 }
 
 /// Read a signed request's header: what kithd checks a request by, and what a signed entry
@@ -83,7 +85,7 @@ pub fn header(header: &str) -> Result<Header<'_>, String> {
         let Some((name, value)) = part.split_once('=') else {
             return Err(bad(format!("{part:?} is no name=value")));
         };
-        let known = matches!(name, "who" | "target" | "expires" | "nonce" | "sig");
+        let known = matches!(name, "who" | "target" | "expires" | "nonce" | "sig" | "key");
         if !known || value.is_empty() || fields.insert(name, value).is_some() {
             return Err(bad(format!("{name:?} is unknown, empty or said twice")));
         }
@@ -105,6 +107,7 @@ pub fn header(header: &str) -> Result<Header<'_>, String> {
         expires,
         nonce,
         sig,
+        key: fields.get("key").copied(),
     })
 }
 
