@@ -1019,6 +1019,17 @@ fn mapped(
 /// is made (as Kubernetes makes a subPath), on the step opened before it.
 /// A directory it makes is its parent's user's and group's, with its parent's mode.
 pub fn beneath(dir: &Path, part: &str) -> Result<OwnedFd> {
+    walk(dir, part, true)
+}
+
+/// As [`beneath`], but a step may enter a mount, which `beneath` refuses: for the directory a
+/// Volume is, whose root may be one (an encrypted Volume's is). What is below that root is then
+/// taken with `beneath`, from the root's own descriptor.
+pub fn beneath_across(dir: &Path, part: &str) -> Result<OwnedFd> {
+    walk(dir, part, false)
+}
+
+fn walk(dir: &Path, part: &str, xdev: bool) -> Result<OwnedFd> {
     use std::os::unix::fs::OpenOptionsExt;
     let steps: Vec<&str> = part
         .split('/')
@@ -1035,30 +1046,7 @@ pub fn beneath(dir: &Path, part: &str) -> Result<OwnedFd> {
         .into();
     for step in steps {
         let name = std::ffi::CString::new(step).map_err(Error::other)?;
-        let open = |at: &OwnedFd| {
-            // struct open_how: flags, mode, resolve.
-            let how: [u64; 3] = [
-                (libc::O_PATH | libc::O_CLOEXEC) as u64,
-                0,
-                libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_XDEV,
-            ];
-            // SAFETY: openat2 reads `name` and `how`, whose size it is told; both live through it.
-            let fd = unsafe {
-                libc::syscall(
-                    libc::SYS_openat2,
-                    at.as_raw_fd(),
-                    name.as_ptr(),
-                    how.as_ptr(),
-                    std::mem::size_of_val(&how),
-                )
-            };
-            match fd < 0 {
-                true => Err(Error::last_os_error()),
-                // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
-                false => Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) }),
-            }
-        };
-        at = match open(&at) {
+        at = match one_step(&at, &name, xdev, false) {
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                 // SAFETY: fstat writes `parent`, which is its own; `at` is an open descriptor.
                 let mut parent: libc::stat = unsafe { std::mem::zeroed() };
@@ -1071,26 +1059,60 @@ pub fn beneath(dir: &Path, part: &str) -> Result<OwnedFd> {
                 if made < 0 && Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
                     return Err(Error::last_os_error());
                 }
-                let new = open(&at)?;
-                // SAFETY: fchownat of the descriptor itself (AT_EMPTY_PATH): nothing is resolved.
-                let owned = unsafe {
-                    libc::fchownat(
-                        new.as_raw_fd(),
-                        c"".as_ptr(),
-                        parent.st_uid,
-                        parent.st_gid,
-                        libc::AT_EMPTY_PATH,
-                    )
-                };
-                if owned < 0 {
-                    return Err(Error::last_os_error());
-                }
-                new
+                adopt_made(&at, &name, &parent, xdev)?
             }
             other => other.map_err(|e| Error::new(e.kind(), format!("`{step}` of `{part}`: {e}")))?,
         };
     }
     Ok(at)
+}
+
+/// The step `name` under `at`, open as a path. Nothing is entered across a mount unless `xdev` is
+/// false; `dir_only` refuses a file.
+fn one_step(at: &OwnedFd, name: &std::ffi::CStr, xdev: bool, dir_only: bool) -> Result<OwnedFd> {
+    let flags = libc::O_PATH | libc::O_CLOEXEC | if dir_only { libc::O_DIRECTORY } else { 0 };
+    let mut resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+    if xdev {
+        resolve |= libc::RESOLVE_NO_XDEV;
+    }
+    // struct open_how: flags, mode, resolve.
+    let how: [u64; 3] = [flags as u64, 0, resolve];
+    // SAFETY: openat2 reads `name` and `how`, whose size it is told; both live through it.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            at.as_raw_fd(),
+            name.as_ptr(),
+            how.as_ptr(),
+            std::mem::size_of_val(&how),
+        )
+    };
+    match fd < 0 {
+        true => Err(Error::last_os_error()),
+        // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
+        false => Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) }),
+    }
+}
+
+/// The directory `name` under `at`, which a step made a moment ago, open again: it takes the owner
+/// and group of `parent`, the directory it was made in. Only a directory is adopted: a file found
+/// there (planted in the gap) is refused before anything is changed.
+fn adopt_made(at: &OwnedFd, name: &std::ffi::CStr, parent: &libc::stat, xdev: bool) -> Result<OwnedFd> {
+    let new = one_step(at, name, xdev, true)?;
+    // SAFETY: fchownat of the descriptor itself (AT_EMPTY_PATH): nothing is resolved.
+    let owned = unsafe {
+        libc::fchownat(
+            new.as_raw_fd(),
+            c"".as_ptr(),
+            parent.st_uid,
+            parent.st_gid,
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    match owned < 0 {
+        true => Err(Error::last_os_error()),
+        false => Ok(new),
+    }
 }
 
 const PT_LOAD: u32 = 1;
@@ -1511,6 +1533,31 @@ mod tests {
         }
         // (Nothing was made through a link: no `x` under the host's /etc, none under `a`.)
         assert!(!Path::new("/etc/x").exists() && !dir.join("a/x").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A step found a file where it had made a directory (one planted in the gap): it is refused,
+    /// and its owner is not changed to the parent's.
+    #[test]
+    fn a_planted_file_is_not_adopted_as_a_made_directory() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("kith-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("planted"), b"x").unwrap();
+        let owner = || {
+            let meta = std::fs::metadata(dir.join("planted")).unwrap();
+            (meta.uid(), meta.gid())
+        };
+        let before = owner();
+        let at: OwnedFd = std::fs::File::open(&dir).unwrap().into();
+        // SAFETY: a zeroed `stat` is a valid value; the test sets two of its fields.
+        let mut parent: libc::stat = unsafe { std::mem::zeroed() };
+        parent.st_uid = 4242;
+        parent.st_gid = 4343;
+        let err = adopt_made(&at, c"planted", &parent, true).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");
+        assert_eq!(owner(), before);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -413,11 +413,16 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **A Volume's archive** (a Backup, an Image, a replica's copy) is read through directory
   handles that are held open: nothing in the volume is reached by a path the workload
   could point elsewhere meanwhile. A Volume's directory is opened beneath its root by
-  openat2 (no link out of it, no `..`), and kithd reads and writes its contents through
-  that held descriptor. A step that replaces the directory (a restore or a replica's new
-  copy, renamed into place), or that must name the path (a container's mount and bind,
-  which runc resolves in its own process, and an NFS export), uses the checked path, and
-  is not closed by this. When one is unpacked, no entry writes outside the
+  openat2 (no link out of it, no `..`, and no mount below the root; the root itself may be
+  the mount of an encrypted Volume), and a share, a backup, a replica, the volume files, an
+  image and the controller's check read and write its contents through that held
+  descriptor. Still by path, and not closed by this: the controller's start path, which
+  is handed to the container runtime after the descriptor is dropped, and which runc, the
+  container's stage and the OCI bind resolve again in their own processes; a restore's
+  and a replica's new copy, whose directory is read with `read_dir` and renamed into place
+  by path; and an NFS export, which is by path. A node's own `hostPaths` directory refuses
+  a link at its last component. A workload that can swap a directory on one of these
+  paths for a link can redirect that step. When one is unpacked, no entry writes outside the
   volume; a restored Backup has no setuid or setgid file (a replica's copy keeps them
   as its volume had them). A restore, a replica's first copy and each sync unpack no more
   than the Volume's `size`, where it says one: the entries are counted as they come, each

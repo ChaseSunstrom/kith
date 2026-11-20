@@ -749,7 +749,15 @@ pub(crate) fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Po
         }
         let path = PathBuf::from(&dir.path);
         std::fs::create_dir_all(&path).map_err(|e| made(&path, e))?;
-        let fd: OwnedFd = std::fs::File::open(&path).map_err(|e| made(&path, e))?.into();
+        // (A directory, and not a link: a FIFO or a link put there since is refused, not opened.)
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK;
+        let fd: OwnedFd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags.bits())
+            .open(&path)
+            .map_err(|e| made(&path, e))?
+            .into();
         return Ok(VolumeDir::from_parts(fd, path));
     }
     let state = state.canonicalize().map_err(|e| made(state, e))?;
@@ -767,8 +775,12 @@ pub(crate) fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Po
         return Err("it was made encrypted and its file is still on this node: say `encrypted: true` again".into());
     }
     let at = root.join(&dir.path);
-    let inside = format!("volumes/{}/{}/{}", dir.namespace, dir.name, dir.path);
-    let fd = kith_dm_sys::beneath(&state, &inside).map_err(|e| made(&at, e))?;
+    // The root is made, and entered across its mount if it is one (an encrypted Volume's is). What
+    // is below it is then taken from the root's own descriptor, where no mount is entered.
+    let held = kith_dm_sys::beneath_across(&state, &format!("volumes/{}/{}", dir.namespace, dir.name))
+        .map_err(|e| made(&root, e))?;
+    let anchor = format!("/proc/self/fd/{}", held.as_raw_fd());
+    let fd = kith_dm_sys::beneath(Path::new(&anchor), &dir.path).map_err(|e| made(&at, e))?;
     let via = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
     let kind = std::fs::metadata(&via).map_err(|e| made(&at, e))?;
     if !kind.is_dir() {
@@ -1497,6 +1509,44 @@ spec: { node: a, path: tiny, size: 1Gi }
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         });
         assert!(taken > 0, "no directory was taken at all");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A Volume whose root is a mount (an encrypted one is) is entered, and a mount below its root
+    /// is refused, as a link would be. Mounting needs a mount namespace (`unshare -Urm` gives one
+    /// to an unprivileged run): where there is none the test says so and passes.
+    #[test]
+    fn a_volume_root_that_is_a_mount_is_entered_and_nothing_below_it() {
+        use nix::mount::{MntFlags, MsFlags, mount, umount2};
+        let state = state("mount-root");
+        let root = state.join("volumes/shop/data");
+        std::fs::create_dir_all(&root).unwrap();
+        if let Err(e) = mount(Some("tmpfs"), &root, Some("tmpfs"), MsFlags::empty(), None::<&str>) {
+            eprintln!("no mount namespace here ({e}): not run");
+            return;
+        }
+        let inner = root.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        mount(Some("tmpfs"), &inner, Some("tmpfs"), MsFlags::empty(), None::<&str>).unwrap();
+        let entered = host_dir(&state, &dir("shop", "sub"));
+        let below = host_dir(&state, &dir("shop", "inner"));
+        let _ = umount2(&inner, MntFlags::MNT_DETACH);
+        let _ = umount2(&root, MntFlags::MNT_DETACH);
+        let entered = entered.expect("a Volume whose root is a mount is entered");
+        assert!(entered.real().starts_with(&root), "{}", entered.real().display());
+        assert!(below.is_err(), "a mount below the root was entered");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A kith-system path that is a link is refused, not followed to whatever it points at.
+    #[test]
+    fn a_kith_system_path_that_is_a_link_is_refused() {
+        let state = state("system-link");
+        let target = state.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = state.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(host_dir(&state, &dir(SYSTEM, link.to_str().unwrap())).is_err());
         let _ = std::fs::remove_dir_all(&state);
     }
 
