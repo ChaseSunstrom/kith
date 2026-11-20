@@ -36,7 +36,7 @@
         vm() { # NAME [QEMU's arguments]: a machine whose serial console is logged and can be typed at
             name=$1
             shift
-            timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none -no-reboot \
+            timeout --foreground "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none -no-reboot \
                 -machine q35 -bios "$firmware" "$@" \
                 -chardev "socket,id=tty,path=$work/$name.tty,server=on,wait=off,logfile=$work/$name.log" -serial chardev:tty \
                 -monitor "${monitor:-none}" </dev/null >/dev/null 2>&1 8>&- &
