@@ -26,6 +26,11 @@ const FIRST_STOP_Y: usize = 240;
 const STOP_GAP: usize = 56;
 const QUESTION_SCALE: usize = 3;
 const LABEL_SCALE: usize = 2;
+/// A glyph's rows (the font's `[u8; 9]`): `CAP_H` down to the baseline, then two below it for
+/// the tails of g, j, p, q, y, the comma and the semicolon. Lines are `LINE_H` rows apart.
+const GLYPH_H: usize = 9;
+const CAP_H: usize = 7;
+const LINE_H: usize = 12;
 
 /// The rail's stops, in the order the installer asks its questions (install.rs's `interview`).
 pub const STOPS: [&str; 6] = ["Disk", "Name", "Address", "Join", "Encryption", "Erase"];
@@ -231,7 +236,7 @@ pub fn draw_question(frame: &mut Frame, stops: &[&str], current: usize, question
     let mut y = MARGIN;
     for (line, scale) in layout(question, frame.width) {
         frame.text(MARGIN, y, scale, &line, SITE_TEXT);
-        y += 10 * scale;
+        y += LINE_H * scale;
     }
     let rail: Vec<(&str, &str)> = stops.iter().map(|&label| (label, "")).collect();
     draw_rail(frame, &rail, current);
@@ -304,7 +309,7 @@ fn draw_rail(frame: &mut Frame, stops: &[(&str, &str)], current: usize) {
             frame.rect(RAIL_X, top, STROKE, STOP, SITE_HAIR);
             frame.rect(RAIL_X + STOP - STROKE, top, STROKE, STOP, SITE_HAIR);
         }
-        let y = centre(i) - 7 * LABEL_SCALE / 2;
+        let y = centre(i) - CAP_H * LABEL_SCALE / 2;
         let end = frame.text(RAIL_X + 2 * STOP, y, LABEL_SCALE, label, text);
         if !detail.is_empty() && i <= current {
             frame.text(end + 3 * 6 * LABEL_SCALE, y, LABEL_SCALE, detail, SITE_DIM);
@@ -328,11 +333,11 @@ pub fn draw_progress(
     let mut y = MARGIN;
     for (piece, scale) in layout(title, frame.width) {
         frame.text(MARGIN, y, scale, &piece, SITE_TEXT);
-        y += 10 * scale;
+        y += LINE_H * scale;
     }
     let room = frame.width.saturating_sub(2 * MARGIN);
     for (n, piece) in wrap(line, room / (6 * LABEL_SCALE)).iter().take(2).enumerate() {
-        frame.text(MARGIN, LINE_Y + n * 10 * LABEL_SCALE, LABEL_SCALE, piece, SITE_DIM);
+        frame.text(MARGIN, LINE_Y + n * LINE_H * LABEL_SCALE, LABEL_SCALE, piece, SITE_DIM);
     }
     if let Some(percent) = bar {
         let percent = percent.min(100);
@@ -743,7 +748,7 @@ mod tests {
         let mut title = screen(3200, RGB);
         title.rect(0, 0, 800, 600, site("bg"));
         title.text(MARGIN, MARGIN, QUESTION_SCALE, "kith OS is installed", site("text"));
-        for y in MARGIN..MARGIN + 7 * QUESTION_SCALE {
+        for y in MARGIN..MARGIN + GLYPH_H * QUESTION_SCALE {
             for x in 0..800 {
                 assert_eq!(frame.pixel(x, y), title.pixel(x, y), "title pixel {x},{y}");
             }
@@ -752,9 +757,9 @@ mod tests {
         line.rect(0, 0, 800, 600, site("bg"));
         let room = (800 - 2 * MARGIN) / (6 * LABEL_SCALE);
         for (n, piece) in wrap(text, room).iter().enumerate() {
-            line.text(MARGIN, LINE_Y + n * 10 * LABEL_SCALE, LABEL_SCALE, piece, site("dim"));
+            line.text(MARGIN, LINE_Y + n * LINE_H * LABEL_SCALE, LABEL_SCALE, piece, site("dim"));
         }
-        for y in LINE_Y..LINE_Y + 2 * 10 * LABEL_SCALE {
+        for y in LINE_Y..LINE_Y + (LINE_H + GLYPH_H) * LABEL_SCALE {
             for x in 0..800 {
                 assert_eq!(frame.pixel(x, y), line.pixel(x, y), "end text pixel {x},{y}");
             }
@@ -782,6 +787,43 @@ mod tests {
         draw_end(&mut end, &steps(), "kith OS is installed", "Powering off.");
         for p in pixels(&frame).into_iter().chain(pixels(&end)) {
             assert!(tokens.contains(&p), "{p:?} is not a colour of docs/site.css's :root");
+        }
+    }
+
+    /// Whether any pixel of the box (x, y, w, h) on `frame` is not paper.
+    fn has_ink(frame: &Frame, x: usize, y: usize, w: usize, h: usize) -> bool {
+        (y..y + h).any(|row| (x..x + w).any(|column| frame.pixel(column, row) != site("bg")))
+    }
+
+    #[test]
+    fn fb_descenders_hang_below_the_baseline_and_stay_in_their_line() {
+        // A glyph is nine rows: seven down to the baseline, two below it.
+        for scale in [1, 2, 3] {
+            let mut frame = screen(3200, RGB);
+            frame.rect(0, 0, 800, 600, site("bg"));
+            let top = 100;
+            let tails = "gjpqy,;";
+            frame.text(MARGIN, top, scale, tails, site("text"));
+            for (n, c) in tails.chars().enumerate() {
+                let x = MARGIN + n * 6 * scale;
+                assert!(
+                    has_ink(&frame, x, top + 7 * scale, 5 * scale, 2 * scale),
+                    "{c:?} has no tail below the baseline at scale {scale}"
+                );
+            }
+            // Nothing runs past its nine rows into the line below (a line is twelve rows apart).
+            assert!(
+                !has_ink(&frame, 0, top + 9 * scale, 800, 3 * scale),
+                "a tail spills into the next line at scale {scale}"
+            );
+            // The letters without tails have none.
+            let mut plain = screen(3200, RGB);
+            plain.rect(0, 0, 800, 600, site("bg"));
+            plain.text(MARGIN, top, scale, "aceiortu.:", site("text"));
+            assert!(
+                !has_ink(&plain, 0, top + 7 * scale, 800, 5 * scale),
+                "a glyph without a tail has ink below the baseline at scale {scale}"
+            );
         }
     }
 

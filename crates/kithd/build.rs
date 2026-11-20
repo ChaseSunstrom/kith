@@ -66,7 +66,7 @@ fn main() {
 /// What the installer's picture (src/install/fb.rs) is drawn with, written to OUT_DIR/site.rs:
 /// the colours of docs/site.css's first `:root` block (read here, not copied: a colour the
 /// site changes is the one the installer draws), and the glyphs of kithd's font, one per
-/// printable ASCII character from the space on, seven rows of five bits each.
+/// printable ASCII character from the space on, nine rows of five bits each (two of them below the baseline).
 fn write_site(dir: &Path, out: &Path) {
     println!("cargo::rerun-if-changed=../../docs/site.css");
     println!("cargo::rerun-if-changed=font/glyphs.txt");
@@ -90,16 +90,16 @@ fn write_site(dir: &Path, out: &Path) {
         code += &format!("#[allow(dead_code)]\npub const SITE_{name}: [u8; 3] = [{r:#04x}, {g:#04x}, {b:#04x}];\n");
     }
     let font = std::fs::read_to_string(dir.join("font/glyphs.txt")).expect("kithd's font");
-    let glyphs: Vec<[u8; 7]> = font
+    let glyphs: Vec<[u8; 9]> = font
         .lines()
         .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
         .map(|line| {
             let rows: Vec<&str> = line.split_whitespace().collect();
             assert!(
-                rows.len() == 7 && rows.iter().all(|row| row.len() == 5),
-                "a glyph is seven rows of five: {line}"
+                rows.len() == 9 && rows.iter().all(|row| row.len() == 5),
+                "a glyph is nine rows of five (seven to the baseline, two below it): {line}"
             );
-            let mut glyph = [0u8; 7];
+            let mut glyph = [0u8; 9];
             for (bits, row) in glyph.iter_mut().zip(rows) {
                 *bits = u8::from_str_radix(row, 2).expect("a row of 0s and 1s");
             }
@@ -111,7 +111,7 @@ fn write_site(dir: &Path, out: &Path) {
         95,
         "the font has a glyph for each printable ASCII character"
     );
-    code += "#[allow(dead_code)]\npub const GLYPHS: [[u8; 7]; 95] = [\n";
+    code += "#[allow(dead_code)]\npub const GLYPHS: [[u8; 9]; 95] = [\n";
     for glyph in &glyphs {
         code += &format!("    {glyph:?},\n");
     }
