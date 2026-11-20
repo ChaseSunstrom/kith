@@ -1287,8 +1287,14 @@ spec! {
         pub max_unavailable: Option<u32>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub windows: Vec<String>,
+        /// Drain each node before it restarts (`kith node drain`): what can move runs
+        /// elsewhere first.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub drain: Option<bool>,
+        /// How long a drain waits for what moves to run elsewhere before the node restarts
+        /// anyway. Defaults to 300.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub drain_seconds: Option<u32>,
         /// Hold back nodes with an active seat until it is idle.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub wait_for_idle_seats: Option<bool>,

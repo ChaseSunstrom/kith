@@ -4142,7 +4142,17 @@
           "type": [
             "boolean",
             "null"
-          ]
+          ],
+          "description": "Drain each node before it restarts (`kith node drain`): what can move runs\nelsewhere first."
+        },
+        "drainSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How long a drain waits for what moves to run elsewhere before the node restarts\nanyway. Defaults to 300."
         },
         "waitForIdleSeats": {
           "type": [
