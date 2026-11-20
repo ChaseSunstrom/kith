@@ -115,6 +115,7 @@ impl Grants {
                     kinds: vec!["*".into()],
                     verbs: reads,
                     namespaces: Vec::new(),
+                    names: Vec::new(),
                 };
                 return Grants(Some(vec![rule]));
             }
@@ -149,15 +150,19 @@ impl Grants {
         Grants(Some(rules))
     }
 
-    /// May it do `verb` to a `kind` in `namespace` (`None`: one that is in no namespace)?
-    pub fn may(&self, verb: &Verb, kind: &str, namespace: Option<&str>) -> bool {
+    /// May it do `verb` to the `kind` called `name` in `namespace` (`None`: one that is in no
+    /// namespace)? The one place a rule is matched. A rule that lists `names` covers only
+    /// those; a caller that has no name to give (`None`) is covered by no such rule, so a
+    /// route that does not yet say which resource it reaches is refused, never widened.
+    pub fn may(&self, verb: &Verb, kind: &str, namespace: Option<&str>, name: Option<&str>) -> bool {
         let Some(rules) = &self.0 else { return true };
         rules.iter().any(|rule| {
             let there = match namespace {
                 Some(namespace) => rule.namespaces.is_empty() || rule.namespaces.iter().any(|named| named == namespace),
                 None => rule.namespaces.is_empty(),
             };
-            there && rule.verbs.contains(verb) && names(&rule.kinds, kind)
+            let called = rule.names.is_empty() || name.is_some_and(|name| rule.names.iter().any(|named| named == name));
+            there && called && rule.verbs.contains(verb) && names(&rule.kinds, kind)
         })
     }
 
@@ -799,31 +804,113 @@ spec: {role: gone, subjects: [bob]}
         );
         let alice = Grants::of(&Caller::Identity("alice".into()), &store);
         // By name: the verbs, kinds and namespaces of the rule, and no others.
-        assert!(alice.may(&Verb::Apply, "Workload", Some("web")));
-        assert!(alice.may(&Verb::Apply, "service", Some("web")));
-        assert!(!alice.may(&Verb::Apply, "Workload", Some("default")));
-        assert!(!alice.may(&Verb::Delete, "Workload", Some("web")));
-        assert!(!alice.may(&Verb::Apply, "Secret", Some("web")));
+        assert!(alice.may(&Verb::Apply, "Workload", Some("web"), Some("a")));
+        assert!(alice.may(&Verb::Apply, "service", Some("web"), Some("a")));
+        assert!(!alice.may(&Verb::Apply, "Workload", Some("default"), Some("a")));
+        assert!(!alice.may(&Verb::Delete, "Workload", Some("web"), Some("a")));
+        assert!(!alice.may(&Verb::Apply, "Secret", Some("web"), Some("a")));
         // A rule for namespaces is not one for what is in none.
-        assert!(!alice.may(&Verb::Apply, "Workload", None));
+        assert!(!alice.may(&Verb::Apply, "Workload", None, Some("a")));
         // Through a group: every kind, everywhere, cluster-scoped ones too; reading only.
-        assert!(alice.may(&Verb::Get, "Secret", Some("default")) && alice.may(&Verb::Watch, "Node", None));
-        assert!(!alice.may(&Verb::Apply, "Node", None) && !alice.may(&Verb::Exec, "Workload", Some("web")));
+        assert!(alice.may(&Verb::Get, "Secret", Some("default"), None) && alice.may(&Verb::Watch, "Node", None, None));
+        assert!(!alice.may(&Verb::Apply, "Node", None, None) && !alice.may(&Verb::Exec, "Workload", Some("web"), None));
         assert!(alice.anywhere(&Verb::Apply, Some("Workload")) && alice.anywhere(&Verb::List, None));
         assert!(!alice.anywhere(&Verb::Delete, None) && !alice.anywhere(&Verb::Apply, Some("Secret")));
 
         // Not in the group, and bound only to a Role that is not there: nothing.
         let bob = Grants::of(&Caller::Identity("bob".into()), &store);
-        assert!(!bob.may(&Verb::Get, "Workload", Some("web")) && !bob.anywhere(&Verb::Get, None));
+        assert!(!bob.may(&Verb::Get, "Workload", Some("web"), None) && !bob.anywhere(&Verb::Get, None));
         // No such Identity: nothing, whatever a binding says of the name.
         let nobody = Grants::of(&Caller::Identity("group:ops".into()), &store);
         assert!(!nobody.anywhere(&Verb::Get, None));
         // The machine's admin is not asked for a Role.
-        assert!(Grants::of(&Caller::Admin, &store).may(&Verb::Delete, "Node", None));
+        assert!(Grants::of(&Caller::Admin, &store).may(&Verb::Delete, "Node", None, None));
         // Someone a node passed on has their own rights, whichever node it was.
         let passed = Caller::Via("n1".into(), Box::new(Caller::Identity("alice".into())));
         let passed = Grants::of(&passed, &store);
-        assert!(passed.may(&Verb::Apply, "Workload", Some("web")) && !passed.anywhere(&Verb::Delete, None));
+        assert!(passed.may(&Verb::Apply, "Workload", Some("web"), None) && !passed.anywhere(&Verb::Delete, None));
+    }
+
+    /// A rule that lists `names` covers those resources of those kinds and no other: not another
+    /// name, kind or namespace, not a pattern, not a request that gives no name; a rule with none
+    /// listed is what it was.
+    #[test]
+    fn rule_names_cover_only_what_they_list() {
+        let store = store(
+            "
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: agent}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: canary-only}
+spec:
+  rules:
+    - {kinds: [OSRelease, UpdatePlan], verbs: [get, apply, delete, list, watch], names: [canary]}
+    - {kinds: [ConfigMap], verbs: [apply], namespaces: [web], names: [site, 'a.b']}
+    - {kinds: [Secret], verbs: [get]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: agent-canary}
+spec: {role: canary-only, subjects: [agent]}
+",
+        );
+        let agent = Grants::of(&Caller::Identity("agent".into()), &store);
+        for verb in [Verb::Get, Verb::Apply, Verb::Delete, Verb::List, Verb::Watch] {
+            for kind in ["OSRelease", "UpdatePlan", "osrelease"] {
+                assert!(agent.may(&verb, kind, None, Some("canary")), "{verb:?} {kind}");
+                // Other names, of the kinds named: no. A pattern or a wildcard is only a name.
+                for other in [
+                    "stable", "canary2", "canar", "Canary", "canary ", "*", "can*", "", "canary/x", "..",
+                ] {
+                    assert!(!agent.may(&verb, kind, None, Some(other)), "{verb:?} {kind} {other:?}");
+                }
+                // No name given: not covered (a route that cannot say which resource it reaches).
+                assert!(!agent.may(&verb, kind, None, None), "{verb:?} {kind} with no name");
+            }
+            // The name is not the kind's: another kind called canary is not covered.
+            for kind in [
+                "Workload",
+                "Node",
+                "Secret",
+                "ConfigMap",
+                "Role",
+                "RoleBinding",
+                "Identity",
+                "*",
+            ] {
+                assert!(
+                    !agent.may(&verb, kind, None, Some("canary")) || (kind == "Secret" && verb == Verb::Get),
+                    "{verb:?} {kind}"
+                );
+            }
+        }
+        // The kinds are cluster-wide: a namespace the rule does not name is refused as it was.
+        assert!(agent.may(&Verb::Apply, "OSRelease", None, Some("canary")));
+        // A rule with names and a namespace: both must hold.
+        assert!(agent.may(&Verb::Apply, "ConfigMap", Some("web"), Some("site")));
+        assert!(agent.may(&Verb::Apply, "ConfigMap", Some("web"), Some("a.b")));
+        assert!(!agent.may(&Verb::Apply, "ConfigMap", Some("web"), Some("other")));
+        assert!(!agent.may(&Verb::Apply, "ConfigMap", Some("default"), Some("site")));
+        assert!(!agent.may(&Verb::Apply, "ConfigMap", None, Some("site")));
+        assert!(!agent.may(&Verb::Delete, "ConfigMap", Some("web"), Some("site")));
+        // A rule with no names is what it was: every name, and none given.
+        assert!(
+            agent.may(&Verb::Get, "Secret", Some("web"), Some("any")) && agent.may(&Verb::Get, "Secret", None, None)
+        );
+        // What it may do somewhere is not narrowed (the list is: `seen`).
+        assert!(agent.anywhere(&Verb::List, Some("OSRelease")) && !agent.anywhere(&Verb::Delete, Some("Secret")));
+        // Someone a node passed on has the same narrow rights, and the admin has them all.
+        let via = Caller::Via("n1".into(), Box::new(Caller::Identity("agent".into())));
+        let via = Grants::of(&via, &store);
+        assert!(
+            via.may(&Verb::Apply, "OSRelease", None, Some("canary"))
+                && !via.may(&Verb::Apply, "OSRelease", None, Some("stable"))
+        );
+        assert!(Grants::of(&Caller::Admin, &store).may(&Verb::Apply, "OSRelease", None, Some("stable")));
     }
 
     /// A node's certificate has no right of its own on the API: it passes on what someone
@@ -877,7 +964,10 @@ spec: {role: gone, subjects: [bob]}
             ] {
                 assert!(!grants.anywhere(&verb, None), "{verb:?}");
             }
-            assert!(!grants.may(&Verb::Get, "Secret", Some("default")) && !grants.may(&Verb::Apply, "Node", None));
+            assert!(
+                !grants.may(&Verb::Get, "Secret", Some("default"), None)
+                    && !grants.may(&Verb::Apply, "Node", None, None)
+            );
         }
         // What nodes pass on: who asked is who it is for, by this node's word.
         for path in [

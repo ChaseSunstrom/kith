@@ -392,6 +392,105 @@ spec:
 - **Not yet:** OpenVPN, port forwarding, one key on two nodes, an exit's traffic from a pod on
   another node, and phones or laptops through an exit.
 
+### A workload that outlives its node
+
+A dev session, a desktop app, a game server or a database is one process that holds state and runs
+for weeks. Kith keeps it going across a node's restarts with three kinds it has already: a
+Workload of one replica, its home on a replicated Volume, its key in a Secret, and each long
+command as a Job of its own.
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: home }
+spec:
+  node: alpha            # where it is first made: the files are in state/volumes/default/home/home
+  path: home
+  replicas: 2            # copies in all: this one, and one on another node
+  sync: 10s              # the other is brought up to date every 10 seconds (10s is the least)
+---
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: session-key }
+spec:
+  data:
+    API_KEY: replace-with-the-key
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: session }
+spec:
+  replicas: 1            # one: it is a process with one home, not a service to spread
+  template:
+    containers:
+      - name: dev
+        image: ghcr.io/example/devbox:1
+        volumeMounts: [{ volume: home, path: /home/dev }]
+        env:
+          - { name: API_KEY, secret: { name: session-key, key: API_KEY } }
+```
+
+The long commands are Jobs, so that the session itself is only what you type into, and a build,
+an index or a training run is a thing kith can see end, fail and run again:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: reindex }
+spec:
+  template:
+    containers:
+      - name: run
+        image: ghcr.io/example/devbox:1
+        command: [sh, -c, "cd /home/dev/project && make index"]
+        volumeMounts: [{ volume: home, path: /home/dev }]
+---
+apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: nightly-build }
+spec:
+  template:
+    containers:
+      - name: run
+        image: ghcr.io/example/devbox:1
+        command: [sh, -c, "cd /home/dev/project && make release"]
+        volumeMounts: [{ volume: home, path: /home/dev }]
+```
+
+A Workload or Job that mounts a Volume runs on the node that has it (the Volume's `primary`), so
+the session and its Jobs share one home. Put the key in the Secret and not in the image or the
+Volume. A worker is sent the Secrets of what is placed on it and no others, but a control node
+holds every Secret of the cluster (`docs/adr-workers.md`), so a key in a Secret is as safe as the
+cluster's control nodes are.
+Clients find the session after a move by a Service that selects the Workload, not by a node's
+address ([Services across nodes](cluster.md#services-across-nodes)).
+
+What each restart of the node costs:
+
+| What happens | The Volume | The Workload | What is lost |
+|---|---|---|---|
+| A planned drain, or an OS update by an `UpdatePlan` with `drain: true` ([restarting a node on purpose](cluster.md#restarting-a-node-on-purpose)) | The copy that synced last is asked to sync now and is handed over once it is current | Starts on that node in seconds, plus the image pull if that node does not have the image yet (`pullPolicy: ifNotPresent`) | Nothing is lost of what was written before the drain asked for the sync; a write in the seconds between that sync and the Workload's stop stays on the old node as `.PATH.was-TIME` |
+| A crash or a lost node, which is also an OS update without `drain: true`: the reboot is a loss | The copy that synced last becomes the primary once the node has been silent for `--lost-after`: about 5 minutes on a default cluster, and about 15 seconds with `--lost-after 10` (10 seconds is the least) | Starts on that node within one reconcile (5 seconds) of that, plus the image pull if needed | Writes of up to 10 seconds (the sync), those since the last sync; the old node keeps them as `.PATH.was-TIME` |
+| A Job that was running when its node went | A drain holds the Volume back until the Job ends | A planned drain waits for the Job and nothing is lost. After a loss, a Job on a replicated Volume starts over on the new primary from its first command; a Job on a Volume with no `replicas` waits for its node ([checkpointing a long GPU Job](cluster.md#checkpointing-a-long-gpu-job)) | The Job's progress: it is in memory, so a Job that must not start over writes its own checkpoints into the home and reads the last at its start |
+
+- **Set `--lost-after` where kithd starts.** `kithd --lost-after 10` (or `KITH_LOST_AFTER=10`) on
+  every node; a node is lost after 10 seconds at the least, whatever smaller number is given.
+  Left at its default, a crash is 5 minutes of nothing before the move.
+- **Seconds, not a lost-after, for a planned move.** A drain is told the Workload's node is going,
+  so nothing waits for a silence; the session is down for the time the container takes to start.
+  After a loss the cost is what was written since the last sync: shorten `sync` to shrink it
+  (10 seconds is the least), or save a file that must not be lost and wait out one sync.
+- **A process in memory is not kept.** The session starts again from its home: a shell, an editor's
+  buffers and a running server do not move, and a program that keeps its state in files (a game
+  server's world, a database's data directory) comes back from the last sync of them. A database
+  wants its own log or replication besides, as a copy 10 seconds old is a crash-consistent
+  one, not a point it chose.
+- **No Kubernetes and no VM.** Kith runs no Kubernetes and no virtual machine for this: the session
+  is a container kithd starts, in the cluster's own scheduler, and a restart is the container
+  started again on another node. Live migration of a VM workload (the memory, devices and the
+  running process of a `vms` unit carried to another node) is a later, separate feature, and the
+  costs above are for a container, not a VM.
+
 ### What a container is given
 
 Files from a ConfigMap or a Secret, directories of its replica's own, what it is told from maps

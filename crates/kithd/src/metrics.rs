@@ -299,10 +299,13 @@ impl Local {
     /// the names of another namespace's, and what they use, are not for it.
     fn keep_readable(&mut self, grants: &crate::access::Grants) {
         self.workloads.retain(|key, _| {
-            let namespace = key.split_once('/').map(|(namespace, _)| namespace);
+            let (namespace, name) = match key.split_once('/') {
+                Some((namespace, name)) => (Some(namespace), Some(name)),
+                None => (None, None),
+            };
             [Verb::List, Verb::Get]
                 .iter()
-                .any(|verb| grants.may(verb, "Workload", namespace))
+                .any(|verb| grants.may(verb, "Workload", namespace, name))
         });
     }
 
@@ -1089,6 +1092,7 @@ mod tests {
             kinds: kinds.iter().map(|kind| kind.to_string()).collect(),
             verbs,
             namespaces: namespaces.iter().map(|ns| ns.to_string()).collect(),
+            names: Vec::new(),
         };
         let keys = |grants: &Grants| {
             let all = vec![
