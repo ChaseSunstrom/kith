@@ -1,0 +1,2 @@
+{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"inner"},"spec":{"retries":0,"template":{"containers":[
+  {"name":"c","image":"kith.test/pod:1","command":["/bin/pod","self"]}]}}}

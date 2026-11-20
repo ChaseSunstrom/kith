@@ -464,6 +464,16 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **An encrypted disk or Volume** cannot be read by whoever takes it out of its machine:
   the key is with the other nodes.
 
+## Running a runtime inside a container
+
+`sh ci/stress.sh --nested` ran, on one kith OS machine in a VM, a second runtime (bubblewrap) and kithd in agent mode inside a kith container, with the defaults and with each opening in turn; the rows are the `nested` lines of ci/stress.txt. No default was changed. In three groups:
+
+- **What works inside a container with the defaults.** kithd in agent mode starts and serves its socket; plain processes run. A user namespace, a second runtime's sandbox and a second kithd's containers do not.
+- **What needs which opening.** A user namespace of its own is refused by kith's seccomp filter (clone and unshare with namespace flags), not by the guest kernel (`max_user_namespaces` 1816, no sysctl that restricts it; with the filter off, `unshare` works). bubblewrap is also refused by the capability kept in the bounding set. `userNamespaces: true` on the container is the smallest opening, of the four tried, that let it run: the bounding set is empty and the filter lets those calls through, with the cost "What is not defended" gives for it (more of the kernel to get wrong). `seccomp: {unconfined: true}` alone lets `unshare` through but not bubblewrap.
+- **What is not recommended.** `runAsUser: 0` for nesting: the filter still refuses, and the container is more privileged for nothing. Unconfined seccomp to get a runtime inside a container: it takes off the whole filter for a few calls. A second kithd that is meant to run workloads inside a container: under the openings tried its containers did not run (under four of the five it stopped at the cgroup check, so what comes after is untested), because the cgroup2 mount inside a container is read-only and the container's cgroup is the root of its namespace ("no delegated cgroup"). That is kith's mount; a writable, delegated cgroup subtree would be a new opening, a way for a container to make cgroups on the node, and it is not offered.
+
+The nested kithd shares the node's network, so its registry port meets the node's.
+
 ## What splitting kithd in two would and would not change
 
 Design in `docs/adr-privilege.md` (T-0334). Built today: the node's own policy and the
