@@ -24,6 +24,10 @@
     # key on /dev/uhid (docs/adr-fido2.md section 2), and of a kernel with that device (the uhid-test
     # spec); in a folder of its own, so the plain image stays plain, and no other test has either.)
     [ "$test" != fido2 ] || { KITHD_FEATURES=fido2-test KITH_OS_SPEC=os/examples/fido2-test.yaml osdir=$root/target/os-fido2; export KITHD_FEATURES; }
+    # (disk: the image of a kithd built with the cargo feature disk-test, which makes the disk named on
+    # the kernel command line a data disk at start (kith.disk-add=SERIAL), so the real mapping and the
+    # mount are seen without the verbs; in a folder of its own, so the plain image stays plain.)
+    [ "$test" != disk ] || { KITHD_FEATURES=disk-test osdir=$root/target/os-disk; export KITHD_FEATURES; }
     sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC"} --out "$osdir" >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
     if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ]; then
         . "$root/ci/vm/cluster.sh"
@@ -39,7 +43,7 @@
     more=$serve once=1
     boot() { # [more of QEMU's arguments]: $once empty lets the guest restart itself
         : >"$work/log"
-        timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none ${once:+-no-reboot} \
+        timeout --foreground "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none ${once:+-no-reboot} \
             -machine q35 -bios "$firmware" -drive "file=$work/disk.raw,format=raw,if=virtio" \
             -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:7443${net_restrict-,restrict=on}" -device virtio-net-pci,netdev=n0 \
             -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=$more" "$@" \
@@ -77,6 +81,9 @@
     fi
     if [ "$test" = modules ]; then
         . "$root/ci/vm/modules.sh"
+    fi
+    if [ "$test" = disk ]; then
+        . "$root/ci/vm/disk.sh"
     fi
 
     # (The disk is longer than the image written to it, as a real one is: 40 GB, of which

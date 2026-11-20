@@ -93,6 +93,64 @@ fn readme_says_how_a_compose_stack_becomes_kiths() {
     }
 }
 
+/// The media stack's apply-to-ready time is written beside `docker compose up`'s, in the
+/// front page and in the numbers guide, as the same two figures, and where kith is the slower
+/// the page says by how much and why.
+#[test]
+fn compose_timing_is_written_beside_docker() {
+    // "kith 12.345 s" / "docker 6.789 s": the figures ci/vm/compose.sh prints, as pages write them.
+    fn figure(page: &str, name: &str) -> f64 {
+        let tail = page
+            .split(&format!("{name} "))
+            .skip(1)
+            .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+            .unwrap_or_else(|| panic!("no `{name} N.N s` figure in the section"));
+        let number: String = tail.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        assert!(
+            tail[number.len()..].starts_with(" s"),
+            "`{name} {number}` is not in seconds"
+        );
+        number.parse().unwrap()
+    }
+    let mut seen = Vec::new();
+    for (path, page) in [DOCS[0], DOCS[12]] {
+        let section = page
+            .split("\n#")
+            .find(|s| {
+                s.trim_start_matches('#')
+                    .trim_start()
+                    .to_lowercase()
+                    .starts_with("the compose stack beside docker")
+            })
+            .unwrap_or_else(|| panic!("{path} has no section `The compose stack beside docker`"));
+        assert!(
+            section.contains("docker compose up"),
+            "{path}: the section does not name `docker compose up`"
+        );
+        assert!(
+            section.contains("ci/vm.sh --test compose"),
+            "{path}: the section does not say how to run it"
+        );
+        let (kith, docker) = (figure(section, "kith"), figure(section, "docker"));
+        assert!(kith > 0.0 && docker > 0.0, "{path}: a figure of 0 s");
+        if kith > docker {
+            assert!(
+                section.contains("slower"),
+                "{path}: kith is slower and the section does not say so"
+            );
+            assert!(
+                section.contains("because"),
+                "{path}: kith is slower and the section does not say why"
+            );
+        }
+        seen.push((kith, docker));
+    }
+    assert_eq!(
+        seen[0], seen[1],
+        "the front page and the numbers guide carry different figures"
+    );
+}
+
 fn root() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
 }

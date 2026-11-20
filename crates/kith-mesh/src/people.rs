@@ -861,6 +861,32 @@ mod tests {
         }
     }
 
+    /// A level that leaves by an Exit (condition 3): its named range is still never out the Exit's
+    /// link, and the one thing passed out that link is the internet, after the private ranges.
+    #[test]
+    fn people_exit_a_named_range_is_never_sent_out_an_exit_link() {
+        let mut level = work();
+        level.internet = Internet::Exit(3);
+        let chains = built(&[peer()], &[("work", level)]);
+        let out = &chain(&chains, "work-out").rules;
+        let named_range = out
+            .iter()
+            .position(|r| {
+                r.contains_slice(&reach(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24, true)) && r.ends_with(&verdict(1))
+            })
+            .expect("the named range is accepted");
+        assert!(out[named_range].contains_slice(&not_begins(7, "kx")));
+        let to = [nfproto(2), named(7, "kx3"), verdict(1)].concat();
+        let exit = out.iter().position(|r| *r == to).expect("the internet goes out kx3");
+        let private = out
+            .iter()
+            .position(|r| {
+                r.contains_slice(&reach(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8, true)) && r.ends_with(&verdict(0))
+            })
+            .expect("private space is dropped");
+        assert!(private < exit, "the Exit's link is passed after the private ranges");
+    }
+
     #[test]
     fn private_drops_each_range_the_adr_names_in_both_directions() {
         let ranges: [(IpAddr, u8); 6] = [

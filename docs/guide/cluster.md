@@ -205,7 +205,10 @@ that name. A kithd restart drops the connections through it.
 A Service with `headless: true` (`clusterIP: None` in Kubernetes) has no address of its own: its
 name answers the addresses of its ready replicas, and it cannot be `expose`d. Each ready replica
 is also named `NAME-N.SERVICE.NAMESPACE.svc.cluster.local` (a StatefulSet's pod names) under every
-Service that selects its Workload.
+Service that selects its Workload. With no ready replica the name still exists: it answers NODATA
+(no records), not NXDOMAIN. A Service's name exists exactly, so a wildcard `DNSRecord` no longer
+answers it (it answers NODATA for a type the Service has no address for). A Workload whose longest replica name `NAME-N` passes 63 characters (a
+DNS label) is refused when applied, by name.
 
 - Relaying runs on up to four threads of its own and DNS on one more, so a busy Service holds up
   neither the API nor lookups.
@@ -282,7 +285,7 @@ port 80 redirects. The ports need CAP_NET_BIND_SERVICE.
   PEM): apply your own, or start with `--acme` (`--acme URL` for another directory; the flag
   accepts its terms) to get and renew one from Let's Encrypt. Point the host's DNS at the
   ingress nodes first, and give `--acme` to every control node that may lead (the leader orders
-  for ingress workers). `kith get service/NAME -o yaml` shows `tls`; a failure is retried an
+  for ingress workers; under `spec.signing: required` a control node that does not lead orders only once the admin has set `spec.ingress: true` on its Node). `kith get service/NAME -o yaml` shows `tls`; a failure is retried an
   hour later. Keys, and the ACME account's (`Secret/kith-system/acme-account`), are Secrets in
   the store.
 - **Bytes as they are:** TLS ends at the ingress and nothing is added; NetworkPolicy sees the
@@ -361,13 +364,14 @@ Three voters are needed for it to move: with two, the one that is left cannot co
 leads. Choose an address outside the router's DHCP range. ARP cannot stop a hostile host on the
 LAN from claiming the address: the holder announces it again when it hears another card answer
 for it (at most once a second) and logs the other MAC, but a host that keeps claiming it can
-still take traffic. Only DNS answers on it so far; TCP 443 is for the nodes' own
-addresses still.
+still take traffic. The router forwards UDP 51820 (the mesh port) and TCP 443 to it as well: the
+holder answers a WireGuard handshake sent there from that address, and TCP 443 (the ingress)
+answers there from the holder, as it does on the nodes' own addresses.
 
 **Calling home from outside.** The holder says so in the `Cluster` (`kith get cluster` shows the
 house address, the endpoint, the holder and since when; the next holder replaces it). To let a
-roaming laptop in, forward UDP 51820 (the mesh port) on the router to the house address, and
-point `endpoint` at the router's public name or address with that port. A laptop (`--roaming`)
+roaming laptop in, the router forwards UDP 51820 (the mesh port) and TCP 443 to the house
+address, and `endpoint` names the router's public name or address with that port. A laptop (`--roaming`)
 that has not shaken hands with the holder for three minutes (as long as any peer is called
 silent; a healthy tunnel shakes hands about every two) calls the holder at `endpoint`; it does
 not give it to any other node, and a node that calls it from somewhere keeps that address, so

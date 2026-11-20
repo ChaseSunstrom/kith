@@ -6,7 +6,7 @@
 # What is in it:
 #   - a kernel built from kernel.org's source at a pinned version and checksum with
 #     os/kernel.config: no modules, no initramfs (but for a spec with the `all` feature:
-#     signed modules and their firmware in the root, see --spec);
+#     signed modules, NVIDIA's open ones among them, and their firmware in the root, see --spec);
 #   - a root file system (squashfs, read-only) holding kithd as /sbin/init, kith, a CA
 #     bundle and empty directories, with a dm-verity hash tree beside it;
 #   - a unified kernel image (systemd's stub, the kernel, and the command line that
@@ -25,6 +25,15 @@ kernel_url=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$kernel_version.ta
 firmware_date=20261019
 firmware_sha256=a10d1ab5baf2c74ba92e8c7cf313e691696c26bddfa6df00db795e48d70cd4ca
 firmware_url=https://cdn.kernel.org/pub/linux/kernel/firmware/linux-firmware-$firmware_date.tar.xz
+# NVIDIA's open GPU kernel modules, for the `all` image only: the source (built out of tree
+# against that kernel's tree and signed with its key) and the release's own .run file, which is
+# only read for the GSP firmware the modules load (nvidia/VERSION/gsp_*.bin: linux-firmware
+# has another layout, for nouveau). Both are the files of this version, by their hashes.
+nvidia_version=595.112.07
+nvidia_sha256=6bf8f19b9d7fa6ca0029100fe09f8a72d413df67e08ad4428b1b358ec10d28c0
+nvidia_url=https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/$nvidia_version.tar.gz
+nvidia_run_sha256=1a38ecd538a2da6232a7330184063af59e9fc946c908cca555bd07909848b9f0
+nvidia_run_url=https://download.nvidia.com/XFree86/Linux-x86_64/$nvidia_version/NVIDIA-Linux-x86_64-$nvidia_version.run
 ca_date=2026-11-05
 ca_sha256=427c064216761a1e72a8b30f0d954d08cb6e4435a82091fb865afd20c8497285
 ca_url=https://curl.se/ca/cacert-$ca_date.pem
@@ -98,12 +107,14 @@ out=$(cd "$out" && pwd)
 # KITHD_FEATURES (ci/musl.sh) builds a kithd with test-only code: only into the folder
 # ci/vm.sh gives that image, so one left in the environment never makes an image that ships.
 # (forge: a route a leader appends an unchecked entry by; fido2-test: a software security key
-# on /dev/uhid, docs/adr-fido2.md section 2.)
+# on /dev/uhid, docs/adr-fido2.md section 2; disk-test: a data disk made at boot from the
+# command line, until the add verb is, docs/adr-second-disk.md.)
 case "${KITHD_FEATURES:-}" in
     '') ;;
     forge) want=$root/target/os-forge ;;
     fido2-test) want=$root/target/os-fido2 ;;
-    *) echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): it knows forge and fido2-test (unset it)" >&2; exit 2 ;;
+    disk-test) want=$root/target/os-disk ;;
+    *) echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): it knows forge, fido2-test and disk-test (unset it)" >&2; exit 2 ;;
 esac
 if [ -n "${KITHD_FEATURES:-}" ] && [ "$out" != "$want" ]; then
     echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): only for --out ${want#"$root"/}, not $out (unset it)" >&2
@@ -258,12 +269,13 @@ fi
 # (a comment edit must not rebuild a kernel: 2.6 GB of tree and an hour). The firmware is
 # in it by its hash and its CONFIG_EXTRA_FIRMWARE line.
 compiler=$(gcc --version | head -n 1)
-key=$({ echo "$kernel_version $kernel_sha256 $compiler"; [ -z "$firmware" ] || echo "$firmware_sha256"; sed -e '/^# CONFIG_.* is not set$/b' -e '/^[[:space:]]*\(#\|$\)/d' "$kconfig"; } | sha256sum | cut -c 1-16)
+key=$({ echo "$kernel_version $kernel_sha256 $compiler"; [ -z "$firmware" ] || echo "$firmware_sha256"; [ -z "$modules" ] || echo "nvidia $nvidia_sha256 no-peermem"; sed -e '/^# CONFIG_.* is not set$/b' -e '/^[[:space:]]*\(#\|$\)/d' "$kconfig"; } | sha256sum | cut -c 1-16)
 kernel=$cache/kernel-$key/vmlinuz
 mods=$cache/kernel-$key/mods
 if ! [ -r "$kernel" ]; then
     echo "build.sh: building the kernel ($kernel_version): this takes a while, once" >&2
     fetch "$kernel_url" "$kernel_sha256" "$cache/linux-$kernel_version.tar.xz"
+    [ -z "$modules" ] || fetch "$nvidia_url" "$nvidia_sha256" "$cache/nvidia-open-$nvidia_version.tar.gz"
     tree=$cache/kernel-$key/src
     # (A build that was cut short goes on from its tree, which has the mark of a config
     # made; a tree without it is begun again. The modules of an earlier key are not kept.)
@@ -306,6 +318,26 @@ if ! [ -r "$kernel" ]; then
             rel=$(make -s kernelrelease)
             m=$mods.part/lib/modules/$rel
             rm -f "$m/build" "$m/source"
+            # NVIDIA's open modules, out of tree against this tree (nvidia, nvidia-modeset,
+            # nvidia-uvm, nvidia-drm; peermem is not built), installed the same way: signed with
+            # the same key, stripped, into extra/, and depmod runs again so modules.alias and
+            # modules.dep have them. The source is the pinned tarball, in a folder of its own.
+            nv=$cache/kernel-$key/nvidia
+            [ ! -d "$nv" ] || find "$nv" -delete
+            mkdir -p "$nv"
+            tar -xzf "$cache/nvidia-open-$nvidia_version.tar.gz" -C "$nv" --strip-components=1
+            nice -n 10 make -s -C "$nv" SYSSRC="$tree" SYSOUT="$tree" -j"${KITH_OS_JOBS:-$(nproc)}" modules
+            make -s -C "$nv" SYSSRC="$tree" SYSOUT="$tree" modules_install INSTALL_MOD_PATH="$mods.part" INSTALL_MOD_STRIP=1 INSTALL_MOD_DIR=extra
+            find "$nv" -delete
+            # (nvidia-peermem is built where the kernel has InfiniBand: not wanted, and no card's
+            # alias loads it. Gone, and the index made again without it.)
+            rm -f "$m/extra/nvidia-peermem.ko"
+            depmod -b "$mods.part" -a "$rel"
+            for f in nvidia nvidia-modeset nvidia-uvm nvidia-drm; do
+                [ -s "$m/extra/$f.ko" ] || { echo "build.sh: NVIDIA's $f.ko is not in lib/modules/$rel/extra" >&2; exit 1; }
+            done
+            ! grep -q peermem "$m/modules.dep" || { echo "build.sh: modules.dep still names nvidia-peermem" >&2; exit 1; }
+            grep -q '^alias pci:v000010DE.* nvidia$' "$m/modules.alias" || { echo "build.sh: modules.alias has no alias of an NVIDIA card for nvidia" >&2; exit 1; }
             for f in modules.dep modules.alias modules.symbols modules.builtin modules.builtin.modinfo modules.order; do
                 [ -s "$m/$f" ] || { echo "build.sh: modules_install left no $f in lib/modules/$rel" >&2; exit 1; }
             done
@@ -325,6 +357,10 @@ if ! [ -r "$kernel" ]; then
             [ -n "$have" ] && [ -n "$(modinfo -F signer "$sample")" ] || { echo "build.sh: amdgpu.ko has no signer: $(modinfo "$sample" | tail -n 5)" >&2; exit 1; }
             [ "$have" = "$serial" ] || [ "$have" = "$ski" ] ||
                 { echo "build.sh: amdgpu.ko is signed by $have, which is not the kernel's key (serial $serial, id $ski)" >&2; exit 1; }
+            for f in nvidia nvidia-modeset nvidia-uvm nvidia-drm; do
+                [ "$(modinfo -F sig_key "$m/extra/$f.ko" | hexid)" = "$have" ] ||
+                    { echo "build.sh: $f.ko is not signed by the key amdgpu.ko is" >&2; exit 1; }
+            done
             echo "build.sh: $n modules, signed by $(modinfo -F signer "$sample") ($have)"
             # The key is not kept: not in the tree, not in what is installed.
             rm -f certs/signing_key.pem
@@ -376,6 +412,26 @@ if [ -n "$modules" ]; then
             [ -e "$fwall/$name" ] || [ -h "$fwall/$name" ] || { mkdir -p "$fwall/$(dirname "$name")" && ln -s "$target" "$fwall/$name"; }
         done
         : >"$fwall/.kith-links"
+    fi
+    # NVIDIA's GSP firmware, the two files the modules load as nvidia/VERSION/gsp_*.bin: from the
+    # release's .run (423 MB, a shell header and a zstd tar behind it, the line it starts at in
+    # `skip=`), of which only they are kept. The .run is the file pinned above.
+    nvfw=$cache/nvidia-firmware-$nvidia_version
+    if ! [ -e "$nvfw/.kith-done" ]; then
+        echo "build.sh: NVIDIA $nvidia_version's GSP firmware" >&2
+        fetch "$nvidia_run_url" "$nvidia_run_sha256" "$cache/nvidia-$nvidia_version.run"
+        skip=$(sed -n '2,20s/^skip=\([0-9][0-9]*\)$/\1/p' "$cache/nvidia-$nvidia_version.run")
+        [ -n "$skip" ] || die "the .run of NVIDIA $nvidia_version has no skip= line"
+        [ ! -d "$nvfw" ] || find "$nvfw" -delete
+        mkdir -p "$nvfw"
+        # (A pipe: a failed zstd leaves tar a short stream, which it fails on; and the files are checked.)
+        tail -n "+$skip" "$cache/nvidia-$nvidia_version.run" | zstd -dcq | tar -x -C "$nvfw" --wildcards 'firmware/gsp_*.bin'
+        for f in gsp_ga10x gsp_tu10x; do
+            [ -s "$nvfw/firmware/$f.bin" ] || die "the .run of NVIDIA $nvidia_version has no firmware/$f.bin"
+        done
+        # (The .run is 423 MB and is not read again.)
+        find "$cache/nvidia-$nvidia_version.run" -delete
+        : >"$nvfw/.kith-done"
     fi
     # (The tag is the layout of the list: a list made before the links was another.)
     fwlist=$cache/kernel-$key/firmware-$(printf 'links2\n%s\n%s\n' "$firmware_sha256" "$fwextra" | sha256sum | cut -c 1-16).list
@@ -446,6 +502,16 @@ assemble() { # DIR
     truncate -s 8M "$r/usr/share/kith/volume.ext4"
     E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -b 4096 -N 4096 -L kith-volume -U "$seed" \
         -E "hash_seed=$seed,root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0" "$r/usr/share/kith/volume.ext4" >&2
+    # The same for a second disk's data (docs/adr-second-disk.md, section 4), with room kept for
+    # the descriptor blocks of a disk of 2^30 blocks (4 TiB): an ext4 grows online only as far
+    # as it reserved, and one made this small reserves little. The grow is one transaction that
+    # holds every reserved descriptor block (512 here), and a journal allows a transaction a
+    # quarter of itself: the default one of a file system this small (4 MiB) is too small for it
+    # (ENOSPC at the grow, seen in a VM), so -J size=16 (4096 blocks). crates/kithd/src/data_disk/seed.rs
+    # pins these parameters (resize= is its CEILING); zeros squash to nothing in the root.
+    truncate -s 64M "$r/usr/share/kith/data.ext4"
+    E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -b 4096 -N 4096 -J size=16 -L kith-data -U "$seed" \
+        -E "hash_seed=$seed,root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0,resize=1073741824" "$r/usr/share/kith/data.ext4" >&2
     msize=0 fsize=0
     if [ -n "$modules" ]; then
         # The modules (signed, with depmod's index and the list of what is built in, so the
@@ -458,6 +524,13 @@ assemble() { # DIR
         (cd "$fwall" && cpio -pd --quiet "$r/lib/firmware") <"$fwlist"
         # (A link whose file the list lacks is not kept.)
         find "$r/lib/firmware" -xtype l -delete
+        # NVIDIA's GSP firmware, where the modules ask for it: nvidia/VERSION/ (VERSION is the
+        # modules' own, which they are built from the source of).
+        mkdir -p "$r/lib/firmware/nvidia/$nvidia_version"
+        cp "$nvfw"/firmware/gsp_*.bin "$r/lib/firmware/nvidia/$nvidia_version/"
+        for f in gsp_ga10x gsp_tu10x; do
+            [ -s "$r/lib/firmware/nvidia/$nvidia_version/$f.bin" ] || die "no NVIDIA $f.bin in the root's /lib/firmware"
+        done
         find "$r/lib" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
         # Not a key anywhere in the root (its CA bundle is a .crt).
         [ -z "$(find "$r" \( -name '*.pem' -o -name 'signing_key*' \))" ] || die "a key is in the root"
@@ -494,9 +567,12 @@ assemble() { # DIR
     # slots by it, and a node told to go to an older release would never start it. The
     # order is the N in the file's name, which the node gives it: crates/kithd/src/os.rs.)
     printf 'NAME="kith OS"\nID=kith\nPRETTY_NAME="kith OS"\n' >"$w/osrel"
+    cmdline() { # SLOT BLOCKS HASH
+        table="root,,,ro,0 $(($2 * 8)) verity 1 PARTLABEL=root-$1 PARTLABEL=verity-$1 4096 4096 $2 1 sha256 $3 $salt"
+        printf '%s' "console=ttyS0 console=tty0 dm-mod.create=\"$table\" dm-mod.waitfor=PARTLABEL=root-$1,PARTLABEL=verity-$1 root=/dev/dm-0 ro rootwait kith.slot=$1"
+    }
     for slot in a b; do
-        table="root,,,ro,0 $((blocks * 8)) verity 1 PARTLABEL=root-$slot PARTLABEL=verity-$slot 4096 4096 $blocks 1 sha256 $hash $salt"
-        printf '%s' "console=ttyS0 console=tty0 dm-mod.create=\"$table\" dm-mod.waitfor=PARTLABEL=root-$slot,PARTLABEL=verity-$slot root=/dev/dm-0 ro rootwait kith.slot=$slot" >"$w/cmdline-$slot"
+        cmdline "$slot" "$blocks" "$hash" >"$w/cmdline-$slot"
         objcopy \
             --add-section .osrel="$w/osrel" --change-section-vma .osrel=0x14dfc0000 \
             --add-section .cmdline="$w/cmdline-$slot" --change-section-vma .cmdline=0x14dfd0000 \
@@ -504,16 +580,31 @@ assemble() { # DIR
             "$efi/linuxx64.efi.stub" "$w/kith-$slot.efi"
         touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-$slot.efi"
     done
-    # The installer's: slot a's, told to install and not to serve (crates/kithd/src/install.rs).
-    printf '%s kith.install' "$(cat "$w/cmdline-a")" >"$w/cmdline-install"
+    # The installer's: slot a's, told to install and not to serve (crates/kithd/src/install.rs),
+    # with its root and verity tree under labels of their own. The kernel takes the first
+    # partition with a label, and a disk that already has kith OS has a root-a: the stick's
+    # hash on that disk's root is a panic (T-1064).
+    sed 's/PARTLABEL=root-a/PARTLABEL=install-root/g; s/PARTLABEL=verity-a/PARTLABEL=install-verity/g' \
+        "$w/cmdline-a" | tr -d '\n' >"$w/cmdline-install"
+    printf ' kith.install' >>"$w/cmdline-install"
+    grep -q 'PARTLABEL=install-root PARTLABEL=install-verity' "$w/cmdline-install" || die "the installer's command line names the disk's root"
     objcopy \
         --add-section .osrel="$w/osrel" --change-section-vma .osrel=0x14dfc0000 \
         --add-section .cmdline="$w/cmdline-install" --change-section-vma .cmdline=0x14dfd0000 \
         --add-section .linux="$kernel" --change-section-vma .linux=0x14e000000 \
         "$efi/linuxx64.efi.stub" "$w/kith-install.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-install.efi"
+    # What tells a node a kithd-only update from a full one (the header's `kithd` object,
+    # crates/kithd/src/os.rs): the digests of kithd; of the boot file but for the root's own
+    # hash (the kernel, the stub, its os-release and the command line with no hash or size
+    # in it); and of the root but for kithd (/sbin/init) and its os-release, which names the
+    # version (sorted, owner and time fixed, as the squashfs is).
+    kithd_sum=$(sha256sum "$bin/kithd" | cut -d ' ' -f 1)
+    kernel_sum=$({ cmdline a 0 0; cat "$kernel" "$efi/linuxx64.efi.stub" "$w/osrel"; } | sha256sum | cut -d ' ' -f 1)
+    rest_sum=$(tar -C "$r" --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+        --exclude=./sbin/init --exclude=./etc/os-release -cf - . | sha256sum | cut -d ' ' -f 1)
     # What a node of an older version is given to become this one (os/update.sh).
-    sh "$root/os/update.sh" "$version" "$hash" "$w/root.squashfs" "$w/root.verity" "$w/kith-a.efi" "$w/kith-b.efi" >"$w/kith-os.update"
+    sh "$root/os/update.sh" "$version" "$hash" "$w/root.squashfs" "$w/root.verity" "$w/kith-a.efi" "$w/kith-b.efi" "$kithd_sum" "$kernel_sum" "$rest_sum" >"$w/kith-os.update"
 
     # The ESP, made here and not by repart: FAT16 at 64 MB, where repart insists on 260.
     # The installer's is the same with its own kernel image.
@@ -578,8 +669,8 @@ assemble() { # DIR
     d=$w/repart-install.d
     mkdir "$d"
     part 10-esp esp esp 64M "CopyBlocks=$w/esp-install.img"
-    part 20-root-a root-x86-64 root-a "$rootsz" "CopyBlocks=$w/root.squashfs"
-    part 30-verity-a root-x86-64-verity verity-a "$veritysz" "CopyBlocks=$w/root.verity"
+    part 20-root-a root-x86-64 install-root "$rootsz" "CopyBlocks=$w/root.squashfs"
+    part 30-verity-a root-x86-64-verity install-verity "$veritysz" "CopyBlocks=$w/root.verity"
     part 50-payload linux-generic payload "$(($(stat -c %s "$w/kith-os.raw") / 1048576 + 1))M" "CopyBlocks=$w/kith-os.raw"
     systemd-repart --empty=create --size=auto --dry-run=no --seed="$seed" --definitions="$d" "$w/kith-os-installer.raw" >"$w/repart-install.log" 2>&1 \
         || { cat "$w/repart-install.log" >&2; die "systemd-repart failed (the installer)"; }

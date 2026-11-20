@@ -36,6 +36,10 @@ struct Header {
     /// The root's verity hash, which is on the command line of a node that runs it.
     hash: String,
     pieces: Vec<Piece>,
+    /// Optional, and signed with the rest of the header: see [`digests`]. An older kithd
+    /// does not read it; one that cannot make sense of it takes the update in full.
+    #[serde(default)]
+    kithd: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +58,42 @@ fn header(block: &[u8]) -> Result<Header, String> {
         return Err("this update is of a kind this kithd does not know".into());
     }
     Ok(header)
+}
+
+/// What an update's header says it is made of, for [`way`] (the header's `kithd` object, made
+/// by the build, see os/build.sh): the digests of kithd (`sha256`), of what the boot file is
+/// but for the root's own hash (`kernel`), and of the root but for kithd and its os-release
+/// (`rest`), as 64 hex digits each. `None` for a header without them or with them malformed.
+pub fn digests(block: &[u8]) -> Option<[String; 3]> {
+    let header = header(block).ok()?;
+    let kithd = header.kithd?;
+    let get = |name: &str| {
+        let digest = kithd.get(name)?.as_str()?;
+        (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then(|| digest.to_ascii_lowercase())
+    };
+    Some([get("sha256")?, get("kernel")?, get("rest")?])
+}
+
+/// How an update is taken.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Way {
+    /// Only kithd differs from the running system: the kernel and the rest of the root are the same.
+    KithdOnly,
+    /// A slot written and a reboot, as ever.
+    Full,
+}
+
+/// `new`, the header of an update, against `running`, the header that wrote the system that
+/// runs (kept: [`keep_signed`]; the caller has shown it is the system's own). Kithd alone only
+/// when both say what they are made of and the kernel and the rest of the root are the same;
+/// on any doubt, in full.
+pub fn way(new: &[u8], running: &[u8]) -> Way {
+    match (digests(new), digests(running)) {
+        (Some([_, kernel, rest]), Some([_, kernel_now, rest_now])) if kernel == kernel_now && rest == rest_now => {
+            Way::KithdOnly
+        }
+        _ => Way::Full,
+    }
 }
 
 /// `kith-7-b+2-1.efi`: generation 7, slot b, 2 tries left. Without a counter it is good.
@@ -412,6 +452,12 @@ fn image(esp: &Path, slot: char, counting: bool) -> Result<PathBuf, String> {
 pub fn running_image(esp: &Path, slot: char) -> Result<Vec<u8>, String> {
     let from = image(esp, slot, false)?;
     std::fs::read(&from).map_err(|e| format!("reading {}: {e}", from.display()))
+}
+
+/// [`running_image`], from where the ESP is mounted already: only inside a `with` of [`esp`]
+/// (an update's `vouched` is one).
+pub fn running_image_here(slot: char) -> Result<Vec<u8>, String> {
+    running_image(&Path::new(ESP).join("EFI/Linux"), slot)
 }
 
 /// The header of the update that wrote `slot`, kept with its signature and key (`os-release-signed-`

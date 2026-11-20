@@ -72,3 +72,26 @@ numbers are not of the same thing:
   core kinds ([kubectl and Helm, as they are](kubernetes.md#kubectl-and-helm-as-they-are))
   and refuses the rest by name; the kith side of these tables is measured through kith's
   own API.
+
+## The compose stack beside docker
+
+`KITH_E2E=1 sh ci/vm.sh --test compose` runs [ci/compose/media.yml](../../ci/compose/media.yml),
+a media stack of eight services in the shape of a real one, as the test pod, and times it twice.
+One run: kith 2.788 s, docker 0.915 s.
+
+- kith: the file is translated by `kith import compose` (nothing left out), applied to one
+  node of 512 MB, and the clock runs from the apply to the moment each Workload says its
+  containers are ready (seven Workloads, the downloader sharing the vpn's pod). Ready includes
+  the HTTP probes the compose healthchecks became. The test asks every 0.2 s, one run.
+- docker: an Alpine 3.24 machine of 2048 MB with docker 29.9.3 and its compose plugin as
+  Alpine packages it, the test pod's image already imported. The clock runs from
+  `docker compose up -d` until eight containers run, after a `down -v` each time, three runs,
+  the median. Health checks are not waited for: the test pod has no curl. The kith node is
+  stopped first, so this machine is the only one running.
+
+kith is slower, by 1.873 s (3.0 times), because the clocks stop at different moments (kith's
+at the probes passing, docker's at running), because each service is a pod of its own, with
+its volumes made on the node, where docker starts a container, and because the test polls
+kith's API every 0.2 s. These are the differences by construction; the run does not split
+the 1.873 s among them, so none of them is measured. One run on a host shared with other work:
+the order of magnitude, not a ratio.

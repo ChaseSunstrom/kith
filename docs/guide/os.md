@@ -116,10 +116,11 @@ card the catalogue does not list yet) is chosen by hand, as above.
 KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
 KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
 sh ci/vm.sh --test modules   # the same image: drivers load at start, on a device added, and a bad signature is refused
+sh ci/vm.sh --test disk      # a disk file made a data disk (a build with the feature disk-test) and mounted; another file left alone, unchanged
 ```
 
 For a node whose hardware is not known when the image is built, `features: [all]` turns on
-kernel modules (`os/features/all.config`): GPUs (amdgpu, i915, xe, nouveau), sound (HDA and its
+kernel modules (`os/features/all.config`): GPUs (amdgpu, i915, xe, nouveau, and NVIDIA's open modules built beside them), sound (HDA and its
 codecs, USB audio, Sound Open Firmware), Wi-Fi (iwlwifi, ath9k to ath12k, mt76, rtw88, rtw89)
 and the network cards the plain kernel lacks. `firmware: [all]` is all of linux-firmware; a list
 of paths there (`amdgpu/*`) is those files, and in both cases the files each module names
@@ -141,13 +142,24 @@ of paths there (`amdgpu/*`) is those files, and in both cases the files each mod
   block by block like the rest. The ESP stays 64 MB; the root slots grow with the root, so a
   node installed from a plain image has slots too small to be updated to this one.
 - **Sizes** (the plain image is 295,715,328 bytes, as before, and its kernel the same bytes):
-  kernel 13 MB; modules 77 MB (170 of them) and firmware 1,992 MB, both before compression; the
-  root 931 MB squashfs; the raw disk image 2,576 MB (954 MB as qcow2); the update file 966 MB.
-  `build.sh --check` allows the `all` image 4 GB, not the plain 300 MB. The installer's memory
-  disk carries the payload and not the modules.
-- **Not in it yet.** The NVIDIA open modules: a later slice, built out of tree against this
-  kernel and signed with the same throwaway key in the same build. A spec naming both `all` and
-  `gpu-amd-phoenix` is refused (the same driver, built in there).
+  kernel 13 MB; modules 109 MB (174 of them) and firmware 2,090 MB, both before compression; the
+  root 1,016 MB squashfs; the raw disk image 2,794 MB (1,039 MB as qcow2); the update file
+  1,051 MB. `build.sh --check` allows the `all` image 4 GB, not the plain 300 MB. The
+  installer's memory disk carries the payload and not the modules.
+- **NVIDIA's open modules.** `nvidia`, `nvidia-modeset`, `nvidia-uvm` and `nvidia-drm` (not
+  `nvidia-peermem`) are built out of tree in the same build, against this kernel, from NVIDIA's
+  `open-gpu-kernel-modules` at a version pinned in `build.sh` with its sha256 (a file that is
+  not the pinned one is refused). They are signed with the same throwaway key before it is
+  deleted, and installed in `/lib/modules/VER/extra`, where `modules.alias` names `nvidia` for
+  NVIDIA's cards. They add about 32 MB of modules (`nvidia.ko` 24 MB, `nvidia-modeset` 4 MB,
+  `nvidia-uvm` 3.5 MB, `nvidia-drm` 0.25 MB, stripped) and, as the GSP firmware the driver asks
+  for (`gsp_ga10x.bin`, `gsp_tu10x.bin`, taken from NVIDIA's release file, which is not
+  linux-firmware's), 98 MB in `/lib/firmware/nvidia/VERSION`. Only the kernel side is here: the
+  pod brings the CUDA userspace (libraries, `nvidia-smi`) and its own driver version must be the
+  same as the modules'. kithd loads `nvidia` before `nouveau` for the same card (nouveau stays
+  built, with no blacklist); a card before Turing, which the open modules refuse, goes to
+  nouveau. A spec naming both `all` and `gpu-amd-phoenix` is refused (the same driver, built in
+  there).
 
 A cluster runs plain and GPU nodes side by side: sign each image's update as its own
 `OSRelease` and roll each with its own `UpdatePlan`, the GPU one with a `selector` on a label
@@ -283,6 +295,13 @@ checks it before it writes a byte, and each piece as it writes it. Refused: a re
 key, signed by another key, changed after signing, or of another version than it says. So the
 address may be plain HTTP.
 
+The header also carries a `kithd` object: the digests of kithd, of the boot file but for the root's
+hash, and of the root but for kithd and its os-release. It is signed with the rest. Before it writes,
+a node reads it against the header kept for the system it runs, and works out whether only kithd
+differs (the kernel and the rest of the root are the same) or the update is a full one. A header
+without it, or no kept header, is a full update. Nothing is done with a kithd-only answer yet: the
+update is still a full one.
+
 **Which keys a node takes.** Its own only, whatever key an OSRelease names. Give them before the
 first release:
 
@@ -390,7 +409,9 @@ machine (the test attaches files as disks to VMs): that is your decision, machin
 
 Write `kith-os-installer.raw` to a USB stick (`dd if=kith-os-installer.raw of=/dev/sdX`), or
 attach it to a VM as its first disk, and start the machine from it (UEFI). It is kith OS started
-with `kith.install`: it serves nothing, and asks on the screen and the serial line alike:
+with `kith.install`: it serves nothing, and asks on the screen and the serial line alike. Its
+root and verity tree are labelled `install-root` and `install-verity`, not `root-a`, so it starts
+from the stick on a machine whose disk already has kith OS, and installs over it:
 
 ```
 This machine's disks:
