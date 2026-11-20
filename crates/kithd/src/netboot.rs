@@ -191,20 +191,32 @@ pub static RELEASES: OnceLock<(Vec<String>, std::path::PathBuf, bool)> = OnceLoc
 
 /// The release keys this node takes releases from (the ones it was given, else the ones it
 /// kept or its image holds) and whether it fetches from the LAN: what a machine installed from
-/// here is told to take too. At most 8 keys, of the 64 hex digits the install answers hold.
-fn releases_of(given: Vec<String>, state: &std::path::Path, lan: bool) -> (Vec<String>, bool) {
-    let keys = crate::update::keys(given, state).mine().map(|(keys, _)| keys);
-    let valid = |key: &String| crate::release_key(key).is_ok();
-    (
-        keys.unwrap_or_default().into_iter().filter(valid).take(8).collect(),
-        lan,
-    )
+/// here is told to take too. The install answers hold 1 to 8 keys of 64 hex digits: keys that
+/// cannot be read, are not such keys or are more are an error, not fewer keys. A machine told
+/// of fewer would take the first release's key, whoever's it is (update.rs, `unkeyed`).
+fn releases_of(given: Vec<String>, state: &std::path::Path, lan: bool) -> Result<(Vec<String>, bool), String> {
+    let (keys, _) = crate::update::keys(given, state).mine().map_err(|e| {
+        format!("netboot is not turned on: this node's release keys cannot be given to the machines ({e})")
+    })?;
+    if let Some(key) = keys.iter().find(|key| crate::release_key(key).is_err()) {
+        return Err(format!(
+            "netboot is not turned on: `{key}` is one of this node's release keys and is not 64 hex digits"
+        ));
+    }
+    if keys.len() > 8 {
+        return Err(format!(
+            "netboot is not turned on: this node takes releases from {} keys, and the machines' answers hold 8",
+            keys.len()
+        ));
+    }
+    Ok((keys, lan))
 }
 
-fn releases() -> (Vec<String>, bool) {
-    RELEASES.get().map_or_else(Default::default, |(given, state, lan)| {
-        releases_of(given.clone(), state, *lan)
-    })
+fn releases() -> Result<(Vec<String>, bool), String> {
+    RELEASES.get().map_or_else(
+        || Ok(Default::default()),
+        |(given, state, lan)| releases_of(given.clone(), state, *lan),
+    )
 }
 
 /// A machine's answers, as long as the room the file has for them. `keys` and `lan` are the
@@ -362,6 +374,10 @@ async fn tftp(socket: UdpSocket) {
             };
             let join = SocketAddr::new(us.ip(), *port);
             let Some(answers) = answers(&disk.0, disk.1, join, &token, &disk.2.0, disk.2.1) else {
+                eprintln!(
+                    "kithd: netboot: the answers for {} do not fit in {ROOM} bytes (or hold a key that is none): it is sent nothing",
+                    written(&mac)
+                );
                 return;
             };
             let sent = send(&transfer, image.len(), &options, |from, len| {
@@ -463,6 +479,7 @@ pub async fn on(
     if disk.is_empty() || !disk.chars().all(plain) {
         return Err(format!("`{disk}` is not a disk's name, or `only`"));
     }
+    let releases = releases()?;
     // (Waited for: until a task is gone its socket holds the port.)
     for task in off() {
         let _ = task.await;
@@ -511,7 +528,7 @@ pub async fn on(
         at,
         disk: disk.to_string(),
         encrypt,
-        releases: releases(),
+        releases,
         machines: held,
         until: Instant::now() + Duration::from_secs(minutes * 60),
         tasks,
@@ -717,11 +734,21 @@ mod tests {
         let (a, b) = ("a".repeat(64), "b".repeat(64));
         let held = |given: &[String]| releases_of(given.to_vec(), &dir, true);
         std::fs::write(dir.join("os-release-keys"), format!("# kept\n{b}\n")).unwrap();
-        assert_eq!(held(&[]), (vec![b.clone()], true));
-        assert_eq!(held(std::slice::from_ref(&a)), (vec![a.clone()], true));
-        let many = vec![a.clone(); 12];
-        assert_eq!(held(&many).0.len(), 8);
-        assert!(held(&["not a key".into(), b.clone()]).0 == [b]);
+        assert_eq!(held(&[]), Ok((vec![b.clone()], true)));
+        assert_eq!(held(std::slice::from_ref(&a)), Ok((vec![a.clone()], true)));
+        assert_eq!(held(&vec![a.clone(); 8]).unwrap().0.len(), 8);
+        // Past 8, a key that is none, or keys that cannot be read: refused, naming which, not fewer keys.
+        let nine = held(&vec![a.clone(); 9]).unwrap_err();
+        assert!(nine.contains("9 keys") && nine.contains("not turned on"), "{nine}");
+        let bad = held(&["not a key".into(), b.clone()]).unwrap_err();
+        assert!(bad.contains("not a key") && bad.contains("64 hex"), "{bad}");
+        std::fs::remove_file(dir.join("os-release-keys")).unwrap();
+        std::fs::create_dir(dir.join("os-release-keys")).unwrap();
+        let unread = held(&[]).unwrap_err();
+        assert!(
+            unread.contains("cannot be given") && unread.contains("release keys"),
+            "{unread}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
