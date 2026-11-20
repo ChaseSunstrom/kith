@@ -107,7 +107,7 @@ pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-siz
 .mark .ring { fill: none; stroke: var(--accent); stroke-width: 1.5; animation: ring var(--breath) ease-out infinite; }
 .who { font-size: var(--small); color: var(--dim); }
 .who:empty { display: none; }
-#generation { font-size: var(--small); }
+#updated { font-size: var(--small); }
 /* The link to kithd is a stop too: filled when live, amber while it waits, a broken ring when lost. */
 .link { display: inline-flex; align-items: center; gap: calc(var(--unit) * 2); font-size: var(--small); font-weight: 700; }
 .link::before { content: ""; width: 14px; height: 14px; border: var(--stroke) solid currentColor; border-radius: 50%; }
@@ -163,7 +163,7 @@ pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-siz
   .kinds .scroll { max-height: min(30vh, 16rem); }
   .scroll { overflow: visible; }
   .list .scroll, .kinds .scroll, .low .scroll, .diff, .logs { overflow: auto; }
-  #generation { display: none; }
+  #updated { display: none; }
 }
 
 /* 01: the line from the mark, a stop for every kind. A ring where the cluster has some of
@@ -272,7 +272,9 @@ button.range[aria-pressed="true"] { background: var(--accent); border-color: var
 .chart-panel:nth-child(2) { animation-delay: var(--step); }
 .chart-panel:nth-child(3) { animation-delay: calc(var(--step) * 2); }
 .chart-panel:nth-child(n + 4) { animation-delay: calc(var(--step) * 3); }
-.chart-panel h3 { font-size: var(--base); font-weight: 800; }
+.chart-panel h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--unit) calc(var(--unit) * 3); font-size: var(--base); font-weight: 800; }
+.chart-panel .key { display: inline-flex; gap: calc(var(--unit) * 4); margin-left: auto; font-size: var(--small); font-weight: 400; color: var(--dim); }
+.chart-panel .key > span { display: inline-flex; align-items: center; gap: calc(var(--unit) * 1.5); }
 .chart { display: block; width: 100%; height: 180px; overflow: visible; touch-action: pan-y; cursor: crosshair; }
 .chart .grid { stroke: var(--hair); stroke-width: 1; }
 .chart .grid.base { stroke: var(--text); stroke-width: 2; }
@@ -293,6 +295,7 @@ button.range[aria-pressed="true"] { background: var(--accent); border-color: var
 .legend .missing { color: var(--dim); }
 .legend .missing .name { font-weight: 400; }
 .swatch { flex: none; display: inline-block; width: 14px; height: var(--stroke); background: var(--hue, var(--text)); }
+.swatch.second { height: 0; background: none; border-top: var(--stroke) dotted var(--hue, var(--text)); }
 .missing .swatch { width: 12px; height: 12px; background: none; border: 2px dashed var(--bad); border-radius: 50%; }
 
 .low { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: calc(var(--unit) * 7) calc(var(--unit) * 9); }

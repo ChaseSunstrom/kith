@@ -73,8 +73,12 @@ if (scene === 'Peer' || scene === 'Qr') {
   });
 }
 if (scene === 'Dash') {
-  // The overview: every chart drawn, a line per node, and no sideways scroll at any width.
+  // The overview: every chart drawn, a line per node, and no sideways scroll at any width; and the
+  // first load, which SHIM fails part way, drawn on its retry (not left waiting for a change).
   step(3500, () => {
+    if (document.querySelectorAll('#kinds li').length === 0) throw new Error('the kinds were not drawn after a first load that failed');
+    if (document.getElementById('link').textContent !== 'live') throw new Error(`the link says ${document.getElementById('link').textContent}`);
+    if (!/^updated \\d\\d:\\d\\d:\\d\\d$/.test(document.getElementById('updated').textContent)) throw new Error('no updated time');
     if (document.getElementById('dash').hidden) throw new Error('the overview is not in view');
     if (document.querySelectorAll('#charts .chart-panel').length < 6) throw new Error('not every chart is there');
     if (!document.querySelector('#charts .series')) throw new Error('no chart has a line');
@@ -99,8 +103,14 @@ SHIM = """\
 const scene = new URLSearchParams(location.search).get('scene');
 if (scene === 'Dash') {
   const real = window.fetch;
+  let failed = false;
   window.fetch = async (url, init = {}) => {
     const asked = new URL(String(url), location.href);
+    // (The first load fails part way, after the watch answered: the page must draw on its retry.)
+    if (asked.pathname.endsWith('/v1/schemas') && !failed) {
+      failed = true;
+      throw new TypeError('Failed to fetch');
+    }
     if (!asked.pathname.endsWith('/v1/metrics')) return real(url, init);
     const { fixture } = await import('./fixture.mjs');
     const body = fixture(asked.searchParams.get('range') ?? '1h', Math.floor(Date.now() / 1000));
