@@ -65,20 +65,25 @@ RoleBindings (it could give itself every right anyway).
   Identity may apply, get, delete (and go back, read the history or the logs of) those and no
   others, in the rule's namespaces; `list` and `watch` show it only those. A refusal is the same
   whether the name is stored or not, so it cannot be used to find what exists. A route that
-  cannot say which resource it reaches (a kind-wide check, some Kubernetes-API routes) is not
-  covered by a rule with `names`: it is refused, never widened. An older kithd refuses a Role with `names` (it
-  does not ignore the field), so apply one only once every control node is updated. A name limits
-  *which* resource, not what is in it: an agent that may apply the UpdatePlan `canary` may change
-  its `release` and `selector`, so give an agent nothing it could widen that way.
+  cannot say which resource it reaches (a kind-wide check) is not covered by a rule with
+  `names`: it is refused, never widened. A Kubernetes-API call is checked without a name
+  (`Call::allowed` in kube.rs), so a rule with `names` does not grant it: it fails closed. An older kithd
+  refuses a Role with `names` (it does not ignore the field), so apply one only once every
+  control node is updated. A name limits *which* resource, not what is in it: an agent that may
+  apply the UpdatePlan `canary` may change its `release` and `selector`, so never give a rule
+  with `names` an UpdatePlan the agent could retarget. Give it the OSRelease and keep the plan:
 
   ```yaml
-  # An agent may roll a release to the canary ring (the OSRelease and UpdatePlan called canary) and no other.
+  # A release agent for the canary ring: it may write the OSRelease called canary and nothing
+  # else. The admin owns the UpdatePlan canary (release: canary, selector: the canary ring); a
+  # changed OSRelease canary is a new revision, so that plan rolls again. The agent can write no
+  # UpdatePlan and no other release (403).
   apiVersion: kith.dev/v1
   kind: Role
   metadata: { name: canary-roller }
   spec:
     rules:
-      - { kinds: [OSRelease, UpdatePlan], verbs: [get, list, apply, delete], names: [canary] }
+      - { kinds: [OSRelease], verbs: [get, list, apply, delete], names: [canary] }
   ```
 - A template with `seccomp` unconfined or allowing calls, or a container with `userNamespaces`
   (which lets the refused calls back), also needs the right to apply `Unconfined` (in no namespace).

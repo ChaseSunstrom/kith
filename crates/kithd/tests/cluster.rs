@@ -2382,10 +2382,11 @@ fn a_workload_runs_as_an_identity() {
     );
 }
 
-/// A Role of OSRelease and UpdatePlan that names `canary`: the Identity bound to it rolls a
-/// release to the canary ring (an OSRelease and an UpdatePlan of that name) through the API,
-/// and is refused, 403, a plan or a release of any other name: to apply, get, delete or list
-/// (a list shows it the canary alone), the same for a name that is stored and one that is not.
+/// A Role of OSRelease that names `canary`: the Identity bound to it rolls a release to the
+/// canary ring through the API (the operator owns the UpdatePlan `canary`, whose selector is
+/// the ring: a plan rolls again when its OSRelease changes), and is refused, 403, any
+/// UpdatePlan write and an OSRelease of another name: to apply, get or delete (a list shows
+/// it the canary alone), the same for a name that is stored and one that is not.
 #[test]
 fn role_names_canary_only() {
     if std::env::var_os("KITH_E2E").is_none() {
@@ -2400,10 +2401,10 @@ fn role_names_canary_only() {
         std::fs::write(alpha.dir.join("apply.yaml"), text).unwrap();
         alpha.ok(&["apply", "-f", "apply.yaml"]);
     };
-    let release = |name: &str| {
+    let release = |name: &str, version: &str| {
         format!(
             "apiVersion: kith.dev/v1\nkind: OSRelease\nmetadata: {{ name: {name} }}\n\
-             spec: {{ version: '1.0', image: 'http://127.0.0.1:1/{name}.kos' }}\n---\n"
+             spec: {{ version: '{version}', image: 'http://127.0.0.1:1/{name}.kos' }}\n---\n"
         )
     };
     let plan = |name: &str| {
@@ -2412,8 +2413,14 @@ fn role_names_canary_only() {
              spec: {{ release: {name}, selector: {{ ring: canary }}, paused: true }}\n---\n"
         )
     };
-    // Stored by the admin: a release and a plan of another name, which the agent must not reach.
-    apply(&format!("{}{}", release("stable"), plan("stable")));
+    // Stored by the operator: a release and a plan of another name, and the plan of the canary
+    // ring (its release is not there yet): none of them is the agent's to write.
+    apply(&format!(
+        "{}{}{}",
+        release("stable", "1.0"),
+        plan("stable"),
+        plan("canary")
+    ));
     std::fs::create_dir_all(alpha.dir.join("agent")).unwrap();
     alpha.ok(&["identity", "cert", "agent", "--out", "agent"]);
     for (from, to) in [("agent.crt", "node.crt"), ("agent.key", "node.key")] {
@@ -2421,7 +2428,7 @@ fn role_names_canary_only() {
     }
     apply(
         "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: canary-roller }\n\
-         spec: { rules: [{ kinds: [OSRelease, UpdatePlan], verbs: [get, list, apply, delete], names: [canary] }] }\n---\n\
+         spec: { rules: [{ kinds: [OSRelease], verbs: [get, list, apply, delete], names: [canary] }] }\n---\n\
          apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: agent-canary-roller }\n\
          spec: { role: canary-roller, subjects: [agent] }\n",
     );
@@ -2433,41 +2440,67 @@ fn role_names_canary_only() {
         serde_json::to_string(&vec![one]).unwrap()
     };
 
-    // The canary ring: a release and a plan of that name.
-    for text in [release("canary"), plan("canary")] {
-        let (code, said) = call("POST", "/v1/apply", Some(&as_json(&text)));
-        assert_eq!(code, "200", "{said}");
+    // The canary release: the agent writes it (and a plan of the same name is not its to write).
+    let (code, said) = call("POST", "/v1/apply", Some(&as_json(&release("canary", "1.0"))));
+    assert_eq!(code, "200", "{said}");
+    assert_eq!(call("GET", "/v1/resources/OSRelease/canary", None).0, "200");
+    // It cannot widen the ring: no UpdatePlan write at all, the canary's own plan included
+    // (its selector is the operator's), and no read of one either.
+    for name in ["canary", "stable", "ghost"] {
+        let (code, said) = call("POST", "/v1/apply", Some(&as_json(&plan(name))));
+        assert!(code == "403" && said.contains("may not apply"), "{name}: {code} {said}");
+        let (code, said) = call("DELETE", &format!("/v1/resources/UpdatePlan/{name}"), None);
+        assert_eq!(code, "403", "{name}: {said}");
     }
-    assert_eq!(call("GET", "/v1/resources/UpdatePlan/canary", None).0, "200");
-    // Any other name, stored or not, is the same refusal; so is another kind.
-    for text in [release("stable"), plan("stable"), release("ghost"), plan("ghost")] {
-        let (code, said) = call("POST", "/v1/apply", Some(&as_json(&text)));
-        assert!(code == "403" && said.contains("may not apply"), "{code} {said}");
+    assert_eq!(call("GET", "/v1/resources?kind=UpdatePlan", None).0, "403");
+    // Any other release, stored or not, is the same refusal.
+    for name in ["stable", "ghost"] {
+        let (code, said) = call("POST", "/v1/apply", Some(&as_json(&release(name, "1.1"))));
+        assert!(code == "403" && said.contains("may not apply"), "{name}: {code} {said}");
+        assert_eq!(
+            call("DELETE", &format!("/v1/resources/OSRelease/{name}"), None).0,
+            "403"
+        );
     }
     let refusals: Vec<(String, String)> = ["stable", "ghost"]
         .iter()
         .map(|name| {
-            let (code, said) = call("GET", &format!("/v1/resources/UpdatePlan/{name}"), None);
+            let (code, said) = call("GET", &format!("/v1/resources/OSRelease/{name}"), None);
             (code, said.replace(name, "NAME"))
         })
         .collect();
     assert_eq!(refusals[0].0, "403", "{refusals:?}");
     assert_eq!(refusals[0], refusals[1], "a stored name and one that is not read alike");
-    for name in ["stable", "ghost"] {
-        let (code, said) = call("DELETE", &format!("/v1/resources/OSRelease/{name}"), None);
-        assert_eq!(code, "403", "{said}");
-    }
     assert_eq!(call("DELETE", "/v1/resources/Secret/default/canary", None).0, "403");
-    // A list shows it the canary and not the rest.
-    let (code, said) = call("GET", "/v1/resources?kind=UpdatePlan", None);
+    // A list shows it the canary release and not the stable one.
+    let (code, said) = call("GET", "/v1/resources?kind=OSRelease", None);
     assert_eq!(code, "200", "{said}");
     let listed: Vec<serde_json::Value> = serde_json::from_str(&said).unwrap();
     let listed: Vec<&str> = listed.iter().map(|r| r["metadata"]["name"].as_str().unwrap()).collect();
     assert_eq!(listed, ["canary"]);
-    // The admin's own store still holds what was refused to be touched.
+    // What was refused is untouched: the operator's plans are as they were, the stable release is there.
     let kept = alpha.ok(&["get", "updateplan", "-o", "json"]);
-    assert!(kept.contains("stable") && kept.contains("canary"), "{kept}");
-    assert_eq!(call("DELETE", "/v1/resources/UpdatePlan/canary", None).0, "200");
+    assert!(
+        kept.contains("stable") && kept.contains("canary") && kept.contains("ring"),
+        "{kept}"
+    );
+    assert!(alpha.ok(&["get", "osrelease", "-o", "json"]).contains("stable"));
+    // And the plan rolls again when its release is changed: its status says which release it is
+    // about (`of`, NAME@REVISION), and a new revision of the OSRelease is a new one.
+    let of = || {
+        let plan = alpha.ok(&["get", "updateplan/canary", "-o", "json"]);
+        let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        plan["status"]["of"].as_str().map(str::to_string)
+    };
+    wait_for("the canary plan to see its release", || {
+        of().is_some_and(|of| of.starts_with("canary@"))
+    });
+    let first = of().unwrap();
+    let (code, said) = call("POST", "/v1/apply", Some(&as_json(&release("canary", "1.1"))));
+    assert_eq!(code, "200", "{said}");
+    wait_for("the canary plan to roll the changed release", || {
+        of().is_some_and(|of| of != first)
+    });
 }
 
 /// A worker's own units are still said to run, and what is not a worker's to write is
