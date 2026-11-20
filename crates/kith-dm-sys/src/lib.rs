@@ -885,6 +885,10 @@ pub struct Forked {
 /// holds at the fork (tracing's registry, the environment's, stderr's, a `Mutex` of the
 /// program's own) is held for good in the child, which then waits for it: the caller keeps
 /// those off the child's path, or holds them across the call, and `collect` gives it a deadline.
+///
+/// A reaper that waits for any child (kith-runtime's `reap_orphans`, `waitid(Id::All)`) can take
+/// this child's status before `collect` does, which then fails with ECHILD: a caller in a process
+/// with such a reaper registers the child with it (kith-runtime's `spawn_awaited`) while it is made.
 pub fn fork_start(f: impl FnOnce() -> Vec<u8>) -> Result<Forked> {
     use std::io::Write;
     let mut ends = [0; 2];
@@ -931,10 +935,48 @@ pub fn fork_start(f: impl FnOnce() -> Vec<u8>) -> Result<Forked> {
 
 /// The parent of process `pid`, as `/proc` says now.
 fn parent_of(pid: i32) -> Option<i32> {
+    stat_of(pid).map(|(_, parent)| parent)
+}
+
+/// The state letter (`R`, `S`, `T`, `Z`, ...) and the parent of process `pid`, as `/proc` says now.
+fn stat_of(pid: i32) -> Option<(char, i32)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // (The name in `stat` may hold spaces and `)`: the fields follow the last one.)
     let (_, rest) = stat.rsplit_once(") ")?;
-    rest.split(' ').nth(1)?.parse::<i32>().ok()
+    let mut fields = rest.split(' ');
+    Some((fields.next()?.chars().next()?, fields.next()?.parse::<i32>().ok()?))
+}
+
+/// How long `collect` waits for a killed helper to be reaped, and for a stopped one to stop.
+const REAP_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+const STOP_WITHIN: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Waits up to `limit` for this process's child `pid` to end and takes it: true once it is gone
+/// (or was taken by another). A child stuck in the kernel (D state, a hung mount) outlasts it:
+/// false, and the zombie is left to the reaper.
+fn reap_within(pid: i32, limit: std::time::Duration) -> bool {
+    let until = std::time::Instant::now() + limit;
+    loop {
+        // SAFETY: waitpid on this process's own child, with no status wanted.
+        let said = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        let interrupted = said < 0 && Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
+        if said == pid || (said < 0 && !interrupted) {
+            return true;
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Waits up to `limit` for `pid` to show as stopped (a SIGSTOP is queued when `kill` returns,
+/// and acted on when the process next runs in the kernel's own time).
+fn stopped_within(pid: i32, limit: std::time::Duration) {
+    let until = std::time::Instant::now() + limit;
+    while stat_of(pid).is_some_and(|(state, _)| state != 'T') && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 /// A process to kill: by descriptor where the kernel gave one (it names that process for as long
@@ -972,13 +1014,14 @@ impl Victim {
 
 /// Every process under `root` (its children, theirs, ...) as `/proc` lists them now, each held
 /// by descriptor and checked to be still its parent's child once held.
-// ponytail: a process that forks while this reads may escape it, and one reparented away
-// mid-scan (its parent ended) is dropped by the check; `collect` stops the child first, which
-// closes the first for its own children. A cgroup kill, where the caller has the cgroup,
-// catches both.
-fn descendants(root: i32) -> Vec<Victim> {
+// ponytail: a process that forks while this reads may escape it, one reparented away mid-scan
+// (its parent ended) is dropped by the check, and one already reparented (to a subreaper) is
+// not under `root` to be found; `collect` stops the child first, which closes the first for
+// its own children. A cgroup kill, where the caller has the cgroup, catches all three.
+fn descendants(root: i32) -> Result<Vec<Victim>> {
     let mut parents = std::collections::HashMap::<i32, Vec<i32>>::new();
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+    // (A `/proc` that cannot be listed, not mounted or hidden, is an error: not an empty tree.)
+    for entry in std::fs::read_dir("/proc")?.flatten() {
         let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<i32>().ok()) else {
             continue;
         };
@@ -996,7 +1039,7 @@ fn descendants(root: i32) -> Vec<Victim> {
             }
         }
     }
-    found
+    Ok(found)
 }
 
 impl Forked {
@@ -1028,19 +1071,31 @@ impl Forked {
                 // before it is killed, as its children are this process's after.
                 // SAFETY: kill and waitpid on this process's own child.
                 unsafe { libc::kill(self.pid, libc::SIGSTOP) };
+                stopped_within(self.pid, STOP_WITHIN);
                 let tree = descendants(self.pid);
-                // SAFETY: kill and waitpid on this process's own child.
+                // SAFETY: kill on this process's own child.
                 unsafe {
                     libc::kill(self.pid, libc::SIGKILL);
                 }
-                tree.iter().for_each(Victim::kill);
-                // SAFETY: waitpid on this process's own child.
-                unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
+                if let Ok(tree) = &tree {
+                    tree.iter().for_each(Victim::kill);
+                }
+                // (Bounded: a helper stuck in the kernel must not hold the caller past its deadline.)
+                let reaped = reap_within(self.pid, REAP_WITHIN);
                 return Err(Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
-                        "the forked helper did not end within {} s and was killed",
-                        deadline.as_secs_f32()
+                        "the forked helper did not end within {} s and {}{}",
+                        deadline.as_secs_f32(),
+                        if reaped {
+                            "was killed"
+                        } else {
+                            "did not die (left to the reaper)"
+                        },
+                        match &tree {
+                            Ok(_) => String::new(),
+                            Err(e) => format!("; its descendants could not be listed: {e}"),
+                        }
                     ),
                 ));
             }
@@ -1389,6 +1444,39 @@ mod tests {
         assert!(!sleeper.wait().unwrap().success());
     }
 
+    // (Taken by `reap_within`, the thing under test, not by `Child::wait`.)
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn a_child_that_will_not_die_is_given_up_on_within_the_limit() {
+        let _children = children();
+        // A child nobody signalled stands in for one stuck in the kernel: it will not end.
+        let sleeper = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+        let pid = sleeper.id() as i32;
+        let begun = std::time::Instant::now();
+        assert!(!reap_within(pid, Duration::from_millis(100)));
+        assert!(begun.elapsed() < Duration::from_secs(5), "the wait is bounded");
+        // SAFETY: kill on this test's own child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(reap_within(pid, Duration::from_secs(10)));
+        // (Taken already: gone, so true, not a wait for the limit.)
+        assert!(reap_within(pid, Duration::from_millis(100)));
+    }
+
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn a_stopped_process_shows_as_stopped_before_the_list_is_taken() {
+        let _children = children();
+        let sleeper = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+        let pid = sleeper.id() as i32;
+        // SAFETY: kill on this test's own child.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        stopped_within(pid, Duration::from_secs(10));
+        assert_eq!(stat_of(pid).map(|(state, _)| state), Some('T'));
+        // SAFETY: kill on this test's own child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(reap_within(pid, Duration::from_secs(10)));
+    }
+
     #[test]
     fn forked_kills_what_the_child_started_too() {
         let _children = children();
@@ -1448,8 +1536,24 @@ mod tests {
             std::io::ErrorKind::Unsupported,
             "this test process has threads"
         );
+        // The environment as libc holds it: `std::env::vars` takes std's environment lock, which
+        // another test's spawn may hold across its fork into this child (the stall this guards).
+        fn environ_now() -> Vec<(String, String)> {
+            let mut vars = Vec::new();
+            // SAFETY: read in a forked child of one thread, where nothing writes it; each entry
+            // is a NUL-ended `NAME=value` string, and the list ends in a null pointer.
+            unsafe {
+                let mut at = libc::environ;
+                while !at.is_null() && !(*at).is_null() {
+                    let entry = std::ffi::CStr::from_ptr(*at).to_string_lossy().into_owned();
+                    vars.extend(entry.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())));
+                    at = at.add(1);
+                }
+            }
+            vars
+        }
         let said = fork_start(|| {
-            let before: Vec<_> = std::env::vars().collect();
+            let before = environ_now();
             let bad = [("", "x"), ("A=B", "x"), ("A\0B", "x"), ("A", "x\0y")];
             for (key, value) in bad {
                 // (A good pair first: the refusal is of the whole call, before any change.)
@@ -1457,14 +1561,14 @@ mod tests {
                     ("GOOD".to_string(), "1".to_string()),
                     (key.to_string(), value.to_string()),
                 ];
-                if replace_environ(&vars).is_ok() || std::env::vars().collect::<Vec<_>>() != before {
+                if replace_environ(&vars).is_ok() || environ_now() != before {
                     return format!("{key:?}={value:?} was not refused whole").into_bytes();
                 }
             }
             if replace_environ(&[("ONLY".into(), "1".into())]).is_err() {
                 return b"a good environment was refused".to_vec();
             }
-            let now: Vec<_> = std::env::vars().collect();
+            let now = environ_now();
             if now != [("ONLY".to_string(), "1".to_string())] {
                 return format!("{now:?}").into_bytes();
             }
