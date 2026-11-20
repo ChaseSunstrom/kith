@@ -6,6 +6,7 @@
 // text nodes only, and the page's policy allows no script or style but its own files.
 import { at, blank, diffLines, entriesCheck, health, keyOf, lamps, resourceOf, shape, summary, written } from './forms.js';
 import { installPart } from './install.js';
+import { dashPart } from './dash.js';
 
 const $ = (id) => document.getElementById(id);
 const PROPERTIES = new Set(['value', 'checked', 'disabled', 'hidden', 'open', 'readOnly', 'selected']);
@@ -29,6 +30,8 @@ const state = {
   kinds: [],
   resources: [],
   generation: null,
+  /** What is in view: 'dash' (the overview), 'events', 'install' or 'board' (a kind's resources). */
+  view: 'dash',
   /** The kind listed in panel 03. */
   kind: null,
   /** The resource open in panel 04: its key, `+` for a new one, or null. */
@@ -142,23 +145,38 @@ function planView(plan) {
   ));
 }
 
-// ── Panel 01: kinds ─────────────────────────────────────────────────────────────────
+// ── The line down the side: the overview, the kinds in groups, what was done ────────
+
+/** The kinds by what they are about. A kind in none of them (a cluster's own) is with Workloads. */
+const GROUPS = [
+  ['Workloads', ['Workload', 'NodeWorkload', 'Job', 'CronJob', 'ConfigMap', 'Secret', 'Image', 'Package', 'Release', 'Repository', 'Source', 'KubeObject']],
+  ['Nodes', ['Cluster', 'Node', 'Namespace', 'NodeKey', 'OSRelease', 'UpdatePlan', 'Seat', 'Device', 'DeviceClaim']],
+  ['Storage', ['Volume', 'VolumeClaim', 'Blob', 'Backup', 'Share']],
+  ['Network', ['Service', 'DNSZone', 'DNSBlockList', 'DNSRecord', 'NetworkPolicy', 'Exit', 'RemotePeer']],
+  ['Access', ['AccessLevel', 'Role', 'RoleBinding', 'Identity', 'KindDefinition']],
+];
 
 function drawKinds() {
   const counts = new Map();
   for (const resource of state.resources) counts.set(resource.kind, (counts.get(resource.kind) ?? 0) + 1);
   const link = (kind) =>
-    h('a', { href: `#/${kind.kind}`, 'aria-current': kind.kind === state.kind ? 'page' : null, title: kind.about },
+    h('a', { href: `#/${kind.kind}`, 'aria-current': state.view === 'board' && kind.kind === state.kind ? 'page' : null, title: kind.about },
       h('span', {}, kind.kind),
       h('span', { class: 'count' }, String(counts.get(kind.kind) ?? '')),
     );
-  const group = (title, kinds) => kinds.length > 0 && [h('h3', {}, title), h('ul', {}, kinds.map((kind) => h('li', {}, link(kind))))];
+  const top = (view, href, text) => h('a', { class: 'top', href, 'aria-current': state.view === view ? 'page' : null }, h('span', {}, text));
+  const placed = new Set(GROUPS.flatMap(([, names]) => names));
+  const group = ([title, names]) => {
+    const kinds = state.kinds.filter((kind) => (names.includes(kind.kind) || (title === 'Workloads' && !placed.has(kind.kind))));
+    return kinds.length > 0 && [h('h3', {}, title), h('ul', {}, kinds.map((kind) => h('li', {}, link(kind))))];
+  };
   $('kinds').replaceChildren(...[
-    group('of kith', state.kinds.filter((kind) => !kind.definition)),
-    group('of this cluster', state.kinds.filter((kind) => kind.definition)),
-  ].flat().filter(Boolean));
+    top('dash', '#/', 'Overview'),
+    GROUPS.map(group),
+    state.kinds.length === 0 && h('p', { class: 'dim' }, 'No kind is yours to see: no Role is bound to you.'),
+    top('events', '#/events', 'Events'),
+  ].flat(2).filter(Boolean));
   $('kinds').querySelector('[aria-current]')?.scrollIntoView({ block: 'nearest' });
-  if (state.kinds.length === 0) $('kinds').append(h('p', { class: 'dim' }, 'No kind is yours to see: no Role is bound to you.'));
 }
 
 // ── Panel 02: pulse ─────────────────────────────────────────────────────────────────
@@ -739,9 +757,16 @@ async function route() {
   let asked = '';
   try { asked = decodeURIComponent(location.hash.replace(/^#\/?/, '')); } catch { /* a hash that is no address: the start */ }
   const [name, ...rest] = asked.split('/');
-  // (The Install part is a view of its own, not a kind: the board is out of sight while it is in.)
-  if (name === 'install') return install.show(true);
-  install.show(false);
+  // (The overview is the start; it, what was done and Install are views of their own, not
+  // kinds: the board is out of sight while one is in. A draft on the board waits there.)
+  const view = ['', 'events', 'install'].includes(name) ? name || 'dash' : 'board';
+  state.view = view;
+  install.show(view === 'install');
+  $('dash').hidden = view !== 'dash';
+  $('events').hidden = view !== 'events';
+  document.querySelector('.board').hidden = view !== 'board';
+  dash.show(view === 'dash' || view === 'events' ? view : false);
+  if (view !== 'board') return drawKinds();
   const kind = kindNamed(name) ?? kindNamed(state.kind) ?? kindNamed('Workload') ?? state.kinds[0];
   const key = rest.length === 0 ? null : rest[0] === '+' ? '+' : [kind?.kind, ...rest].join('/');
   if (state.draft?.dirty && (key !== state.key || kind?.kind !== state.kind)) {
@@ -776,11 +801,13 @@ function linked(how, text) {
 /** Everything one may see, whenever any of it changes: one long question after another. */
 async function watch() {
   let poll = false;
+  // (Until the page is drawn once, each question is answered at once: a first pass that failed
+  // part way is not left waiting for the cluster's next change.)
+  let drawn = false;
   for (;;) {
     try {
-      const after = state.generation == null || poll ? '' : `?after=${state.generation}`;
+      const after = state.generation == null || poll || !drawn ? '' : `?after=${state.generation}`;
       const got = poll ? { generation: null, resources: await api('GET', 'resources') } : await api('GET', `watch${after}`);
-      const first = state.generation == null && state.kinds.length === 0;
       state.generation = got.generation;
       state.resources = got.resources;
       await kinds();
@@ -791,9 +818,12 @@ async function watch() {
       $('warning').hidden = !warning;
       $('generation').textContent = got.generation == null ? '' : `generation ${got.generation}`;
       drawPulse();
+      dash.redraw();
       install.draw();
-      if (first) await route();
-      else {
+      if (!drawn) {
+        await route();
+        drawn = true;
+      } else {
         drawKinds();
         drawTable();
         stale();
@@ -813,6 +843,7 @@ async function watch() {
 }
 
 const install = installPart({ $, h, api, ask, toast, say, state, may: (verb, kind) => may(verb, kindNamed(kind)) });
+const dash = dashPart({ $, h, api, state, still: () => matchMedia('(prefers-reduced-motion: reduce)').matches });
 $('filter').addEventListener('input', (event) => {
   state.filter = event.target.value;
   drawTable();
