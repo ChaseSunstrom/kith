@@ -268,7 +268,7 @@ fn readme_says_what_a_deleted_claim_takes_with_it_and_how_to_retain() {
 }
 
 /// T-0031: how a laptop reaches a remote cluster by a context, the file it is kept in, and that
-/// renewing and revoking a node's certificate is not part of it (T-1014).
+/// a node's certificate is not part of it (renewed and revoked by kithd: T-1014).
 #[test]
 fn readme_and_access_say_how_a_context_reaches_a_remote_cluster() {
     let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -281,8 +281,8 @@ fn readme_and_access_say_how_a_context_reaches_a_remote_cluster() {
         "~/.config/kith/contexts.yaml",
         "mode 0600 in a 0700 directory",
         "A flag given as well wins over the entry",
-        "Renewal and revocation of a node's own certificate is not here",
-        "is T-1014",
+        "A node's own certificate is not part of a context",
+        "A node's certificate: its life, its renewal, and its revocation",
     ] {
         assert!(access.contains(said), "access.md no longer says {said:?}");
     }
