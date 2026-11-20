@@ -436,6 +436,21 @@ const missingEndpoint = async () => { throw Object.assign(new Error('not found')
     assert.match(words(panel), /gamma.*no answer/);
   }
   assert.match(words($('charts')), /100%/, 'the CPU axis');
+  for (const panel of panels) {
+    // The axis's figures stand in a gutter at the left, and the lines start right of it: no line
+    // runs through a figure.
+    const plot = find(panel, (one) => one.tag === 'g')[0];
+    const left = Number(/translate\((\d+(?:\.\d+)?) /.exec(plot.props.transform)?.[1]);
+    const figures = find(panel, (one) => one.tag === 'text' && one.props['text-anchor'] === 'end' && one.props.class === 'tick figure');
+    assert.ok(figures.length >= 2 && left >= 24, `${panel.props['data-panel']}: a gutter of ${left}`);
+    assert.ok(figures.every((one) => one.props.x <= left - 4), `${panel.props['data-panel']}: every figure left of the lines`);
+  }
+  // Where a panel draws two measures, its title says which line is which: solid, then dotted.
+  for (const [id, said] of [['io', /read.*write/], ['net', /in.*out/]]) {
+    const head = find($('charts'), (one) => one.props['data-panel'] === id)[0].children[0];
+    assert.match(words(head), said, id);
+    assert.deepEqual(find(head, (one) => /\bswatch\b/.test(one.props.class ?? '')).map((one) => one.props.class), ['swatch', 'swatch second'], id);
+  }
   // The tiles: sums of what answered.
   const { cpu } = tiles(RESOURCES, metrics);
   assert.match(words($('tiles')), new RegExp(format(cpu.used / cpu.total, 'pct')));

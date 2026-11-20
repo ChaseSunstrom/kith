@@ -262,7 +262,8 @@ export function dashPart({ $, h, api, state, still }) {
       svg.addEventListener('pointermove', (event) => {
         const box = svg.getBoundingClientRect();
         const x = ((event.clientX - box.left) / (box.width || 1)) * plot.width;
-        hover(Math.round((Math.min(Math.max(x, 0), plot.width) / plot.width) * (when.length - 1)), plot);
+        const share = (x - plot.left) / (plot.right - plot.left || 1);
+        hover(Math.round(Math.min(Math.max(share, 0), 1) * (when.length - 1)), plot);
       });
       svg.addEventListener('pointerleave', () => hover(null));
       svg.addEventListener('blur', () => hover(null));
@@ -273,7 +274,10 @@ export function dashPart({ $, h, api, state, still }) {
         event.preventDefault();
         hover(Math.min(when.length - 1, Math.max(0, (at ?? when.length - 1) + moves[event.key])), plot);
       });
-      return h('section', { class: 'chart-panel', 'data-panel': panel.id }, h('h3', {}, panel.title), svg, tip, legend);
+      // (Two measures in a panel: which line is which, solid then dotted, beside its title.)
+      const key = panel.labels && h('span', { class: 'key' }, panel.labels.map((label, n) =>
+        h('span', {}, h('span', { class: n ? 'swatch second' : 'swatch', 'aria-hidden': 'true' }), label)));
+      return h('section', { class: 'chart-panel', 'data-panel': panel.id }, h('h3', {}, panel.title, key), svg, tip, legend);
     }));
     plots.forEach(plotOne);
     hover(null);
@@ -292,19 +296,20 @@ export function dashPart({ $, h, api, state, still }) {
     let max = 0;
     for (const name of nodes) for (const key of panel.series) for (const value of metrics.nodes[name][key] ?? []) if (value > max) max = value;
     const { top, ticks } = scale(max, panel.unit);
+    const figures = ticks.map((tick) => format(tick, panel.unit));
+    // (The axis's figures stand in a gutter as wide as the longest, about 7 px a character at 12 px.)
+    const left = Math.max(28, ...figures.map((text) => text.length * 7 + 10));
     const y = (value) => TOP + inner - Math.min(1, Math.max(0, value / top)) * inner;
-    const x = (i) => (when.length > 1 ? (i * right) / (when.length - 1) : right);
-    Object.assign(plot, { width, right, x, y });
+    const x = (i) => left + (when.length > 1 ? (i * (right - left)) / (when.length - 1) : right - left);
+    Object.assign(plot, { width, left, right, x, y });
     svg.setAttribute('viewBox', `0 0 ${width} ${HEIGHT}`);
     svg.setAttribute('height', String(HEIGHT));
     const drawn = [];
-    // (The axis's figures go over the lines, haloed in paper, so a line never strikes one out.)
-    const figures = [];
-    for (const tick of ticks) {
+    ticks.forEach((tick, n) => {
       const gy = round(y(tick));
-      drawn.push(h('line', { class: tick === 0 ? 'grid base' : 'grid', x1: 0, x2: width, y1: gy, y2: gy }));
-      figures.push(h('text', { class: 'tick', x: 0, y: gy - 5 }, format(tick, panel.unit)));
-    }
+      drawn.push(h('line', { class: tick === 0 ? 'grid base' : 'grid', x1: left, x2: width, y1: gy, y2: gy }));
+      drawn.push(h('text', { class: 'tick figure', x: left - 6, y: gy + 4, 'text-anchor': 'end' }, figures[n]));
+    });
     const marks = when.length > 2 ? [0, Math.floor((when.length - 1) / 2), when.length - 1] : [when.length - 1];
     for (const i of marks) {
       const anchor = i === 0 && marks.length > 1 ? 'start' : i === when.length - 1 ? 'end' : 'middle';
@@ -317,7 +322,7 @@ export function dashPart({ $, h, api, state, still }) {
     for (const name of nodes) {
       panel.series.forEach((key, n) => {
         const values = metrics.nodes[name][key] ?? [];
-        const d = line(values, { width: right, height: inner, max: top });
+        const d = line(values, { width: right - left, height: inner, max: top });
         const look = `s${hue.get(name)}${n ? ' second' : ''}`;
         if (d) lines.push(h('path', { class: `series ${look}`, d }));
         const last = values.at(-1);
@@ -327,7 +332,7 @@ export function dashPart({ $, h, api, state, still }) {
       });
     }
     const cross = h('line', { class: 'cross', y1: TOP, y2: TOP + inner, visibility: 'hidden' });
-    svg.replaceChildren(...drawn, h('g', { transform: `translate(0 ${TOP})` }, lines), ...figures, cross, ...nows, ...dots.map((one) => one.dot));
+    svg.replaceChildren(...drawn, h('g', { transform: `translate(${left} ${TOP})` }, lines), cross, ...nows, ...dots.map((one) => one.dot));
     Object.assign(plot, { cross, dots });
   }
 

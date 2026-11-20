@@ -816,7 +816,6 @@ async function watch() {
       const { warning } = await api('GET', 'lock').catch(() => ({}));
       $('warning').textContent = warning ?? '';
       $('warning').hidden = !warning;
-      $('generation').textContent = got.generation == null ? '' : `generation ${got.generation}`;
       drawPulse();
       dash.redraw();
       install.draw();
@@ -830,6 +829,9 @@ async function watch() {
         if (state.tab === 'status' && state.draft) drawDetail();
         if (!state.draft && state.key && state.key !== '+' && live(state.key)) open(state.key);
       }
+      // (When the page last drew what kithd said; the generation, for whoever asks, under it.)
+      $('updated').textContent = `updated ${new Date().toTimeString().slice(0, 8)}`;
+      $('updated').title = got.generation == null ? '' : `the cluster's state, generation ${got.generation}`;
       if (poll) await sleep(5000);
     } catch (error) {
       // (May list but not watch: asked every few seconds instead.)
