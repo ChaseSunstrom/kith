@@ -61,7 +61,10 @@ KITHD_IDLE_RSS = 9 * MB
 # 3,777,912 B in the checkout), so a budget set at the gate's size failed every finish on main.
 # 3.62 (T-0941): kith peer add (T-0764) made it 3,782,008 B in the gate's folder and 3,786,104 B
 # in the checkout, 745 B over 3.61, so every budgets run on main failed again.
-SIZE_BUDGETS = {"kith": 3 * MB, "kith-remote": int(3.62 * MB), "kithd": int(KITHD_SIZE * MB)}
+# RAISE, kith 3.00 to 3.02 and kith-remote 3.62 to 3.64 (T-0031): kith context add|use|ls|rm and
+# the --context pick read and write contexts.yaml through kith-yaml over a plain value (no
+# derived type), 3,159,384 B and 3,810,680 B built here; the budgets keep a few KB for a folder.
+SIZE_BUDGETS = {"kith": int(3.02 * MB), "kith-remote": int(3.64 * MB), "kithd": int(KITHD_SIZE * MB)}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 

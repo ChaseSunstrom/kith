@@ -26,7 +26,8 @@ impl Daemon {
     fn start_with(name: &str, args: &'static [&'static str]) -> Daemon {
         // `kith` is another package's binary: cargo only builds it when asked.
         let built = Command::new(env!("CARGO"))
-            .args(["build", "--quiet", "-p", "kith-cli"])
+            // (With `remote`: a context test calls kithd's TLS port with it; it is the same kith otherwise.)
+            .args(["build", "--quiet", "-p", "kith-cli", "--features", "remote"])
             .status()
             .unwrap();
         assert!(built.success());
@@ -2252,6 +2253,89 @@ spec:
     };
     assert_eq!(call("/v1/resources?kind=Service"), "200");
     assert_eq!(call("/v1/resources/Secret/default/token"), "403");
+}
+
+/// T-0031: `kith` over a context is the identity in the context's directory, held to its Role
+/// as `--server --identity` is: what the Role does not allow is refused, with kithd's reason.
+#[test]
+fn an_identity_through_a_context_is_held_to_its_role() {
+    let port = free_port();
+    let listen: &'static str = Box::leak(format!("127.0.0.1:{port}").into_boxed_str());
+    let args: &'static [&'static str] = Box::leak(Box::new(["--name", "alpha", "--listen", listen]));
+    let daemon = Daemon::start_with("context", args);
+    std::fs::create_dir_all(daemon.dir.join("alice")).unwrap();
+    daemon.ok(&["identity", "cert", "alice", "--out", "alice"]);
+    // Over TLS, from a HOME of its own: only the context says where kithd is and who calls it.
+    let through = |args: &[&str]| {
+        let out = Command::new(&daemon.kith)
+            .args(args)
+            .current_dir(&daemon.dir)
+            .env("HOME", daemon.dir.join("home"))
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("KITH_SOCKET")
+            .env_remove("KITH_STORE")
+            .env_remove("KITH_SERVER")
+            .env_remove("KITH_IDENTITY")
+            .env_remove("KITH_CONTEXT")
+            .output()
+            .unwrap();
+        let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
+        (out.status.code().unwrap(), text(out.stdout), text(out.stderr))
+    };
+    let (code, _, err) = through(&["context", "add", "lab", "--server", listen, "--identity", "alice"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(through(&["context", "use", "lab"]).0, 0);
+
+    // A certificate and no Role: known, and allowed nothing.
+    let mut refused = String::new();
+    wait_for("the TLS port to refuse alice", || {
+        refused = through(&["get", "configmap"]).2;
+        refused.contains("may not")
+    });
+    assert!(refused.contains("alice may not list"), "{refused}");
+
+    // A Role that reads and lists ConfigMaps, and no more.
+    daemon.apply(
+        "
+apiVersion: kith.dev/v1
+kind: Role
+metadata: { name: reader }
+spec:
+  rules: [{ kinds: [ConfigMap], verbs: [get, list] }]
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: { name: alice-reader }
+spec: { role: reader, subjects: [alice] }
+---
+apiVersion: kith.dev/v1
+kind: ConfigMap
+metadata: { name: site }
+spec: { data: { k: one } }
+",
+    );
+    let (code, out, err) = through(&["get", "configmap"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("site"), "{out}");
+    // Named by the flag as well as by the file's current one.
+    assert_eq!(through(&["--context", "lab", "get", "configmap"]).0, 0);
+    let (code, _, err) = through(&["--context", "nope", "get", "configmap"]);
+    assert!(
+        code != 0 && err.contains("no context") && err.contains("contexts.yaml"),
+        "{err}"
+    );
+
+    // What the Role does not allow is refused, through the context as over --server.
+    std::fs::write(
+        daemon.dir.join("more.yaml"),
+        "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: more }\nspec: { data: { k: two } }\n",
+    )
+    .unwrap();
+    let (code, _, err) = through(&["apply", "-f", "more.yaml"]);
+    assert!(code != 0 && err.contains("alice may not"), "{err}");
+    let (code, _, err) = through(&["get", "secret"]);
+    assert!(code != 0 && err.contains("alice may not"), "{err}");
+    assert!(!daemon.ok(&["get", "configmap"]).contains("more"));
 }
 
 #[test]

@@ -10,6 +10,7 @@
 // (net.ipv6.conf.all.forwarding): kithd says so and leaves the host's setting alone.
 
 use crate::Shared;
+use crate::root_part::{KeyStep, Told};
 use kith_api::store::Store;
 use kith_mesh::{Key, Member};
 use serde_json::{Value, json};
@@ -47,10 +48,15 @@ fn says_of(public: &[u8], address: Ipv6Addr, port: u16) -> Value {
     says
 }
 
+/// A key from its text: exactly 64 lower-case hex digits (what `hex` writes), so one key has one
+/// text and two texts are the same key when they are the same text.
 pub(crate) fn key_of(hex: &str) -> Option<Key> {
-    let byte = |at: usize| u8::from_str_radix(hex.get(2 * at..2 * at + 2)?, 16).ok();
-    let bytes: Vec<u8> = (0..32).map_while(byte).collect();
-    bytes.try_into().ok().filter(|_| hex.len() == 64)
+    let digit = |c: u8| matches!(c, b'0'..=b'9' | b'a'..=b'f');
+    if hex.len() != 64 || !hex.bytes().all(digit) {
+        return None;
+    }
+    let byte = |at: usize| u8::from_str_radix(&hex[2 * at..2 * at + 2], 16).ok();
+    (0..32).map_while(byte).collect::<Vec<u8>>().try_into().ok()
 }
 
 /// The cluster's /48, the same on every node of it.
@@ -59,35 +65,68 @@ pub fn prefix(ca: &str) -> Ipv6Addr {
     kith_mesh::prefix(print.as_deref().unwrap_or(ca).as_bytes())
 }
 
-/// This node's private key: made the first time, and never anywhere but in its file.
-pub(crate) fn private_key(path: &std::path::Path) -> std::io::Result<Key> {
-    use std::io::{Error, Write};
+/// The key in `path`.
+pub(crate) fn read_key(path: &std::path::Path) -> std::io::Result<Key> {
+    let text = std::fs::read_to_string(path)?;
+    key_of(text.trim()).ok_or_else(|| std::io::Error::other(format!("{} is not a key", path.display())))
+}
+
+/// `key` written to `path`: whole or not at all (half a key file would be no key for good), for
+/// its owner alone, and in the directory when this returns (so a power cut keeps it; a directory
+/// that will not sync is said, and is no failure: the file is the key by then).
+pub(crate) fn write_key(path: &std::path::Path, key: &Key) -> std::io::Result<()> {
+    use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let what = || Error::other(format!("{} is not a key", path.display()));
-            return key_of(text.trim()).ok_or_else(what);
-        }
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-        Err(_) => {}
-    }
-    let mut key = [0; 32];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
-        .map_err(|_| Error::other("no random numbers"))?;
-    // Whole or not at all: half a key file would be no key for good.
     let new = path.with_extension("new");
     let mut options = std::fs::OpenOptions::new();
     let mut file = options.write(true).create(true).truncate(true).mode(0o600).open(&new)?;
-    file.write_all(hex(&key).as_bytes())?;
+    file.write_all(hex(key).as_bytes())?;
     file.sync_all()?;
     std::fs::rename(&new, path)?;
-    // The rename is in the directory, not the file: synced so a power cut keeps the key.
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
-    std::fs::File::open(dir)?.sync_all()?;
+    // The file is the key now, whatever the sync says: an error here must not read as "not written"
+    // (the node would go back to the old key while the file holds the new). Tried twice, then said.
+    let synced = || std::fs::File::open(dir)?.sync_all();
+    if let Err(e) = synced().or_else(|_| synced()) {
+        eprintln!(
+            "kithd: mesh: {} is written, but its directory is not synced: {e}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn random_key() -> std::io::Result<Key> {
+    let mut key = [0; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
+        .map_err(|_| std::io::Error::other("no random numbers"))?;
     Ok(key)
+}
+
+/// This node's private key: made the first time, and never anywhere but in its file.
+pub(crate) fn private_key(path: &std::path::Path) -> std::io::Result<Key> {
+    match read_key(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let key = random_key()?;
+            write_key(path, &key).map(|()| key)
+        }
+        read => read,
+    }
+}
+
+/// Where a key that is to replace the one in `key` waits until it does (`mesh.next` beside
+/// `mesh.key`).
+pub(crate) fn next_path(key: &std::path::Path) -> PathBuf {
+    key.with_extension("next")
+}
+
+/// A new key, in `path` (one that was there is replaced).
+pub(crate) fn make_key(path: &std::path::Path) -> std::io::Result<Key> {
+    let key = random_key()?;
+    write_key(path, &key).map(|()| key)
 }
 
 /// For a node about to join as one that roams: its interface, up before it is a member, and
@@ -305,6 +344,131 @@ fn resolving(cache: &Arc<std::sync::Mutex<Lookup>>, endpoint: &str, wake: &Arc<N
     now.found.flatten()
 }
 
+/// A name for a rotation that is one: some text, not long, with nothing in it a log line would break on.
+pub(crate) fn rotate_name(id: &str) -> bool {
+    (1..=64).contains(&id.chars().count()) && !id.chars().any(char::is_control)
+}
+
+/// How long each of a key's two waits lasts (for the peers to take the new key, then for them to
+/// shake hands on it) before the node goes back to the old key it never left the file of.
+const ROTATE_WAIT: Duration = Duration::from_secs(120);
+
+/// A rotation of this node's key under way (T-1017), as this node holds it. In memory only: a
+/// node that stops in the middle has `mesh.key` still the old key and starts on it, and what it
+/// says first leaves out the `next` it said.
+struct Rotation {
+    /// What `spec.mesh.rotate` said: made once for each name.
+    id: String,
+    next: Key,
+    /// The peers (by name) that were reached when it began, and have to agree on the new key.
+    need: Vec<String>,
+    /// When the peers were asked to take the key, then when the interface was switched to it.
+    since: Instant,
+    switched: Option<Instant>,
+}
+
+/// What a rotation does next.
+#[derive(Debug, PartialEq, Eq)]
+enum Turn {
+    Wait,
+    /// Every peer has taken the key: the interface runs on it.
+    Switch,
+    /// Every peer has shaken hands on the new key: the file is the new key.
+    Commit,
+    /// Given up, and why: the old key is the node's still.
+    Revert(&'static str),
+}
+
+/// Where a rotation stands, from what the peers say. `took`: who has taken the new key; `shook`:
+/// how long ago each peer last shook hands (by name). One handshake since the switch is the
+/// proof that the peer holds the new key: it is only the new key that could have made it.
+fn turn(rotation: &Rotation, took: &BTreeSet<String>, shook: &BTreeMap<String, Duration>, now: Instant) -> Turn {
+    let waited = |since: Instant| now.saturating_duration_since(since) >= ROTATE_WAIT;
+    match rotation.switched {
+        None if rotation.need.iter().all(|name| took.contains(name)) => Turn::Switch,
+        None if waited(rotation.since) => Turn::Revert("the peers did not take the new key"),
+        None => Turn::Wait,
+        Some(at) => {
+            // (A handshake is dated to the second, rounded down: it reads older than it was, never newer.)
+            let since = now.saturating_duration_since(at);
+            let after = |name: &String| shook.get(name).is_some_and(|ago| *ago < since);
+            if rotation.need.iter().all(after) {
+                Turn::Commit
+            } else if waited(at) {
+                Turn::Revert("no handshake on the new key")
+            } else {
+                Turn::Wait
+            }
+        }
+    }
+}
+
+/// The keys other nodes say they are to take next (`status.mesh.next`), by node name. One is
+/// taken only if it is a key, is no node's key (this node's `own` included) and is said by one
+/// node alone: a node that says another's cannot make this node call that one by another key.
+fn nexts(store: &Store, me: &str, own: &Key, pending: Option<&Key>) -> BTreeMap<String, Key> {
+    let say = |node: &kith_api::Resource, field: &str| {
+        let status = node.status.as_ref()?;
+        key_of(status["mesh"][field].as_str()?).filter(|key| *key != [0; 32])
+    };
+    let mut keys: BTreeSet<Key> = store.list(Some("Node")).filter_map(|node| say(node, "key")).collect();
+    keys.extend([*own].into_iter().chain(pending.copied()));
+    let said: Vec<(String, Key)> = store
+        .list(Some("Node"))
+        .filter(|node| node.metadata.name != me)
+        .filter_map(|node| Some((node.metadata.name.clone(), say(node, "next")?)))
+        .collect();
+    let alone = |key: &Key| said.iter().filter(|(_, other)| other == key).count() == 1;
+    said.iter()
+        .filter(|(_, key)| !keys.contains(key) && alone(key))
+        .cloned()
+        .collect()
+}
+
+/// `nexts` without those said for `ROTATE_WAIT` or longer: a node that says a `next` and never
+/// commits it (its own wait gives up by then) is not one this node waits for for ever. `seen`:
+/// when each was first said, kept while it is said. (A node that takes its `next` back and says
+/// one again has the wait start over: that costs this node a wait of its own, once.)
+fn fresh(nexts: BTreeMap<String, Key>, seen: &mut BTreeMap<String, Instant>, now: Instant) -> BTreeMap<String, Key> {
+    seen.retain(|name, _| nexts.contains_key(name));
+    for name in nexts.keys() {
+        seen.entry(name.clone()).or_insert(now);
+    }
+    nexts
+        .into_iter()
+        .filter(|(name, _)| now.saturating_duration_since(seen[name]) < ROTATE_WAIT)
+        .collect()
+}
+
+/// The peers with the keys they are to take: each member that has a `next` has it as a peer
+/// too, which answers its handshakes and has no addresses (so what it sends is not taken as
+/// anyone's) until it has shaken hands: then it is the member's peer, and the old key is not.
+fn standby(
+    peers: &mut Vec<kith_mesh::Peer>,
+    members: &[Member],
+    nexts: &BTreeMap<String, Key>,
+    shook: &BTreeMap<Key, Option<Duration>>,
+) {
+    for member in members {
+        let Some(next) = nexts.get(&member.name) else { continue };
+        let Some(old) = peers.iter_mut().find(|peer| peer.key == member.key) else {
+            continue;
+        };
+        let mut new = kith_mesh::Peer {
+            key: *next,
+            endpoint: None,
+            allowed: Vec::new(),
+            keepalive: 0,
+        };
+        if shook_lately(shook, next) {
+            new.endpoint = old.endpoint;
+            new.allowed = std::mem::take(&mut old.allowed);
+            new.keepalive = std::mem::replace(&mut old.keepalive, 0);
+        }
+        peers.push(new);
+    }
+}
+
 /// Set `field` in the status of Node `node`: what this node says of itself under it, or null to take it back.
 pub(crate) async fn say(shared: &Shared, node: &str, field: &str, value: Value) -> Result<(), String> {
     let fields = serde_json::Map::from_iter([(field.to_string(), value)]);
@@ -324,7 +488,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     let root = crate::root_part::Direct::new();
     let up =
         told_root(&options, me, prefix).and_then(|()| crate::root_part::mesh_key(&root, &options.interface, address));
-    let public = match up {
+    let mut public = match up {
         Ok(public) => public,
         Err(e) => {
             let hint = "it takes the kernel's WireGuard and the right to set up interfaces, CAP_NET_ADMIN";
@@ -334,7 +498,11 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     // What the root part was last asked for the interface: not asked again while it is the same.
     let mut asked = None;
     eprintln!("kithd: mesh address {address} on {}", options.interface);
-    let base = says_of(&public, address, options.port);
+    let mut base = says_of(&public, address, options.port);
+    // A key's replacement under way, the rotation that was last given up, and the last one that was done.
+    let (mut rotation, mut failed, mut done): (Option<Rotation>, Option<String>, Option<String>) = (None, None, None);
+    // When each other node first said the `next` it says now.
+    let mut said_next: BTreeMap<String, Instant> = BTreeMap::new();
     let node = format!("Node/{me}");
     let first = told(&first_peers(&options.key));
     let mut known = BTreeMap::new();
@@ -345,6 +513,8 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
         Arc::new(Notify::new()),
     );
     loop {
+        // (Before the interface is asked: a handshake read after it is not newer than this.)
+        let now = Instant::now();
         let peers = crate::root_part::mesh_seen(&root, &options.interface).unwrap_or_else(|e| {
             eprintln!("kithd: mesh: reading the peers of {}: {e}", options.interface);
             Vec::new()
@@ -354,10 +524,30 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             .iter()
             .filter_map(|peer| Some((peer.key, peer.endpoint?)))
             .collect();
-        let (mut members, mine, said, edge, services, home) = {
+        let (mut members, mine, said, edge, services, home, turns) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let own = state.store.get(&node);
             let mut members = members(&state.store, &shook, &mut known, Instant::now());
+            // The key replacement: what this node's spec asks, what it has done, the keys the others are to
+            // take, and who has taken this node's.
+            let spec = own.and_then(|own| own.spec["mesh"]["rotate"].as_str());
+            let spec = spec.filter(|id| rotate_name(id)).map(str::to_string);
+            let rotated = done
+                .clone()
+                .or_else(|| own?.status.as_ref()?["mesh"]["rotated"].as_str().map(str::to_string));
+            let pending = rotation.as_ref().map(|rotation| &rotation.next);
+            let nexts = fresh(nexts(&state.store, me, &public, pending), &mut said_next, now);
+            let took: BTreeSet<String> = match &rotation {
+                None => BTreeSet::new(),
+                Some(rotation) => {
+                    let next = hex(&rotation.next);
+                    let takes = |node: &kith_api::Resource| {
+                        let said = node.status.as_ref()?["mesh"]["takes"].as_array()?.clone();
+                        said.contains(&next.clone().into()).then(|| node.metadata.name.clone())
+                    };
+                    state.store.list(Some("Node")).filter_map(takes).collect()
+                }
+            };
             // (Until the store says who the nodes are: those this node was told of as it joined.)
             // Once it does, they are forgotten: a node that has left since is not called for ever.
             let nobody = members.iter().all(|member| member.name == me);
@@ -372,11 +562,138 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
                 mine["reaches"] = json!(reaching(&members, &shook));
                 mine["seen"] = seeing(&members, &shook, &at);
             }
+            // (`takes`: the keys it has as peers, as far as the interface was last asked.)
+            let held = |key: &Key| {
+                asked
+                    .as_ref()
+                    .is_some_and(|(peers, _): &Told| peers.iter().any(|p| p.key == *key))
+            };
+            // (At most 64: what a node may say of it; the rest are taken on the next pass they are not.)
+            let takes: Vec<String> = nexts
+                .values()
+                .filter(|key| held(key))
+                .take(64)
+                .map(|key| hex(key))
+                .collect();
+            if !takes.is_empty() {
+                mine["takes"] = json!(takes);
+            }
+            if let Some(rotation) = &rotation {
+                mine["next"] = json!(hex(&rotation.next));
+            }
+            if let Some(id) = &rotated {
+                mine["rotated"] = json!(id);
+            }
+            if let Some(id) = &failed {
+                mine["failed"] = json!(id);
+            }
             let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
             let services = crate::services::addresses(&state.store, prefix);
             let home = home_endpoint(&state.store, me, &members, &shook);
-            (members, mine, said, edge, services.into_values().collect(), home)
+            let turns = (spec.filter(|id| rotated.as_ref() != Some(id)), took, nexts);
+            (members, mine, said, edge, services.into_values().collect(), home, turns)
         };
+        let (asking, took, nexts) = turns;
+        // The key replacement goes a step on (the next pass, at once, says it). It waits while another
+        // node's is under way (it says a `next`), for `ROTATE_WAIT` of it at most.
+        let waiting = !nexts.is_empty();
+        let shook_by_name: BTreeMap<String, Duration> = members
+            .iter()
+            .filter(|member| member.name != me)
+            .filter_map(|member| Some((member.name.clone(), shook.get(&member.key).copied().flatten()?)))
+            .collect();
+        let step = |step| crate::root_part::mesh_key_step(&root, &options.interface, step);
+        let mut moved = true;
+        match rotation.take() {
+            None => match asking.filter(|id| failed.as_ref() != Some(id)) {
+                // (One node at a time: two that switch together have no key to call each other by.)
+                Some(_) if waiting => moved = false,
+                Some(id) => {
+                    let need: Vec<String> = members
+                        .iter()
+                        .filter(|member| member.name != me && shook_lately(&shook, &member.key))
+                        .map(|member| member.name.clone())
+                        .collect();
+                    match (need.is_empty(), step(KeyStep::Make)) {
+                        (false, Ok(Some(next))) => {
+                            eprintln!(
+                                "kithd: mesh: replacing this node's key ({id}): asking {} peers to take the new one",
+                                need.len()
+                            );
+                            rotation = Some(Rotation {
+                                id,
+                                next,
+                                need,
+                                since: now,
+                                switched: None,
+                            });
+                        }
+                        (true, made) => {
+                            if made.is_ok() {
+                                let _ = step(KeyStep::Revert);
+                            }
+                            eprintln!(
+                                "kithd: mesh: not replacing the key ({id}): no peer is reached to take the new one"
+                            );
+                            failed = Some(id);
+                        }
+                        (false, made) => {
+                            let why = made.err().unwrap_or_default();
+                            eprintln!("kithd: mesh: not replacing the key ({id}): {why}");
+                            failed = Some(id);
+                        }
+                    }
+                }
+                None => moved = false,
+            },
+            Some(mut active) => {
+                // Ok: whether it is done. Err: given up, and why.
+                let went: Result<bool, String> = match turn(&active, &took, &shook_by_name, now) {
+                    Turn::Wait => {
+                        moved = false;
+                        Ok(false)
+                    }
+                    Turn::Switch => match step(KeyStep::Use) {
+                        Ok(Some(key)) if key == active.next => {
+                            active.switched = Some(Instant::now());
+                            Ok(false)
+                        }
+                        Ok(_) => Err("the interface did not answer with the new key".to_string()),
+                        Err(e) => Err(e),
+                    },
+                    Turn::Commit => step(KeyStep::Commit).map(|_| true),
+                    Turn::Revert(why) => Err(why.to_string()),
+                };
+                match went {
+                    Ok(true) => {
+                        eprintln!("kithd: mesh: this node's key is replaced ({})", active.id);
+                        public = active.next;
+                        base = says_of(&public, address, options.port);
+                        done = Some(active.id);
+                        failed = None;
+                    }
+                    Ok(false) => rotation = Some(active),
+                    // (The old key back first: only once it is, the others are told to forget the new one.)
+                    Err(why) => match step(KeyStep::Revert) {
+                        Ok(_) => {
+                            eprintln!(
+                                "kithd: mesh: the key replacement {} is given up ({why}): this node keeps its old key",
+                                active.id
+                            );
+                            failed = Some(active.id);
+                        }
+                        Err(e) => {
+                            eprintln!("kithd: mesh: going back to the old key: {e}");
+                            rotation = Some(active);
+                            moved = false;
+                        }
+                    },
+                }
+            }
+        }
+        if moved {
+            wake.notify_one();
+        }
         // (Resolved beside the loop, not here: the endpoint may be a name. Until it is, the holder is called where it was.)
         if let Some((holder, endpoint)) = home
             && let Some(at) = resolving(&lookup, &endpoint, &wake)
@@ -396,10 +713,14 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
                  set net.ipv6.conf.all.forwarding=1 for nodes to reach each other through it"
             );
         }
-        let peers = kith_mesh::wanted(prefix, me, &members);
+        let mut peers = kith_mesh::wanted(prefix, me, &members);
+        standby(&mut peers, &members, &nexts, &shook);
         // Every node has every Service's address (crate::services listens on them).
-        if let Err(e) = crate::root_part::mesh(&root, &mut asked, &options.interface, peers.clone(), services) {
-            eprintln!("kithd: mesh: setting {}: {e}", options.interface);
+        match crate::root_part::mesh(&root, &mut asked, &options.interface, peers.clone(), services) {
+            // (A new key taken is said at once: the node that asked is waiting for it.)
+            Ok(true) if !nexts.is_empty() => wake.notify_one(),
+            Ok(_) => {}
+            Err(e) => eprintln!("kithd: mesh: setting {}: {e}", options.interface),
         }
         // For `kith node status`.
         let path = |member: &Member| {
@@ -747,5 +1068,250 @@ mod tests {
             assert!(told(&path).is_empty(), "{torn:?}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn rotation(need: &[&str], since: Instant, switched: Option<Instant>) -> Rotation {
+        let need = need.iter().map(|name| name.to_string()).collect();
+        Rotation {
+            id: "r".into(),
+            next: [9; 32],
+            need,
+            since,
+            switched,
+        }
+    }
+
+    /// A rotation switches once every peer took the key, commits once every peer shook hands after
+    /// the switch (a handshake from before it proves nothing), and gives the old key back when
+    /// either wait runs out: it never commits on less.
+    #[test]
+    fn a_rotation_commits_only_on_a_handshake_after_the_switch() {
+        let start = Instant::now();
+        let both: BTreeSet<String> = ["a", "b"].iter().map(|name| name.to_string()).collect();
+        let one: BTreeSet<String> = ["a"].iter().map(|name| name.to_string()).collect();
+        let r = rotation(&["a", "b"], start, None);
+        assert_eq!(
+            turn(&r, &one, &BTreeMap::new(), start + Duration::from_secs(5)),
+            Turn::Wait
+        );
+        assert_eq!(
+            turn(&r, &both, &BTreeMap::new(), start + Duration::from_secs(5)),
+            Turn::Switch
+        );
+        assert!(matches!(
+            turn(&r, &one, &BTreeMap::new(), start + ROTATE_WAIT),
+            Turn::Revert(_)
+        ));
+        // Switched 40 s ago: a handshake 50 s ago is the old key's; 10 s ago is the new one's.
+        let now = start + Duration::from_secs(100);
+        let r = rotation(&["a", "b"], start, Some(now - Duration::from_secs(40)));
+        let ago = |a: u64, b: u64| {
+            BTreeMap::from([
+                ("a".to_string(), Duration::from_secs(a)),
+                ("b".to_string(), Duration::from_secs(b)),
+            ])
+        };
+        assert_eq!(turn(&r, &both, &ago(10, 50), now), Turn::Wait);
+        assert_eq!(turn(&r, &both, &BTreeMap::new(), now), Turn::Wait);
+        assert_eq!(turn(&r, &both, &ago(10, 20), now), Turn::Commit);
+        let late = now + ROTATE_WAIT;
+        assert!(matches!(turn(&r, &both, &ago(500, 500), late), Turn::Revert(_)));
+        // A rotation with nobody to agree has nothing to wait for.
+        assert_eq!(
+            turn(&rotation(&[], start, None), &one, &BTreeMap::new(), start),
+            Turn::Switch
+        );
+    }
+
+    /// The keys other nodes say they take next: only a key that is none of the nodes' keys, not
+    /// zeros, and said once.
+    #[test]
+    fn a_next_key_is_taken_only_if_it_is_new_and_the_only_one() {
+        let mut store = Store::default();
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            let source = format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{}}\n");
+            let resource = kith_api::Resource::from_source(&source).unwrap().remove(0);
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let status = |key: u8, next: Option<u8>| {
+            let mut mesh = json!({ "key": hex(&[key; 32]), "port": 51820 });
+            if let Some(next) = next {
+                mesh["next"] = json!(hex(&[next; 32]));
+            }
+            json!({ "address": "10.9.0.1:7443", "mesh": mesh })
+        };
+        for (node, key, next) in [
+            ("a", 1, Some(10)),
+            ("b", 2, Some(11)),
+            ("c", 3, Some(11)),
+            ("d", 4, Some(2)),
+        ] {
+            store
+                .set_status(&format!("Node/{node}"), Some(status(key, next)))
+                .unwrap();
+        }
+        store.set_status("Node/e", Some(status(5, Some(0)))).unwrap();
+        store.set_status("Node/f", Some(status(6, Some(1)))).unwrap();
+        store.set_status("Node/g", Some(status(7, None))).unwrap();
+        store.set_status("Node/h", Some(status(8, Some(12)))).unwrap();
+        let got = nexts(&store, "h", &[9; 32], None);
+        // b and c say one key (neither is taken), d says b's key, e's is zeros, f says a's key.
+        assert_eq!(got, BTreeMap::from([("a".to_string(), [10; 32])]));
+        // This node's own key is not another's to take, and its own `next` is not one it takes.
+        store.set_status("Node/a", Some(status(1, Some(9)))).unwrap();
+        assert!(nexts(&store, "h", &[9; 32], None).is_empty());
+        // Nor is the key this node has made and not yet switched to (a node that says it is refused).
+        store.set_status("Node/a", Some(status(1, Some(10)))).unwrap();
+        assert_eq!(nexts(&store, "h", &[9; 32], None).len(), 1);
+        assert!(nexts(&store, "h", &[9; 32], Some(&[10; 32])).is_empty());
+    }
+
+    /// A peer that is to change keys has the new key beside the old, with no addresses (and no
+    /// endpoint, no keepalive) until it shook hands on it; then it has the old peer's, and the old
+    /// has none.
+    #[test]
+    fn a_standby_peer_has_nothing_until_it_shook_hands() {
+        let old = kith_mesh::Peer {
+            key: [1; 32],
+            endpoint: Some("127.0.0.1:51820".parse().unwrap()),
+            allowed: vec![(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), 128)],
+            keepalive: 25,
+        };
+        let member = |name: &str, byte: u8| Member {
+            name: name.into(),
+            key: [byte; 32],
+            endpoint: None,
+            edge: false,
+            reached: true,
+            direct_only: false,
+            reaches: Vec::new(),
+            seen: None,
+        };
+        let members = [member("a", 1), member("b", 2)];
+        let nexts = BTreeMap::from([("a".to_string(), [10; 32]), ("x".to_string(), [11; 32])]);
+        let mut peers = vec![old.clone()];
+        standby(&mut peers, &members, &nexts, &BTreeMap::new());
+        let blank = kith_mesh::Peer {
+            key: [10; 32],
+            endpoint: None,
+            allowed: Vec::new(),
+            keepalive: 0,
+        };
+        assert_eq!(peers, [old.clone(), blank]);
+        let mut peers = vec![old.clone()];
+        let shook = BTreeMap::from([([10; 32], Some(Duration::from_secs(3)))]);
+        standby(&mut peers, &members, &nexts, &shook);
+        let flipped = kith_mesh::Peer {
+            key: [10; 32],
+            ..old.clone()
+        };
+        let inert = kith_mesh::Peer {
+            allowed: Vec::new(),
+            keepalive: 0,
+            ..old
+        };
+        assert_eq!(peers, [inert, flipped]);
+    }
+
+    #[test]
+    fn a_rotation_name_is_short_text_with_no_control_characters() {
+        assert!(rotate_name("first") && rotate_name(&"x".repeat(64)));
+        assert!(!rotate_name("") && !rotate_name(&"x".repeat(65)) && !rotate_name("a\nb"));
+    }
+
+    /// A key file is written whole, for its owner alone, with no half-written file left beside it;
+    /// writing again replaces it, and `private_key` reads what is there and makes one if not.
+    #[test]
+    fn a_key_file_is_written_whole_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kith-key-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mesh.key");
+        let made = private_key(&path).unwrap();
+        assert_eq!(read_key(&path).unwrap(), made);
+        assert_eq!(private_key(&path).unwrap(), made);
+        let next = next_path(&path);
+        assert_eq!(next, dir.join("mesh.next"));
+        let new = make_key(&next).unwrap();
+        assert_ne!(new, made);
+        write_key(&path, &new).unwrap();
+        assert_eq!(read_key(&path).unwrap(), new);
+        for file in [&path, &next] {
+            assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let names: BTreeSet<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, BTreeSet::from(["mesh.key".to_string(), "mesh.next".to_string()]));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What holds this node's rotation back is a `next` another node says, and for `ROTATE_WAIT`
+    /// at most: a node that is asked to rotate (a lower name, say) and has not started says none,
+    /// and one whose `next` is older than that is not waited for.
+    #[test]
+    fn a_node_that_has_not_started_or_never_finishes_holds_no_one_back() {
+        let mut store = Store::default();
+        for name in ["a", "b"] {
+            let source = format!(
+                "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{ mesh: {{ rotate: r1 }} }}\n"
+            );
+            let resource = kith_api::Resource::from_source(&source).unwrap().remove(0);
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let key = |byte: u8| hex(&[byte; 32]);
+        // a is asked to rotate and has said no `next`: no one waits for it.
+        store
+            .set_status("Node/a", Some(json!({ "mesh": { "key": key(1) } })))
+            .unwrap();
+        let (mut seen, start) = (BTreeMap::new(), Instant::now());
+        assert!(fresh(nexts(&store, "z", &[9; 32], None), &mut seen, start).is_empty());
+        // Once it says one, this node waits, until it is older than ROTATE_WAIT.
+        store
+            .set_status("Node/a", Some(json!({ "mesh": { "key": key(1), "next": key(2) } })))
+            .unwrap();
+        let mut said = |at| fresh(nexts(&store, "z", &[9; 32], None), &mut seen, at);
+        assert_eq!(said(start).len(), 1);
+        assert_eq!(said(start + ROTATE_WAIT - Duration::from_secs(1)).len(), 1);
+        assert!(said(start + ROTATE_WAIT).is_empty());
+    }
+
+    /// A key is exactly 64 lower-case hex digits: one text per key, so that comparing the texts
+    /// of two keys is comparing the keys.
+    #[test]
+    fn a_key_is_64_lower_case_hex_digits_and_nothing_else() {
+        let good = "ab".repeat(32);
+        assert_eq!(key_of(&good), Some([0xab; 32]));
+        assert_eq!(key_of(&good.to_uppercase()), None);
+        assert_eq!(key_of(&format!("aB{}", &good[2..])), None);
+        assert_eq!(key_of(&good[..63]), None);
+        assert_eq!(key_of(&format!("{good}a")), None);
+        assert_eq!(key_of(&format!("{good} ")), None);
+        // (`from_str_radix` takes a sign.)
+        assert_eq!(key_of(&format!("+a{}", &good[2..])), None);
+        assert_eq!(key_of(&format!("{}zz", &good[..62])), None);
+        assert_eq!(key_of(&hex(&[0x5c; 32])), Some([0x5c; 32]));
+    }
+
+    /// A peer's `next` that has not been taken in `ROTATE_WAIT` stops holding this node's
+    /// rotation back (its own rotation gave up by then); a `next` said again after it was taken
+    /// back starts the wait over.
+    #[test]
+    fn a_next_key_that_never_commits_stops_holding_others_back() {
+        let start = Instant::now();
+        let said = BTreeMap::from([("a".to_string(), [10; 32])]);
+        let mut seen = BTreeMap::new();
+        assert_eq!(fresh(said.clone(), &mut seen, start), said);
+        assert_eq!(
+            fresh(said.clone(), &mut seen, start + ROTATE_WAIT - Duration::from_secs(1)),
+            said
+        );
+        let late = start + ROTATE_WAIT;
+        assert!(fresh(said.clone(), &mut seen, late).is_empty());
+        assert!(fresh(said.clone(), &mut seen, late + Duration::from_secs(500)).is_empty());
+        // Taken back (not said for a pass), then said: a new wait.
+        assert!(fresh(BTreeMap::new(), &mut seen, late + Duration::from_secs(501)).is_empty());
+        assert_eq!(fresh(said.clone(), &mut seen, late + Duration::from_secs(502)), said);
     }
 }
