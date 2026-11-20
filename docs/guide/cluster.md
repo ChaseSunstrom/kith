@@ -460,6 +460,19 @@ the mesh's loop, never holding it: until the first answer the holder is called w
 answer is kept and looked up again each minute (each half minute while it does not resolve), and
 kithd logs when it starts or stops resolving, not on each try.
 
+### Usage over time
+
+Each kithd samples its machine every 10 seconds (CPU, memory, the disk under `--state`, disk
+and network rates, load) and each unit of a Workload's replicas (CPU cores from its cgroup's
+`cpu.stat`, memory from `memory.current`), and keeps an hour of 10-second points and a day of
+5-minute points in memory: a restart starts them empty, and nothing goes through Raft or to
+disk. A Workload not seen for an hour is forgotten with its history, and at most 512 are kept.
+
+`GET /v1/metrics?range=15m|1h|6h|24h` on any node answers for all of them: the other nodes'
+series are asked over the node-to-node connection, each given 3 seconds, and one that does not
+answer is `"missing": true` with empty series. A Workload with replicas on several nodes is
+under `NS/NAME` for the first node by name and `NS/NAME@NODE` for each other.
+
 ### Not yet
 
 - Workloads have no mesh addresses (Services do); two nodes behind NATs that give a port per

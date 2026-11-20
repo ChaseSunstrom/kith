@@ -3365,6 +3365,14 @@
       },
       "description": "`{ weight: 50, node.labels.room: closet }`: a weight plus the labels it rewards."
     },
+    "Priority": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "idle"
+      ],
+      "description": "How a replica's units share the node. `idle`: CPU and disk only when nothing else wants\nthem (`cpu.idle`, the lowest `io.weight`), and memory reclaimed from them first\n(`memory.high` at the unit's memory amount, if it has one)."
+    },
     "Probe": {
       "type": "object",
       "additionalProperties": false,
@@ -4086,6 +4094,17 @@
             }
           ],
           "description": "Hold this replica back (a sliver of one CPU) while a seat of its node is busy."
+        },
+        "priority": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Priority"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`idle` makes this replica's units take only the node's spare CPU and disk (and their\nmemory is reclaimed first); `normal`, the default, changes nothing."
         },
         "pod": {
           "type": [

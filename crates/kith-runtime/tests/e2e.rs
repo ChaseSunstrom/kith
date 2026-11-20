@@ -168,6 +168,7 @@ async fn read_only_root() {
             read_only: false,
             give: true,
             part: None,
+            held: None,
         };
         let unit = Unit {
             user,

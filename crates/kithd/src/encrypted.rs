@@ -687,6 +687,7 @@ spec: { node: a, path: /srv/data, size: 1Gi, encrypted: true }
         assert!(
             crate::volumes::host_dir(&state, &plain)
                 .unwrap()
+                .real()
                 .ends_with("volumes/default/vault/data")
         );
         // With its file there, a volume that stopped saying `encrypted` is no empty directory

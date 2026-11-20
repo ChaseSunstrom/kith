@@ -51,6 +51,7 @@ mod kubeproto;
 mod levels;
 mod members;
 mod mesh;
+mod metrics;
 mod modules;
 mod netboot;
 mod os;
@@ -1305,13 +1306,20 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         ];
         let saying = async {
             let format = raft::tend_format(shared.clone(), stopping.clone());
+            let state = shared.logs.parent().unwrap_or(&shared.logs).to_path_buf();
+            let sampler = metrics::run(state, stopping.clone());
             // (Only a machine's first process keeps its clock: on another system something else does.)
             let clock = async {
                 if init::is_init() {
                     clock::run(shared.clone(), stopping.clone()).await;
                 }
             };
-            tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format, clock);
+            tokio::join!(
+                say_serves(shared.clone(), says, stopping.clone()),
+                format,
+                sampler,
+                clock
+            );
         };
         let house = home::run(shared.clone(), stopping.clone());
         let (served, nodes, (), (), (), (), (), (), (), (), _) = tokio::join!(

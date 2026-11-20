@@ -48,7 +48,11 @@ RUNS = 5  # each time is the median of this many runs
 # Raised to 13.40 for one train of features (T-0810 socketpair Root +139 KB, T-0838/T-0842
 # kubectl port-forward/exec/attach/cp, T-0797 exits, T-0849 own writes): the end-of-run size
 # pass brings it back down.
-KITHD_SIZE = 13.40
+# RAISE, kithd 13.40 to 13.55 (T-1113 for train BF): the tree of T-1118 + T-1111 + main 0258d2e8
+# + T-0986 + T-1113 measures 14,074,912 B (13.423 MiB) with the musl build and stat; T-1083 (GUI
+# installer fb.rs and font), T-1155 (FIDO2 PIN protocol) and T-1076 (mesh) land on main ahead of
+# BF and add more; the end-of-run size pass brings it back down.
+KITHD_SIZE = 13.55
 KITHD_IDLE_RSS = 9 * MB
 # binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
 # 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.
