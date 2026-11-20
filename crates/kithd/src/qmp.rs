@@ -7,9 +7,10 @@
 //! a blocking thread. Every call has one deadline, not one per read, so a peer that trickles
 //! bytes cannot hold it past its time; the whole connection has another.
 //
-// ponytail: the migration is started and polled by URI (`tcp:`, `unix:`, `exec:`); handing
-// QEMU an open descriptor (SCM_RIGHTS, `fd:`) is not done: the migration stream between two
-// nodes is a TCP connection QEMU makes itself. Each is left for later.
+// ponytail: the migration is started and polled by URI, and only `tcp:`, `unix:` and `fd:`
+// are sent (`exec:` and `file:` run a program or write a file as QEMU's user); handing QEMU
+// an open descriptor (SCM_RIGHTS) is not done: the migration stream between two nodes is a
+// TCP connection QEMU makes itself. Each is left for later.
 
 // (Nothing calls it yet: the migration of slices C and D of T-1135 does.)
 #![allow(dead_code)]
@@ -121,6 +122,28 @@ fn own(path: &Path) -> Result<()> {
     }
 }
 
+/// `text` from the peer, cut to what an error message can carry.
+fn clip(text: impl fmt::Display) -> String {
+    let text = text.to_string();
+    let end = (0..=200.min(text.len())).rev().find(|at| text.is_char_boundary(*at));
+    match end {
+        Some(end) if end < text.len() => format!("{}...", &text[..end]),
+        _ => text,
+    }
+}
+
+/// `uri` as a migration's address: `tcp:`, `unix:` or `fd:`, and no scheme that runs a
+/// program or writes a file (`exec:`, `file:`).
+fn address(uri: &str) -> Result<&str> {
+    match ["tcp:", "unix:", "fd:"].iter().any(|scheme| uri.starts_with(scheme)) {
+        true => Ok(uri),
+        false => Err(Error::Protocol(format!(
+            "migration address `{}` is not tcp:, unix: or fd:",
+            clip(uri)
+        ))),
+    }
+}
+
 fn left(until: Instant) -> Result<Duration> {
     until
         .checked_duration_since(Instant::now())
@@ -129,9 +152,9 @@ fn left(until: Instant) -> Result<Duration> {
 }
 
 impl Qmp {
-    /// Connect to `path`, waiting up to `call` for QEMU to make the socket and greet, then
-    /// the handshake. `call` is also each later call's time; `overall` is the connection's,
-    /// from now: nothing is answered after it.
+    /// Connect to `path`, waiting up to `call` in all for QEMU to make the socket and greet,
+    /// then up to `call` for the handshake. `call` is also each later call's time; `overall`
+    /// is the connection's, from now: nothing is answered after it.
     pub fn connect(path: &Path, call: Duration, overall: Duration) -> Result<Qmp> {
         use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, getsockopt, socket, sockopt};
         let (start, deadline) = (Instant::now(), Instant::now() + call.min(overall));
@@ -179,9 +202,9 @@ impl Qmp {
             end: start + overall,
             broken: false,
         };
-        let greeting = qmp.read(qmp.until())?;
+        let greeting = qmp.read(deadline)?;
         if !greeting.get("QMP").is_some_and(Value::is_object) {
-            return Err(Error::Protocol(format!("no greeting: {greeting}")));
+            return Err(Error::Protocol(format!("no greeting: {}", clip(greeting))));
         }
         qmp.run("qmp_capabilities", None)?;
         Ok(qmp)
@@ -200,7 +223,8 @@ impl Qmp {
                 if at > MAX_LINE {
                     return Err(Error::TooLong);
                 }
-                return serde_json::from_slice(&line[..at]).map_err(|e| Error::Protocol(format!("not JSON: {e}")));
+                return serde_json::from_slice(&line[..at])
+                    .map_err(|e| Error::Protocol(format!("not JSON: {}", clip(e))));
             }
             if self.buf.len() > MAX_LINE {
                 return Err(Error::TooLong);
@@ -242,14 +266,24 @@ impl Qmp {
             said["arguments"] = arguments;
         }
         self.stream.set_write_timeout(Some(left(until)?))?;
-        self.stream.write_all(format!("{said}\n").as_bytes())?;
+        // (Part of a command may be written: what is read after it is no longer in step.)
+        if let Err(e) = self.stream.write_all(format!("{said}\n").as_bytes()) {
+            self.broken = true;
+            return Err(e.into());
+        }
         loop {
             let got = self.read(until)?;
-            if got.get("event").is_some() || got.get("id").is_some_and(|got| *got != id) {
+            if got.get("event").is_some() {
                 continue;
             }
+            // (An answer to a call given up on has a lower id; anything else is not QEMU's.)
+            match got.get("id").and_then(Value::as_u64) {
+                Some(theirs) if theirs == id => {}
+                Some(theirs) if theirs < id => continue,
+                _ => return Err(Error::Protocol(format!("an answer to no call of ours: {}", clip(got)))),
+            }
             if let Some(error) = got.get("error") {
-                let text = |key| error.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+                let text = |key| clip(error.get(key).and_then(Value::as_str).unwrap_or_default());
                 return Err(Error::Qemu {
                     class: text("class"),
                     desc: text("desc"),
@@ -258,7 +292,7 @@ impl Qmp {
             return got
                 .get("return")
                 .cloned()
-                .ok_or_else(|| Error::Protocol(format!("no answer in {got}")));
+                .ok_or_else(|| Error::Protocol(format!("no answer in {}", clip(got))));
         }
     }
 
@@ -269,7 +303,7 @@ impl Qmp {
                 running,
                 state: state.into(),
             }),
-            _ => Err(Error::Protocol(format!("query-status: {got}"))),
+            _ => Err(Error::Protocol(format!("query-status: {}", clip(got)))),
         }
     }
 
@@ -295,12 +329,13 @@ impl Qmp {
 
     /// `migrate`: start sending this machine to `uri`. It returns at once; [`Qmp::migration`] tells how far.
     pub fn migrate(&mut self, uri: &str) -> Result<()> {
-        self.run("migrate", Some(json!({ "uri": uri }))).map(drop)
+        self.run("migrate", Some(json!({ "uri": address(uri)? }))).map(drop)
     }
 
     /// `migrate-incoming`: a machine started with `-incoming defer` listens at `uri`.
     pub fn migrate_incoming(&mut self, uri: &str) -> Result<()> {
-        self.run("migrate-incoming", Some(json!({ "uri": uri }))).map(drop)
+        self.run("migrate-incoming", Some(json!({ "uri": address(uri)? })))
+            .map(drop)
     }
 
     pub fn migration(&mut self) -> Result<Migration> {
@@ -495,13 +530,18 @@ mod tests {
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
             writeln!(stream, "{}", ok(&json!(1), json!({}))).unwrap();
-            let _ = stream.read(&mut buf);
-            std::thread::sleep(Duration::from_millis(700));
+            // (Silent till the client lets go: read to EOF, whatever it sends.)
+            while stream.read(&mut buf).unwrap_or(0) > 0 {}
         });
-        let mut qmp = Qmp::connect(&path, Duration::from_millis(300), SECOND * 20).unwrap();
+        // (A long time to connect in, so a loaded machine does not time the handshake out.)
+        let mut qmp = Qmp::connect(&path, SECOND * 10, SECOND * 60).unwrap();
+        qmp.call = Duration::from_millis(500);
         let start = Instant::now();
         assert!(matches!(qmp.status(), Err(Error::Timeout)));
-        assert!(start.elapsed() < Duration::from_millis(600), "{:?}", start.elapsed());
+        assert!(start.elapsed() < SECOND * 4, "{:?}", start.elapsed());
+        // (A call that timed out leaves it fit for the next.)
+        assert!(matches!(qmp.status(), Err(Error::Timeout)));
+        drop(qmp);
         server.join().unwrap();
 
         let (path, server) = fake("trickle", |mut stream| {
@@ -510,17 +550,19 @@ mod tests {
             writeln!(stream, "{}", ok(&json!(1), json!({}))).unwrap();
             let _ = stream.read(&mut buf);
             // (A line that never ends, a byte every 20 ms: a per-read timeout would never fire.)
-            for _ in 0..100 {
+            for _ in 0..500 {
                 if stream.write_all(b" ").is_err() {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        let mut qmp = Qmp::connect(&path, Duration::from_millis(300), SECOND * 20).unwrap();
+        let mut qmp = Qmp::connect(&path, SECOND * 10, SECOND * 60).unwrap();
+        qmp.call = Duration::from_millis(500);
         let start = Instant::now();
+        // (Per-read timeouts would end only when the peer did, 10 s on, with `Closed`.)
         assert!(matches!(qmp.status(), Err(Error::Timeout)));
-        assert!(start.elapsed() < Duration::from_millis(900), "{:?}", start.elapsed());
+        assert!(start.elapsed() < SECOND * 5, "{:?}", start.elapsed());
         drop(qmp);
         server.join().unwrap();
 
@@ -529,14 +571,17 @@ mod tests {
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
             writeln!(stream, "{}", ok(&json!(1), json!({}))).unwrap();
-            let _ = stream.read(&mut buf);
-            std::thread::sleep(Duration::from_millis(900));
+            while stream.read(&mut buf).unwrap_or(0) > 0 {}
         });
-        let mut qmp = Qmp::connect(&path, SECOND * 30, Duration::from_millis(300)).unwrap();
+        let mut qmp = Qmp::connect(&path, SECOND * 30, SECOND * 3).unwrap();
         let start = Instant::now();
         assert!(matches!(qmp.status(), Err(Error::Timeout)));
-        assert!(start.elapsed() < Duration::from_millis(800), "{:?}", start.elapsed());
+        assert!(start.elapsed() < SECOND * 10, "{:?}", start.elapsed());
+        // (Past the connection's end: no wait at all.)
+        let start = Instant::now();
         assert!(matches!(qmp.status(), Err(Error::Timeout)));
+        assert!(start.elapsed() < SECOND, "{:?}", start.elapsed());
+        drop(qmp);
         server.join().unwrap();
     }
 
@@ -580,12 +625,68 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            writeln!(stream, r#"{{"hello":1}}"#).unwrap();
+            writeln!(stream, r#"{{"hello":"{}"}}"#, "a".repeat(5000)).unwrap();
         });
-        assert!(matches!(
-            Qmp::connect(&path, SECOND * 5, SECOND * 20),
-            Err(Error::Protocol(_))
-        ));
+        // (What the peer said is cut to what a message carries.)
+        match Qmp::connect(&path, SECOND * 5, SECOND * 20) {
+            Err(Error::Protocol(why)) => assert!(why.len() < 300, "{}", why.len()),
+            other => panic!("{:?}", other.map(drop)),
+        }
+        server.join().unwrap();
+
+        // An answer with no id is not QEMU's to give, nor one for a call not made yet.
+        for answer in [
+            r#"{"return":{}}"#,
+            r#"{"return":{},"id":99}"#,
+            r#"{"return":{},"id":"x"}"#,
+        ] {
+            let (path, server) = fake("noid", move |mut stream| {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                writeln!(stream, "{}", ok(&json!(1), json!({}))).unwrap();
+                let _ = stream.read(&mut buf);
+                writeln!(stream, "{answer}").unwrap();
+            });
+            let mut qmp = Qmp::connect(&path, SECOND * 5, SECOND * 20).unwrap();
+            assert!(matches!(qmp.status(), Err(Error::Protocol(_))), "{answer}");
+            server.join().unwrap();
+        }
+    }
+
+    /// A migration address that would run a program or write a file is refused before it is
+    /// sent, and the connection goes on; `tcp:`, `unix:` and `fd:` are sent.
+    #[test]
+    fn qmp_sends_only_the_migration_addresses_it_allows() {
+        let (path, server) = fake("uri", |stream| {
+            let seen = std::cell::RefCell::new(Vec::new());
+            answer(stream, |command, arguments, id| {
+                seen.borrow_mut().push((command.to_string(), arguments["uri"].clone()));
+                vec![ok(id, json!({}))]
+            });
+            let seen = seen.into_inner();
+            let sent: Vec<_> = seen.iter().filter(|(c, _)| c.starts_with("migrate")).collect();
+            assert_eq!(sent.len(), 3, "{seen:?}");
+            assert_eq!(sent[0].1, "tcp:127.0.0.1:4444");
+            assert_eq!(sent[1].1, "unix:/run/x/mig.sock");
+            assert_eq!(sent[2].1, "fd:mig");
+        });
+        let mut qmp = Qmp::connect(&path, SECOND * 5, SECOND * 20).unwrap();
+        for uri in [
+            "exec:cat > /etc/passwd",
+            "file:/etc/passwd",
+            "127.0.0.1:4444",
+            "",
+            "TCP:1.2.3.4:1",
+            "x:tcp:1",
+        ] {
+            assert!(matches!(qmp.migrate(uri), Err(Error::Protocol(_))), "{uri}");
+            assert!(matches!(qmp.migrate_incoming(uri), Err(Error::Protocol(_))), "{uri}");
+        }
+        qmp.migrate("tcp:127.0.0.1:4444").unwrap();
+        qmp.migrate_incoming("unix:/run/x/mig.sock").unwrap();
+        qmp.migrate("fd:mig").unwrap();
+        qmp.cont().unwrap();
+        drop(qmp);
         server.join().unwrap();
     }
 
@@ -650,7 +751,7 @@ mod tests {
         let words = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
         let has = |line: &[String], at: &[&str]| line.windows(at.len()).any(|w| w == at);
         let mut line = words(&["qemu-system-x86_64", "-nodefaults", "-m", "64M"]);
-        crate::vm::control(&mut line, Path::new("/run/kith/replicas/r1/qmp.sock"), false);
+        crate::vm::control(&mut line, Path::new("/run/kith/replicas/r1/qmp.sock"), false).unwrap();
         assert_eq!(
             line[..3],
             words(&[
@@ -661,15 +762,25 @@ mod tests {
         );
         assert!(has(&line, &["-m", "64M"]) && !line.iter().any(|w| w == "-incoming"));
         let mut line = words(&["qemu-system-aarch64", "-nodefaults"]);
-        crate::vm::control(&mut line, Path::new("/run/a,b/qmp.sock"), true);
+        crate::vm::control(&mut line, Path::new("/run/a,b/qmp.sock"), true).unwrap();
         assert!(
             has(&line, &["-qmp", "unix:/run/a,,b/qmp.sock,server=on,wait=off"]),
             "{line:?}"
         );
         assert!(has(&line, &["-incoming", "defer"]));
         let mut other = words(&["cloud-hypervisor", "--cpus", "boot=1"]);
-        crate::vm::control(&mut other, Path::new("/run/x/qmp.sock"), true);
+        crate::vm::control(&mut other, Path::new("/run/x/qmp.sock"), true).unwrap();
         assert_eq!(other, words(&["cloud-hypervisor", "--cpus", "boot=1"]));
+        // A path that does not go into an option as it is: refused, and the line is as it was.
+        use std::os::unix::ffi::OsStrExt;
+        let mut line = words(&["qemu-system-x86_64"]);
+        for path in [
+            Path::new("/run/a=b/qmp.sock"),
+            Path::new(std::ffi::OsStr::from_bytes(b"/run/\xff/qmp.sock")),
+        ] {
+            assert!(crate::vm::control(&mut line, path, true).is_err());
+        }
+        assert_eq!(line, words(&["qemu-system-x86_64"]));
     }
 
     /// Ends the QEMU it holds, whatever the test did.
@@ -696,7 +807,7 @@ mod tests {
             ]
             .map(String::from),
         );
-        crate::vm::control(&mut line, &dir.join(crate::vm::CONTROL), incoming);
+        crate::vm::control(&mut line, &dir.join(crate::vm::CONTROL), incoming).unwrap();
         let child = Command::new(&line[0])
             .args(&line[1..])
             .stdin(Stdio::null())
@@ -720,6 +831,14 @@ mod tests {
             println!("skipped: qemu-system-x86_64 is not on this machine");
             return;
         }
+        // (A socket's path is at most 107 bytes: a long TMPDIR cannot hold one.)
+        let longest = std::env::temp_dir()
+            .join("kith-qmp-4294967295-999-real-incoming")
+            .join(crate::vm::CONTROL);
+        if longest.as_os_str().len() > 100 {
+            println!("skipped: TMPDIR is too long for a socket path ({})", longest.display());
+            return;
+        }
         let dir = dir("real");
         let mut qemu = start(&dir, false);
         let mut qmp = Qmp::connect(&dir.join(crate::vm::CONTROL), SECOND * 20, SECOND * 60).unwrap();
@@ -729,7 +848,7 @@ mod tests {
         qmp.set_downtime_limit(300).unwrap();
         assert_eq!(qmp.migration().unwrap().status, "none");
         // (A refusal from the real thing is typed too.)
-        assert!(matches!(qmp.migrate("nonsense:"), Err(Error::Qemu { .. })));
+        assert!(matches!(qmp.migrate("tcp:bad"), Err(Error::Qemu { .. })));
         qmp.quit().unwrap();
         assert!(qemu.0.wait().unwrap().success());
 
