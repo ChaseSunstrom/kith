@@ -89,6 +89,8 @@ def said():
         return giveup.encode() in open(log, "rb").read()
     except OSError:
         return False
+def ioerr():
+    raise OSError("monitor closed")
 def ask():
     global conn
     if conn is None:
@@ -97,11 +99,11 @@ def ask():
         conn.connect(mon)
         seen = b""
         while seen.count(b"(qemu)") < 1:
-            seen += conn.recv(4096)
+            seen += conn.recv(4096) or ioerr()
     conn.sendall(("screendump " + ppm + "\n").encode())
     seen = b""
     while seen.count(b"(qemu)") < 1:
-        seen += conn.recv(4096)
+        seen += conn.recv(4096) or ioerr()
 def shape():
     head = open(ppm, "rb").read().split(b"\n", 3)
     if head[0] != b"P6":
