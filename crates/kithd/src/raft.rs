@@ -1402,6 +1402,69 @@ fn next_change(
     (!gone.is_empty()).then_some(ChangeMembers::RemoveNodes(gone))
 }
 
+/// Seconds since a WireGuard handshake that count as fresh: a node is moved to the mesh only on
+/// one this young (WireGuard makes a new one every two minutes while traffic flows, and a session
+/// dies at three). A moved node is taken back to its LAN address when its handshake is older
+/// than twice this, or there is none once `to_mesh` has had that long to see one.
+const SHOOK: u64 = 180;
+
+/// The status patches that move a node's `address` to its mesh address (the one its name gives
+/// in the cluster's `prefix`, not the one its status says), so Raft and the node API ride the
+/// mesh, and that take it back to its `lan` address when it can no longer be called there.
+///
+/// A node that joined over the LAN stays there until it says it serves the API on the mesh
+/// (`status.mesh.api`) and `me` has a fresh handshake with it (`shook`: seconds since the last
+/// one, by node name; `me`'s own is its freshest with any other). A moved node goes back when
+/// it stops saying it (it restarted without `--mesh`, or with a `--listen` of its own) or the
+/// handshake is stale; with `settled` false (this leader has only just begun to look) a missing
+/// handshake is not yet taken for a stale one. Workers and nodes with no mesh key are left where
+/// they are and do not hold the others back; but `me` stays on the LAN while one of the nodes
+/// that take part in Raft has no key, for that one could not call it on the mesh. Said again each
+/// look, never a heartbeat: what is where it should be is not listed.
+fn to_mesh(
+    store: &kith_api::store::Store,
+    prefix: std::net::Ipv6Addr,
+    me: &str,
+    shook: &BTreeMap<&str, u64>,
+    settled: bool,
+) -> Vec<(String, serde_json::Map<String, serde_json::Value>)> {
+    let keyed = |node: &kith_api::Resource| {
+        node.status
+            .as_ref()
+            .is_some_and(|status| status["mesh"]["key"].is_string())
+    };
+    let in_raft = |node: &&kith_api::Resource| node.spec["trust"] != "worker";
+    let all_keyed = store.list(Some("Node")).filter(in_raft).all(keyed);
+    let freshest = shook.values().copied().min();
+    let patch = |fields: [(&str, serde_json::Value); 2]| {
+        serde_json::Map::from_iter(fields.map(|(field, value)| (field.to_string(), value)))
+    };
+    let moved = |node: &kith_api::Resource| {
+        let name = node.metadata.name.as_str();
+        let status = node.status.as_ref()?;
+        if !in_raft(&node) || !keyed(node) {
+            return None;
+        }
+        let old: std::net::SocketAddr = status["address"].as_str()?.parse().ok()?;
+        let ago = if name == me { freshest } else { shook.get(name).copied() };
+        let api = status["mesh"]["api"] == true;
+        let at = kith_mesh::node_address(prefix, name);
+        let new = std::net::SocketAddr::new(at.into(), old.port());
+        if old == new {
+            // Back where it was seen from, when the mesh is no way to it now.
+            let lan: std::net::SocketAddr = status["lan"].as_str()?.parse().ok()?;
+            let stale = ago.map_or(settled, |ago| ago > 2 * SHOOK);
+            let back = [("address", lan.to_string().into()), ("lan", serde_json::Value::Null)];
+            return (!api || stale).then(|| (node.key(), patch(back)));
+        }
+        let ready = api && ago.is_some_and(|ago| ago <= SHOOK) && (name != me || all_keyed);
+        // (`lan`: where it was seen from: WireGuard's endpoint and the ingress DNS answers go on using it.)
+        let there = [("address", new.to_string().into()), ("lan", old.to_string().into())];
+        ready.then(|| (node.key(), patch(there)))
+    };
+    store.list(Some("Node")).filter_map(moved).collect()
+}
+
 async fn tend_once(shared: &Shared) -> Result<(), String> {
     let metrics = shared.raft.metrics().borrow().clone();
     if metrics.current_leader != Some(metrics.id) {
@@ -1426,6 +1489,19 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
         if let Some(id) = id.filter(|_| gone >= LOST) {
             lost.insert(id);
         }
+    }
+    if let Some(cluster) = &shared.cluster {
+        let prefix = crate::mesh::prefix(&cluster.me.ca);
+        // (Handshakes with the nodes this one calls: it is for it to say it can reach a node there.)
+        let paths = shared.mesh.lock().expect("nothing panics holding the mesh").clone();
+        let shook = paths.as_array().into_iter().flatten();
+        let shook = shook.filter_map(|path| Some((path["node"].as_str()?, path["handshake"].as_u64()?)));
+        let shook: BTreeMap<&str, u64> = shook.collect();
+        // (The mesh's own look comes a few seconds after the start: no handshake is not yet a stale one.)
+        static LOOKING_SINCE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let settled = LOOKING_SINCE.get_or_init(Instant::now).elapsed().as_secs() >= 2 * SHOOK;
+        let store = shared.store.lock().expect("nothing panics holding the store");
+        statuses.extend(to_mesh(&store.store, prefix, &cluster.me.name, &shook, settled));
     }
     if !statuses.is_empty() {
         // Put here, never forwarded: a forward that finds a new leader reaches it as this node's own
@@ -3030,5 +3106,127 @@ mod tests {
         }
         assert!(took >= PATIENCE && took < PATIENCE + Duration::from_secs(5), "{took:?}");
         assert!(!holds(&one, "ConfigMap/default/waits") && holds(&two, "RoleBinding/alice-writes"));
+    }
+
+    /// A node that joined over the LAN and says it has the mesh and serves the API on it is moved
+    /// to the address its name gives there, once the leader has shaken hands with it and every node
+    /// is on the mesh; its LAN address is kept beside; what it says of the address is not believed.
+    #[test]
+    fn a_lan_node_is_moved_to_its_mesh_address() {
+        use serde_json::json;
+        let prefix: std::net::Ipv6Addr = "fd00:1:2::".parse().unwrap();
+        let on = |name: &str| kith_mesh::node_address(prefix, name).to_string();
+        let mut store = kith_api::store::Store::default();
+        let nodes = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: a }\n---\n\
+                     apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: b }\n";
+        for node in kith_api::Resource::from_source(nodes).unwrap() {
+            store.apply(node.unwrap()).unwrap();
+        }
+        let says =
+            |api: bool, address: &str| json!({ "key": "07".repeat(32), "port": 51820, "address": address, "api": api });
+        let status = |store: &mut kith_api::store::Store, node: &str, at: &str, mesh: Option<serde_json::Value>| {
+            let mut status = json!({ "address": at });
+            if let Some(mesh) = mesh {
+                status["mesh"] = mesh;
+            }
+            store.set_status(node, Some(status)).unwrap();
+        };
+        let shook = BTreeMap::from([("b", 5)]);
+        let moves =
+            |store: &kith_api::store::Store, shook: &BTreeMap<&str, u64>| to_mesh(store, prefix, "a", shook, true);
+        // a has no mesh yet, and no handshake with b: nothing moves.
+        status(&mut store, "Node/a", "10.9.0.1:7443", None);
+        status(&mut store, "Node/b", "10.9.0.2:7443", Some(says(true, &on("b"))));
+        assert!(moves(&store, &BTreeMap::new()).is_empty());
+        // A handshake that is old does not count; a fresh one does, though a has no key
+        // (it holds only its own move back, which says nothing of b's).
+        assert!(moves(&store, &BTreeMap::from([("b", SHOOK + 1)])).is_empty());
+        assert_eq!(moves(&store, &shook).len(), 1, "a keyless node does not hold b back");
+        // Both are on the mesh, but a does not serve the API there (a --listen of its own): it stays.
+        status(&mut store, "Node/a", "10.9.0.1:7443", Some(says(false, &on("a"))));
+        // b is not shaken hands with yet: it stays on the LAN.
+        assert!(moves(&store, &BTreeMap::new()).is_empty());
+        // b is moved, with what it said of the address (a trap) not believed, and a stays.
+        status(&mut store, "Node/b", "10.9.0.2:7443", Some(says(true, "::1")));
+        let moved = moves(&store, &shook);
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].0, "Node/b");
+        assert_eq!(moved[0].1["address"], format!("[{}]:7443", on("b")));
+        assert_eq!(moved[0].1["lan"], "10.9.0.2:7443");
+        // Once moved it is not listed again; a, which leads, is moved when it serves there.
+        status(
+            &mut store,
+            "Node/b",
+            &format!("[{}]:7443", on("b")),
+            Some(says(true, &on("b"))),
+        );
+        assert!(moves(&store, &shook).is_empty());
+        status(&mut store, "Node/a", "10.9.0.1:7443", Some(says(true, &on("a"))));
+        let moved = moves(&store, &shook);
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].0, "Node/a");
+        // a, with no fresh handshake with any other node, is not moved.
+        assert!(moves(&store, &BTreeMap::new()).is_empty());
+        assert!(moves(&store, &BTreeMap::from([("b", SHOOK + 1)])).is_empty());
+    }
+
+    /// A node moved to the mesh is taken back to its LAN address when it stops saying it serves
+    /// the API there, or its handshake is stale (a missing one only once the leader has looked a while).
+    /// Workers and keyless nodes are neither moved nor in the way; a keyless node holds back only the leader's own move.
+    #[test]
+    fn a_moved_node_goes_back_to_its_lan_address_when_the_mesh_fails_it() {
+        use serde_json::json;
+        let prefix: std::net::Ipv6Addr = "fd00:1:2::".parse().unwrap();
+        let on = |name: &str| kith_mesh::node_address(prefix, name).to_string();
+        let mut store = kith_api::store::Store::default();
+        let nodes = ["a", "b", "c", "w"].map(|name| {
+            let trust = if name == "w" { "worker" } else { "control" };
+            format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{ trust: {trust} }}\n")
+        });
+        for node in kith_api::Resource::from_source(&nodes.join("---\n")).unwrap() {
+            store.apply(node.unwrap()).unwrap();
+        }
+        let mesh = |name: &str, api: bool| json!({ "key": "07".repeat(32), "address": on(name), "api": api });
+        let set = |store: &mut kith_api::store::Store, node: &str, address: String, lan: Option<&str>, api: bool| {
+            let mut status = json!({ "address": address, "mesh": mesh(node, api) });
+            if let Some(lan) = lan {
+                status["lan"] = lan.into();
+            }
+            store.set_status(&format!("Node/{node}"), Some(status)).unwrap();
+        };
+        let to = |name: &str| format!("[{}]:7443", on(name));
+        let look = |store: &kith_api::store::Store, shook: &[(&str, u64)], settled: bool| {
+            let moved = to_mesh(store, prefix, "a", &BTreeMap::from_iter(shook.iter().copied()), settled);
+            moved.into_iter().collect::<BTreeMap<_, _>>()
+        };
+        set(&mut store, "a", "10.9.0.1:7443".into(), None, true);
+        set(&mut store, "b", to("b"), Some("10.9.0.2:7443"), true);
+        // c has no mesh key at all, and w is a worker: neither is moved nor holds b back.
+        store
+            .set_status("Node/c", Some(json!({ "address": "10.9.0.3:7443" })))
+            .unwrap();
+        set(&mut store, "w", "10.9.0.4:7443".into(), None, true);
+        let fresh = [("b", 5), ("c", 5), ("w", 5)];
+        let moved = look(&store, &fresh, true);
+        assert!(
+            moved.is_empty(),
+            "b is where it should be, a waits for c's key, c and w stay: {moved:?}"
+        );
+        // b, said to be on the mesh and shaken hands with a while ago (not yet twice SHOOK): it stays.
+        assert!(look(&store, &[("b", 2 * SHOOK)], true).is_empty());
+        // Past that, b goes back to the address it was seen from, and the LAN one is taken off.
+        let back = look(&store, &[("b", 2 * SHOOK + 1)], true);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back["Node/b"]["address"], "10.9.0.2:7443");
+        assert!(back["Node/b"]["lan"].is_null());
+        // No handshake at all: back, but not before the leader has looked a while.
+        assert!(look(&store, &[], false).is_empty());
+        assert_eq!(look(&store, &[], true).len(), 1);
+        // It stops saying it serves the API (restarted without --mesh): back at once.
+        set(&mut store, "b", to("b"), Some("10.9.0.2:7443"), false);
+        assert_eq!(look(&store, &[("b", 1)], false)["Node/b"]["address"], "10.9.0.2:7443");
+        // A moved node with no `lan` to go back to is left alone.
+        set(&mut store, "b", to("b"), None, false);
+        assert!(look(&store, &[("b", 1)], true).is_empty());
     }
 }

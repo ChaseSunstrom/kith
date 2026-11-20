@@ -239,7 +239,9 @@ fn members(
         let port = u16::try_from(status["mesh"]["port"].as_u64()?)
             .ok()
             .filter(|port| *port != 0)?;
-        let at = status["address"].as_str().and_then(|at| at.parse::<SocketAddr>().ok());
+        // (Its LAN address when the leader has moved `address` onto the mesh: WireGuard is not called through itself.)
+        let at = node.node_addresses().next();
+        let at = at.and_then(|at| at.parse::<SocketAddr>().ok());
         let since = *known.entry(key).or_insert(now);
         let fresh = shook_lately(shook, &key);
         let reaches = status["mesh"]["reaches"].as_array();
@@ -558,6 +560,10 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             // says who it reaches too, and where it saw them: it is asked when a relay is
             // picked and where to call a node behind NAT, the others are not.
             let mut mine = base.clone();
+            // The API listens on every IPv6 address, the mesh's too: the leader may move the Node's address here.
+            if crate::cluster::SERVES_MESH.load(std::sync::atomic::Ordering::Relaxed) {
+                mine["api"] = true.into();
+            }
             if edge {
                 mine["reaches"] = json!(reaching(&members, &shook));
                 mine["seen"] = seeing(&members, &shook, &at);
@@ -840,6 +846,14 @@ mod tests {
         let said = json!({ "address": "10.0.0.2:7443", "mesh": { "key": key(2), "port": 51820, "reaches": ["a", 3] } });
         let with = store_with_node(&store, "Node/b", said);
         assert_eq!(members(&with, &none, &mut BTreeMap::new(), start)[1].reaches, ["a"]);
+        // Moved onto the mesh by the leader: the endpoint stays the LAN address it was moved from.
+        let moved =
+            json!({ "address": "[fd00::2]:7443", "lan": "10.0.0.2:7443", "mesh": { "key": key(2), "port": 51820 } });
+        let with = store_with_node(&store, "Node/b", moved);
+        assert_eq!(
+            members(&with, &none, &mut BTreeMap::new(), start)[1].endpoint,
+            Some("10.0.0.2:51820".parse().unwrap())
+        );
         let heard = BTreeMap::from([([1; 32], Some(Duration::from_secs(20))), ([2; 32], Some(QUIET))]);
         assert_eq!(reaching(&got, &heard), ["a"]);
         // New peers have three minutes to answer; after that only one that shook hands

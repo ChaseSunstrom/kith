@@ -483,6 +483,18 @@ fn listen_at(
     give(listener)
 }
 
+/// Where a node says it is reached, as IPv4 addresses: its LAN one (`status.lan`, once the leader
+/// has moved `status.address` onto the mesh) and its `status.address` if that is one too.
+fn reached(node: &kith_api::Resource) -> Vec<Ipv4Addr> {
+    let at = node.node_addresses();
+    let at = at.filter_map(|address| address.parse::<std::net::SocketAddr>().ok());
+    at.filter_map(|address| match address.ip() {
+        IpAddr::V4(address) => Some(address),
+        IpAddr::V6(address) => address.to_ipv4_mapped(),
+    })
+    .collect()
+}
+
 /// The Shares of volumes on `me` that name NFS clients: each one's name, its volume, and what
 /// [`Table`] has of it but for where the volume's directory is on this node.
 fn lans(store: &Store, me: &str) -> Vec<(String, Dir, Lan)> {
@@ -679,21 +691,13 @@ pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
             let store = &file_store.store;
             let address = |node: &kith_api::Resource| kith_mesh::node_address(prefix, &node.metadata.name);
-            // Where each node says it is reached, when that is an IPv4 address.
-            let reached = |node: &kith_api::Resource| -> Option<Ipv4Addr> {
-                let address: std::net::SocketAddr = node.status.as_ref()?["address"].as_str()?.parse().ok()?;
-                match address.ip() {
-                    IpAddr::V4(address) => Some(address),
-                    IpAddr::V6(address) => address.to_ipv4_mapped(),
-                }
-            };
             (
                 crate::volumes::served(store, me),
                 store.list(Some("Node")).map(address).collect(),
                 lans(store, me),
                 store
                     .list(Some("Node"))
-                    .filter_map(reached)
+                    .flat_map(reached)
                     .collect::<BTreeSet<Ipv4Addr>>(),
             )
         };
@@ -782,6 +786,27 @@ pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node moved onto the mesh (its `address` an IPv6 one) is still one of the IPv4 addresses
+    /// a container here may come from: its LAN address, kept in `status.lan`.
+    #[test]
+    fn a_moved_nodes_lan_address_is_still_a_node_address() {
+        let node = |status: serde_json::Value| {
+            let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: b }\nspec: {}\n";
+            let mut node = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
+            node.status = Some(status);
+            node
+        };
+        let lan: Ipv4Addr = "10.9.0.2".parse().unwrap();
+        assert_eq!(reached(&node(serde_json::json!({ "address": "10.9.0.2:7443" }))), [lan]);
+        let moved = serde_json::json!({ "address": "[fd00:1:2::5]:7443", "lan": "10.9.0.2:7443" });
+        assert_eq!(reached(&node(moved)), [lan]);
+        assert_eq!(
+            reached(&node(serde_json::json!({ "address": "[::ffff:10.9.0.2]:7443" }))),
+            [lan]
+        );
+        assert!(reached(&node(serde_json::json!({ "address": "[fd00:1:2::5]:7443" }))).is_empty());
+    }
 
     fn table() -> Table {
         Table {
