@@ -222,6 +222,26 @@ pub fn sha256_hex(digest: &str) -> Result<&str> {
     }
 }
 
+/// A lock file (`images/.lock`, the index's `.lock`), unlocked before it is closed. The lock
+/// belongs to the open file, not to this descriptor: a child forked meanwhile (a container's
+/// start) holds a copy until it execs, and closing ours alone would leave the lock held for as
+/// long as that copy lives.
+struct Held(File);
+
+impl std::ops::Deref for Held {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // Nothing to say if it fails: the close that follows drops what this holds anyway.
+        let _ = self.0.unlock();
+    }
+}
+
 impl ImageStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<ImageStore> {
         let root = root.into();
@@ -290,12 +310,13 @@ impl ImageStore {
     /// The lock of `images/` (not yet taken): each pull holds it shared, from before it looks
     /// for its image here until it has marked the one it answers with used; a removal holds it
     /// alone, and only if it can at once.
-    fn images_lock(&self) -> std::io::Result<File> {
+    fn images_lock(&self) -> std::io::Result<Held> {
         File::options()
             .create(true)
             .truncate(false)
             .write(true)
             .open(self.root.join("images/.lock"))
+            .map(Held)
     }
 
     /// The images unpacked here that nothing uses, oldest first, each with when it was last
@@ -1019,13 +1040,14 @@ fn shared_name(hex: &str, (mode, uid, gid, secs, nanos, _): Same) -> String {
 
 /// The index's lock, held by an unpack while it shares and by the sweep: no entry is
 /// swept between an unpack finding it and linking to it.
-fn lock(index: &Path) -> std::io::Result<File> {
+fn lock(index: &Path) -> std::io::Result<Held> {
     fs::create_dir_all(index)?;
     let file = File::options()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(index.join(".lock"))?;
+        .open(index.join(".lock"))
+        .map(Held)?;
     file.lock()?;
     Ok(file)
 }
@@ -1360,17 +1382,6 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, tar.into_inner().unwrap()).unwrap();
         path
-    }
-
-    /// Keeps every other test of this process from forking while the caller's test runs. A
-    /// child forked while a store's `images/.lock` is open here holds that lock (the open
-    /// file is copied, and a created container's first process keeps it until it execs): a
-    /// removal that must find the lock free then finds it taken. (The tests of removal
-    /// hold it; a kithd that forks meanwhile only has its removal wait for the next look.)
-    fn no_forks() -> std::sync::MutexGuard<'static, ()> {
-        crate::container::FORKING
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn sandbox(name: &str) -> (PathBuf, PathBuf) {
@@ -3148,7 +3159,6 @@ mod tests {
     /// only it linked. A layer and a shared file another image has stay, and that image whole.
     #[test]
     fn image_removal_takes_an_unused_image_whole_with_what_only_it_named() {
-        let _forks = no_forks();
         let (dir, _) = sandbox("image-removal");
         let store = ImageStore::new(dir.join("store")).unwrap();
         let common: &[E] = &[E::File("lib", "library")];
@@ -3220,7 +3230,6 @@ mod tests {
     /// holds the store. An image of a kithd from before layers were noted goes with no layer.
     #[test]
     fn image_removal_keeps_what_is_in_use_or_within_grace() {
-        let _forks = no_forks();
         let (dir, _) = sandbox("image-kept");
         let store = ImageStore::new(dir.join("store")).unwrap();
         let file: &[E] = &[E::File("f", "file")];
@@ -3276,7 +3285,6 @@ mod tests {
     /// what is left of it, and the next look (`tidy`) removes the rest, not the store's opening.
     #[test]
     fn image_removal_cut_halfway_leaves_no_half_image() {
-        let _forks = no_forks();
         let (dir, _) = sandbox("image-cut");
         let store = ImageStore::new(dir.join("store")).unwrap();
         let entries: &[E] = &[E::Dir("stuck", 0o755), E::File("stuck/f", "x"), E::File("g", "y")];
@@ -3341,7 +3349,6 @@ mod tests {
     /// blobs beside the store, which the node's registry serves its Images from.
     #[test]
     fn image_removal_takes_the_layers_no_image_names() {
-        let _forks = no_forks();
         let (dir, _) = sandbox("image-unnamed");
         let store = ImageStore::new(dir.join("state/runtime")).unwrap();
         let a = stored(&store, "a:1", 'a', &[('1', &[E::File("f", "file")])]);
@@ -3390,9 +3397,7 @@ mod tests {
     /// A pull answered from the store marks the image used; an image removed is pulled again
     /// in full, its layer fetched and unpacked anew.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // (a test on one thread: nothing else waits on it but forks)
     async fn image_removal_an_image_removed_is_pulled_again() {
-        let _forks = no_forks();
         let (dir, _) = sandbox("image-pulled-again");
         let registry = Registry::start(false);
         let digest = registry.publish("1", "/bin/one");
@@ -3687,6 +3692,58 @@ mod tests {
             "{said:?}"
         );
         assert!(store.pull_progress(&second).is_none(), "an ended pull is still listed");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The index lock, likewise: a sweep after an unpack is not held up by a forked child.
+    #[test]
+    fn index_lock_a_forked_child_does_not_keep_it_held() {
+        let (dir, _) = sandbox("index-lock-forked");
+        let index = dir.join("index");
+        let held = lock(&index).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::from(held.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        drop(held);
+        let again = File::open(index.join(".lock")).unwrap();
+        let got = again.try_lock();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(got.is_ok(), "the index lock stayed held by the child's copy");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A child forked while the lock is held keeps a copy of its descriptor (here as its
+    /// stdin); the lock belongs to the open file, so releasing it must not wait for that copy
+    /// to close, or a removal started right after is told "busy" for nothing.
+    #[test]
+    fn image_lock_a_forked_child_does_not_keep_it_held() {
+        let (dir, _) = sandbox("image-lock-forked");
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        for shared in [false, true] {
+            let held = store.images_lock().unwrap();
+            if shared {
+                held.lock_shared().unwrap();
+            } else {
+                held.lock().unwrap();
+            }
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::from(held.try_clone().unwrap()))
+                .spawn()
+                .unwrap();
+            drop(held);
+            let again = store.images_lock().unwrap();
+            let got = again.try_lock();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert!(
+                got.is_ok(),
+                "the lock stayed held by the child's copy (shared: {shared})"
+            );
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 }
