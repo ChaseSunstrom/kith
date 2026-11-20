@@ -44,7 +44,7 @@ spec:
   link in it (in `kith-system`, an absolute host path). A container path that is relative, has
   `..`, or is `/`, `/proc`, `/sys` or `/dev` (or under them) stops the unit. A mount at `/etc`
   stops it too, since it would hide the `resolv.conf` kith binds there: mount under `/etc`, or
-  add a mount at `/etc/resolv.conf`.
+  add a mount at `/etc/resolv.conf` after it (mounts go on in order). A container that ran with such a mount before fails at its next start. An alias of `/etc` made inside the image is not seen.
 - A Volume named like a claim is what the claim's workloads mount, even if the claim is bound to
   another Volume. The claim's `status.message` says so, naming the Volume.
 - Not yet: `subvolume: true` makes a plain directory; `size` is no quota; an `exec` unit and a

@@ -3065,8 +3065,10 @@ fn hides_resolv(mounts: &[kith_runtime::Mount]) -> Option<String> {
         let at = Path::new(&m.container);
         Path::new(RESOLV).starts_with(at) && at != Path::new(RESOLV) && at != Path::new("/")
     };
-    let hiding = mounts.iter().find(|m| over(m))?;
-    (!mounts.iter().any(own)).then(|| {
+    // (The runtime binds mounts in order: its own file's mount must come after the one over it.)
+    let at = mounts.iter().position(over)?;
+    let hiding = &mounts[at];
+    (!mounts[at..].iter().any(own)).then(|| {
         format!(
             "a mount at `{}` would hide the container's {RESOLV}: mount under it (`{}/app`) or add a mount at {RESOLV} itself",
             hiding.container,
@@ -4373,7 +4375,8 @@ mod tests {
         );
         // Its own resolver file, mounted after or before: the runtime binds no other there.
         assert_eq!(hides_resolv(&[at("/etc"), at("/etc/resolv.conf")]), None);
-        assert_eq!(hides_resolv(&[at("/etc/resolv.conf"), at("/etc")]), None);
+        // Before it, the file is hidden by the mount over it.
+        assert!(hides_resolv(&[at("/etc/resolv.conf"), at("/etc")]).is_some());
         assert_eq!(hides_resolv(&[]), None);
     }
 

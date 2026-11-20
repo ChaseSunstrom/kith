@@ -583,7 +583,7 @@ pub fn resolve(store: &Store) -> Volumes {
         let takes = vols.contains_key(&format!("Volume/{namespace}/{name}")) && *outcome != Ok(name.to_string());
         let note = takes.then(|| {
             format!(
-                "Volume {name} has this claim's name: a workload's mount of {name} is that Volume, not this claim's"
+                "Volume {name} has this claim's name: a workload's mount of {name} is that Volume, not this claim's (rename the claim or the Volume)"
             )
         });
         let status = match outcome {
