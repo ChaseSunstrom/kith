@@ -17,6 +17,7 @@ mod keyless;
 mod outside;
 mod seccomp;
 pub mod signed;
+pub mod timeline;
 
 pub use container::*;
 pub use image::{Image, ImageStore, Local, PullPolicy, Unpacking, registry, repository, sha256_hex};

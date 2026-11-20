@@ -97,7 +97,9 @@ RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 # gate read medians of 33 ms against 10 ms and 38 ms against 7), and the fastest run waited least.
 # A regression in kith slows every run, the fastest too; CI's quiet runner judges the median.
 TIME_BUDGETS = {
-    "apply to a running container": 0.180,
+    # LOWERED 180 -> 80 ms (T-1207): the first image reference parse no longer compiles its regex
+    # on the start's path (40 to 60 ms), 156 -> 64 ms at load 29 here (`--phases` has each phase).
+    "apply to a running container": 0.080,
     # RAISED 10 -> 20 ms (T-1096): under a 25+ load it read 16.1 and 18.0 ms and refused closes and prechecks;
     # bring it back to 10 ms once the trains are done and the host is quiet.
     "a status change reaching a second kithd": 0.020,
@@ -202,15 +204,71 @@ def apply_to_running(bins, dir):
     node = Daemon(bins, dir)
     try:
         began = time.monotonic()
+        began_ns = time.monotonic_ns()
         node.apply("workload", WORKLOAD)
         deadline = began + 20
         while running(node, "timing") != 1:
             if time.monotonic() > deadline:
                 raise NotHere(node.said())
             time.sleep(0.005)
-        return time.monotonic() - began
+        seen = time.monotonic() - began
+        if "KITH_TIMELINE" in os.environ:
+            with open(node.log.name) as log:
+                TIMELINES.append(timeline(log.read(), began_ns, time.monotonic_ns()))
+        return seen
     finally:
         node.stop()
+
+
+# What kithd's marks (crates/kith-runtime/src/timeline.rs) are, in the order one apply passes them, and
+# the phase each one ends: the time since the mark before it. "began" and "seen" are this script's own.
+PHASES = [
+    ("api", "the CLI and the request reaching the handler"),
+    ("stored", "store write (a raft commit, one fsync)"),
+    ("start", "schedule (the controller wakes, plans, begins the start)"),
+    ("pull", "the unit made ready (volumes, identity, pod, settings, policy, signing rules, image reference parsed)"),
+    ("image", "the image already on the node (read from its note, marked used)"),
+    ("create", "the hand-off to the runtime's create"),
+    ("spec", "bundle and spec written and synced"),
+    ("fork", "fork of the build helper"),
+    ("built", "clone3, cgroup, mounts (libcontainer's build, in the helper)"),
+    ("collected", "the parent collecting what the helper built"),
+    ("made", "the container's state loaded, its cgroup set"),
+    ("go", "back in kithd, before the start"),
+    ("running", "start (the init process released)"),
+    ("status", "its status committed (a second raft commit)"),
+    ("seen", "kith get polling (every 5 ms) seeing it"),
+]
+
+
+def timeline(log, began_ns, seen_ns):
+    """name -> nanoseconds of each mark of one apply: the first one at or after the mark before it."""
+    found = {"began": began_ns}
+    last = began_ns
+    for name, _ in PHASES[:-1]:
+        for line in log.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[:1] == ["kith-timeline"] and parts[1] == name and parts[2].isdigit() and int(parts[2]) >= last:
+                found[name] = last = int(parts[2])
+                break
+        else:
+            return found
+    found["seen"] = seen_ns
+    return found
+
+
+def phases(timelines):
+    """[(name, what, median milliseconds)] of each phase over the runs that held every mark, and their total."""
+    whole = [t for t in timelines if "seen" in t]
+    rows, before = [], "began"
+    for name, what in PHASES:
+        spent = [(t[name] - t[before]) / 1e6 for t in whole]
+        rows.append((name, what, statistics.median(spent) if spent else float("nan")))
+        before = name
+    return rows, statistics.median([(t["seen"] - t["began"]) / 1e6 for t in whole]) if whole else float("nan"), len(whole)
+
+
+TIMELINES = []
 
 
 def running(node, name):
@@ -452,20 +510,43 @@ def relro_writable(binary, pid):
     return writable, size
 
 
+def build():
+    """The folder of the binaries the image ships."""
+    built = subprocess.run(["sh", "ci/musl.sh"], check=True, stdout=subprocess.PIPE, text=True,
+                           env={**{k: v for k, v in os.environ.items() if k != "KITHD_FEATURES"}, "KITH_MUSL_REMOTE": "1"})
+    return built.stdout.strip()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Hold the binaries to their size, memory and time budgets (builds them first).")
+    parser =argparse.ArgumentParser(description="Hold the binaries to their size, memory and time budgets (builds them first).")
     parser.add_argument("--self-test", action="store_true", help="check the checks: with 1-byte and 1 ms budgets every one must fail")
     parser.add_argument("--times", action="store_true", help="print the median times of the timed paths, unjudged, and stop")
+    parser.add_argument("--phases", action="store_true", help="where the time of an apply to a running container goes, phase by phase (kithd's KITH_TIMELINE marks), and stop")
+    parser.add_argument("--runs", type=int, default=20, help="with --phases: how many applies to time (default 20)")
+    parser.add_argument("--bins", help="with --phases: the folder of a kithd and kith already built (default: build them)")
     args = parser.parse_args()
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
     self_test = args.self_test
+    if args.phases:
+        os.environ["KITH_TIMELINE"] = "1"
+        bins = os.path.abspath(args.bins) if args.bins else build()
+        with tempfile.TemporaryDirectory() as tmp:
+            print(f"load {os.getloadavg()[0]:.1f} on {os.cpu_count()} CPUs")
+            try:
+                totals = [apply_to_running(bins, os.path.join(tmp, f"phases-{i}")) for i in range(args.runs)]
+            except NotHere as said:
+                sys.exit(f"no container starts here: {said}")
+        rows, total, held = phases(TIMELINES)
+        print(f"apply to a running container, the median of {args.runs} runs ({held} with every mark):")
+        for name, what, ms in rows:
+            print(f"  {ms:7.2f} ms  {name:<9} {what}")
+        print(f"  {total:7.2f} ms  total (marks, the median of the totals); {statistics.median(totals) * 1000:.2f} ms by the script's clock")
+        return
     # The binaries the image ships, built by the one command line that builds them for it: a
     # package built alone gets other features of the crates both share, so it is another binary
     # (and each order would build those crates again).
-    built = subprocess.run(["sh", "ci/musl.sh"], check=True, stdout=subprocess.PIPE, text=True,
-                           env={**{k: v for k, v in os.environ.items() if k != "KITHD_FEATURES"}, "KITH_MUSL_REMOTE": "1"})
-    bin_dir = built.stdout.strip()
+    bin_dir = build()
     with tempfile.TemporaryDirectory() as tmp:
         if args.times:
             # The same three paths, unjudged: the numbers the budgets are set from.
@@ -517,6 +598,15 @@ def main():
         # A quiet host is judged on the median, a busy one on the fastest run.
         if judged(0.03, [0.03, 0.01, 0.05], 1.0)[0] != 0.03 or judged(0.03, [0.03, 0.01, 0.05], 2.0)[0] != 0.01:
             sys.exit("self-test failed: a busy host is not judged on its fastest run")
+        # --phases reads each mark once, in order, from the first one after the mark before it: an earlier
+        # "status" (another commit) and a mark before the apply are skipped, a missing mark ends the timeline.
+        log = "kith-timeline status 5\nkith-timeline api 10\nkith-timeline api 11\nnoise\n" + "".join(
+            f"kith-timeline {n} {20 + i}\n" for i, (n, _) in enumerate(PHASES[1:-1]))
+        found = timeline(log, 8, 99)
+        if found["api"] != 10 or found["status"] != 20 + len(PHASES) - 3 or found["seen"] != 99:
+            sys.exit("self-test failed: the timeline is not read from the marks")
+        if "seen" in timeline("kith-timeline api 10\n", 8, 99):
+            sys.exit("self-test failed: a timeline with marks missing was taken whole")
         # With 1-byte and 1 ms budgets every check must fail; otherwise the checks check nothing.
         if any(results):
             sys.exit("self-test failed: a check passed against a 1-byte or 1 ms budget")

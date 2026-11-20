@@ -116,10 +116,38 @@ budget.
 
 | Time | On the CI runner: the median of five, on three runs on main | Budget |
 |---|---|---|
-| apply to a running container | 85.3, 88.1, 78.3 ms | 180 ms |
+| apply to a running container | 85.3, 88.1, 78.3 ms (before T-1207) | 80 ms |
 | a status change reaching a second kithd | 4.7, 4.8, 4.8 ms | 10 ms |
 | one DNS answer from kithd | 2.9, 3.1, 3.5 ms | 7 ms |
 | boot to ready | 2.5 to 3.7 s to `kithd` answering, in a VM (`boot` in [ci/compare.txt](../../ci/compare.txt)) | not budgeted: no VM runs in CI |
+
+Where the apply to a running container goes: `python3 ci/budgets.py --phases` starts a kithd with
+`KITH_TIMELINE` set (off otherwise: no mark is written), applies a Workload whose image is on the
+node 20 times, and prints the median of each phase, the time since the mark before it. Each mark
+is a line `kith-timeline NAME NANOS` (CLOCK_MONOTONIC) on kithd's log. On the dev PC (16 CPUs,
+load 29, so each number is slower than a quiet host's), before and after the first image
+reference was parsed at start-up instead of on the start's path:
+
+| Phase | Before | After |
+|---|---|---|
+| the CLI and the request reaching the handler | 10.7 ms | 9.0 ms |
+| store write (a raft commit, one fsync) | 8.6 ms | 7.3 ms |
+| schedule (the controller wakes, begins the start) | 0.4 ms | 0.4 ms |
+| the image reference parsed, the unit made ready, the image found | 67.7 ms | 0.4 ms |
+| runtime create: the bundle and spec written and synced (two fsyncs) | 12.6 ms | 12.4 ms |
+| clone3, cgroup and mounts (libcontainer's build in a forked helper; its steps cannot be marked from outside, so one phase) | 16.3 ms | 14.4 ms |
+| the parent collecting the helper, the container loaded | 6.8 ms | 6.1 ms |
+| start (the init process released) | 0.3 ms | 0.2 ms |
+| its status committed (a second raft commit) | 10.7 ms | 9.7 ms |
+| `kith get` polling (every 5 ms) seeing it | 1.1 ms | 0.8 ms |
+| total | 149.7 ms | 63.7 ms |
+
+The largest phase was not the runtime's: oci-spec compiles a large regex at the first image
+reference it parses, 40 to 60 ms, and every kithd paid it at its first start. `ImageStore::new`
+now parses one on a thread of its own. What is left is mostly disk and the kernel: three fsyncs
+(two raft commits and the spec; the spec's stay, for a config.json torn by a power cut gives no
+range to any container) and libcontainer's build. Under 20 ms is not reached on this loaded host;
+the budget is what a quiet runner reads, twice over.
 
 Release binaries are static musl builds: `ring` (C) needs `musl-tools` (Debian/Ubuntu) or
 `CC_x86_64_unknown_linux_musl` set to a `zig cc -target x86_64-linux-musl` wrapper.
