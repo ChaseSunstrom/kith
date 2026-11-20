@@ -497,14 +497,21 @@ impl Keys {
     /// image `running`: kithd alone only when the header kept for that system is its own
     /// (`signed_system`) and says the kernel and the rest of the root are the same. A missing,
     /// unsigned, stale or older-style kept header is a full update.
+    #[cfg(test)]
     pub fn way(&self, slot: char, running: &[u8], block: &[u8]) -> crate::os::Way {
-        let kept = self
-            .signed_system(slot, running)
-            .and_then(|()| crate::os::kept_signed(&self.state, slot));
-        match kept {
-            Ok((_, _, kept)) => crate::os::way(block, &kept),
+        match self.kithd_only(slot, running, block) {
+            Ok(()) => crate::os::Way::KithdOnly,
             Err(_) => crate::os::Way::Full,
         }
+    }
+
+    /// [`Keys::way`], saying why it is a full update where it is.
+    pub fn kithd_only(&self, slot: char, running: &[u8], block: &[u8]) -> Result<(), String> {
+        let (_, _, kept) = self
+            .signed_system(slot, running)
+            .and_then(|()| crate::os::kept_signed(&self.state, slot))
+            .map_err(|e| format!("the running system's own release is not proven: {e}"))?;
+        crate::os::why_full(block, &kept).map_or(Ok(()), |why| Err(why.to_string()))
     }
 
     /// The keys this node takes releases from, and whose they are: `given`, `kept`,
@@ -776,6 +783,107 @@ fn raise(file: &Path, version: &str) -> Result<(), String> {
     }
 }
 
+/// What a kithd-only hand-over leaves for the kithd it starts (tmpfs: a reboot clears it, and
+/// then the slot that boots has the new release whole): the version, a space, and the sha256
+/// of the kithd that is that release's.
+const HANDED_OVER: &str = "/run/kith/handed-over";
+/// Where the new slot's root is mounted, for as long as the kithd in it is copied out.
+const NEW_ROOT: &str = "/run/kith/new-root";
+/// The most a staged kithd may be (its place is a 64 MB tmpfs: init.rs `mounts`).
+const STAGE_MOST: u64 = 48 << 20;
+
+/// Stages the kithd at `from` in `dir` (the root-only tmpfs of init.rs `mounts`): only a file whose
+/// sha256 is `digest` (the signed header's), taken whole into memory so what is checked is what is
+/// written, to a file of its own that only its owner may run, put in place by a rename (a kithd
+/// that runs from the old one is not written into). `dir` must be there and be nobody else's
+/// to use. Says the file staged.
+fn stage(from: &Path, digest: &str, dir: &Path) -> Result<PathBuf, String> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let place = std::fs::metadata(dir).map_err(|e| format!("the place for a staged kithd ({}): {e}", dir.display()))?;
+    if !place.is_dir() || place.mode() & 0o077 != 0 || place.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(format!(
+            "{} is not a directory only this node may use: no kithd is staged there",
+            dir.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(from)
+        .and_then(|file| file.take(STAGE_MOST + 1).read_to_end(&mut bytes))
+        .map_err(|e| format!("reading the new kithd ({}): {e}", from.display()))?;
+    if bytes.len() as u64 > STAGE_MOST {
+        return Err(format!(
+            "the new kithd ({}) is larger than {STAGE_MOST} bytes",
+            from.display()
+        ));
+    }
+    let got = crate::os::sha256(&bytes);
+    if !got.eq_ignore_ascii_case(digest) {
+        return Err(format!(
+            "the new kithd's sha256 is {got}, and the release's signed header names {digest}"
+        ));
+    }
+    let (new, file) = (dir.join("kithd.new"), dir.join("kithd"));
+    let _ = std::fs::remove_file(&new);
+    let wrote = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&new)
+        .and_then(|mut out| out.write_all(&bytes).and_then(|()| out.sync_all()))
+        .and_then(|()| std::fs::rename(&new, &file));
+    if let Err(e) = wrote {
+        let _ = std::fs::remove_file(&new);
+        return Err(format!("staging the new kithd in {}: {e}", dir.display()));
+    }
+    Ok(file)
+}
+
+/// Stages the kithd of the release just written into slot `into`, as `digest` (the signed header's)
+/// has it: the slot's root is mounted read-only for as long as `/sbin/init` is read from it.
+fn stage_release(into: char, digest: &str) -> Result<PathBuf, String> {
+    use nix::mount::{MsFlags, mount, umount};
+    let device =
+        crate::init::labelled(&format!("root-{into}")).ok_or(format!("no partition is labelled root-{into}"))?;
+    let at = Path::new(NEW_ROOT);
+    std::fs::create_dir_all(at).map_err(|e| format!("making {NEW_ROOT}: {e}"))?;
+    let flags = MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+    mount(Some(&device), at, Some("squashfs"), flags, None::<&str>)
+        .map_err(|e| format!("mounting {}: {e}", device.display()))?;
+    let staged = stage(&at.join("sbin/init"), digest, Path::new(crate::keeper::STAGED_DIR));
+    if let Err(e) = umount(at) {
+        eprintln!("kithd: update: unmounting {NEW_ROOT}: {e}");
+    }
+    staged
+}
+
+/// Writes down that the kithd that is the sha256 `digest` is `version`'s (see [`effective`]).
+fn hand_over(record: &Path, version: &str, digest: &str) -> Result<(), String> {
+    if version.is_empty() || version.contains(char::is_whitespace) {
+        return Err(format!(
+            "kith OS {version:?} is not a version a hand-over can write down"
+        ));
+    }
+    crate::pki::write_whole(record, format!("{version} {digest}\n").as_bytes())
+        .map_err(|e| format!("keeping a note of the hand-over ({}): {e}", record.display()))
+}
+
+/// The version this node runs: `os_release`'s (the root is read-only, and a kithd-only
+/// hand-over leaves it as it was), or the newer one a hand-over wrote in `record`, but only for
+/// the kithd it names (`exe`'s sha256): a keeper that fell back to its own kithd runs the old
+/// release again, and a reboot has the new root, whose os-release says so.
+fn effective(os_release: String, record: &Path, exe: &Path) -> String {
+    let handed = std::fs::read_to_string(record).ok();
+    let Some((version, digest)) = handed.as_deref().and_then(|text| text.trim().split_once(' ')) else {
+        return os_release;
+    };
+    let runs = std::fs::read(exe).map(|bytes| crate::os::sha256(&bytes));
+    match runs {
+        Ok(runs) if before(&os_release, version) && runs.eq_ignore_ascii_case(digest) => version.to_string(),
+        _ => os_release,
+    }
+}
+
 /// The client an update is fetched with: `host`'s vetted addresses are the ones connected
 /// to, through no proxy (which would look the name up again itself), and no redirect is
 /// followed (the address is the release's, and the release is what was applied: nowhere
@@ -843,7 +951,7 @@ async fn fetch(
     runs: &str,
     back: bool,
     lan: bool,
-) -> Result<String, String> {
+) -> Result<(String, Option<String>), String> {
     let text = |field: &str| release[field].as_str().map(str::to_string);
     let (signature, public) = (text("signature"), text("publicKey"));
     above(&keys.floor, &wanted)?;
@@ -884,7 +992,11 @@ async fn fetch(
             Ok(some)
         }
     }
+    // The signed digest of the new kithd, when the header says kithd alone differs.
+    let only = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let said = only.clone();
     let writer = tokio::task::spawn_blocking(move || {
+        let only = said;
         let running = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
         let public = public.clone();
         let signed = crate::os::signed(signature.as_deref(), public.as_deref());
@@ -901,11 +1013,16 @@ async fn fetch(
                         let keep = crate::pki::write_whole(&kept, keys.first_kept(public).as_bytes());
                         keep.map_err(|e| format!("keeping the release's key ({}): {e}", kept.display()))?;
                     }
-                    // (Decided here, before a slot is written: the handover is not built yet,
-                    // so what is done is the full update either way.)
+                    // (Decided here, before a slot is written, on the signed header: the slot is
+                    // written whichever way it is, and a reboot into it is the way back.)
                     let running_image = crate::os::running_image_here(slot).unwrap_or_default();
-                    if keys.way(slot, &running_image, header) == crate::os::Way::KithdOnly {
-                        eprintln!("kithd: update: {version} differs from this system in kithd alone");
+                    match keys.kithd_only(slot, &running_image, header) {
+                        Ok(()) => {
+                            eprintln!("kithd: update: {version} differs from this system in kithd alone");
+                            *only.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                crate::os::digests(header).map(|[kithd, ..]| kithd);
+                        }
+                        Err(why) => eprintln!("kithd: update: {version} is a full update (a restart): {why}"),
                     }
                     keys.pend(&release, version, header, &runs)?;
                     // (The header is kept for the slot it writes, with its signature: check 3 of
@@ -960,7 +1077,8 @@ async fn fetch(
                 Some(Err(why)) => eprintln!("kithd: update: no key is sealed ahead for {version}: {why}"),
                 None => {}
             }
-            Ok(version)
+            let only = only.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            Ok((version, only))
         }
         (Ok((None, _)), _) => Err("that release is what this node runs already, under another version".into()),
         (Err(_), Some(cut)) => Err(cut),
@@ -981,9 +1099,11 @@ pub async fn node(
         let _ = MESH.set(crate::mesh::prefix(&cluster.me.ca));
     }
     let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    // (After a kithd-only hand-over the root still says the old version: see `effective`.)
     let version = std::fs::read_to_string("/etc/os-release")
         .ok()
-        .and_then(|text| version_in(&text));
+        .and_then(|text| version_in(&text))
+        .map(|version| effective(version, Path::new(HANDED_OVER), Path::new("/proc/self/exe")));
     let (Some(slot), Some(version), Some(cluster)) = (crate::init::options(&line).0.slot, version, &shared.cluster)
     else {
         return;
@@ -1079,6 +1199,29 @@ pub async fn node(
                 Err(e) => Err(format!("keeping a note of the update: {e}")),
             };
             match wrote {
+                // (Kithd alone differs, and this kithd has a keeper to start the next: it is
+                // staged and started with no unit stopped. Else, or if that fails, the restart.)
+                Ok((_, Some(kithd))) if crate::keeper::kept().is_some() => {
+                    let staged = stage_release(crate::os::other(slot), &kithd)
+                        .and_then(|_| hand_over(Path::new(HANDED_OVER), &wanted, &kithd));
+                    match staged {
+                        Ok(()) => {
+                            eprintln!(
+                                "kithd: kith OS {wanted} differs in kithd alone: handing over to the kithd staged"
+                            );
+                            crate::init::HANDING_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // (The keeper counts a kithd that ends sooner than this as a failure.)
+                            tokio::time::sleep(crate::keeper::HANDOVER_AFTER + Duration::from_secs(1)).await;
+                            shared.stop.send_replace(true);
+                            return;
+                        }
+                        Err(why) => {
+                            eprintln!("kithd: no hand-over to kith OS {wanted} ({why}): restarting into it instead");
+                            shared.stop.send_replace(true);
+                            return;
+                        }
+                    }
+                }
                 Ok(_) => {
                     eprintln!("kithd: kith OS {wanted} is in the other slot: restarting into it");
                     shared.stop.send_replace(true);
@@ -2197,5 +2340,115 @@ mod kithd_vouched {
         let (forge, _) = pair();
         crate::os::keep_signed(&keys.state, 'b', Some(&forge(&now)), Some(&public), &now).unwrap();
         assert_eq!(keys.way('b', IMAGE, &next), Way::Full);
+    }
+
+    #[test]
+    fn says_why_it_is_a_full_update() {
+        let now = block("1", Some([&digest('a'), &digest('b'), &digest('c')]));
+        let (keys, _) = node("kithd-vouched-why", &now);
+        let same = block("2", Some([&digest('f'), &digest('b'), &digest('c')]));
+        let kernel = block("2", Some([&digest('f'), &digest('d'), &digest('c')]));
+        let rest = block("2", Some([&digest('f'), &digest('b'), &digest('e')]));
+        assert_eq!(keys.kithd_only('b', IMAGE, &same), Ok(()));
+        assert!(keys.kithd_only('b', IMAGE, &kernel).unwrap_err().contains("kernel"));
+        assert!(
+            keys.kithd_only('b', IMAGE, &rest)
+                .unwrap_err()
+                .contains("rest of the root")
+        );
+        assert!(
+            keys.kithd_only('b', IMAGE, &block("2", None))
+                .unwrap_err()
+                .contains("no kithd object")
+        );
+        // (The running system's own release is not proven: no header kept for that slot.)
+        assert!(keys.kithd_only('a', IMAGE, &same).unwrap_err().contains("not proven"));
+    }
+}
+
+/// Staging a kithd (T-0709): the new kithd is put in a root-only place of its own, and only
+/// after its sha256 is the one the signed header names.
+#[cfg(test)]
+mod stage {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const KITHD: &[u8] = b"#!/bin/sh\nexit 0\n";
+
+    /// A staging folder (mode 0700, as the mount is) and a file holding `KITHD` beside it.
+    fn folders(name: &str) -> (PathBuf, PathBuf) {
+        let root = tests::scratch(&format!("stage-{name}"));
+        let (dir, from) = (root.join("bin"), root.join("sbin-init"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&from, KITHD).unwrap();
+        (dir, from)
+    }
+
+    fn sum(bytes: &[u8]) -> String {
+        crate::os::sha256(bytes)
+    }
+
+    #[test]
+    fn refuses_a_binary_whose_sha256_differs_from_the_signed_digest_and_leaves_the_mount_root_only() {
+        let (dir, from) = folders("differs");
+        // An older staged file stays what it was (it may be the one that runs).
+        std::fs::write(dir.join("kithd"), b"older").unwrap();
+        let why = stage(&from, &sum(b"another kithd"), &dir).unwrap_err();
+        assert!(why.contains("sha256"), "{why}");
+        assert_eq!(std::fs::read(dir.join("kithd")).unwrap(), b"older");
+        assert!(!dir.join("kithd.new").exists(), "no half-staged file is left");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "still root-only");
+    }
+
+    #[test]
+    fn stages_what_the_digest_names_as_an_executable_only_its_owner_has() {
+        let (dir, from) = folders("matches");
+        std::fs::write(dir.join("kithd"), b"older").unwrap();
+        // (Upper case, as a header may write it.)
+        let staged = stage(&from, &sum(KITHD).to_ascii_uppercase(), &dir).unwrap();
+        assert_eq!(staged, dir.join("kithd"));
+        assert_eq!(std::fs::read(&staged).unwrap(), KITHD);
+        assert_eq!(std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(!dir.join("kithd.new").exists());
+        // Twice: the same file again.
+        stage(&from, &sum(KITHD), &dir).unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), KITHD);
+    }
+
+    #[test]
+    fn refuses_a_place_that_others_could_write_or_that_is_not_there() {
+        let (dir, from) = folders("open");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let why = stage(&from, &sum(KITHD), &dir).unwrap_err();
+        assert!(why.contains("only"), "{why}");
+        assert!(!dir.join("kithd").exists());
+        assert!(stage(&from, &sum(KITHD), &dir.join("nowhere")).is_err());
+        let (dir, _) = folders("no-file");
+        assert!(stage(&dir.join("not-there"), &sum(KITHD), &dir).is_err());
+    }
+
+    #[test]
+    fn a_hand_over_counts_for_the_kithd_it_names_and_for_no_other() {
+        let root = tests::scratch("stage-effective");
+        let (record, exe) = (root.join("handed-over"), root.join("exe"));
+        std::fs::write(&exe, KITHD).unwrap();
+        let says = |os: &str| effective(os.to_string(), &record, &exe);
+        // No record: what the system says.
+        assert_eq!(says("1.0"), "1.0");
+        hand_over(&record, "1.1", &sum(KITHD)).unwrap();
+        assert_eq!(says("1.0"), "1.1");
+        // The system itself has caught up (a reboot into the new slot): its own word.
+        assert_eq!(says("1.1"), "1.1");
+        assert_eq!(says("1.2"), "1.2");
+        // Not the kithd that runs (the keeper fell back to its own): the system's.
+        std::fs::write(&exe, b"the old kithd").unwrap();
+        assert_eq!(says("1.0"), "1.0");
+        // A record that is not what was written.
+        std::fs::write(&record, "nonsense").unwrap();
+        assert_eq!(says("1.0"), "1.0");
+        // A version that could not be read back is not recorded.
+        assert!(hand_over(&record, "1.1 x", &sum(KITHD)).is_err());
     }
 }
