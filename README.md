@@ -107,6 +107,7 @@ is still there when it starts again.
 | Add a kind of your own, with its controller | [Kinds of your own](docs/guide/api.md#kinds-of-your-own) |
 | Let other people and programs in, each with their own rights | [Who may do what](docs/guide/access.md#who-may-do-what) |
 | Run `kith` on a laptop, over TLS to a node | [Use kith from a laptop](docs/guide/access.md#use-kith-from-a-laptop) |
+| Name a remote cluster once (`kith context add`) and reach it with `--context` | [Contexts](docs/guide/access.md#contexts-a-name-for-a-cluster) |
 | Hand out GPUs and seats, run virtual machines | [Hardware](docs/guide/hardware.md#hardware) |
 | Run a Flatpak app in a seat's window | [Running a Flatpak app in a session](docs/guide/hardware.md#running-a-flatpak-app-in-a-session) |
 | Keep data: volumes, shares, replicas, backups | [Storage](docs/guide/storage.md#storage) |

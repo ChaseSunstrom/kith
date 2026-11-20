@@ -267,6 +267,29 @@ fn readme_says_what_a_deleted_claim_takes_with_it_and_how_to_retain() {
     );
 }
 
+/// T-0031: how a laptop reaches a remote cluster by a context, the file it is kept in, and that
+/// renewing and revoking a node's certificate is not part of it (T-1014).
+#[test]
+fn readme_and_access_say_how_a_context_reaches_a_remote_cluster() {
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let access = flat(DOCS.iter().find(|(path, _)| path.ends_with("access.md")).unwrap().1);
+    for said in [
+        "kith context add lab --server HOST:PORT --identity ~/alice",
+        "kith context use lab",
+        "kith --context other get",
+        "KITH_CONTEXT",
+        "~/.config/kith/contexts.yaml",
+        "mode 0600 in a 0700 directory",
+        "A flag given as well wins over the entry",
+        "Renewal and revocation of a node's own certificate is not here",
+        "is T-1014",
+    ] {
+        assert!(access.contains(said), "access.md no longer says {said:?}");
+    }
+    let front = flat(DOCS[0].1);
+    assert!(front.contains("kith context add") && front.contains("access.md#contexts-a-name-for-a-cluster"));
+}
+
 /// Who has a host two Services name is said in both documents: the one made first, a
 /// delete gives it up, a Namespace's hosts keep it for good, and what the update is.
 #[test]
