@@ -125,10 +125,24 @@ fn key(kind: &str, name: &str) -> String {
     format!("{kind}/{DEFAULT_NAMESPACE}/{name}")
 }
 
-/// The machine `name`: a Workload that carries the label.
+/// Part of machine `name`: in the default namespace and labelled with it.
+fn mine(r: &Resource, name: &str) -> bool {
+    r.metadata.namespace.as_deref() == Some(DEFAULT_NAMESPACE)
+        && r.metadata.labels.get(LABEL).map(String::as_str) == Some(name)
+}
+
+/// Does this Workload or Job mount the Volume `volume`?
+fn mounts(r: &Resource, volume: &str) -> bool {
+    let all = |v: &Value| v.as_array().into_iter().flatten().cloned().collect::<Vec<_>>();
+    all(&r.spec["template"]["containers"])
+        .iter()
+        .any(|c| all(&c["volumeMounts"]).iter().any(|m| m["volume"] == volume))
+}
+
+/// The machine `name`: a Workload that is part of it.
 fn find(backend: &Backend, name: &str) -> Result<Resource, String> {
     match backend.get(&key("Workload", name)) {
-        Ok(w) if w.metadata.labels.get(LABEL).map(String::as_str) == Some(name) => Ok(w),
+        Ok(w) if mine(&w, name) => Ok(w),
         _ => fail(format!("no machine `{name}` (`kith machine list`)")),
     }
 }
@@ -150,7 +164,24 @@ pub fn run(command: Machine, backend: &dyn Fn() -> Result<Backend, String>) -> R
                     _ => return fail("--node NODE: the node that holds its home first (`kith get node`)"),
                 },
             };
-            for change in backend.apply(resources(&name, &image(&distro)?, &user, uid, &node, replicas)?, false)? {
+            if replicas < 2 {
+                return fail("--replicas: 2 or more (a machine's home is copied to another node)");
+            }
+            let new = resources(&name, &image(&distro)?, &user, uid, &node, replicas)?;
+            // Never over another's resource, nor a changed machine: remove it, then create.
+            for r in &new {
+                if let Ok(old) = backend.get(&r.key()) {
+                    if !mine(&old, &name) {
+                        return fail(format!("{} exists and is not machine `{name}`'s", r.key()));
+                    }
+                    if old.spec != r.spec {
+                        return fail(format!(
+                            "machine `{name}` exists with other settings (`kith machine rm {name}`, then create)"
+                        ));
+                    }
+                }
+            }
+            for change in backend.apply(new, false)? {
                 println!(
                     "{} {}",
                     change.after.key(),
@@ -161,7 +192,7 @@ pub fn run(command: Machine, backend: &dyn Fn() -> Result<Backend, String>) -> R
         Machine::List => {
             let mut rows = vec![];
             for w in backend.list(Some("Workload"))? {
-                if w.metadata.labels.contains_key(LABEL) {
+                if mine(&w, &w.metadata.name) {
                     let image = w.spec["template"]["containers"][0]["image"]
                         .as_str()
                         .unwrap_or_default();
@@ -181,7 +212,8 @@ pub fn run(command: Machine, backend: &dyn Fn() -> Result<Backend, String>) -> R
             container["command"] = json!(argv);
             let job = format!(
                 "{name}-run-{}",
-                std::time::UNIX_EPOCH.elapsed().map_or(0, |t| t.as_secs())
+                // Microseconds: 16 digits, so a 40-character name still fits a label of 63.
+                std::time::UNIX_EPOCH.elapsed().map_or(0, |t| t.as_micros())
             );
             let job = make(json!({
                 "apiVersion": "kith.dev/v1", "kind": "Job",
@@ -197,16 +229,28 @@ pub fn run(command: Machine, backend: &dyn Fn() -> Result<Backend, String>) -> R
             }
         }
         Machine::Rm { name, purge } => {
-            find(&backend, &name)?;
-            // The Workload first, so nothing starts another Job on the Volume; Jobs, then the Volume.
-            backend.delete(&key("Workload", &name))?;
-            for job in backend.list(Some("Job"))? {
-                if job.metadata.labels.get(LABEL).map(String::as_str) == Some(&name) {
-                    backend.delete(&job.key())?;
-                }
+            // Whatever of it is left (a first `rm` may have stopped midway, or kept the home).
+            let volume = format!("{name}-home");
+            let home = backend.get(&key("Volume", &volume)).ok();
+            let mut all = backend.list(Some("Workload"))?;
+            all.extend(backend.list(Some("Job"))?);
+            let ours: Vec<_> = all.iter().filter(|r| mine(r, &name)).collect();
+            if purge && home.as_ref().is_some_and(|v| !mine(v, &name)) {
+                return fail(format!("Volume {volume} is not machine `{name}`'s: it stays"));
             }
-            if purge {
-                backend.delete(&key("Volume", &format!("{name}-home")))?;
+            let home = home.filter(|v| mine(v, &name));
+            if ours.is_empty() && home.is_none() {
+                return fail(format!("no machine `{name}` (`kith machine list`)"));
+            }
+            if purge && all.iter().any(|r| !mine(r, &name) && mounts(r, &volume)) {
+                return fail(format!("another Workload or Job mounts {volume}: it stays"));
+            }
+            // The Workload first (they come first), so nothing runs on the Volume as it goes.
+            for r in ours {
+                backend.delete(&r.key())?;
+            }
+            if purge && home.is_some() {
+                backend.delete(&key("Volume", &volume))?;
             }
             println!(
                 "machine {name} deleted{}",

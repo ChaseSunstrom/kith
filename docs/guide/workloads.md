@@ -503,12 +503,19 @@ kith machine rm dev              # its Jobs and the Workload; the home Volume st
 - **Your user.** The container runs as your numeric user, read from the process and never 0: kith
   as root is refused, and so is a `$HOME` that is not yours. Where kithd is your service that user
   is yours on the node, and [its users](#what-a-container-is-kept-from) say what it is elsewhere.
-  Its `$HOME` is `/home/$USER` there.
-- **Its home** is the Volume `NAME-home` with `replicas: 2` (`--replicas`, `sync: 10s`), mounted at
-  `/home/$USER`. The node that holds it first is `--node`, or the cluster's only node. When that
-  node is lost the Volume's other copy takes over and the Workload follows it, as above.
-- **A command** is `kith machine run`, a Job of its own with the machine's container and mount;
-  read it with `kith logs job NAME-run-N -f`. The machine's own container only sleeps.
+  Its `$HOME` is `/home/$USER` there; `$USER` falls back to `dev` when it is unset, has an
+  uppercase letter or is longer than 32 characters.
+- **Its home** is the Volume `NAME-home` with `replicas: 2` (`--replicas`, 2 or more, `sync: 10s`),
+  mounted at `/home/$USER`: the machine's own replicated Volume, not your host home. The node that
+  holds it first is `--node`, or the cluster's only node. When that node is lost the Volume's other
+  copy takes over and the Workload follows it, as above.
+- **Yours stays yours.** `create` refuses a Workload or Volume of that name that is not a machine's,
+  and a machine that exists with other settings (`rm` it first); the same settings are `unchanged`.
+  `rm --purge` leaves the home when another Workload or Job mounts it. `rm` can be run again
+  to finish what stopped midway.
+- **A command** is `kith machine run`, which runs a Job of its own with the machine's container
+  and mount (there is no interactive shell yet); read it with `kith logs job NAME-run-N -f`. The
+  machine's own container only sleeps.
 - **Not yet.** There is no way into a running container, so no interactive `shell`; `sudo` does
   not work, since a container has `no_new_privs` and a setuid program is an ordinary program;
   `userNamespaces: true` is not set. Your real home is not mounted: an absolute host path is a

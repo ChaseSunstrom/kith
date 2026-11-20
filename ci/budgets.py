@@ -82,7 +82,9 @@ KITHD_IDLE_RSS = 9 * MB
 # RAISE, kith 3.04 to 3.05 and kith-remote 3.66 to 3.67 (T-1192 for train B): main 76101487 with
 # train B's eight lanes builds kith at 3,192,184 B and kith-remote at 3,843,512 B (main alone
 # 3,179,864 B and 3,831,160 B); T-0269 brings them back down.
-SIZE_BUDGETS = {"kith": int(3.05 * MB), "kith-remote": int(3.67 * MB), "kithd": int(KITHD_SIZE * MB)}
+# RAISED, kith 3.05 to 3.10 (T-1209): kith machine create|list|run|rm costs about 20 KB (3,159,384 B
+# to 3,179,896 B alone), more than the 3.05 budget has left once train B is merged; T-0269 brings it back down.
+SIZE_BUDGETS = {"kith": int(3.10 * MB), "kith-remote": int(3.67 * MB), "kithd": int(KITHD_SIZE * MB)}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
