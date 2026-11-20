@@ -36,7 +36,7 @@
         vm() { # NAME [QEMU's arguments]: a machine whose serial console is logged and can be typed at
             name=$1
             shift
-            timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none -no-reboot \
+            timeout --foreground "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none -no-reboot \
                 -machine q35 -bios "$firmware" "$@" \
                 -chardev "socket,id=tty,path=$work/$name.tty,server=on,wait=off,logfile=$work/$name.log" -serial chardev:tty \
                 -monitor "${monitor:-none}" </dev/null >/dev/null 2>&1 8>&- &
@@ -95,6 +95,15 @@
         # shellcheck disable=SC2046
         vm install-alpha $(drive alpha.stick) $(drive alpha.disk)
         installed install-alpha vdb
+        # A machine whose disk already has kith OS, that disk before the stick (vda), the firmware
+        # told to start the stick: the kernel takes the first partition with a label, so the
+        # installer's root has its own (install-root), not the disk's root-a; it starts from the
+        # stick and installs on that disk (T-1064).
+        cp "$work/alpha.disk" "$work/old.disk"
+        vm reinstall -drive "file=$work/old.disk,format=raw,if=none,id=old" -device virtio-blk-pci,drive=old,bootindex=1 \
+            -drive "file=$work/alpha.stick,format=raw,if=none,id=stick" -device virtio-blk-pci,drive=stick,bootindex=0
+        installed reinstall vda
+        rm -f "$work/old.disk"
         # shellcheck disable=SC2046
         vm alpha $(drive alpha.disk) $(lan 1)
         hears alpha 'kithd: init: alpha is up'

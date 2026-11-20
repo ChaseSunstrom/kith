@@ -9,6 +9,7 @@
 #   sh ci/vm.sh --test init     kithd as the first process: up, serving, restarts when told
 #   sh ci/vm.sh --test image    kith OS's disk image (os/build.sh), booted under UEFI on a longer disk
 #   sh ci/vm.sh --test update   that image updating itself, and going back when it must
+#   sh ci/vm.sh --test disk     a disk file made a data disk and mounted, another left alone
 #   sh ci/vm.sh --test rollout  three nodes of it taking a release, one at a time
 #   sh ci/vm.sh --test install  the installer, onto virtual disks, and what it installed
 #   sh ci/vm.sh --test vps      the installer started from memory, as os/vps.sh starts it
@@ -48,7 +49,7 @@
 #                               disk never has another's, and what it does with no control node in reach
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
 #                               in turn losing power, then all at once; what was acknowledged is on all three
-#   sh ci/vm.sh --test home     three nodes with a house address in the Cluster: one MAC answers for it
+#   sh ci/vm.sh --test home     three voters and a roaming fourth, with a house address in the Cluster: one MAC answers for it, and DNS, TCP 443 and WireGuard answer from it
 #                               and DNS answers from it; the holder reset, and the next stopped: another
 #                               announces it within 10 s and two are never heard at once
 #   sh ci/vm.sh --test access   three nodes: a write let through by a node that had not heard its
@@ -98,6 +99,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    audio device the monitor adds later, in the same boot; the same spec built
                    with one byte of snd-usb-audio changed is refused on one console line; same
                    needs as image, and the image is built twice
+  --test disk      instead: the image of a kithd built with the cargo feature disk-test
+                   (target/os-disk, never shipped), two more disks that are files: one the
+                   kernel command line makes a data disk at start (the mapping, the seed ext4
+                   grown to the disk, the mount after the state opens), one nobody added.
+                   Expected: the first mounted, again at the next start from its key; the
+                   second listed as left alone and unchanged byte for byte; same needs as image
   --test rollout   instead: three nodes on a network of their own, claimed and joined
                    over TLS, their image built with a release key; a first release by
                    another key (refused), one with another file's signature (refused), a signed
@@ -261,11 +268,14 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    writes each time, a cut-off node acknowledges none, every write
                    that was acknowledged is on all three nodes at the end, and the
                    three hold the same; needs what --test rollout needs
-  --test home      instead: three nodes as for rollout, a house address (10.9.0.100/24)
+  --test home      instead: three voters as for rollout and a fourth that roams (a learner,
+                   reset by the hypervisor; its Node says spec.roaming), a house address (10.9.0.100/24)
                    in the Cluster, and a machine on their network (ci/lan_probe.py)
                    that asks who has it four times a second. Expected: one card
                    answers and announces it, the Cluster's status.home says whose
-                   it is (and the next holder's after a reset), DNS asked of it answers from it, with
+                   it is (and the next holder's after a reset), DNS and TCP 443 asked of it answer
+                   from it, a WireGuard handshake sent to it is answered from it (a reset roaming
+                   node dials it), with
                    the holder reset by the hypervisor and then (after it is back)
                    the next one stopped, another announces it within 10 s (the
                    seconds are printed), and two cards are never heard answering at
@@ -316,6 +326,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --selftest-kill  instead: start this script with a stand-in for QEMU, kill its shell from
                    outside (SIGKILL, then SIGTERM) and expect no QEMU left and the VM lock
                    free; needs no QEMU, KVM or kernel
+  --selftest-sweep instead: a run takes the VM lock and deletes the work folders of killed runs (the
+                   kith-vm-work-UID.* folders under TMPDIR), but no other folder and not the lock file;
+                   needs sh and mktemp, no QEMU, KVM or kernel
   --selftest-web   instead: web_up serves a directory on a port and returns once it answers; with
                    another process holding the port, it returns 1 with that server's own error;
                    needs python3 and curl, no QEMU, KVM or kernel
@@ -334,6 +347,7 @@ while [ $# -gt 0 ]; do
     --selftest-kill) selftest='kill'; shift ;;
     --selftest-said) selftest='said'; shift ;;
     --selftest-web) selftest='web'; shift ;;
+    --selftest-sweep) selftest='sweep'; shift ;;
     --kernel | --initrd | --disk | --append | --time | --test)
         [ $# -ge 2 ] || { echo "vm.sh: $1 needs a value" >&2; exit 2; }
         case $1 in
@@ -344,7 +358,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | alone) ;; *) echo "vm.sh: --test knows: init, image, update, modules, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | alone | disk) ;; *) echo "vm.sh: --test knows: init, image, update, modules, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -363,10 +377,11 @@ skip() { echo "skipped: $1"; exit 0; }
 # said_in FILE TEXT: the console FILE says TEXT (a grep pattern). A kernel stack-depth record (what a
 # task prints when it exits: "[ts] comm (pid) used greatest stack depth: N bytes left") can land in the
 # middle of a line the guest is writing, which then reads as two lines. TEXT is looked for as written;
-# failing that, with that one record taken out (and its newline) and nothing else.
+# failing that, with that one record taken out (and its newline) and nothing else. (The serial console
+# ends a line with CR LF, the kernel's and the guest's alike, so the newline may follow a CR.)
 said_in() {
     grep -aq "$2" "$1" 2>/dev/null && return 0
-    sed -z -E 's/\[ *[0-9]+\.[0-9]+\] [^ ()]+ \([0-9]+\) used greatest stack depth: [0-9]+ bytes left\n//g' "$1" | grep -aq "$2"
+    sed -z -E 's/\[ *[0-9]+\.[0-9]+\] [^ ()]+ \([0-9]+\) used greatest stack depth: [0-9]+ bytes left\r?\n//g' "$1" | grep -aq "$2"
 }
 
 # --selftest-said: said_in on fixture logs. A kernel stack-depth record can land in the middle of a
@@ -381,8 +396,10 @@ if [ "$selftest" = said ]; then
     printf 'reboot: Restarting %s\nkithd: serving\n' "$rec" >"$st/absent"
     printf 'kithd: init: restarting\n' >"$st/other"
     printf 'kithd: init: the state'"'"'s file system grown to 40[    2.926586] kithd (90) used greatest stack depth: 13224 bytes left\n709 MB\n' >"$st/grown"
+    printf 'kithd: init: sta[    1.208476] kithd (90) used greatest stack depth: 13224 bytes left\r\nte on /dev/vda7\r\n' >"$st/crlf"
     bad=0
     said_in "$st/grown" 'grown to 40709 MB' || { echo "vm.sh: selftest: FAIL: a line split by a record does not match" >&2; bad=1; }
+    said_in "$st/crlf" 'kithd: init: state on /dev/vda7' || { echo "vm.sh: selftest: FAIL: a line split by a record on a CR LF console does not match" >&2; bad=1; }
     said_in "$st/split" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: an interleaved line does not match" >&2; bad=1; }
     said_in "$st/whole" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: a whole line does not match" >&2; bad=1; }
     said_in "$st/beside" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: a line beside a record does not match" >&2; bad=1; }
@@ -406,7 +423,7 @@ if [ "$selftest" = kill ]; then
     bad=0 alive=''
     for sig in KILL TERM; do
         rm -f "$st/pid"
-        KITH_VM_STUB=1 KITH_VM_LOCK="$st/lock" PATH="$st/bin:$PATH" \
+        KITH_VM_STUB=1 KITH_VM_LOCK="$st/lock" TMPDIR="$st" PATH="$st/bin:$PATH" \
             sh "$0" --kernel "$st/kernel" --initrd "$st/initrd" --time 300 >/dev/null 2>&1 8>&- &
         shell=$!
         n=0
@@ -435,6 +452,31 @@ if [ "$selftest" = kill ]; then
     rm -rf "$st"
     [ "$bad" = 0 ] || exit 1
     echo "vm.sh: selftest ok: killed from outside (SIGKILL, SIGTERM), no QEMU left and the lock free"
+    exit 0
+fi
+
+# --selftest-sweep: the run takes the VM lock, then deletes the work folders a killed run left (SIGKILL runs
+# no EXIT trap): kith-vm-work-UID.* under TMPDIR. A folder under another name, and the lock file, stay. TMPDIR
+# is a folder of the selftest's own, so no real folder is touched. Needs sh and mktemp; no QEMU, KVM or kernel.
+if [ "$selftest" = sweep ]; then
+    st=$(mktemp -d)
+    uid=$(id -u)
+    mkdir "$st/bin" "$st/kith-vm-work-$uid.stale" "$st/kith-vm-work-${uid}0.keep"
+    : >"$st/kith-vm-work-$uid.stale/disk.raw"
+    printf '#!/bin/sh\nexit 0\n' >"$st/bin/qemu-system-x86_64"
+    chmod +x "$st/bin/qemu-system-x86_64"
+    : >"$st/kernel"; : >"$st/initrd"
+    # (The run ends with "nothing of kithd's": only what it left matters here.)
+    KITH_VM_STUB=1 KITH_VM_LOCK="$st/lock" TMPDIR="$st" PATH="$st/bin:$PATH" \
+        sh "$0" --kernel "$st/kernel" --initrd "$st/initrd" --time 5 >/dev/null 2>&1 8>&- || true
+    bad=0
+    [ ! -e "$st/kith-vm-work-$uid.stale" ] || { echo "vm.sh: selftest: FAIL: a work folder a killed run left was not swept" >&2; bad=1; }
+    [ -d "$st/kith-vm-work-${uid}0.keep" ] || { echo "vm.sh: selftest: FAIL: the sweep took a folder that is not under the prefix" >&2; bad=1; }
+    [ -f "$st/lock" ] || { echo "vm.sh: selftest: FAIL: the lock file was removed" >&2; bad=1; }
+    [ -z "$(ls -d "$st/kith-vm-work-$uid".* 2>/dev/null)" ] || { echo "vm.sh: selftest: FAIL: the run's own work folder was left behind" >&2; bad=1; }
+    rm -rf "$st"
+    [ "$bad" = 0 ] || exit 1
+    echo "vm.sh: selftest ok: a run swept the work folder a killed run left, under the lock, and nothing else"
     exit 0
 fi
 
@@ -503,10 +545,15 @@ lock=${KITH_VM_LOCK-/tmp/kith-vm-$(id -u).lock}
 if [ -n "$lock" ] && command -v flock >/dev/null 2>&1; then
     exec 8>>"$lock"
     flock -w 7200 8 || { echo "vm.sh: another VM test has held $lock for two hours" >&2; exit 1; }
+    # (Holding the lock, no other run is using a work folder: the folders under this prefix are those of
+    # runs killed with SIGKILL, which ran no EXIT trap, 2-3 GB of disk copies each. The lock file is not one.)
+    for old in "${TMPDIR:-/tmp}"/kith-vm-work-"$(id -u)".*; do
+        [ ! -d "$old" ] || rm -rf "$old" || true
+    done
 fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-work=$(mktemp -d)
+work=$(mktemp -d "${TMPDIR:-/tmp}/kith-vm-work-$(id -u).XXXXXX")
 vms='' web='' found=''
 # (What a test left running goes with it; its consoles' logs are kept where KITH_VM_LOGS
 # names a directory, for a failure that does not come again. Stopped, it ends there: a trap on
@@ -522,10 +569,10 @@ KITH_VM_RUN=$$.$(date +%s%N); export KITH_VM_RUN
 reap='for sig in TERM KILL; do pids=; for f in $(grep -lzx "KITH_VM_RUN=$1" /proc/[0-9]*/environ 2>/dev/null); do p=${f#/proc/}; pids="$pids ${p%/environ}"; done; [ -z "$pids" ] || { kill -$sig $pids 2>/dev/null; sleep 1; }; done; true'
 setsid=''; ! command -v setsid >/dev/null 2>&1 || setsid=setsid
 env -u KITH_VM_RUN $setsid sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 1; done; exec sh -c "$2" sh "$3"' sh $$ "$reap" "$KITH_VM_RUN" </dev/null >/dev/null 2>&1 8>&- &
-trap 'kill $vms $web 2>/dev/null || true; env -u KITH_VM_RUN sh -c "$reap" sh "$KITH_VM_RUN"; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
+trap 'st=$?; kill $vms $web 2>/dev/null || true; env -u KITH_VM_RUN sh -c "$reap" sh "$KITH_VM_RUN"; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$work"/wg "$work"/wg.err "$work"/arp "$work"/arp.err "$KITH_VM_LOGS"/ 2>/dev/null || true; if [ "$st" -ne 0 ] && [ -n "${KITH_VM_LOGS:-}" ] && [ ! -e "$KITH_VM_LOGS/fail" ]; then echo "vm.sh: FAIL: exit $st without a fail file: a failure that did not go through fail(), see the log" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; fi; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
 trap 'exit 1' INT TERM
 said() { said_in "$work/log" "$1"; }
-fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
+fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; [ -z "${KITH_VM_LOGS:-}" ] || echo "vm.sh: FAIL: $1" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; exit 1; }
 
 if [ -n "$test" ] && [ "$test" != init ]; then
     . "$root/ci/vm/tests.sh"
@@ -563,7 +610,7 @@ if [ "$test" = init ]; then
         told=$1 last=$2
         shift 2
         rm -f "$work/log" "$work/keys"
-        timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
+        timeout --foreground "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
             -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" "$@" </dev/null >/dev/null 2>&1 8>&- &
         vm=$!
         until said 'kithd: serving '; do
@@ -593,7 +640,8 @@ fi
 # panic=-1 reboots at once, -no-reboot turns that into QEMU exiting: a kithd that
 # stops (as init, it must not) ends the run; the timeout ends one that does not.
 # (In the background and waited for: a signal's trap waits for a command in the foreground.)
-timeout "$time" qemu-system-x86_64 "$@" </dev/null >"$work/log" 2>&1 8>&- &
+# (--foreground, here and at every QEMU start in ci/vm/: QEMU stays in this run's process group, so a SIGKILL to the group ends it too; a plain timeout moves it to a group of its own.)
+timeout --foreground "$time" qemu-system-x86_64 "$@" </dev/null >"$work/log" 2>&1 8>&- &
 vms=$!
 wait "$vms" || true
 cat "$work/log"

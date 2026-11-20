@@ -33,6 +33,12 @@
         # worker: two, on the mesh; quota: one, on the mesh; services: one, with no mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os dumps='' gateway='' https='' guest=''
         seed() { :; }
+        # (home: on the mesh, so the holder answers a WireGuard handshake to the house address
+        # (51820) and the node that roams dials it; and ingress, so it answers TCP 443 there.
+        # Three voters, and a fourth node that roams: a roaming node never votes, so it joins as a
+        # learner, and the cluster says four nodes.)
+        nodes=three four=''
+        [ "$test" != home ] || { more='--mesh --ingress' others='2 3 4' nodes=four four=',[^,? ]+'; }
         # (access: the nodes run the image tests.sh built with the forge feature.)
         [ "$test" != access ] || base=$osdir
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
@@ -178,11 +184,13 @@
         # reaches the node's API through it, and tries its NFS port, or port $inside).
         node() { # N [kithd's further arguments]
             [ -f "$work/n$1.raw" ] || { cp "$base/kith-os.raw" "$work/n$1.raw" && seed "$work/n$1.raw"; }
-            timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
+            lanport=$((port + 8))
+            [ "$test$1" != home4 ] || lanport=$((port + 9)) # (the bridge's other side)
+            timeout --foreground "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
-                -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
+                -netdev "socket,id=lan,mcast=230.0.0.1:$lanport,localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
                 -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside${https:+,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:443}$guest${net_restrict-,restrict=on}" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $dumps \
-                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway${nolink:+ KITH_NO_LINK=1} -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
+                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway${nolink:+ KITH_NO_LINK=1} -- --listen ${listen:-0.0.0.0:7443} --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 8>&- &
             vms="$vms $!"
         }
@@ -251,7 +259,14 @@ EOF
         keep=${net_restrict-,restrict=on}
         [ "$test" != pods ] || net_restrict=''
         # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
+        # (home: every joined one serves DNS too; node 4 roams (--roaming, as a laptop joins): it is reset, and dials the house endpoint.)
         [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353'; }
+        # (home: node 4 is on a LAN of its own, joined to the others' by a bridge that, while $work/cut
+        # exists, passes nothing from or to the voters' own addresses: the house address stays reachable.)
+        if [ "$test" = home ]; then
+            python3 -I "$root/ci/lan_bridge.py" $((port + 8)) $((port + 9)) "$work/cut" 2>"$work/bridge.err" &
+            vms="$vms $!"
+        fi
         node 1 "--claim ${first:-}"
         net_restrict=$keep
         tries=0
@@ -271,8 +286,11 @@ EOF
             [ "$test" != worker ] || asks='/v1/tokens?trust=worker'
             join=$(api 1 POST "$asks" | field token) || fail "no join token over TLS"
             # (pods: the second node takes its pods' addresses from another range than the first's.)
-            range=''
+            range='' listen=0.0.0.0:7443
             [ "$test$n" != pods2 ] || range='--pod-range 10.77.0.0/20'
+            # (home: node 4 roams, as a laptop joins. It listens on [::] as a roaming node does by default
+            # (main.rs): the leader reaches it at its mesh address, which is IPv6; 0.0.0.0 has no listener there.)
+            [ "$test$n" != home4 ] || { range='--roaming' listen='[::]:7443'; }
             # (poddns: a joined node asks this machine's resolver over UDP, which restrict=on
             # drops. unrestricted: only that test's joined nodes keep their card out open; the
             # value is put back after each, so no other node of it is opened.)
@@ -368,7 +386,7 @@ EOF
         if [ "$test" = share ]; then
             . "$root/ci/vm/share.sh"
         fi
-        until_says "three nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+ "
+        until_says "$nodes nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+$four "
         was=${line#- 0 } was=${was%% *}
         if [ "$test" = access ]; then
             . "$root/ci/vm/access.sh"
