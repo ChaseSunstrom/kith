@@ -367,6 +367,12 @@ pub fn connect_filter(cgroup: &File, program: &[u8]) -> Result<()> {
     cgroup_program(cgroup, program, 18, 11)
 }
 
+/// [`connect_filter`] for the connect() of an IPv4 socket (BPF_CGROUP_INET4_CONNECT): a
+/// program of its own, put and replaced apart from the IPv6 one.
+pub fn connect_filter4(cgroup: &File, program: &[u8]) -> Result<()> {
+    cgroup_program(cgroup, program, 18, 10)
+}
+
 /// The last lines of what the verifier wrote in `log` (to its first NUL), to follow the
 /// error: none where it wrote nothing, and said to be cut short where it filled the room.
 fn verifier_said(log: &[u8], cut: bool) -> String {
