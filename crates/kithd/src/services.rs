@@ -26,6 +26,8 @@ pub mod v4;
 // (One link to each node that takes them, opened by `Proxy::linked`; its receiving end is `receive`.)
 mod link;
 mod receive;
+// (A Service that may sleep, and the connection held while it wakes: T-1210.)
+pub(crate) mod wake;
 
 /// KITH_NO_LINK in the environment (ci/vm.sh --test services sets it on one node): this node
 /// says no `status.mesh.link` and opens no link, as a node of before does, so that a cluster of
@@ -529,6 +531,8 @@ struct Proxy {
     // ponytail: one link, so one task (a core) frames and writes everything to a node; a second
     // link per node when a profile of a busy one shows that core full.
     linked: Mutex<BTreeMap<String, (link::Link, Instant)>>,
+    /// The Services that may sleep: what this node met of them, and the connections it holds.
+    naps: wake::Naps,
     /// Where every other node is dialled, in the tests (a node's mesh address is not on the machine).
     #[cfg(test)]
     dial_to: Option<SocketAddr>,
@@ -776,10 +780,20 @@ impl Proxy {
         let Some(_place) = client.peer_addr().ok().and_then(|from| self.serving.take(from.ip())) else {
             return;
         };
-        let backends = {
+        let backends_of = || {
             let table = self.table.lock().expect("nothing panics holding the table");
             table.get(&key).cloned().unwrap_or_default()
         };
+        let mut backends = backends_of();
+        // A Service that may sleep (T-1210) counts the connection, and holds one that finds no
+        // replica while the Workload wakes: until one is ready, or the Service's `start` is up.
+        let met = self.naps.meet(key, wake::unix());
+        if let Some(met) = met.as_ref().filter(|_| backends.is_empty()) {
+            if let Err(closed) = wake::hold(met, || !backends_of().is_empty()).await {
+                return wake::close(&mut client, &closed).await;
+            }
+            backends = backends_of();
+        }
         // (No turn is taken, or kept, for what has nothing behind it.)
         let first = if backends.is_empty() { 0 } else { self.turns.next(key) };
         // What the client has said by now goes with the asking where another node is
@@ -1261,9 +1275,11 @@ pub async fn run(
         kept: Mutex::default(),
         links: receive::BOUNDS,
         linked: Mutex::default(),
+        naps: wake::Naps::default(),
         #[cfg(test)]
         dial_to: None,
     });
+    tokio::spawn(wake::run(proxy.clone(), stopping.clone()));
     let me = kith_mesh::node_address(prefix, proxy.me());
     // (False again if the ingress gives up: then the ports are ours after all.)
     let elsewhere = Arc::new(AtomicBool::new(strays.is_some()));
@@ -1399,10 +1415,14 @@ pub async fn run(
             for policy in state.store.list(Some("NetworkPolicy")) {
                 reports.extend(policy_unsaid(policy, unsent).map(|fields| (policy.key(), fields)));
             }
-            let plans = match kernel {
+            proxy.naps.set(wake::ports(&state.store, prefix, &table));
+            let mut plans = match kernel {
                 Kernel::Has(..) => kernel_plan(&state.store, &table, proxy.me()),
                 Kernel::Off | Kernel::Stuck(_) => Vec::new(),
             };
+            // (The kernel passes a connection past kithd, which would not meet it: a Service
+            // that may sleep is kithd's.)
+            plans.retain(|plan| !proxy.naps.has(&plan.service));
             (table, reports, plans)
         };
         // Where each replica here the kernel may pass to is asked; then, before anything that
@@ -2608,6 +2628,7 @@ spec:
             kept: Mutex::default(),
             links: receive::BOUNDS,
             linked: Mutex::default(),
+            naps: wake::Naps::default(),
             dial_to: None,
             shared,
         }

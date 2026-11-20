@@ -1284,7 +1284,11 @@ fn bound(resource: &Resource) -> Vec<u32> {
 pub(crate) fn template_of(resource: &Resource) -> Result<(Template, u32), String> {
     let spec = resource.spec.clone();
     match resource.kind.as_str() {
-        "Workload" => serde_json::from_value::<WorkloadSpec>(spec).map(|s| (s.template, s.replicas.unwrap_or(1))),
+        // (A sleeping Workload, T-1210, keeps its `spec.replicas` and runs none.)
+        "Workload" => serde_json::from_value::<WorkloadSpec>(spec).map(|s| {
+            let asleep = resource.status.as_ref().is_some_and(|status| status["asleep"] == true);
+            (s.template, if asleep { 0 } else { s.replicas.unwrap_or(1) })
+        }),
         "Job" => serde_json::from_value::<JobSpec>(spec).map(|s| (s.template, s.completions.unwrap_or(1))),
         // One copy for each node the scheduler has given a number to.
         "NodeWorkload" => {
@@ -2459,6 +2463,10 @@ impl Controller {
             let Some(live) = file_store.store.get(&key).map(|live| live.status.as_ref()) else {
                 continue;
             };
+            // (`asleep` is the leader's word and a report replaces the status it is in.)
+            if live.is_some_and(|live| live["asleep"] == true) {
+                status["asleep"] = json!(true);
+            }
             // What runs elsewhere is for its node to say; this one only takes back what it said.
             let said = ours.contains(&key).then_some(status);
             let units = live.and_then(|status| status["containers"].as_array());

@@ -536,6 +536,11 @@ mod tests {
             patch("Node/own-k", serde_json::json!({ "os": "x" })),
             // Its boot writes its raft id again: the id its name gives, forwarded to the leader.
             patch("Node/own-k", serde_json::json!({ "raftId": own_id })),
+            // Which Services it met a connection to, and which it holds one for (T-1210).
+            patch(
+                "Node/own-k",
+                serde_json::json!({ "seen": { "default/web": 5 }, "wake": { "default/web": 6 } }),
+            ),
             patch("Volume/default/data", serde_json::json!({ "synced": { "own-k": 5 } })),
             Command::Report {
                 node: "own-k".into(),
@@ -568,6 +573,8 @@ mod tests {
             },
             patch("Node/own-w", serde_json::json!({ "os": "x" })),
             patch("Node/own-k", serde_json::json!({ "raftId": "1" })),
+            // Another node's `wake`: a node cannot wake a Service for another (nor hold it awake).
+            patch("Node/own-w", serde_json::json!({ "wake": { "default/web": 6 } })),
         ];
         for command in &refused {
             let said = to_k

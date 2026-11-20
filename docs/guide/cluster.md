@@ -332,6 +332,31 @@ egress rules, which decide where a pod may connect, are below.
   says `partial` and why until every rule is written on the node, then `enforced`. Not tested:
   a policy changing under a running pod; access returning after the policy is deleted.
 
+### Scale to zero: a Service that lets its Workload sleep
+
+A Service may opt in with `spec.scaleToZero: { idle: 15m, start: 60s }` (both durations like
+`90s` or `30m`; `start` at most `10m`; unset means off). Its Workload then sleeps after no
+connection to the Service for `idle`: no replica runs, `status.asleep` is `true`, and
+`spec.replicas` stays as it is (sleep is state, not a spec edit, so `kith apply` of the same file
+changes nothing). The first connection to a sleeping Service is held by the kithd it reached
+while a replica starts, up to `start`, then passed on as any other; at the deadline, or when 256
+connections to that Service already wait, the connection is closed after one line saying why.
+
+- **TCP only.** Only a TCP connection to the Service's address wakes it. A datagram wakes
+  nothing, so a Service with a `udp` port is refused when applied, and so is a headless one (no
+  address a connection could reach). A Workload with no Service, or with any Service that has no
+  `scaleToZero`, never sleeps; a sleeping one whose Service loses `scaleToZero` is woken.
+- **How idle is counted.** Each node says in its own Node's status which Services it met a
+  connection to (`seen`, now while one is open) and which it holds one for (`wake`); the node
+  that leads the store reads them. The idle time is therefore right to within about ten seconds
+  (the sleep comes `idle` plus ten seconds after the last connection), and the nodes' clocks are
+  taken to agree to within a minute. A node that is down stops saying, so its old word does not
+  keep a Workload awake.
+- **Kernel path.** A Service that may sleep is passed by kithd, not by the kernel's connect
+  hook (the kernel would not count the connection), so it does not have the same-node fast path.
+- A Workload that was never seen idle is counted from when the leader first saw it awake, so a
+  new Workload does not sleep at once.
+
 ### Rolling updates
 
 A changed Workload is replaced one replica at a time, on the node that runs it. The replacement

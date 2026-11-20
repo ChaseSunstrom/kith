@@ -313,8 +313,16 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
                     "peopleNotes",
                     "alone",
                     "shares",
+                    "seen",
+                    "wake",
                 ],
             )?;
+            // (Which Services it met a connection to, and holds one for: the leader sleeps and wakes by them.)
+            for field in ["seen", "wake"] {
+                if let Some(said) = fields.get(field) {
+                    crate::services::wake::shape(said).map_err(|why| refused(key, format!("`{field}` {why}")))?;
+                }
+            }
             // (The Shares it serves over NFS, by name: for the leader to say a Share is served.)
             if let Some(shares) = fields.get("shares") {
                 let names = shares.as_array().filter(|names| names.len() <= 256);
@@ -548,7 +556,12 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
                 "notes",
             ],
         )?,
-        _ => only(key, &said, &["replicas", "containers", "notes"])?,
+        _ => only(key, &said, &["replicas", "containers", "notes", "asleep"])?,
+    }
+    // (`asleep` is the leader's word (T-1210), and a report replaces the status it is in: a node
+    // says it again only as it is now.)
+    if said.contains_key("asleep") && live.status.as_ref().is_none_or(|status| status["asleep"] != true) {
+        return Err(refused(key, "`asleep` is not a worker's to write"));
     }
     // (A NodeWorkload's copies too: the scheduler gives each node it selects a number.)
     let placed = live.status.as_ref().and_then(|status| status["nodes"].as_object());
@@ -1027,6 +1040,24 @@ spec: { volume: there, every: 1d }
         );
     }
 
+    /// A worker says which Services it met a connection to (`seen`) and which it holds one for
+    /// (`wake`) in its own Node: an object of unix seconds by Service, or null (T-1210).
+    #[test]
+    fn a_worker_says_which_services_it_met_connections_to_and_holds_one_for() {
+        let store = store();
+        for field in ["seen", "wake"] {
+            for ok in [json!({ "default/web": 5 }), json!({}), json!(null)] {
+                assert!(try_as(&store, "w", patch_of("Node/w", json!({ field: ok }))).is_ok());
+            }
+            let many: serde_json::Map<String, Value> = (0..300).map(|i| (format!("ns/s{i}"), json!(1))).collect();
+            for bad in [json!(["default/web"]), json!({ "default/web": "now" }), json!(many)] {
+                assert!(try_as(&store, "w", patch_of("Node/w", json!({ field: bad }))).is_err());
+            }
+            let said = json!({ field: { "default/web": 5 } });
+            assert!(try_as(&store, "w-b", patch_of("Node/w", said)).is_err());
+        }
+    }
+
     #[test]
     fn another_nodes_status_and_the_fields_a_join_wrote_are_refused() {
         let store = store();
@@ -1356,6 +1387,22 @@ spec: { volume: there, every: 1d }
         let store = store();
         let said = json!({ "state": "running", "succeeded": 0, "failed": 0, "containers": [], "notes": ["restartPolicy is ignored"] });
         assert!(try_as(&store, "a", report_of("a", "Job/default/once", said)).is_ok());
+    }
+
+    /// `asleep` is the leader's word (T-1210): a report carries it again only where the store has it.
+    #[test]
+    fn a_report_carries_asleep_only_as_the_store_has_it() {
+        let mut store = store();
+        let said = json!({ "containers": [], "asleep": true });
+        let report = |store: &Store| try_as(store, "w", report_of("w", "Workload/default/web", said.clone()));
+        assert!(report(&store).unwrap_err().contains("asleep"));
+        store
+            .set_status(
+                "Workload/default/web",
+                Some(json!({ "nodes": { "0": "w" }, "asleep": true })),
+            )
+            .unwrap();
+        assert_eq!(reported(report(&store).unwrap()).unwrap()["asleep"], true);
     }
 
     #[test]
