@@ -40,6 +40,8 @@
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
 #                               kills in a minute restart the machine
+#   sh ci/vm.sh --test nofile   one node: a container's open-file limit is soft 1024 and hard 524288
+#                               (a Job of the test pod; KITH_E2E=1 also a busybox Job's ulimit -Sn, -Hn)
 #   sh ci/vm.sh --test quota    one node whose state disk keeps project quotas: a pod's storage limit
 #                               holds at the write, in its root and its scratch, however it tries past it
 #   sh ci/vm.sh --test kube     two nodes: the real kubectl and helm against them, with manifests written
@@ -187,6 +189,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    not know to an outside resolver (ci/outside-dns.py, on this machine); a pod
                    on the first finds outside.example.test through both. KITH_POD_NOUPSTREAM=1
                    starts neither with an upstream: the control, where the name is not found
+  --test nofile    instead: one node on the mesh with ci/pod.rs as a container image: a Job
+                   there reads its open-file limits (/proc/self/limits). Expected: soft
+                   1024 and hard 524288, so an app can raise its own, as under containerd.
+                   KITH_E2E=1 also a Job of busybox, whose ulimit -Sn and -Hn say the same
   --test outlive   instead: one node on the mesh with ci/pod.rs as an image and on its
                    disk: kithd killed (SIGKILL) under a pod of two containers, an exec
                    unit and a Job; the machine stays up, kithd serves again within
@@ -348,7 +354,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | alone) ;; *) echo "vm.sh: --test knows: init, image, update, modules, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | nofile | alone) ;; *) echo "vm.sh: --test knows: init, image, update, modules, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, nofile" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
