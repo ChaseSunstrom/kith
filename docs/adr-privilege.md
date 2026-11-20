@@ -289,9 +289,10 @@ the OCI bind source is that staged clone, not the path; and `give` walks the hel
 descriptor, `fchownat` with `AT_SYMLINK_NOFOLLOW` on each entry, so a link is given as a link and
 never followed, and a file with another hard link is left as it is (it may be one outside the
 volume; a hard link inside a volume is therefore not given, and the start logs how many files it
-left). The walk holds one descriptor for each directory it is inside, at most 128 deep, and
-all the gives of a process together at most 4 x 130 (more fails the start, not the node's other
-creates). A check between the stat and the
+left). The walk is streamed: it holds one descriptor for each directory it is inside, at most 128
+deep (deeper fails that start), and keeps no list of names, so its cost is bounded by its own
+depth, not by a tenant's width, and no start's walk is counted against another's. A check between
+the stat and the
 chown of one entry is still a race; `protected_hardlinks` limits what it gains. In `--split` the
 descriptor follows the unit across the socket (`Call::Create.volumes` names the mounts, their
 descriptors ride after the output and error files as `SCM_RIGHTS`), and `check_mount` refuses one
