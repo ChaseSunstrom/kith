@@ -82,6 +82,9 @@
     if [ "$test" = modules ]; then
         . "$root/ci/vm/modules.sh"
     fi
+    if [ "$test" = clock ]; then
+        . "$root/ci/vm/clock.sh"
+    fi
     if [ "$test" = disk ]; then
         . "$root/ci/vm/disk.sh"
     fi

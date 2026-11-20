@@ -15,6 +15,7 @@ mod backups;
 mod blobs;
 mod blocklist;
 mod claims;
+mod clock;
 mod cluster;
 mod controller;
 mod controllers;
@@ -1306,7 +1307,13 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         ];
         let saying = async {
             let format = raft::tend_format(shared.clone(), stopping.clone());
-            tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format);
+            // (Only a machine's first process keeps its clock: on another system something else does.)
+            let clock = async {
+                if init::is_init() {
+                    clock::run(shared.clone(), stopping.clone()).await;
+                }
+            };
+            tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format, clock);
         };
         let house = home::run(shared.clone(), stopping.clone());
         let (served, nodes, (), (), (), (), (), (), (), (), _) = tokio::join!(
@@ -1365,6 +1372,9 @@ async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, m
     let node = format!("Node/{}", cluster.me.name);
     let mut generation = shared.generation.subscribe();
     loop {
+        // (What the clock found is said too, and it changes by itself: `clock::CHANGED` wakes this.)
+        let mut mine = mine.clone();
+        mine.push(("clock", clock::status()));
         // (Not known until the store has this node: asked again when the store changes.)
         let says = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -1395,7 +1405,10 @@ async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, m
             if wrote {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             } else {
-                let _ = generation.changed().await;
+                tokio::select! {
+                    _ = generation.changed() => {}
+                    () = clock::CHANGED.notified() => {}
+                }
             }
         };
         tokio::select! {
