@@ -204,7 +204,14 @@ fn replies_compress_names() {
 fn a_service_name_answers_nodata_and_nxdomain() {
     let mut z = zones();
     z.records.add_name("empty.default.kith").unwrap();
+    // A Service with an IPv6 address and no IPv4 one (no Service range on its node, or the range
+    // is full): AAAA answers, A is NODATA.
+    z.records
+        .add(rec("v6only.default.kith", Rdata::Aaaa("fd00::2".parse().unwrap())))
+        .unwrap();
+    assert_eq!(ask(&z, "v6only.default.kith", 28).an.len(), 1);
     for (name, qtype, rcode) in [
+        ("v6only.default.kith", A, 0),
         ("web.default.kith", 15, 0),
         ("empty.default.kith", 28, 0),
         ("empty.default.kith", A, 0),

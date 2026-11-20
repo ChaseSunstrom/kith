@@ -125,10 +125,15 @@ fn what_is_wrong_is_said_with_its_place() {
     let mut package = example();
     package.meta.version = "one".into();
     package.meta.name = "Web Server".into();
+    package.meta.kith_version = Some("nonsense".into());
     package.schema = Some(json!({ "type": "object", "properties": { "image": { "pattern": "^a" } } }));
     let lint = package.lint().join("\n");
     assert!(lint.contains("version `one` is not like 1.2.3"), "{lint}");
     assert!(lint.contains("invalid name `Web Server`"), "{lint}");
+    assert!(lint.contains("kithVersion `nonsense` is not a version range"), "{lint}");
+    // (A pre-release kith counts as its release.)
+    package.meta.kith_version = Some(">=1.2".into());
+    assert_eq!(package.meta.kith_mismatch("1.2.0-rc1"), None);
     assert!(
         lint.contains("values.schema.json.image: `pattern` is not a keyword kith checks"),
         "{lint}"

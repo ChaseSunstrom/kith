@@ -14,6 +14,18 @@
 //!   pod once HOST PORT [...]   knock each once (two seconds): say "HOST:PORT answered: FIRST
 //!                              LAST" (then one request's first and last line), "refused" (a
 //!                              reset), or "silent" (nothing back), one line each
+//!   pod peer                   on port 80 (v4 and v6), answer each connection with this pod's
+//!                              name and the address it came from: "NAME peer4 ADDRESS" for
+//!                              IPv4 (also as a v6 socket shows it), "NAME peer6 ADDRESS"
+//!   pod v4only NAME PORT       try to turn IPv6 off in this namespace (disable_ipv6 = 1: a
+//!                              pod's /proc/sys is read-only) and say whether it is off
+//!                              ("ipv6: off": no inet6 address, the sysctl reads 1) or "ipv6:
+//!                              on"; then say the IPv4 addresses NAME resolves to (asked
+//!                              for up to 30 seconds until it has one) and,
+//!                              30 times each, asking `pod peer` at the first of them by the
+//!                              A record of its name and by its address as a literal, each
+//!                              different answer:
+//!                              "name: ANSWER", "literal: ANSWER"
 //!   pod seen DIR [SOCKET]      for as long as it runs, say the names in DIR each time they
 //!                              change: those it can open with a `+`, the others with a `-`;
 //!                              and answer whoever connects to SOCKET (a path) with a line
@@ -675,6 +687,76 @@ fn main() {
                     }
                     Err(e) => println!("{name}: failed: {e}"),
                 }
+            }
+        }
+        ["peer"] => {
+            let name = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("a name");
+            let listener = TcpListener::bind("[::]:80").expect("port 80");
+            for mut stream in listener.incoming().flatten() {
+                let from = stream.peer_addr().map(|a| a.ip().to_canonical());
+                let said = match from {
+                    Ok(std::net::IpAddr::V4(ip)) => format!("{} peer4 {ip}", name.trim()),
+                    Ok(ip) => format!("{} peer6 {ip}", name.trim()),
+                    Err(e) => format!("{} peer failed {e}", name.trim()),
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                let _ = stream.read(&mut [0; 512]);
+                let _ = stream.write_all(format!("HTTP/1.0 200 OK\r\n\r\n{said}").as_bytes());
+            }
+        }
+        ["v4only", name, port] => {
+            let out = std::fs::OpenOptions::new().write(true).open("/dev/stdout");
+            let mut out = out.expect("/dev/stdout, by its name");
+            let sysctl = "/proc/sys/net/ipv6/conf/all/disable_ipv6";
+            let wrote = std::fs::write(sysctl, "1");
+            let inet6 = std::fs::read_to_string("/proc/net/if_inet6").unwrap_or_default();
+            let reads = std::fs::read_to_string(sysctl).unwrap_or_default();
+            // (A pod's /proc/sys is read-only, so in a pod this stays "on": the Service's IPv4
+            // address is still asked for, by the A record and as a literal, which a v6 fallback
+            // cannot do. The no-IPv6 namespace itself is proved in kith-mesh's pod tests.)
+            if inet6.trim().is_empty() && reads.trim() == "1" {
+                writeln!(out, "ipv6: off").expect("a line out");
+            } else {
+                writeln!(out, "ipv6: on: wrote {wrote:?}, sysctl {:?}", reads.trim()).expect("a line out");
+            }
+            let port: u16 = port.parse().expect("a port");
+            // (The Service's address comes a moment after the Service: asked for up to 30 s.)
+            let mut v4: Vec<std::net::Ipv4Addr> = Vec::new();
+            for _ in 0..30 {
+                let found = std::net::ToSocketAddrs::to_socket_addrs(&(*name, port));
+                v4 = found
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|addr| match addr.ip() {
+                        std::net::IpAddr::V4(ip) => Some(ip),
+                        std::net::IpAddr::V6(_) => None,
+                    })
+                    .collect();
+                if !v4.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            writeln!(out, "addresses: {v4:?}").expect("a line out");
+            let Some(first) = v4.first() else { return };
+            let mut heard = std::collections::BTreeSet::new();
+            for _ in 0..30 {
+                // (By name: the A record, asked again each time, and its address connected to.)
+                let named = std::net::ToSocketAddrs::to_socket_addrs(&(*name, port))
+                    .into_iter()
+                    .flatten()
+                    .find(|addr| addr.is_ipv4())
+                    .map_or_else(|| name.to_string(), |addr| addr.ip().to_string());
+                for (how, host) in [("name", named), ("literal", first.to_string())] {
+                    heard.insert(format!(
+                        "{how}: {}",
+                        asked(&host, &port.to_string()).unwrap_or_else(|e| format!("failed: {host}: {e}"))
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            for line in heard {
+                writeln!(out, "{line}").expect("a line out");
             }
         }
         ["seen", dir, hears @ ..] if hears.len() < 2 => {

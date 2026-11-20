@@ -270,8 +270,54 @@ what it is, never for who asked.
 | Services | `ServiceTable(entries)` | the root part builds the BPF program itself; every entry inside the cluster's Service range, sent to this node only |
 | Images | `Unpack(image digest, manifest text, layers as file handles)`, `Drop(image digest, before)` | the root part checks the manifest is the image digest (sha256 of its bytes), that the files are exactly the manifest's layers in order, that no file is larger than the size the manifest gives it, and hashes each layer itself as it reads it (under the decompression, and the rest of the file after the tar's end), refusing one that is not the digest the manifest names and publishing nothing (done in process: `root_part::Request::Unpack`, the pulling code still fetching and choosing the digest); the same containment as `unpack_layer` today (nothing outside the image's root, what it refuses today refused). The store is the node's own, `<state>/runtime` from the Book and canonical, never a path the asker names; the image's path is derived from its digest. A Drop refuses an image a container's bundle names whatever `before` says, and a `before` that is no time. This is integrity, not authority: the asker picks the image; a manifest over the request's 256 KiB cannot be unpacked this way |
 | Units | `Create(unit)`, `Start(id)`, `Kill(id)`, `Delete(id)`, `Tune(id, limits)`, `Plug`/`Unplug(id, device)`, `Exec(id, argv, tty)` → handles, `Usage` → sizes of all units | the image by digest (one it unpacked), mounts by Volume name and sub-path or as file contents, devices by inventory name, the pod by number, the cgroup and log files derived from the id. A VM's disks, kernel, initrd and firmware by Volume name and a path beneath it, or a name in a fixed list in the signed root; its program from that list; its arguments built here from typed fields. Each thing of the list in "What the split does not change" only where the node's own policy allows it, a path on the node for a VM among them |
-| Volumes | `Volume(name, size, key?)`, `VolumeGone(name)`, `Open(volume, path, how, owner)` → a file, `Restore(volume, archive)`, `Share`, `Unshare`, `Remote(volume, node)` | the name's form; every path beneath the volume's root; an owner that is not 0 unless policy allows. Built in process (`root_part::Request`): `Volume(volume)` (what mounts, backs up, replicates from or downloads a Volume: the directory, made if it is not there), `Open(volume)` (what writes into one: an upload, a replica's copy), `Restore(volume)` (a backup restored into one) and `VolumeGone(namespace, name)`; each answers with the directory, derived by `volumes::host_dir_under` from the state directory the Book has and the Volume's `spec.path`, never a path the asker gives. The namespace and the name are in the store's own form (lowercase letters, digits, `-` and `.`, at most 63, a letter or digit at both ends) before any path is made from them; the path has no empty part, `.`, `..` or NUL (for a directory of the node's own too, which is an absolute path and only where policy has `hostPaths`), and a link met on the way is refused. **A gap, not closed**: the root part answers with a path, not a descriptor, so a path is checked and then used by the caller, and a part swapped for a symbolic link between the two is followed (the same as `check_mount` above); the upgrade is an `openat2` descriptor with `RESOLVE_BENEATH`, passed on, as T-0810 says. The files an `Open` or a `Restore` makes take the owner the Volume's directory has (the request has no owner of its own: a caller's owner stays in the serving part, as an unpack's does). `VolumeGone` removes `<state>/volumes/<namespace>/<name>` and nothing else, and never a directory of the node's own. **Not built yet**: `Volume(name, size, key?)` (the encrypted file's make, `encrypted.rs`), `Share`, `Unshare` and `Remote`, which stay as they are |
+| Volumes | `Volume(name, size, key?)`, `VolumeGone(name)`, `Open(volume, path, how, owner)` → a file, `Restore(volume, archive)`, `Share`, `Unshare`, `Remote(volume, node)` | the name's form; every path beneath the volume's root; an owner that is not 0 unless policy allows. Built in process (`root_part::Request`): `Volume(volume)` (what mounts, backs up, replicates from or downloads a Volume: the directory, made if it is not there), `Open(volume)` (what writes into one: an upload, a replica's copy), `Restore(volume)` (a backup restored into one) and `VolumeGone(namespace, name)`; each answers with the directory, derived by `volumes::host_dir_under` from the state directory the Book has and the Volume's `spec.path`, never a path the asker gives. The namespace and the name are in the store's own form (lowercase letters, digits, `-` and `.`, at most 63, a letter or digit at both ends) before any path is made from them; the path has no empty part, `.`, `..` or NUL (for a directory of the node's own too, which is an absolute path and only where policy has `hostPaths`), and a link met on the way is refused. Which of these are opened beneath, and which still name a path, is the paragraph below the table. The files an `Open` or a `Restore` makes take the owner the Volume's directory has (the request has no owner of its own: a caller's owner stays in the serving part, as an unpack's does). `VolumeGone` removes `<state>/volumes/<namespace>/<name>` and nothing else, and never a directory of the node's own. **Not built yet**: `Volume(name, size, key?)` (the encrypted file's make, `encrypted.rs`), `Share`, `Unshare` and `Remote`, which stay as they are |
 | Node | `Update(artifact)`, `Reboot(how)`, `Lock(what the NodeKey says)` → what to write in its status, `Run(via, argv)` | `Update`: the keys kept after a handover (`os-release-keys`) and the floor no release goes below (`os-release-floor`) are files of the state directory today, read before the signed root's own keys (`update.rs`); both move to the root part's side, where the serving part cannot write them, and a handover is taken only signed by a key already held. `Lock`: the whole loop that keeps the lock record (`crypt.rs`, `keep`) runs in the root part, so the state's key and the record's secret never cross; what it is sent is the NodeKey's fields, and a wipe or a new duress key from them is taken only where policy allows (`wipe`). `Run` only where policy allows: built in process (`root_part::Request::Run`, asked by `POST /v1/run` before it starts the program): refused where `run` is off, with no program, no argument list, an argument with a NUL, more than 1024 arguments or more than 64 KiB of them; the serving part still starts the program, as it holds the connection it is joined to. **Not built yet**: `Update`, `Reboot` and `Lock`, which wait on the key and floor files moving (T-0811), pid 1's keeper and the keep loop of `crypt.rs` |
+
+**Volumes: what is opened beneath, and what still names a path (T-0986).** A Volume's
+directory is opened by `volumes::host_dir_under` through `kith_dm_sys::beneath_across` (the
+root, which may be the mount of an encrypted Volume) and `beneath` (below it): `openat2` with
+`RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_MAGICLINKS`, and `RESOLVE_NO_XDEV` below
+the root, so a mount under the Volume is refused. A missing step is made as its parent's owner.
+The answer is the descriptor with its path beside it (in process, `VolumeDir`; across the socket,
+`Answer::Dir` with one descriptor). Content reads and writes go through the held descriptor: a
+share, a backup, a replica, the volume files, an image, the controller's check, and (T-1113) the
+container's start. The controller hands the runtime the held descriptor in `kith_runtime::Mount.held`
+(`Held`), and as root the runtime never names the path again: the stage clones the tree from the
+descriptor (`open_tree` on the descriptor, `CLONE | RECURSIVE | EMPTY_PATH`, before the stage's
+mount namespace is made) and mounts the clone (`mount_setattr` for an id-mapped one, `move_mount`);
+the OCI bind source is that staged clone, not the path; and `give` walks the held directory by
+descriptor, `fchownat` with `AT_SYMLINK_NOFOLLOW` on each entry, so a link is given as a link and
+never followed, and a file with another hard link is left as it is (it may be one outside the
+volume; a hard link inside a volume is therefore not given, and the start logs how many files it
+left). The walk is streamed: it holds one descriptor for each directory it is inside, at most 128
+deep (deeper fails that start), and keeps no list of names, so its cost is bounded by its own
+depth, not by a tenant's width. The walks of a process together hold at most half its soft limit
+of descriptors (8192 at most), each taking its 130 before it opens one: a give that finds them
+taken waits for another to finish, 30 s at most, and then only that start fails, with a plain
+error. One namespace holds at most half of them (a Unit carries its namespace, and the root part
+refuses one that is not a namespace name), so one tenant with many starts of big volumes waits on
+its own share and the other half stays for the rest; that holds against ONE hog only: two
+namespaces can hold the whole pool between them, and a third then waits its 30 s. The limit
+is read after kithd raised its soft one to the hard one (T-1075), so a normal node has the 8192.
+Ceiling: a give holds its slots for its whole walk (a slow volume holds its namespace's share
+while it is walked), and a volume whose give times out is walked again by the next start (the walk
+is idempotent); if that bites, the slots are given back between directories. A check between
+the stat and the
+chown of one entry is still a race; `protected_hardlinks` limits what it gains. In `--split` the
+descriptor follows the unit across the socket (`Call::Create.volumes` names the mounts, their
+descriptors ride after the output and error files as `SCM_RIGHTS`), and `check_mount` refuses one
+that is not the directory its path names (device and inode). Still by path, and raceable: a
+subPath of a Volume (it is opened beneath the held directory, but needs the id-mapped mount, and
+is refused without it); a kithd that is not root (the OCI bind source is the path, resolved by the
+container's init in its own namespaces: `still_held` refuses a path whose device and inode are not
+the held directory's, just before the init is forked, but a swap after that check binds what the
+link names, anything kithd's own user can reach; the tenant and that user are the two sides of
+a boundary here, and only a root kithd's clone closes it); a container's scratch directory, map
+files, identity, seat and pod files; a restore's and a replica's new copy, whose `read_dir`, `canonicalize` and
+rename into place name the directory by path (`backups.rs`, `replicas.rs`); and an NFS export
+(`share.rs`), which exports by path. A node's own `hostPaths` directory refuses a link at its last
+component (`O_NOFOLLOW`, `O_DIRECTORY`), but an ancestor link is followed as before. The by-path
+steps of this list are not closed by this.
 
 About thirty requests. That is more than the plan guessed (ten to fifteen), and the
 study says why: API handlers reach into volumes and containers in more places than the
@@ -340,7 +386,11 @@ and sysfs, as one process cannot:**
   part trusted, that is the same hands; across the socket it is a hole. The root part must open
   each mount source itself with `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`) beneath the
   directory it derived, and pass the descriptor on (`SCM_RIGHTS`, mounted through `/proc/self/fd`
-  or `open_tree`), never the path again.
+  or `open_tree`), never the path again. Done for a Volume's directory (T-0986, T-1113: the Volumes
+  paragraph below the table). Still by path: a Volume's subPath, a restore's or a replica's new copy,
+  an NFS export, a container's scratch directory, map files, identity, seat and pod files, and a
+  Volume's bind where kithd is not root (checked against the held descriptor just before, not
+  bound from it).
 - *The pod's network.* The pod's address in the mesh /80, its exit tunnel and its DNS are what
   the asker says and are not verified; the root part must derive them from its own `--pod-range`,
   tunnels and gateway.

@@ -47,7 +47,7 @@
         [ "$test" != home ] || { more='--mesh --ingress' others='2 3 4' nodes=four four=',[^,? ]+'; }
         # (access: the nodes run the image tests.sh built with the forge feature.)
         [ "$test" != access ] || base=$osdir
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = access ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = access ]; then
         others=2 more=--mesh project=''
         # (access: three nodes on the mesh, pod's image in each; people on the first, below.)
         [ "$test" != access ] || others='2 3'
@@ -74,6 +74,8 @@
         # (services: no --mesh, as kith OS starts a node: its Services answer there too, T-0723;
         # then services.sh starts it again with --mesh beside a second node with $nolink, T-0326.)
         [ "$test" != services ] || more=''
+        # (mesh: two nodes, neither started with --mesh: the Cluster's spec.mesh turns it on, T-1076.)
+        [ "$test" != mesh ] || more=''
         # (policy: no way left to be root with all of the kernel's capabilities, so kithd gives up the rest.
         # QEMU reads a comma in -smbios as the end of a value, so each one here is doubled.)
         [ "$test" != policy ] || more='--mesh --node-policy no-exec-units,,no-vm-paths,,no-run'
@@ -415,6 +417,9 @@ EOF
         fi
         if [ "$test" = services ]; then
             . "$root/ci/vm/services.sh"
+        fi
+        if [ "$test" = mesh ]; then
+            . "$root/ci/vm/mesh.sh"
         fi
         if [ "$test" = outlive ]; then
             . "$root/ci/vm/outlive.sh"

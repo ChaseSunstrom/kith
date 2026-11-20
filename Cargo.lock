@@ -1405,6 +1405,7 @@ dependencies = [
  "kith-yaml",
  "minijinja",
  "ring",
+ "semver",
  "serde",
  "serde_json",
 ]
