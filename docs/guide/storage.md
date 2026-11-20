@@ -124,8 +124,10 @@ spec:
 
   The package makes the Share too (`--set 'nfs.clients=[192.168.1.0/24]'` for NFS beside it).
   kith ships no Samba image: name one you trust, with Samba 4.15 or later and `nss_wrapper`.
-- A Share's `status` says why it is given to nobody. Applying one takes leave to apply its
-  Volume.
+- A Share's `status` says why it is given to nobody, or where it is (`node`, `path`) and, for
+  one that names `nfs.clients`, `served`: whether that node says it serves it (the node lists
+  the Shares it serves in its own Node's `status.shares`; `served` is false until it has, and
+  while it is down it is what it last said). Applying one takes leave to apply its Volume.
 - Not yet: NFS trusts an address (no Kerberos), so name single addresses or a network you trust
   (wider than a /8 is refused); IPv6 clients are not served; SMB users all write as one user, on
   port 445 of every address (one `nas` release a node); a `kith-system` Volume cannot be given;
@@ -149,7 +151,9 @@ spec:
 
 - The cluster picks the other nodes (`status.replicas`). Every `sync` (at least `10s`), each
   fetches the directory from the node that has the volume (`status.primary`) over the cluster's
-  mutual TLS and replaces its own copy; `status.synced` says when.
+  mutual TLS and replaces its own copy; `status.synced-NODE` says when (each replica writes its
+  own, so two syncing at once never put the other's time back; `status.synced` is what an older
+  kithd wrote, still read).
 - When the primary is not heard from for `--lost-after`, the replica that synced last becomes
   primary and workloads that mount the volume are placed there. A node that comes back is not
   given the volume back; what it had is kept beside it as `.PATH.was-TIME`, a hidden name (yours to

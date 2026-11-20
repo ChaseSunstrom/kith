@@ -557,7 +557,7 @@ pub fn resolve(store: &Store) -> Volumes {
         let copies = was
             .into_iter()
             .flatten()
-            .filter(|(field, _)| crate::replicas::FIELDS.contains(&field.as_str()));
+            .filter(|(field, value)| crate::replicas::is_copy_field(field) && !value.is_null());
         let copies: serde_json::Map<String, Value> =
             copies.map(|(field, value)| (field.clone(), value.clone())).collect();
         // (Without replicas any more, only where it is, while that is not where `node` says.)
