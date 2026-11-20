@@ -437,6 +437,12 @@ fn mine(store: &Store, prefix: Ipv6Addr, by: (&str, bool), resource: &Resource) 
     }
 }
 
+/// Is `kind` one of `names`? However it is cased: `kith_api::kind` reads a kind that way, so the
+/// store may hold a `release` that is a Release.
+fn is(kind: &str, names: &[&str]) -> bool {
+    names.iter().any(|name| name.eq_ignore_ascii_case(kind))
+}
+
 fn not_made(key: impl std::fmt::Display, why: impl std::fmt::Display) -> String {
     format!("{key}: {why}")
 }
@@ -446,7 +452,7 @@ fn not_made(key: impl std::fmt::Display, why: impl std::fmt::Display) -> String 
 fn writer_of<'a>(store: &'a Store, owner: &str) -> Result<&'a Resource, String> {
     let owner = store.get(owner).ok_or_else(|| format!("{owner} is not there"))?;
     match owner.kind.as_str() {
-        "Release" | "Source" => Ok(owner),
+        kind if is(kind, &["Release", "Source"]) => Ok(owner),
         kind => store
             .definition(kind)
             .ok_or_else(|| format!("no KindDefinition makes a {kind}")),
@@ -466,7 +472,8 @@ fn within(store: &Store, of: &str, resource: &Resource) -> Result<(), String> {
     }
     let owner = store.get(of).ok_or_else(|| format!("{of} is not there"))?;
     let home = owner.metadata.namespace.as_deref();
-    if owner.kind == "Source" && home == Some("kith-system") {
+    let of_source = is(&owner.kind, &["Source"]);
+    if of_source && home == Some("kith-system") {
         return Ok(());
     }
     let kind = resource.kind.as_str();
@@ -481,12 +488,12 @@ fn within(store: &Store, of: &str, resource: &Resource) -> Result<(), String> {
             "{of} does not get to make a {kind}: it is in no namespace, and only a Source in kith-system makes one"
         ));
     }
-    let kept: &[&str] = if owner.kind == "Source" {
+    let kept: &[&str] = if of_source {
         &["Source"]
     } else {
         &["Release", "Source", "KindDefinition"]
     };
-    if kept.contains(&kind) {
+    if is(kind, kept) {
         return Err(format!("{of} does not get to make a {kind}"));
     }
     if home.is_some() && resource.metadata.namespace.as_deref() != home {
@@ -496,7 +503,7 @@ fn within(store: &Store, of: &str, resource: &Resource) -> Result<(), String> {
             home.unwrap_or_default()
         ));
     }
-    if owner.kind != "Source" && (kind, resource.metadata.name.as_str()) == ("ConfigMap", crate::releases::SHARED) {
+    if !of_source && is(kind, &["ConfigMap"]) && resource.metadata.name == crate::releases::SHARED {
         return Err(format!("{of} does not get to set the values releases are given"));
     }
     Ok(())
@@ -524,7 +531,7 @@ fn owned(store: &Store, leads: bool, of: &str, resource: &Resource) -> Result<()
     within(store, of, resource).map_err(|why| not_made(&key, why))?;
     // A Release, Source or Package says who wrote it and with what key, and what it renders says
     // what its owner says (`sources`): another would be written as a writer that is not its owner's.
-    if matches!(resource.kind.as_str(), "Release" | "Source" | "Package") {
+    if is(&resource.kind, &["Release", "Source", "Package"]) {
         use crate::releases::{KEY, WRITER};
         for note in [WRITER, KEY] {
             if resource.metadata.annotations.get(note) != writer.metadata.annotations.get(note) {
@@ -554,7 +561,7 @@ fn takes_away(store: &Store, leads: bool, key: &str) -> Option<Result<(), String
         // another stays. Nobody applies one by hand, `releases::claims`: it is the reaper's to take.)
         Some(of) if store.get(of).is_none() => {
             let kind = kind_of(of);
-            match matches!(kind, "Release" | "Source") || store.definition(kind).is_some() {
+            match is(kind, &["Release", "Source"]) || store.definition(kind).is_some() {
                 true => Ok(()),
                 false => Err(format!("{of} is gone, and no controller makes things of a {kind}")),
             }
@@ -2145,7 +2152,7 @@ mod tests {
             let mut made = named(kind, name, serde_json::json!({}));
             made.metadata.namespace = namespace.map(str::to_string);
             made.metadata.annotations.insert(OWNER.into(), owner.to_string());
-            if matches!(kind, "Release" | "Source") {
+            if super::is(kind, &["Release", "Source"]) {
                 made.metadata.annotations.insert(WRITER.into(), "local socket".into());
             }
             made
@@ -2202,5 +2209,68 @@ mod tests {
             made(rel, "Exit", "x", None),
         ]);
         assert!(admitted(&mixed).is_err());
+        // A kind is read however it is cased (`kith_api::kind` does): the limits hold for each.
+        refused(rel, "release", "r2", Some("shop"), "does not get to make a release");
+        refused(rel, "SOURCE", "s2", Some("shop"), "does not get to make a SOURCE");
+        refused(src, "source", "s2", Some("shop"), "does not get to make a source");
+        refused(rel, "configmap", "kith-values", Some("shop"), "values releases");
+        refused(rel, "osrelease", "x", None, "in no namespace");
+        passes(rel, "configmap", "c", Some("shop"));
+    }
+
+    /// A chain (a Release makes a GameServer, whose controller makes a Workload) is held to the
+    /// KindDefinition's writer: bob, who may apply a Workload in `shop` or may not, and in the
+    /// GameServer's namespace only. And what says it is a CronJob's is not a Workload's to say:
+    /// no signed write of it passes (T-0850).
+    #[test]
+    fn own_writes_signed_a_chain_is_held_to_the_kind_definitions_writer_and_its_namespace() {
+        use crate::releases::{OWNER, bob_is, bobs_note};
+        let ca = pki::Ca::create().unwrap();
+        let id = pki::fingerprint(&ca.cert).unwrap();
+        let note = bobs_note(0);
+        for may in [false, true] {
+            let (mut store, nodes) = required(&ca, &["a"]);
+            let workloads = if may { ", Workload" } else { "" };
+            for resource in kith_api::Resource::from_source(&format!(
+                "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: bob }}\nspec: {{ rules: [\
+                 {{ kinds: [ConfigMap{workloads}], verbs: [apply, delete], namespaces: [shop] }}] }}\n---\n\
+                 apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob }}\nspec: {{ role: bob, subjects: [bob] }}\n\
+                 ---\napiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: rel, namespace: shop, \
+                 annotations: {{ 'kith.dev/written-by': 'local socket' }} }}\nspec: {{ package: {{ name: maps }} }}\n---\n\
+                 apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: {{ name: gameserver, {note} }}\n\
+                 spec: {{ group: games.example.com, version: v1, kind: GameServer, schema: {{ type: object }} }}\n---\n\
+                 apiVersion: games.example.com/v1\nkind: GameServer\nmetadata: {{ name: one, namespace: shop, \
+                 annotations: {{ 'kith.dev/owned-by': 'Release/shop/rel' }} }}\nspec: {{ map: dust }}\n"
+            ))
+            .unwrap()
+            {
+                store.apply(resource.unwrap()).unwrap();
+            }
+            bob_is(&mut store, 0);
+            let leader = kith_store::node_id("a");
+            let admitted = |command: &Command| {
+                let entry = sign(&nodes[0], &id, command).unwrap();
+                crate::access_sign::admit(&store, &id, &entry, leader)
+            };
+            let workload = |owner: &str, namespace: &str| {
+                let mut made = named("Workload", "w", serde_json::json!({}));
+                made.metadata.namespace = Some(namespace.into());
+                made.metadata.annotations.insert(OWNER.into(), owner.into());
+                made
+            };
+            let at = admitted(&apply(vec![workload("GameServer/shop/one", "shop")]));
+            match may {
+                true => assert_eq!(at, Ok(()), "bob may apply a Workload in shop"),
+                false => assert!(at.unwrap_err().contains("bob may not apply Workload"), "he may not"),
+            }
+            // Another namespace is the controller's to leave alone, whatever bob may do there.
+            let said = admitted(&apply(vec![workload("GameServer/shop/one", "play")])).unwrap_err();
+            assert!(said.contains("stays in"), "{may}: {said}");
+            // What says it is a CronJob's is not held by a writer: nothing signed passes.
+            assert!(
+                admitted(&apply(vec![workload("CronJob/shop/nightly", "shop")])).is_err(),
+                "{may}: a Workload of a CronJob"
+            );
+        }
     }
 }

@@ -517,7 +517,17 @@ nodes too, and a replay decides alike.
   Release makes a GameServer, whose controller makes a Workload), and I kept that chain,
   which is what the controller path does: each step is held to `within` and to that writer,
   so it cannot leave the namespace nor make a Release, and what it may make is what the
-  KindDefinition's writer may. What a refusal under
+  KindDefinition's writer may. The bound, plainly: a taken leader can sign anything the
+  KindDefinition's writer may write in the namespace of the owner it names (any namespace
+  for an owner that is itself in none), whatever the wasm controller answered: no answer is
+  checked, none need exist. The node policy keys (`exec-units`, host network, VMs,
+  passthrough) still gate what runs on each node, whoever signed it. What `within` leaves
+  open, on purpose: a Source in `kith-system` returns early, so it (and a taken leader that
+  names one) may make any new kind that is in no namespace (a Node, a DNS record, a
+  Repository, an OSRelease, an UpdatePlan), as `sources` itself lets it, and the caps the
+  render has (`ANSWERED` 64 resources an answer, `RESOURCES_LIMIT` for a Source) are not
+  here, so an unbounded number may be signed in the owner's namespace. A Share or a public
+  Service stays one that an owner's writer may write. A kind is read however cased. What a refusal under
   `required` does cost: a Source that brings a KindDefinition (`sources`) and the prune that
   takes one away, the reaper's delete of an orphaned access kind, and a NetworkPolicy a
   Release renders (the only namespaced kind of these). A person applies those, signed,
