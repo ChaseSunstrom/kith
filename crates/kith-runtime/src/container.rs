@@ -91,6 +91,13 @@ pub fn exec_shim() {
     std::process::exit(127);
 }
 
+/// A container's open-file limits given kithd's hard one: soft 1024, as containerd gives (most
+/// programs size their tables from the soft limit), and hard kithd's own so an app can raise
+/// its soft one; the soft one is never above the hard one.
+pub fn container_nofile(hard: u64) -> (u64, u64) {
+    (hard.min(1024), hard)
+}
+
 pub struct Runtime {
     root: PathBuf,
     cgroup_parent: String,
@@ -2016,6 +2023,25 @@ fn spec_shifted(
             .into(),
     );
     process.set_terminal(Some(false));
+    // The open-file limit: the spec's default is 1024 soft and hard, which an app cannot raise.
+    let (soft, hard) = match nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE) {
+        Ok((_, hard)) => {
+            // (The kernel refuses a hard limit above fs.nr_open: an unlimited one is capped to it.)
+            let cap = fs::read_to_string("/proc/sys/fs/nr_open")
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            container_nofile(hard.min(cap))
+        }
+        Err(_) => (1024, 1024),
+    };
+    process.set_rlimits(Some(vec![
+        oci_spec::runtime::PosixRlimitBuilder::default()
+            .typ(oci_spec::runtime::PosixRlimitType::RlimitNofile)
+            .soft(soft)
+            .hard(hard)
+            .build()?,
+    ]));
     let root = uid.is_root();
     if root {
         // (Its group said once more as the whole list of its groups: with no list,
@@ -2414,6 +2440,16 @@ mod tests {
 
         let made = spec(&"x".repeat(100), &image, &unit(Some(500)), "/kith/a", Path::new("/b")).unwrap();
         assert_eq!(made.hostname().as_ref().unwrap().len(), 63);
+        // (The open-file limit: soft 1024 and kithd's hard one, never the spec's 1024 and 1024.)
+        let (_, hard) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
+        let process = made.process().as_ref().unwrap();
+        let limits = process.rlimits().as_ref().unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(
+            (limits[0].soft(), limits[0].hard()),
+            container_nofile(hard),
+            "a container's open-file limits"
+        );
         let linux = made.linux().as_ref().unwrap();
         let namespaces = linux.namespaces().as_ref().unwrap();
         assert!(

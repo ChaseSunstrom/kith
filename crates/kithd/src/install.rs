@@ -181,6 +181,9 @@ pub struct Answers {
     pub ip: Option<String>,
     #[serde(default)]
     pub dns: Option<String>,
+    /// The time server, `ADDRESS` or `ADDRESS:PORT`; without, the network's (DHCP), then the way out.
+    #[serde(default)]
+    pub ntp: Option<String>,
     /// How many bytes the disk holds, where its name was looked up under another kernel
     /// (os/vps.sh): a disk of that name and another size is not the one that was meant.
     #[serde(default)]
@@ -311,6 +314,7 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
         ("kith.hostname", &answers.hostname),
         ("kith.ip", &answers.ip),
         ("kith.dns", &answers.dns),
+        ("kith.ntp", &answers.ntp),
     ] {
         let Some(value) = value.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
             continue;
@@ -1225,20 +1229,20 @@ mod tests {
         let told = |yaml: &str| answers(yaml).unwrap();
         let config = |yaml: &str, disks: &[Disk]| plan(&told(yaml), disks, 300 << 20, 1 << 20);
         let (on, config_new) = config(
-            "disk: nvme0n1\nhostname: alpha\nip: 10.0.0.5/24,10.0.0.1\ndns: 9.9.9.9\n",
+            "disk: nvme0n1\nhostname: alpha\nip: 10.0.0.5/24,10.0.0.1\ndns: 9.9.9.9\nntp: 10.0.2.2:5123\n",
             &two,
         )
         .unwrap();
         assert_eq!(on.name, "nvme0n1");
         assert_eq!(
             config_new,
-            "kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9 -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443 --claim"
+            "kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9 kith.ntp=10.0.2.2:5123 -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443 --claim"
         );
         // The node reads it back as it was meant.
         let (read, args) = crate::init::configured(&config_new);
         assert_eq!(
             read,
-            "kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9"
+            "kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9 kith.ntp=10.0.2.2:5123"
         );
         assert_eq!(
             args,
@@ -1293,6 +1297,7 @@ mod tests {
             "disk: sda\nhostname: a kith.slot=b\n",
             "disk: sda\nip: 10.0.0.5\n",
             "disk: sda\ndns: nine\n",
+            "disk: sda\nntp: pool.ntp.org\n",
             "disk: sda\njoin: { address: 10.0.0.7, token: kith1.ab }\n",
             "disk: sda\njoin: { address: '10.0.0.7:7443 --claim', token: kith1.ab }\n",
             "disk: sda\njoin: { address: 10.0.0.7:7443, token: 'kith1.ab --state /tmp' }\n",

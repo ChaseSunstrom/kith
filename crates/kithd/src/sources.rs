@@ -165,8 +165,7 @@ fn ours(ip: std::net::IpAddr) -> bool {
 async fn nodes(shared: &Shared) {
     let said: Vec<String> = {
         let state = shared.store.lock().expect("nothing panics holding the store");
-        let at = |node: &Resource| Some(node.status.as_ref()?["address"].as_str()?.to_string());
-        state.store.list(Some("Node")).filter_map(at).collect()
+        said_by_nodes(state.store.list(Some("Node")))
     };
     let mut found = Vec::new();
     for at in said {
@@ -175,6 +174,14 @@ async fn nodes(shared: &Shared) {
         }
     }
     *NODES.lock().expect("nothing panics holding the Nodes' addresses") = found;
+}
+
+/// Where the Nodes say they are: each one's LAN address and its `address` (on the mesh, once the
+/// leader has moved it there), so that no place a node is reached at is one a Source may fetch from.
+fn said_by_nodes<'a>(nodes: impl Iterator<Item = &'a Resource>) -> Vec<String> {
+    nodes
+        .flat_map(|node| node.node_addresses().map(str::to_string))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1098,6 +1105,22 @@ mod tests {
         );
         assert!(!pinnable("git version 2.36.9") && !pinnable("git version 1.99") && !pinnable("nonsense"));
         assert_eq!(plain("a\x1b[2Jb\nc"), "a[2Jb\nc");
+    }
+
+    /// A Node moved onto the mesh (its `address` an IPv6 one) still keeps its LAN address out of
+    /// a Source's reach.
+    #[test]
+    fn a_moved_nodes_lan_address_is_still_ours() {
+        let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: b }\nspec: {}\n";
+        let mut node = Resource::from_source(text).unwrap().remove(0).unwrap();
+        node.status = Some(serde_json::json!({ "address": "[fd00:1:2::5]:7443", "lan": "198.51.100.7:7443" }));
+        let said = said_by_nodes([&node].into_iter());
+        assert_eq!(said, ["198.51.100.7:7443", "[fd00:1:2::5]:7443"]);
+        let lan: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        assert!(!ours(lan));
+        NODES.lock().unwrap().push(lan);
+        assert!(ours(lan));
+        NODES.lock().unwrap().retain(|at| *at != lan);
     }
 
     /// git goes to the address it was told, whatever the name would answer (this one answers nothing).

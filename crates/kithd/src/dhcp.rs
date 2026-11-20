@@ -19,6 +19,8 @@ pub struct Lease {
     pub bits: u8,
     pub router: Option<Ipv4Addr>,
     pub dns: Vec<Ipv4Addr>,
+    /// The time servers it names (option 42), first the one it likes best: `clock.rs` asks them.
+    pub ntp: Vec<Ipv4Addr>,
     pub server: Ipv4Addr,
     pub secs: u32,
 }
@@ -49,8 +51,8 @@ pub fn message(kind: u8, xid: u32, mac: [u8; 6], hostname: &str, offered: Option
         message.extend([12, name.len() as u8]);
         message.extend(name);
     }
-    // Asked for: the subnet mask, the router, the name servers, how long it is for.
-    message.extend([55, 4, 1, 3, 6, 51, 255]);
+    // Asked for: the subnet mask, the router, the name servers, how long it is for, the time servers.
+    message.extend([55, 5, 1, 3, 6, 51, 42, 255]);
     message.resize(message.len().max(300), 0);
     message
 }
@@ -69,6 +71,7 @@ pub fn reply(packet: &[u8], xid: u32, mac: [u8; 6]) -> Option<(u8, Lease)> {
         bits: 0,
         router: None,
         dns: Vec::new(),
+        ntp: Vec::new(),
         server: Ipv4Addr::UNSPECIFIED,
         secs: 3600,
     };
@@ -87,6 +90,16 @@ pub fn reply(packet: &[u8], xid: u32, mac: [u8; 6]) -> Option<(u8, Lease)> {
                     1 => lease.bits = u32::from_be_bytes(four(value)?).leading_ones() as u8,
                     3 => lease.router = four(value).map(Ipv4Addr::from),
                     6 => lease.dns = value.as_chunks::<4>().0.iter().copied().map(Ipv4Addr::from).collect(),
+                    42 => {
+                        lease.ntp = value
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .copied()
+                            .take(4)
+                            .map(Ipv4Addr::from)
+                            .collect()
+                    }
                     51 => lease.secs = u32::from_be_bytes(four(value)?),
                     54 => lease.server = four(value)?.into(),
                     _ => {}
@@ -277,6 +290,7 @@ mod tests {
             bits: 24,
             router: Some([10, 9, 0, 1].into()),
             dns: vec![[10, 9, 0, 1].into(), [9, 9, 9, 9].into()],
+            ntp: Vec::new(),
             server: [10, 9, 0, 1].into(),
             secs: 3600,
         };
@@ -450,5 +464,78 @@ mod tests {
         kith_mesh::address4(card.index, lease.address, lease.bits, lease.router).unwrap();
         assert!(ip("-4 -o addr show kc").contains(&format!("inet {}/24 brd 10.9.0.255", lease.address)));
         assert!(ip("-4 route show default").contains("default via 10.9.0.1 dev kc"));
+    }
+}
+
+#[cfg(test)]
+mod ntp {
+    use super::*;
+
+    /// A server's OFFER for xid 7 to `mac`, with `options` after the mask and before the end.
+    fn offer(mac: [u8; 6], options: &[u8]) -> Vec<u8> {
+        let mut offer = vec![0; 236];
+        offer[0] = 2;
+        offer[4..8].copy_from_slice(&7u32.to_be_bytes());
+        offer[16..20].copy_from_slice(&[10, 9, 0, 50]);
+        offer[28..34].copy_from_slice(&mac);
+        offer.extend(MAGIC);
+        offer.extend([53, 1, OFFER, 1, 4, 255, 255, 255, 0]);
+        offer.extend(options);
+        offer.push(255);
+        offer
+    }
+
+    #[test]
+    fn dhcp_ntp_option_42_is_parsed_into_the_lease() {
+        let mac = [0x52, 0x54, 0, 1, 2, 3];
+        let (_, lease) = reply(&offer(mac, &[42, 8, 10, 9, 0, 7, 10, 9, 0, 8]), 7, mac).unwrap();
+        assert_eq!(lease.ntp, [Ipv4Addr::new(10, 9, 0, 7), Ipv4Addr::new(10, 9, 0, 8)]);
+        // None named: none (and the lease is as before); a ragged tail is not an address.
+        let (_, none) = reply(&offer(mac, &[]), 7, mac).unwrap();
+        assert!(none.ntp.is_empty());
+        let (_, ragged) = reply(&offer(mac, &[42, 6, 10, 9, 0, 7, 1, 2]), 7, mac).unwrap();
+        assert_eq!(ragged.ntp, [Ipv4Addr::new(10, 9, 0, 7)]);
+        // A server that names a hundred is heard for four.
+        let mut many = vec![42, 40];
+        many.extend((1..=10).flat_map(|n| [10, 9, 0, n]));
+        let (_, many) = reply(&offer(mac, &many), 7, mac).unwrap();
+        assert_eq!(many.ntp.len(), 4);
+    }
+
+    #[test]
+    fn dhcp_ntp_server_choice_is_the_one_told_and_the_lease_only_where_none_is() {
+        let mac = [0x52, 0x54, 0, 1, 2, 3];
+        let options = [3, 4, 10, 9, 0, 1, 42, 4, 10, 9, 0, 7];
+        let (_, lease) = reply(&offer(mac, &options), 7, mac).unwrap();
+        let told = Some("10.9.0.9:5123".parse().unwrap());
+        let at = |address: &str| address.parse::<std::net::SocketAddr>().unwrap();
+        // A rogue DHCP server's option 42 does not outrank the operator's word.
+        assert_eq!(
+            crate::clock::order(&lease.ntp, told, lease.router),
+            [at("10.9.0.9:5123")]
+        );
+        // Nothing told: the lease's server, then the gateway.
+        assert_eq!(
+            crate::clock::order(&lease.ntp, None, lease.router),
+            [at("10.9.0.7:123"), at("10.9.0.1:123")]
+        );
+        // A network that names none, and one told: the one told; with neither, none
+        // (the cluster's leader is asked then, as `clock::ask` does).
+        let (_, bare) = reply(&offer(mac, &options[..6]), 7, mac).unwrap();
+        assert_eq!(crate::clock::order(&bare.ntp, told, bare.router), [at("10.9.0.9:5123")]);
+        assert!(crate::clock::order(&bare.ntp, None, None).is_empty());
+    }
+
+    #[test]
+    fn dhcp_ntp_is_asked_for_in_every_message() {
+        let mac = [0x52, 0x54, 0, 1, 2, 3];
+        for kind in [DISCOVER, REQUEST] {
+            let message = message(kind, 7, mac, "", None);
+            let at = message
+                .windows(2)
+                .position(|w| w == [55, 5])
+                .expect("a parameter request list");
+            assert_eq!(&message[at + 2..at + 8], &[1, 3, 6, 51, 42, 255]);
+        }
     }
 }
