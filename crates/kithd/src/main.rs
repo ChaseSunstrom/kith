@@ -574,8 +574,11 @@ async fn membership(
     }
     // (A node that roams is called at its mesh address, which is an IPv6 one.)
     // It joined as one if it was told whom to call first; that file stays.
+    // So is one with a mesh that joined over the LAN: it is called there once the mesh is up, and
+    // still on the LAN (an IPv6 socket takes both, unless the machine's `bindv6only` says not).
     let roams = args.roaming || mesh::first_peers(&dir.join("mesh.key")).exists();
-    let anywhere: std::net::IpAddr = if roams {
+    let takes_both = || std::fs::read_to_string("/proc/sys/net/ipv6/bindv6only").is_ok_and(|on| on.trim() == "0");
+    let anywhere: std::net::IpAddr = if roams || args.mesh.is_some() && takes_both() {
         std::net::Ipv6Addr::UNSPECIFIED.into()
     } else {
         std::net::Ipv4Addr::UNSPECIFIED.into()
@@ -1107,13 +1110,17 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 cluster::offer_claim(&shared);
             }
             eprintln!("kithd: node {} serving other nodes on {address}", cluster.me.name);
+            let on_mesh = address.is_ipv6() && address.ip().is_unspecified();
+            cluster::SERVES_MESH.store(on_mesh, std::sync::atomic::Ordering::Relaxed);
             let _ = netboot::PORT.set(address.port());
             let _ = netboot::RELEASES.set((args.release_key.clone(), state.clone(), args.lan_releases));
             if args.admit_deleted_nodes {
                 eprintln!("kithd: --admit-deleted-nodes: a deleted node's certificate is still taken here");
                 cluster::ADMIT_DELETED.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            let listener = cluster::listen(tcp, pki::server_config(&cluster.me)?).map_err(|e| fail("listening", &e))?;
+            let mesh_me = kith_mesh::node_address(mesh::prefix(&cluster.me.ca), &cluster.me.name);
+            let listener = cluster::listen_on(tcp, pki::server_config(&cluster.me)?, Some(mesh_me))
+                .map_err(|e| fail("listening", &e))?;
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();
             let served = axum::serve(listener, app).with_graceful_shutdown(async move { drop(stop.changed().await) });
