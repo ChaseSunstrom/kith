@@ -1155,7 +1155,12 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        // (A copy left behind holds the init's env, so a failed removal is said, not dropped.)
+        if let Err(e) = fs::remove_dir_all(&self.0)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("kithd: cannot remove {}: {e}", self.0.display());
+        }
     }
 }
 

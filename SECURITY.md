@@ -176,7 +176,7 @@ Only the newest version is fixed. There are no security releases of older ones.
   state and spec made for that one entry (a directory of kithd's own user, mode 0700,
   created without following a link, removed when the process has started or failed to, and
   swept at the next start if kithd was killed in between); the copy differs from the
-  init's spec in `additionalGids` alone, which the entered process is given as its own.
+  init's spec in `additionalGids` alone (and in the paths that name where the copy is kept), which the entered process is given as its own.
   A GPU share (`share: { vram }`) is a ceiling only where the Device has a `dmem` region
   and kithd can hand the dmem controller down: the kernel then keeps the container's use
   of that GPU's memory under the share (`dmem.max`). Elsewhere it is a count the scheduler
