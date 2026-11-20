@@ -496,6 +496,9 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
   - During a rolling upgrade, an older kithd reads only the exact value `owner`, so on a node
     with `owner;plan:NAME` it may lift a cordon that was an operator's, or leave one stuck until
     `kith node uncordon`. Finish the upgrade before you run an UpdatePlan with `drain: true`.
+  - A plan lifts only a drain or cordon that carries its own stamp. One an older kithd put on
+    has none, so it stays after the plan ends or is deleted, until `kith node undrain` or
+    `kith node uncordon`.
 
 ### Checkpointing a long GPU Job
 

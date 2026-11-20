@@ -501,6 +501,17 @@ fn written(
     plan: &str,
     live: &dyn Fn(&str) -> bool,
 ) -> Option<Value> {
+    if !on && crate::sched::has_record(spec, record) {
+        // Only the plan's own record is lifted by it; the sweep (`plan` empty) lifts a gone plan's.
+        let by = stamped_by(spec, record);
+        if !(if plan.is_empty() {
+            by.is_some_and(|by| !live(by))
+        } else {
+            by == Some(plan)
+        }) {
+            return None;
+        }
+    }
     let mut next = what(spec, on).unwrap_or_else(|| spec.clone());
     let ours = !crate::sched::has_record(spec, record) || stamped_by(spec, record).is_some_and(|by| !live(by));
     if on && ours {
@@ -2967,6 +2978,40 @@ mod tests {
         // A record the write creates is stamped.
         let made = written(&json!({}), true, drained_spec, drain, "p", &live).expect("a drain");
         assert_eq!(made["taints"][0]["value"], "plan:p");
+    }
+
+    /// A lift takes off only a record that is the plan's own (its stamp), or, for the sweep (plan
+    /// `""`), one a gone plan left: not an operator's drain put on after the plan's.
+    #[test]
+    fn update_delete_lifts_not_a_record_put_on_after_the_plans() {
+        let (drain, cordon) = (kith_sched::DRAIN, crate::sched::UPDATE_CORDON);
+        let live = |plan: &str| plan == "p" || plan == "q";
+        // The plan drained and cordoned `a`; the operator undrained and drained again: a new,
+        // unstamped record. The plan's end, and the sweep, leave it.
+        let mut spec = put_on_by(&json!({}), "p", true);
+        let mut redone = spec.clone();
+        apply_drain(&mut redone, false);
+        apply_drain(&mut redone, true);
+        assert_eq!(stamped_by(&redone, drain), None);
+        assert_eq!(written(&redone, false, drained_spec, drain, "p", &live), None);
+        assert_eq!(written(&redone, false, drained_spec, drain, "", &|_| false), None);
+        // The same for the update's cordon.
+        let mut cordoned = json!({});
+        crate::sched::cordon_on(&mut cordoned, cordon, "noSchedule");
+        assert_eq!(written(&cordoned, false, cordoned_spec, cordon, "p", &live), None);
+        assert_eq!(written(&cordoned, false, cordoned_spec, cordon, "", &|_| false), None);
+        // Its own stamp is lifted by it, and by no other live plan; the sweep lifts it only
+        // once the plan is gone.
+        assert_eq!(written(&spec, false, drained_spec, drain, "q", &live), None);
+        assert_eq!(written(&spec, false, drained_spec, drain, "", &live), None);
+        let lifted = written(&spec, false, drained_spec, drain, "p", &live).expect("its own drain");
+        assert!(!crate::sched::has_record(&lifted, drain), "{lifted}");
+        let gone = written(&spec, false, drained_spec, drain, "", &|plan| plan != "p").expect("a gone plan's");
+        assert!(!crate::sched::has_record(&gone, drain), "{gone}");
+        // With nothing recorded there is nothing to lift (an older kithd's update cordon is
+        // still taken off as before).
+        spec = json!({ "unschedulable": true });
+        assert!(written(&spec, false, cordoned_spec, cordon, "p", &live).is_some());
     }
 
     #[test]
