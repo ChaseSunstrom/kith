@@ -196,17 +196,20 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
         .flatten()
         .filter_map(|(name, why)| Some((name.clone(), why.as_str()?.to_string())))
         .collect();
+    // The wait for a seat counts continuous picking: it is kept only by the pass that picks, so any
+    // other (paused, a closed window, no release) writes none and the clock starts again.
+    let mut idle_before: BTreeMap<String, u64> = old
+        .and_then(|status| status["idleSince"].as_object())
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, at)| Some((name.clone(), at.as_u64()?)))
+        .collect();
     let mut held = Held {
         drained: names("drained"),
         gave,
         drain: Vec::new(),
         lifting: Vec::new(),
-        idle: old
-            .and_then(|status| status["idleSince"].as_object())
-            .into_iter()
-            .flatten()
-            .filter_map(|(name, at)| Some((name.clone(), at.as_u64()?)))
-            .collect(),
+        idle: BTreeMap::new(),
     };
     // A lift that was lost (the Node still shows the drain) is asked for again.
     for name in names("undraining") {
@@ -251,7 +254,7 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
             let_go(&name, &mut cordoned, &mut held, &mut cordon);
         }
         held.gave.clear();
-        held.idle.clear();
+        idle_before.clear();
     }
     let selected = |node: &&Node| {
         let wanted = spec["selector"].as_object();
@@ -407,7 +410,7 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
         let fits = now_going.len() < most && !now_going.iter().any(|other| other.voter);
         let busy = node.seat.as_ref().filter(|_| idle_wait);
         // (The count runs while it waits for its turn too.)
-        let began = held.idle.get(&node.name).copied().unwrap_or(now);
+        let began = idle_before.get(&node.name).copied().unwrap_or(now);
         if busy.is_some() {
             idle.insert(node.name.clone(), began);
         }
@@ -3001,6 +3004,38 @@ mod tests {
         let first = go(&long, None, &nodes, 0);
         assert!(told(&go(&long, Some(&first), &nodes, 86_399)).is_empty());
         assert_eq!(told(&go(&long, Some(&first), &nodes, 86_400)), ["a"]);
+    }
+
+    /// The wait for a seat counts continuous picking: a pause or a closed window restarts it.
+    #[test]
+    fn update_idle_wait_restarts_after_a_pause_or_a_closed_window() {
+        let go = |spec: &Value, last: Option<&Decided>, nodes: &[Node], at: u64| {
+            step(&plan(spec.clone(), last), Some(("2", "next@1")), nodes, at)
+        };
+        let nodes = vec![seated("a", "active")];
+        let open = json!({ "waitForIdleSeats": true });
+        let first = go(&open, None, &nodes, 1000);
+        assert!(told(&first).is_empty());
+        // Paused for a day: the next pass picks again, and the clock starts there.
+        let paused = go(
+            &json!({ "waitForIdleSeats": true, "paused": true }),
+            Some(&first),
+            &nodes,
+            1000 + 86_400,
+        );
+        assert_eq!(paused.status["idleSince"], json!({}));
+        let again = go(&open, Some(&paused), &nodes, 1000 + 86_400);
+        assert!(told(&again).is_empty(), "{:?}", again.status);
+        assert_eq!(told(&go(&open, Some(&again), &nodes, 1000 + 86_400 + 3600)), ["a"]);
+        // A closed window (1970-01-01 is a Thursday; 00:00 UTC is minute 0 of that day) does too.
+        let spec = json!({ "waitForIdleSeats": true, "windows": ["00:00-00:30"] });
+        let first = go(&spec, None, &nodes, 0);
+        assert!(told(&first).is_empty());
+        let closed = go(&spec, Some(&first), &nodes, 3600 * 12);
+        assert_eq!(closed.status["phase"], "Waiting");
+        assert_eq!(closed.status["idleSince"], json!({}));
+        let next_night = go(&spec, Some(&closed), &nodes, 86_400);
+        assert!(told(&next_night).is_empty(), "{:?}", next_night.status);
     }
 
     /// An update ends only the cordon it put on: one its owner set first stays, a drained node
