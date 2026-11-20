@@ -64,7 +64,10 @@ KITHD_IDLE_RSS = 9 * MB
 # RAISE, kith 3.00 to 3.02 and kith-remote 3.62 to 3.64 (T-0031): kith context add|use|ls|rm and
 # the --context pick read and write contexts.yaml through kith-yaml over a plain value (no
 # derived type), 3,159,384 B and 3,810,680 B built here; the budgets keep a few KB for a folder.
-SIZE_BUDGETS = {"kith": int(3.02 * MB), "kith-remote": int(3.64 * MB), "kithd": int(KITHD_SIZE * MB)}
+# RAISE, kith 3.02 to 3.03 (T-1107): main 7b895da2 builds kith at 3,163,480 B in one folder and
+# 3,167,576 B (877 B over 3.02) in another; T-1016's kith adds a 4 KiB page, so train AY's merged
+# tree is over 3.02 in every folder.
+SIZE_BUDGETS = {"kith": int(3.03 * MB), "kith-remote": int(3.64 * MB), "kithd": int(KITHD_SIZE * MB)}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
