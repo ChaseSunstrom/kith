@@ -4,8 +4,8 @@
 //! the root part as a second process takes the same [`Request`]s over a socket pair, with
 //! [`decode`] reading each one. Here are the Listeners family (`Bind`), the Pods family (`Pod`,
 //! `Sockets`, [`Root::create`] and [`Root::start`]) and, through the last, what Services and
-//! probes connect into a pod by, and the Mesh family (`MeshUp`, `Mesh`, `MeshSeen`, `MeshDown`:
-//! the WireGuard interface, its addresses and its peers) and the Images family (`Unpack`, with
+//! probes connect into a pod by, and the Mesh family (`MeshUp`, `Mesh`, `MeshSeen`, `MeshDown`, `MeshKey`:
+//! the WireGuard interface, its addresses, its peers and the steps of replacing its key) and the Images family (`Unpack`, with
 //! the layers as files beside the request, and `Drop`: both name a digest, and the path is
 //! derived from it here) and the Units family (`Kill`, `Delete`, `Tune`, `Plug`, `Unplug`: each
 //! names a unit by the id this part made at Create, and is refused one it did not; `Plug` a
@@ -87,6 +87,21 @@ pub enum Proto {
     Udp,
 }
 
+/// The steps of a mesh key's replacement, in the order they are taken (`mesh.rs` says when). The key
+/// file stays the old key until `Commit`; every step before it can be undone by `Revert`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyStep {
+    /// A new key made and written beside the file's (`mesh.next`, atomically, for the node alone):
+    /// its public key comes back.
+    Make,
+    /// The interface run on the new key: its public key comes back.
+    Use,
+    /// The interface run on the file's key again, and the new key taken away.
+    Revert,
+    /// The new key made the file's, atomically: the old one is gone.
+    Commit,
+}
+
 /// One thing the serving part asks of the root part.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,6 +139,9 @@ pub enum Request {
     MeshSeen { interface: String },
     /// The interface taken away.
     MeshDown { interface: String },
+    /// A step of this node's WireGuard key being replaced, which only the root part touches: the
+    /// key file and the interface's key are its own, and what it was told of the mesh names them.
+    MeshKey { interface: String, step: KeyStep },
     /// The image `image` (a digest) unpacked, its `manifest` (the text the digest is of) saying
     /// what it is made of; the layer files come beside the request, one for each layer the
     /// manifest names, in order. The store and the path are the root part's: it derives them
@@ -298,7 +316,11 @@ pub fn check(request: &Request) -> Result<(), String> {
             }
         }
         // (Against what the root part was told of the mesh, which is not in the request: [`check_mesh`].)
-        Request::MeshUp { .. } | Request::Mesh { .. } | Request::MeshSeen { .. } | Request::MeshDown { .. } => Ok(()),
+        Request::MeshUp { .. }
+        | Request::Mesh { .. }
+        | Request::MeshSeen { .. }
+        | Request::MeshDown { .. }
+        | Request::MeshKey { .. } => Ok(()),
         // (Digests, and nothing else, become the names of files.)
         Request::Unpack { image, .. } | Request::Drop { image, .. } => digest(image),
         // (Against the units made here and the claims: [`Book::known`].)
@@ -393,7 +415,8 @@ fn check_mesh(request: &Request, told: &Option<MeshTold>) -> Result<(), String> 
         Request::MeshUp { interface, .. }
         | Request::Mesh { interface, .. }
         | Request::MeshSeen { interface }
-        | Request::MeshDown { interface } => interface,
+        | Request::MeshDown { interface }
+        | Request::MeshKey { interface, .. } => interface,
         _ => return Ok(()),
     };
     let told = told.as_ref().ok_or("this root part was told no mesh")?;
@@ -412,6 +435,8 @@ fn check_mesh(request: &Request, told: &Option<MeshTold>) -> Result<(), String> 
             "{address}: not this node's address of the mesh {prefix}/{}",
             kith_mesh::MESH_BITS
         )),
+        // (A key is replaced on an interface that is up: the steps run on it, and the file is its.)
+        Request::MeshKey { .. } if !told.up => Err("the mesh is not up".into()),
         Request::Mesh { peers, addresses, .. } => {
             if !told.up {
                 return Err("the mesh is not up".into());
@@ -921,6 +946,55 @@ pub trait Hands {
         let device = DEVICE.lock().expect("nothing panics holding the device").take();
         device.ok_or("the mesh is not up")?.remove().map_err(|e| e.to_string())
     }
+    /// A step of the key's replacement (`key` is the key file, `KeyStep` says what each does). A
+    /// public key comes back from `Make` and `Use`. The key file is only ever written whole, and
+    /// only `Commit` writes it: until then the old key is the node's, and `Revert` puts the
+    /// interface back on it.
+    fn mesh_key(&self, step: KeyStep, key: &Path) -> Result<Option<kith_mesh::Key>, String> {
+        let next = crate::mesh::next_path(key);
+        let (io, read) = (
+            |e: std::io::Error| e.to_string(),
+            |path: &Path| crate::mesh::read_key(path),
+        );
+        match step {
+            KeyStep::Make => {
+                let made = crate::mesh::make_key(&next).map_err(io)?;
+                kith_mesh::public_of(&made).map(Some).map_err(io)
+            }
+            KeyStep::Use => {
+                let new = read(&next).map_err(io)?;
+                let public = kith_mesh::public_of(&new).map_err(io)?;
+                device(|device| device.set_private_key(&new))?;
+                Ok(Some(public))
+            }
+            KeyStep::Revert => {
+                // (Only an interface that is not on the file's key is touched: a set expires its sessions.)
+                let old = read(key).map_err(io)?;
+                let public = kith_mesh::public_of(&old).map_err(io)?;
+                let held = DEVICE.lock().expect("nothing panics holding the device").is_some();
+                if held && device(|device| device.public_key())? != public {
+                    device(|device| device.set_private_key(&old))?;
+                }
+                match std::fs::remove_file(&next) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+                    _ => Ok(None),
+                }
+            }
+            KeyStep::Commit => {
+                // (Never the file of a key the interface is not running on: that would be a node
+                // that is gone from the mesh at its next start.)
+                let new = read(&next).map_err(io)?;
+                if device(|device| device.public_key())? != kith_mesh::public_of(&new).map_err(io)? {
+                    return Err("the interface is not on the new key".into());
+                }
+                crate::mesh::write_key(key, &new).map_err(io)?;
+                // (The file is the key now: a `mesh.next` left behind is the same key, and the next
+                // `Make` writes over it. An error here would be a refusal of what is done.)
+                let _ = std::fs::remove_file(&next);
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// The root part, as the serving part sees it.
@@ -1235,6 +1309,10 @@ impl<'a, H: Hands> Direct<'a, H> {
                 self.up(false);
                 Ok(Reply::Done)
             }
+            Request::MeshKey { step, .. } => match self.hands.mesh_key(step, &told.key)? {
+                Some(key) => Ok(Reply::Key(key)),
+                None => Ok(Reply::Done),
+            },
             _ => Err("not a request of the mesh".into()),
         }
     }
@@ -1479,7 +1557,9 @@ impl<H: Hands> Direct<'_, H> {
             Request::Bind { .. } => Kind::Bind,
             Request::Pod { .. } => Kind::Pod,
             Request::Sockets { .. } => Kind::Sockets,
-            Request::MeshUp { .. } | Request::Mesh { .. } | Request::MeshDown { .. } => Kind::Mesh,
+            Request::MeshUp { .. } | Request::Mesh { .. } | Request::MeshDown { .. } | Request::MeshKey { .. } => {
+                Kind::Mesh
+            }
             Request::MeshSeen { .. } => Kind::Seen,
             Request::Unpack { .. } => Kind::Unpack,
             Request::Drop { .. } => Kind::Drop,
@@ -1529,7 +1609,8 @@ impl<H: Hands> Direct<'_, H> {
             mesh @ (Request::MeshUp { .. }
             | Request::Mesh { .. }
             | Request::MeshSeen { .. }
-            | Request::MeshDown { .. }) => self.mesh_request(mesh),
+            | Request::MeshDown { .. }
+            | Request::MeshKey { .. }) => self.mesh_request(mesh),
             Request::Bind { address, port, proto } => {
                 let at = SocketAddr::new(address, port);
                 let made = match proto {
@@ -1732,6 +1813,19 @@ pub fn mesh_seen<R: Root>(root: &R, interface: &str) -> Result<Vec<kith_mesh::Se
         interface: interface.into(),
     })? {
         Reply::Seen(seen) => Ok(seen),
+        _ => Err("the root part answered a request for the mesh with something else".into()),
+    }
+}
+
+/// A step of the node's mesh key being replaced: the new public key, for the two steps that have one.
+pub fn mesh_key_step<R: Root>(root: &R, interface: &str, step: KeyStep) -> Result<Option<kith_mesh::Key>, String> {
+    let ask = Request::MeshKey {
+        interface: interface.into(),
+        step,
+    };
+    match (root.request(ask)?, step) {
+        (Reply::Key(key), KeyStep::Make | KeyStep::Use) => Ok(Some(key)),
+        (Reply::Done, KeyStep::Revert | KeyStep::Commit) => Ok(None),
         _ => Err("the root part answered a request for the mesh with something else".into()),
     }
 }
@@ -2005,6 +2099,16 @@ mod tests {
 
         fn mesh_down(&self) -> Result<(), String> {
             self.slow("mesh_down")
+        }
+
+        fn mesh_key(&self, step: KeyStep, _: &Path) -> Result<Option<kith_mesh::Key>, String> {
+            let (what, key) = match step {
+                KeyStep::Make => ("mesh_key_make", Some([8; 32])),
+                KeyStep::Use => ("mesh_key_use", Some([8; 32])),
+                KeyStep::Revert => ("mesh_key_revert", None),
+                KeyStep::Commit => ("mesh_key_commit", None),
+            };
+            self.slow(what).map(|()| key)
         }
     }
 
@@ -3197,6 +3301,33 @@ mod tests {
         let literal = r#"{"MeshUp":{"interface":"kith0","address":"fd12:3456:789a:bcde:f012::1"}}"#;
         assert_eq!(serde_json::to_string(&up).unwrap(), literal);
         assert_eq!(decode(literal.as_bytes()).unwrap(), up);
+    }
+
+    #[test]
+    fn a_key_step_is_on_the_wire_as_pinned_and_answered_as_a_key_or_as_done() {
+        let (book, prefix) = meshed("a cluster");
+        let root = Direct::with(Fake::default(), &book);
+        up(&root, prefix).unwrap();
+        let literal = r#"{"MeshKey":{"interface":"kith0","step":"Use"}}"#;
+        let ask = Request::MeshKey {
+            interface: WG.into(),
+            step: KeyStep::Use,
+        };
+        assert_eq!(serde_json::to_string(&ask).unwrap(), literal);
+        assert_eq!(decode(literal.as_bytes()).unwrap(), ask);
+        assert!(decode(br#"{"MeshKey":{"interface":"kith0","step":"Wipe"}}"#).is_err());
+        assert!(decode(br#"{"MeshKey":{"interface":"kith0","step":"Use","path":"/x"}}"#).is_err());
+        assert_eq!(mesh_key_step(&root, WG, KeyStep::Make).unwrap(), Some([8; 32]));
+        assert_eq!(mesh_key_step(&root, WG, KeyStep::Use).unwrap(), Some([8; 32]));
+        assert_eq!(mesh_key_step(&root, WG, KeyStep::Revert).unwrap(), None);
+        assert_eq!(mesh_key_step(&root, WG, KeyStep::Commit).unwrap(), None);
+        // Only the mesh's own interface, and only of a node that was told a mesh.
+        let refused = mesh_key_step(&root, "eth0", KeyStep::Commit).unwrap_err();
+        assert!(refused.contains("not the mesh's interface"), "{refused}");
+        let none = Book::new();
+        let nobody = Direct::with(Fake::default(), &none);
+        assert!(mesh_key_step(&nobody, WG, KeyStep::Make).is_err());
+        assert!(nobody.hands.reached().is_empty());
     }
 
     #[test]
