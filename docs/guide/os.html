@@ -190,6 +190,7 @@ join:                         # without it the node starts a new cluster
 encrypt: true                 # its state under a key the cluster holds: see "Encrypted state"
 releaseKey: $KEY              # kith OS releases signed by this key only: see "Rolling a release"
 lanReleases: true             # releases may come from a server on the node's private ranges
+mesh: true                    # starts with its WireGuard mesh on (`--mesh`); see "The mesh" in the cluster guide
 nodePolicy: hardened          # what the cluster may not have this node do: see "What a node refuses, whatever the cluster says"
 </code></pre>
 <p>Then nothing is asked or confirmed: a stick with answers erases the disk they name in whatever machine it starts. A disk that is not there, <code>only</code> on a machine with several, or an unknown field stops it with the reason on the console and nothing written. <a href="../install.html">The installer's page</a> is a form that writes this file in your browser, and checks each answer as you type.</p>
@@ -209,7 +210,7 @@ kith node netboot --off
 sh ci/vm.sh --test netboot             # the same, in QEMU, on a disk that is a file
 </code></pre>
 <p>Then set each machine to start from the network (PXE, IPv4) once, or first in its boot order: a machine that has the installer is not answered again and goes on to its disk. <strong>Everything on that disk is lost</strong>, and nobody is asked at the machine: name only cards of machines you mean to erase. <code>--disk only</code> (the default) installs on a machine's one disk and refuses a machine with several; <code>--disk nvme0n1</code> names it. Netboot turns itself off after <code>--minutes</code> (30; at most 60), when the node restarts, or with <code>--off</code>.</p>
-<p>The machine is installed with this node's release keys (as the node holds them when netboot is turned on) and <code>--lan-releases</code>, if the node has them: it takes kith OS releases from the same keys, not from the first release's. The answers hold 8 keys at most: a node with more, or with keys it cannot read, does not turn netboot on and says which.</p>
+<p>The machine is installed with this node's release keys (as the node holds them when netboot is turned on) and <code>--lan-releases</code>, if the node has them: it takes kith OS releases from the same keys, not from the first release's. The answers hold 8 keys at most: a node with more, or with keys it cannot read, does not turn netboot on and says which. A node started with <code>--mesh</code> has the machine start with <code>mesh: true</code> as well. A node on the Cluster's <code>spec.mesh</code> does not: the machine has no flag, so it follows the Cluster's switch once it has joined.</p>
 <p>The node must be the one that started the cluster (it holds the CA, which makes the join tokens) and run with <code>--listen</code>. An Identity that may apply Nodes, Roles and RoleBindings sends the same over TLS (<code>GET</code> says where it stands, <code>DELETE</code> turns it off):</p>
 <pre><code class="language-sh">curl --cacert ca.pem --cert cert.pem --key key.pem --data-binary @target/os/kith-netboot.efi \
     -X PUT 'https://NODE:7443/v1/netboot?macs=52:54:00:12:34:56,52:54:00:12:34:57&amp;minutes=30&amp;disk=only'

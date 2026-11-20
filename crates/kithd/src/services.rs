@@ -1237,14 +1237,14 @@ async fn within<T>(doing: impl Future<Output = std::io::Result<T>>) -> std::io::
 }
 
 /// Listen for every Service on this node's mesh interface (the loopback with no mesh), until
-/// stopped. `port` is the TCP port other nodes pass connections on to (the mesh's own, which is
-/// UDP); none with no mesh, where there is no relay either.
+/// stopped. `shared.mesh_port` is the TCP port other nodes pass connections on to (the mesh's
+/// own, which is UDP); none with no mesh, where there is no relay either. It may change while
+/// this runs (`mesh::follow`): the listeners are then made again.
 ///
 /// With `strays` (a node with the ingress), ports 443 and 80 of the Services' addresses
 /// are not listened on here: the ingress has those ports, and sends what is ours on.
 pub async fn run(
     shared: Arc<Shared>,
-    port: Option<u16>,
     mut strays: Option<mpsc::UnboundedReceiver<TcpStream>>,
     mut stopping: watch::Receiver<bool>,
 ) {
@@ -1337,8 +1337,22 @@ pub async fn run(
     let services = crate::pods::service_range();
     let mut on_loopback4 = services.map(v4::Loopback::new);
     let mut unbound = BTreeSet::new();
-    let relay = port.map(|port| (IpAddr::V6(me), port));
+    let mut mesh_port = shared.mesh_port.subscribe();
+    let mut port = *mesh_port.borrow_and_update();
     loop {
+        // (The mesh came, or went, since the last round: the listeners were made for the other
+        // kind of address, so they are made again; the loopback's addresses go with the mesh's.)
+        let now = *mesh_port.borrow_and_update();
+        if now != port {
+            port = now;
+            listening.values().flatten().for_each(tokio::task::JoinHandle::abort);
+            listening.clear();
+            unbound.clear();
+            if port.is_some() {
+                on_loopback.hold(&BTreeSet::new());
+            }
+        }
+        let relay = port.map(|port| (IpAddr::V6(me), port));
         // (Asked before the store's lock: never both at once. The rules themselves are kept in
         // step by `pods::keep_held`, which needs no cluster.)
         let unsent = shared.pods.lock().expect("nothing panics holding the pods").unsent();
@@ -1502,6 +1516,7 @@ pub async fn run(
         tokio::select! {
             _ = generation.changed() => {}
             () = moved.notified() => {}
+            _ = mesh_port.changed() => {}
             () = tokio::time::sleep(again) => {}
             _ = stopping.changed() => break,
         }

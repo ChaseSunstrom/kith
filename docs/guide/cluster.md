@@ -76,6 +76,12 @@ the plan allowed 0.3 ms).
 - Without `--mesh` (kith OS's default) a Service still answers the pods of the node it is on:
   kithd puts the Service's address on the loopback, and its status says the address and
   backends as ever. Other nodes' replicas are out of reach, as no mesh carries them.
+- A cluster turns the mesh on for kith OS nodes with no reinstall: `spec.mesh: { enabled: true }`
+  (`port:` is the UDP port, 51820 without) on its `Cluster`. Every node started without `--mesh`,
+  the members already running included, brings `kith0` up within seconds, and takes it down
+  again, and goes back to loopback Services, when the switch is removed or set to `false`.
+  Nothing restarts. A node started with `--mesh` keeps it whatever the Cluster says. Off is the
+  default. At install, `mesh: true` in the answers starts a node with it on.
 - Each node gets a stable IPv6 address derived from the CA and its name; `kith get node/NAME -o
   yaml` shows it and the public key (`mesh`), `kith node status` the peers and their last
   handshakes. The private key stays in `<state>/pki`.
@@ -459,6 +465,19 @@ lands on the new holder, as the address moved with it. A name in `endpoint` is l
 the mesh's loop, never holding it: until the first answer the holder is called where it was, the
 answer is kept and looked up again each minute (each half minute while it does not resolve), and
 kithd logs when it starts or stops resolving, not on each try.
+
+### Usage over time
+
+Each kithd samples its machine every 10 seconds (CPU, memory, the disk under `--state`, disk
+and network rates, load) and each unit of a Workload's replicas (CPU cores from its cgroup's
+`cpu.stat`, memory from `memory.current`), and keeps an hour of 10-second points and a day of
+5-minute points in memory: a restart starts them empty, and nothing goes through Raft or to
+disk. A Workload not seen for an hour is forgotten with its history, and at most 512 are kept.
+
+`GET /v1/metrics?range=15m|1h|6h|24h` on any node answers for all of them: the other nodes'
+series are asked over the node-to-node connection, each given 3 seconds, and one that does not
+answer is `"missing": true` with empty series. A Workload with replicas on several nodes is
+under `NS/NAME` for the first node by name and `NS/NAME@NODE` for each other.
 
 ### Not yet
 

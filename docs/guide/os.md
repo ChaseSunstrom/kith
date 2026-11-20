@@ -516,6 +516,7 @@ join:                         # without it the node starts a new cluster
 encrypt: true                 # its state under a key the cluster holds: see "Encrypted state"
 releaseKey: $KEY              # kith OS releases signed by this key only: see "Rolling a release"
 lanReleases: true             # releases may come from a server on the node's private ranges
+mesh: true                    # starts with its WireGuard mesh on (`--mesh`); see "The mesh" in the cluster guide
 nodePolicy: hardened          # what the cluster may not have this node do: see "What a node refuses, whatever the cluster says"
 ```
 
@@ -583,7 +584,9 @@ when the node restarts, or with `--off`.
 The machine is installed with this node's release keys (as the node holds them when netboot is
 turned on) and `--lan-releases`, if the node has them: it takes kith OS releases from the same
 keys, not from the first release's. The answers hold 8 keys at most: a node with more, or with
-keys it cannot read, does not turn netboot on and says which.
+keys it cannot read, does not turn netboot on and says which. A node started
+with `--mesh` has the machine start with `mesh: true` as well. A node on the Cluster's
+`spec.mesh` does not: the machine has no flag, so it follows the Cluster's switch once it has joined.
 
 The node must be the one that started the cluster (it holds the CA, which makes the join tokens)
 and run with `--listen`. An Identity that may apply Nodes, Roles and RoleBindings sends the same
