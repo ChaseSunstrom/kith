@@ -127,7 +127,7 @@ node 20 times, and prints the median of each phase, the time since the mark befo
 is a line `kith-timeline NAME NANOS` (CLOCK_MONOTONIC) on kithd's log. On the dev PC (16 CPUs,
 load 6.4, the median of 20):
 
-| Phase | Time |
+| Step | Time |
 |---|---|
 | the CLI and the request reaching the handler | 5.8 ms |
 | store write (a raft commit, one fsync) | 7.7 ms |
