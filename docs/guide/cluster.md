@@ -607,6 +607,21 @@ The GPU is a `DeviceClaim` ([Hardware](hardware.md#hardware)); the checkpoint fo
 program's. `sh ci/vm.sh --test pods` runs this around a drain: the Job waits while its node is
 drained, then resumes from the step it left.
 
+### Encrypting a node that was installed plain
+
+```sh
+kith node drain n1                # nothing may be left running on n1
+kith node encrypt n1              # makes n1's key and recovery key, shows the recovery key once, restarts n1
+kith node encrypt n1 --cancel     # before that restart: takes the marker and the key away
+```
+
+`kith node encrypt` is refused for a node that is not drained (or still runs something), is
+already encrypted or marked, or is in its installer. The next start encrypts n1's state in place
+before it is opened, and the node comes back as it was, encrypted. Keep the recovery key it shows:
+it is shown once, and no log has it. A power cut in the instant between the key and the marker
+stops that start with a message naming it; take the lock record off the config partition to start
+the node plain again.
+
 ## When every node was off
 
 A power cut takes every node at once, and a cluster of [encrypted

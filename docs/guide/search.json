@@ -27,6 +27,7 @@
 {"u":"guide/cluster.html#not-yet","t":"A cluster","h":"Not yet"},
 {"u":"guide/cluster.html#restarting-a-node-on-purpose","t":"A cluster","h":"Restarting a node on purpose"},
 {"u":"guide/cluster.html#checkpointing-a-long-gpu-job","t":"A cluster","h":"Checkpointing a long GPU Job"},
+{"u":"guide/cluster.html#encrypting-a-node-that-was-installed-plain","t":"A cluster","h":"Encrypting a node that was installed plain"},
 {"u":"guide/cluster.html#when-every-node-was-off","t":"A cluster","h":"When every node was off"},
 {"u":"guide/cluster.html#a-node-away-from-its-cluster","t":"A cluster","h":"A node away from its cluster"},
 {"u":"guide/cluster.html#dns","t":"A cluster","h":"DNS"},

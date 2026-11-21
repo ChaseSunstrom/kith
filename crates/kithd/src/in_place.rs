@@ -409,7 +409,6 @@ pub fn marked(config: &impl Disk) -> io::Result<bool> {
 /// Put the marker down: the next start runs the pass. The lock record, holding the state's key,
 /// is on the disk before this (init has no key to pass under without it), and the journal is
 /// empty: a pass of an older journal would be taken for this one's.
-#[allow(dead_code, reason = "what the verb writes (T-1106 slice b)")]
 pub fn mark(config: &impl Disk) -> io::Result<()> {
     if begun(config)? {
         return Err(bad("the journal holds a pass already: it is not marked over"));
