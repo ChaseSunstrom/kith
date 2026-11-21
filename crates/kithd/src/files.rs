@@ -198,7 +198,7 @@ mod tests {
                     crate::controller::storage::tests::deep(&base.join(REPLICAS).join("w_default_web_1/scratch/cache"));
                 let _ = crate::controller::storage::remove_tree(&base, &|| false);
                 assert!(!base.exists(), "{} is left behind", base.display());
-                assert_eq!(left,["w_default_web_1"], "{left:?}");
+                assert_eq!(left, ["w_default_web_1"], "{left:?}");
                 assert_eq!(kept, 2000);
             },
         );
