@@ -39,7 +39,8 @@ const CONTENT_TYPE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x
 /// The most bytes of a timestamp, certificates in it, and levels of DER nesting that are read.
 const STAMP: usize = 16 * 1024;
 const STAMP_CERTS: usize = 4;
-const STAMP_DEPTH: usize = 8;
+/// (10: a real TSA's signer is named by an issuer Name whose attributes sit at depth 9.)
+const STAMP_DEPTH: usize = 10;
 
 /// Who an image may be signed by without a kept key: whom the authority certified, as whom
 /// the issuer signed them in, and the authority's certificates and the log's key that say so.
@@ -498,6 +499,9 @@ fn nest(input: &[u8], depth: usize) -> std::result::Result<(), &'static str> {
         let Some((tag, contents, after)) = element(rest) else {
             return Err(match rest.get(1) {
                 Some(0x80) => "is BER, not DER (an indefinite length)",
+                Some(&first @ 0x81..=0x83) if non_minimal(&rest[2..], first) => {
+                    "is not DER (a length written in more bytes than it needs)"
+                }
                 _ => "cannot be read",
             });
         };
@@ -507,7 +511,7 @@ fn nest(input: &[u8], depth: usize) -> std::result::Result<(), &'static str> {
             }
         } else if tag & 0x20 != 0 && !(tag == 0x31 && last == 0x06) {
             if depth > STAMP_DEPTH {
-                return Err("nests deeper than 8");
+                return Err("nests deeper than 10");
             }
             nest(contents, depth + 1)?;
         }
@@ -745,8 +749,7 @@ fn element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         0x81..=0x83 => {
             let (bytes, rest) = rest.split_at_checked(usize::from(first & 0x7f))?;
             let len = bytes.iter().fold(0usize, |len, &byte| len << 8 | usize::from(byte));
-            // DER writes a length in the fewest bytes: a long form for under 128 is BER.
-            if len < 0x80 || bytes[0] == 0 {
+            if non_minimal(bytes, first) {
                 return None;
             }
             (len, rest)
@@ -755,6 +758,16 @@ fn element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     };
     let (contents, rest) = rest.split_at_checked(len)?;
     Some((tag, contents, rest))
+}
+
+/// Whether a long-form length (`first` is its 0x81..=0x83 byte, `after` what follows it) is
+/// written in more bytes than DER allows: DER uses the fewest, and the long form only from 128.
+fn non_minimal(after: &[u8], first: u8) -> bool {
+    let Some(bytes) = after.get(..usize::from(first & 0x7f)) else {
+        return false;
+    };
+    let len = bytes.iter().fold(0usize, |len, &byte| len << 8 | usize::from(byte));
+    len < 0x80 || bytes[0] == 0
 }
 
 /// The elements one after another in `input`.
@@ -1465,7 +1478,27 @@ pub(crate) mod tests {
                 &over
             },
         );
-        let sid = der(0x30, [der(0x30, vec![]), int(1)].concat());
+        // The signer's sid: an IssuerAndSerialNumber, the issuer a Name of no RDN, or (as a real
+        // TSA's) of several: C, O, OU, CN, and one RDN of two values.
+        let name = if fault == "issuer" {
+            let attr = |kind: u8, value: &str| {
+                der(
+                    0x30,
+                    [oid(&[0x55, 0x04, kind]), der(0x13, value.as_bytes().to_vec())].concat(),
+                )
+            };
+            let rdn = |attrs: &[Vec<u8>]| der(0x31, attrs.concat());
+            let rdns = [
+                rdn(&[attr(6, "US")]),
+                rdn(&[attr(10, "Example TSA Inc.")]),
+                rdn(&[attr(11, "Timestamping")]),
+                rdn(&[attr(3, "Example TSA"), attr(5, "0042")]),
+            ];
+            der(0x30, rdns.concat())
+        } else {
+            der(0x30, vec![])
+        };
+        let sid = der(0x30, [name, int(1)].concat());
         let ecdsa = der(0x30, oid(&[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]));
         let info = der(
             0x30,
@@ -1479,7 +1512,8 @@ pub(crate) mod tests {
                 // Unsigned attributes, which the reader skips: `levels` of nesting or a blob.
                 match fault {
                     "deep" | "edge" => {
-                        let levels = if fault == "deep" { 3 } else { 2 };
+                        // The [1] is at depth 6: its SEQUENCEs reach STAMP_DEPTH, or one past it.
+                        let levels = STAMP_DEPTH - 6 + usize::from(fault == "deep");
                         der(0xa1, (0..levels).fold(vec![5, 0], |inner, _| der(0x30, inner)))
                     }
                     "big" => der(0xa1, der(0x04, vec![0; STAMP])),
@@ -1768,7 +1802,24 @@ pub(crate) mod tests {
         );
     }
 
-    /// Over 16 KiB, nesting past 8, a fifth certificate and BER are each refused, saying why.
+    /// A token whose signer is named by a real issuer (several RDNs, one with two values) is
+    /// read, whole and through `timestamp`: the sid's Name nests to depth 9.
+    #[test]
+    fn the_timestamp_reader_reads_a_token_of_a_real_issuer() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let good = v2(&made, &cert, &key, None, 60, "");
+        let imprint = super::bundle(good.to_string().as_bytes()).unwrap().signature;
+        let token = response(&cert, &key, &imprint, 60, "issuer");
+        assert_eq!(stamp(&token).map(|read| read.time), Some((START + 60) as i64));
+        let mut bundle = super::bundle(good.to_string().as_bytes()).unwrap();
+        bundle.stamp = Some(token);
+        assert_eq!(timestamp(&mut bundle, &tsa.root), Ok((START + 60) as i64));
+    }
+
+    /// Over 16 KiB, nesting past the limit, a fifth certificate and BER are each refused, saying why.
+    #[test]
     fn refuses_what_is_past_the_limits() {
         let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
         let made = Making::new(&authority, &log, DIGEST);
@@ -1785,7 +1836,7 @@ pub(crate) mod tests {
         let with = |fault: &str| response(&cert, &key, &imprint, 60, fault);
         refused(with("big"), "is over 16 KiB");
         refused(vec![0x30; STAMP + 1], "is over 16 KiB");
-        refused(with("deep"), "nests deeper than 8");
+        refused(with("deep"), "nests deeper than 10");
         refused(with("certs"), "holds more than 4 certificates");
         // BER: an indefinite length on the outer sequence, and a length written longer than needed.
         let ok = with("");
@@ -1793,7 +1844,8 @@ pub(crate) mod tests {
         refused(ber, "is BER, not DER");
         assert_eq!(ok[1], 0x82);
         let long = [&[0x30, 0x83, 0, ok[2], ok[3]][..], &ok[4..]].concat();
-        refused(long, "cannot be read");
+        assert!(!limits(&long).unwrap_err().contains("BER"), "a long length is not BER");
+        refused(long, "a length written in more bytes than it needs");
         // Nesting to the limit is not refused.
         assert!(stamp(&with("edge")).is_some());
     }
@@ -1801,7 +1853,6 @@ pub(crate) mod tests {
     /// The reader fed every cut and 2000 altered responses: it says why not, never panics.
     #[test]
     fn the_timestamp_reader_survives_damaged_bytes() {
-        refuses_what_is_past_the_limits();
         let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
         let made = Making::new(&authority, &log, DIGEST);
         let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
