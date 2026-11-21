@@ -199,7 +199,7 @@ trap 'rm -f "$kconfig"; [ -z "$tree" ] || rm -f "$tree/certs/signing_key.pem"' E
 trap 'exit 1' HUP INT TERM
 cp "$root/os/kernel.config" "$kconfig"
 fwdir=$cache/firmware-$firmware_date
-firmware='' modules='' fwextra=''
+firmware='' modules='' fwextra='' mstate=''
 if [ -n "$spec" ]; then
     bad=$(spec_list features | grep '^?' | head -n 1) || true
     [ -z "$bad" ] || die "--spec: not a feature, a firmware or a list item: '${bad#?}'"
@@ -217,6 +217,8 @@ if [ -n "$spec" ]; then
         [ "$f" != uhid-test ] || [ "$out" = "$root/target/os-fido2" ] ||
             die "--spec: the feature uhid-test (CONFIG_UHID) is for --out target/os-fido2 only, not $out"
         { echo "# --spec: $f"; cat "$root/os/features/$f.config"; } >>"$kconfig"
+        # (`# modules: state`: its modules go to the state partition, in an image the root pins.)
+        ! grep -qx '# modules: state' "$root/os/features/$f.config" || mstate=1
         globs="$globs
 $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
     done
@@ -234,6 +236,14 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
     # the files the modules name (modinfo -F firmware), and the whole of linux-firmware
     # for `all`.
     [ "$(grep -E '^(CONFIG_MODULES=y|# CONFIG_MODULES is not set)$' "$kconfig" | tail -n 1)" != CONFIG_MODULES=y ] || modules=1
+    # Modules on the state partition are read once the root has mounted the state, so the
+    # drivers of the disk and the network are never among them (this asks the config; the
+    # modules built are asked again, in assemble).
+    if [ -n "$mstate" ]; then
+        [ -n "$modules" ] || die "--spec: '# modules: state' is for a kernel with modules (CONFIG_MODULES=y)"
+        netblk=$(grep -E '^CONFIG_(VIRTIO_(BLK|NET)|BLK_DEV[A-Z0-9_]*|NVME[A-Z0-9_]*|ATA[A-Z0-9_]*|SATA_[A-Z0-9_]*|PATA_[A-Z0-9_]*|SCSI[A-Z0-9_]*|MMC[A-Z0-9_]*|USB_STORAGE|MD[A-Z0-9_]*|DM_[A-Z0-9_]*|EXT4_FS|SQUASHFS[A-Z0-9_]*|NETDEVICES|ETHERNET|NET_VENDOR_[A-Z0-9_]*|E1000E?|IGBV?F?|IGC|IXGBEV?F?|R8169|TIGON3|BNX2X?|MLX[45][A-Z0-9_]*|ATL1[A-Z0-9_]*|ALX|WLAN[A-Z0-9_]*)=m$' "$kconfig" | head -n 1) || true
+        [ -z "$netblk" ] || die "--spec: '# modules: state' with a block or network driver as a module ($netblk): the disk and the network come up before the state does"
+    fi
     if [ -n "$modules" ]; then
         for tool in modinfo depmod openssl; do
             command -v "$tool" >/dev/null 2>&1 || lacks "$tool (kmod, openssl: modules are signed and indexed)"
@@ -270,13 +280,13 @@ fi
 # (a comment edit must not rebuild a kernel: 2.6 GB of tree and an hour). The firmware is
 # in it by its hash and its CONFIG_EXTRA_FIRMWARE line.
 compiler=$(gcc --version | head -n 1)
-key=$({ echo "$kernel_version $kernel_sha256 $compiler"; [ -z "$firmware" ] || echo "$firmware_sha256"; [ -z "$modules" ] || echo "nvidia $nvidia_sha256 no-peermem"; sed -e '/^# CONFIG_.* is not set$/b' -e '/^[[:space:]]*\(#\|$\)/d' "$kconfig"; } | sha256sum | cut -c 1-16)
+key=$({ echo "$kernel_version $kernel_sha256 $compiler"; [ -z "$firmware" ] || echo "$firmware_sha256"; [ -z "$modules" ] || [ -n "$mstate" ] || echo "nvidia $nvidia_sha256 no-peermem"; sed -e '/^# CONFIG_.* is not set$/b' -e '/^[[:space:]]*\(#\|$\)/d' "$kconfig"; } | sha256sum | cut -c 1-16)
 kernel=$cache/kernel-$key/vmlinuz
 mods=$cache/kernel-$key/mods
 if ! [ -r "$kernel" ]; then
     echo "build.sh: building the kernel ($kernel_version): this takes a while, once" >&2
     fetch "$kernel_url" "$kernel_sha256" "$cache/linux-$kernel_version.tar.xz"
-    [ -z "$modules" ] || fetch "$nvidia_url" "$nvidia_sha256" "$cache/nvidia-open-$nvidia_version.tar.gz"
+    [ -z "$modules" ] || [ -n "$mstate" ] || fetch "$nvidia_url" "$nvidia_sha256" "$cache/nvidia-open-$nvidia_version.tar.gz"
     tree=$cache/kernel-$key/src
     # (A build that was cut short goes on from its tree, which has the mark of a config
     # made; a tree without it is begun again. The modules of an earlier key are not kept.)
@@ -323,6 +333,8 @@ if ! [ -r "$kernel" ]; then
             # nvidia-uvm, nvidia-drm; peermem is not built), installed the same way: signed with
             # the same key, stripped, into extra/, and depmod runs again so modules.alias and
             # modules.dep have them. The source is the pinned tarball, in a folder of its own.
+            # (Not for modules on state: a feature's own drivers, which name theirs.)
+            if [ -z "$mstate" ]; then
             nv=$cache/kernel-$key/nvidia
             [ ! -d "$nv" ] || find "$nv" -delete
             mkdir -p "$nv"
@@ -339,6 +351,7 @@ if ! [ -r "$kernel" ]; then
             done
             ! grep -q peermem "$m/modules.dep" || { echo "build.sh: modules.dep still names nvidia-peermem" >&2; exit 1; }
             grep -q '^alias pci:v000010DE.* nvidia$' "$m/modules.alias" || { echo "build.sh: modules.alias has no alias of an NVIDIA card for nvidia" >&2; exit 1; }
+            fi
             for f in modules.dep modules.alias modules.symbols modules.builtin modules.builtin.modinfo modules.order; do
                 [ -s "$m/$f" ] || { echo "build.sh: modules_install left no $f in lib/modules/$rel" >&2; exit 1; }
             done
@@ -347,8 +360,11 @@ if ! [ -r "$kernel" ]; then
                 tail -c 28 "$f" | grep -aq '^~Module signature appended~$' || { echo "build.sh: $f is not signed" >&2; exit 1; }
             done
             n=$(find "$m" -name '*.ko' | wc -l)
-            [ "$n" -gt 100 ] || { echo "build.sh: only $n modules built: the config did not give the drivers" >&2; exit 1; }
-            sample=$(find "$m" -name 'amdgpu.ko' | head -n 1)
+            # (A feature's modules on state are its few drivers, any of which shows the signer.)
+            least=100 sample=amdgpu.ko
+            [ -z "$mstate" ] || least=0 sample='*.ko'
+            [ "$n" -gt "$least" ] || { echo "build.sh: only $n modules built: the config did not give the drivers" >&2; exit 1; }
+            sample=$(find "$m" -name "$sample" | LC_ALL=C sort | head -n 1)
             [ -n "$sample" ] || { echo "build.sh: no amdgpu.ko among the modules" >&2; exit 1; }
             # (kmod shows the signer's serial or its key id, by version: either names the cert.)
             hexid() { tr -d ': \n' | tr 'a-f' 'A-F' | sed 's/^0*//'; }
@@ -358,7 +374,7 @@ if ! [ -r "$kernel" ]; then
             [ -n "$have" ] && [ -n "$(modinfo -F signer "$sample")" ] || { echo "build.sh: amdgpu.ko has no signer: $(modinfo "$sample" | tail -n 5)" >&2; exit 1; }
             [ "$have" = "$serial" ] || [ "$have" = "$ski" ] ||
                 { echo "build.sh: amdgpu.ko is signed by $have, which is not the kernel's key (serial $serial, id $ski)" >&2; exit 1; }
-            for f in nvidia nvidia-modeset nvidia-uvm nvidia-drm; do
+            [ -n "$mstate" ] || for f in nvidia nvidia-modeset nvidia-uvm nvidia-drm; do
                 [ "$(modinfo -F sig_key "$m/extra/$f.ko" | hexid)" = "$have" ] ||
                     { echo "build.sh: $f.ko is not signed by the key amdgpu.ko is" >&2; exit 1; }
             done
