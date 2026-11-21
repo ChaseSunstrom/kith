@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod context;
+#[cfg(feature = "docker")]
+mod docker_store;
 mod import;
 mod remote;
 mod signing;
@@ -1269,7 +1271,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 path.display(),
                 path.display()
             );
-            kith_docker::serve(listener);
+            kith_docker::serve_with(listener, Some(Box::new(docker_store::DockerStore(backend()?))));
             return Ok(ExitCode::SUCCESS);
         }
         Command::Lint { files } => {
