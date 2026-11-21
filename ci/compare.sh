@@ -239,7 +239,7 @@ machine() { # N and the rest of QEMU's line
     it=$1
     shift
     timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m "$mem" -smp 2 -display none -machine q35 "$@" \
-        -serial "file:$work/n$it.log" -monitor none -pidfile "$work/n$it.pid" </dev/null >"$work/n$it.err" 2>&1 &
+        -serial "file:$work/n$it.log" -monitor none -pidfile "$work/n$it.pid" </dev/null >"$work/n$it.err" 2>&1 8>&- &
     vms="$vms $!"
 }
 # A machine's power goes: QEMU itself is killed (the pid above is of the timeout that minds it).
