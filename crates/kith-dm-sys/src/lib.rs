@@ -192,6 +192,15 @@ pub fn set_window(tty: &File, rows: u16, cols: u16) -> Result<()> {
     Ok(())
 }
 
+/// The size of the terminal `tty` is, in rows and columns (`TIOCGWINSZ`).
+pub fn window(tty: BorrowedFd) -> Result<(u16, u16)> {
+    let file = File::from(tty.try_clone_to_owned()?);
+    let mut size = [0u8; 8];
+    ioctl(&file, libc::TIOCGWINSZ as u32, &mut size)?;
+    let at = |from: usize| u16::from_ne_bytes([size[from], size[from + 1]]);
+    Ok((at(0), at(2)))
+}
+
 /// Give `file` a block device (`/dev/loopN`): what `losetup --find` does. The device is
 /// gone again when the last thing that has it open closes it, so keep what is returned open
 /// until something else (a mapping over it) holds the device.

@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use std::os::unix::fs::MetadataExt;
 use std::process::ExitCode;
 
+mod shell;
+
 const LABEL: &str = "kith.dev/machine";
 
 #[derive(Subcommand)]
@@ -28,7 +30,16 @@ pub enum Machine {
     },
     /// List the machines
     List,
-    /// Run a command in a machine's image and home, as a Job of its own (kith has no way into a running container)
+    /// A shell in the running machine, on a terminal (or a command with `-- COMMAND`); its exit code is kith's
+    Shell {
+        name: String,
+        /// Root of the machine's own user namespace: root there only, never the node's (refused where it would be)
+        #[arg(long)]
+        root: bool,
+        #[arg(last = true, value_name = "COMMAND")]
+        argv: Vec<String>,
+    },
+    /// Run a command in a fresh Job in a machine's image and home (`shell` goes into the running one)
     Run {
         name: String,
         #[arg(last = true, required = true, value_name = "COMMAND")]
@@ -205,6 +216,7 @@ pub fn run(command: Machine, backend: &dyn Fn() -> Result<Backend, String>) -> R
             }
             print_table(["NAME", "IMAGE", "STATUS"], rows);
         }
+        Machine::Shell { name, root, argv } => return shell::shell(&backend, &name, root, argv),
         Machine::Run { name, argv } => {
             let machine = find(&backend, &name)?;
             let mut container = machine.spec["template"]["containers"][0].clone();
