@@ -41,6 +41,8 @@ const STAMP: usize = 16 * 1024;
 const STAMP_CERTS: usize = 4;
 /// (10: a real TSA's signer is named by an issuer Name whose attributes sit at depth 9.)
 const STAMP_DEPTH: usize = 10;
+/// The most RFC 3161 timestamps a Rekor v2 bundle may carry: each is read and must verify.
+const STAMPS: usize = 4;
 
 /// Who an image may be signed by without a kept key: whom the authority certified, as whom
 /// the issuer signed them in, and the authority's certificates and the log's key that say so.
@@ -169,9 +171,10 @@ pub struct Signed {
     /// Whether the payload is an in-toto statement (a bundle's) or cosign's simple text.
     statement: bool,
     promise: Option<Promise>,
-    /// A Rekor v2 bundle's RFC 3161 timestamp (a DER TimeStampResp) over the signature, and the
-    /// time it was found to give once `timestamp` checked it against the TSA.
-    stamp: Option<Vec<u8>>,
+    /// A Rekor v2 bundle's RFC 3161 timestamps (DER TimeStampResps) over the signature, and the
+    /// time they were found to give once `timestamp` checked them all against the TSA: the
+    /// earliest of their times.
+    stamps: Vec<Vec<u8>>,
     stamped: Option<i64>,
 }
 
@@ -231,11 +234,21 @@ pub fn bundle(bytes: &[u8]) -> std::result::Result<Signed, String> {
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let stamp = base64(&material["timestampVerificationData"]["rfc3161Timestamps"][0]["signedTimestamp"]);
+    let listed = material["timestampVerificationData"]["rfc3161Timestamps"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if listed.len() > STAMPS {
+        return Err(format!("a bundle with {} timestamps, not more than {STAMPS}", listed.len()));
+    }
+    let stamps = listed
+        .iter()
+        .map(|entry| base64(&entry["signedTimestamp"]).ok_or("a bundle whose timestamp is not base64"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let promise = match entries {
         [] => None,
-        // Rekor v2's: no promise, the timestamp is what says when.
-        [entry, ..] if stamp.is_some() && entry["inclusionPromise"].is_null() => None,
+        // Rekor v2's: no promise, the timestamps are what say when.
+        [entry, ..] if !stamps.is_empty() && entry["inclusionPromise"].is_null() => None,
         [entry, ..] => {
             let promise = &entry["inclusionPromise"]["signedEntryTimestamp"];
             let read = || {
@@ -247,7 +260,7 @@ pub fn bundle(bytes: &[u8]) -> std::result::Result<Signed, String> {
                     signature: base64(promise)?,
                 })
             };
-            Some(read().ok_or(match (promise.is_null(), stamp.is_some()) {
+            Some(read().ok_or(match (promise.is_null(), !stamps.is_empty()) {
                 (true, true) => "its log entry's promise is not one kith can read (and the bundle has a timestamp)",
                 (true, false) => {
                     "its log entry has no promise from the log, nor has the bundle a timestamp (a log of Rekor v2)"
@@ -263,7 +276,7 @@ pub fn bundle(bytes: &[u8]) -> std::result::Result<Signed, String> {
         payload,
         statement: true,
         promise,
-        stamp,
+        stamps,
         stamped: None,
     })
 }
@@ -302,7 +315,7 @@ pub fn tagged(
         payload: payload.to_vec(),
         statement: false,
         promise,
-        stamp: None,
+        stamps: Vec::new(),
         stamped: None,
     })
 }
@@ -393,7 +406,7 @@ fn promised(signed: &Signed, promise: &Promise, who: &Identity) -> std::result::
 pub fn verify(signed: &mut Signed, digest: &str, who: &Identity) -> std::result::Result<(), String> {
     signed.stamped = None;
     if who.tsa.is_empty() {
-        if signed.promise.is_none() && signed.stamp.is_some() {
+        if signed.promise.is_none() && !signed.stamps.is_empty() {
             return Err(
                 "its log is Rekor v2 (a timestamp and no promise), and the rule names no `tsa`: the root of \
                  the timestamp authority to take its time from"
@@ -402,26 +415,38 @@ pub fn verify(signed: &mut Signed, digest: &str, who: &Identity) -> std::result:
         }
         return check(signed, digest, who);
     }
-    if signed.stamp.is_none() {
+    if signed.stamps.is_empty() {
         return Err("the rule names a `tsa`, and the bundle has no timestamp from it".into());
     }
-    let mut refused = Vec::new();
-    for root in &who.tsa {
-        match timestamp(signed, root) {
-            Ok(_) => return check(signed, digest, who),
-            Err(why) => refused.push(why),
-        }
-    }
-    refused.dedup();
-    Err(refused.join("; "))
+    timestamp(signed, &who.tsa)?;
+    check(signed, digest, who)
 }
 
-/// Checks a Rekor v2 bundle's RFC 3161 timestamp against the root `tsa` (a certificate's
-/// DER) of the timestamp authority a rule names; on success the bundle is taken to have been
-/// signed at the timestamp's time (`check` then holds its certificate to that), which is
-/// returned. Why not, if not.
-fn timestamp(signed: &mut Signed, tsa: &[u8]) -> std::result::Result<i64, String> {
-    let time = stamped(signed, tsa)?;
+/// Checks each of a Rekor v2 bundle's RFC 3161 timestamps against the roots `tsa` of the
+/// timestamp authority a rule names: every one must be from one of them. On success the bundle
+/// is taken to have been signed at the earliest of their times (`check` then holds its
+/// certificate to that), which is returned. Why not, if not.
+fn timestamp(signed: &mut Signed, tsa: &[CertificateDer]) -> std::result::Result<i64, String> {
+    let mut earliest: Option<i64> = None;
+    for der in &signed.stamps {
+        let mut refused = Vec::new();
+        let mut time = None;
+        for root in tsa {
+            match stamped(der, signed, root) {
+                Ok(at) => {
+                    time = Some(at);
+                    break;
+                }
+                Err(why) => refused.push(why),
+            }
+        }
+        let at = time.ok_or_else(|| {
+            refused.dedup();
+            refused.join("; ")
+        })?;
+        earliest = Some(earliest.map_or(at, |so_far| so_far.min(at)));
+    }
+    let time = earliest.ok_or("it has no timestamp")?;
     signed.stamped = Some(time);
     Ok(time)
 }
@@ -623,10 +648,9 @@ fn stamp(der: &[u8]) -> Option<Stamp<'_>> {
     })
 }
 
-/// Whether `signed`'s timestamp is of the signature, by a certificate that chains to `tsa`
+/// Whether the timestamp `der` is of `signed`'s signature, by a certificate that chains to `tsa`
 /// for timestamping at the time it gives; that time.
-fn stamped(signed: &Signed, tsa: &[u8]) -> std::result::Result<i64, String> {
-    let der = signed.stamp.as_deref().ok_or("it has no timestamp")?;
+fn stamped(der: &[u8], signed: &Signed, tsa: &CertificateDer) -> std::result::Result<i64, String> {
     limits(der).map_err(|why| format!("its timestamp {why}"))?;
     let read = stamp(der).ok_or("its timestamp cannot be read")?;
     let carried: Vec<CertificateDer> = read.certs.iter().map(|der| CertificateDer::from(*der)).collect();
@@ -640,8 +664,8 @@ fn stamped(signed: &Signed, tsa: &[u8]) -> std::result::Result<i64, String> {
         webpki::ring::RSA_PKCS1_2048_8192_SHA384,
     ];
     let by = |cert: &webpki::EndEntityCert| {
-        let signed = |algorithm| cert.verify_signature(algorithm, &read.attributes, read.signature);
-        algorithms.iter().any(|&algorithm| signed(algorithm).is_ok())
+        let verified = |algorithm| cert.verify_signature(algorithm, &read.attributes, read.signature);
+        algorithms.iter().any(|&algorithm| verified(algorithm).is_ok())
     };
     let signer = carried
         .iter()
@@ -654,9 +678,8 @@ fn stamped(signed: &Signed, tsa: &[u8]) -> std::result::Result<i64, String> {
         return Err("its timestamp's signed attributes are not of its content".into());
     }
     // The signer chains to the TSA's root, for timestamping, when it says.
-    let root = CertificateDer::from(tsa);
     let anchor =
-        webpki::anchor_from_trusted_cert(&root).map_err(|_| "the timestamp authority's root is no certificate")?;
+        webpki::anchor_from_trusted_cert(tsa).map_err(|_| "the timestamp authority's root is no certificate")?;
     let others: Vec<CertificateDer> = carried.iter().filter(|der| *der != signer).cloned().collect();
     let at = u64::try_from(read.time).map_err(|_| "its timestamp is of before 1970")?;
     let when = UnixTime::since_unix_epoch(std::time::Duration::from_secs(at));
@@ -1552,12 +1575,13 @@ pub(crate) mod tests {
         bundle
     }
 
-    /// A bundle with a timestamp from the TSA root given is taken at the timestamp's time
-    /// (and its certificate held to that time, not to a log's).
+    /// A bundle with a timestamp from the rule's TSA is taken at the timestamp's time (and its
+    /// certificate held to that time, not to a log's).
     #[test]
-    fn a_rekor_v2_bundle_takes_its_time_from_the_tsa() {
+    fn a_rekor_v2_bundle_takes_its_time_from_the_rules_tsa() {
         let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
         let who = named(WHO, ISSUED, &authority, &log);
+        let rule = identity(&with_tsa(&who, &[&tsa.root])).unwrap();
         // The signer's certificate: START + 120 to START + 720. The TSA's: START + 100 to + 700.
         let made = Making {
             at: START + 120,
@@ -1571,16 +1595,10 @@ pub(crate) mod tests {
         );
         let taken = |bundle: &Value| -> std::result::Result<i64, String> {
             let mut signed = super::bundle(bundle.to_string().as_bytes())?;
-            // Untimed until the TSA is asked.
-            assert_eq!(
-                check(&signed, DIGEST, &identity(&who).unwrap()),
-                Err("it has no entry in a log".into())
-            );
-            let time = timestamp(&mut signed, &tsa.root)?;
-            check(&signed, DIGEST, &identity(&who).unwrap())?;
-            Ok(time)
+            verify(&mut signed, DIGEST, &rule)?;
+            Ok(signed.stamped.unwrap())
         };
-        // Made at START + 300: in both certificates' time.
+        // Made at START + 300: in both certificates' time, and taken at that time.
         assert_eq!(taken(&v2(&made, &cert, &key, None, 300, "")), Ok((START + 300) as i64));
         // Made at START + 110: the TSA's certificate is good, the signer's is not yet.
         let early = v2(&made, &cert, &key, None, 110, "");
@@ -1706,76 +1724,209 @@ pub(crate) mod tests {
         assert!(read(&said.to_string()).unwrap_err().contains("`tsa`"));
     }
 
+    /// The rule for `who` that takes its time from the timestamp authority whose root is `root`.
+    fn rule_from(who: &str, root: &CertificateDer) -> Identity {
+        identity(&with_tsa(who, &[root])).unwrap()
+    }
+
+    /// Why the rule `rule` refuses `bundle` (which must read: a refusal is at `verify`).
+    fn refused_under(bundle: &Value, rule: &Identity) -> String {
+        let mut signed = super::bundle(bundle.to_string().as_bytes()).unwrap();
+        verify(&mut signed, DIGEST, rule).unwrap_err()
+    }
+
+    /// A timestamp from another authority than the rule's is no timestamp the rule takes.
     #[test]
-    fn timestamps_that_are_not_the_tsas_are_refused() {
+    fn timestamps_that_are_not_the_rules_are_refused_from_another_tsa() {
         let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
         let made = Making::new(&authority, &log, DIGEST);
         let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
-        let refused = |bundle: &Value, root: &CertificateDer, why: &str| {
-            let mut signed = super::bundle(bundle.to_string().as_bytes()).unwrap();
-            let said = timestamp(&mut signed, root).unwrap_err();
-            assert!(said.contains(why), "expected `{why}`, got `{said}`");
-        };
         let good = v2(&made, &cert, &key, None, 60, "");
-        let mut signed = super::bundle(good.to_string().as_bytes()).unwrap();
-        assert_eq!(timestamp(&mut signed, &tsa.root), Ok((START + 60) as i64));
-        // Another TSA: its root is not the one given.
-        refused(&good, &Authority::new().root, "not from the authority named");
-        // Another signature's imprint.
-        refused(
-            &v2(&made, &cert, &key, Some(b"another signature"), 60, ""),
-            &tsa.root,
-            "is of another signature",
-        );
-        // A time outside the TSA certificate's own, after and before.
-        refused(
-            &v2(&made, &cert, &key, None, 3_600, ""),
-            &tsa.root,
-            "outside its authority's certificate's time",
-        );
-        let (late, late_key) = tsa.leaf(
-            START + 7_200,
-            "tsa@example.test",
-            ISSUED,
-            ExtendedKeyUsagePurpose::TimeStamping,
-        );
-        refused(
-            &v2(&made, &late, &late_key, None, 60, ""),
-            &tsa.root,
-            "outside its authority's certificate's time",
-        );
-        // Signed attributes whose signature is not the certificate's, or whose digest is not
-        // of the content.
-        refused(
-            &v2(&made, &cert, &key, None, 60, "signature"),
-            &tsa.root,
-            "not by its certificate's key",
-        );
-        refused(
-            &v2(&made, &cert, &key, None, 60, "digest"),
-            &tsa.root,
-            "not of its content",
-        );
-        // A certificate that is not for timestamping.
+        let said = refused_under(&good, &rule_from(&who, &Authority::new().root));
+        assert!(said.contains("not from the authority named"), "{said}");
+    }
+
+    /// A timestamp whose imprint is of another signature is refused: it is not of this one.
+    #[test]
+    fn timestamps_that_are_not_the_rules_are_refused_of_another_signature() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let other = v2(&made, &cert, &key, Some(b"another signature"), 60, "");
+        let said = refused_under(&other, &rule_from(&who, &tsa.root));
+        assert!(said.contains("is of another signature"), "{said}");
+    }
+
+    /// A timestamp at a time the TSA's certificate is not valid at (after it, and before it) is
+    /// refused: the authority did not stamp then.
+    #[test]
+    fn timestamps_that_are_not_the_rules_are_refused_with_the_tsa_cert_not_valid_at_gentime() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let rule = rule_from(&who, &tsa.root);
+        let made = Making::new(&authority, &log, DIGEST);
+        // The TSA's certificate runs START to START + 600: a timestamp at 3,600 is after it.
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let said = refused_under(&v2(&made, &cert, &key, None, 3_600, ""), &rule);
+        assert!(said.contains("outside its authority's certificate's time"), "{said}");
+        // A certificate that starts at START + 7,200: a timestamp at 60 is before it.
+        let (late, late_key) = tsa.leaf(START + 7_200, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let said = refused_under(&v2(&made, &late, &late_key, None, 60, ""), &rule);
+        assert!(said.contains("outside its authority's certificate's time"), "{said}");
+    }
+
+    /// A timestamp whose genTime is outside the signer's Fulcio certificate's validity is
+    /// refused (the signature was not made then), before and after it.
+    #[test]
+    fn timestamps_that_are_not_the_rules_are_refused_with_gentime_outside_the_fulcio_cert() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let rule = rule_from(&who, &tsa.root);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        // The signer's certificate starts at START + 120: a timestamp at 60 is before it.
+        let early = Making {
+            at: START + 120,
+            ..Making::new(&authority, &log, DIGEST)
+        };
+        let said = refused_under(&v2(&early, &cert, &key, None, 60, ""), &rule);
+        assert!(said.contains("outside its certificate's time"), "{said}");
+        // The signer's certificate runs START to START + 600; a timestamp at 700, by a TSA
+        // certificate that runs past it, is after it.
+        let made = Making::new(&authority, &log, DIGEST);
+        let (later, later_key) = tsa.leaf(START + 300, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let said = refused_under(&v2(&made, &later, &later_key, None, 700, ""), &rule);
+        assert!(said.contains("outside its certificate's time"), "{said}");
+    }
+
+    /// A timestamp whose signature is not the certificate's key's is refused.
+    #[test]
+    fn timestamps_that_are_not_the_rules_are_refused_with_a_bad_signature() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let bad = v2(&made, &cert, &key, None, 60, "signature");
+        let said = refused_under(&bad, &rule_from(&who, &tsa.root));
+        assert!(said.contains("not by its certificate's key"), "{said}");
+    }
+
+    /// Signed attributes whose digest is not of the content are refused.
+    #[test]
+    fn timestamps_that_are_not_the_rules_are_refused_not_of_their_content() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let bad = v2(&made, &cert, &key, None, 60, "digest");
+        let said = refused_under(&bad, &rule_from(&who, &tsa.root));
+        assert!(said.contains("not of its content"), "{said}");
+    }
+
+    /// A certificate that is not for timestamping is refused.
+    #[test]
+    fn timestamps_that_are_not_the_rules_are_refused_not_for_timestamping() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let made = Making::new(&authority, &log, DIGEST);
         let (code, code_key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::CodeSigning);
-        refused(
-            &v2(&made, &code, &code_key, None, 60, ""),
-            &tsa.root,
-            "not for timestamping",
-        );
-        // A root that is no certificate; a timestamp that is none; one cut short.
-        refused(&good, &CertificateDer::from(&[1u8, 2, 3][..]), "is no certificate");
-        let mut none = good.clone();
+        let bad = v2(&made, &code, &code_key, None, 60, "");
+        let said = refused_under(&bad, &rule_from(&who, &tsa.root));
+        assert!(said.contains("not for timestamping"), "{said}");
+    }
+
+    /// A rule that names a `tsa` refuses a bundle with no timestamp from it: a log's promise
+    /// and none, and a Rekor v2 bundle with none (which the bundle reader refuses).
+    #[test]
+    fn timestamps_that_are_not_the_rules_are_refused_when_there_is_none() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let said = refused_under(&made.bundle(), &rule_from(&who, &tsa.root));
+        assert!(said.contains("the bundle has no timestamp from it"), "{said}");
+        let mut none = v2(&made, &cert, &key, None, 60, "");
         none["verificationMaterial"]["timestampVerificationData"] = Value::Null;
         let said = super::bundle(none.to_string().as_bytes()).err().unwrap();
         assert!(said.contains("Rekor v2"), "{said}");
+    }
+
+    /// A bundle with two timestamps is refused when either does not verify, in either order.
+    #[test]
+    fn timestamps_that_are_not_the_rules_are_refused_when_one_of_several_does_not_verify() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let rule = rule_from(&who, &tsa.root);
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let good = v2(&made, &cert, &key, None, 60, "");
+        let bad = v2(&made, &cert, &key, Some(b"another signature"), 60, "");
+        let entry = |bundle: &Value| bundle["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"][0].clone();
+        for (first, second) in [(&good, &bad), (&bad, &good)] {
+            let mut two = good.clone();
+            two["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"] =
+                serde_json::json!([entry(first), entry(second)]);
+            let said = refused_under(&two, &rule);
+            assert!(said.contains("is of another signature"), "{said}");
+        }
+    }
+
+    /// A root that is no certificate, and a timestamp cut short, are refused as unreadable.
+    #[test]
+    fn timestamps_that_are_not_the_rules_are_refused_when_unreadable() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let good = v2(&made, &cert, &key, None, 60, "");
+        let mut signed = super::bundle(good.to_string().as_bytes()).unwrap();
+        let said = timestamp(&mut signed, &[CertificateDer::from(&[1u8, 2, 3][..])]).unwrap_err();
+        assert!(said.contains("is no certificate"), "{said}");
         let response = response(&cert, &key, b"x", 60, "");
         for cut in [0, 1, 5, response.len() / 2, response.len() - 1] {
             let mut cuts = super::bundle(good.to_string().as_bytes()).unwrap();
-            cuts.stamp = Some(response[..cut].to_vec());
-            let said = timestamp(&mut cuts, &tsa.root).unwrap_err();
+            cuts.stamps = vec![response[..cut].to_vec()];
+            let said = timestamp(&mut cuts, &[tsa.root.clone()]).unwrap_err();
             assert!(said.contains("cannot be read"), "{cut}: {said}");
         }
+    }
+
+    /// Several timestamps, each from the rule's TSA, are taken at the earliest of their times; an
+    /// entry that is not base64, or more than four entries, is refused as the bundle is read.
+    #[test]
+    fn a_rekor_v2_bundle_takes_the_earliest_of_its_timestamps() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let rule = rule_from(&who, &tsa.root);
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let entry = |bundle: &Value| {
+            bundle["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"][0].clone()
+        };
+        // Both timestamps are of the one signature `late` carries (each `made.bundle()` signs anew).
+        let late = v2(&made, &cert, &key, None, 120, "");
+        let signature = STANDARD
+            .decode(late["dsseEnvelope"]["signatures"][0]["sig"].as_str().unwrap())
+            .unwrap();
+        let early = v2(&made, &cert, &key, Some(&signature), 60, "");
+        let mut both = late.clone();
+        both["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"] =
+            serde_json::json!([entry(&late), entry(&early)]);
+        let mut signed = super::bundle(both.to_string().as_bytes()).unwrap();
+        verify(&mut signed, DIGEST, &rule).unwrap();
+        assert_eq!(signed.stamped, Some((START + 60) as i64));
+        // Not base64.
+        let mut text = early.clone();
+        text["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"][0]["signedTimestamp"] =
+            Value::from("not base64!");
+        let said = super::bundle(text.to_string().as_bytes()).err().unwrap();
+        assert!(said.contains("not base64"), "{said}");
+        // More than four.
+        let mut five = early.clone();
+        five["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"] =
+            Value::from((0..5).map(|_| entry(&early)).collect::<Vec<Value>>());
+        let said = super::bundle(five.to_string().as_bytes()).err().unwrap();
+        assert!(said.contains("not more than 4"), "{said}");
     }
 
     /// A token the test builds reads back its signer, signed attributes, digest, imprint and time.
@@ -1814,8 +1965,8 @@ pub(crate) mod tests {
         let token = response(&cert, &key, &imprint, 60, "issuer");
         assert_eq!(stamp(&token).map(|read| read.time), Some((START + 60) as i64));
         let mut bundle = super::bundle(good.to_string().as_bytes()).unwrap();
-        bundle.stamp = Some(token);
-        assert_eq!(timestamp(&mut bundle, &tsa.root), Ok((START + 60) as i64));
+        bundle.stamps = vec![token];
+        assert_eq!(timestamp(&mut bundle, &[tsa.root.clone()]), Ok((START + 60) as i64));
     }
 
     /// Over 16 KiB, nesting past the limit, a fifth certificate and BER are each refused, saying why.
@@ -1828,8 +1979,8 @@ pub(crate) mod tests {
         let refused = |der: Vec<u8>, why: &str| {
             assert!(stamp(&der).is_none(), "{why}");
             let mut bundle = super::bundle(good.to_string().as_bytes()).unwrap();
-            bundle.stamp = Some(der);
-            let said = timestamp(&mut bundle, &tsa.root).unwrap_err();
+            bundle.stamps = vec![der];
+            let said = timestamp(&mut bundle, &[tsa.root.clone()]).unwrap_err();
             assert!(said.contains(why), "expected `{why}`, got `{said}`");
         };
         let imprint = super::bundle(good.to_string().as_bytes()).unwrap().signature;
@@ -1858,7 +2009,7 @@ pub(crate) mod tests {
         let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
         let good = v2(&made, &cert, &key, None, 60, "");
         let signed = super::bundle(good.to_string().as_bytes()).unwrap();
-        let response = signed.stamp.clone().unwrap();
+        let response = signed.stamps[0].clone();
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut inputs: Vec<Vec<u8>> = (0..response.len()).map(|cut| response[..cut].to_vec()).collect();
         for _ in 0..2_000 {
@@ -1878,8 +2029,8 @@ pub(crate) mod tests {
         for input in inputs {
             read += usize::from(stamp(&input).is_some());
             let mut damaged = super::bundle(good.to_string().as_bytes()).unwrap();
-            damaged.stamp = Some(input);
-            let _ = timestamp(&mut damaged, &tsa.root);
+            damaged.stamps = vec![input];
+            let _ = timestamp(&mut damaged, &[tsa.root.clone()]);
         }
         // (Some alterations leave it readable, say a byte of the certificate's name: they
         // are refused by the checks, not the reader. None of the cuts is readable.)

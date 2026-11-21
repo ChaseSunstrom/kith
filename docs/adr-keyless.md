@@ -41,10 +41,12 @@ signedBy:
   the same id). It gives the root certificates, 1 to 4, of the RFC 3161 timestamp authority
   that timed the signature. Without it a bundle of Rekor v2 (a timestamp, no promise) is
   refused, naming `tsa`; a bundle with a log's promise is taken as it was. With it,
-  `keyless::verify` runs `timestamp` against each root before `check`: a Rekor v2 bundle
-  is timed by it, and a v1 bundle needs its timestamp too (it must be there and be the
-  authority's; the time the certificate is held to is still the log's promise). A signature
-  kept under the tag has no timestamp, so under a rule with `tsa` it is refused.
+  `keyless::verify` runs `timestamp` before `check`: every RFC 3161 timestamp in the bundle
+  (at most 4) must verify against one of the roots, or the bundle is refused. A Rekor v2
+  bundle is then timed by the earliest of their genTimes. A v1 bundle needs its timestamp too
+  (it must be there and be the authority's; the time the certificate is held to is still the
+  log's promise). A signature kept under the tag has no timestamp, so under a rule with `tsa`
+  it is refused.
 - Nothing is built in and nothing is fetched (no TUF). A wrong root or key refuses every
   signature. It never widens what runs.
 - A template's identities narrow a rule's in the same way its keys do. An identity is the
@@ -98,7 +100,8 @@ signature, payload and log entry are read from. Each refusal names its reason.
      - any other kind.
 3. **The time** is the promise's `integratedTime` when the entry has a promise, never the
    node's clock. For an entry with no promise (Rekor v2), under a rule with `tsa`, it is the
-   time of the RFC 3161 timestamp, once that verifies against the rule's `tsa`. Under a rule
+   earliest genTime of its RFC 3161 timestamps, once every one verifies against the rule's
+   `tsa`. Under a rule
    with `tsa`, a v1 bundle needs the timestamp to be present and to verify, but its time
    is not used: the check still takes the promise's time (presence-only for v1). The ten-minute
    certificate is good only then.
@@ -168,11 +171,12 @@ the hash covering all four fields, the way a key is remembered by its id.
 - **Revocation.** There is none for a ten-minute certificate. The time from the log is
   what bounds it.
 - **Rekor v2 (no promise; a timestamp authority's RFC 3161 token instead).** Without a
-  timestamp, or under a rule with no `tsa`, it is refused, naming it. `keyless::timestamp` reads the token in the bundle
-  (`timestampVerificationData`) and takes its genTime as the signing time when the TSA's
-  signature over the signed attributes, their messageDigest, the SHA-256 imprint of the
-  signature, and a chain to the TSA root given (EKU timeStamping, valid at genTime) all
-  hold; the log's inclusion proof is not read. The rule field that carries the TSA root is
+  timestamp, or under a rule with no `tsa`, it is refused, naming it. `keyless::timestamp`
+  reads each token in the bundle (`timestampVerificationData`, at most 4) and takes the
+  earliest genTime as the signing time when, for every token, the TSA's signature over the
+  signed attributes, their messageDigest, the SHA-256 imprint of the signature, and a chain
+  to one of the TSA roots given (EKU timeStamping, valid at genTime) all hold; the signer's
+  certificate must then be valid at that time. The log's inclusion proof is not read. The rule field that carries the TSA root is
   the identity's `tsa`: `keyless::verify` is what calls `timestamp`, per identity, and
   forgets what it found before the next identity is asked. The token is read as DER only, of
   at most 16 KiB, nested at most 10 deep (not counting what a certificate or an attribute's

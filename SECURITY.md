@@ -893,9 +893,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     checked: offline, with no witness, they add nothing the log's promise does not;
   - a log of Rekor v2 (an inclusion proof and a time from a timestamp authority, no
     promise) is taken only under an identity that names the authority's root as `tsa`
-    (its RFC 3161 timestamp then says when); without `tsa` such a signature is refused,
-    naming the field. The log's inclusion proof is still not read, so a signature timed
-    this way was not shown to be in any log;
+    (its RFC 3161 timestamps then say when: every one in the bundle, at most four, must be
+    from that authority, and the earliest of their times is the signing time); without
+    `tsa` such a signature is refused, naming the field, and a bundle with no timestamp,
+    or one that does not verify, is refused too. The log's inclusion proof is still not
+    read, so a signature timed this way was not shown to be in any log;
   - an attestation (an in-toto statement of another kind) is never taken as a signature.
 - **A node's WireGuard key is replaced on its own Node's word, and never leaves it with no key.**
   `spec.mesh.rotate` (a name; nothing rotates by itself or on a timer) makes the node write a
