@@ -720,7 +720,7 @@ pub(crate) fn unmap(name: &str) -> std::io::Result<()> {
 pub fn seal(image: &File, disk: &Path) -> Result<String, String> {
     let (at, length) = crate::install::named(image, "state")?;
     let (config, _) = crate::install::named(image, "config")?;
-    let (key, secret, recovery): ([u8; 64], [u8; 32], [u8; 16]) = (random(), random(), random());
+    let (key, secret, recovery) = draw();
     let io = |what: &'static str| move |e: std::io::Error| format!("{what}: {e}");
     let mapped = kith_dm_sys::crypt("kith-install", disk, at / 512, length / 512, &key);
     let mapped = mapped.map_err(io("opening the state partition under its key"))?;
@@ -747,9 +747,27 @@ pub fn seal(image: &File, disk: &Path) -> Result<String, String> {
     if plain == there {
         return Err("the state partition is still readable without its key".into());
     }
-    let record = Record {
+    let record = sealed_record(&key, &secret, &recovery);
+    record.write(&disk, config + AT)?;
+    Ok(shown(&recovery))
+}
+
+/// One `kith node encrypt` (or its cancel) at a time: a second ask must see the first's record,
+/// not draw a key over it, or the recovery key the first one showed opens nothing.
+static ENCRYPTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The state's key, the lock record's secret and the recovery key, drawn as the installer draws
+/// them (and as `kith node encrypt` does for a node that is already installed).
+fn draw() -> ([u8; 64], [u8; 32], [u8; 16]) {
+    (random(), random(), random())
+}
+
+/// The lock record of a state under `key`, with its `secret` and the `recovery` key that wraps the
+/// key.
+fn sealed_record(key: &[u8; 64], secret: &[u8; 32], recovery: &[u8; 16]) -> Record {
+    Record {
         secret: secret.to_vec(),
-        recovery: wrap(&recovery, &key),
+        recovery: wrap(recovery, key),
         key: Some(key.to_vec()),
         tpm: None,
         parent: None,
@@ -762,9 +780,133 @@ pub fn seal(image: &File, disk: &Path) -> Result<String, String> {
         duress: None,
         duress_all: None,
         fido2: Vec::new(),
-    };
-    record.write(&disk, config + AT)?;
+    }
+}
+
+/// Whether a plain node's state may be encrypted in place now: not in the installer, drained,
+/// with no lock record yet and no marker (or pass) already put.
+fn may_encrypt(config: &Path, drained: bool, installing: bool, name: &str) -> Result<(), String> {
+    if installing {
+        return Err(format!(
+            "{name} is in its installer: its state is encrypted by the install"
+        ));
+    }
+    if !drained {
+        return Err(format!(
+            "drain {name} first: its state is encrypted with nothing running on it"
+        ));
+    }
+    if Record::read(config)?.is_some() {
+        return Err(format!("{name} is already encrypted"));
+    }
+    let disk = File::open(config).map_err(|e| format!("opening the config partition: {e}"))?;
+    let reading = |e: std::io::Error| format!("reading the config partition: {e}");
+    if crate::in_place::marked(&disk).map_err(reading)? || crate::in_place::begun(&disk).map_err(reading)? {
+        return Err(format!("{name} is already marked for an encryption"));
+    }
+    Ok(())
+}
+
+/// Write a lock record under a new key on the config partition `config`, then put the marker that
+/// the next start encrypts the state under it. A marker that cannot be put takes the record back:
+/// a record over a state that is not marked would have the next start open it under a key the
+/// state is not under. Says the recovery key, once.
+fn begin_encrypt(config: &Path) -> Result<String, String> {
+    let (key, secret, recovery) = draw();
+    let disk = File::options().read(true).write(true).open(config);
+    let disk = disk.map_err(|e| format!("opening the config partition: {e}"))?;
+    let record = sealed_record(&key, &secret, &recovery);
+    let put = record
+        .write(&disk, AT)
+        .and_then(|()| crate::in_place::mark(&disk).map_err(|e| format!("putting the marker down: {e}")));
+    if let Err(why) = put {
+        let zero = [0; 2 * ROOM];
+        let taken = disk.write_all_at(&zero, AT).and_then(|()| disk.sync_all());
+        taken.map_err(|e| format!("{why}, and the lock record could not be taken back: {e}"))?;
+        return Err(why);
+    }
     Ok(shown(&recovery))
+}
+
+/// Take an unstarted marker away, and the lock record written with it: the record first, so a
+/// cut leaves a marker with no record, which the next start takes for nothing.
+fn cancel_encrypt(config: &Path) -> Result<(), String> {
+    let disk = File::options().read(true).write(true).open(config);
+    let disk = disk.map_err(|e| format!("opening the config partition: {e}"))?;
+    let io = |e: std::io::Error| format!("reading the config partition: {e}");
+    if crate::in_place::begun(&disk).map_err(io)? {
+        return Err("the encryption has begun: it is not cancelled".into());
+    }
+    if !crate::in_place::marked(&disk).map_err(io)? {
+        return Err("no encryption is marked here".into());
+    }
+    let zero = [0; 2 * ROOM];
+    let taken = disk.write_all_at(&zero, AT).and_then(|()| disk.sync_all());
+    taken.map_err(|e| format!("taking the lock record back: {e}"))?;
+    crate::in_place::unmark(&disk).map_err(|e| format!("taking the marker away: {e}"))
+}
+
+/// The body of `POST /v1/lock/NAME/encrypt`: `cancel` takes an unstarted marker away instead.
+#[derive(serde::Deserialize)]
+pub struct Encrypt {
+    #[serde(default)]
+    cancel: bool,
+}
+
+/// `POST /v1/lock/NAME/encrypt` (`kith node encrypt NAME`): NAME, a drained node that is not
+/// installing, makes its state's key as the installer does, writes its lock record, marks its
+/// state for an encryption in place and says its recovery key once. The next start encrypts the
+/// state (in_place.rs), so NAME restarts after this answer is sent. Another node asks NAME, as
+/// itself, having checked the caller.
+pub async fn encrypt(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Named(name): Named<String>,
+    Json(asked): Json<Encrypt>,
+) -> Response {
+    let kind = |_: &_| vec![("NodeKey".to_string(), None)];
+    if let Err(refused) = crate::api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, kind) {
+        return crate::cluster::no_store(refused.into_response());
+    }
+    let done: Result<Value, String> = async {
+        let cluster = shared.cluster.as_ref();
+        let cluster = cluster.ok_or("this node is in no cluster: its state is its own to encrypt")?;
+        if name != cluster.me.name {
+            return at_node(&shared, &caller, &name, "encrypt", json!({ "cancel": asked.cancel })).await;
+        }
+        let config = crate::init::labelled("config").ok_or("no partition is labelled config")?;
+        let _one = ENCRYPTING.lock().unwrap_or_else(|e| e.into_inner());
+        if asked.cancel {
+            cancel_encrypt(&config)?;
+            return Ok(json!({ "node": name, "cancelled": true }));
+        }
+        let drained = {
+            let state = shared.store.lock().expect("a handler panicked holding the store");
+            let node = state.store.get(&format!("Node/{name}"));
+            node.is_some_and(|node| crate::sched::has_record(&node.spec, kith_sched::DRAIN))
+        };
+        let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        let installing = crate::init::options(&line).0.install.is_some();
+        may_encrypt(&config, drained, installing, &name)?;
+        let recovery = begin_encrypt(&config)?;
+        // (The restart comes after this answer: the next start is what encrypts the state.)
+        let stop = shared.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            stop.stop.send_replace(true);
+        });
+        Ok(json!({ "node": name, "recovery": recovery }))
+    }
+    .await;
+    let said = done.as_ref().map(drop).map_err(String::clone);
+    shared
+        .audit
+        .record(&caller, "encrypt", vec![format!("NodeKey/{name}")], said);
+    // (The key is this answer's alone: no cache keeps it, and the web UI shows it once.)
+    crate::cluster::no_store(match done {
+        Ok(answer) => Json(answer).into_response(),
+        Err(why) => refuse(StatusCode::CONFLICT, why).into_response(),
+    })
 }
 
 fn client() -> reqwest::Client {
@@ -5516,5 +5658,92 @@ mod fido2_parse_strict {
             said(format!("{HEAD}fido2: {}\nfido2: {}\n", line(0).text(), line(1).text()).as_bytes()).1,
             Vec::<String>::new()
         );
+    }
+}
+
+#[cfg(test)]
+mod encrypt_verb {
+    use super::*;
+
+    /// A config partition as a file of `size` bytes, at a path no other test uses.
+    fn config(name: &str, size: u64) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("kith-encrypt-{name}-{}", std::process::id()));
+        let disk = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        disk.set_len(size).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_key_secret_and_recovery_key_are_the_installers_shape() {
+        let (key, secret, recovery) = draw();
+        assert_eq!((key.len(), secret.len(), recovery.len()), (64, 32, 16));
+        let record = sealed_record(&key, &secret, &recovery);
+        assert_eq!(record.plain_key(), Some(&key[..]));
+        assert_eq!(record.secret, secret.to_vec());
+        assert_eq!(unwrap(&recovery, &record.recovery).as_deref(), Some(&key[..]));
+    }
+
+    #[test]
+    fn a_node_in_the_installer_or_not_drained_or_already_marked_or_encrypted_is_refused() {
+        let path = config("refuse", 8 << 20);
+        assert_eq!(may_encrypt(&path, true, false, "a"), Ok(()));
+        assert!(may_encrypt(&path, true, true, "a").unwrap_err().contains("installer"));
+        assert!(
+            may_encrypt(&path, false, false, "a")
+                .unwrap_err()
+                .contains("drain a first")
+        );
+        let disk = File::options().read(true).write(true).open(&path).unwrap();
+        crate::in_place::mark(&disk).unwrap();
+        assert!(
+            may_encrypt(&path, true, false, "a")
+                .unwrap_err()
+                .contains("already marked")
+        );
+        cancel_encrypt(&path).unwrap();
+        begin_encrypt(&path).unwrap();
+        assert!(
+            may_encrypt(&path, true, false, "a")
+                .unwrap_err()
+                .contains("already encrypted")
+        );
+    }
+
+    #[test]
+    fn the_record_is_written_then_marked_and_its_recovery_key_is_the_one_shown() {
+        let path = config("begin", 8 << 20);
+        let text = begin_encrypt(&path).unwrap();
+        let record = Record::read(&path).unwrap().expect("the lock record");
+        let disk = File::open(&path).unwrap();
+        assert!(crate::in_place::marked(&disk).unwrap());
+        let recovery = typed(&text).expect("the recovery key, as it is shown");
+        assert_eq!(unwrap(&recovery, &record.recovery).as_deref(), record.plain_key());
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_put_takes_the_record_back() {
+        // (A journal begun with no marker: `in_place::mark` will not put the marker over it, so
+        // the record written before the marker is taken back.)
+        let path = config("short", 8 << 20);
+        let disk = File::options().write(true).open(&path).unwrap();
+        disk.write_all_at(&[1], (128 << 10) + ROOM as u64).unwrap();
+        assert!(begin_encrypt(&path).is_err());
+        assert!(matches!(Record::read(&path), Ok(None)));
+    }
+
+    #[test]
+    fn cancel_takes_an_unstarted_marker_and_its_record_away_and_refuses_with_none() {
+        let path = config("cancel", 8 << 20);
+        assert!(cancel_encrypt(&path).unwrap_err().contains("no encryption is marked"));
+        begin_encrypt(&path).unwrap();
+        cancel_encrypt(&path).unwrap();
+        assert!(matches!(Record::read(&path), Ok(None)));
+        assert!(!crate::in_place::marked(&File::open(&path).unwrap()).unwrap());
     }
 }

@@ -586,6 +586,15 @@ enum NodeCommand {
     /// Have NAME, running, make a new recovery key for its encrypted state and show it, once: the
     /// one it had opens it no more (an install nobody watched printed a key nobody saw)
     Recovery { name: String },
+    /// Encrypt NAME's state in place, with no reinstall: NAME, drained, makes the key and the
+    /// recovery key as the installer does, shows the recovery key once, and restarts to encrypt the
+    /// state as it starts. `--cancel` takes away an encryption that has not started
+    Encrypt {
+        name: String,
+        /// Take the encryption away, if it has not started, instead of starting it
+        #[arg(long)]
+        cancel: bool,
+    },
     /// Make a duress code for NAME and show it, once: typed at NAME's waiting console in place of
     /// the recovery key, it erases what that disk opens with and has the cluster forget its key,
     /// and the console answers as it does a wrong key. There is no way back
@@ -1747,6 +1756,23 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             );
         }
         Command::Node {
+            command: NodeCommand::Encrypt { name, cancel },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("keys are held by kithd: leave out --store");
+            };
+            // (The node writes its record and marker before it answers, and restarts after: an
+            // answer lost on the way leaves the marker, which `--cancel` takes away until it starts.)
+            let body = serde_json::json!({ "cancel": cancel });
+            let said = request::<serde_json::Value>(
+                &kithd,
+                "POST",
+                &format!("/v1/lock/{name}/encrypt"),
+                body.to_string().as_bytes(),
+            )?;
+            print!("{}", encrypt_text(&name, cancel, &said)?);
+        }
+        Command::Node {
             command: NodeCommand::Duress { name, all, off },
         } => {
             let Backend::Daemon(kithd) = backend()? else {
@@ -2596,6 +2622,61 @@ fn features_spec(node: &Resource) -> Result<String, String> {
     };
     text.push_str(&format!("features: [{}]\n", names.join(", ")));
     Ok(text)
+}
+
+/// What `kith node encrypt` says of the node's answer: its recovery key, shown once, and what
+/// happens next; or that an encryption not yet started was taken away.
+fn encrypt_text(name: &str, cancel: bool, said: &serde_json::Value) -> Result<String, String> {
+    if cancel {
+        return Ok(format!(
+            "{name}'s encryption is cancelled: nothing was encrypted, and its state is as it was.\n"
+        ));
+    }
+    let key = said["recovery"].as_str().ok_or(format!(
+        "No recovery key was shown. If {name} marked its state before this failed, `kith node encrypt {name} --cancel` takes the mark away until it starts."
+    ))?;
+    Ok(format!(
+        "{name}'s recovery key, shown this once and kept nowhere: write it down. {name} restarts now and encrypts its state as it starts, which takes a while: it is down until that is done. Typed at {name}'s console when it starts and no node hands its key out, the key opens its state. `kith node encrypt {name} --cancel` takes the encryption away only until it starts.\n\n    {key}\n"
+    ))
+}
+
+#[cfg(test)]
+mod node_encrypt_tests {
+    use super::{Cli, Command, NodeCommand, encrypt_text};
+    use clap::Parser;
+    use serde_json::json;
+
+    #[test]
+    fn node_encrypt_takes_a_name_and_cancel_and_nothing_else() {
+        let parsed = |args: &[&str]| match Cli::try_parse_from(args).map(|cli| cli.command) {
+            Ok(Command::Node {
+                command: NodeCommand::Encrypt { name, cancel },
+            }) => Some((name, cancel)),
+            _ => None,
+        };
+        assert_eq!(parsed(&["kith", "node", "encrypt", "n1"]), Some(("n1".into(), false)));
+        assert_eq!(
+            parsed(&["kith", "node", "encrypt", "n1", "--cancel"]),
+            Some(("n1".into(), true))
+        );
+        assert_eq!(parsed(&["kith", "node", "encrypt"]), None);
+        assert_eq!(parsed(&["kith", "node", "encrypt", "n1", "--now"]), None);
+    }
+
+    #[test]
+    fn node_encrypt_shows_the_recovery_key_once_and_says_what_next() {
+        let key = "0123 4567 89ab cdef 0123 4567 89ab cdef";
+        let text = encrypt_text("n1", false, &json!({ "node": "n1", "recovery": key })).unwrap();
+        assert_eq!(text.matches(key).count(), 1, "{text}");
+        assert!(text.contains("restarts") && text.contains("--cancel"), "{text}");
+        assert!(encrypt_text("n1", false, &json!({ "node": "n1" })).is_err());
+    }
+
+    #[test]
+    fn node_encrypt_cancel_says_so_and_shows_no_key() {
+        let text = encrypt_text("n1", true, &json!({ "node": "n1", "cancelled": true })).unwrap();
+        assert!(text.contains("cancelled") && !text.contains("recovery"), "{text}");
+    }
 }
 
 #[cfg(test)]
