@@ -420,7 +420,8 @@ start that goes back by itself, not a lockout.
 How the new values are predicted (no TPM command; about 190 lines):
 
 1. The event log, as the kernel gives it (`/sys/kernel/security/tpm0/binary_bios_measurements`
-   with securityfs mounted; unverified that kith OS's kernel configuration exposes it), is
+   with securityfs mounted; kith OS's kernel had securityfs off until T-1180 turned
+   `CONFIG_SECURITYFS` on, so before that no key was sealed again or ahead), is
    read in the TCG's crypto-agile format, SHA-256 digests.
 2. The log is replayed for the sealed PCRs, PCR 15 being kithd's one extend. If that replay
    is not what TPM2_PCR_Read gives, nothing is predicted ("the event log does not explain
@@ -490,7 +491,12 @@ match one of the four command-line forms, or it seals nothing; a failure is logg
 update stands. One seal ahead at a time: while a `tpm-next:` that opens on this system waits
 for promotion, none is made; one the TPM refuses on its PCR policy (a fallback left it) is
 replaced, and `tpm:` is untouched. Any other failure to try it (a device error, a busy TPM, a
-cut seal) keeps it and refuses the seal ahead for now: the next update or wake retries. `crypt::keep` promotes (`tpm:` takes `tpm-next:`, which goes, in one read-back
+cut seal) keeps it and refuses the seal ahead for now: the next update or wake retries.
+The event log needs `CONFIG_SECURITYFS=y` in the kernel (T-1180: it was off, and neither
+seal ahead nor seal again could read the log). A boot file with extra command line (smbios
+`beside`) has a PCR 9 event no form explains, so seal again refuses it by design. A fresh
+system's first seal again comes before the slot is good (`os::running_image` fails), so it
+waits the 300 s retry. `crypt::keep` promotes (`tpm:` takes `tpm-next:`, which goes, in one read-back
 write) once `os::GOOD`, and only if the new seal opens to the key held; a failed try is made
 again at a later wake, three times. The wait is `open`'s, five minutes, restarted by a
 typed line. Not built: dropping `tpm-next:` when the old slot runs again after a fallback.
@@ -737,7 +743,24 @@ All against swtpm, in VMs on disk files. None on a real TPM, a real FIDO2 key or
   with QEMU's `-no-reboot` so the restart after writing it powers the VM off. The test flips one
   byte of `tpm-next:` in the disk file, then starts the VM with the peers still off. The new
   slot fails three times, the old one starts, and the state opens with nothing typed.
-- An unsigned update from a stick: no `tpm-next:`, and the trial wait leads back.
+  As built (T-1180, `ci/vm/netboot.sh`): release r1 (Full, over the unsigned base) makes the
+  system the key is sealed for, r2 is the update, r3 the third. The base must be signed, and
+  each root names the test key plus a junk one (`KITH_RELEASE_KEY="$key1,<junk>"`), so the
+  roots differ and the test key stays one of the system's own. The trials are killed after 15
+  seconds instead of waiting out the five minutes (that wait is the unit test's). The damaged
+  byte is one hex digit of the sealed blob in `tpm-next:`, changed in both copies of the record
+  with its `sum:` made again (else the record is damaged, and not a seal the TPM refuses); the
+  old slot then starts by the boot loader's count, and `tpm:` opens it. That digit lies in the
+  integrity HMAC of the sealed blob, so the TPM's load is what refuses (the log says the
+  refusal of `tpm:`, the system that runs, not of `tpm-next:`); the signed leg before it, whose
+  undamaged `tpm-next:` opens its slot, is the control. Not run end to end: the 300 second wait
+  and the restart it ends with (the trials are killed first), and the 300 second retry of a
+  seal-again that began before its slot was good.
+- An unsigned update from a stick: no `tpm-next:`, and the trial wait leads back (as built:
+  the stick's slot is tried three times, the old slot starts, the disk reads `tpm` only). A
+  stick update cannot seal ahead at all: init takes it before the state is opened, when kithd
+  holds no key to seal, so the leg reads what is observable (no `tpm-next:` on the disk, the
+  stick's slot never opened by its TPM) and the signed leg is its control.
 - Every VM test ends by opening the disk with its recovery key.
 
 ## On hardware: the owner's checklist
@@ -817,7 +840,9 @@ resets the count. Item 8 is not: kithd refuses an M or an I of 0 before the TPM 
     an outside command line into PCR 12; the kernel's EFI stub measures its command line into
     PCR 9.
 18. kith OS's kernel exposes the event log (securityfs, `binary_bios_measurements`), the events
-    before ExitBootServices included.
+    before ExitBootServices included. (Found false and fixed by T-1180: the kernel configuration
+    left `CONFIG_SECURITYFS` off, so the log could not be read; with it on, the VM test's
+    update leg reads swtpm's log. A real machine's firmware log is still the owner's checklist.)
 19. A sealed blob is about 200 bytes. swtpm made it 272 ("The lock record" uses that).
 20. QEMU's emulated security key speaks U2F only; the kernel's merged configuration lacks
     CONFIG_HIDRAW and CONFIG_USB_HID. (Checked since in [adr-fido2.md](adr-fido2.md): this

@@ -501,7 +501,15 @@ pub(crate) fn status(store: &Store, who: &Worker, key: &str, said: Option<&Value
         "NodeKey" if live.metadata.name == who.name => only(
             key,
             &fields,
-            &["sealed", "message", "passphrase", "recoverySeen", "duress", "duressAll"],
+            &[
+                "sealed",
+                "message",
+                "passphrase",
+                "pin",
+                "recoverySeen",
+                "duress",
+                "duressAll",
+            ],
         ),
         // What its session does (`activity`), and nothing else of the status.
         "Seat" if live.spec["node"] == who.name => {
@@ -1894,5 +1902,11 @@ spec: { volume: there, every: 1d }
         };
         assert!(try_as(&store, "w", sealed.clone()).is_ok());
         assert!(try_as(&store, "w-b", sealed).is_err());
+        // Every flag crypt.rs's sealed_status says (a PIN's too: the VM test --test tpm found it refused, T-1180).
+        let said = json!({ "sealed": false, "passphrase": true, "pin": true, "recoverySeen": true, "duress": true, "duressAll": true });
+        let all = Command::Status {
+            statuses: vec![("NodeKey/w".into(), Some(said))],
+        };
+        assert!(try_as(&store, "w", all).is_ok());
     }
 }

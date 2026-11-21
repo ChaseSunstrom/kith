@@ -13,6 +13,45 @@
             # (Six starts of the machine: the node has to outlast them all.)
             [ "$test" = netboot ] || more='&encrypt=true' time=$((time * 2))
             [ -z "$sealing" ] || time=$((time * 3 / 2))
+            # --test tpm, the update leg (docs/adr-unlock.md, Tests): three releases signed by a key
+            # this run makes, and a second key the node does not take releases from. Alpha is started
+            # with the first key and --lan-releases: the installer carries both on to the machine it
+            # installs, which takes releases from that key alone (so none is taken on trust) and
+            # fetches them from this machine (served below). Each root names that key and a junk
+            # one of its own (64 hex digits, no one's): a system's own keys are what a command
+            # line's key must be one of, and a root that differs makes the update a full one, a
+            # restart: three releases that only said another version would be hand-overs of
+            # kithd, with no restart at all.
+            #
+            # What this run does not do end to end (T-1180): a slot on trial is killed 15 s
+            # after it starts, not left to wait its 300 s (TRIAL_WAIT) and restart by itself, so
+            # that restart (init::end(true)) and the 300 s retry of a seal-again that began before
+            # its slot was good (UNSEALED_RETRY) are not run here; the boot loader's count of
+            # tries is what the legs read (ondisk b N). And an update from a stick cannot seal
+            # ahead by design: init takes it before the state is opened, when kithd holds no key
+            # to seal, so that leg checks what it can (the stick's slot has no seal and the old
+            # slot comes back), and the control that sealing ahead works is the signed leg above it.
+            releasing=''
+            if [ -n "$sealing" ]; then
+                command -v xxd >/dev/null 2>&1 || skip "no xxd to make a release key with"
+                command -v openssl >/dev/null 2>&1 || skip "no openssl to make a release key with"
+                keygen() { # NAME: a key file in $work (PKCS#8 in hex, as os/update.sh --sign reads it); its public key said
+                    (umask 077 && openssl genpkey -algorithm ed25519 -outform DER | xxd -p -c 256 >"$work/$1")
+                    xxd -r -p <"$work/$1" | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | xxd -p -c 64
+                }
+                key1=$(keygen key1)
+                key2=$(keygen key2)
+                releasing="--release-key $key1 --lan-releases"
+                mkdir "$work/www"
+                for n in 1 2 3; do
+                    KITH_RELEASE_KEY="$key1,$(printf '%064d' "$n")" KITH_OS_VERSION=9.$n.0 sh "$root/os/build.sh" --out "$work/r$n" >&2
+                    cp "$work/r$n/kith-os.update" "$work/www/r$n.update"
+                    rm -rf "$work/r$n"
+                done
+                web_up "$work/www" $((port + 7)) || fail "the web server on port $((port + 7)) did not start"
+                # (The machine's second card: its port 80 is that server. cmd: each connection gets its own socat.)
+                guest="user,id=w,restrict=on,guestfwd=tcp:10.0.2.100:80-cmd:socat - TCP:127.0.0.1:$((port + 7))"
+            fi
             # Alpha and the DHCP server of its hub, started again where a test takes alpha off:
             # the server ends when the hub's connection to it does, so it goes with alpha.
             start_alpha() {
@@ -26,7 +65,7 @@
                     -netdev "socket,id=s,listen=127.0.0.1:$((port + 8))" -netdev hubport,id=h1,hubid=0,netdev=s \
                     -netdev hubport,id=h2,hubid=0 -device virtio-net-pci,netdev=h2,mac=52:54:00:00:09:01 \
                     -netdev "user,id=u,restrict=on,hostfwd=tcp:127.0.0.1:$((port + 1))-10.0.2.15:7443" -device virtio-net-pci,netdev=u \
-                    -smbios 'type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=alpha -- --listen 0.0.0.0:7443 --advertise 10.9.0.1:7443 --claim'
+                    -smbios 'type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=alpha -- --listen 0.0.0.0:7443 --advertise 10.9.0.1:7443 --claim '"$releasing"
                 alpha=$vm
             }
             cp "$out/kith-os.raw" "$work/alpha.disk"
@@ -109,12 +148,33 @@ disk.seek(at["state"] + 1080)
 state = "plain" if disk.read(2) == b"\x53\xef" else "sealed"
 disk.seek(at["config"] + (512 << 10))
 record = disk.read(4096)
-print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record), *["tpm-parent"] * (b"\ntpm-parent: " in record), *["tpm-pin"] * (b"\ntpm-pin: " in record), *["passphrase"] * (b"\npassphrase: " in record), *["seen"] * (b"\nseen: yes\n" in record), *["duress"] * (b"\nduress: " in record))' "$1"
+print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record), *["tpm-parent"] * (b"\ntpm-parent: " in record), *["tpm-next"] * (b"\ntpm-next: " in record), *["tpm-pin"] * (b"\ntpm-pin: " in record), *["passphrase"] * (b"\npassphrase: " in record), *["seen"] * (b"\nseen: yes\n" in record), *["duress"] * (b"\nduress: " in record))' "$1"
                 }
                 lock() { api POST "/v1/lock/kith-000902?do=$1"; }
                 up() { # LOG: the machine's state is open and it serves
                     hears "$1" 'kithd: init: state on /dev/dm-'
                     hears "$1" 'kithd: node kith-000902 serving other nodes'
+                }
+                command -v mdir >/dev/null 2>&1 || mdir() { nix shell nixpkgs#mtools -c mdir "$@"; }
+                espat() { # NAME: where the partition NAME of beta's disk starts
+                    python3 -c '
+import struct, sys
+disk = open(sys.argv[1], "rb")
+disk.seek(512 + 72)
+entries = struct.unpack("<Q", disk.read(8))[0] * 512
+for index in range(128):
+    disk.seek(entries + index * 128)
+    entry = disk.read(128)
+    if entry[56:].decode("utf-16-le").rstrip("\0") == sys.argv[2]:
+        print(struct.unpack("<Q", entry[32:40])[0] * 512, end="")
+        sys.exit(0)
+sys.exit(1)' "$work/beta.disk" "$1"
+                }
+                ondisk() { # SLOT TRIES: beta's ESP holds exactly one boot file for SLOT, with TRIES tries left (kith-N-SLOT+TRIES.efi, or +TRIES-DONE once tried; TRIES good: the slot is marked good, kith-N-SLOT.efi)
+                    names=$(mdir -b -i "$work/beta.disk@@$(espat esp)" ::EFI/Linux) || fail "beta's ESP could not be read"
+                    [ "$(printf '%s\n' "$names" | grep -cE "/kith-[0-9]*-$1[+.]")" = 1 ] || fail "beta's ESP does not have exactly one boot file for slot $1: $names"
+                    [ "$2" = good ] && pattern="/kith-[0-9]*-$1\.efi$" || pattern="/kith-[0-9]*-$1\+$2(-[0-9]+)?\.efi$"
+                    [ "$(printf '%s\n' "$names" | grep -cE "$pattern")" = 1 ] || fail "beta's ESP does not have slot $1 with $2 tries left: $names"
                 }
                 recovery=$(grep -ao 'shown this once: [0-9a-f-]*' "$work/install-beta.log") || fail "the installer showed no recovery key"
                 [ "$(says "$out/kith-os.raw")" = 'plain none' ] || fail "the image's state is not a plain file system: $(says "$out/kith-os.raw")"
@@ -125,10 +185,11 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
                 if [ -n "$sealing" ]; then
                     tpm=''
                     mkdir "$work/tpm"
-                    own() { # LOG [away] [more of QEMU's arguments]: the machine from its disk, with its TPM (the same at every start: its state is kept); away: without its card, so no node is in reach
+                    own() { # LOG [away] [web] [more of QEMU's arguments]: the machine from its disk, with its TPM (the same at every start: its state is kept); away: without its card, so no node is in reach; web: with a card to the web server of the releases
                         machine=$1 card=1
                         shift
                         [ "${1:-}" != away ] || { card='' && shift; }
+                        [ "${1:-}" != web ] || { shift && set -- -netdev "$guest" -device virtio-net-pci,netdev=w,romfile= "$@"; }
                         [ -z "$tpm" ] || kill "$tpm" 2>/dev/null || true
                         rm -f "$work/tpm.sock"
                         swtpm socket --tpm2 --tpmstate "dir=$work/tpm" --ctrl "type=unixio,path=$work/tpm.sock" >/dev/null 2>&1 &
@@ -149,6 +210,15 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
                         kill "$vm"
                         wait "$vm" 2>/dev/null || true
                     }
+                    restarts() { # WHAT: the machine restarts itself (its qemu ends) within 5 minutes
+                        tries=0
+                        while kill -0 "$vm" 2>/dev/null; do
+                            tries=$((tries + 1))
+                            [ "$tries" -lt 1500 ] || fail "the machine did not restart after $1"
+                            sleep 0.2
+                        done
+                        wait "$vm" || true
+                    }
                     told() { # WHAT: the cluster's NodeKey of the machine comes to say it
                         tries=0
                         until api GET /v1/resources/NodeKey/kith-000902 | grep -q "$1"; do
@@ -157,20 +227,94 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
                             sleep 0.2
                         done
                     }
+                    types() { printf '%s\n' "$2" | socat - "unix-connect:$work/$1.tty" >/dev/null; }
+                    labelled() { # the machine's Node resource, labelled ring=canary: the update plan below names that ring (alpha has no label, so it is no part of any rollout)
+                        api GET /v1/resources/Node/kith-000902 -f >"$work/node.json" || fail "the machine's Node could not be read"
+                        python3 -c '
+import json, sys
+found = json.load(open(sys.argv[1]))
+found = found if isinstance(found, list) else [found]
+for node in found:
+    node["metadata"].pop("revision", None)
+    node["metadata"].setdefault("labels", {})["ring"] = "canary"
+json.dump(found, open(sys.argv[2], "w"))' "$work/node.json" "$work/node-label.json" || fail "the machine's Node could not be labelled: $(cat "$work/node.json")"
+                        api POST /v1/apply -f -H 'Content-Type: application/json' --data-binary "@$work/node-label.json" >/dev/null || fail "the machine's Node label was refused"
+                    }
+                    release() { # NAME VERSION KEYFILE PUBLIC FILE: that release (FILE.update, in the web server's folder), signed by KEYFILE, and a plan that gives it to the ring
+                        signature=$(sh "$root/os/update.sh" --sign "$work/$3" "$work/www/$5.update") || fail "the release $1 could not be signed"
+                        cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"OSRelease","metadata":{"name":"$1"},
+  "spec":{"version":"$2","image":"http://10.0.2.100/$5.update","publicKey":"$4","signature":"$signature"}},
+ {"apiVersion":"kith.dev/v1","kind":"UpdatePlan","metadata":{"name":"all"},"spec":{"release":"$1","selector":{"ring":"canary"}}}]
+EOF
+                        api POST /v1/apply -f -H 'Content-Type: application/json' --data-binary "@$work/apply.json" >/dev/null || fail "the release $1 was not applied"
+                    }
+                    good() { # SLOT: beta's boot loader marks SLOT good (its boot file loses its tries) once the state has been open a while
+                        tries=0
+                        until mdir -b -i "$work/beta.disk@@$(espat esp)" ::EFI/Linux | grep -qE "/kith-[0-9]*-$1\.efi$"; do
+                            tries=$((tries + 1))
+                            [ "$tries" -lt 150 ] || fail "slot $1 was not marked good"
+                            sleep 0.5
+                        done
+                    }
+                    opens() { hears "$1" 'kithd: init: state on /dev/dm-'; }
+                    recovered() { # LOG: the end of each leg: away from the cluster, the TPM refused (a command line beside the boot file's), the recovery key typed at the console opens the disk
+                        own "$1" away -smbios 'type=11,value=io.systemd.stub.kernel-cmdline-extra=loglevel=6'
+                        hears "$1" 'Or type the recovery key here'
+                        hears "$1" 'still locked'
+                        ! grep -aqF 'state on' "$work/$1.log" || fail "a machine away from its cluster opened its state before the recovery key was typed"
+                        types "$1" "${recovery##* }"
+                        hears "$1" 'kithd: init: opened with the recovery key'
+                        hears "$1" 'kithd: init: state on /dev/dm-'
+                        off
+                    }
+                    trial() { # LOG TRIES: a start of the slot on trial with no node in reach, and no key for it: it waits (kithd restarts it after 300 s: killed before, the boot loader has counted the try), and has TRIES tries left
+                        own "$1" away
+                        hears "$1" 'asking the cluster for its key'
+                        hears "$1" 'still locked: 10.9.0.1:7443 cannot be reached'
+                        sleep 15
+                        ! grep -aqF 'slot b is good' "$work/$1.log" || fail "the slot on trial was called good with its key not opened"
+                        ondisk b "$2"
+                        off
+                    }
                     # Told to seal, a machine with no TPM says why not, and runs on as it was.
                     lock seal | grep -q '"seal": *true' || fail "the machine could not be told to seal its key"
-                    hears beta 'is not sealed: this machine has no TPM'
-                    told 'no TPM'
+                    hears beta 'is not sealed: reading /sys/kernel/security/tpm0/binary_bios_measurements'
+                    told 'binary_bios_measurements'
                     off
                     [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the machine's disk, read from outside: $(says "$work/beta.disk")"
+                    # With its TPM, but on the image the installer wrote (no release signed it: no
+                    # header of one is kept): it is not sealed for, the node's key is all it has.
+                    own beta1 web
+                    hears beta1 'asking the cluster for its key'
+                    up beta1
+                    hears beta1 'is not sealed: no release header is kept for slot a'
+                    told 'no release header is kept for slot a'
+                    # The first signed release is taken: a full update (a restart). Slot b is
+                    # the first system a release signed, and the one that is sealed for.
+                    labelled
+                    release r1 9.1.0 key1 "$key1" r1
+                    hears beta1 '9.1.0 is a full update (a restart)'
+                    hears beta1 'kith OS 9.1.0 is in the other slot: restarting into it'
+                    restarts 'the first release'
+                    [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the disk of the machine that took its first release, read from outside: $(says "$work/beta.disk")"
                     # With its TPM: it asks the node this once, and seals its key to what it runs.
-                    own beta2
+                    own beta2 web
                     hears beta2 'asking the cluster for its key'
                     up beta2
-                    hears beta2 "this machine's TPM holds the key of its state"
+                    hears beta2 "this machine's TPM holds the key of its state, for this system"
                     told '"sealed": *true'
+                    # A release the cluster's key did not sign (a second key, which the node does
+                    # not take releases from) is refused before its image is fetched: the other
+                    # slot is not written, and no key is sealed for what it holds.
+                    release rx 9.5.0 key2 "$key2" r3
+                    hears beta2 'the release is not signed by a key this node takes releases from'
+                    hears beta2 'no update to kith OS 9.5.0'
+                    ! grep -aqF -e 'kith OS 9.5.0 is in the other slot' -e 'sealed ahead for 9.5.0' "$work/beta2.log" || fail "a release the cluster's key did not sign was taken"
+                    good b
                     off
                     [ "$(says "$work/beta.disk")" = 'sealed held tpm tpm-parent' ] || fail "the sealed machine's disk, read from outside: $(says "$work/beta.disk")"
+                    ondisk b good
                     # Started again: its own TPM gives the key, and no node is asked.
                     own beta3
                     hears beta3 'TPM gave the key of its state: no node was asked'
@@ -213,22 +357,52 @@ with open(sys.argv[1], "r+b") as disk:
         disk[at : at + 12], found = b"console=tty1", found + 1
         at = disk.find(b"console=tty0 dm-mod.create", at)
     sys.exit(found == 0)' "$work/beta.disk" || fail "the machine's disk has no boot file with the command line this test changes"
-                    own beta5
-                    refused beta5
-                    # A command line beside the boot file's: the same. And with that one again,
-                    # its own TPM gives the key, and no node is asked.
+                    # (The boot file is no longer the piece the release names for this slot: the
+                    # TPM refuses, the node is asked, and the key is not sealed for it: that is a
+                    # system the cluster's key did not sign.)
+                    own beta5 web
+                    hears beta5 'this is not the system it was sealed for'
+                    hears beta5 'asking the cluster for its key'
+                    up beta5
+                    hears beta5 'is not sealed: the image that runs is not the piece the release names for slot b'
+                    told 'the image that runs is not the piece the release names for slot b'
+                    off
+                    python3 -c '
+import mmap, sys
+with open(sys.argv[1], "r+b") as disk:
+    disk, found = mmap.mmap(disk.fileno(), 0), 0
+    at = disk.find(b"console=tty1 dm-mod.create")
+    while at >= 0:
+        disk[at : at + 12], found = b"console=tty0", found + 1
+        at = disk.find(b"console=tty1 dm-mod.create", at)
+    sys.exit(found == 0)' "$work/beta.disk" || fail "the machine's disk has no changed boot file to put back"
+                    # Put back, the TPM's seal for it opens again, with no node asked.
+                    own beta5b
+                    hears beta5b 'TPM gave the key of its state: no node was asked'
+                    up beta5b
+                    ! grep -aqF 'asking the cluster' "$work/beta5b.log" || fail "a machine whose TPM holds its key asked the cluster for it, once its boot file was put back"
+                    off
+                    # A command line beside the boot file's: the same for the TPM (it gives no key, the
+                    # node is asked), but the key is not sealed again for it: PCR 9 holds a command
+                    # line that is not the boot file's in any form kithd can explain (docs/adr-unlock.md,
+                    # step 5), so what it would predict is not to be trusted. The old seal stays: the
+                    # machine started as it was, its own TPM gives the key, and no node is asked.
                     beside='type=11,value=io.systemd.stub.kernel-cmdline-extra=loglevel=7'
                     own beta6 -smbios "$beside"
-                    refused beta6
-                    own beta7 -smbios "$beside"
+                    hears beta6 'this is not the system it was sealed for'
+                    hears beta6 'asking the cluster for its key'
+                    up beta6
+                    hears beta6 'is not sealed: the event log has no event in PCR 9 that is the running boot file'
+                    off
+                    own beta7
                     hears beta7 'TPM gave the key of its state: no node was asked'
                     up beta7
-                    ! grep -aqF 'asking the cluster' "$work/beta7.log" || fail "the machine, sealed anew, asked the cluster for its key"
+                    ! grep -aqF 'asking the cluster' "$work/beta7.log" || fail "the machine, started as it was, asked the cluster for its key"
                     # Locked: it drops the seal, restarts and waits; unlocked, it seals again.
                     lock lock | grep -q '"locked": *true' || fail "the sealed machine could not be locked"
                     hears beta7 "this machine's TPM no longer holds the key of its state"
                     hears beta7 'kithd: the cluster has locked this node'
-                    wait "$vm" || true
+                    restarts 'the cluster locked it'
                     [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the locked machine's disk, read from outside: $(says "$work/beta.disk")"
                     own beta8
                     hears beta8 'still locked: 10.9.0.1:7443 does not hand this node'
@@ -242,6 +416,126 @@ with open(sys.argv[1], "r+b") as disk:
                     told '"sealed": *false'
                     off
                     [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the machine's disk, read from outside, once its seal was taken back: $(says "$work/beta.disk")"
+                    # The update leg (docs/adr-unlock.md, Tests). The machine runs slot b (the first
+                    # release), and is told to seal again. A second release, signed by the cluster's
+                    # key, is taken: the key is sealed ahead (tpm-next:) for the system in the other
+                    # slot, and the machine restarts into it with its peers off (no card), and opens
+                    # by tpm-next with no node asked. (The plan names a label that only this machine
+                    # has: alpha is no part of the rollout.)
+                    own up1 web
+                    hears up1 'asking the cluster for its key'
+                    up up1
+                    lock seal | grep -q '"seal": *true' || fail "the machine could not be told to seal its key again"
+                    hears up1 "this machine's TPM holds the key of its state, for this system"
+                    release r2 9.2.0 key1 "$key1" r2
+                    hears up1 '9.2.0 is a full update (a restart)'
+                    hears up1 "the key of this node's state is sealed ahead for 9.2.0"
+                    hears up1 'kith OS 9.2.0 is in the other slot: restarting into it'
+                    restarts 'the second release'
+                    [ "$(says "$work/beta.disk")" = 'sealed held tpm tpm-parent tpm-next' ] || fail "the disk of the machine that sealed ahead, read from outside: $(says "$work/beta.disk")"
+                    ondisk a 3
+                    own up2 away
+                    hears up2 'TPM gave the key of its state (the seal made ahead for this system, tpm-next:): no node was asked'
+                    opens up2
+                    ! grep -aqF 'asking the cluster' "$work/up2.log" || fail "a machine whose TPM holds the key ahead asked the cluster for it"
+                    # Once the slot is good the seal made ahead is the seal of this system.
+                    hears up2 'the old seal is dropped'
+                    good a
+                    off
+                    [ "$(says "$work/beta.disk")" = 'sealed held tpm tpm-parent' ] || fail "the disk of the machine that took its update, read from outside: $(says "$work/beta.disk")"
+                    ondisk a good
+                    recovered rec1
+                    # An update from a stick is taken on the word of whoever holds it (no release
+                    # signed it), and never sealed for. By design it cannot be: init takes it before
+                    # the state is opened, so kithd holds no key to seal ahead with (and its boot
+                    # carries a command line of its own, which the TPM refuses anyway). So this
+                    # checks what is observable, and the signed leg above is its control (the same
+                    # kind of update, sealed ahead, opens its slot by tpm-next): the disk says no
+                    # tpm-next after it, and the slot it wrote is tried three times and asks the
+                    # cluster each time, never opened by its TPM, before the old slot starts again.
+                    # It is the third release here, which no key signed so far.
+                    cp "$work/www/r3.update" "$work/stick.update"
+                    truncate -s %1M "$work/stick.update"
+                    own stick away -drive "file=$work/stick.update,format=raw,if=virtio,readonly=on" -smbios 'type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.update=vdb'
+                    hears stick 'kithd: init: kith OS 9.3.0 from vdb is in the other slot'
+                    restarts 'the update from a stick'
+                    # (From here the record says "seen": the recovery key was typed at the console.)
+                    [ "$(says "$work/beta.disk")" = 'sealed held tpm tpm-parent seen' ] || fail "the disk of the machine that took an update from a stick, read from outside: $(says "$work/beta.disk")"
+                    ondisk b 3
+                    trial stick1 2
+                    trial stick2 1
+                    trial stick3 0
+                    ! grep -aqF 'TPM gave the key' "$work/stick1.log" "$work/stick2.log" "$work/stick3.log" || fail "the slot an update from a stick wrote was opened by the TPM: something was sealed for it"
+                    own stick4 away
+                    hears stick4 'slot b did not come up in 3 tries: this is slot a'
+                    hears stick4 'TPM gave the key of its state: no node was asked'
+                    opens stick4
+                    off
+                    recovered rec2
+                    # The third release, signed, with its tpm-next: damaged by a byte of the file on
+                    # the disk: the slot it was sealed for fails three times (the TPM refuses the
+                    # seal), the old slot starts, and its state opens with nothing typed.
+                    own dm2 web
+                    hears dm2 'TPM gave the key of its state: no node was asked'
+                    up dm2
+                    release r3 9.3.0 key1 "$key1" r3
+                    hears dm2 "the key of this node's state is sealed ahead for 9.3.0"
+                    hears dm2 'kith OS 9.3.0 is in the other slot: restarting into it'
+                    restarts 'the third release'
+                    [ "$(says "$work/beta.disk")" = 'sealed held tpm tpm-parent tpm-next seen' ] || fail "the disk of the machine that sealed ahead again, read from outside: $(says "$work/beta.disk")"
+                    ondisk b 3
+                    python3 -c '
+import hashlib, re, struct, sys
+# (The format of the lock record is in crates/kithd/src/crypt.rs, Record::read and Record::write: it sits
+# at 512 KiB of the "config" partition and a copy follows 4096 bytes on, written first; its text is
+# "kith-lock v1", a "sum:" line that is the SHA-256 of the rest, then the lines. One byte changed
+# and the sum kept would be a damaged record kithd refuses, not a seal the TPM refuses; so the
+# byte is changed in both copies and the sum made again.
+# The byte is hex digit 40 of tpm-next:, byte 20 of the sealed blob: inside the integrity HMAC
+# of the TPM2B_PRIVATE (bytes 4 to 36), so what reads the record whole and parses the blob (sizes
+# untouched) is TPM2_Load of the TPM, and that is what refuses. The log cannot say so: a seal that
+# does not open is said as the refusal of tpm:, the system that runs now. The control is the signed
+# leg above, whose undamaged tpm-next opens its slot; here the old slot "TPM gave the key" line
+# and the three tries are what is read.)
+with open(sys.argv[1], "r+b") as disk:
+    disk.seek(512 + 72)
+    entries = struct.unpack("<Q", disk.read(8))[0] * 512
+    for index in range(128):
+        disk.seek(entries + index * 128)
+        entry = disk.read(128)
+        if entry[56:].decode("utf-16-le").rstrip("\0") == "config":
+            at = struct.unpack("<Q", entry[32:40])[0] * 512 + (512 << 10)
+            disk.seek(at)
+            record = disk.read(4096).split(b"\0")[0]
+            first, _, rest = record.split(b"\n", 2)
+            found = re.search(rb"\ntpm-next: ([0-9a-f]+)\n", rest)
+            assert found, "no tpm-next: in the lock record"
+            place = found.start(1) + 40
+            rest = rest[:place] + (b"0" if rest[place : place + 1] != b"0" else b"1") + rest[place + 1 :]
+            made = first + b"\nsum: " + hashlib.sha256(rest).hexdigest().encode() + b"\n" + rest
+            for to in (0, 4096):
+                disk.seek(at + to)
+                disk.write(made.ljust(4096, b"\0"))
+            sys.exit(0)
+    sys.exit(1)' "$work/beta.disk" || fail "the machine's lock record has no tpm-next: to damage"
+                    trial dmg1 2
+                    trial dmg2 1
+                    trial dmg3 0
+                    ! grep -aqF 'TPM gave the key' "$work/dmg1.log" "$work/dmg2.log" "$work/dmg3.log" || fail "the TPM gave the key from the seal that was damaged"
+                    own dmg4 away
+                    hears dmg4 'slot b did not come up in 3 tries: this is slot a'
+                    hears dmg4 'TPM gave the key of its state: no node was asked'
+                    opens dmg4
+                    off
+                    recovered rec3
+                    # (The damaged seal is no use to anyone: taken back, with the rest, for what follows.)
+                    own dmg5 web
+                    up dmg5
+                    lock unseal | grep -q '"seal": *false' || fail "the seal could not be taken back after the damaged leg"
+                    hears dmg5 "this machine's TPM no longer holds the key of its state"
+                    told '"sealed": *false'
+                    off
+                    [ "$(says "$work/beta.disk")" = 'sealed held seen' ] || fail "the machine's disk, read from outside, once its seal was taken back again: $(says "$work/beta.disk")"
                     # A PIN, asked of the machine itself at its own address (no node passes one
                     # on): refused unless the owner says this TPM is untried (swtpm's is: 3
                     # wrong PINs, then one more every 1000 seconds, which 8 digits are enough
@@ -267,14 +561,13 @@ with open(sys.argv[1], "r+b") as disk:
                     hears beta9 "this machine's TPM and its PIN open its state; its TPM alone no longer does"
                     ! api GET /v1/resources | grep -qF "$pin" || fail "the PIN is in the store"
                     off
-                    [ "$(says "$work/beta.disk")" = 'sealed held tpm-parent tpm-pin' ] || fail "the disk of the machine with a PIN, read from outside: $(says "$work/beta.disk")"
+                    [ "$(says "$work/beta.disk")" = 'sealed held tpm-parent tpm-pin seen' ] || fail "the disk of the machine with a PIN, read from outside: $(says "$work/beta.disk")"
                     ! grep -aqF "$pin" "$work/beta.disk" "$work/alpha.log" "$work/beta9.log" || fail "the PIN is on the machine's disk or was said by a node"
                     # Away from its cluster it asks at its console: its PIN opens it.
                     own pin1 away
                     hears pin1 'Or type its PIN, or the recovery key, here: neither is shown'
                     hears pin1 'still locked'
                     ! grep -aqF 'state on' "$work/pin1.log" || fail "a machine away from its cluster opened its state before its PIN was typed"
-                    types() { printf '%s\n' "$2" | socat - "unix-connect:$work/$1.tty" >/dev/null; }
                     types pin1 "$pin"
                     hears pin1 'kithd: init: opened with its PIN'
                     hears pin1 'kithd: init: state on /dev/dm-'
@@ -313,7 +606,7 @@ with open(sys.argv[1], "r+b") as disk:
                     hears pin2 'kithd: init: state on /dev/dm-'
                     ! grep -aqF -e "$pin" -e 40917250 "$work/pin1.log" "$work/pin2.log" || fail "the machine's console showed a PIN as it was typed"
                     off
-                    echo "vm.sh: ok: a machine with its state encrypted, told to seal its key, said why not without a TPM; with one (swtpm) it sealed the key, and started again with no node asked; started with a word of its config partition changed, then with its boot file changed, then with a command line beside the boot file's, the TPM refused the key each time, the node was asked and the key sealed anew; locked, it dropped the seal, restarted and waited until unlocked, then sealed again; the seal taken back, its disk holds none; a PIN not passed on by the other node, given at its own address (once the owner said the TPM is untried), away from its cluster it opened with that PIN, then refused $wrong wrong ones until its TPM refused every PIN, the right one too, and the recovery key opened it all the same"
+                    echo "vm.sh: ok: a machine with its state encrypted, told to seal its key, said why not without a TPM; with one (swtpm) it sealed the key, and started again with no node asked; started with a word of its config partition changed, then with its boot file changed, then with a command line beside the boot file's, the TPM refused the key each time, the node was asked and the key sealed anew; locked, it dropped the seal, restarted and waited until unlocked, then sealed again; the seal taken back, its disk holds none; a boot file that is not the piece the cluster's key signed was never sealed for, and a release another key signed was refused before its image was fetched; a second signed release sealed the key ahead (tpm-next:), and the machine, with no node in reach, opened by it in the new slot and made it its seal once the slot was good; an update from a stick sealed nothing ahead; a third release with its tpm-next: damaged by a byte failed three times, the old slot started and opened with nothing typed; each leg ended with the recovery key opening the disk; a PIN not passed on by the other node, given at its own address (once the owner said the TPM is untried), away from its cluster it opened with that PIN, then refused $wrong wrong ones until its TPM refused every PIN, the right one too, and the recovery key opened it all the same"
                     exit 0
                 fi
                 api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"' || fail "the cluster holds no key for the machine"
@@ -443,26 +736,6 @@ with open(sys.argv[1], "r+b") as disk:
                 # without its key the boot loader is back on slot a. Read from beta's ESP, where the counter is.
                 # The update comes by kith.update from a stick (vdb), not from the cluster: update.rs's path
                 # from the OS release is not exercised here.
-                command -v mdir >/dev/null 2>&1 || mdir() { nix shell nixpkgs#mtools -c mdir "$@"; }
-                espat() { # NAME: where the partition NAME of beta's disk starts
-                    python3 -c '
-import struct, sys
-disk = open(sys.argv[1], "rb")
-disk.seek(512 + 72)
-entries = struct.unpack("<Q", disk.read(8))[0] * 512
-for index in range(128):
-    disk.seek(entries + index * 128)
-    entry = disk.read(128)
-    if entry[56:].decode("utf-16-le").rstrip("\0") == sys.argv[2]:
-        print(struct.unpack("<Q", entry[32:40])[0] * 512, end="")
-        sys.exit(0)
-sys.exit(1)' "$work/beta.disk" "$1"
-                }
-                ondisk() { # SLOT TRIES: beta's ESP holds exactly one boot file for SLOT, with TRIES tries left (kith-N-SLOT+TRIES.efi, or +TRIES-DONE once tried)
-                    names=$(mdir -b -i "$work/beta.disk@@$(espat esp)" ::EFI/Linux) || fail "beta's ESP could not be read"
-                    [ "$(printf '%s\n' "$names" | grep -cE "/kith-[0-9]*-$1[+.]")" = 1 ] || fail "beta's ESP does not have exactly one boot file for slot $1: $names"
-                    [ "$(printf '%s\n' "$names" | grep -cE "/kith-[0-9]*-$1\+$2(-[0-9]+)?\.efi$")" = 1 ] || fail "beta's ESP does not have slot $1 with $2 tries left: $names"
-                }
                 kill "$vm"
                 wait "$vm" 2>/dev/null || true
                 kill "$alpha"
