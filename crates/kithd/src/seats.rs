@@ -8,7 +8,9 @@
 // ponytail: a seat's reserve is taken off its node whether or not anything holds the seat (the
 // screen is there; a session may start any moment), and workloads already placed are not moved.
 // Every unit of a holder gets the whole memory guarantee (not a share of it). A session that
-// hangs while fullscreen keeps the others held back until it goes: a heartbeat if that bites.
+// hangs after a POST of fullscreen holds the others back for `EXPLICIT_FOR`, then `watch` judges
+// again; on a seat with no sound card or input to look at it stays until the session goes: a
+// heartbeat if that bites.
 // `watch` polls every `TICK` (a few small files; inotify if that is ever felt), and a session
 // that grabs its inputs (EVIOCGRAB) hides them from it: only sound counts then.
 
@@ -199,9 +201,35 @@ struct Mark {
 pub struct Memory {
     marks: BTreeMap<String, Mark>,
     inputs: BTreeMap<String, std::fs::File>,
+    /// Input paths that were refused (and said so), so the reason is said once.
+    refused: std::collections::BTreeSet<String>,
+    /// Tests only: a regular file stands in for an input, so the device checks are skipped.
+    lax: bool,
+}
+
+/// The `N` of `/dev/input/eventN`, and nothing else (a path in the store is not trusted).
+fn event(path: &str) -> Option<&str> {
+    path.strip_prefix("/dev/input/event")
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Is this open file an evdev node (a character device of major 13)? Not a regular file, a
+/// terminal, a watchdog or any other device.
+fn is_evdev(file: &std::fs::File) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    file.metadata()
+        .is_ok_and(|meta| meta.file_type().is_char_device() && nix::sys::stat::major(meta.rdev()) == 13)
 }
 
 impl Memory {
+    #[cfg(test)]
+    fn stand_in() -> Memory {
+        Memory {
+            lax: true,
+            ..Memory::default()
+        }
+    }
+
     /// The writes did not land: forget they were made, so they are not taken for a POST.
     fn failed(&mut self, writes: &[(String, Option<Value>)]) {
         for (key, _) in writes {
@@ -215,16 +243,30 @@ impl Memory {
     fn touched(&mut self, path: &str) -> bool {
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
+        if self.refused.contains(path) {
+            return false;
+        }
         if !self.inputs.contains_key(path) {
-            let flags = nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_NOFOLLOW;
+            let flags = nix::fcntl::OFlag::O_NONBLOCK
+                | nix::fcntl::OFlag::O_CLOEXEC
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_NOCTTY;
             let opened = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(flags.bits())
                 .open(path);
-            match opened {
-                Ok(file) => drop(self.inputs.insert(path.to_string(), file)),
-                Err(_) => return false,
+            let Ok(file) = opened else { return false };
+            // (Opened without a wait, so a node that is not an input could not hold this up; and
+            // what was opened is looked at, not what the name said: nothing else is ever read.)
+            let real = std::fs::canonicalize(path).ok();
+            let sound = self.lax || (real.as_deref() == Some(Path::new(path)) && is_evdev(&file));
+            if !sound {
+                if self.refused.insert(path.to_string()) {
+                    eprintln!("kithd: seats: {path} is not an input device of this node: not read");
+                }
+                return false;
             }
+            self.inputs.insert(path.to_string(), file);
         }
         let (mut came, mut buf) = (false, [0u8; 4096]);
         // (A bounded drain: a device that never runs dry cannot hold the loop.)
@@ -240,17 +282,26 @@ impl Memory {
     }
 }
 
-/// The held seats of `me`, each with the cards and inputs it has.
-fn plan(store: &Store, me: &str) -> Vec<Plan> {
+/// The held seats of `me` that have something to look at, each with the cards and inputs it has.
+/// (The store is not trusted for a path: an input is only a `/dev/input/event<N>` under `dev`,
+/// a card only a `/dev/snd/controlC<N>`, and only of a Device of this node. A seat with neither
+/// is not judged: what a session said of it stays.)
+fn plan(store: &Store, me: &str, dev: &Path) -> Vec<Plan> {
+    let mine = |name: &str| seat(store, name).filter(|spec| spec.node == me);
+    // (Before `holders`, which resolves every claim: a node with no seat has nothing to look at.)
+    if !store
+        .list(Some("Seat"))
+        .any(|found| mine(&found.metadata.name).is_some())
+    {
+        return Vec::new();
+    }
     let held: std::collections::BTreeSet<String> = holders(store).into_values().flatten().collect();
+    let digits = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
     let mut plans = Vec::new();
     for name in held {
-        let (Some(seat), Some(spec)) = (store.get(&format!("Seat/{name}")), seat(store, &name)) else {
+        let (Some(seat), Some(spec)) = (store.get(&format!("Seat/{name}")), mine(&name)) else {
             continue;
         };
-        if spec.node != me {
-            continue;
-        }
         let mut plan = Plan {
             seat: seat.clone(),
             cards: vec![],
@@ -261,17 +312,27 @@ fn plan(store: &Store, me: &str) -> Vec<Plan> {
             let Some(device) = found.and_then(|d| serde_json::from_value::<DeviceSpec>(d.spec.clone()).ok()) else {
                 continue;
             };
+            if device.node != me {
+                continue;
+            }
             let path = device.path.unwrap_or_default();
             match device.class {
                 DeviceClass::Audio => plan.cards.extend(
                     path.strip_prefix("/dev/snd/controlC")
+                        .filter(|n| digits(n))
                         .and_then(|n| n.parse::<u32>().ok()),
                 ),
-                DeviceClass::Input if !path.is_empty() => plan.inputs.push(path),
+                DeviceClass::Input => {
+                    let found = event(&path).map(|n| dev.join(format!("input/event{n}")));
+                    plan.inputs
+                        .extend(found.map(|path| path.to_string_lossy().into_owned()));
+                }
                 _ => {}
             }
         }
-        plans.push(plan);
+        if !plan.cards.is_empty() || !plan.inputs.is_empty() {
+            plans.push(plan);
+        }
     }
     plans
 }
@@ -310,6 +371,7 @@ fn round(plans: &[Plan], proc: &Path, memory: &mut Memory, now: u64) -> Vec<(Str
     memory.marks.retain(|name, _| names.contains(&name.as_str()));
     let paths: Vec<&String> = plans.iter().flat_map(|plan| &plan.inputs).collect();
     memory.inputs.retain(|path, _| paths.contains(&path));
+    memory.refused.retain(|path| paths.contains(&path));
     let mut writes = Vec::new();
     for plan in plans {
         let name = plan.seat.metadata.name.clone();
@@ -345,7 +407,7 @@ pub async fn watch(shared: Arc<Shared>, mut stopping: tokio::sync::watch::Receiv
     // (Alone, in agent mode, a node has no name to find its seats by.)
     let Some(cluster) = &shared.cluster else { return };
     let me = cluster.me.name.as_str();
-    let mut memory = Memory::default();
+    let (mut memory, mut failing) = (Memory::default(), false);
     loop {
         tokio::select! {
             () = tokio::time::sleep(TICK) => {}
@@ -353,21 +415,25 @@ pub async fn watch(shared: Arc<Shared>, mut stopping: tokio::sync::watch::Receiv
         }
         let plans = {
             let state = shared.store.lock().expect("nothing panics holding the store");
-            plan(&state.store, me)
+            plan(&state.store, me, Path::new("/dev"))
         };
         let statuses = round(&plans, Path::new("/proc/asound"), &mut memory, kith_api::store::now());
         if statuses.is_empty() {
             continue;
         }
-        if let Err(e) = shared
+        let sent = shared
             .submit(Command::Status {
                 statuses: statuses.clone(),
             })
-            .await
-        {
-            eprintln!("kithd: seats: saying what a seat does: {e}");
+            .await;
+        if let Err(e) = &sent {
+            // (Once while it fails, not every tick.)
+            if !failing {
+                eprintln!("kithd: seats: saying what a seat does: {e}");
+            }
             memory.failed(&statuses);
         }
+        failing = sent.is_err();
     }
 }
 
@@ -588,17 +654,15 @@ spec:
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join("asound/card3/pcm0p/sub0")).unwrap();
             std::fs::create_dir_all(dir.join("asound/card3/pcm0c/sub0")).unwrap();
-            std::fs::write(dir.join("event0"), "").unwrap();
-            let more = format!(
-                "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: {{ name: a-snd }}\nspec: {{ node: a, class: audio, path: /dev/snd/controlC3 }}\n\
-                 ---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: {{ name: a-kbd }}\nspec: {{ node: a, class: input, path: {} }}\n",
-                dir.join("event0").display()
-            );
+            std::fs::create_dir_all(dir.join("input")).unwrap();
+            std::fs::write(dir.join("input/event0"), "").unwrap();
+            let more = "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: { name: a-snd }\nspec: { node: a, class: audio, path: /dev/snd/controlC3 }\n\
+                 ---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: { name: a-kbd }\nspec: { node: a, class: input, path: /dev/input/event0 }\n";
             let seated = SEATED.replace("devices: [a-gpu-card0]", "devices: [a-gpu-card0, a-snd, a-kbd]");
             let tv = Tv {
                 store: store(&format!("{seated}{more}")),
                 dir,
-                memory: Memory::default(),
+                memory: Memory::stand_in(),
             };
             tv.pcm("closed");
             tv
@@ -614,14 +678,15 @@ spec:
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
-                .open(self.dir.join("event0"))
+                .open(self.dir.join("input/event0"))
                 .unwrap();
             file.write_all(&[0; 24]).unwrap();
         }
 
         /// One round of the loop for node `me` at `now`, its writes applied; what it wrote.
         fn round(&mut self, me: &str, now: u64) -> Vec<(String, Option<Value>)> {
-            let writes = round(&plan(&self.store, me), &self.dir.join("asound"), &mut self.memory, now);
+            let plans = plan(&self.store, me, &self.dir);
+            let writes = round(&plans, &self.dir.join("asound"), &mut self.memory, now);
             let statuses = writes.clone();
             kith_store::run(&mut self.store, Command::Status { statuses }).unwrap();
             writes
@@ -673,7 +738,7 @@ spec:
         tv.pcm("state: RUNNING");
         tv.store.delete("Workload/default/desktop").unwrap();
         assert_eq!(tv.round("a", 410), []);
-        assert!(plan(&tv.store, "a").is_empty());
+        assert!(plan(&tv.store, "a", &tv.dir).is_empty());
     }
 
     #[test]
@@ -691,7 +756,7 @@ spec:
         // A start of kithd (no memory) takes what the store says as its own, and judges at once.
         says(&mut tv.store, "active");
         tv.pcm("closed");
-        tv.memory = Memory::default();
+        tv.memory = Memory::stand_in();
         assert_eq!(tv.round("a", 2000), wrote("idle"));
     }
 
@@ -699,11 +764,75 @@ spec:
     fn a_write_that_failed_is_not_taken_for_a_post() {
         let mut tv = Tv::new("failed");
         tv.pcm("state: RUNNING");
-        let writes = round(&plan(&tv.store, "a"), &tv.dir.join("asound"), &mut tv.memory, 100);
+        let plans = plan(&tv.store, "a", &tv.dir);
+        let writes = round(&plans, &tv.dir.join("asound"), &mut tv.memory, 100);
         assert_eq!(writes, wrote("fullscreen"));
         // (The store never got it.) The loop forgets it wrote, and says it again next round.
         tv.memory.failed(&writes);
         assert_eq!(tv.round("a", 105), wrote("fullscreen"));
         assert_eq!(tv.round("a", 110), []);
+    }
+
+    #[test]
+    fn a_path_in_the_store_is_not_trusted_and_a_seat_with_nothing_to_look_at_is_not_judged() {
+        let mut tv = Tv::new("paths");
+        let device = |node: &str, path: &str| {
+            let source = format!(
+                "apiVersion: kith.dev/v1\nkind: Device\nmetadata: {{ name: a-kbd }}\nspec: {{ node: {node}, class: input, path: {path} }}\n"
+            );
+            Resource::from_source(&source).unwrap().remove(0).unwrap()
+        };
+        let inputs = |tv: &Tv| plan(&tv.store, "a", &tv.dir).remove(0).inputs;
+        assert_eq!(inputs(&tv), [tv.dir.join("input/event0").to_string_lossy()]);
+        for path in [
+            "/dev/input/../x",
+            "input/event0",
+            "/proc/kmsg",
+            "/dev/watchdog",
+            "/dev/zero",
+            "/dev/input/event",
+            "/dev/input/event0x",
+            "/dev/input/event0/..",
+        ] {
+            tv.store.apply(device("a", path)).unwrap();
+            assert!(inputs(&tv).is_empty(), "{path}");
+        }
+        // A Device of another node is not read, whatever its path.
+        tv.store.apply(device("b", "/dev/input/event0")).unwrap();
+        assert!(inputs(&tv).is_empty());
+        tv.store.apply(device("a", "/dev/input/event7")).unwrap();
+        assert_eq!(inputs(&tv), [tv.dir.join("input/event7").to_string_lossy()]);
+        // A seat with no card and no input (a GPU alone) keeps what a session POSTed.
+        let mut gpu = self::store(SEATED);
+        says(&mut gpu, "fullscreen");
+        assert!(plan(&gpu, "a", &tv.dir).is_empty());
+        let mut memory = Memory::default();
+        assert_eq!(
+            round(&plan(&gpu, "a", &tv.dir), &tv.dir, &mut memory, 5 * EXPLICIT_FOR),
+            []
+        );
+        assert_eq!(tunes(&gpu, "a")["Workload/default/batch"], (None, true));
+    }
+
+    #[test]
+    fn an_input_that_is_not_an_evdev_node_is_refused_when_opened() {
+        assert_eq!(event("/dev/input/event12"), Some("12"));
+        assert_eq!(
+            [event("/dev/input/mice"), event("/dev/input/by-id/event1")],
+            [None, None]
+        );
+        // A regular file named like an event node, and a character device that is not one.
+        let mut tv = Tv::new("refused");
+        tv.memory = Memory::default();
+        let path = tv.dir.join("input/event0");
+        assert!(!is_evdev(&std::fs::File::open(&path).unwrap()));
+        assert!(!is_evdev(&std::fs::File::open("/dev/null").unwrap()));
+        tv.touch();
+        let path = path.to_string_lossy().into_owned();
+        assert!(!tv.memory.touched(&path));
+        assert!(tv.memory.refused.contains(&path) && tv.memory.inputs.is_empty());
+        // (Said once, and not opened again until its path leaves the plan.)
+        assert!(!tv.memory.touched(&path));
+        assert_eq!(tv.round("a", 100), []);
     }
 }

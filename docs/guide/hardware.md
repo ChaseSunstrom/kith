@@ -182,11 +182,13 @@ spec:
   memory (`memory.min`) and go first for CPU and disk (`cpu.weight` and `io.weight` at 10000;
   all else 100). CPUs are not pinned; a GPU is not shared out (not yet).
 - kithd sets `status.activity` of a held seat itself, every few seconds: `fullscreen` while the
-  seat's sound card plays, `active` for three minutes after its keyboard, mouse or pad is touched
-  (kithd notes only that something came, never what), `idle` otherwise. A seat nobody holds is
-  idle. A session may say better with `POST
+  seat's sound card plays (any playback counts, music too), `active` for three minutes after its
+  keyboard, mouse or pad is touched (kithd notes only that something came, never what), `idle`
+  otherwise. A seat nobody holds is idle, and one with no sound card or input is left as it is.
+  A session may say better with `POST
   /v1/seats/desk-seat0/activity?state=active|idle|fullscreen` (it needs an Identity whose Role
-  may apply `Seat`s): a POST wins for ten minutes, then kithd judges again. A plan with
+  may apply `Seat`s): a POST wins for ten minutes, then kithd judges again. (A POST of the value
+  already there, or one made before the node first looks at the seat, is not seen as a POST.) A plan with
   `waitForIdleSeats` waits for a node whose seat is `active` or `fullscreen`.
 - A workload with `yieldTo` runs on a twentieth of a CPU on that seat's node while the seat is
   in a state it names, and gets its limit back when the state changes (about ten seconds).
