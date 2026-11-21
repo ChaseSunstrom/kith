@@ -204,6 +204,7 @@ pub struct Memory {
     /// Input paths that were refused (and said so), so the reason is said once.
     refused: std::collections::BTreeSet<String>,
     /// Tests only: a regular file stands in for an input, so the device checks are skipped.
+    #[cfg(test)]
     lax: bool,
 }
 
@@ -255,11 +256,23 @@ impl Memory {
                 .read(true)
                 .custom_flags(flags.bits())
                 .open(path);
-            let Ok(file) = opened else { return false };
+            let file = match opened {
+                Ok(file) => file,
+                // (Not there yet: looked for again next round. Any other failure, once.)
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+                Err(e) => {
+                    if self.refused.insert(path.to_string()) {
+                        eprintln!("kithd: seats: {path} cannot be opened: {e}");
+                    }
+                    return false;
+                }
+            };
             // (Opened without a wait, so a node that is not an input could not hold this up; and
             // what was opened is looked at, not what the name said: nothing else is ever read.)
             let real = std::fs::canonicalize(path).ok();
-            let sound = self.lax || (real.as_deref() == Some(Path::new(path)) && is_evdev(&file));
+            let sound = real.as_deref() == Some(Path::new(path)) && is_evdev(&file);
+            #[cfg(test)]
+            let sound = sound || self.lax;
             if !sound {
                 if self.refused.insert(path.to_string()) {
                     eprintln!("kithd: seats: {path} is not an input device of this node: not read");
@@ -358,7 +371,8 @@ fn playing(proc: &Path, card: u32) -> bool {
 fn judge(playing: bool, touched: Option<u64>, now: u64) -> &'static str {
     match touched {
         _ if playing => "fullscreen",
-        Some(at) if now.saturating_sub(at) < ACTIVE_FOR => "active",
+        // (`at` after `now`: the clock went back; a touch from the future is not a touch.)
+        Some(at) if now >= at && now - at < ACTIVE_FOR => "active",
         _ => "idle",
     }
 }
@@ -389,7 +403,8 @@ fn round(plans: &[Plan], proc: &Path, memory: &mut Memory, now: u64) -> Vec<(Str
             mark.hold_until = Some(now + EXPLICIT_FOR);
         }
         match mark.hold_until {
-            Some(until) if now < until => continue,
+            // (More than `EXPLICIT_FOR` ahead: the clock went back, so the hold is over.)
+            Some(until) if now < until && until - now <= EXPLICIT_FOR => continue,
             _ => mark.hold_until = None,
         }
         let judged = judge(plan.cards.iter().any(|&card| playing(proc, card)), mark.touched, now);
@@ -408,6 +423,8 @@ pub async fn watch(shared: Arc<Shared>, mut stopping: tokio::sync::watch::Receiv
     let Some(cluster) = &shared.cluster else { return };
     let me = cluster.me.name.as_str();
     let (mut memory, mut failing) = (Memory::default(), false);
+    // (Seconds since this loop began: the wall clock can be stepped back, this cannot.)
+    let began = std::time::Instant::now();
     loop {
         tokio::select! {
             () = tokio::time::sleep(TICK) => {}
@@ -417,7 +434,12 @@ pub async fn watch(shared: Arc<Shared>, mut stopping: tokio::sync::watch::Receiv
             let state = shared.store.lock().expect("nothing panics holding the store");
             plan(&state.store, me, Path::new("/dev"))
         };
-        let statuses = round(&plans, Path::new("/proc/asound"), &mut memory, kith_api::store::now());
+        let statuses = round(
+            &plans,
+            Path::new("/proc/asound"),
+            &mut memory,
+            began.elapsed().as_secs(),
+        );
         if statuses.is_empty() {
             continue;
         }
@@ -758,6 +780,32 @@ spec:
         tv.pcm("closed");
         tv.memory = Memory::stand_in();
         assert_eq!(tv.round("a", 2000), wrote("idle"));
+    }
+
+    #[test]
+    fn a_clock_that_steps_back_does_not_keep_a_seat_active_or_a_post_in_force() {
+        let mut tv = Tv::new("back");
+        tv.touch();
+        assert_eq!(tv.round("a", 1_000_000), wrote("active"));
+        assert_eq!(tv.round("a", 100), wrote("idle"));
+        // A POST seen at 2_000_000 holds for EXPLICIT_FOR; a step back ends it, not lengthens it.
+        says(&mut tv.store, "fullscreen");
+        assert_eq!(tv.round("a", 2_000_000), []);
+        assert_eq!(tv.round("a", 200), wrote("idle"));
+    }
+
+    #[test]
+    fn an_input_that_cannot_be_opened_is_said_once_and_a_missing_one_is_looked_for_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut tv = Tv::new("denied");
+        tv.memory = Memory::default();
+        let gone = tv.dir.join("input/event9").to_string_lossy().into_owned();
+        assert!(!tv.memory.touched(&gone) && tv.memory.refused.is_empty());
+        let path = tv.dir.join("input/event0");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        assert!(!tv.memory.touched(&path));
+        assert!(tv.memory.refused.contains(&path));
     }
 
     #[test]

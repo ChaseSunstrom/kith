@@ -187,7 +187,9 @@ spec:
   otherwise. A seat nobody holds is idle, and one with no sound card or input is left as it is.
   A session may say better with `POST
   /v1/seats/desk-seat0/activity?state=active|idle|fullscreen` (it needs an Identity whose Role
-  may apply `Seat`s): a POST wins for ten minutes, then kithd judges again. (A POST of the value
+  may apply `Seat`s): a POST wins for ten minutes, then kithd judges again. Posting the same
+  value again does not extend the ten minutes (there is no heartbeat yet): a session that must
+  stay `fullscreen` longer than that has a sound card or input that says so. (A POST of the value
   already there, or one made before the node first looks at the seat, is not seen as a POST.) A plan with
   `waitForIdleSeats` waits for a node whose seat is `active` or `fullscreen`.
 - A workload with `yieldTo` runs on a twentieth of a CPU on that seat's node while the seat is
