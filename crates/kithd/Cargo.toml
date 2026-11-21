@@ -84,6 +84,8 @@ zeroize = "1"
 log = { version = "0.4", features = ["release_max_level_off"] }
 
 [dev-dependencies]
+# (A process on this host in the place of a container's, to test exec's terminal with.)
+kith-runtime = { path = "../kith-runtime", features = ["host"] }
 # (A clock a test owns: the waiting console answers at a fixed time.)
 tokio = { version = "1", features = ["test-util"] }
 serde_json.workspace = true
