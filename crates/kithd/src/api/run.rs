@@ -451,25 +451,36 @@ impl App {
         let socket = dir.0.join("s");
         let listener =
             UnixListener::bind(&socket).map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
-        let mut command = Command::new(via);
-        command
-            .arg("--socket")
-            .arg(&socket)
-            .args(["server", "--"])
-            .args(&spec.argv)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .process_group(0)
-            .kill_on_drop(true);
-        let child = command.spawn().map_err(|e| match e.kind() {
+        let start = |procs: Option<&Path>| {
+            let mut command = Command::new(via);
+            command
+                .arg("--socket")
+                .arg(&socket)
+                .args(["server", "--"])
+                .args(&spec.argv)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .process_group(0)
+                .kill_on_drop(true);
+            if let Some(procs) = procs {
+                kith_dm_sys::join_cgroup_before_exec(command.as_std_mut(), procs)?;
+            }
+            command.spawn()
+        };
+        // In the cgroup before its exec (so nothing it forks is outside). If that fails the
+        // program is not started, and it is started again without: the process group still ends it.
+        let procs = leaf.as_ref().map(|leaf| leaf.0.join("cgroup.procs"));
+        let spawned = match start(procs.as_deref()) {
+            Err(e) if procs.is_some() => {
+                eprintln!("kithd: run: could not start the app in its cgroup, the process group is all that ends it: {e}");
+                start(None)
+            }
+            other => other,
+        };
+        let child = spawned.map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => format!("{via} is not installed on node {node} (kith does not ship it)"),
             _ => format!("cannot start {via} on node {node}: {e}"),
         })?;
-        if let (Some(leaf), Some(pid)) = (&leaf, child.id())
-            && let Err(e) = std::fs::write(leaf.0.join("cgroup.procs"), pid.to_string())
-        {
-            eprintln!("kithd: run: could not put the app in its cgroup, the process group is all that ends it: {e}");
-        }
         Ok(App {
             group: child.id().and_then(|pid| i32::try_from(pid).ok()),
             child,
@@ -1034,6 +1045,34 @@ spec: {role: other-jobber, subjects: [carol]}
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("the connections to node b, armed or not: {seen:?} (two expected: a's end and b's)");
+    }
+
+    /// A VIA that reads its own cgroup as its first act (and forks `cat` to do it, which keeps
+    /// whatever cgroup it is in at that moment): it is in the run's cgroup from its first
+    /// instruction, however fast it forks. (Skipped where no cgroup can be made: no delegation.)
+    #[tokio::test]
+    async fn run_puts_a_program_that_forks_at_once_in_the_runs_cgroup() {
+        let probe = format!("kith-run-probe-{}", std::process::id());
+        if Leaf::make(&probe).is_none() {
+            eprintln!("skipped: no delegated cgroup to make one in (run in a systemd user session or scope)");
+            return;
+        }
+        static PATH: OnceLock<String> = OnceLock::new();
+        let fast = installed(&PATH, "fast", "#!/bin/sh\ncat /proc/self/cgroup > \"$0.cgroup\"\nexec sleep 300\n");
+        let world = World::new("cgroup-fast").await;
+        let alice = world.user("alice");
+        let spec = json!({"on": "a", "via": fast, "argv": ["true"]});
+        let tunnel = tunnel(&alice, world.a_port, "/v1/run", spec).await.unwrap();
+        let mut seen = String::new();
+        for _ in 0..200 {
+            seen = std::fs::read_to_string(format!("{fast}.cgroup")).unwrap_or_default();
+            if !seen.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(tunnel);
+        assert!(seen.contains("kith-run-"), "the program's first look at its cgroup: {seen:?}");
     }
 
     /// A program that makes its own session leaves the process group, and is still ended with the

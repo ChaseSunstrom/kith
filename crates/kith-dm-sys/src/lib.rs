@@ -1435,11 +1435,51 @@ pub fn relro_ranges(headers: impl Iterator<Item = (u32, usize, usize)> + Clone, 
         .collect()
 }
 
+/// Makes `command`'s child join the cgroup whose `cgroup.procs` is `procs` between the fork and
+/// the exec: from its first instruction, so nothing it forks can be outside. The child writes
+/// `0` (itself) with raw `open`, `write` and `close` (nothing that allocates, as a forked
+/// child of a threaded process may do only async-signal-safe calls). If any of them fails,
+/// `spawn` fails with that error and the program is not started.
+pub fn join_cgroup_before_exec(command: &mut std::process::Command, procs: &Path) -> Result<()> {
+    use std::os::unix::{ffi::OsStrExt, process::CommandExt};
+    let procs = std::ffi::CString::new(procs.as_os_str().as_bytes()).map_err(Error::other)?;
+    // SAFETY: the closure makes only async-signal-safe calls on memory made before the fork.
+    unsafe {
+        command.pre_exec(move || {
+            let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if fd < 0 {
+                return Err(Error::last_os_error());
+            }
+            let written = libc::write(fd, c"0".as_ptr().cast(), 1);
+            let failed = (written != 1).then(Error::last_os_error);
+            libc::close(fd);
+            failed.map_or(Ok(()), Err)
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
     use std::time::Duration;
+
+    #[test]
+    fn a_child_writes_zero_to_the_cgroup_file_before_it_execs_or_does_not_start() {
+        let procs = std::env::temp_dir().join(format!("kith-dm-sys-procs-{}", std::process::id()));
+        std::fs::write(&procs, "").unwrap();
+        let mut command = std::process::Command::new("true");
+        join_cgroup_before_exec(&mut command, &procs).unwrap();
+        assert!(command.status().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&procs).unwrap(), "0");
+        std::fs::remove_file(&procs).unwrap();
+        // A file it cannot open: the spawn fails with that, and `true` does not run.
+        let mut command = std::process::Command::new("true");
+        join_cgroup_before_exec(&mut command, &procs).unwrap();
+        assert_eq!(command.spawn().unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(join_cgroup_before_exec(&mut command, Path::new("a\0b")).is_err());
+    }
 
     #[test]
     fn rtc_time_is_the_civil_time_in_utc() {
