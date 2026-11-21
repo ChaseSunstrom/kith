@@ -1,8 +1,9 @@
 # Encrypting a node's state in place: the journal and the order of writes
 
 Status: the engine is built (T-1136, `crates/kithd/src/in_place.rs`, tested on files with every
-cut); nothing calls it yet. Its wiring into init is T-1137, the real dm-crypt mapper is the
-slice after. This record is the part of T-1106 that the cuts depend on. Where the code differs
+cut), and init runs it at boot (T-1137: a marker 64 KiB into the config partition, a lock record
+with the key, the pass before the state is mounted; `ci/vm/encrypt.sh` cuts it mid-pass). The
+verb that writes the marker is the slice after. This record is the part of T-1106 that the cuts depend on. Where the code differs
 from a line here, the code is the word. It builds on [adr-unlock.md](adr-unlock.md) (the lock
 record, at 512 KiB into the config partition) and on the order of writes of
 [adr-second-disk.md](adr-second-disk.md).

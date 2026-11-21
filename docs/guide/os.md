@@ -28,8 +28,11 @@ As process 1, kithd:
   other), or it is left and the status says so; a node that runs alone for long should set
   `kith.ntp`. A node whose clock is not yet set answers its peers' time
   question with a 503. Each Node's status says its `clock`: the server, the offset and whether it
-  stepped it. A node under the `hardened` policy does not set its clock: its status says the
-  offset and the refusal;
+  stepped it. A step is written to the hardware clock (the RTC, in UTC) too, so a restarted node
+  boots with the time it had (not the first answer of a network alone, before the clock was ever
+  set: only the server you name, the leader, or a server the leader agrees with); a write that
+  fails is in the status as `rtcError` and in the log, and the step still counts. A node under the `hardened` policy does not set its clock, either of them: its
+  status says the offset and the refusal;
 - reads its own arguments after ` -- ` on the command line: `console=ttyS0 kith.hostname=alpha
   -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443`;
 - collects orphaned processes and says what it says on every console the kernel has;
@@ -364,7 +367,11 @@ address on the node itself or its own networks (loopback, private, shared, link-
 multicast) is refused. `--lan-releases` (`lanReleases: true` at install) allows the private
 ranges for a release server on the LAN; then whoever may write an OSRelease can have every node
 ask any host on them and read in the plan's status whether it answered. Give OSRelease and
-UpdatePlan to nobody but the cluster's admin in any case: they decide when nodes restart.
+UpdatePlan to nobody but the cluster's admin in any case: they decide when nodes restart. A
+release agent for the canary ring is the exception a Role can name: `{ kinds: [OSRelease],
+verbs: [get, list, apply, delete], names: [canary] }` (see Access), with the plan `canary`
+(its selector is the ring) kept by the admin: the agent cannot write any UpdatePlan or any
+other release, and a changed release `canary` rolls that plan again.
 
 **Handing over to other keys.** `handover` in a release names the keys that count once a node
 runs it (its own among them, if it is to go on counting), signed by the release's key and by one

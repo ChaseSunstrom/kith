@@ -543,7 +543,9 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
 
 A Job runs to its end on one node, and a drain never stops it. Keep its state on a Volume there:
 the program reads its last checkpoint at start. If the node is lost, the Job waits for it and
-resumes from that checkpoint.
+resumes from that checkpoint (on a Volume with `replicas` it does not wait: once the node is lost
+a copy takes over and the Job starts over on it, from the checkpoint of the last sync, as in [a
+workload that outlives its node](workloads.md#a-workload-that-outlives-its-node)).
 
 ```yaml
 apiVersion: kith.dev/v1

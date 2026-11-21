@@ -1189,13 +1189,19 @@ fn read(
     verb: &Verb,
     look: &mut Look,
 ) -> Vec<(String, Value)> {
-    let may = |resource: &&Resource| grants.may(verb, &resource.kind, resource.metadata.namespace.as_deref());
+    let may = |resource: &&Resource| {
+        let (namespace, name) = (
+            resource.metadata.namespace.as_deref(),
+            Some(resource.metadata.name.as_str()),
+        );
+        grants.may(verb, &resource.kind, namespace, name)
+    };
     let of_kind = |(of, object): (&'static Kind, Value)| std::ptr::eq(of, kind).then_some(object);
     match (kind.held, name) {
         (Held::Made, _) => made(store, kind, namespace, name, &may, look),
         // A namespace is there when it is said to be, and when anything is in it.
         (Held::As("Namespace"), _) => {
-            if !grants.may(verb, "Namespace", None) {
+            if !grants.may(verb, "Namespace", None, None) {
                 return Vec::new();
             }
             let mut names: BTreeSet<&str> = store
