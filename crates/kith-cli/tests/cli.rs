@@ -308,6 +308,90 @@ fn a_silent_daemon_times_out() {
     assert!(began.elapsed() < std::time::Duration::from_secs(10));
 }
 
+/// `kith node encrypt` against a stand-in kithd on a socket: it asks the route the node serves, the
+/// recovery key it is given reaches stdout once and nothing else (stderr, and what the stand-in
+/// was sent, are searched), and `--cancel` asks the same route with the cancel flag and shows no key.
+#[test]
+fn node_encrypt_asks_its_route_and_shows_the_recovery_key_once() {
+    use std::io::{Read, Write};
+    let sb = Sandbox::new("node-encrypt");
+    let socket = sb.0.join("kithd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let key = "0123 4567 89ab cdef 0123 4567 89ab cdef";
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            let (head, sent) = loop {
+                let n = conn.read(&mut buf).unwrap();
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let head = text[..end].to_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                        .unwrap_or(0);
+                    if got.len() >= end + 4 + length || n == 0 {
+                        break (text[..end].to_string(), text[end + 4..].to_string());
+                    }
+                }
+            };
+            let first = head.lines().next().unwrap().to_string();
+            let body = if first.contains("/v1/cluster") {
+                "{}".to_string()
+            } else if sent.contains("true") {
+                r#"{"node":"n1","cancelled":true}"#.to_string()
+            } else {
+                format!(r#"{{"node":"n1","recovery":"{key}"}}"#)
+            };
+            seen.push(first);
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            conn.write_all(reply.as_bytes()).unwrap();
+        }
+        seen
+    });
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_kith"))
+            .args(args)
+            .env("KITH_SOCKET", &socket)
+            .env_remove("KITH_STORE")
+            .output()
+            .unwrap()
+    };
+    let started = run(&["node", "encrypt", "n1"]);
+    let (out, err) = (
+        String::from_utf8(started.stdout).unwrap(),
+        String::from_utf8(started.stderr).unwrap(),
+    );
+    assert_eq!(started.status.code(), Some(0), "{err}");
+    assert_eq!(out.matches(key).count(), 1, "{out}");
+    assert!(!err.contains(key) && !err.contains("0123"), "{err}");
+    let cancelled = run(&["node", "encrypt", "n1", "--cancel"]);
+    let (out, err) = (
+        String::from_utf8(cancelled.stdout).unwrap(),
+        String::from_utf8(cancelled.stderr).unwrap(),
+    );
+    assert_eq!(cancelled.status.code(), Some(0), "{err}");
+    assert!(
+        out.contains("cancelled") && !out.contains(key) && !err.contains(key),
+        "{out}{err}"
+    );
+    let seen = server.join().unwrap();
+    assert!(
+        seen.iter()
+            .filter(|l| l.starts_with("POST /v1/lock/n1/encrypt "))
+            .count()
+            == 2,
+        "{seen:?}"
+    );
+}
+
 /// The nas package: a Share for the volume, and (when it names SMB users) the Samba
 /// container with the volume mounted and each user's password from the Secret.
 /// The kith-build package: a Volume for what the build leaves, a Job that runs the steps
