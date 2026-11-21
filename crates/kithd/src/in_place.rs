@@ -7,8 +7,10 @@
 //! a cut at any point of it leaves every chunk either plain or encrypted with the journal saying
 //! which, is the ADR's, section 2 and 3; the comments here say only what a line must not move
 //! past.
-// (Called by init's wiring, T-1137: not yet.)
-#![allow(dead_code)]
+//!
+//! [`at_boot`] is what init calls before the state is mounted: it decides from the marker, the
+//! journal and the lock record's key whether a pass is due, runs it, and clears the marker and
+//! then the journal.
 
 use ring::{aead, digest, hkdf, hmac};
 use std::fs::File;
@@ -28,6 +30,10 @@ const HEAD1: u64 = 128 << 10;
 const HEAD2: u64 = HEAD1 + ROOM as u64;
 const SLOT: u64 = 192 << 10;
 const SLOT_ROOM: usize = CHUNK + ROOM;
+/// The marker: this node's state is to be encrypted in place, at the next start. It is the first
+/// 4 KiB past the node's config, clear of the journal and of the lock record.
+const MARK: u64 = 64 << 10;
+const MARKED: &[u8] = b"kith-inplace pending v1\n";
 const MAGIC: &[u8; 16] = b"kith-inplace v1\n";
 const NONCE: usize = aead::NONCE_LEN;
 const TAG: usize = aead::MAX_TAG_LEN;
@@ -226,7 +232,7 @@ impl Sealer {
 /// ([`finished`]) when this returns: [`forget`] it only once the lock record is on the disk.
 pub fn pass(
     part: &impl Disk,
-    mapped: &impl Disk,
+    mapped: &(impl Disk + ?Sized),
     journal: &impl Disk,
     key: &[u8; 64],
     (total, chunk): (u64, usize),
@@ -369,9 +375,114 @@ pub fn finished(journal: &impl Disk) -> io::Result<bool> {
 /// So not before the node's lock record (T-1137) says the partition is encrypted and is on the
 /// disk: until then "no journal" and "a pass never begun" are the same to this engine.
 pub fn forget(journal: &impl Disk) -> io::Result<()> {
-    journal.write_at(&[0; 2 * ROOM], HEAD1)?;
+    // (The second header first, each to the disk before the next: a cut in the first's write leaves
+    // it torn beside a second that is zero, which reads as a pass never begun, not as a damaged one.)
+    journal.write_at(&[0; ROOM], HEAD2)?;
+    journal.sync()?;
+    journal.write_at(&[0; ROOM], HEAD1)?;
+    journal.sync()?;
     journal.write_at(&vec![0; SLOT_ROOM], SLOT)?;
     journal.sync()
+}
+
+/// Whether the journal holds a pass at all: a header that is whole or one that is not (a pass
+/// whose two copies are both damaged is begun, and [`pass`] says what is wrong with it).
+pub fn begun(journal: &impl Disk) -> io::Result<bool> {
+    let (one, two, zero) = heads(journal)?;
+    Ok(one.is_some() || two.is_some() || !zero)
+}
+
+/// How far the journal's pass is: the chunks done and the chunks in all, if it holds one.
+pub fn progress(journal: &impl Disk) -> io::Result<Option<(u64, u64)>> {
+    let (one, two, _) = heads(journal)?;
+    let newest = [one, two].into_iter().flatten().max_by_key(|head| head.done);
+    Ok(newest.map(|head| (head.done, head.total.div_ceil(head.chunk.max(1) as u64))))
+}
+
+/// Whether the node's state is to be encrypted in place at this start.
+pub fn marked(config: &impl Disk) -> io::Result<bool> {
+    let mut room = [0; ROOM];
+    config.read_at(&mut room, MARK)?;
+    Ok(room.starts_with(MARKED))
+}
+
+/// Put the marker down: the next start runs the pass. The lock record, holding the state's key,
+/// is on the disk before this (init has no key to pass under without it), and the journal is
+/// empty: a pass of an older journal would be taken for this one's.
+#[allow(dead_code, reason = "what the verb writes (T-1106 slice b)")]
+pub fn mark(config: &impl Disk) -> io::Result<()> {
+    if begun(config)? {
+        return Err(bad("the journal holds a pass already: it is not marked over"));
+    }
+    let mut room = [0; ROOM];
+    room[..MARKED.len()].copy_from_slice(MARKED);
+    config.write_at(&room, MARK)?;
+    config.sync()
+}
+
+/// Take the marker away.
+pub fn unmark(config: &impl Disk) -> io::Result<()> {
+    config.write_at(&[0; ROOM], MARK)?;
+    config.sync()
+}
+
+/// What [`at_boot`] did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Outcome {
+    /// No marker and no journal: a node that is as it was.
+    Nothing,
+    /// A finished pass's journal, left by a cut after the marker went, forgotten.
+    Cleaned,
+    /// The pass ran (or was found finished) and the marker and the journal are gone.
+    Encrypted,
+}
+
+/// Makes the mapping of the partition under a key and hands it to what it is given; closes it
+/// after (a mapping that cannot be closed is an error).
+pub type Open<'a> = &'a dyn Fn(&[u8; 64], &mut dyn FnMut(&dyn Disk) -> io::Result<()>) -> io::Result<()>;
+
+/// What init does before the state is mounted or opened: decide from the marker, the journal and
+/// the lock record's `key` (the state's, while no other node holds it) whether a pass is due,
+/// and run it over the partition's `total` bytes.
+///
+/// - Marked, with a key: the pass (a finished one is a no-op), then the marker goes, and then the
+///   journal; in that order, so that a cut between them leaves a finished journal with no marker
+///   ([`Outcome::Cleaned`] at the next start) and never a marker with no journal over a state
+///   that is encrypted already, which would be encrypted again.
+/// - Marked, with no key: an error. Nothing is written.
+/// - Not marked, a finished journal: forgotten. A journal not finished: an error, the state is
+///   part encrypted and nothing to mount it as.
+/// - Neither: nothing.
+///
+/// An error leaves the marker and the journal as they are, and the caller does not mount the
+/// state: it is not a plain file system to mount as it lies.
+pub fn at_boot(
+    config: &impl Disk,
+    part: &impl Disk,
+    total: u64,
+    key: Option<&[u8]>,
+    open: Open,
+    hit: &mut dyn FnMut(Point) -> io::Result<()>,
+) -> io::Result<Outcome> {
+    match (marked(config)?, begun(config)?) {
+        (false, false) => Ok(Outcome::Nothing),
+        (false, true) if finished(config)? => forget(config).map(|()| Outcome::Cleaned),
+        (false, true) => Err(bad(
+            "a pass was begun and its marker is gone: the state is part encrypted, and not mounted as either",
+        )),
+        (true, _) => {
+            let key = key.and_then(|key| <&[u8; 64]>::try_from(key).ok());
+            let key =
+                key.ok_or_else(|| bad("a pass is due, and the lock record holds no key of 64 bytes to do it with"))?;
+            open(key, &mut |mapped| {
+                pass(part, mapped, config, key, (total, CHUNK), &mut *hit)
+            })?;
+            // (The marker first: see above.)
+            unmark(config)?;
+            forget(config)?;
+            Ok(Outcome::Encrypted)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -592,6 +703,20 @@ mod support {
         /// The end state of any pass: every byte of the partition encrypted, all of it readable
         /// through the mapping, the slot empty, and the journal saying all done.
         pub fn assert_done(&self, why: &str) {
+            self.assert_encrypted(why);
+            let journal = self.journal.on_disk();
+            let head = Header::parse(journal[HEAD1 as usize..][..ROOM].try_into().unwrap());
+            assert_eq!(
+                head.map(|head| head.done),
+                Some(self.total.div_ceil(self.chunk as u64)),
+                "{why}"
+            );
+        }
+
+        /// The partition is the plain data encrypted and reads back through the mapping, the
+        /// slot is empty, and no plain data is in the journal: what a journal that was forgotten
+        /// leaves too.
+        pub fn assert_encrypted(&self, why: &str) {
             let on_disk = self.raw.on_disk();
             let want: Vec<u8> = self.plain.iter().zip(0..).map(|(byte, at)| byte ^ stream(at)).collect();
             assert!(on_disk == want, "{why}: the partition is not the plain data encrypted");
@@ -608,12 +733,6 @@ mod support {
                 "{why}: the backup slot is not empty"
             );
             assert!(!self.leaks(), "{why}: plain data is in the journal");
-            let head = Header::parse(journal[HEAD1 as usize..][..ROOM].try_into().unwrap());
-            assert_eq!(
-                head.map(|head| head.done),
-                Some(self.total.div_ceil(self.chunk as u64)),
-                "{why}"
-            );
         }
     }
 }
@@ -628,6 +747,7 @@ mod layout {
     fn the_journal_fits_clear_of_the_config_and_the_lock_record() {
         let lock = crate::crypt::AT..crate::crypt::AT + 2 * 4096;
         let places = [
+            ("marker", MARK..MARK + ROOM as u64),
             ("header 1", HEAD1..HEAD1 + ROOM as u64),
             ("header 2", HEAD2..HEAD2 + ROOM as u64),
             ("backup slot", SLOT..SLOT + SLOT_ROOM as u64),
@@ -984,5 +1104,289 @@ mod cut {
         assert!(Sealer::new(&KEY).open(&id, 1, 4096, &sealed).is_none());
         assert!(Sealer::new(&[8; 64]).open(&id, 0, 4096, &sealed).is_none());
         assert!(sealed[NONCE..].windows(16).all(|window| window != &rig.plain[..16]));
+    }
+}
+
+/// What init does at a start (T-1137): the marker, the journal and the key decide whether a pass
+/// runs, and the marker and the journal go only after it did.
+#[cfg(test)]
+mod boot {
+    use super::support::*;
+    use super::*;
+    use std::cell::Cell;
+
+    /// Three chunks of the real size, the last one short.
+    const THREE: (u64, usize) = (2 * CHUNK as u64 + 1024, CHUNK);
+    const POINTS: [Point; 7] = [
+        Point::BackupWritten,
+        Point::BackupSynced,
+        Point::ChunkPart,
+        Point::ChunkDone,
+        Point::HeaderFirst,
+        Point::HeaderSecond,
+        Point::HeaderBoth,
+    ];
+
+    /// `at_boot` over the rig, the mapping the fake one: it says it was made under `KEY`.
+    fn boot(rig: &Rig, key: Option<&[u8]>, hit: &mut dyn FnMut(Point) -> io::Result<()>) -> io::Result<Outcome> {
+        let open = |got: &[u8; 64], run: &mut dyn FnMut(&dyn Disk) -> io::Result<()>| {
+            assert_eq!(got, &KEY, "the mapping is made under the lock record's key");
+            run(&Xor(&rig.raw))
+        };
+        at_boot(&rig.journal, &rig.raw, rig.total, key, &open, hit)
+    }
+
+    fn go(rig: &Rig) -> io::Result<Outcome> {
+        boot(rig, Some(&KEY), &mut |_| Ok(()))
+    }
+
+    /// The journal's headers and slot are all zero: forgotten, or never begun.
+    fn forgotten(rig: &Rig) -> bool {
+        let journal = rig.journal.on_disk();
+        journal[HEAD1 as usize..][..2 * ROOM].iter().all(|&b| b == 0)
+            && journal[SLOT as usize..][..SLOT_ROOM].iter().all(|&b| b == 0)
+    }
+
+    /// A node with no marker and no journal is not touched: nothing is mapped, nothing written.
+    #[test]
+    fn a_node_with_no_marker_and_no_journal_is_left_alone() {
+        let rig = Rig::new(THREE);
+        let before = (rig.raw.on_disk(), rig.journal.on_disk());
+        let mapped = Cell::new(false);
+        let open = |_: &[u8; 64], _: &mut dyn FnMut(&dyn Disk) -> io::Result<()>| {
+            mapped.set(true);
+            Ok(())
+        };
+        let done = at_boot(&rig.journal, &rig.raw, rig.total, Some(&KEY), &open, &mut |_| Ok(()));
+        assert_eq!(done.unwrap(), Outcome::Nothing);
+        assert!(!mapped.get(), "a mapping was made for no pass");
+        assert!(
+            before == (rig.raw.on_disk(), rig.journal.on_disk()),
+            "something was written"
+        );
+    }
+
+    /// The marker is written and read back, and cleared; a zeroed room is none.
+    #[test]
+    fn a_marker_is_written_read_and_cleared() {
+        let rig = Rig::new(THREE);
+        assert!(!marked(&rig.journal).unwrap());
+        mark(&rig.journal).unwrap();
+        assert!(marked(&rig.journal).unwrap());
+        assert!(rig.journal.on_disk()[MARK as usize..].starts_with(MARKED));
+        unmark(&rig.journal).unwrap();
+        assert!(!marked(&rig.journal).unwrap());
+    }
+
+    /// A marker over a journal that holds a pass is refused: that pass is another's, and the
+    /// new one would be taken for it.
+    #[test]
+    fn a_marker_is_not_put_over_a_journal() {
+        let rig = Rig::new(THREE);
+        assert!(rig.cut(Point::ChunkDone, 1));
+        let why = mark(&rig.journal).unwrap_err().to_string();
+        assert!(why.contains("journal"), "{why}");
+        assert!(!marked(&rig.journal).unwrap());
+    }
+
+    /// A marked node with a key: the pass runs, the partition is its plain data encrypted, and
+    /// only then the marker and the journal are gone.
+    #[test]
+    fn a_marked_node_is_encrypted_and_then_the_marker_and_journal_go() {
+        let rig = Rig::new(THREE);
+        mark(&rig.journal).unwrap();
+        assert_eq!(go(&rig).unwrap(), Outcome::Encrypted);
+        rig.assert_encrypted("a marked node");
+        assert!(!marked(&rig.journal).unwrap(), "the marker stays");
+        assert!(!begun(&rig.journal).unwrap() && forgotten(&rig), "the journal stays");
+        // (The next start has nothing to do.)
+        assert_eq!(go(&rig).unwrap(), Outcome::Nothing);
+    }
+
+    /// A marker and no key (or one that is not a key of 64 bytes) is an error that writes
+    /// nothing: the marker stays, and the partition is plain.
+    #[test]
+    fn a_marker_with_no_usable_key_is_an_error_and_writes_nothing() {
+        for key in [None, Some(&KEY[..32]), Some(&[][..])] {
+            let rig = Rig::new(THREE);
+            mark(&rig.journal).unwrap();
+            let before = (rig.raw.on_disk(), rig.journal.on_disk());
+            let why = boot(&rig, key, &mut |_| Ok(())).unwrap_err().to_string();
+            assert!(why.contains("key"), "{why}");
+            assert!(before == (rig.raw.on_disk(), rig.journal.on_disk()));
+            assert!(marked(&rig.journal).unwrap());
+        }
+    }
+
+    /// A cut at every point of the pass, the disk losing, keeping or tearing what was not
+    /// synced: the marker is still there, and the next start ends in the same state as an
+    /// uncut one.
+    #[test]
+    fn a_cut_pass_resumes_at_the_next_start() {
+        let mut cuts = 0;
+        for how in CRASHES {
+            for point in POINTS {
+                for k in 0..5 {
+                    let rig = Rig::new(THREE);
+                    mark(&rig.journal).unwrap();
+                    let mut seen = 0;
+                    let cut = boot(&rig, Some(&KEY), &mut |at| {
+                        seen += usize::from(at == point);
+                        if at == point && seen > k {
+                            return Err(io::Error::other("cut"));
+                        }
+                        Ok(())
+                    });
+                    match cut {
+                        Ok(done) => {
+                            assert!(k > 0, "{point:?} is never reached");
+                            assert_eq!(done, Outcome::Encrypted);
+                            break;
+                        }
+                        Err(e) => assert_eq!(e.to_string(), "cut", "{e}"),
+                    }
+                    cuts += 1;
+                    rig.crash(how);
+                    assert!(
+                        marked(&rig.journal).unwrap(),
+                        "the marker went with the pass cut at {point:?} {k}"
+                    );
+                    assert!(!rig.leaks(), "plain data in the journal at {point:?} {k} ({how:?})");
+                    let why = format!("a cut at {point:?} {k} ({how:?})");
+                    assert_eq!(go(&rig).unwrap(), Outcome::Encrypted, "{why}");
+                    rig.assert_encrypted(&why);
+                    assert!(!marked(&rig.journal).unwrap() && forgotten(&rig), "{why}");
+                }
+            }
+        }
+        assert!(cuts > 4 * 7 * 2, "{cuts}");
+    }
+
+    /// A pass that is finished with the marker still there (a cut between the pass and the
+    /// marker's clearing): nothing is written to the partition, and the marker and the journal go.
+    #[test]
+    fn a_finished_pass_with_its_marker_is_cleared_and_not_run_again() {
+        let rig = Rig::new(THREE);
+        mark(&rig.journal).unwrap();
+        rig.run(&mut |_| Ok(())).unwrap();
+        let raw = rig.raw.on_disk();
+        assert_eq!(go(&rig).unwrap(), Outcome::Encrypted);
+        assert!(raw == rig.raw.on_disk(), "the partition was written again");
+        rig.assert_encrypted("a finished pass");
+        assert!(!marked(&rig.journal).unwrap() && forgotten(&rig));
+    }
+
+    /// A finished journal with no marker (a cut between the marker's clearing and the journal's):
+    /// the journal is forgotten, the partition untouched.
+    #[test]
+    fn a_finished_journal_with_no_marker_is_forgotten() {
+        let rig = Rig::new(THREE);
+        rig.run(&mut |_| Ok(())).unwrap();
+        let raw = rig.raw.on_disk();
+        assert_eq!(go(&rig).unwrap(), Outcome::Cleaned);
+        assert!(raw == rig.raw.on_disk() && forgotten(&rig));
+        rig.assert_encrypted("a finished journal");
+    }
+
+    /// A journal's `forget` cut at each of its writes and syncs (the operation itself not done),
+    /// the unsynced writes then lost, kept, torn or cut to a sliver: the marker was cleared before,
+    /// so the next start must not find an error in a state that is fully encrypted. It ends with
+    /// no pass in the journal, whatever was torn.
+    #[test]
+    fn a_forget_that_is_cut_never_leaves_a_journal_the_next_start_refuses() {
+        /// Fails the `at`th write or sync it is asked for.
+        struct Cutting<'a>(&'a Lossy, Cell<usize>);
+        impl Cutting<'_> {
+            fn step(&self) -> io::Result<()> {
+                let left = self.1.get();
+                self.1.set(left.wrapping_sub(1));
+                if left == 0 {
+                    Err(io::Error::other("cut"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl Disk for Cutting<'_> {
+            fn read_at(&self, buf: &mut [u8], at: u64) -> io::Result<()> {
+                self.0.read_at(buf, at)
+            }
+            fn write_at(&self, buf: &[u8], at: u64) -> io::Result<()> {
+                self.step()?;
+                self.0.write_at(buf, at)
+            }
+            fn sync(&self) -> io::Result<()> {
+                self.step()?;
+                self.0.sync()
+            }
+        }
+        let mut cuts = 0;
+        for at in 0..8 {
+            for how in CRASHES {
+                let rig = Rig::new(THREE);
+                rig.run(&mut |_| Ok(())).unwrap();
+                rig.journal.sync().unwrap();
+                let cut = forget(&Cutting(&rig.journal, Cell::new(at))).is_err();
+                cuts += usize::from(cut);
+                rig.crash(how);
+                let why = format!("a forget cut at step {at} ({how:?})");
+                let done = go(&rig).unwrap_or_else(|e| panic!("{why}: the next start refuses it: {e}"));
+                assert!(matches!(done, Outcome::Nothing | Outcome::Cleaned), "{why}: {done:?}");
+                rig.assert_encrypted(&why);
+                // (A first header torn beside a zero second is what a cut leaves: a pass never begun.)
+                assert!(
+                    !begun(&rig.journal).unwrap(),
+                    "{why}: the journal is still a pass after it"
+                );
+            }
+        }
+        assert!(
+            cuts >= 6 * CRASHES.len(),
+            "the forget was cut {cuts} times: it has six steps"
+        );
+    }
+
+    /// A journal that is not finished and no marker: the state is part encrypted and no
+    /// plain file system. An error that keeps the journal, as it was; nothing is mapped.
+    #[test]
+    fn an_unfinished_journal_with_no_marker_is_an_error_that_keeps_it() {
+        let rig = Rig::new(THREE);
+        assert!(rig.cut(Point::ChunkDone, 1));
+        rig.crash(Crash::Lost);
+        let before = (rig.raw.on_disk(), rig.journal.on_disk());
+        let why = go(&rig).unwrap_err().to_string();
+        assert!(why.contains("marker"), "{why}");
+        assert!(before == (rig.raw.on_disk(), rig.journal.on_disk()));
+    }
+
+    /// The pass's own error (a chunk neither plain nor backed up, here) leaves the marker and
+    /// the journal, and says so.
+    #[test]
+    fn a_pass_that_fails_leaves_the_marker_and_the_journal() {
+        let rig = Rig::new(THREE);
+        mark(&rig.journal).unwrap();
+        assert!(
+            boot(&rig, Some(&KEY), &mut |at| match at == Point::ChunkPart {
+                true => Err(io::Error::other("cut")),
+                false => Ok(()),
+            })
+            .is_err()
+        );
+        rig.crash(Crash::Kept);
+        rig.journal.file.write_all_at(&[0xff; 100], SLOT + 20).unwrap();
+        let why = go(&rig).unwrap_err().to_string();
+        assert!(why.contains("backed up"), "{why}");
+        assert!(marked(&rig.journal).unwrap() && begun(&rig.journal).unwrap());
+    }
+
+    /// How far a pass is, for what init says of it and the screen of a later slice shows.
+    #[test]
+    fn progress_is_the_chunks_done_and_the_chunks_in_all() {
+        let rig = Rig::new(THREE);
+        assert_eq!(progress(&rig.journal).unwrap(), None);
+        assert!(rig.cut(Point::HeaderBoth, 2));
+        assert_eq!(progress(&rig.journal).unwrap(), Some((2, 3)));
+        rig.run(&mut |_| Ok(())).unwrap();
+        assert_eq!(progress(&rig.journal).unwrap(), Some((3, 3)));
     }
 }

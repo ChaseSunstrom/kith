@@ -44,7 +44,12 @@ directory is refused.
   `localhost` every `intervalSeconds` (10), and once a second until the first success. A liveness
   probe's `startSeconds` (0, none) is how long a container may take to pass its first check: after
   it, a failure counts like any other. (Kubernetes' `initialDelaySeconds` on a liveness probe is
-  imported as `startSeconds`; on a readiness probe it is said and left out.)
+  imported as `startSeconds`; on a readiness probe it is said and left out.) An `exec` probe runs
+  its command in the container's own namespaces, as `kubectl exec` does, with the same interval
+  and thresholds: exit 0 passes, anything else fails, and a command that outlasts
+  `timeoutSeconds` (1) is killed and fails. A container whose only probe is `exec` readiness is
+  not ready (and a rolling update does not move on, nor `kubectl rollout status` return) until
+  the command has passed once. Its output is not read: keep it small.
 - **Updates.** A changed Workload (or a changed `ConfigMap` or `Secret` value in a unit's `env`) is
   replaced one replica at a time, the next once the others are ready: an update that does not come
   up stops at its first replica and the status says where. `strategy: recreate` replaces all at once.
@@ -155,8 +160,7 @@ spec:
 
 ### Not yet
 
-- `exec` probes are accepted and do nothing (the status says so). A container's `ports` only name
-  them for probes and Services; nothing is opened or mapped.
+- A container's `ports` only name them for probes and Services; nothing is opened or mapped.
 - A replica that holds a volume, a device or the node's network is stopped before its replacement
   starts, so `replicas: 1` of one is down for a moment during an update. `blueGreen` is treated as
   rolling. A readiness probe's `initialDelaySeconds` is not kept: kith asks at once.

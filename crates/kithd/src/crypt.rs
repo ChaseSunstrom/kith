@@ -534,6 +534,12 @@ impl Record {
         format!("{FIRST}\nsum: {}\n{rest}", hex(sum.as_ref()))
     }
 
+    /// The state's key as the record holds it plain (the `key:` line, until another node holds
+    /// it): what an encryption in place is done under (in_place.rs).
+    pub fn plain_key(&self) -> Option<&[u8]> {
+        self.key.as_deref()
+    }
+
     /// The record of the node whose config partition is `config`, if its state is encrypted.
     /// A record that begins as one and cannot be read is an error: the state under it is
     /// not a file system to mount as it lies.
@@ -685,7 +691,7 @@ impl Record {
 }
 
 /// A device that the kernel has just made, opened: its name takes a moment to be there.
-fn opened(device: &Path) -> std::io::Result<File> {
+pub(crate) fn opened(device: &Path) -> std::io::Result<File> {
     for _ in 0..100 {
         match File::options().read(true).write(true).open(device) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::thread::sleep(Duration::from_millis(20)),
@@ -693,6 +699,20 @@ fn opened(device: &Path) -> std::io::Result<File> {
         }
     }
     File::options().read(true).write(true).open(device)
+}
+
+/// Close the mapping `name` once what had it open is done: the kernel holds it for a moment
+/// after, at times.
+pub(crate) fn unmap(name: &str) -> std::io::Result<()> {
+    let mut removed = kith_dm_sys::remove(name);
+    for _ in 0..50 {
+        if removed.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        removed = kith_dm_sys::remove(name);
+    }
+    removed
 }
 
 /// The installer's part, once the image is on `disk`: write the state partition again,
@@ -714,15 +734,7 @@ pub fn seal(image: &File, disk: &Path) -> Result<String, String> {
         }
         through.sync_all()
     });
-    // (Held for a moment after it is closed, at times.)
-    let mut removed = kith_dm_sys::remove("kith-install");
-    for _ in 0..50 {
-        if removed.is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-        removed = kith_dm_sys::remove("kith-install");
-    }
+    let removed = unmap("kith-install");
     copied.map_err(io("writing the state under its key"))?;
     removed.map_err(io("closing the state partition"))?;
     let disk = File::options().read(true).write(true).open(disk);
