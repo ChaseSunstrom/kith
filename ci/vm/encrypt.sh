@@ -46,8 +46,8 @@
     truncate -s 4096 "$work/lock"
     printf 'kith-inplace pending v1\n' >"$work/marker"
     truncate -s 4096 "$work/marker"
-    # A file of known bytes in the state, big enough to span where the cut falls (the pass is cut a few
-    # dozen chunks in, a chunk is 256 KiB): after the pass the host decrypts it from the disk and
+    # A file of known bytes in the state, big enough to span where the cut falls (the pass is cut at its
+    # first progress line, a second in; a chunk is 256 KiB): after the pass the host decrypts it from the disk and
     # compares, so a chunk lost or doubled at the resume shows. Where its blocks are is read while the
     # state is still plain (the ext4 is not readable after).
     head -c 67108864 /dev/urandom >"$work/blob"
@@ -61,7 +61,7 @@
     # The power goes a little way into the pass.
     boot
     heard 'kithd: init: encrypting the state in place: [0-9]* chunks of 256 KiB'
-    heard 'kithd: init: encrypting the state in place: 32 of '
+    heard 'kithd: init: encrypting the state in place: [0-9]*% of [0-9]* MB'
     echo quit | socat - "unix-connect:$work/keys" >/dev/null 2>&1 || :
     wait "$vm" || :
     ! said 'the state is encrypted in place' || fail "the pass ended before it was cut: the disk is too short for the test"

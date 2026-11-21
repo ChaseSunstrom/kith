@@ -16,6 +16,7 @@ use ring::{aead, digest, hkdf, hmac};
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 /// The most a chunk is: what one backup and one write through the mapping hold.
@@ -397,6 +398,97 @@ pub fn progress(journal: &impl Disk) -> io::Result<Option<(u64, u64)>> {
     let (one, two, _) = heads(journal)?;
     let newest = [one, two].into_iter().flatten().max_by_key(|head| head.done);
     Ok(newest.map(|head| (head.done, head.total.div_ceil(head.chunk.max(1) as u64))))
+}
+
+/// One progress line: the percent through, and the text the console and the panel show.
+#[derive(Debug, PartialEq)]
+pub struct Line {
+    pub percent: u64,
+    pub text: String,
+}
+
+/// A pass's progress line, at most one a second (T-1139). It counts from the chunks the journal
+/// already had, so a resumed pass rates only what it did since it resumed.
+pub struct Meter {
+    total: u64,
+    chunk: usize,
+    first: u64,
+    began: Instant,
+    last: Instant,
+}
+
+impl Meter {
+    pub fn new(total: u64, chunk: usize, done: u64, now: Instant) -> Meter {
+        Meter {
+            total,
+            chunk: chunk.max(1),
+            first: done,
+            began: now,
+            last: now,
+        }
+    }
+
+    /// The bytes `done` chunks cover, the last chunk stopping at the partition's end.
+    fn bytes(&self, done: u64) -> u64 {
+        (done * self.chunk as u64).min(self.total)
+    }
+
+    /// How far through the partition `done` chunks are, in whole percent (bytes, not chunks).
+    pub fn percent(&self, done: u64) -> u64 {
+        self.bytes(done) * 100 / self.total.max(1)
+    }
+
+    /// The line for `done` chunks done at `now`, if a second has passed since the last one.
+    pub fn due(&mut self, done: u64, now: Instant) -> Option<Line> {
+        if now.duration_since(self.last) < Duration::from_secs(1) {
+            return None;
+        }
+        self.last = now;
+        let total = self.total.max(1);
+        let through = self.bytes(done);
+        let percent = self.percent(done);
+        let since = through.saturating_sub(self.bytes(self.first));
+        let secs = now.duration_since(self.began).as_secs_f64();
+        let rate = if secs > 0.0 { since as f64 / secs } else { 0.0 };
+        let left = if rate > 0.0 {
+            format!("about {} left", eta((total - through) as f64 / rate))
+        } else {
+            "estimate unknown".to_string()
+        };
+        let chunks = self.total.div_ceil(self.chunk as u64);
+        Some(Line {
+            percent,
+            text: format!(
+                "{percent}% of {} MB, {:.1} MB/s, {left} (chunk {done} of {chunks})",
+                self.total / 1_000_000,
+                rate / 1e6
+            ),
+        })
+    }
+
+    /// What the pass says when it starts: its size, or where a resumed pass resumes.
+    pub fn start_line(&self) -> String {
+        let chunks = self.total.div_ceil(self.chunk as u64);
+        if self.first == 0 {
+            format!("{chunks} chunks of {} KiB", self.chunk >> 10)
+        } else {
+            let at = self.bytes(self.first);
+            let percent = self.percent(self.first);
+            format!("resumed at chunk {} of {chunks}, at byte {at} ({percent}%)", self.first)
+        }
+    }
+}
+
+/// An estimate in seconds, minutes or hours, rounded up so that it is never short.
+fn eta(secs: f64) -> String {
+    let s = secs.ceil() as u64;
+    if s < 60 {
+        format!("{s} s")
+    } else if s < 3600 {
+        format!("{} min", s.div_ceil(60))
+    } else {
+        format!("{} h", s.div_ceil(3600))
+    }
 }
 
 /// Whether the node's state is to be encrypted in place at this start.
@@ -1396,5 +1488,109 @@ mod boot {
         assert_eq!(progress(&rig.journal).unwrap(), Some((2, 3)));
         rig.run(&mut |_| Ok(())).unwrap();
         assert_eq!(progress(&rig.journal).unwrap(), Some((3, 3)));
+    }
+}
+
+/// The progress line of a pass (T-1139): the percent, the rate and the estimate, at most one a
+/// second; and where a resumed pass starts.
+#[cfg(test)]
+mod progress {
+    use super::support::*;
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A line is due a second after the last one, not before.
+    #[test]
+    fn a_line_is_due_at_most_once_a_second() {
+        let t0 = Instant::now();
+        let mut meter = Meter::new(100_000_000, 1_000_000, 0, t0);
+        assert!(meter.due(1, t0 + Duration::from_millis(999)).is_none());
+        assert!(meter.due(2, t0 + Duration::from_secs(1)).is_some());
+        assert!(meter.due(3, t0 + Duration::from_millis(1500)).is_none());
+        assert!(meter.due(4, t0 + Duration::from_secs(2)).is_some());
+    }
+
+    /// 20 of 100 MB in 2 s is 10 MB a second, so 8 s are left: the line says the percent, the rate,
+    /// the estimate and the chunk.
+    #[test]
+    fn a_line_says_the_percent_the_rate_and_the_estimate() {
+        let t0 = Instant::now();
+        let mut meter = Meter::new(100_000_000, 1_000_000, 0, t0);
+        let line = meter.due(20, t0 + Duration::from_secs(2)).unwrap();
+        assert_eq!(line.percent, 20);
+        assert_eq!(line.text, "20% of 100 MB, 10.0 MB/s, about 8 s left (chunk 20 of 100)");
+    }
+
+    /// Nothing through yet: no rate to divide by, so no estimate, and not a made-up one.
+    #[test]
+    fn a_line_with_nothing_through_has_no_estimate() {
+        let t0 = Instant::now();
+        let mut meter = Meter::new(100_000_000, 1_000_000, 0, t0);
+        let line = meter.due(0, t0 + Duration::from_secs(1)).unwrap();
+        assert_eq!(line.text, "0% of 100 MB, 0.0 MB/s, estimate unknown (chunk 0 of 100)");
+    }
+
+    /// A resumed pass rates what it did since it resumed, not what the journal already had.
+    #[test]
+    fn a_resumed_pass_rates_only_what_it_did_since() {
+        let t0 = Instant::now();
+        let mut meter = Meter::new(100_000_000, 1_000_000, 50, t0);
+        let line = meter.due(60, t0 + Duration::from_secs(1)).unwrap();
+        assert_eq!(line.percent, 60);
+        assert!(line.text.contains("10.0 MB/s, about 4 s left"), "{}", line.text);
+    }
+
+    /// The estimate in seconds, minutes or hours.
+    #[test]
+    fn an_estimate_is_said_in_seconds_minutes_or_hours() {
+        assert_eq!(eta(8.0), "8 s");
+        assert_eq!(eta(600.0), "10 min");
+        assert_eq!(eta(7300.0), "3 h");
+    }
+
+    /// A fresh pass says its size; a resumed one says the chunk and byte it resumes at, and the percent.
+    #[test]
+    fn a_pass_says_where_it_starts() {
+        let t0 = Instant::now();
+        let fresh = Meter::new(2 * CHUNK as u64 + 1024, CHUNK, 0, t0);
+        assert_eq!(fresh.start_line(), "3 chunks of 256 KiB");
+        let resumed = Meter::new(2 * CHUNK as u64 + 1024, CHUNK, 2, t0);
+        assert_eq!(resumed.start_line(), "resumed at chunk 2 of 3, at byte 524288 (99%)");
+    }
+
+    /// A pass cut in two and resumed: the start line names the chunk the journal says it resumes at.
+    #[test]
+    fn a_resume_names_the_chunk_the_journal_resumes_at() {
+        let rig = Rig::new((2 * CHUNK as u64 + 1024, CHUNK));
+        assert!(rig.cut(Point::ChunkDone, 1));
+        rig.crash(Crash::Kept);
+        let (done, chunks) = progress(&rig.journal).unwrap().unwrap();
+        assert_eq!((done, chunks), (1, 3));
+        let line = Meter::new(rig.total, rig.chunk, done, Instant::now()).start_line();
+        assert!(line.starts_with("resumed at chunk 1 of 3, at byte 262144"), "{line}");
+    }
+
+    /// A real pass, a chunk every 40 ms: the lines it prints come at most a second apart, eight of
+    /// them over its eight seconds.
+    #[test]
+    fn a_pass_prints_at_most_a_line_a_second() {
+        let rig = Rig::new((200 * 4096, 4096));
+        let t0 = Instant::now();
+        let mut meter = Meter::new(rig.total, rig.chunk, 0, t0);
+        let (mut at, mut done, mut lines) = (t0, 0, Vec::new());
+        rig.run(&mut |point| {
+            if point == Point::ChunkDone {
+                done += 1;
+                at += Duration::from_millis(40);
+                lines.extend(meter.due(done, at).map(|line| (at, line)));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(lines.len(), 8, "200 chunks of 40 ms are 8 s");
+        for pair in lines.windows(2) {
+            assert!(pair[1].0 - pair[0].0 >= Duration::from_secs(1));
+        }
+        rig.assert_done("a pass over 200 chunks");
     }
 }

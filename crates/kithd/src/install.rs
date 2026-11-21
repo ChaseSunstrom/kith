@@ -23,7 +23,7 @@
 // spare partition table sits where the image ended, until the node's first start from
 // the disk, which makes both right (`gpt`).
 
-mod fb;
+pub(crate) mod fb;
 
 use fb::Panel;
 use serde::Deserialize;
