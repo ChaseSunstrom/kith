@@ -308,6 +308,109 @@ fn a_silent_daemon_times_out() {
     assert!(began.elapsed() < std::time::Duration::from_secs(10));
 }
 
+/// A fake carrier (what `waypipe client` is to `kith run`) that writes its pid beside itself,
+/// listens on the socket it is given, takes the connection and then does `after`; and a fake
+/// kithd that answers `101` to the ask and then holds the tunnel (`hold`) or closes it. Starts
+/// `kith run` against them, with its temp dir in the sandbox; the receiver says when the tunnel
+/// is up.
+fn kith_run(sb: &Sandbox, after: &str, hold: bool) -> (std::process::Child, std::sync::mpsc::Receiver<()>, PathBuf) {
+    use std::io::{Read, Write};
+    let socket = sb.0.join("kithd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (up, tunnel) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8];
+                if conn.read(&mut byte).unwrap() == 0 {
+                    return;
+                }
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+            let length = head.split("content-length:").nth(1).unwrap().lines().next().unwrap();
+            conn.read_exact(&mut vec![0; length.trim().parse().unwrap()]).unwrap();
+            if head.starts_with("get ") {
+                // kith asks the cluster whether its writes are signed first: they are not.
+                let body = r#"{"signing":"none"}"#;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                conn.write_all(reply.as_bytes()).unwrap();
+                continue;
+            }
+            conn.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: kith-run\r\n\r\n")
+                .unwrap();
+            let _ = up.send(());
+            if hold {
+                // Until kith lets go of it.
+                let _ = conn.read_to_end(&mut Vec::new());
+            }
+            return;
+        }
+    });
+    let carrier = sb.0.join("carrier");
+    let script = format!(
+        "#!/usr/bin/env python3\nimport os, socket, sys, time\nargs = sys.argv[1:]\nif args[0] == \"--secctx\":\n    args = args[2:]\nopen(sys.argv[0] + \".pid\", \"w\").write(str(os.getpid()))\ns = socket.socket(socket.AF_UNIX)\ns.bind(args[1])\ns.listen(1)\ns.accept()\n{after}\n"
+    );
+    write_executable(&carrier, &script);
+    let child = Command::new(env!("CARGO_BIN_EXE_kith"))
+        .args(["--timeout", "60", "run", "--on", "b", "--via"])
+        .arg(&carrier)
+        .args(["--", "true"])
+        .env("KITH_SOCKET", &socket)
+        .env("TMPDIR", &sb.0)
+        .env_remove("KITH_STORE")
+        .spawn()
+        .unwrap();
+    (child, tunnel, carrier)
+}
+
+fn run_dirs(sb: &Sandbox) -> usize {
+    let names = std::fs::read_dir(&sb.0).unwrap().map(|e| e.unwrap().file_name());
+    names
+        .filter(|name| name.to_string_lossy().starts_with("kith-run-"))
+        .count()
+}
+
+/// The carrier's word is the one `kith run` has of how the run went: its exit status is `kith`'s.
+#[test]
+fn kith_run_returns_the_status_the_carrier_ends_with() {
+    let sb = Sandbox::new("run-status");
+    let (mut kith, _, _) = kith_run(&sb, "sys.exit(7)", false);
+    assert_eq!(kith.wait().unwrap().code(), Some(7));
+    assert_eq!(run_dirs(&sb), 0, "the run's directory stays");
+}
+
+/// An interrupt ends the run as an end of the tunnel does: the carrier is killed, the directory
+/// goes, and the exit status is the shell's for the signal (128 + 2).
+#[test]
+fn kith_run_cleans_up_and_exits_130_on_an_interrupt() {
+    let sb = Sandbox::new("run-interrupt");
+    let (mut kith, tunnel, carrier) = kith_run(&sb, "time.sleep(300)", true);
+    tunnel.recv_timeout(std::time::Duration::from_secs(90)).unwrap();
+    assert_eq!(run_dirs(&sb), 1, "the run's directory is not there while it runs");
+    let pid = std::fs::read_to_string(format!("{}.pid", carrier.display())).unwrap();
+    let sent = Command::new("kill")
+        .args(["-INT", &kith.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    assert_eq!(kith.wait().unwrap().code(), Some(130));
+    assert_eq!(run_dirs(&sb), 0, "the run's directory stays after an interrupt");
+    let alive = || Path::new(&format!("/proc/{pid}")).exists();
+    for _ in 0..100 {
+        if !alive() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!alive(), "the carrier stays after an interrupt");
+}
+
 /// The nas package: a Share for the volume, and (when it names SMB users) the Samba
 /// container with the volume mounted and each user's password from the Secret.
 /// The kith-build package: a Volume for what the build leaves, a Job that runs the steps

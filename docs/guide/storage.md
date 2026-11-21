@@ -369,6 +369,14 @@ passed as written, never through a shell.
   for who asked: see SECURITY.md).
 - **How:** `kith` asks its kithd for a tunnel (`POST /v1/run`); kithd runs the app under
   `waypipe server`, `kith` runs `waypipe client`, and the two are joined. Either end closing
-  kills the app and what it started. The command line is in the audit log: pass no secret.
-- Not yet: a node that vanishes without a word leaves an idle app running on the other; one
-  `kith run` carries one connection; the app's exit status is not returned.
+  kills the app and what it started: each run has its own cgroup on the node (where kithd has
+  one delegated to it), so a program that left its session with `setsid()` is ended too. Node to
+  node, the connection has TCP keepalive, so a node that vanishes without a word is noticed in
+  under a minute. The command line is in the audit log: pass no secret.
+- **Exit status:** `kith run` ends with the status of the local `waypipe client` (or `--via`
+  program), not the app's: the app's own status does not cross the tunnel. An interrupt
+  (Ctrl-C, SIGTERM) kills the carrier, removes its directory and ends with 128 plus the signal.
+- **Not tested for real:** this was built and tested against stand-in programs. Real waypipe has
+  not been run with it: which side of the pair listens, and what its client exits with, are as
+  its manual says.
+- Not yet: one `kith run` carries one connection; the app's exit status is not returned.

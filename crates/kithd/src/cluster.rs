@@ -281,6 +281,17 @@ impl Drop for Place {
     }
 }
 
+/// Has the kernel probe a connection that has been quiet for 15 s, three times 15 s apart, and
+/// drop it when none is answered: a peer that vanished (powered off) ends what it held, such as
+/// a run's tunnel (reqwest does the same for the connections this node makes). Best effort.
+fn keep_alive(stream: &tokio::net::TcpStream) {
+    use nix::sys::socket::{setsockopt, sockopt};
+    let _ = setsockopt(stream, sockopt::KeepAlive, &true);
+    let _ = setsockopt(stream, sockopt::TcpKeepIdle, &15);
+    let _ = setsockopt(stream, sockopt::TcpKeepInterval, &15);
+    let _ = setsockopt(stream, sockopt::TcpKeepCount, &3);
+}
+
 /// Whether a connection that came in to `local` on a socket bound to every address is one this
 /// node answers: to an IPv4 address (or an IPv4 one in IPv6's clothes), to loopback, or to its own
 /// address on the mesh (`mesh`). Not to another IPv6 address of the machine: a global one that
@@ -323,6 +334,7 @@ pub fn listen_on(
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
+            keep_alive(&stream);
             // (Asked of the socket, not the peer: which of this machine's addresses it called.)
             if hung_up_on(stream.local_addr(), mesh) {
                 continue;
