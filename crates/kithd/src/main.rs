@@ -1225,6 +1225,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 }
             };
             let hardware = devices::run(shared.clone(), stopping.clone(), dmem);
+            let seating = seats::watch(shared.clone(), stopping.clone());
             let crons = cron::run(shared.clone(), stopping.clone());
             let exits = exits::run(shared.clone(), stopping.clone());
             let people = people::run(shared.clone(), stopping.clone());
@@ -1242,6 +1243,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 apart(system),
                 apart(key),
                 apart(hardware),
+                apart(seating),
                 apart(crons)
             );
         };
