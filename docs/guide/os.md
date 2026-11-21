@@ -100,6 +100,17 @@ update is 43 MB against 34 and the ESP's two kernels 36 of its 64 MB; the root i
 Built and started under UEFI in QEMU, the kernel brings amdgpu up (`amdgpu: Topology: Add CPU
 node`) and kithd serves; on a 780M itself it has not run yet.
 
+`gpu-nvidia-pascal`, the nouveau driver and HDMI sound (HDA with its NVIDIA codec) built in, for
+an NVIDIA card before Turing (GeForce GTX 10xx, Quadro Pxxx; `os/examples/gpu-nvidia-pascal.yaml`).
+Nouveau's display and HDMI sound work on any card before Turing that it knows; the firmware it
+brings (`nvidia/gp102` to `gp108`) gives 3D on a desktop Pascal card, GP102 to GP108. There is no
+reclocking (the card stays at its boot clock) and no video decode under nouveau, and NVIDIA's own
+driver is not part of kith OS. Most of that firmware is named again in linux-firmware's `WHENCE`
+(`Link:` lines): `os/firmware.sh` makes the links a glob names, as copy-firmware.sh does, with the
+files they point at, and refuses a link out of the tree, a cycle or a glob that names nothing. A
+spec for it with `all` is refused (nouveau as modules and built in). Its first real use is a TV
+seat: [a TV or kiosk seat](hardware.md#a-tv-or-kiosk-seat).
+
 `vfio`, to prepare the kernel for handing a PCI card (a GPU, a USB controller) to a virtual
 machine: the IOMMU switched on (Intel's, with interrupt remapping) and `vfio-pci` built in
 (`os/examples/vfio.yaml`). That is all it does: binding a card to `vfio-pci`, and `vms` on kith
@@ -128,9 +139,11 @@ A node with no card a feature matches prints `features: []`; a node that runs no
 `wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
 card the catalogue does not list yet) is chosen by hand, as above. A line may give `vendor:*`
 instead of a device id, which matches any display card (PCI class 03) of that vendor and not its
-audio function: `all` has `10de:*`, so a node with an NVIDIA GPU wants `all` (nouveau's driver is
-in it). A node that also has an AMD Phoenix GPU wants `all` alone, which build.sh would refuse with
-`gpu-amd-phoenix` and whose modules cover that GPU.
+audio function, and only one that no feature names by its exact id: `all` has `10de:*`, so a node
+with an NVIDIA display card no feature lists wants `all` (nouveau's driver is in it), while a
+Pascal card (`10de:1c03`) wants `gpu-nvidia-pascal`, not `all`. A node that also has an AMD Phoenix
+or a Pascal GPU and a card of another NVIDIA family (a Turing) wants `all` alone, which build.sh
+would refuse with `gpu-amd-phoenix` or `gpu-nvidia-pascal` and whose modules cover those GPUs.
 
 #### The `all` feature: drivers as signed modules
 

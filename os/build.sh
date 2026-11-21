@@ -224,6 +224,8 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
     # would be =y and =m by the order of the lines.)
     ! spec_list features | grep -qx all || ! spec_list features | grep -qx gpu-amd-phoenix ||
         die "--spec: 'all' and 'gpu-amd-phoenix' do not go together (the same driver, as modules and built in)"
+    ! spec_list features | grep -qx all || ! spec_list features | grep -qx gpu-nvidia-pascal ||
+        die "--spec: 'all' and 'gpu-nvidia-pascal' do not go together (nouveau, as modules and built in)"
     # shellcheck disable=SC2086
     globs=$(printf '%s\n' $globs | LC_ALL=C sort -u)
     for g in $globs; do
@@ -243,18 +245,21 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
     elif [ -n "$globs" ]; then
         case " $(echo $globs) " in *" all "*) die "--spec: firmware: [all] is for a kernel with modules (os/examples/all.yaml)" ;; esac
         # (The tarball is 640 MB, read once per new list of files: what it gave is kept.)
-        if [ "$(cat "$fwdir/.globs" 2>/dev/null)" != "$globs" ]; then
+        if [ "$(cat "$fwdir/.kith-globs" 2>/dev/null)" != "$globs" ]; then
             echo "build.sh: firmware from linux-firmware $firmware_date: $(echo $globs)" >&2
             fetch "$firmware_url" "$firmware_sha256" "$cache/linux-firmware-$firmware_date.tar.xz"
             [ ! -d "$fwdir" ] || find "$fwdir" -delete
             mkdir -p "$fwdir"
-            # shellcheck disable=SC2046
-            tar -xJf "$cache/linux-firmware-$firmware_date.tar.xz" -C "$fwdir" --strip-components=1 --wildcards \
-                --no-wildcards-match-slash $(for g in $globs; do echo "linux-firmware-$firmware_date/$g"; done) ||
-                die "--spec: tar's 'Not found in archive' line above names what linux-firmware $firmware_date lacks"
-            echo "$globs" >"$fwdir/.globs"
+            # The files the globs name, and the links of linux-firmware's WHENCE that they name
+            # (most of nvidia/gp106 is links) with what those point at: os/firmware.sh, which
+            # dies, naming why, for a glob that names nothing, a link out of the tree or a cycle.
+            # shellcheck disable=SC2086
+            sh "$root/os/firmware.sh" "$cache/linux-firmware-$firmware_date.tar.xz" "$fwdir" $globs ||
+                die "--spec: os/firmware.sh's line above says what linux-firmware $firmware_date lacks or why a link is refused"
+            echo "$globs" >"$fwdir/.kith-globs"
         fi
-        firmware=$(cd "$fwdir" && find . -type f ! -name .globs | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ')
+        # (Files and links, as the kernel's firmware list: a link is a name a driver asks for.)
+        firmware=$(cd "$fwdir" && find . \( -type f -o -type l \) ! -name '.*' | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ')
         firmware=${firmware% }
         # Built in: no modules and no initramfs, so a driver finds its firmware in the
         # kernel when it starts, before any root is mounted. (A path relative to the
@@ -410,6 +415,8 @@ if [ -n "$modules" ]; then
             # (The tarball is checked against its hash; still, no link out of the tree.)
             case $name in /* | *..*) continue ;; esac
             case $target in /*) continue ;; esac
+            # (Nor a `..` that climbs past the top, however deep the link sits.)
+            case $(realpath -ms --relative-to="$fwall" "$fwall/$(dirname "$name")/$target") in .. | ../* | /*) continue ;; esac
             [ -e "$fwall/$name" ] || [ -h "$fwall/$name" ] || { mkdir -p "$fwall/$(dirname "$name")" && ln -s "$target" "$fwall/$name"; }
         done
         : >"$fwall/.kith-links"
@@ -455,9 +462,15 @@ if [ -n "$modules" ]; then
                     for f in $name; do
                         [ -f "$f" ] || continue
                         echo "$f"
-                        ! [ -h "$f" ] || realpath --relative-to=. "$f"
+                        [ -h "$f" ] || continue
+                        # (A link that leaves the tree stops the build, as the one made above is not made.)
+                        r=$(realpath --relative-to=. "$f")
+                        case $r in .. | ../* | /*) die "a link out of linux-firmware's tree: $f -> $r" ;; esac
+                        echo "$r"
                     done
-                done <"$fwlist.named" | LC_ALL=C sort -u
+                done <"$fwlist.named" >"$fwlist.kept"
+                LC_ALL=C sort -u "$fwlist.kept"
+                find "$fwlist.kept" -delete
             ) >"$fwlist.part"
             echo "build.sh: the $(wc -l <"$fwlist.named") names the modules ask for are $(wc -l <"$fwlist.part") files and links in linux-firmware" >&2
             find "$fwlist.named" -delete

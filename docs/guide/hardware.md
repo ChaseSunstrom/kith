@@ -24,6 +24,9 @@ its `spec` has `node`, `class` and the device node as `path`. The class is `gpu`
 - **NVIDIA's own driver.** A card on it also has `nodes`: what CUDA, OpenGL and Vulkan open
   beside the card (`/dev/nvidiactl`, `nvidia-uvm`, `nvidia-uvm-tools`, `nvidia-modeset`,
   `/dev/nvidiaN`), those that exist. **Not tried on a real card.**
+- **A sound card** also has `nodes`: its own playback PCM nodes (`/dev/snd/pcmC1D3p`, one per
+  output, not capture and not another card's), so a claim of it, or of a seat that has it, plays
+  sound as well as opening the control node.
 
 ### Claiming hardware
 
@@ -189,6 +192,89 @@ spec:
 - A template that says `priority: idle` goes further down: `cpu.idle`, the lowest `io.weight` and
   a `memory.high`, on every node and whatever the seat does. Batch work beside a desktop takes
   only spare cycles (see [idle work](workloads.md#idle-work)).
+
+### A TV or kiosk seat
+
+A PC on a TV that shows one web page (a media server's TV page) is a seat held by one container:
+a Wayland compositor (cage) with a browser in it, on an image from a registry or on a stock
+Alpine that installs them into a Volume. The seat's sound goes out of the TV's HDMI. The node
+runs a kith OS image with the card's driver built in (`gpu-nvidia-pascal` for a GeForce GTX 10xx,
+`gpu-amd-phoenix` for a Ryzen's GPU: [kith OS](os.md#a-node-that-needs-more-a-spec)).
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: tv, namespace: kith-system }
+spec: { node: tv, path: /var/lib/kith/tv, size: 4Gi }   # the packages and the browser's profile
+---
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: { name: tv, namespace: kith-system }
+spec: { seat: tv-seat0, access: exclusive }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: tv, namespace: kith-system }
+spec:
+  replicas: 1
+  template:
+    deviceClaims: [tv]
+    containers:
+      - name: session
+        image: docker.io/library/alpine:3.22
+        runAsUser: 0            # apk installs into the image's root
+        readOnlyRoot: false
+        resources: { memory: 3Gi }     # no cpu: see below
+        volumeMounts: [{ volume: tv, path: /data }]
+        env:
+          - { name: URL, value: "https://media.example/tv" }
+          - { name: CARD, value: NVidia }      # the sound card's id: the audio Device's `model` label
+          - { name: XDG_RUNTIME_DIR, value: /tmp/run }
+          - { name: LIBSEAT_BACKEND, value: noop }
+        command:
+          - sh
+          - -c
+          - |
+            mkdir -p /data/apk /data/profile /tmp/run && chmod 700 /tmp/run
+            apk add -q --cache-dir /data/apk cage chromium mesa-dri-gallium mesa-gbm alsa-utils wlr-randr font-noto
+            for i in 0 1 2 3; do amixer -q -c "$CARD" sset "IEC958,$i" on; done
+            exec cage -- chromium --kiosk --no-sandbox --ozone-platform=wayland --ignore-gpu-blocklist \
+              --autoplay-policy=no-user-gesture-required --user-data-dir=/data/profile "$URL"
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: encode }
+spec:
+  template:
+    priority: idle              # only spare cycles, and a twentieth of a CPU while the TV is full screen
+    yieldTo: { seat: tv-seat0, when: [fullscreen] }
+    containers: [{ name: run, image: registry.example/batch/encode:1, resources: { memory: 2Gi } }]
+```
+
+The seat's sound card is a Device with its playback PCM nodes (`/dev/snd/pcmC1D3p`, one per
+output), so the claim gives the container the sound as well as the screen. What this taught on a
+spare PC (n22, a GTX 1060) and on n20:
+
+- **Memory only.** A container's `resources.cpu` is a hard `cpu.max`, and drawing in software
+  uses every core. The seat's `reserve` is the browser's guarantee; a Workload beside it that must
+  stay out of the way is `priority: idle` with `yieldTo` (the second Workload).
+- **The screen's mode.** An LG TV prefers 3840x2160 at 30 Hz and offers 4K at 60 Hz only with
+  HDMI Ultra HD Deep Colour on for that input. Pick 1080p at 60 Hz (`wlr-randr --output NAME
+  --mode 1920x1080@60Hz` in cage) where drawing is in software.
+- **Sound.** NVIDIA's HDMI sound starts with its IEC958 switches off (`amixer sset IEC958,0
+  on`, up to `,3`). The output PCM is the one whose ELD control (`iface=PCM,name=ELD,device=N`) is
+  not empty, which shows once the compositor has set the mode (`amixer cget` splits the jack
+  control's name at its comma, so ask for the ELD). A container does not see `/proc/asound`
+  (masked): read `/dev/snd/pcmC*D*p` and ask `amixer`.
+- **nouveau.** On Pascal it has no reclocking and no video decode: 4K and HEVC play better on a
+  GPU with VAAPI (n20's Radeon 780M). With the firmware built in, cage needs no `WLR_RENDERER`;
+  Chromium needs `--ignore-gpu-blocklist` on nouveau.
+- **The image.** It comes from a registry (kith reaches a plain-HTTP registry only on the same
+  machine), or from a stock Alpine as above, with `apk add` into the Volume so the next start
+  has the packages.
+- **`status.activity`.** A session sets it (`POST /v1/seats/tv-seat0/activity?state=fullscreen`),
+  or kithd once it judges it; kithd does not set it by itself yet, so until a session does, the
+  seat shows no activity.
 
 ### Virtual machines
 
