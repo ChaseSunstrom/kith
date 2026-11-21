@@ -943,6 +943,7 @@ pub struct Forked {
 /// with such a reaper registers the child with it (kith-runtime's `spawn_awaited`) while it is made.
 pub fn fork_start(f: impl FnOnce() -> Vec<u8>) -> Result<Forked> {
     use std::io::Write;
+    clone_panics_end();
     let mut ends = [0; 2];
     // SAFETY: pipe2 writes two descriptors into `ends`.
     if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -968,12 +969,14 @@ pub fn fork_start(f: impl FnOnce() -> Vec<u8>) -> Result<Forked> {
         // `kith stop`. kithd's threads hold the keeper's block (SIGINT, SIGTERM, SIGCHLD).
         // Likewise Rust's runtime ignores SIGPIPE, and that stays ignored through clone and exec.
         // SAFETY: sigemptyset fills a set this child owns; pthread_sigmask sets its one thread's
-        // mask; signal sets this one process's disposition (both are async-signal-safe).
+        // mask; signal sets this one process's disposition (both are async-signal-safe); getpid
+        // takes nothing. (HELPER, for `clone_panics_end`'s hook: this child's own copy.)
         unsafe {
             let mut none = std::mem::zeroed::<libc::sigset_t>();
             libc::sigemptyset(&mut none);
             libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            HELPER.store(libc::getpid(), std::sync::atomic::Ordering::Relaxed);
         }
         let mut bytes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_default();
         bytes.truncate(FORKED_MOST);
@@ -983,6 +986,37 @@ pub fn fork_start(f: impl FnOnce() -> Vec<u8>) -> Result<Forked> {
         unsafe { libc::_exit(0) }
     }
     Ok(Forked { pid: child, read })
+}
+
+/// The pid of the [`fork_start`] child this process is or was copied from; 0 outside one.
+static HELPER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Makes a panic in a process cloned inside a [`fork_start`] child (libcontainer's intermediate
+/// and init, raw `clone3` copies of the child's stack, unwind with no `catch_unwind` of their
+/// own) say so on its fd 2 and `_exit(101)`, instead of unwinding into the child's frames: there
+/// it aborted on a destructor (a pid-1 init then died by a silent SIGSEGV), or reached the
+/// child's `catch_unwind` and ended 0 as if it were the child. Any other panic goes to the hook
+/// there was (kithd's own). Set once, here in the parent: a forked child that set it would wait
+/// for good on std's hook lock if another thread held it at the fork.
+fn clone_panics_end() {
+    static SET: std::sync::Once = std::sync::Once::new();
+    SET.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let helper = HELPER.load(std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: getpid takes nothing.
+            if helper == 0 || helper == unsafe { libc::getpid() } {
+                return prev(info);
+            }
+            let said = format!("kith: a process cloned in a forked helper panicked: {info}\n");
+            // SAFETY: write from a buffer this process owns to fd 2, then end at once, with no
+            // handler or destructor.
+            unsafe {
+                libc::write(2, said.as_ptr().cast(), said.len());
+                libc::_exit(101);
+            }
+        }));
+    });
 }
 
 /// The parent of process `pid`, as `/proc` says now.
@@ -1562,6 +1596,43 @@ mod tests {
             .unwrap()
             .collect(Duration::from_secs(30));
         assert!(got.unwrap().is_empty());
+    }
+
+    /// A process the child clones (as libcontainer's intermediate and init are) that panics
+    /// says so on its fd 2 and ends with 101: it does not unwind into the child's frames and
+    /// pass as the child (an empty answer, then `_exit(0)`).
+    #[test]
+    fn forked_clone_that_panics_says_so_and_ends_101() {
+        let _children = children();
+        let got = fork_start(|| {
+            let mut ends = [0; 2];
+            // SAFETY: pipe writes two descriptors into `ends`; fork in this one-thread child;
+            // the grandchild puts the write end on its fd 2 and panics; waitpid on its own child.
+            unsafe {
+                assert_eq!(libc::pipe(ends.as_mut_ptr()), 0);
+                let pid = libc::fork();
+                if pid == 0 {
+                    libc::dup2(ends[1], 2);
+                    panic!("boom");
+                }
+                libc::close(ends[1]);
+                let mut status = 0;
+                libc::waitpid(pid, &mut status, 0);
+                let mut said = File::from_raw_fd(ends[0]);
+                let mut answer = vec![libc::WEXITSTATUS(status) as u8];
+                std::io::Read::read_to_end(&mut said, &mut answer).unwrap();
+                answer
+            }
+        })
+        .unwrap()
+        .collect(Duration::from_secs(30))
+        .unwrap();
+        let said = String::from_utf8_lossy(&got[1..]);
+        assert_eq!(got[0], 101, "{said}");
+        assert!(
+            said.contains("kith: a process cloned in a forked helper panicked") && said.contains("boom"),
+            "{said}"
+        );
     }
 
     /// A child that does not end is killed and collected at the deadline, and says so.

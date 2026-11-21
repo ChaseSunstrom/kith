@@ -1397,16 +1397,35 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
     let pipe = || nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).ctx(&what);
     let ((stdin, to_stdin), (from_stdout, stdout), (from_stderr, stderr)) = (pipe()?, pipe()?, pipe()?);
     let container = Container::load(root.join("state").join(id)).ctx(&what)?;
-    // libcontainer's tenant takes no user, groups or working directory of its init's: left
-    // unsaid they are root, no groups and `/`, so they are read from the init's spec and said.
+    // libcontainer's tenant takes no user, groups or working directory of its init's (left
+    // unsaid they are root, no groups and `/`), and its own open-file limit is 1024 soft and
+    // hard, set before it opens the namespace files while it holds every descriptor of this
+    // process (EMFILE), and one the program can never raise. So it is given its init's process,
+    // with `argv` and the soft open-file limit at the hard one (`Entry` lowers it, as an init's).
     let made = oci_spec::runtime::Spec::load(container.bundle().join("config.json")).ctx(&what)?;
-    let process = init_process(&made).ctx(&what)?;
-    let who = process.user();
+    let mut process = init_process(&made).ctx(&what)?.clone();
+    process.set_args(Some(argv.to_vec()));
+    if let Some(limits) = process.rlimits().clone() {
+        let limits = limits.into_iter().map(|limit| {
+            if limit.typ() != oci_spec::runtime::PosixRlimitType::RlimitNofile {
+                return Ok(limit);
+            }
+            oci_spec::runtime::PosixRlimitBuilder::default()
+                .typ(limit.typ())
+                .soft(limit.hard())
+                .hard(limit.hard())
+                .build()
+        });
+        process.set_rlimits(Some(limits.collect::<std::result::Result<_, _>>().ctx(&what)?));
+    }
     // libcontainer checks the init's spec again, in the user namespace the helper joins below,
     // and refuses `additionalGids` there (CVE-2014-8989: a user that may not drop its groups
     // may not name them). So it is given a private copy of the init's state and spec without
-    // them; the tenant says its groups itself, below.
+    // them; the tenant's own process (above) keeps them.
     let scratch = Scratch::new(root, id, &container.state, &made).ctx(&what)?;
+    // (In the scratch directory, which is this process's alone, and removed with it.)
+    let tenant = scratch.root().join("process.json");
+    fs::write(&tenant, serde_json::to_vec(&process).ctx(&what)?).ctx(&what)?;
     let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
         .with_root_path(scratch.root())
         .ctx(&what)?
@@ -1416,11 +1435,7 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
         // (The same entry as its init's: the filter and the user its image says.)
         .with_executor(Entry)
         .as_tenant()
-        .with_container_args(argv.to_vec())
-        .with_user(Some(who.uid()))
-        .with_group(Some(who.gid()))
-        .with_additional_gids(who.additional_gids().clone().unwrap_or_default())
-        .with_cwd(Some(process.cwd().clone()));
+        .with_process(Some(tenant));
     // libcontainer's tenant joins every namespace of its init but the user one, so a process
     // without the rights over the container's other namespaces (a rootless kithd) is refused
     // the first of them. The helper that makes it joins the user namespace that owns the
@@ -2194,6 +2209,28 @@ impl Executor for Entry {
                 caps::clear(None, set).map_err(|e| failed("dropping capabilities", &e))?;
             }
         }
+        // The program's open-file limits (the spec says soft = hard so that the setup has room,
+        // see `spec`): lowered here, not sooner, since the inherited descriptors stay open until
+        // the exec and a soft 1024 fails the writes above. (No privilege needed, no fd opened.)
+        let nofile = spec
+            .process()
+            .as_ref()
+            .and_then(|process| process.rlimits().as_ref())
+            .and_then(|limits| {
+                limits
+                    .iter()
+                    .find(|limit| limit.typ() == oci_spec::runtime::PosixRlimitType::RlimitNofile)
+            });
+        if let Some(limit) = nofile {
+            let (soft, hard) = container_nofile(limit.hard());
+            nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE, soft, hard).map_err(|e| {
+                let _ = nix::unistd::write(
+                    std::io::stderr(),
+                    format!("kith: the open-file limit: {e}\n").as_bytes(),
+                );
+                ExecutorError::Other(format!("the open-file limit: {e}"))
+            })?;
+        }
         // Last, once nothing above needs a call it refuses. (Not said, the filter is whole.)
         let said = spec.annotations().as_ref().and_then(|notes| notes.get(CALLS));
         if said.map(String::as_str) != Some(UNCONFINED) {
@@ -2748,21 +2785,25 @@ fn spec_shifted(
     );
     process.set_terminal(Some(false));
     // The open-file limit: the spec's default is 1024 soft and hard, which an app cannot raise.
-    let (soft, hard) = match nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE) {
+    // Said as kithd's hard one, soft too: libcontainer sets it before it makes the init, which
+    // holds every descriptor of the process that creates it until late in its setup (kithd's,
+    // a thousand and more), so a soft 1024 there fails its opens. `Entry` lowers the soft one
+    // to `container_nofile`'s right before the program runs.
+    let hard = match nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE) {
         Ok((_, hard)) => {
             // (The kernel refuses a hard limit above fs.nr_open: an unlimited one is capped to it.)
             let cap = fs::read_to_string("/proc/sys/fs/nr_open")
                 .ok()
                 .and_then(|text| text.trim().parse::<u64>().ok())
                 .unwrap_or(u64::MAX);
-            container_nofile(hard.min(cap))
+            hard.min(cap)
         }
-        Err(_) => (1024, 1024),
+        Err(_) => 1024,
     };
     process.set_rlimits(Some(vec![
         oci_spec::runtime::PosixRlimitBuilder::default()
             .typ(oci_spec::runtime::PosixRlimitType::RlimitNofile)
-            .soft(soft)
+            .soft(hard)
             .hard(hard)
             .build()?,
     ]));
@@ -3171,14 +3212,21 @@ mod tests {
 
         let made = spec(&"x".repeat(100), &image, &unit(Some(500)), "/kith/a", Path::new("/b")).unwrap();
         assert_eq!(made.hostname().as_ref().unwrap().len(), 63);
-        // (The open-file limit: soft 1024 and kithd's hard one, never the spec's 1024 and 1024.)
+        // (The open-file limit: kithd's hard one, soft too, never the spec's 1024 and 1024: the init
+        // holds kithd's descriptors through its setup, and `Entry` lowers the soft one to 1024 only
+        // right before the program runs.)
         let (_, hard) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
+        let cap = fs::read_to_string("/proc/sys/fs/nr_open")
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
         let process = made.process().as_ref().unwrap();
         let limits = process.rlimits().as_ref().unwrap();
         assert_eq!(limits.len(), 1);
         assert_eq!(
             (limits[0].soft(), limits[0].hard()),
-            container_nofile(hard),
+            (hard.min(cap), hard.min(cap)),
             "a container's open-file limits"
         );
         let linux = made.linux().as_ref().unwrap();
@@ -4861,6 +4909,91 @@ mod tests {
             Some(0),
             "the container's process ignores SIGPIPE: {ignored:x?}"
         );
+    }
+
+    /// A process that holds many files (kithd with ~1,010 open, or this suite while its give walks
+    /// run) still starts a container and enters one: youki's init and a tenant's intermediate keep
+    /// every inherited descriptor until late in their setup, so an open-file limit of 1024 set
+    /// before that fails their opens (BrokenChannel or "io error" at create, EMFILE at enter).
+    /// Both programs still run with soft 1024 and kithd's hard limit.
+    #[test]
+    fn a_container_starts_while_this_process_holds_many_files() {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+        if !delegated_or_skip() {
+            return;
+        }
+        let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        if hard < 4096 {
+            return report_skip("skipped: this process's hard open-file limit is under 4096");
+        }
+        setrlimit(Resource::RLIMIT_NOFILE, hard, hard).unwrap();
+        let cap = fs::read_to_string("/proc/sys/fs/nr_open")
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        let want = container_nofile(hard.min(cap));
+        let hold = || -> Vec<File> { (0..1100).map(|_| File::open("/dev/null").unwrap()).collect() };
+        // The program of `pid` ran (an Entry that failed leaves a zombie `youki:[2:INIT]`), and
+        // its open-file limits.
+        let ran = |pid: i32| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let comm = || fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            while comm().trim() != "sleep" && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let limits = fs::read_to_string(format!("/proc/{pid}/limits")).unwrap_or_default();
+            let line = limits
+                .lines()
+                .find(|l| l.starts_with("Max open files"))
+                .unwrap_or_default();
+            let numbers: Vec<u64> = line.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+            (comm().trim().to_string(), numbers)
+        };
+        let root = std::env::temp_dir().join(format!("kith-manyfiles-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        host_rootfs(&root.join("rootfs"), &["sleep"]);
+        let image = Image {
+            rootfs: root.join("rootfs"),
+            entrypoint: vec!["/bin/sleep".into(), "300".into()],
+            ..Image::default()
+        };
+        let (out, err) = (
+            File::create(root.join("out")).unwrap(),
+            File::create(root.join("err")).unwrap(),
+        );
+        let held = hold();
+        let made = runtime.create("manyfiles", &image, &Unit::default(), out, err);
+        let mut handle = match made {
+            Err(e) if cgroup_skip(&e.to_string()).is_some() => {
+                let _ = fs::remove_dir_all(&root);
+                return report_skip(&cgroup_skip(&e.to_string()).unwrap());
+            }
+            Err(e) => {
+                let _ = fs::remove_dir_all(&root);
+                panic!("a create while 1100 files are held: {e}");
+            }
+            Ok(handle) => handle,
+        };
+        let started = handle.start();
+        drop(held);
+        let init = ran(handle.pid());
+        let said = fs::read_to_string(root.join("err")).unwrap_or_default();
+        let held = hold();
+        let entered = enter(&root.join("runtime"), "manyfiles", &["/bin/sleep".into(), "30".into()]);
+        drop(held);
+        let tenant = entered
+            .as_ref()
+            .map(|entered| ran(entered.pid()))
+            .map_err(|e| e.to_string());
+        drop(entered);
+        handle.discard(&root.join("runtime/state/manyfiles"));
+        let _ = fs::remove_dir_all(&root);
+        started.unwrap();
+        assert_eq!(init, ("sleep".into(), vec![want.0, want.1]), "the init: {said}");
+        assert_eq!(said, "", "the init's stderr");
+        assert_eq!(tenant, Ok(("sleep".into(), vec![want.0, want.1])), "the tenant");
     }
 
     /// A rootfs of this host's own programs: each of `bins` under `/bin`, and the libraries
