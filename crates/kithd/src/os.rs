@@ -857,6 +857,149 @@ mod tests {
 
     static UNMOUNTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+    /// A small linux-firmware tarball of this test's own (a top directory, a WHENCE with `Link:`
+    /// lines, files) and a directory to extract into, and what `sh os/firmware.sh` says of `globs`
+    /// (os/build.sh's built-in firmware): its exit status's success and its stderr.
+    /// None when there is no tar or xz here.
+    fn firmware(name: &str, globs: &[&str]) -> Option<(PathBuf, Result<(), String>)> {
+        let sh = |script: &str| std::process::Command::new("sh").args(["-c", script]).output().unwrap();
+        if !(sh("command -v tar && command -v xz").status.success()) {
+            eprintln!("skipped: no tar or xz here");
+            return None;
+        }
+        let base = std::env::temp_dir().join(format!("kithd-firmware-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let top = base.join("linux-firmware-1");
+        let put = |file: &str, text: &str| {
+            let path = top.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        put(
+            "WHENCE",
+            "Driver: a made-up one\n\
+             Link: a/x -> ../b/x\n\
+             Link: a/y -> x\n\
+             Link: c/only -> ../b/z\n\
+             Link: d/deep/n -> ../../b/x\n\
+             Link: loop/p -> q\n\
+             Link: loop/q -> p\n\
+             Link: bad/out -> ../../etc/passwd\n\
+             Link: bad/up -> ../../../etc/passwd\n\
+             Link: abs/out -> /etc/passwd\n\
+             Link: dangling/x -> ../b/missing\n\
+             Link: long/a -> b/../../../etc/passwd\n\
+             Link: this line is prose, not a link\n",
+        );
+        for file in ["b/x", "b/z", "b/other", "a/file", "d/f", "d/deep/m", "e/one/f", "e/two/g"] {
+            put(file, file);
+        }
+        let tarball = base.join("linux-firmware-1.tar.xz");
+        let made = sh(&format!("tar -cJf {} -C {} linux-firmware-1", tarball.display(), base.display()));
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        let dir = base.join("out");
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../os/firmware.sh");
+        let ran = std::process::Command::new("sh")
+            .args([script, tarball.to_str().unwrap(), dir.to_str().unwrap()])
+            .args(globs)
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&ran.stderr).to_string();
+        Some((dir, if ran.status.success() { Ok(()) } else { Err(said) }))
+    }
+
+    /// What a link in `dir` points at as written, none if `name` is no link.
+    fn pointing(dir: &Path, name: &str) -> Option<String> {
+        Some(std::fs::read_link(dir.join(name)).ok()?.to_str()?.to_string())
+    }
+
+    /// The files and links under `dir`, as paths from it, sorted.
+    fn found(dir: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut walk = vec![dir.to_path_buf()];
+        while let Some(at) = walk.pop() {
+            for entry in std::fs::read_dir(&at).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() && !path.is_symlink() {
+                    walk.push(path);
+                } else {
+                    found.push(path.strip_prefix(dir).unwrap().to_str().unwrap().to_string());
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// A glob's links are made as WHENCE says, with what they point at taken, links in turn;
+    /// a file the glob names is taken; what no glob names is not.
+    #[test]
+    fn built_in_firmware_makes_the_links_a_glob_names_and_takes_their_targets() {
+        let Some((dir, said)) = firmware("links", &["a/*"]) else { return };
+        assert_eq!(said, Ok(()));
+        assert_eq!(pointing(&dir, "a/x").as_deref(), Some("../b/x"));
+        // A link to a link: a/y is made, a/x it points at is too, and b/x at the end.
+        assert_eq!(pointing(&dir, "a/y").as_deref(), Some("x"));
+        assert_eq!(found(&dir), ["a/file", "a/x", "a/y", "b/x"]);
+        // They are all readable from where they are: no link dangles.
+        assert_eq!(std::fs::read_to_string(dir.join("a/y")).unwrap(), "b/x");
+        assert!(!dir.join("WHENCE").exists());
+    }
+
+    /// A glob that names only links (no file of linux-firmware's own) works, not a tar "not found".
+    #[test]
+    fn built_in_firmware_takes_a_glob_that_names_only_links() {
+        let Some((dir, said)) = firmware("only-links", &["c/*"]) else { return };
+        assert_eq!(said, Ok(()));
+        assert_eq!(found(&dir), ["b/z", "c/only"]);
+        assert_eq!(pointing(&dir, "c/only").as_deref(), Some("../b/z"));
+    }
+
+    /// A glob that names neither a file nor a link is an error, and says which.
+    #[test]
+    fn built_in_firmware_dies_for_a_glob_that_matches_nothing() {
+        let Some((_, said)) = firmware("nothing", &["a/*", "zz/*"]) else { return };
+        let said = said.unwrap_err();
+        assert!(said.contains("zz/*") && !said.contains("a/*"), "{said}");
+    }
+
+    /// Links that point at each other stop with an error, not a loop that never ends.
+    #[test]
+    fn built_in_firmware_stops_a_cycle_of_links() {
+        let Some((_, said)) = firmware("cycle", &["loop/*"]) else { return };
+        assert!(said.unwrap_err().contains("cycle"));
+    }
+
+    /// A link that leaves the tree (an absolute target, or `..` past its top, however deep it
+    /// goes first) is refused, and so is one that points at what linux-firmware lacks.
+    #[test]
+    fn built_in_firmware_refuses_a_link_out_of_the_tree() {
+        for (glob, why) in [
+            ("bad/out", "out of"),
+            ("bad/up", "out of"),
+            ("abs/*", "out of"),
+            ("long/*", "out of"),
+            ("dangling/*", "lacks"),
+        ] {
+            let Some((dir, said)) = firmware("out-of-tree", &[glob]) else { return };
+            let said = said.unwrap_err();
+            assert!(said.contains(why), "{glob}: {said}");
+            assert!(!dir.join("etc").exists());
+        }
+    }
+
+    /// `*` stands for one piece of a path, as tar's does here: `d/*` takes d/f and no link or
+    /// file deeper, and `e/*/*` goes down two.
+    #[test]
+    fn built_in_firmware_star_does_not_cross_a_slash() {
+        let Some((dir, said)) = firmware("star", &["d/*"]) else { return };
+        assert_eq!(said, Ok(()));
+        assert_eq!(found(&dir), ["d/f"]);
+        let Some((dir, said)) = firmware("star-down", &["e/*/*", "d/*/*"]) else { return };
+        assert_eq!(said, Ok(()));
+        assert_eq!(found(&dir), ["b/x", "d/deep/m", "d/deep/n", "e/one/f", "e/two/g"]);
+    }
+
     #[test]
     fn os_counts_failed_starts_on_the_esp_until_one_comes_up() {
         let places = places("counts");

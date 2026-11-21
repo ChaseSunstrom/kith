@@ -57,6 +57,7 @@
 {"u":"guide/hardware.html#an-app-as-a-workload-of-its-own-in-a-sessions-window","t":"Hardware","h":"An app as a workload of its own, in a session's window"},
 {"u":"guide/hardware.html#running-a-flatpak-app-in-a-session","t":"Hardware","h":"Running a Flatpak app in a session"},
 {"u":"guide/hardware.html#what-a-seat-keeps-for-itself","t":"Hardware","h":"What a seat keeps for itself"},
+{"u":"guide/hardware.html#a-tv-or-kiosk-seat","t":"Hardware","h":"A TV or kiosk seat"},
 {"u":"guide/hardware.html#virtual-machines","t":"Hardware","h":"Virtual machines"},
 {"u":"guide/hardware.html#switching-one-gpu","t":"Hardware","h":"Switching one GPU"},
 {"u":"guide/hardware.html#confidential-machines","t":"Hardware","h":"Confidential machines"},
