@@ -187,8 +187,10 @@ for r in sorted(found, key=lambda r: r["metadata"]["name"]):
             applied first
             applied second
             agreed ConfigMap 'ConfigMap/genuine=.*"n": "2"'
-            # The audit log's refusals are held to a number a minute: begin a minute of our own.
-            sleep $((61 - $(date +%s) % 60))
+            # The audit log's refusals are held to a number a minute, by each node's own clock (a VM's runs
+            # some seconds off the host's, so the host's minute proves nothing): let a whole minute pass, so
+            # the writers' refusals above cannot be in the minute the forged ones are counted in.
+            sleep 61
             # (1) a bare RoleBinding, which no one signed.
             printf '{"Apply":{"resources":[{"apiVersion":"kith.dev/v1","kind":"RoleBinding","metadata":{"name":"forged-bare"},"spec":{"role":"cluster-admin","subjects":["mallory"]}}],"at":0}}' >"$work/bare.entry"
             forge bare
@@ -225,7 +227,7 @@ sys.exit(0 if any(e["verb"] == "signed" and not e["ok"] and e["who"] == who and 
             }
             for n in 1 2 3; do
                 tries=0
-                until audited "$n" unsigned forged-bare 'a bare write that changes access is refused' \
+                until audited "$n" unsigned forged-bare 'a bare write that writes a spec is refused' \
                     && audited "$n" 'local socket' /v1/apply 'over this request' \
                     && audited "$n" 'local socket' /v1/apply "$(printf '%032x' 2) of local socket was seen already" \
                     && audited "$n" 'local socket' /v1/apply 'is not what its method, path and body make' \
@@ -240,6 +242,21 @@ sys.exit(0 if any(e["verb"] == "signed" and not e["ok"] and e["who"] == who and 
             ! grep -q 'forged\|harmless' "$work/held" || fail "a forged resource is held: $(cat "$work/held")"
             agreed RoleBinding
             ! grep -q 'forged\|mallory' "$work/held" || fail "a forged RoleBinding is held: $(cat "$work/held")"
+            # Every bare spec write is refused under required, whatever it writes (T-0850; open kept them: the
+            # writers above and the Cluster of the admin's key were bare): a ConfigMap by curl, which the API
+            # refuses unsigned, and a ConfigMap Apply and a Delete of the genuine one a taken leader appends, which
+            # every node refuses at apply.
+            configmap curled 1 >"$work/curled.json"
+            ! api 1 POST /v1/apply "$work/curled.json" >/dev/null 2>&1 || fail "a bare curl write of a ConfigMap was taken under required"
+            printf '{"Apply":{"resources":[{"apiVersion":"kith.dev/v1","kind":"ConfigMap","metadata":{"name":"forged-map"},"spec":{"data":{"n":"x"}}}],"at":0}}' >"$work/barecm.entry"
+            forge barecm
+            grep -q '"applied":false' "$work/forged.json" || fail "a bare ConfigMap was applied under required: $(cat "$work/forged.json")"
+            printf '{"Delete":{"key":"ConfigMap/genuine"}}' >"$work/baredel.entry"
+            forge baredel
+            grep -q '"applied":false' "$work/forged.json" || fail "a bare Delete of a ConfigMap was applied under required: $(cat "$work/forged.json")"
+            agreed ConfigMap 'ConfigMap/genuine=.*"n": "2"'
+            ! grep -q 'forged-map\|curled' "$work/held" || fail "a bare ConfigMap is held under required: $(cat "$work/held")"
+            echo "vm.sh: a bare ConfigMap by curl, a bare ConfigMap Apply and a bare Delete, each refused under required" >&2
             # A node's own write, signed by its key (`own_writes`): the scheduler's Volume for a claim the
             # admin signed, applied on all three nodes while signing is required (a bare one is refused).
             printf '[{"apiVersion":"kith.dev/v1","kind":"VolumeClaim","metadata":{"name":"own"},"spec":{"size":"1Gi","provision":true}}]' >"$work/claim.json"

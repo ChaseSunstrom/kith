@@ -72,6 +72,7 @@
 {"u":"guide/access.html#a-workload-that-calls-the-api","t":"Access: who may do what, and what a node refuses","h":"A Workload that calls the API"},
 {"u":"guide/access.html#use-kith-from-a-laptop","t":"Access: who may do what, and what a node refuses","h":"Use kith from a laptop"},
 {"u":"guide/access.html#contexts-a-name-for-a-cluster","t":"Access: who may do what, and what a node refuses","h":"Contexts: a name for a cluster"},
+{"u":"guide/access.html#signed-writes-specsigning-required-and-open","t":"Access: who may do what, and what a node refuses","h":"Signed writes: spec.signing: required and open"},
 {"u":"guide/access.html#what-a-node-refuses-whatever-the-cluster-says","t":"Access: who may do what, and what a node refuses","h":"What a node refuses, whatever the cluster says"},
 {"u":"guide/api.html","t":"Resources and the language","h":""},
 {"u":"guide/api.html#kithdevv1-is-stable","t":"Resources and the language","h":"kith.dev/v1 is stable"},

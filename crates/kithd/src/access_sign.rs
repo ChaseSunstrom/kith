@@ -390,15 +390,13 @@ pub fn new_identity(name: &str) -> Resource {
 }
 
 /// May a bare entry (not a signed one) be applied to `store`? Under `spec.signing: required`
-/// in format 4 not one that changes access ([`crate::raft::changes_access`]: a Role,
-/// RoleBinding, Identity, KindDefinition or Cluster, and any import): only a signed entry
-/// does, so a taken leader cannot write what the admin did not sign. Every other bare write
-/// stays bare here (a node's own, a spec a Release or Source writes: later slices).
-///
-/// A cost, until slice 6 (T-0850: `writer_may` for a Release and a Source): a Release or Source
-/// whose render holds a Role, RoleBinding, Identity or KindDefinition (or prunes one) is bare, so
-/// it is refused here too. Their controllers do not propose it under `required`
-/// ([`refuses_render`]) and say so in the status.
+/// in format 4 no bare write of a spec: an Apply, Delete, Rollback or Import, whatever it writes
+/// (curl, kubectl, a Role or a Release's resource alike). A person's write is signed (the
+/// request's, [`admit`]); the leader's controllers and a control node's own writes are signed by
+/// that node's key (`own_writes`), each held at apply to what it is derived from, so a taken
+/// leader cannot write a spec nobody signed. Under `open` they all stay. What stays bare under
+/// `required` is a status (a Patch, Status or Report: slice 4's own, but for a Node's
+/// certificate or raft id), the format marks, and membership.
 pub(crate) fn bare(store: &Store, command: &Command) -> Result<(), String> {
     // A Node's certificate or raft id is what its signature is checked by: a node's own, signed.
     let node = |(key, fields): &(String, serde_json::Map<String, serde_json::Value>)| {
@@ -408,7 +406,8 @@ pub(crate) fn bare(store: &Store, command: &Command) -> Result<(), String> {
                 .any(|field| fields.contains_key(*field))
     };
     let what = match command {
-        _ if crate::raft::changes_access(command) => "changes access",
+        Command::Apply { .. } | Command::Delete { .. } | Command::Rollback { .. } => "writes a spec",
+        Command::Import { .. } => "imports a store",
         Command::Patch { statuses } if statuses.iter().any(node) => "sets a Node's certificate or raft id",
         _ => return Ok(()),
     };
@@ -419,13 +418,6 @@ pub(crate) fn bare(store: &Store, command: &Command) -> Result<(), String> {
         )),
         false => Ok(()),
     }
-}
-
-/// Would the cluster refuse `command` bare, a controller's own write (a Release's or a Source's
-/// render), under `spec.signing: required`? Then the controller proposes nothing and says so,
-/// rather than write an entry every node refuses and audits, again each round.
-pub fn refuses_render(store: &Store, command: &Command) -> Option<String> {
-    bare(store, command).err()
 }
 
 /// What a command touches, for the audit log: its resources' keys (an import: the whole store).
@@ -1551,9 +1543,12 @@ mod tests {
         assert_eq!(targets(&Command::Delete { key: "Role/x".into() }), ["Role/x"]);
         assert_eq!(targets(writes.last().unwrap()), ["(the whole store)"]);
         assert!(writes.iter().all(|write| !targets(write).is_empty()));
-        // The scan of the store for `required` is for an access write only: a plain one is not asked.
-        assert_eq!(refuses_render(&required_store(), &applies(vec![map("a")])), None);
-        assert!(refuses_render(&required_store(), &writes[0]).is_some());
+        // A status is no spec write: not refused, so the scan of the store for `required` is not asked.
+        assert_eq!(
+            bare(&required_store(), &Command::Status { statuses: Vec::new() }),
+            Ok(())
+        );
+        assert!(bare(&required_store(), &writes[0]).is_err());
     }
 
     #[test]
@@ -1564,12 +1559,23 @@ mod tests {
             let said = admit(&store, CLUSTER, &write, leader).unwrap_err();
             assert!(said.contains("bare"), "{write:?}: {said}");
         }
+        // A bare write of any spec, a ConfigMap's too (curl, kubectl), is refused as well; a status is not.
         for write in [
             applies(vec![map("a")]),
             Command::Delete {
                 key: "ConfigMap/a".into(),
             },
+        ] {
+            let said = admit(&store, CLUSTER, &write, leader).unwrap_err();
+            assert!(said.contains("writes a spec"), "{write:?}: {said}");
+        }
+        for write in [
             Command::Status { statuses: Vec::new() },
+            Command::Patch { statuses: Vec::new() },
+            Command::Report {
+                node: LEADER.into(),
+                statuses: Vec::new(),
+            },
         ] {
             assert!(admit(&store, CLUSTER, &write, leader).is_ok(), "{write:?}");
         }
@@ -1602,6 +1608,62 @@ mod tests {
         for write in bare_access() {
             assert!(admit(&open, CLUSTER, &write, leader).is_ok(), "open: {write:?}");
             assert!(admit(&old, CLUSTER, &write, leader).is_ok(), "format 3: {write:?}");
+        }
+    }
+
+    /// The one place that holds every kind: under `required` a bare Apply, Delete or Rollback of
+    /// each kind kith has, and of a custom kind (a wasm controller's), is refused at apply on
+    /// every node; under `open` the same writes are kept; a status is neither.
+    #[test]
+    fn signed_required_refuses_every_bare_spec_write_of_every_kind_and_open_keeps_them() {
+        let leader = kith_store::node_id(LEADER);
+        let (required, open) = (required_store(), signing_store());
+        let custom = "GameServer";
+        let kinds = crate::own_writes::CLASSES.iter().map(|(kind, _)| *kind).chain([
+            "Release",
+            "Source",
+            "Package",
+            "Repository",
+            "KindDefinition",
+            custom,
+        ]);
+        let mut named = 0;
+        for kind in kinds {
+            let mut of = map("x");
+            of.kind = kind.to_string();
+            of.spec = serde_json::json!({});
+            let writes = [
+                applies(vec![of]),
+                Command::Delete {
+                    key: format!("{kind}/x"),
+                },
+                Command::Delete {
+                    key: format!("{kind}/default/x"),
+                },
+                Command::Rollback {
+                    key: format!("{kind}/x"),
+                    to: 1,
+                    at: 7,
+                },
+            ];
+            for write in writes {
+                let said = admit(&required, CLUSTER, &write, leader).unwrap_err();
+                assert!(
+                    said.contains("bare") || said.contains("writes a spec"),
+                    "{kind}: {write:?}: {said}"
+                );
+                assert!(
+                    admit(&open, CLUSTER, &write, leader).is_ok(),
+                    "open keeps {kind}: {write:?}"
+                );
+            }
+            named += 1;
+        }
+        assert!(named >= crate::own_writes::CLASSES.len() + 6);
+        // A status is no spec write: taken under both.
+        for store in [&required, &open] {
+            let status = Command::Status { statuses: Vec::new() };
+            assert!(admit(store, CLUSTER, &status, leader).is_ok());
         }
     }
 

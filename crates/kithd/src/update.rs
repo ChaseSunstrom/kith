@@ -504,7 +504,7 @@ fn apply_cordon(spec: &mut Value, on: bool) {
 
 /// The spec a Node should have for the update's cordon, given the spec it has now: `None`
 /// when it has that already.
-fn cordoned_spec(spec: &Value, on: bool) -> Option<Value> {
+pub(crate) fn cordoned_spec(spec: &Value, on: bool) -> Option<Value> {
     let mut next = spec.clone();
     apply_cordon(&mut next, on);
     (next != *spec).then_some(next)
@@ -632,7 +632,7 @@ async fn write_cordon(
         node.spec = spec;
         let at = kith_api::store::now();
         let sent = shared
-            .submit(Command::Apply {
+            .submit_node(Command::Apply {
                 resources: vec![node],
                 at,
             })
