@@ -182,6 +182,8 @@ through the same few commands:
 kith get workload/hello -o yaml  # status: each container's state, restarts and last exit code
 kith get -w workload             # the table, then each row as it changes (a long-poll on GET /v1/watch)
 kith logs workload/hello -f      # its output, as it arrives
+kith launch alpine -- echo hi    # a one-off Job, followed, exiting with its code (`-d`: a Workload, and return)
+kith ps -A                       # every replica, Job run and exec unit: node, state, exit code (a Job's, when kithd names it), the resource's age
 kith lint -f examples/           # validate files; needs no daemon
 kith diff -f examples/           # what apply would change; exits 1 if anything
 kith apply -f examples/          # all or nothing
