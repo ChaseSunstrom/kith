@@ -54,6 +54,9 @@ pub fn watch() {
 /// when [`watch`] has been told to stop).
 struct Dir(PathBuf);
 
+/// What a Unix socket's path can hold: `sun_path` is 108 bytes, the last for the NUL.
+const SOCKET_PATH_MAX: usize = 107;
+
 impl Dir {
     fn make() -> Result<Dir, String> {
         let mut random = [0u8; 16];
@@ -61,6 +64,16 @@ impl Dir {
         read.or_else(|e| fail(format!("no random numbers: {e}")))?;
         let name: String = random.iter().map(|b| format!("{b:02x}")).collect();
         let path = std::env::temp_dir().join(format!("kith-run-{name}"));
+        // The carrier binds a socket in here (`t` is the longest name it gets): a path past
+        // `sun_path` fails there, and the tunnel never opens; say so now, before anything is made.
+        let longest = path.as_os_str().len() + "/t".len();
+        if longest > SOCKET_PATH_MAX {
+            return fail(format!(
+                "the run's socket would be {}/t, {longest} bytes, and a Unix socket path can be at most \
+                 {SOCKET_PATH_MAX} (set TMPDIR to a shorter directory)",
+                path.display()
+            ));
+        }
         let made = std::fs::DirBuilder::new().mode(0o700).create(&path);
         made.or_else(|e| fail(format!("cannot make {}: {e}", path.display())))?;
         live().0.push(path.clone());
