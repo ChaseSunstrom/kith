@@ -853,3 +853,308 @@ fn cluster_fields_nothing_reads_are_said() {
     let (code, _, said) = sandbox.kith(&["lint", "-f", "read.yaml"]);
     assert!(code == 0 && !said.contains("note:"), "{code}: {said}");
 }
+
+/// A kithd on a unix socket that answers each request with `answer(method, path, body)`, a JSON
+/// text, and keeps what it was asked as `METHOD PATH BODY`. (The cluster's signing is open.)
+fn fake_kithd(
+    sb: &Sandbox,
+    answer: impl Fn(&str, &str, &str) -> String + Send + 'static,
+) -> (PathBuf, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    let socket = sb.0.join("kithd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = seen.clone();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut got = Vec::new();
+            let mut byte = [0u8; 1];
+            while !got.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                got.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&got).to_string();
+            let length = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|n| n.trim().parse().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; length];
+            stream.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            let mut words = head.split(' ');
+            let (method, path) = (words.next().unwrap(), words.next().unwrap());
+            let reply = match path {
+                "/v1/cluster" => r#"{"signing":"open"}"#.to_string(),
+                _ => {
+                    kept.lock().unwrap().push(format!("{method} {path} {body}"));
+                    answer(method, path, &body)
+                }
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    (socket, seen)
+}
+
+fn kith_at(socket: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_kith"))
+        .args(args)
+        .env("KITH_SOCKET", socket)
+        .env_remove("KITH_STORE")
+        .output()
+        .unwrap();
+    let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
+    (out.status.code().unwrap(), text(out.stdout), text(out.stderr))
+}
+
+fn bare(
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    spec: serde_json::Value,
+    status: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "kith.dev/v1", "kind": kind,
+        "metadata": { "name": name, "namespace": namespace },
+        "spec": spec, "status": status,
+    })
+}
+
+/// `kith launch IMAGE -- CMD` applies a Job that never retries, prints the unit's output as it
+/// comes and exits with the unit's code; its name is the first free `IMAGE-N`.
+#[test]
+fn launch_makes_a_job_follows_its_logs_and_exits_with_its_code() {
+    let sb = Sandbox::new("launch-job");
+    let polled = std::sync::atomic::AtomicUsize::new(0);
+    let (socket, seen) = fake_kithd(&sb, move |method, path, body| match (method, path) {
+        ("GET", "/v1/resources?kind=Job") => serde_json::json!([bare(
+            "Job",
+            "default",
+            "alpine-1",
+            serde_json::json!({}),
+            serde_json::json!({})
+        )])
+        .to_string(),
+        ("POST", "/v1/apply") => {
+            let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+            serde_json::json!([{ "action": "created", "before": null, "after": sent[0] }]).to_string()
+        }
+        ("GET", p) if p.starts_with("/v1/logs/Job/default/alpine-2?replica=0&unit=main&stderr=true") => {
+            match p.ends_with("&offset=0") {
+                true => r#"{"data":"boom\n","next":5,"more":false}"#.into(),
+                false => r#"{"data":"","next":5,"more":false}"#.into(),
+            }
+        }
+        ("GET", p) if p.starts_with("/v1/logs/Job/default/alpine-2?replica=0&unit=main") => {
+            let n = polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match n {
+                0 => r#"{"data":"","next":0,"more":true}"#.into(),
+                1 => r#"{"data":"hi\n","next":3,"more":true}"#.into(),
+                _ => r#"{"data":"","next":3,"more":false}"#.into(),
+            }
+        }
+        ("GET", "/v1/resources/Job/default/alpine-2") => {
+            // (The shape kithd gives a finished Job: no containers, the culprit in the message,
+            // crates/kithd/src/controller.rs `job.message = Some(format!("run {run}, {}: {why}"`.)
+            let status = serde_json::json!({ "state": "failed", "message": "run 0, main: exited with code 3", "containers": [] });
+            bare("Job", "default", "alpine-2", serde_json::json!({}), status).to_string()
+        }
+        _ => panic!("unexpected {method} {path}"),
+    });
+    let (code, out, err) = kith_at(
+        &socket,
+        &["launch", "alpine:3.20", "-e", "A=b=c", "-p", "8080", "--", "echo", "hi"],
+    );
+    assert_eq!((code, out.as_str()), (3, "hi\n"), "{err}");
+    assert!(err.contains("exited with code 3") && err.contains("boom"), "{err}");
+    let seen = seen.lock().unwrap();
+    let applied = seen.iter().find_map(|s| s.strip_prefix("POST /v1/apply ")).unwrap();
+    let job: serde_json::Value = serde_json::from_str(applied).unwrap();
+    assert_eq!(job[0]["kind"], "Job");
+    assert_eq!(job[0]["metadata"]["name"], "alpine-2");
+    assert_eq!(job[0]["spec"]["retries"], 0);
+    let template = &job[0]["spec"]["template"];
+    assert_eq!(template["restartPolicy"], "never");
+    let unit = &template["containers"][0];
+    assert_eq!(
+        (
+            &unit["image"],
+            &unit["command"],
+            &unit["env"][0]["value"],
+            &unit["ports"][0]["port"]
+        ),
+        (
+            &"alpine:3.20".into(),
+            &serde_json::json!(["echo", "hi"]),
+            &"b=c".into(),
+            &8080.into()
+        )
+    );
+}
+
+/// A Job that succeeded exits 0.
+#[test]
+fn launch_exits_0_for_a_job_that_succeeded() {
+    let sb = Sandbox::new("launch-ok");
+    let (socket, _) = fake_kithd(&sb, |method, path, body| match (method, path) {
+        ("GET", "/v1/resources?kind=Job") => "[]".into(),
+        ("POST", "/v1/apply") => {
+            let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+            serde_json::json!([{ "action": "created", "before": null, "after": sent[0] }]).to_string()
+        }
+        ("GET", p) if p.contains("&stderr=true") => r#"{"data":"","next":0,"more":false}"#.into(),
+        ("GET", p) if p.ends_with("/v1/logs/Job/team/batch?replica=0&unit=main&offset=0") => {
+            r#"{"data":"done\n","next":5,"more":false}"#.into()
+        }
+        ("GET", p) if p.ends_with("&offset=5") => r#"{"data":"","next":5,"more":false}"#.into(),
+        ("GET", "/v1/resources/Job/team/batch") => {
+            let status = serde_json::json!({ "state": "succeeded", "containers": [] });
+            bare("Job", "team", "batch", serde_json::json!({}), status).to_string()
+        }
+        _ => panic!("unexpected {method} {path}"),
+    });
+    let (code, out, err) = kith_at(&socket, &["launch", "-n", "team", "--name", "batch", "busybox"]);
+    assert_eq!((code, out.as_str()), (0, "done\n"), "{err}");
+}
+
+/// `-d` makes a Workload of one replica and returns: no logs are asked for.
+#[test]
+fn launch_detached_makes_a_workload_of_one_replica() {
+    let sb = Sandbox::new("launch-detached");
+    let (socket, seen) = fake_kithd(&sb, |method, path, body| match (method, path) {
+        ("GET", "/v1/resources?kind=Workload") => "[]".into(),
+        ("POST", "/v1/apply") => {
+            let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+            serde_json::json!([{ "action": "created", "before": null, "after": sent[0] }]).to_string()
+        }
+        _ => panic!("unexpected {method} {path}"),
+    });
+    let (code, out, err) = kith_at(&socket, &["launch", "-d", "ghcr.io/acme/Web:1", "-p", "8080"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Workload/default/web-1 created"), "{out}");
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().all(|s| !s.contains("/v1/logs")), "{seen:?}");
+    let applied = seen.iter().find_map(|s| s.strip_prefix("POST /v1/apply ")).unwrap();
+    let workload: serde_json::Value = serde_json::from_str(applied).unwrap();
+    assert_eq!(
+        (&workload[0]["kind"], &workload[0]["spec"]["replicas"]),
+        (&"Workload".into(), &1.into())
+    );
+}
+
+/// Against a store file: a launch in front has no logs to follow, `-d` works and numbers its
+/// names, a taken `--name` is refused, and a bad `-e` is said before anything is made.
+#[test]
+fn launch_against_a_store_file() {
+    let sb = Sandbox::new("launch-store");
+    let (code, _, err) = sb.kith(&["launch", "alpine"]);
+    assert!(code == 2 && err.contains("use -d"), "{code}: {err}");
+    for want in ["Workload/default/alpine-1 created", "Workload/default/alpine-2 created"] {
+        let (code, out, err) = sb.kith(&["launch", "-d", "alpine", "--", "sleep", "9"]);
+        assert!(code == 0 && out.contains(want), "{code}: {out}{err}");
+    }
+    let (code, _, err) = sb.kith(&["launch", "-d", "--name", "alpine-2", "alpine"]);
+    assert!(code == 2 && err.contains("already there"), "{code}: {err}");
+    assert!(err.contains("`kith delete workload/alpine-2`"), "{err}");
+    sb.kith(&["launch", "-d", "-n", "team", "--name", "x", "alpine"]);
+    let (_, _, err) = sb.kith(&["launch", "-d", "-n", "team", "--name", "x", "alpine"]);
+    assert!(err.contains("`kith delete workload/x -n team`"), "{err}");
+    let (code, _, err) = sb.kith(&["launch", "-d", "-e", "NOEQUALS", "alpine"]);
+    assert!(code == 2 && err.contains("KEY=VALUE"), "{code}: {err}");
+    let (code, out, err) = sb.kith(&["get", "workload"]);
+    assert!(
+        out.contains("alpine-1") && out.contains("alpine-2") && !out.contains("alpine-3"),
+        "{code}: {out}{err}"
+    );
+}
+
+/// `kith ps` has one row for each unit of each Workload, Job and exec unit: where, state,
+/// code, what it runs and its age; `-n` and `-A` choose the namespaces.
+#[test]
+fn ps_lists_replicas_job_runs_and_exec_units() {
+    let sb = Sandbox::new("ps");
+    let three_hours_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 3 * 3600
+        - 5;
+    let unit = |name: &str, replica: u32, node: &str, state: &str| serde_json::json!({ "name": name, "replica": replica, "node": node, "state": state });
+    let web = serde_json::json!({ "template": { "containers": [{ "name": "web", "image": "nginx:1.27" }] } });
+    let tick = serde_json::json!({ "template": { "exec": [{ "name": "t", "command": ["sleep", "9"] }] } });
+    let job = serde_json::json!({ "template": { "containers": [{ "name": "main", "image": "alpine" }] } });
+    let (socket, _) = fake_kithd(&sb, move |_, path, _| {
+        let at = |key: &str| serde_json::json!([{ "at": three_hours_ago, "resource": bare("Job", "x", key, serde_json::json!({}), serde_json::json!({})) }]);
+        match path {
+            "/v1/resources?kind=Workload" => serde_json::json!([
+                bare("Workload", "default", "web", web.clone(), serde_json::json!({ "containers": [unit("web", 0, "a", "running"), unit("web", 1, "b", "running")] })),
+                bare("Workload", "default", "tick", tick.clone(), serde_json::json!({ "containers": [unit("t", 0, "a", "running")] })),
+                bare("Workload", "team", "api", web.clone(), serde_json::json!({ "containers": [unit("web", 0, "c", "running")] })),
+            ]).to_string(),
+            "/v1/resources?kind=NodeWorkload" => "[]".into(),
+            "/v1/resources?kind=Job" => {
+                // (A finished Job as kithd writes it: no containers; the code is in the message.)
+                let failed = serde_json::json!({ "state": "failed", "message": "run 0, main: exited with code 3", "containers": [] });
+                let ok = serde_json::json!({ "state": "succeeded", "containers": [] });
+                serde_json::json!([
+                    bare("Job", "default", "alpine-1", job.clone(), failed),
+                    bare("Job", "default", "alpine-2", job.clone(), ok),
+                ]).to_string()
+            }
+            p if p.starts_with("/v1/history/") => at("h").to_string(),
+            _ => panic!("unexpected {path}"),
+        }
+    });
+    let rows = |args: &[&str]| {
+        let (code, out, err) = kith_at(&socket, args);
+        assert_eq!(code, 0, "{err}");
+        out.lines()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(&["ps"]),
+        [
+            "NAMESPACE KIND NAME UNIT NODE STATE EXIT IMAGE/COMMAND AGE",
+            "default workload web-0 web a running - nginx:1.27 3h",
+            "default workload web-1 web b running - nginx:1.27 3h",
+            "default workload tick-0 t a running - sleep 9 3h",
+            "default job alpine-1 main - failed 3 alpine 3h",
+            "default job alpine-2 main - succeeded 0 alpine 3h",
+        ]
+    );
+    let team = rows(&["ps", "-n", "team"]);
+    assert_eq!(team.len(), 2, "{team:?}");
+    assert!(team[1].starts_with("team workload api-0 web c running"), "{team:?}");
+    assert_eq!(rows(&["ps", "-A"]).len(), 7);
+    assert_eq!(kith_at(&socket, &["ps", "-A", "-n", "team"]).0, 2);
+}
+
+/// `kith run` is still the waypipe verb (`--on` required), and the help lists `launch` and `ps`
+/// beside it: a one-off container is `launch`, not `run`.
+#[test]
+fn help_lists_launch_and_ps_and_run_keeps_its_meaning() {
+    let sb = Sandbox::new("help");
+    let (code, out, _) = sb.kith(&["--help"]);
+    assert_eq!(code, 0);
+    for verb in ["launch", "ps", "run"] {
+        assert!(
+            out.lines().any(|l| l.trim_start().starts_with(&format!("{verb} "))),
+            "{verb}: {out}"
+        );
+    }
+    let (code, _, err) = sb.kith(&["run", "--", "app"]);
+    assert!(code == 2 && err.contains("--on"), "{code}: {err}");
+    let (_, out, _) = sb.kith(&["run", "--help"]);
+    assert!(out.contains("waypipe"), "{out}");
+    let (_, out, _) = sb.kith(&["launch", "--help"]);
+    assert!(out.contains("Job") && out.contains("--detach"), "{out}");
+}

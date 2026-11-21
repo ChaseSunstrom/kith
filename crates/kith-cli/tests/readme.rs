@@ -770,6 +770,21 @@ fn the_guide_says_a_bare_pod_is_run_and_deleted() {
     );
 }
 
+/// `kith launch` and `kith ps` are written down, with why the one-off container is not `run`
+/// (which is waypipe's, and needs `--on`).
+#[test]
+fn the_docs_say_launch_and_ps_and_why_it_is_not_run() {
+    for said in [
+        "kith launch alpine -- echo hi",
+        "kith ps -A",
+        "`kith launch IMAGE",
+        "`kith ps [-n NS | -A]`",
+        "`kith run` is waypipe's",
+    ] {
+        assert!(README.contains(said), "the docs no longer say {said:?}");
+    }
+}
+
 /// The recipe for a workload that outlives its node says kith runs no Kubernetes and no VM for it,
 /// and that live migration of a VM workload is a later, separate feature (T-1131).
 #[test]
