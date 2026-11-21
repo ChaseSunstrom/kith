@@ -542,11 +542,18 @@ fn encrypt_in_place(config: &std::path::Path, record: &crate::crypt::Record) -> 
         .seek(std::io::SeekFrom::End(0))
         .map_err(io("measuring the state partition"))?;
     let chunks = total.div_ceil(in_place::CHUNK as u64);
-    let from = in_place::progress(&config).map_err(io("reading the journal"))?;
-    match from {
-        Some((done, _)) => eprintln!("kithd: init: encrypting the state in place, resumed at chunk {done} of {chunks}"),
-        None => eprintln!("kithd: init: encrypting the state in place: {chunks} chunks of 256 KiB"),
-    }
+    let resumed = in_place::progress(&config)
+        .map_err(io("reading the journal"))?
+        .map_or(0, |(done, _)| done);
+    // (The line a console and the panel the installer draws on show of the pass, at most one a
+    // second, and where a resumed pass resumes. No screen is no panel: the console has the line.)
+    let mut meter = in_place::Meter::new(total, in_place::CHUNK, resumed, std::time::Instant::now());
+    let mut screen = crate::install::fb::open();
+    let start = meter.start_line();
+    // (ci/vm/encrypt.sh greps the resumed start with a comma after "in place": that stays.)
+    let joint = if resumed > 0 { "," } else { ":" };
+    eprintln!("kithd: init: encrypting the state in place{joint} {start}");
+    show_pass(&mut screen, &start, resumed.min(chunks) * 100 / chunks.max(1));
     // (The mapping is the whole partition, as the one that opens the state is: what is written
     // through it here is what that one reads.)
     let open = |key: &[u8; 64], run: &mut dyn FnMut(&dyn in_place::Disk) -> std::io::Result<()>| {
@@ -558,27 +565,51 @@ fn encrypt_in_place(config: &std::path::Path, record: &crate::crypt::Record) -> 
         let closed = crate::crypt::unmap("kith-inplace");
         through.and(closed)
     };
-    // (A line every 8 MiB through the mapping: what a console, and the test that cuts the power
-    // at one, sees of a pass.)
-    let mut done = from.map_or(0, |(done, _)| done);
+    let mut done = resumed;
     let mut hit = |point: Point| {
         if point == Point::ChunkDone {
             done += 1;
-            if done % 32 == 0 || done == chunks {
-                eprintln!("kithd: init: encrypting the state in place: {done} of {chunks} chunks");
+            if let Some(line) = meter.due(done, std::time::Instant::now()) {
+                eprintln!("kithd: init: encrypting the state in place: {}", line.text);
+                show_pass(&mut screen, &line.text, line.percent);
             }
         }
         Ok(())
     };
     let ran = in_place::at_boot(&config, &part, total, record.plain_key(), &open, &mut hit);
     match ran.map_err(io("encrypting the state in place"))? {
-        Outcome::Encrypted => eprintln!("kithd: init: the state is encrypted in place"),
+        Outcome::Encrypted => {
+            eprintln!("kithd: init: the state is encrypted in place");
+            show_pass(&mut screen, "the state is encrypted in place", 100);
+        }
         Outcome::Cleaned => {
             eprintln!("kithd: init: the state was encrypted in place already: its journal is forgotten")
         }
         Outcome::Nothing => {}
     }
     Ok(())
+}
+
+/// Draw a pass's line and its bar on the panel the installer draws on, if there is one. A panel
+/// that cannot be drawn on is said of on the console; the pass goes on.
+fn show_pass(screen: &mut Option<crate::install::fb::Device>, line: &str, percent: u64) {
+    use crate::install::fb::{self, Panel};
+    let Some(device) = screen.as_mut() else {
+        return;
+    };
+    let mut frame = device.frame();
+    fb::draw_progress(
+        &mut frame,
+        &[],
+        0,
+        Some(percent),
+        "Encrypting the state in place",
+        line,
+        "",
+    );
+    if let Err(e) = device.show(&frame) {
+        eprintln!("kithd: init: the picture is not on the screen: {e}");
+    }
 }
 
 /// How many blocks the ext4 file system with this superblock has, and how long one is.
