@@ -433,6 +433,11 @@ impl Meter {
         (done * self.chunk as u64).min(self.total)
     }
 
+    /// How far through the partition `done` chunks are, in whole percent (bytes, not chunks).
+    pub fn percent(&self, done: u64) -> u64 {
+        self.bytes(done) * 100 / self.total.max(1)
+    }
+
     /// The line for `done` chunks done at `now`, if a second has passed since the last one.
     pub fn due(&mut self, done: u64, now: Instant) -> Option<Line> {
         if now.duration_since(self.last) < Duration::from_secs(1) {
@@ -441,7 +446,7 @@ impl Meter {
         self.last = now;
         let total = self.total.max(1);
         let through = self.bytes(done);
-        let percent = through * 100 / total;
+        let percent = self.percent(done);
         let since = through.saturating_sub(self.bytes(self.first));
         let secs = now.duration_since(self.began).as_secs_f64();
         let rate = if secs > 0.0 { since as f64 / secs } else { 0.0 };
@@ -468,7 +473,7 @@ impl Meter {
             format!("{chunks} chunks of {} KiB", self.chunk >> 10)
         } else {
             let at = self.bytes(self.first);
-            let percent = at * 100 / self.total.max(1);
+            let percent = self.percent(self.first);
             format!("resumed at chunk {} of {chunks}, at byte {at} ({percent}%)", self.first)
         }
     }

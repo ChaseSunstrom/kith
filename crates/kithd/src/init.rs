@@ -541,7 +541,6 @@ fn encrypt_in_place(config: &std::path::Path, record: &crate::crypt::Record) -> 
     let total = (&part)
         .seek(std::io::SeekFrom::End(0))
         .map_err(io("measuring the state partition"))?;
-    let chunks = total.div_ceil(in_place::CHUNK as u64);
     let resumed = in_place::progress(&config)
         .map_err(io("reading the journal"))?
         .map_or(0, |(done, _)| done);
@@ -550,10 +549,11 @@ fn encrypt_in_place(config: &std::path::Path, record: &crate::crypt::Record) -> 
     let mut meter = in_place::Meter::new(total, in_place::CHUNK, resumed, std::time::Instant::now());
     let mut screen = crate::install::fb::open();
     let start = meter.start_line();
-    // (ci/vm/encrypt.sh greps the resumed start with a comma after "in place": that stays.)
+    // (ci/vm/encrypt.sh greps the resumed start with a comma after "in place", and a progress line
+    // by "in place: N% of N MB": both stay.)
     let joint = if resumed > 0 { "," } else { ":" };
     eprintln!("kithd: init: encrypting the state in place{joint} {start}");
-    show_pass(&mut screen, &start, resumed.min(chunks) * 100 / chunks.max(1));
+    show_pass(&mut screen, &start, meter.percent(resumed));
     // (The mapping is the whole partition, as the one that opens the state is: what is written
     // through it here is what that one reads.)
     let open = |key: &[u8; 64], run: &mut dyn FnMut(&dyn in_place::Disk) -> std::io::Result<()>| {
@@ -579,8 +579,9 @@ fn encrypt_in_place(config: &std::path::Path, record: &crate::crypt::Record) -> 
     let ran = in_place::at_boot(&config, &part, total, record.plain_key(), &open, &mut hit);
     match ran.map_err(io("encrypting the state in place"))? {
         Outcome::Encrypted => {
+            // (The console only: the panel is cleared when `screen` drops, a moment after, so a
+            // final frame would not be seen.)
             eprintln!("kithd: init: the state is encrypted in place");
-            show_pass(&mut screen, "the state is encrypted in place", 100);
         }
         Outcome::Cleaned => {
             eprintln!("kithd: init: the state was encrypted in place already: its journal is forgotten")
