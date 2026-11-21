@@ -46,6 +46,12 @@
         hears() { # NAME TEXT
             waited=0
             until grep -aqF -- "$2" "$work/$1.log" 2>/dev/null; do
+                # (A machine's TPM seals the key of a node the cluster handed it only after kithd has read the firmware's event log;
+                # where the firmware leaves none (Debian's OVMF in a cluster Job, with swtpm: KITH_VM_NO_TPM_LOG=1, set by the Job), no TPM test can go on.)
+                case ${KITH_VM_NO_TPM_LOG:+$2} in "this machine's TPM holds the key"*)
+                    ! grep -aqF 'reading /sys/kernel/security/tpm0/binary_bios_measurements' "$work/$1.log" 2>/dev/null ||
+                        skip "the firmware leaves no TPM event log, which kithd reads to check the system before it seals a key the cluster handed out" ;;
+                esac
                 waited=$((waited + 1))
                 [ "$waited" -lt $((time * 5)) ] || fail "$1 never said: $2"
                 sleep 0.2

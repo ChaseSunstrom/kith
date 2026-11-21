@@ -87,20 +87,39 @@ The VM tests (`sh ci/vm.sh --test NAME`) can go to the same cluster:
 - **The split.** The tests are dealt to the nodes in turn, in the order given, and each node
   runs its own one at a time. One merged report names `FAILED: NODE: TEST` for each failure; a test
   that ci/vm.sh skips (no KVM, a tool missing) counts as failed, with its reason.
-- **What runs there.** On a cluster of three nodes, 21 of the 29 tests pass: alone, image,
+- **What runs there.** Of the 33 tests, the first run on a cluster of three nodes passed 21: alone, image,
   update, modules, disk, rollout, install, vps, access, pods, poddns, nested, outlive, services,
   compose, quota, worker, chaos, home, policy and tunnel (from 30 s warm to 17 minutes for the
   first kernel and image a node builds). rollout gets the checkout's `kith` built first; kube
-  goes by `sh ci/kube.sh --vm`, which fetches kubectl and helm. The rest, and why:
-  - `init` skips: it boots the host's kernel, and a Job has none in /boot.
-  - `netboot`, `crypt`, `tpm` and `duress`: the machine installed from the network starts
-    again into the firmware's UEFI shell, not its disk. Debian's OVMF has a built-in shell,
-    and that second start gives the disk no boot index.
+  goes by `sh ci/kube.sh --vm`, which fetches kubectl and helm. The rest, and why (the fixes
+  are made, and not yet run again on a cluster):
+  - `init` found no kernel in /boot of a Job, and now boots the image's own (built once, in the
+    Volume) when none is there.
+  - `netboot`, `crypt`, `tpm` and `duress`: the machine installed from the network started
+    again into the firmware's UEFI shell, not its disk. Debian's OVMF has a built-in shell and
+    no persistent NVRAM, and that second start gave the disk no boot index; it has one now.
   - `blackout`: the guests find no TPM event log
     (`/sys/kernel/security/tpm0/binary_bios_measurements`) with Debian's OVMF and swtpm, so
-    no node seals its key.
-  - `share` ("the Share mine does not say where it is") and `kube` ("the claim was refused")
-    fail there, on more than one node, and are not explained yet.
+    no node seals its key. A Job sets `KITH_VM_NO_TPM_LOG=1`, and with it `blackout`, `tpm`
+    and `netboot` skip, with that reason, at the step the log is missing (`netboot` expects the
+    log-read error there instead of "this machine has no TPM"). Without it, a run on a machine
+    of one's own asserts the TPM texts as before, and fails where its firmware has no log.
+  - `share` ("the Share mine does not say where it is") compared a status that has had a
+    `served` flag since T-1010: the check accepts it.
+  - `kube` ("the claim was refused") is likely the nodes' clocks, hours off; it is not yet
+    re-checked, as it waits for the node rollout that carries the clock fix (T-1080).
+  - `clock`, `mesh`, `nofile` and `fido2` came after that run: not yet run on a Job. Nothing in
+    them asks more of a Job than the others (`fido2` makes its keys in the guest, on its
+    kernel's uhid); a failure there is a difference of the Job to read.
+- **The Device.** It is applied only when the cluster has none by that name, or one that is
+  wrong (another node or path, or granted to more than `ci`): a second run leaves a right one
+  alone. An old Volume `ci-NODE` of the `default`
+  namespace (from before Jobs went to `ci`) is not used: remove it with
+  `DELETE /v1/resources/Volume/default/ci-NODE`.
+- **A pending Job.** A `--vm` Job still pending after `KITH_REMOTE_PENDING` seconds (600 by
+  default) fails with the DeviceClaim's status message; a fan Job waits as long as its timeout.
+  The cache is dropped at the size `KITH_REMOTE_CACHE_MB` gives (30000 MB by default), as the
+  fan's is. Both settings must be whole numbers, or the run is refused (exit 64).
 
 Time budgets are medians of five runs on one machine, no VM. `python3 ci/budgets.py --times`
 prints them; `python3 ci/budgets.py` holds each to twice the slowest of three medians on main on
