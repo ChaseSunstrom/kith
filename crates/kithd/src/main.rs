@@ -64,6 +64,7 @@ mod pods;
 mod policy;
 mod predict;
 mod probe;
+mod qmp;
 mod raft;
 mod registry;
 mod releases;
