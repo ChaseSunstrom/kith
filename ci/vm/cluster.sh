@@ -520,6 +520,9 @@ EOF
         if [ "$test" = chaos ]; then
             . "$root/ci/vm/chaos.sh"
         fi
+        if [ "$test" = clockleader ]; then
+            . "$root/ci/vm/clockleader.sh"
+        fi
         if [ "$test" = home ]; then
             . "$root/ci/vm/home.sh"
         fi

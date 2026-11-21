@@ -32,7 +32,7 @@
         "kind",
         "metadata"
       ],
-      "description": "Cluster-wide settings: the keys that sign images, the admin's key and whether callers must sign, and the house address (the other fields are kept and not acted on)",
+      "description": "Cluster-wide settings: the keys that sign images, the admin's key and whether callers must sign, the house address and the time server (the other fields are kept and not acted on)",
       "title": "Cluster",
       "$schema": "https://json-schema.org/draft/2020-12/schema"
     },
@@ -1657,6 +1657,13 @@
             }
           ],
           "description": "The house's one address on its LAN: whichever control node leads holds it, and\nanswers DNS at it, so a router can name it once (DHCP option 6) and forward to it."
+        },
+        "ntp": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The operator's time server, `ADDRESS[:PORT]` (port 123 left out): every node asks it\nalone, at its next check, unless its own `kith.ntp` names one. When Clusters say\ndifferent servers, the lowest key's is the one taken."
         }
       }
     },

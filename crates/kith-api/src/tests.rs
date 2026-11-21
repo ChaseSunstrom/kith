@@ -1436,7 +1436,7 @@ fn cluster_fields_nothing_reads_are_named() {
         ))
     };
     let all = "{ domain: example.org, voters: [a], updatePolicy: { windows: [Sat 02:00-05:00] }, \
-               mesh: { port: 51820 }, values: { a: 1 }, images: [] }";
+               mesh: { port: 51820 }, values: { a: 1 }, images: [], ntp: 10.0.0.7 }";
     let named = ["domain", "voters", "updatePolicy", "mesh", "values"];
     assert_eq!(cluster(all).not_acted_on(), named);
     assert_eq!(cluster("{ voters: [a] }").not_acted_on(), ["voters"]);
@@ -1445,6 +1445,40 @@ fn cluster_fields_nothing_reads_are_named() {
     }
     let other = "apiVersion: kith.dev/v1\nkind: Namespace\nmetadata: { name: values }\n";
     assert!(read(other).not_acted_on().is_empty());
+}
+
+/// A Cluster's time server (`spec.ntp`, which every node reads) is an address, or an address and
+/// a port, as `kith.ntp` is: anything else is refused when it is applied, naming the field.
+#[test]
+fn cluster_ntp_is_an_address_or_an_address_and_port() {
+    let cluster = |ntp: &str| {
+        let text =
+            format!("apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec:\n  ntp: '{ntp}'\n");
+        Resource::from_source(&text)
+            .and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>())
+            .map(|mut docs| docs.remove(0))
+            .map_err(|e| e.msg)
+    };
+    for good in ["10.0.0.7", "10.0.2.2:5123", "fd00::7", "[fd00::7]:99"] {
+        let read = cluster(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+        assert_eq!(read.spec["ntp"], good);
+        assert!(read.not_acted_on().is_empty(), "{good}");
+    }
+    for wrong in [
+        "pool.ntp.org",
+        "",
+        "10.0.0.7:",
+        "10.0.0.7:99999",
+        "10.0.0.7 10.0.0.8",
+        "10.0.0.7:0",
+    ] {
+        let e = cluster(wrong).expect_err(wrong);
+        assert!(e.contains("spec.ntp"), "{wrong}: {e}");
+    }
+    assert_eq!(kinds::ntp_server("10.0.0.7"), Some("10.0.0.7:123".parse().unwrap()));
+    assert_eq!(kinds::ntp_server("[fd00::7]:99"), Some("[fd00::7]:99".parse().unwrap()));
+    // Port 0 is no server's: nothing answers there (kith.ntp reads the same).
+    assert_eq!(kinds::ntp_server("[fd00::7]:0"), None);
 }
 
 /// The house address and its endpoint are checked when a Cluster is applied, by the one parser

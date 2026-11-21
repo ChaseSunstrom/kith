@@ -173,7 +173,7 @@ macro_rules! kinds {
 }
 
 kinds! {
-    Cluster: ClusterSpec, cluster, "Cluster-wide settings: the keys that sign images, the admin's key and whether callers must sign, and the house address (the other fields are kept and not acted on)";
+    Cluster: ClusterSpec, cluster, "Cluster-wide settings: the keys that sign images, the admin's key and whether callers must sign, the house address and the time server (the other fields are kept and not acted on)";
     Node: NodeSpec, cluster, "One machine: roles, taints, OS version, system extensions, resource reservations";
     Namespace: NamespaceSpec, cluster, "Grouping, quotas, default policies";
     Workload: WorkloadSpec, namespaced, "Long-running replicas";
@@ -442,7 +442,7 @@ impl Resource {
 
     /// The fields of its spec that are set and that nothing acts on: kept, and no rule in
     /// force for them. Whoever reads a file says them, so that nobody takes one for a rule.
-    /// (Today a Cluster's, of which kithd reads `images` and `home`.)
+    /// (Today a Cluster's, of which kithd reads `images`, `home` and `ntp`.)
     pub fn not_acted_on(&self) -> Vec<&'static str> {
         let cluster = ["domain", "voters", "updatePolicy", "mesh", "values"];
         match self.kind.as_str() {
