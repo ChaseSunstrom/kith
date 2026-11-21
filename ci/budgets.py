@@ -56,7 +56,10 @@ RUNS = 5  # each time is the median of this many runs
 # T-1130, T-1136, T-1157, T-1039 and T-1129 merged builds kithd at 14,447,936 B (13.779 MiB; main
 # alone 14,148,736 B); 13.79, not 13.78, for the 4 KiB page another folder may add (T-0900).
 # T-0269 brings it back down.
-KITHD_SIZE = 13.79
+# RAISE, kithd 13.79 to 14.20 (T-1265 for trains E and F): main 81fe0db4 with train D's lanes builds
+# kithd at 13.81 to 13.83 MB with T-1216 or T-1218 merged, and train E (kith docker, machines, VM
+# migration, mDNS names, image pull progress) adds more; T-0269 brings it back down.
+KITHD_SIZE = 14.20
 KITHD_IDLE_RSS = 9 * MB
 # binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
 # 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.
@@ -86,7 +89,10 @@ KITHD_IDLE_RSS = 9 * MB
 # docker, on in this build only) is 3,851,640 B built here (main alone 3,831,160 B, 20 KB: the std
 # HTTP server, ring's SHA-256 and the two JSON documents); the default kith and kithd are
 # byte-for-byte what main builds.
-SIZE_BUDGETS = {"kith": int(3.05 * MB), "kith-remote": int(3.68 * MB), "kithd": int(KITHD_SIZE * MB)}
+# RAISE, kith 3.05 to 3.10 and kith-remote 3.68 to 3.75 (T-1265 for trains E and F): kith-remote
+# built 3.68 MB with T-1218 merged on main 81fe0db4, and train E adds kith verbs (machine, launch,
+# pull progress); T-0269 brings them back down.
+SIZE_BUDGETS = {"kith": int(3.10 * MB), "kith-remote": int(3.75 * MB), "kithd": int(KITHD_SIZE * MB)}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
