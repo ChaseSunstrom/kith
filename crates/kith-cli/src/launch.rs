@@ -4,6 +4,7 @@
 //! is an apply of a Job (or, with `-d`, a Workload of one replica), and `ps` reads the
 //! `status.containers` that kithd writes for every Workload, NodeWorkload and Job.
 
+use kith_api::store::Action;
 use super::{Backend, DEFAULT_NAMESPACE, Resource, escape, fail, print_table, stream_logs};
 use clap::Args;
 use serde_json::{Value, json};
@@ -13,6 +14,7 @@ use std::process::ExitCode;
 pub struct Launch {
     /// The image to run
     image: String,
+    /// The namespace of the Job or Workload
     #[arg(short, long, default_value = DEFAULT_NAMESPACE)]
     namespace: String,
     /// The resource's name [default: the image's name and the first number free]
@@ -93,13 +95,14 @@ fn resource(l: &Launch, kind: &str, name: &str) -> Result<Resource, String> {
 }
 
 /// `NAME` if it was given and is free, or the first `BASE-N` that is.
-fn free_name(backend: &Backend, kind: &str, l: &Launch) -> Result<String, String> {
-    let taken: Vec<String> = backend
+fn free_name(backend: &Backend, kind: &str, l: &Launch, lost: &[String]) -> Result<String, String> {
+    let mut taken: Vec<String> = backend
         .list(Some(kind))?
         .into_iter()
         .filter(|r| r.metadata.namespace.as_deref() == Some(l.namespace.as_str()))
         .map(|r| r.metadata.name)
         .collect();
+    taken.extend_from_slice(lost);
     if let Some(name) = &l.name {
         return match taken.contains(name) {
             true => {
@@ -123,22 +126,37 @@ fn free_name(backend: &Backend, kind: &str, l: &Launch) -> Result<String, String
     Ok(format!("{base}-{}", number.expect("an endless range")))
 }
 
+/// Apply a new resource under a free name. An apply is an upsert, so when it did not create (a
+/// concurrent launch took the name between the listing and the apply) the next free name is tried;
+/// a `--name` that lost the race is refused.
+/// ponytail: the loser's apply has already written its own spec over the winner's; a create-only
+/// apply would close that, and kithd has none.
+fn apply_new(backend: &Backend, kind: &str, l: &Launch) -> Result<Resource, String> {
+    let mut lost = Vec::new();
+    loop {
+        let name = free_name(backend, kind, l, &lost)?;
+        let changes = backend.apply(vec![resource(l, kind, &name)?], false)?;
+        match changes.into_iter().next() {
+            Some(c) if c.action == Action::Created => return Ok(c.after),
+            _ if l.name.is_some() || lost.len() >= 20 => {
+                return fail(format!("{kind}/{}/{name} was taken meanwhile: pick another --name", l.namespace));
+            }
+            _ => lost.push(name),
+        }
+    }
+}
+
 pub fn launch(l: Launch, backend: &Backend) -> Result<ExitCode, String> {
     if l.detach {
-        let name = free_name(backend, "Workload", &l)?;
-        for change in backend.apply(vec![resource(&l, "Workload", &name)?], false)? {
-            println!("{} created: `kith ps -n {}` shows it", change.after.key(), l.namespace);
-        }
+        let made = apply_new(backend, "Workload", &l)?;
+        println!("{} created: `kith ps -n {}` shows it", made.key(), l.namespace);
         return Ok(ExitCode::SUCCESS);
     }
     // (Before anything is made: the output of a Job is kithd's to give.)
     let Backend::Daemon(kithd) = backend else {
         return fail("a launch in front follows kithd's logs: use -d, or leave out --store");
     };
-    let name = free_name(backend, "Job", &l)?;
-    let job = resource(&l, "Job", &name)?;
-    let key = job.key();
-    backend.apply(vec![job], false)?;
+    let key = apply_new(backend, "Job", &l)?.key();
     let path = format!("/v1/logs/{}?replica=0&unit=main", escape(&key));
     if !stream_logs(kithd, &path, None, true, &mut std::io::stdout())? {
         eprintln!("{key} goes on: `kith logs {} -f` follows it", key.replacen('/', " ", 1));
@@ -147,13 +165,16 @@ pub fn launch(l: Launch, backend: &Backend) -> Result<ExitCode, String> {
     // The logs end when the Job does (kithd says no more may come), so its state is final and
     // its stderr is whole: it is read after the output, not interleaved with it.
     // ponytail: a failed command's error comes after its output; interleave if that ever misleads.
-    stream_logs(
+    // (The Job is over: a failed read of its stderr must not lose its exit code.)
+    if let Err(e) = stream_logs(
         kithd,
         &format!("{path}&stderr=true"),
         None,
         false,
         &mut std::io::stderr(),
-    )?;
+    ) {
+        eprintln!("{key}: its error output could not be read: {e}");
+    }
     let status = backend.get(&key)?.status.unwrap_or_default();
     let code = job_code(&status);
     match (status["state"].as_str(), code) {
@@ -192,7 +213,7 @@ fn job_code(status: &Value) -> Option<i64> {
 }
 
 /// One row per unit of each Workload, NodeWorkload and Job: where it runs, its state, how it
-/// ended, what it runs, and how long ago its resource was first applied.
+/// ended, what it runs, and the age of its resource (since the oldest revision kithd keeps).
 pub fn ps(p: &Ps, backend: &Backend) -> Result<(), String> {
     let mut rows = Vec::new();
     for kind in ["Workload", "NodeWorkload", "Job"] {
@@ -251,11 +272,14 @@ fn unit_rows(r: &Resource, backend: &Backend) -> Vec<[String; 9]> {
     };
     let status = r.status.clone().unwrap_or_default();
     let units = status["containers"].as_array().cloned().unwrap_or_default();
-    let age = backend
-        .history(&r.key())
-        .ok()
-        .and_then(|h| h.iter().map(|rev| rev.at).min())
-        .map_or("-".into(), age);
+    // (The oldest revision kithd keeps, at most 100: not always when it was first applied.)
+    let age = match backend.history(&r.key()) {
+        Ok(h) => h.iter().map(|rev| rev.at).min().map_or("-".into(), age),
+        Err(e) => {
+            eprintln!("{}: its age is unknown: {e}", r.key());
+            "-".into()
+        }
+    };
     let text = |v: &Value| v.as_str().map_or_else(|| v.to_string(), str::to_string);
     let cell = |v: &Value| if v.is_null() { "-".to_string() } else { plain(&text(v)) };
     let row = |name: String, unit: String, node: String, state: String, exit: String| {

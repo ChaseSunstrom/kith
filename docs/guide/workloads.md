@@ -33,7 +33,7 @@ directory is refused.
   applies a `Job` (no retries, never restarted), follows its logs and exits with the container's
   exit code; `-d` applies a one-replica `Workload` instead and returns. The name is the image's
   and the first number free (`alpine-1`). `kith ps [-n NS | -A]` lists every Workload replica,
-  Job run and exec unit with its node, state, exit code, image or command and age, from the
+  Job run and exec unit with its node, state, exit code, image or command and age (the resource's, since the oldest revision kithd keeps), from the
   `status.containers` kithd writes. A finished Job has no units there: its row shows the code
   only when kithd's message for it names one (`exited with code 3`), and `0` once it succeeded;
   `kith launch` exits with that code, or 1 when a failed Job names none. A failed command's
