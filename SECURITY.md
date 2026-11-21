@@ -315,9 +315,7 @@ Only the newest version is fixed. There are no security releases of older ones.
   with the sender's signature: the node that runs the replica checks the signature, the named
   caller and the `exec` right on that node, from its own copy of the Roles, before it enters
   the pod or opens a connection. A pod not yet made on its node is refused, never answered by
-  the host's own ports. The `exec` right on a NodeWorkload opens nothing:
-  a NodeWorkload's pod runs on the host, not in a container, so `exec`, `cp` and `port-forward`
-  into it are refused (501), and `kith run` is the way onto its node.
+  the host's own ports.
 - **What a resource makes for itself is asked for with it.** Whoever writes a CronJob
   must be allowed to write a Job, and whoever writes a claim that says `provision`
   (every PersistentVolumeClaim does, unless it names no storage class) a Volume.
