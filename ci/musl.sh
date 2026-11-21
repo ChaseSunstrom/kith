@@ -57,7 +57,8 @@ out="$dir/$target/release"
 # the default kith, which the size budget weighs; the default build after it leaves kith as it was.
 # Only when KITH_MUSL_REMOTE=1, which the budgets script sets: the other callers want kith alone.
 if [ "${KITH_MUSL_REMOTE:-}" = 1 ]; then
-    cargo build --release --quiet --target "$target" -p kith-cli --features remote >&2
+    # (docker: `kith docker serve`, the Docker Engine API front, T-1205: here and not in the default kith.)
+    cargo build --release --quiet --target "$target" -p kith-cli --features remote,docker >&2
     cp "$out/kith" "$out/kith-remote"
 fi
 cargo build --release --quiet --target "$target" -p kithd -p kith-cli >&2

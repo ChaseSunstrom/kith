@@ -1328,6 +1328,7 @@ dependencies = [
  "clap",
  "kith-api",
  "kith-dm-sys",
+ "kith-docker",
  "kith-kube",
  "kith-lang",
  "kith-packages",
@@ -1352,6 +1353,14 @@ name = "kith-dns"
 version = "1.0.0"
 dependencies = [
  "tokio",
+]
+
+[[package]]
+name = "kith-docker"
+version = "1.0.0"
+dependencies = [
+ "ring",
+ "serde_json",
 ]
 
 [[package]]
