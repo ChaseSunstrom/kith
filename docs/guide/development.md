@@ -117,10 +117,44 @@ budget.
 
 | Time | On the CI runner: the median of five, on three runs on main | Budget |
 |---|---|---|
-| apply to a running container | 85.3, 88.1, 78.3 ms | 180 ms |
+| apply to a running container | 85.3, 88.1, 78.3 ms (before T-1207; not retaken since) | 160 ms |
 | a status change reaching a second kithd | 4.7, 4.8, 4.8 ms | 10 ms |
 | one DNS answer from kithd | 2.9, 3.1, 3.5 ms | 7 ms |
 | boot to ready | 2.5 to 3.7 s to `kithd` answering, in a VM (`boot` in [ci/compare.txt](../../ci/compare.txt)) | not budgeted: no VM runs in CI |
+
+Where the apply to a running container goes: `python3 ci/budgets.py --phases` starts a kithd with
+`KITH_TIMELINE` set (off otherwise: no mark is written), applies a Workload whose image is on the
+node 20 times, and prints the median of each phase, the time since the mark before it. Each mark
+is a line `kith-timeline NAME NANOS` (CLOCK_MONOTONIC) on kithd's log. On the dev PC (16 CPUs,
+load 6.4, the median of 20):
+
+| Step | Time |
+|---|---|
+| the CLI and the request reaching the handler | 5.8 ms |
+| store write (a raft commit, one fsync) | 7.7 ms |
+| schedule (the controller wakes, begins the start) | 0.5 ms |
+| the unit made ready, its image reference parsed (waits for the regex compile, below) | 28.4 ms |
+| the image found on the node | 0.2 ms |
+| runtime create: the bundle and spec written and synced (two fsyncs) | 10.4 ms |
+| fork of the build helper | 0.4 ms |
+| clone3, cgroup and mounts (libcontainer's build in the forked helper; its steps cannot be marked from outside, so one phase) | 15.1 ms |
+| the parent collecting the helper, the container loaded, its cgroup set | 5.1 ms |
+| start (the init process released) | 0.6 ms |
+| its status committed (a second raft commit) | 7.8 ms |
+| `kith get` polling (every 5 ms) seeing it | 0.6 ms |
+| total | 83.6 ms (90.5 ms before T-1207, the same load) |
+
+The largest phase is not the runtime's: oci-spec compiles a large regex at the first image
+reference it parses, about 35 ms and 8 MB of heap, and a kithd paid it at its first start.
+`kith_runtime::warm_reference` now parses one on a thread of its own when a Workload,
+NodeWorkload or Job is applied, so the compile overlaps the store write; most of it is still
+waited for. Parsing at start-up hid all of it (150 to 64 ms at load 29) but took kithd's idle
+RSS from 5.4 to 16.2 MB, over its 9 MB budget, so it was not kept. What is left is mostly disk
+and the kernel: four fsyncs (two raft commits, and two for the spec, which stay: a config.json
+torn by a power cut gives no range to any container) and libcontainer's build. The goal is
+under 20 ms on a quiet run; it was not reached or measurable here (the quietest load was 6). The
+160 ms budget is twice the CI median expected after the change (about 81 ms, from the dev PC's
+ratio, not three CI medians): retake three on main and tighten it (T-0269).
 
 Release binaries are static musl builds: `ring` (C) needs `musl-tools` (Debian/Ubuntu) or
 `CC_x86_64_unknown_linux_musl` set to a `zig cc -target x86_64-linux-musl` wrapper.

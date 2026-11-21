@@ -908,6 +908,7 @@ impl Runtime {
         stderr: File,
         refused: &AtomicBool,
     ) -> Result<Handle> {
+        crate::timeline::mark("create");
         let what = format!("creating container `{id}`");
         let bundle = self.root.join("containers").join(id);
         let cgroup = format!("{}/kith-{id}", self.cgroup_parent);
@@ -1007,9 +1008,12 @@ impl Runtime {
             // it, on the disk, and renamed, so `take_range` never reads half of one.)
             let new = bundle.join("config.json.new");
             spec.save(&new).ctx(&what)?;
+            // (Both fsyncs stay for every container, T-1207: a config.json torn by a power cut
+            // gives no range to any container, `take_range`, whether or not its own names one.)
             File::open(&new).and_then(|file| file.sync_all()).ctx(&what)?;
             fs::rename(&new, bundle.join("config.json")).ctx(&what)?;
             File::open(&bundle).and_then(|dir| dir.sync_all()).ctx(&what)?;
+            crate::timeline::mark("spec");
             if let Some(base) = shift {
                 stage(image, unit, &bundle, base).ctx(format!("{what}: mounting its image and volumes id-mapped"))?;
             } else if staged_held {
@@ -1042,7 +1046,9 @@ impl Runtime {
                 let (forked, _awaited) = spawn_awaited(
                     || {
                         kith_dm_sys::fork_start(|| {
+                            crate::timeline::mark("fork");
                             let built = logged_build(dispatch, &log, refused, || builder.build());
+                            crate::timeline::mark("built");
                             // First byte: 0 made, 1 failed, 2 failed for the kernel's refusal of the overlay.
                             let mut said = vec![match (&built, refused.load(Ordering::Relaxed)) {
                                 (Ok(_), _) => 0,
@@ -1069,6 +1075,7 @@ impl Runtime {
                 }
                 None => return err(format!("{what}: the process making it ended before it said how")),
             }
+            crate::timeline::mark("collected");
             let container = Container::load(state.clone()).ctx(&what)?;
             match container.pid() {
                 Some(pid) => Ok((container, pid)),
@@ -1111,7 +1118,10 @@ impl Runtime {
             return Err(e).ctx(&what);
         }
         match handle.no_swap(unit, &what) {
-            Ok(()) => Ok(handle),
+            Ok(()) => {
+                crate::timeline::mark("made");
+                Ok(handle)
+            }
             Err(e) => {
                 handle.discard(&state);
                 Err(e)
@@ -1786,7 +1796,10 @@ impl Handle {
         match &mut self.container {
             Some(container) => {
                 let _cwd = CWD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                container.start().ctx("starting the container")
+                crate::timeline::mark("go");
+                let started = container.start().ctx("starting the container");
+                crate::timeline::mark("running");
+                started
             }
             None => {
                 let go = self.go.take().ok_or(crate::Error("it was started before".into()))?;

@@ -2269,6 +2269,7 @@ impl Controller {
                             return Ok(handle);
                         }
                         let project = given.transpose()?;
+                        kith_runtime::timeline::mark("start");
                         start(shared, &self.runtime, &self.logs, mesh, id, slot, project).await
                     } => started,
                     // A pull can take minutes; shutting down does not wait for it.
@@ -2478,6 +2479,7 @@ impl Controller {
                     if let Err(e) = shared.submit(report).await {
                         eprintln!("kithd: saving status: {e}");
                     }
+                    kith_runtime::timeline::mark("status");
                 }
             }));
         }
@@ -3496,11 +3498,13 @@ async fn start(
                         .map_err(|e| e.to_string())?
                 })
             };
+            kith_runtime::timeline::mark("pull");
             let image = runtime
                 .images
                 .pull_with(&c.image, policy, &signed_by, &unpack)
                 .await
                 .map_err(|e| e.to_string())?;
+            kith_runtime::timeline::mark("image");
             let (out, err) = (log("out")?, log("err")?);
             let created = root.create(crate::root_part::Create {
                 id,
@@ -3626,6 +3630,14 @@ fn signers(rules: &[(String, Vec<String>)], image: &str, template: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The timeline's shape (`ci/budgets.py --phases` reads it), and a mark off by default.
+    #[test]
+    fn timeline_line_names_the_mark_and_its_monotonic_nanos() {
+        assert_eq!(kith_runtime::timeline::line("api", 5), "kith-timeline api 5\n");
+        // Off (KITH_TIMELINE unset in the tests), a mark writes nothing and does not panic.
+        kith_runtime::timeline::mark("api");
+    }
 
     #[test]
     fn a_look_is_kept_for_its_time_and_made_again_after() {

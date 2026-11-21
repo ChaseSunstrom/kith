@@ -24,7 +24,7 @@ tar = { version = "0.4", default-features = false }
 flate2 = "1"
 serde.workspace = true
 serde_json.workspace = true
-nix = { version = "0.29", features = ["process", "user", "signal", "sched", "fs", "mount"] }
+nix = { version = "0.29", features = ["process", "user", "signal", "sched", "fs", "mount", "time"] }
 # Already in the tree through libcontainer.
 caps = "0.5"
 # What a container's init process logs at error level, read back when its create fails (see

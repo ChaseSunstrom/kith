@@ -138,6 +138,18 @@ pub fn sha256_hex(digest: &str) -> Result<&str> {
     }
 }
 
+/// Parse one image reference on a thread of its own, once per process: oci-spec compiles the
+/// regex of a reference at the first it parses, 40 to 60 ms of the first container start
+/// (T-1207). Asked when a resource that runs containers is applied, not at start-up: a kithd
+/// that never runs one keeps the memory (kithd idle is budgeted). A refused thread is no
+/// failure: the first start then pays the compile, as before.
+pub fn warm_reference() {
+    static WARM: std::sync::Once = std::sync::Once::new();
+    WARM.call_once(|| {
+        let _ = std::thread::Builder::new().spawn(|| drop("local.test/warm:1".parse::<Reference>()));
+    });
+}
+
 /// A lock file (`images/.lock`, the index's `.lock`), unlocked before it is closed. The lock
 /// belongs to the open file, not to this descriptor: a child forked meanwhile (a container's
 /// start) holds a copy until it execs, and closing ours alone would leave the lock held for as
