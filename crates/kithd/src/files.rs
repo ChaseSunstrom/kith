@@ -183,7 +183,7 @@ mod tests {
             concat!(module_path!(), "::a_deep_chain_in_a_gone_replicas_files_is_freed"),
             || {
                 let base = std::env::temp_dir().join(format!("kith-files-deep-{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&base);
+                let _ = crate::controller::storage::remove_tree(&base, &|| false);
                 for replica in ["w_default_web_0", "w_default_web_1"] {
                     let made = scratch(&base, replica, "cache").unwrap();
                     crate::controller::storage::tests::chain(&made, 2000);
@@ -196,8 +196,9 @@ mod tests {
                     .collect();
                 let kept =
                     crate::controller::storage::tests::deep(&base.join(REPLICAS).join("w_default_web_1/scratch/cache"));
-                let _ = std::fs::remove_dir_all(&base);
-                assert_eq!(left, ["w_default_web_1"], "{left:?}");
+                let _ = crate::controller::storage::remove_tree(&base, &|| false);
+                assert!(!base.exists(), "{} is left behind", base.display());
+                assert_eq!(left,["w_default_web_1"], "{left:?}");
                 assert_eq!(kept, 2000);
             },
         );
