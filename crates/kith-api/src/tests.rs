@@ -26,6 +26,8 @@ fn passed_on_is_one_list_for_the_nodes_and_the_cli() {
     assert!(passed_on("POST", "/v1/apply"));
     assert!(passed_on("DELETE", "/v1/resources/ConfigMap/default/gone"));
     assert!(passed_on("POST", "/v1/rollback/ConfigMap/default/gone?to=1"));
+    // A node's lock record, written for whoever asked it (T-1138: its encryption).
+    assert!(passed_on("POST", "/v1/lock/n1/encrypt"));
     // Not these: a node's own reads, and the same routes by another method.
     assert!(!passed_on("GET", "/v1/cluster"));
     assert!(!passed_on("GET", "/v1/resources?namespace=default"));
