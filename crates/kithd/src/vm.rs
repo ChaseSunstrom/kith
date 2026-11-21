@@ -9,8 +9,15 @@
 //
 // ponytail: kithd does not bind a device to vfio-pci (the node's owner does, on the kernel's
 // command line: `vfio-pci.ids=`); a machine reaches out through the hypervisor's own NAT
-// under QEMU and has no network under cloud-hypervisor; a disk is a raw image at a path on
-// the node, not a Volume; x86-64 and arm64 machine types only. Each is left for later.
+// under QEMU and has no network under cloud-hypervisor; a disk is a raw image, at a path on
+// the node or in a Volume's directory on the node that has the Volume ([`resolve`]); x86-64
+// and arm64 machine types only. Each is left for later.
+//
+// ponytail: a disk in a Volume is opened by the hypervisor by name, after kithd checked it is a
+// regular file ([`make_images`]): a container that mounts the same Volume could swap it for a
+// link in between. Keep a Volume that holds a disk mounted by no container, and run the machine
+// as one replica (two would write one image). Open it by descriptor (QEMU's `fd=` protocol,
+// cloud-hypervisor's `fd=`) when a Volume is shared with anything else.
 //
 // A template that is `confidential` runs its machines with their memory encrypted by the
 // processor (AMD SEV-SNP or Intel TDX), where the node has one of the two; nothing of it
@@ -20,7 +27,9 @@
 // here; the scheduler does not know which nodes have one (a `placement` says), and nobody
 // outside is shown the guest's measurement (attestation). Those are next.
 
-use kith_api::kinds::{ExecUnit, Hypervisor, VmUnit};
+use crate::volumes::Dir;
+use kith_api::kinds::{ExecUnit, Hypervisor, VmDisk, VmUnit};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Where the kernel lists PCI devices, and a Device that is one has its path.
@@ -81,8 +90,107 @@ pub fn confidential(asked: Option<bool>, guard: Option<Guard>) -> Result<Option<
     }
 }
 
+/// An image a machine's disk is, in a Volume's directory: made once, if the file is not there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Image {
+    pub dir: Dir,
+    pub file: String,
+    /// Its size in bytes (the file is sparse).
+    pub size: u64,
+}
+
+/// `vm` with each disk that names a Volume given the path of its file on this node (in the
+/// directory of the Volume among `volumes`, the Volumes this node holds for the workload, by
+/// the name the disk gives), and the images that are to be there before it starts. Nothing is
+/// made here: a replica that never starts leaves nothing behind. A Volume this node does not
+/// hold is why the machine does not run here.
+pub fn resolve(
+    vm: &VmUnit,
+    state: &Path,
+    me: &str,
+    volumes: &BTreeMap<String, Dir>,
+) -> Result<(VmUnit, Vec<Image>), String> {
+    // (As `host_dir` has it: the directory it makes is under the state directory as it really is.)
+    let state = state.canonicalize().unwrap_or_else(|_| state.to_path_buf());
+    let (mut placed, mut images) = (vm.clone(), Vec::new());
+    for disk in &mut placed.disks {
+        let Some(name) = &disk.volume else { continue };
+        let dir = volumes
+            .get(name)
+            .ok_or_else(|| format!("disks: volume {name} is not on this node"))?;
+        // (A shared Volume of another node is mounted into a container, and no file of it is a disk.)
+        if dir.node != me {
+            return Err(format!(
+                "disks: volume {name} is on node {}, not on this node",
+                dir.node
+            ));
+        }
+        let file = disk.file.clone().unwrap_or_else(|| VmDisk::FILE.into());
+        let at = crate::volumes::planned(&state, dir).join(&file);
+        // (It goes into an option of the hypervisor's: a comma would start another.)
+        let at = at
+            .to_str()
+            .filter(|at| !at.contains(',') && !at.contains(char::is_control));
+        disk.path = Some(
+            at.ok_or("disks: the Volume's directory has a comma or a control character in its path")?
+                .into(),
+        );
+        let size = disk.size.as_ref().map_or(0.0, |size| size.value()) as u64;
+        images.push(Image {
+            dir: dir.clone(),
+            file,
+            size,
+        });
+    }
+    Ok((placed, images))
+}
+
+/// Make each image that is not in its Volume's directory yet, a sparse file of its size that only
+/// kithd can read. A file that is there is left as the machine wrote it, whatever its size; one
+/// that is no regular file (a link, a directory put in its place) is refused. Blocking file I/O.
+pub fn make_images(state: &Path, images: &[Image]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    for Image { dir, file, size } in images {
+        let said = |why: &dyn std::fmt::Display| format!("volume {}: {file}: {why}", dir.name);
+        let root = crate::volumes::host_dir(state, dir).map_err(|e| format!("volume {}: {e}", dir.name))?;
+        // (Where the machine's command line says it is, and not elsewhere.)
+        let planned = crate::volumes::planned(&state.canonicalize().map_err(|e| said(&e))?, dir);
+        if root.real() != planned {
+            return Err(said(&format!(
+                "the directory is at {}, not {}",
+                root.real().display(),
+                planned.display()
+            )));
+        }
+        let at = root.held().join(file);
+        // (`create_new` is O_EXCL: it makes nothing where a link is, and does not follow one.)
+        let made = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&at);
+        match made {
+            Ok(image) => {
+                if let Err(e) = image.set_len(*size) {
+                    let _ = std::fs::remove_file(&at);
+                    return Err(said(&e));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // (Not opened: a FIFO put there would block it.)
+                if !std::fs::symlink_metadata(&at).is_ok_and(|kind| kind.is_file()) {
+                    return Err(said(&"it is not a regular file"));
+                }
+            }
+            Err(e) => return Err(said(&e)),
+        }
+    }
+    Ok(())
+}
+
 /// The hypervisor's command line for `vm`, with the PCI devices at `pci` passed through, its
 /// memory encrypted by `guard` if there is one (QEMU's options: the spec has no other then).
+/// A disk that names a Volume has its path from [`resolve`]: one that has none is left out.
 pub fn command(vm: &VmUnit, pci: &[String], guard: Option<Guard>) -> Vec<String> {
     let (cpus, bytes) = (vm.cpus.unwrap_or(1), vm.memory.value() as u64);
     let read_only = |disk: &kith_api::kinds::VmDisk| disk.read_only == Some(true);
@@ -120,9 +228,9 @@ pub fn command(vm: &VmUnit, pci: &[String], guard: Option<Guard>) -> Vec<String>
             if let Some(cmdline) = &vm.cmdline {
                 say(&["-append", cmdline]);
             }
-            for disk in &vm.disks {
+            for (disk, path) in vm.disks.iter().filter_map(|disk| Some((disk, disk.path.as_ref()?))) {
                 let ro = if read_only(disk) { ",readonly=on" } else { "" };
-                say(&["-drive", &format!("file={},format=raw,if=virtio{ro}", disk.path)]);
+                say(&["-drive", &format!("file={path},format=raw,if=virtio{ro}")]);
             }
             for address in pci {
                 say(&["-device", &format!("vfio-pci,host={address}")]);
@@ -172,9 +280,9 @@ pub fn command(vm: &VmUnit, pci: &[String], guard: Option<Guard>) -> Vec<String>
             if let Some(cmdline) = &vm.cmdline {
                 say(&["--cmdline", cmdline]);
             }
-            for disk in &vm.disks {
+            for (disk, path) in vm.disks.iter().filter_map(|disk| Some((disk, disk.path.as_ref()?))) {
                 let ro = if read_only(disk) { ",readonly=on" } else { "" };
-                say(&["--disk", &format!("path={}{ro}", disk.path)]);
+                say(&["--disk", &format!("path={path}{ro}")]);
             }
             for address in pci {
                 say(&["--device", &format!("path={}/", Path::new(PCI).join(address).display())]);
@@ -281,6 +389,80 @@ mod tests {
         assert!(has(&["--device", "path=/sys/bus/pci/devices/0000:01:00.0/"]));
         assert!(has(&["--serial", "tty", "--console", "off"]));
     }
+    /// A disk that names a Volume is a file in the Volume's directory on this node, and the
+    /// sparse image of its size is made there once: what is there is never made again, and
+    /// what is no regular file there (a link a container put in its place) is refused.
+    #[test]
+    fn vm_disk_volume_is_the_volumes_file_made_sparse_once() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let state = std::env::temp_dir().join(format!("kith-vm-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+        let state = state.canonicalize().unwrap();
+        let dir = crate::volumes::Dir {
+            namespace: "default".into(),
+            name: "home".into(),
+            path: "data".into(),
+            node: "a".into(),
+            encrypted: false,
+        };
+        let volumes = BTreeMap::from([("home".to_string(), dir)]);
+        let unit = vm(
+            json!({ "name": "vm", "firmware": "/fw/OVMF.fd", "memory": "1Gi", "disks": [
+            { "volume": "home", "size": "64Mi" },
+            { "volume": "home", "file": "scratch.img", "size": "1Mi", "readOnly": true },
+            { "path": "/var/d.raw" }] }),
+        );
+        let (placed, images) = resolve(&unit, &state, "a", &volumes).unwrap();
+        let root = state.join("volumes/default/home/data");
+        let line = command(&placed, &[], None);
+        let has = |words: &[&str]| line.windows(words.len()).any(|at| at == words);
+        assert!(has(&[
+            "-drive",
+            &format!("file={}/disk.img,format=raw,if=virtio", root.display())
+        ]));
+        assert!(has(&[
+            "-drive",
+            &format!("file={}/scratch.img,format=raw,if=virtio,readonly=on", root.display())
+        ]));
+        assert!(has(&["-drive", "file=/var/d.raw,format=raw,if=virtio"]));
+        assert_eq!(images.len(), 2, "the disk at a path is no image of the Volume's");
+        // (Planning made nothing: a directory made for a replica that never starts is left behind.)
+        assert!(!root.exists());
+
+        make_images(&state, &images).unwrap();
+        let image = root.join("disk.img");
+        let made = std::fs::metadata(&image).unwrap();
+        assert!(made.is_file() && made.len() == 64 << 20);
+        assert_eq!(made.permissions().mode() & 0o777, 0o600);
+        assert!(made.blocks() * 512 < made.len(), "sparse: {} blocks", made.blocks());
+        assert_eq!(std::fs::metadata(root.join("scratch.img")).unwrap().len(), 1 << 20);
+
+        // A second start leaves what the guest wrote, and its size, as they are.
+        std::fs::write(&image, b"guest").unwrap();
+        make_images(&state, &images).unwrap();
+        assert_eq!(std::fs::read(&image).unwrap(), b"guest");
+
+        // A link put where the image is, or a directory, is refused and nothing behind it is touched.
+        let outside = state.join("outside");
+        std::fs::write(&outside, b"mine").unwrap();
+        std::fs::remove_file(&image).unwrap();
+        std::os::unix::fs::symlink(&outside, &image).unwrap();
+        let refused = make_images(&state, &images).unwrap_err();
+        assert!(refused.contains("disk.img"), "{refused}");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"mine");
+        std::fs::remove_file(&image).unwrap();
+        std::fs::create_dir(&image).unwrap();
+        assert!(make_images(&state, &images).unwrap_err().contains("not a regular file"));
+
+        // No Volume of the name on this node: no machine here, and the reason says which.
+        let lacking = resolve(&unit, &state, "a", &BTreeMap::new()).unwrap_err();
+        assert!(lacking.contains("home") && lacking.contains("this node"), "{lacking}");
+        let elsewhere = resolve(&unit, &state, "b", &volumes).unwrap_err();
+        assert!(elsewhere.contains("on node a, not on this node"), "{elsewhere}");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
     /// A confidential template's machine is started with its memory encrypted by what the
     /// node has, and not at all on a node that has neither SEV-SNP nor TDX.
     #[test]

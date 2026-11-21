@@ -328,7 +328,9 @@ pub fn needs(template: &Template, pci: bool, node_workload: bool) -> Vec<&'stati
             .hypervisor
             .as_ref()
             .is_some_and(|h| *h != kith_api::kinds::Hypervisor::Qemu);
-        other || vm.kernel.is_some() || vm.initrd.is_some() || vm.firmware.is_some() || !vm.disks.is_empty()
+        other || vm.kernel.is_some() || vm.initrd.is_some() || vm.firmware.is_some()
+            // (A disk that is a Volume's file is no path on the node: it is in the tenant's Volume.)
+            || vm.disks.iter().any(|disk| disk.path.is_some())
     };
     let vms = !template.vms.is_empty();
     let asked = [
@@ -544,8 +546,13 @@ mod tests {
         let vm_disk =
             template(json!({ "vms": [{ "name": "a", "memory": "1Gi", "disks": [{ "path": "/var/a.raw" }] }] }));
         let vm_other = template(json!({ "vms": [{ "name": "a", "memory": "1Gi", "hypervisor": "cloudHypervisor" }] }));
+        let vm_volume = template(
+            json!({ "vms": [{ "name": "a", "memory": "1Gi", "disks": [{ "volume": "home", "size": "1Gi" }] }] }),
+        );
         let everything = Policy::default();
-        for template in [&exec, &plain, &pod, &loose, &allowed, &vm, &vm_disk, &vm_other] {
+        for template in [
+            &exec, &plain, &pod, &loose, &allowed, &vm, &vm_disk, &vm_other, &vm_volume,
+        ] {
             assert_eq!(everything.refuses(template, true, false), Vec::<String>::new());
         }
         let hardened = Policy::hardened();
@@ -567,6 +574,8 @@ mod tests {
         assert_eq!(keys(&allowed, false), ["unconfined"]);
         assert_eq!(keys(&vm, false), ["vms"]);
         assert_eq!(keys(&vm_disk, false), ["vms", "vmPaths"]);
+        // (A disk in a Volume is no path of the node's: only `vms`.)
+        assert_eq!(keys(&vm_volume, false), ["vms"]);
         assert_eq!(keys(&vm_other, true), ["vms", "vmPaths", "passthrough"]);
         // One key back on, and only its thing is run.
         let vms: Policy = "hardened,vms".parse().unwrap();

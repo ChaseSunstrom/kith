@@ -462,8 +462,14 @@ fn mount_names(owner: &Resource) -> (BTreeSet<String>, BTreeSet<String>) {
     let mounts = containers
         .filter_map(|container| container["volumeMounts"].as_array())
         .flatten();
-    let named = mounts.filter_map(|mount| Some((mount["volume"].as_str()?.to_string(), mount["perReplica"] == true)));
-    let (each, plain): (Vec<_>, Vec<_>) = named.partition(|(_, each)| *each);
+    let mut named: Vec<_> = mounts
+        .filter_map(|mount| Some((mount["volume"].as_str()?.to_string(), mount["perReplica"] == true)))
+        .collect();
+    // A VM's disk that is a Volume's file is held like a mount: the machine runs where the Volume is.
+    let vms = owner.spec["template"]["vms"].as_array().into_iter().flatten();
+    let disks = vms.filter_map(|vm| vm["disks"].as_array()).flatten();
+    named.extend(disks.filter_map(|disk| Some((disk["volume"].as_str()?.to_string(), false))));
+    let (each, plain): (Vec<_>, Vec<_>) = named.into_iter().partition(|(_, each)| *each);
     let names = |list: Vec<(String, bool)>| list.into_iter().map(|(name, _)| name).collect();
     (names(plain), names(each))
 }
@@ -756,6 +762,19 @@ impl VolumeDir {
     }
 }
 
+/// Where [`host_dir`] puts the directory of `dir`, as `state` (the state directory as it really is,
+/// canonical) has it: for a path a command line names before the directory is made.
+pub fn planned(state: &Path, dir: &Dir) -> PathBuf {
+    if dir.namespace == SYSTEM {
+        return PathBuf::from(&dir.path);
+    }
+    state
+        .join("volumes")
+        .join(&dir.namespace)
+        .join(&dir.name)
+        .join(&dir.path)
+}
+
 /// Make the directory a volume is on this node, and hold it. In `kith-system` it is the path as
 /// written; anywhere else it is `<state>/volumes/<namespace>/<name>/<path>`.
 ///
@@ -910,6 +929,67 @@ spec: { node: a, path: tiny, size: 1Gi }
             .iter()
             .map(|(name, node)| res("Volume", "default", name, &format!("{{ node: {node}, path: {name} }}")));
         [made.collect::<String>(), res("Workload", "default", "db", spec)].concat()
+    }
+
+    /// A Workload of a VM whose disks are the Volumes `volumes`, each a file the image is made in.
+    fn vm_workload(name: &str, volumes: &[&str]) -> String {
+        let disks: Vec<String> = volumes
+            .iter()
+            .map(|v| format!("{{ volume: {v}, size: 10Gi }}"))
+            .collect();
+        let spec = format!(
+            "{{ template: {{ vms: [{{ name: m, firmware: /fw/OVMF.fd, memory: 1Gi, disks: [{}] }}] }} }}",
+            disks.join(", ")
+        );
+        res("Workload", "default", name, &spec)
+    }
+
+    /// A VM whose disk is a Volume is placed where the Volume is, like a container that mounts it: a
+    /// node that does not have the Volume is not given the VM, and the reason is said. A disk
+    /// is a path or a Volume, not both.
+    #[test]
+    fn vm_disk_placement_is_the_volumes_node_and_no_other() {
+        let source = [
+            res("Volume", "default", "onb", "{ node: b, path: onb, size: 1Gi }"),
+            vm_workload("one", &["fast"]),
+            vm_workload("split", &["fast", "onb"]),
+            vm_workload("lost", &["nowhere"]),
+        ]
+        .concat();
+        let store = store(&source);
+        let found = resolve(&store);
+        let one = found.owners["Workload/default/one"].clone().unwrap();
+        assert_eq!(one.node.as_deref(), Some("a"));
+        assert_eq!(one.volumes["fast"].node, "a");
+        assert_eq!(
+            found.owners["Workload/default/split"],
+            Err("its volumes are on different nodes: a, b".into())
+        );
+        assert_eq!(
+            found.owners["Workload/default/lost"],
+            Err("there is no Volume or VolumeClaim nowhere".into())
+        );
+        // Only the Volume's node is given the VM: node b has no mount of it, and so no VM.
+        assert!(mounts(&store, "a").contains_key("Workload/default/one"));
+        assert!(!mounts(&store, "b").contains_key("Workload/default/one"));
+        // A VM and a DeviceClaim on another node do not meet.
+        let on_a = found.owners.get("Workload/default/one");
+        let device = Ok(crate::claims::Held {
+            node: "b".into(),
+            devices: vec!["b-gpu".into()],
+            seat: None,
+            shares: Default::default(),
+        });
+        assert_eq!(
+            together(Some(&device), on_a),
+            Err("its DeviceClaims are on node b but its volumes on node a".into())
+        );
+
+        // A disk with a path and a volume both is refused when it is applied.
+        let both = vm_workload("both", &["fast"]).replace("{ volume: fast,", "{ path: /d.raw, volume: fast,");
+        let docs = Resource::from_source(&both).unwrap();
+        let refused = docs.into_iter().next().unwrap().map(drop).unwrap_err().msg;
+        assert!(refused.contains("set exactly one of `path`, `volume`"), "{refused}");
     }
 
     #[test]

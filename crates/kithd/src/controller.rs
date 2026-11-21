@@ -106,6 +106,8 @@ struct Slot {
     /// What its containers mount: the Volume's directory, where in the container, and read-only
     /// (a changed one replaces the unit, as a changed value does). An exec unit mounts nothing.
     volumes: Vec<(crate::volumes::Dir, String, bool)>,
+    /// The disk images of a VM's Volumes, made where they are when it starts if they are not there.
+    images: Vec<crate::vm::Image>,
     /// The ConfigMaps and Secrets it mounts as files, as they are, or why one cannot be
     /// read. One that changes is written again where it is mounted: nothing is started over.
     //
@@ -1403,6 +1405,7 @@ impl Controller {
         let mut counts: BTreeMap<String, u32> = BTreeMap::new();
         let mut ours: BTreeSet<String> = BTreeSet::new();
         self.jobs.retain(|key, _| resources.iter().any(|r| r.key() == *key));
+        let state = self.logs.parent().unwrap_or(&self.logs).to_path_buf();
         for resource in &resources {
             let key = resource.key();
             let note = notes.entry(key.clone()).or_default();
@@ -1463,10 +1466,30 @@ impl Controller {
             let volumes = mounted.get(&key).cloned().unwrap_or_default();
             // (A ConfigMap, a Secret and a scratch are on whichever node the replica is.)
             let mut mounts = template.containers().flat_map(|c| &c.volume_mounts);
-            let mounts = mounts.any(|mount| mount.volume.is_some());
+            let mounts = mounts.any(|mount| mount.volume.is_some())
+                || template
+                    .vms
+                    .iter()
+                    .flat_map(|vm| &vm.disks)
+                    .any(|disk| disk.volume.is_some());
             let (may, said) = volume_gate(&resource.kind, mounts, mounted.contains_key(&key), me.is_some());
-            let allowed = allowed && may;
             note.extend(said.map(String::from));
+            // A VM whose disk is a Volume's file runs where the Volume is, with the path it has
+            // here: one that cannot be had is no machine of this node's (and says why).
+            let (mut vms, mut images, mut resolved) = (Vec::new(), BTreeMap::new(), true);
+            for vm in template.vms.iter().filter(|_| may) {
+                match crate::vm::resolve(vm, &state, me.unwrap_or_default(), &volumes) {
+                    Ok((vm, made)) => {
+                        images.insert(vm.name.clone(), made);
+                        vms.push(vm);
+                    }
+                    Err(why) => {
+                        note.push(format!("vm {}: {why}", vm.name));
+                        resolved = false;
+                    }
+                }
+            }
+            let allowed = allowed && may && resolved;
             // And a pod that leaves by an exit starts only with its tunnel up here (fail closed).
             let ready = template
                 .exit
@@ -1548,8 +1571,8 @@ impl Controller {
             // (A VM is the process of its hypervisor: an exec unit, with the command line made here.)
             // A confidential template on a node whose processor encrypts no guest: none of it.
             let guard = crate::vm::confidential(template.confidential, crate::vm::guard(Path::new("/sys")));
-            let vms = template
-                .vms
+            // (Where the node does not run them, `vms` is empty: a template with none of its own.)
+            let vms = vms
                 .iter()
                 .map(|vm| Run::Exec(crate::vm::exec(vm, &devices, guard.clone().ok().flatten())));
             let mut units: Vec<Run> = containers
@@ -1679,6 +1702,10 @@ impl Controller {
                             dmem: dmem.clone(),
                             seat: seat.clone(),
                             volumes: mounts_of(unit, &volumes, replica),
+                            images: match unit {
+                                Run::Exec(e) => images.get(&e.name).cloned().unwrap_or_default(),
+                                Run::Container(_) => Vec::new(),
+                            },
                             files: files.clone(),
                             init: at < inits,
                             after: at.min(inits) as u32,
@@ -3282,6 +3309,14 @@ async fn start(
     // logs', parent), now and not when planned: a directory made for a replica that never starts
     // would be left behind.
     let state = logs.parent().unwrap_or(logs);
+    // (A VM's disk images the same: made where its Volume is, once, at the start that needs them.)
+    if !slot.images.is_empty() {
+        let (state, images) = (state.to_path_buf(), slot.images.clone());
+        tokio::task::spawn_blocking(move || crate::vm::make_images(&state, &images))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|made| made)?;
+    }
     for (dir, at, read_only) in &slot.volumes {
         // (Only a shared volume of another node ever gets here: `volumes::mounts`.)
         let taken = match mesh.filter(|(_, me)| *me != dir.node) {
@@ -3986,6 +4021,7 @@ mod tests {
             dmem: Vec::new(),
             seat: None,
             volumes: Vec::new(),
+            images: Vec::new(),
             files: Ok(Vec::new()),
             init: false,
             after: 0,

@@ -571,9 +571,22 @@ spec! {
 
     pub enum Hypervisor { Qemu, CloudHypervisor }
 
+    /// Exactly one of `path` or `volume`.
     pub struct VmDisk {
         /// A raw disk image on the node, by absolute path.
-        pub path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub path: Option<String>,
+        /// A Volume (or a VolumeClaim's) that holds the image `file`, so that it is kept on
+        /// the Volume's replicas and goes with it when the Volume's node changes: the machine
+        /// runs where the Volume is. Needs `size`; one replica of a Workload at most.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub volume: Option<String>,
+        /// The image's name inside the Volume [default: disk.img].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub file: Option<String>,
+        /// How big the image is made, sparse, when `file` is not in the Volume yet.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub size: Option<Quantity>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub read_only: Option<bool>,
     }
@@ -2097,7 +2110,13 @@ impl VmUnit {
         let paths = paths
             .into_iter()
             .filter_map(|(field, path)| Some((field, path.as_deref()?)));
-        let disks = self.disks.iter().map(|disk| ("disks", disk.path.as_str()));
+        let disks = self
+            .disks
+            .iter()
+            .filter_map(|disk| Some(("disks", disk.path.as_deref()?)));
+        for disk in &self.disks {
+            disk.check()?;
+        }
         for (field, path) in paths.chain(disks) {
             if !path.starts_with('/') || path.contains(',') || path.chars().any(char::is_control) {
                 return Err(format!(
@@ -2119,6 +2138,43 @@ impl VmUnit {
             return Err("memory: at least 16Mi".into());
         }
         Ok(())
+    }
+}
+
+impl VmDisk {
+    /// The image's name in its Volume when `file` is not said.
+    pub const FILE: &'static str = "disk.img";
+
+    fn check(&self) -> Result<(), String> {
+        exactly_one(
+            "disks",
+            &[("path", self.path.is_some()), ("volume", self.volume.is_some())],
+        )?;
+        let Some(volume) = &self.volume else {
+            return match (&self.file, &self.size) {
+                (None, None) => Ok(()),
+                _ => Err("disks: `file` and `size` are a `volume`'s".into()),
+            };
+        };
+        crate::check_name(volume).map_err(|e| format!("disks: volume: {e}"))?;
+        let file = self.file.as_deref().unwrap_or(Self::FILE);
+        // (One name in the Volume's directory, and a comma ends a value in a hypervisor's options.)
+        let plain = !matches!(file, "" | "." | "..")
+            && file.len() <= 255
+            && !file.contains(|c: char| c == '/' || c == ',' || c.is_control());
+        if !plain {
+            return Err(format!(
+                "disks: file: `{file}` must be one name, with no `/`, no comma and no control character"
+            ));
+        }
+        match &self.size {
+            // (At most 1024Ti: the image is sparse, but `ftruncate` has a limit and a typo is not a disk.)
+            Some(size) if size.value() >= 1_048_576.0 && size.value() <= 1_125_899_906_842_624.0 => Ok(()),
+            _ => Err(
+                "disks: size: a `volume` disk needs a size from 1Mi to 1024Ti (the image is made that big, sparse)"
+                    .into(),
+            ),
+        }
     }
 }
 
