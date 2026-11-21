@@ -309,8 +309,9 @@ fn a_silent_daemon_times_out() {
 }
 
 /// `kith node encrypt` against a stand-in kithd on a socket: it asks the route the node serves, the
-/// recovery key it is given reaches stdout once and nothing else (stderr, and what the stand-in
-/// was sent, are searched), and `--cancel` asks the same route with the cancel flag and shows no key.
+/// recovery key it is given reaches stdout once and not stderr, and `--cancel` asks the same route
+/// with the cancel flag and shows no key. (That kithd's own output holds no key is
+/// `crypt::encrypt_verb` in kithd: its audit log is searched there.)
 #[test]
 fn node_encrypt_asks_its_route_and_shows_the_recovery_key_once() {
     use std::io::{Read, Write};

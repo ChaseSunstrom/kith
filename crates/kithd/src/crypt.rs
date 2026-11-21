@@ -785,17 +785,13 @@ fn sealed_record(key: &[u8; 64], secret: &[u8; 32], recovery: &[u8; 16]) -> Reco
 
 /// Whether a plain node's state may be encrypted in place now: not in the installer, drained,
 /// with no lock record yet and no marker (or pass) already put.
-fn may_encrypt(config: &Path, drained: bool, installing: bool, name: &str) -> Result<(), String> {
+fn may_encrypt(config: &Path, drained: Result<(), String>, installing: bool, name: &str) -> Result<(), String> {
     if installing {
         return Err(format!(
             "{name} is in its installer: its state is encrypted by the install"
         ));
     }
-    if !drained {
-        return Err(format!(
-            "drain {name} first: its state is encrypted with nothing running on it"
-        ));
-    }
+    drained?;
     if Record::read(config)?.is_some() {
         return Err(format!("{name} is already encrypted"));
     }
@@ -810,12 +806,21 @@ fn may_encrypt(config: &Path, drained: bool, installing: bool, name: &str) -> Re
 /// Write a lock record under a new key on the config partition `config`, then put the marker that
 /// the next start encrypts the state under it. A marker that cannot be put takes the record back:
 /// a record over a state that is not marked would have the next start open it under a key the
-/// state is not under. Says the recovery key, once.
+/// state is not under. Says the recovery key, once: so the record is `seen` (the key is shown to
+/// the asker, as `renewed` does), and the cluster does not warn that nobody was shown one.
+///
+/// A power cut between the two writes leaves a record and no marker: the next start finds a lock
+/// record over a state that is still plain, which `open` names (`plain_under_a_record`) and stops
+/// at, with the record and the state as they are. `kith node encrypt` cannot be asked of a node
+/// that is down: that start is mended from its disk (the record's lines taken out), not by a verb.
 fn begin_encrypt(config: &Path) -> Result<String, String> {
     let (key, secret, recovery) = draw();
     let disk = File::options().read(true).write(true).open(config);
     let disk = disk.map_err(|e| format!("opening the config partition: {e}"))?;
-    let record = sealed_record(&key, &secret, &recovery);
+    let record = Record {
+        seen: true,
+        ..sealed_record(&key, &secret, &recovery)
+    };
     let put = record
         .write(&disk, AT)
         .and_then(|()| crate::in_place::mark(&disk).map_err(|e| format!("putting the marker down: {e}")));
@@ -864,30 +869,61 @@ pub async fn encrypt(
     Named(name): Named<String>,
     Json(asked): Json<Encrypt>,
 ) -> Response {
+    let config = || crate::init::labelled("config");
+    let installing = || {
+        let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        crate::init::options(&line).0.install.is_some()
+    };
+    encrypt_by(&shared, &caller, &name, asked.cancel, &config, &installing).await
+}
+
+/// [`encrypt`], with where this node's config partition is and whether it is in its installer
+/// given, so a test can say both.
+async fn encrypt_by(
+    shared: &Arc<Shared>,
+    caller: &Caller,
+    name: &str,
+    cancel: bool,
+    config: &(dyn Fn() -> Option<PathBuf> + Sync),
+    installing: &(dyn Fn() -> bool + Sync),
+) -> Response {
     let kind = |_: &_| vec![("NodeKey".to_string(), None)];
-    if let Err(refused) = crate::api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, kind) {
+    if let Err(refused) = crate::api::permit(shared, caller, kith_api::kinds::Verb::Apply, kind) {
         return crate::cluster::no_store(refused.into_response());
     }
     let done: Result<Value, String> = async {
         let cluster = shared.cluster.as_ref();
-        let cluster = cluster.ok_or("this node is in no cluster: its state is its own to encrypt")?;
+        let cluster = cluster.ok_or(
+            "this node is in no cluster: `kith node encrypt` needs one, for the drain it requires and to keep the node's key after",
+        )?;
         if name != cluster.me.name {
-            return at_node(&shared, &caller, &name, "encrypt", json!({ "cancel": asked.cancel })).await;
+            return at_node(shared, caller, name, "encrypt", json!({ "cancel": cancel })).await;
         }
-        let config = crate::init::labelled("config").ok_or("no partition is labelled config")?;
+        let config = config().ok_or("no partition is labelled config")?;
         let _one = ENCRYPTING.lock().unwrap_or_else(|e| e.into_inner());
-        if asked.cancel {
+        if cancel {
             cancel_encrypt(&config)?;
             return Ok(json!({ "node": name, "cancelled": true }));
         }
+        // (Drained is the drain record, and nothing left on the node that the scheduler would move
+        // off it: what is still stopping is not to be cut by a restart.)
         let drained = {
             let state = shared.store.lock().expect("a handler panicked holding the store");
             let node = state.store.get(&format!("Node/{name}"));
-            node.is_some_and(|node| crate::sched::has_record(&node.spec, kith_sched::DRAIN))
+            if node.is_some_and(|node| crate::sched::has_record(&node.spec, kith_sched::DRAIN)) {
+                let seen = crate::sched::seen_at(shared, std::time::Instant::now());
+                let left = crate::sched::drain_lines(&state.store, &seen, shared.lost_after, name).len();
+                match left {
+                    0 => Ok(()),
+                    left => Err(format!(
+                        "{name} still runs {left} thing(s): wait until `kith node drain {name}` shows nothing left on it"
+                    )),
+                }
+            } else {
+                Err(format!("drain {name} first: its state is encrypted with nothing running on it"))
+            }
         };
-        let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-        let installing = crate::init::options(&line).0.install.is_some();
-        may_encrypt(&config, drained, installing, &name)?;
+        may_encrypt(&config, drained, installing(), name)?;
         let recovery = begin_encrypt(&config)?;
         // (The restart comes after this answer: the next start is what encrypts the state.)
         let stop = shared.clone();
@@ -1603,9 +1639,29 @@ pub async fn open(record: &Record, config: &Path, join: Option<&String>) -> Resu
     };
     let mapped = kith_dm_sys::crypt("kith-state", &device, 0, sectors, &key);
     let mapped = mapped.map_err(|e| format!("opening {} under its key: {e}", device.display()))?;
+    if plain_under_a_record(&device, &mapped) {
+        eprintln!(
+            "kithd: init: this node has a lock record and its state is not encrypted, and no marker asks for an encryption: a `kith node encrypt` was cut by a power loss between writing the record and the marker. The state is untouched; the lock record on the config partition is what to take away (or put the marker down) to start this node"
+        );
+        init::end(true)
+    }
     drop(opened(&mapped));
     init::mount_state(&mapped);
     Ok((key, by))
+}
+
+/// Whether `path` holds an ext4 at its start (the magic is at byte 1080).
+fn ext4_at(path: &Path) -> bool {
+    let mut magic = [0; 2];
+    File::open(path)
+        .and_then(|file| file.read_exact_at(&mut magic, 1080))
+        .is_ok_and(|()| magic == [0x53, 0xef])
+}
+
+/// Whether the state on `device` is a plain file system while `mapped` (the same under the
+/// record's key) is not one: a lock record written for an encryption whose marker never was.
+fn plain_under_a_record(device: &Path, mapped: &Path) -> bool {
+    ext4_at(device) && !ext4_at(mapped)
 }
 
 /// `record` with a new recovery key for the state `opened` is the key of, and the key as
@@ -5692,27 +5748,197 @@ mod encrypt_verb {
     #[test]
     fn a_node_in_the_installer_or_not_drained_or_already_marked_or_encrypted_is_refused() {
         let path = config("refuse", 8 << 20);
-        assert_eq!(may_encrypt(&path, true, false, "a"), Ok(()));
-        assert!(may_encrypt(&path, true, true, "a").unwrap_err().contains("installer"));
+        assert_eq!(may_encrypt(&path, Ok(()), false, "a"), Ok(()));
+        assert!(may_encrypt(&path, Ok(()), true, "a").unwrap_err().contains("installer"));
+        let not = Err("drain a first".to_string());
         assert!(
-            may_encrypt(&path, false, false, "a")
+            may_encrypt(&path, not, false, "a")
                 .unwrap_err()
                 .contains("drain a first")
         );
         let disk = File::options().read(true).write(true).open(&path).unwrap();
         crate::in_place::mark(&disk).unwrap();
         assert!(
-            may_encrypt(&path, true, false, "a")
+            may_encrypt(&path, Ok(()), false, "a")
                 .unwrap_err()
                 .contains("already marked")
         );
         cancel_encrypt(&path).unwrap();
         begin_encrypt(&path).unwrap();
         assert!(
-            may_encrypt(&path, true, false, "a")
+            may_encrypt(&path, Ok(()), false, "a")
                 .unwrap_err()
                 .contains("already encrypted")
         );
+    }
+
+    #[test]
+    fn the_record_says_its_recovery_key_was_seen() {
+        // (It is shown to the asker in the answer: a record with `seen` false would have the
+        // cluster warn that nobody was shown one, and refuse `duress --all`.)
+        let path = config("seen", 8 << 20);
+        begin_encrypt(&path).unwrap();
+        assert!(Record::read(&path).unwrap().expect("the lock record").seen);
+    }
+
+    #[test]
+    fn a_plain_state_under_a_record_is_told_from_one_that_is_encrypted() {
+        // (An ext4 magic at byte 1080 of the device and none on what the record's key maps.)
+        let magic = |name: &str, there: bool| {
+            let path = config(name, 8 << 20);
+            if there {
+                let file = File::options().write(true).open(&path).unwrap();
+                file.write_all_at(&[0x53, 0xef], 1080).unwrap();
+            }
+            path
+        };
+        let (plain, other) = (magic("ext-plain", true), magic("ext-other", false));
+        assert!(plain_under_a_record(&plain, &other));
+        assert!(!plain_under_a_record(&other, &plain));
+        assert!(!plain_under_a_record(&plain, &plain));
+        assert!(!plain_under_a_record(&other, &other));
+        assert!(!plain_under_a_record(&other.with_extension("none"), &other));
+    }
+
+    /// What `encrypt_by` answered a node `a` (and wrote to its audit log), asked as `caller`.
+    struct Asked {
+        status: StatusCode,
+        body: Value,
+        audit: String,
+    }
+
+    /// Asks the handler for `a`, a node of a cluster of its own, with `config` as its config
+    /// partition. `drained` puts the drain record on a, and `running` a Workload on it.
+    async fn ask(
+        tag: &str,
+        caller: Caller,
+        cancel: bool,
+        (drained, running, installing): (bool, bool, bool),
+        config: Option<PathBuf>,
+    ) -> Asked {
+        use crate::cluster::pinned_peer::{at, node, shared_with};
+        let ca = crate::pki::Ca::create().unwrap();
+        let shared = shared_with(tag, node(&ca, "a"), &[at("a", "127.0.0.1:1", None)]).await;
+        let sources = [
+            (
+                drained,
+                "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: a}\nspec: {unschedulable: true, taints: [{key: kith.dev/drain, effect: noExecute}]}\n",
+            ),
+            (
+                running,
+                "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {name: w}\nspec: {template: {containers: [{name: run, image: img}]}}\n",
+            ),
+        ];
+        {
+            let mut state = shared.store.lock().unwrap();
+            for (_, source) in sources.iter().filter(|(on, _)| *on) {
+                let resource = kith_api::Resource::from_source(source).unwrap().remove(0).unwrap();
+                state.store.apply(resource).unwrap();
+            }
+            if running {
+                let nodes = json!({ "nodes": { "0": "a" } });
+                state.store.set_status("Workload/default/w", Some(nodes)).unwrap();
+            }
+        }
+        let at_config = move || config.clone();
+        let answer = encrypt_by(&shared, &caller, "a", cancel, &at_config, &move || installing).await;
+        let status = answer.status();
+        assert_eq!(answer.headers()["cache-control"], "no-store");
+        let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap();
+        let log = std::env::temp_dir().join(format!("kithd-pinned-{tag}-{}/audit.log", std::process::id()));
+        Asked {
+            status,
+            body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            audit: std::fs::read_to_string(log).unwrap_or_default(),
+        }
+    }
+
+    fn why(asked: &Asked) -> String {
+        asked.body["error"].as_str().unwrap_or_default().to_string()
+    }
+
+    #[tokio::test]
+    async fn the_verb_shows_the_recovery_key_in_its_answer_and_in_no_audit_line() {
+        let path = config("verb-ok", 8 << 20);
+        let asked = ask("enc-ok", Caller::Admin, false, (true, false, false), Some(path.clone())).await;
+        assert_eq!(asked.status, StatusCode::OK, "{}", why(&asked));
+        let text = asked.body["recovery"].as_str().expect("the recovery key").to_string();
+        let record = Record::read(&path).unwrap().expect("the lock record");
+        let recovery = typed(&text).expect("the key as it is shown");
+        assert_eq!(unwrap(&recovery, &record.recovery).as_deref(), record.plain_key());
+        assert!(record.seen && crate::in_place::marked(&File::open(&path).unwrap()).unwrap());
+        // The audit log says the verb was done, to what, and by whom: and not the key.
+        assert!(asked.audit.contains("\"verb\":\"encrypt\"") && asked.audit.contains("NodeKey/a"));
+        let bare: String = text.chars().filter(|c| c.is_alphanumeric()).collect();
+        for secret in [text, bare] {
+            assert!(!asked.audit.contains(&secret), "the recovery key is in the audit log");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_verb_is_refused_with_the_state_as_it_was_and_no_key_in_the_audit_log() {
+        let (plain, over) = (config("verb-plain", 8 << 20), config("verb-installing", 8 << 20));
+        let refused = |asked: &Asked, status, says: &str| {
+            assert_eq!(asked.status, status, "{}", why(asked));
+            assert!(why(asked).contains(says), "{}", why(asked));
+            assert!(asked.body.get("recovery").is_none() && asked.audit.contains("\"ok\":false"));
+        };
+        let one = |on: &Path| (Some(on.to_path_buf()), Some(on.to_path_buf()));
+        let (config_a, config_b) = one(&plain);
+        let carol = Caller::Identity("carol".into());
+        let by = |tag, caller, cancel, flags, config| ask(tag, caller, cancel, flags, config);
+        // Someone who may not apply NodeKeys.
+        let asked = by("enc-403", carol, false, (true, false, false), config_a).await;
+        assert_eq!(asked.status, StatusCode::FORBIDDEN);
+        // Not drained: no drain record, or one with a Workload still on the node.
+        let asked = by("enc-undrained", Caller::Admin, false, (false, false, false), config_b).await;
+        refused(&asked, StatusCode::CONFLICT, "drain a first");
+        let asked = by(
+            "enc-running",
+            Caller::Admin,
+            false,
+            (true, true, false),
+            Some(plain.clone()),
+        )
+        .await;
+        refused(&asked, StatusCode::CONFLICT, "still runs 1 thing(s)");
+        // In the installer; with no config partition.
+        let asked = by("enc-installing", Caller::Admin, false, (true, false, true), Some(over)).await;
+        refused(&asked, StatusCode::CONFLICT, "installer");
+        let asked = by("enc-nodisk", Caller::Admin, false, (true, false, false), None).await;
+        refused(&asked, StatusCode::CONFLICT, "no partition is labelled config");
+        // Nothing of that touched the partition.
+        assert!(matches!(Record::read(&plain), Ok(None)));
+        assert!(!crate::in_place::marked(&File::open(&plain).unwrap()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_verb_is_refused_in_no_cluster_and_cancel_takes_the_marker_away() {
+        let dir = std::env::temp_dir().join(format!("kithd-pinned-enc-nocluster-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let alone = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let none = || None;
+        let answer = encrypt_by(&alone, &Caller::Admin, "a", false, &none, &|| false).await;
+        assert_eq!(answer.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap();
+        let said = String::from_utf8_lossy(&bytes).to_string();
+        assert!(said.contains("in no cluster") && said.contains("needs one"), "{said}");
+
+        let path = config("verb-cancel", 8 << 20);
+        let marked = begin_encrypt(&path).unwrap();
+        let asked = ask(
+            "enc-cancel",
+            Caller::Admin,
+            true,
+            (false, false, false),
+            Some(path.clone()),
+        )
+        .await;
+        assert_eq!(asked.status, StatusCode::OK, "{}", why(&asked));
+        assert_eq!(asked.body["cancelled"], true);
+        assert!(matches!(Record::read(&path), Ok(None)));
+        assert!(!crate::in_place::marked(&File::open(&path).unwrap()).unwrap());
+        assert!(!asked.audit.contains(&marked));
     }
 
     #[test]
