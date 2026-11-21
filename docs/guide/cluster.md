@@ -483,17 +483,22 @@ Every node reads it at its next check, and asks it alone, as if it had been told
 `kith.ntp=`; a change is asked within a minute. A node's own `kith.ntp` (or its installer's
 `ntp:`) wins over it. Anything but an address, or an address and port, is refused at apply
 naming `spec.ntp`; where two Clusters name different servers, the one with the lowest name is
-taken.
+taken. Like `kith.ntp`, it is the only server asked: a mistyped address leaves the nodes with no
+network server to fall back on (the leader still answers).
 
-The leader's time outweighs a server's only while a server set the leader's own clock: its
-answer to `/v1/clock` says `kith-clock: server` then. A leader that does not say it (one that
-started hours off, with no server in reach) is held to ten seconds of steps, like any one
-source, by a node a server set and by a voter that most voters agree with: each voter asks the
-other voters too, and when itself and those within two seconds of it are over half of them, the
-leader's step is not taken and the status says why ("no time server set its clock: 2 of 3
-voters agree with this node's"). Otherwise the leader is followed, so a cluster with no server
-still keeps one time. With two voters a follower has no one else to ask: it follows a leader
-no server set unless a server set its own clock, so name one in `spec.ntp`.
+The leader's time outweighs a server's only while the operator's time server (`kith.ntp` or
+`spec.ntp`) set the leader's own clock: its answer to `/v1/clock` says `kith-clock: server` then.
+A server the network names (DHCP's, the gateway) gives time but never that mark: anyone on the
+wire can answer for it. A leader that does not say it (one that started hours off, with no
+server in reach) is held to ten seconds of steps, like any one source, by a node the operator's
+server set and by a voter that most voters that answered agree with: each following voter asks
+the other voters too, and when itself and those within two seconds of it are over half of
+those that answered (the leader counted, three at least), the leader's step is not taken and
+the status says why ("no time server set its clock: 2 of 3 voters that answered agree with this
+node's"). Otherwise the leader is followed, so a cluster with no server still keeps one time.
+With two voters, or three with one down, a follower has no majority without the leader: it
+follows a leader no server set unless the operator's server set its own clock, so name one in
+`spec.ntp`. A worker follows the control node it uses, as before (it asks no one else).
 
 - Tested: `sh ci/vm.sh --test clockleader` stops three nodes with no time server, starts one
   eight hours ahead, and lets it lead: the other two keep their time within five seconds and

@@ -1464,12 +1464,21 @@ fn cluster_ntp_is_an_address_or_an_address_and_port() {
         assert_eq!(read.spec["ntp"], good);
         assert!(read.not_acted_on().is_empty(), "{good}");
     }
-    for wrong in ["pool.ntp.org", "", "10.0.0.7:", "10.0.0.7:99999", "10.0.0.7 10.0.0.8"] {
+    for wrong in [
+        "pool.ntp.org",
+        "",
+        "10.0.0.7:",
+        "10.0.0.7:99999",
+        "10.0.0.7 10.0.0.8",
+        "10.0.0.7:0",
+    ] {
         let e = cluster(wrong).expect_err(wrong);
         assert!(e.contains("spec.ntp"), "{wrong}: {e}");
     }
     assert_eq!(kinds::ntp_server("10.0.0.7"), Some("10.0.0.7:123".parse().unwrap()));
     assert_eq!(kinds::ntp_server("[fd00::7]:99"), Some("[fd00::7]:99".parse().unwrap()));
+    // Port 0 is no server's: nothing answers there (kith.ntp reads the same).
+    assert_eq!(kinds::ntp_server("[fd00::7]:0"), None);
 }
 
 /// The house address and its endpoint are checked when a Cluster is applied, by the one parser

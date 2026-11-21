@@ -1622,6 +1622,7 @@ pub fn ntp_server(word: &str) -> Option<std::net::SocketAddr> {
     word.parse()
         .ok()
         .or_else(|| word.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 123)))
+        .filter(|server: &SocketAddr| server.port() != 0)
 }
 
 impl Spec for ClusterSpec {

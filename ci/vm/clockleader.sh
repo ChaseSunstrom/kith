@@ -43,6 +43,20 @@
                 sleep 10
                 node 2
                 node 3
+                # Both followers up and answering (this machine asks as n2 and n3 ask each other).
+                # A check of one before the other answered has two voters answering, no majority,
+                # and follows the leader as it should: that start proves nothing and is tried again.
+                # Once both answer, a follower moved fails the test.
+                waited=0
+                until s2=$(skew 2) && s3=$(skew 3); do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 240 ] || fail "n2 and n3 did not both answer: $(tail -n 3 "$work/n2.log" "$work/n3.log")"
+                    sleep 1
+                done
+                if ! near "$s2" || ! near "$s3"; then
+                    echo "vm.sh: a follower checked before the other answered (n2 $s2 s, n3 $s3 s): all three start again" >&2
+                    return 1
+                fi
                 waited=0
                 until grep -aq 'no time server set its clock' "$work/n2.log" && grep -aq 'no time server set its clock' "$work/n3.log"; do
                     waited=$((waited + 1))
@@ -62,10 +76,10 @@
             tries=1
             until started; do
                 tries=$((tries + 1))
-                [ "$tries" -le 4 ] || fail "n1 was not elected in four starts"
+                [ "$tries" -le 4 ] || fail "no start of four had n1 elected with both followers answering"
             done
             for n in 2 3; do
-                grep -aq 'no time server set its clock: 2 of 3 voters agree' "$work/n$n.log" \
+                grep -aq 'no time server set its clock: 2 of 3 voters that answered agree' "$work/n$n.log" \
                     || fail "n$n did not say two of three voters agree: $(grep -a 'kithd: clock' "$work/n$n.log" | tail -n 3)"
             done
             # And they keep it, past the next check (a minute: their first found no leader).

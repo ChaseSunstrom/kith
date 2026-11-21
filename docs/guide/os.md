@@ -23,12 +23,14 @@ As process 1, kithd:
   where none is named, the one
   DHCP names (option 42), then the gateway. The cluster's leader (a worker asks its control node)
   is asked too, over the cluster's own TLS, and its time wins over a server over two seconds
-  from it, as long as a server set the leader's own clock: its answer says so (`kith-clock:
-  server`). A leader whose clock no server set (one restarted hours off, on a network with no
-  server) is one more source, held to the ten seconds below, by a node a server set and by a
-  voter most voters agree with (each voter asks the others at each check); the status says why
-  its step was not taken. With neither, it is followed as before: a closed network with no
-  server still keeps one time. The server you name is followed alone, whatever the step. Before the clock was ever
+  from it, as long as the operator's time server (`kith.ntp` or `spec.ntp`; a network's never)
+  set the leader's own clock: its answer says so (`kith-clock: server`). A leader whose clock no
+  such server set (one restarted hours off, on a network with no server) is one more source,
+  held to the ten seconds below, by a node the operator's server set and by a voter most voters
+  that answered agree with (each following voter asks the others at each check; three at least
+  must answer); the status says why its step was not taken. With neither, it is followed as
+  before (a worker follows its control node so): a closed network with no server still keeps
+  one time. The server you name is followed alone, whatever the step. Before the clock was ever
   set (it reads before 2026) the first answer is enough; after that a network's word alone moves
   it by ten seconds in all (its steps together, until the leader agrees), and more needs the
   leader within a second of the same time (servers a network names do not vouch for each

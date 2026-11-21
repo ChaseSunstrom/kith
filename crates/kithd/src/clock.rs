@@ -17,12 +17,16 @@
 //! network do not vouch for each other: see `ask`).
 //!
 //! A leader's word is only as good as its own clock: `/v1/clock` says `kith-clock: server` beside
-//! the time when a server (or a leader that said so) set or confirmed this node's clock, and
-//! nothing where none did. A leader that does not say it is one source (the ten seconds above)
-//! to a node a server set, and to a voter that most voters agree with (it asks the others, not
-//! the leader, at each check: itself and those within two seconds of it, over half the voters);
-//! otherwise it is followed as before, so a closed network with no server still has one time.
-//! The status says why a step was not taken. While the clock is
+//! the time when the operator's time server (`kith.ntp` or `spec.ntp`; a network's, plain UDP
+//! that anyone on the wire can answer, never) or a leader that said so set or confirmed this
+//! node's clock, and nothing where none did. A leader that does not say it is one source (the ten
+//! seconds above) to a node the operator's server set, and to a voter that most voters that
+//! answered agree with (a following voter asks the others, not the leader, at each check: itself
+//! and those within two seconds of it, over half of those that answered, three at least: with one
+//! of three down there is no majority, and `spec.ntp` is the way); otherwise it is followed as
+//! before, so a closed network with no server still has one time. A worker follows the control
+//! node it uses as before (it asks no one else). The mark and the budget spent start again at
+//! each boot. The status says why a step was not taken. While the clock is
 //! unset, `/v1/clock` answers 503: a node that reads 1970 is no one's time. What it found is
 //! in this Node's status as `clock`: `{server, offsetMs, delayMs, stepped, checked}`, or
 //! `{error, checked}` where no one answered. A step is written to the hardware clock too
@@ -66,7 +70,7 @@ const NETWORK_SERVERS: usize = 4;
 /// Set while this node keeps its clock and has not found the time yet: `serve` says nothing then
 /// (a leader whose clock reads 1970 must not be the time the others set theirs to).
 static UNSET: AtomicBool = AtomicBool::new(false);
-/// Set while a time server's answer (or a leader's that a server set) is the time this clock was
+/// Set while the operator's time server's answer (or a marked leader's) is the time this clock was
 /// set to or kept at: `serve` marks its answer so (`VOUCH`), and a member does not follow a leader
 /// without the mark that is hours from its own clock (see `ask`).
 static VOUCHED: AtomicBool = AtomicBool::new(false);
@@ -287,13 +291,12 @@ struct Said {
     vouched: bool,
 }
 
-/// What the cluster says: its leader (or, for a worker, the control node it follows), the offsets
-/// of the other voters that answered (not this node, not the leader), and how many voters there
-/// are (0: the others were not asked, as on a worker).
+/// What the cluster says: its leader (or, for a worker, the control node it follows), and the
+/// offsets of the other voters that answered (not this node, not the leader; none asked on a
+/// worker, a learner or the leader).
 struct Heard {
     leader: Result<Said, String>,
     others: Vec<i64>,
-    voters: usize,
 }
 
 /// What the member at `address` says the time is (`GET /v1/clock`), within `WAIT`.
@@ -320,7 +323,6 @@ async fn heard(shared: &Shared) -> Heard {
         return Heard {
             leader,
             others: Vec::new(),
-            voters: 0,
         };
     }
     let upstream = shared
@@ -334,7 +336,6 @@ async fn heard(shared: &Shared) -> Heard {
         return Heard {
             leader,
             others: Vec::new(),
-            voters: 0,
         };
     }
     let metrics = shared.raft.metrics().borrow().clone();
@@ -347,10 +348,10 @@ async fn heard(shared: &Shared) -> Heard {
             .ok_or("the leader's address is not known")?;
         time_of(&address.addr, &crate::raft::to_voter(shared, leader)?.0).await
     };
-    // (Only a voter asks the others: a learner is not one of the cluster's time.)
-    let me_votes = membership.voter_ids().any(|id| id == metrics.id);
-    let voters = if me_votes { membership.voter_ids().count() } else { 0 };
-    let asked = |id: &kith_store::NodeId| me_votes && *id != metrics.id && Some(*id) != metrics.current_leader;
+    // (Only a voter that follows asks the others: a learner is not one of the cluster's time, and
+    // the leader has no leader to weigh them against.)
+    let polls = membership.voter_ids().any(|id| id == metrics.id) && metrics.current_leader != Some(metrics.id);
+    let asked = |id: &kith_store::NodeId| polls && *id != metrics.id && Some(*id) != metrics.current_leader;
     let others = membership.voter_ids().filter(asked).map(|id| {
         let membership = &membership;
         async move {
@@ -363,7 +364,6 @@ async fn heard(shared: &Shared) -> Heard {
     Heard {
         leader,
         others: others.into_iter().flatten().collect(),
-        voters,
     }
 }
 
@@ -467,11 +467,13 @@ fn nothing(why: &str, at: i64) -> Value {
 /// The leader's word is a member's, not a server's: a leader whose clock no time server set (its
 /// answer has no mark: it came up from a hardware clock hours off, on a network with no server)
 /// is one source like a network's, within the same budget, once this node's clock was set and
-/// either a server set it (`vouched`, this node's own mark) or most voters, this node with the
-/// others that answered within two seconds of it, say this node's time. Otherwise (a cluster of
-/// two with no server, a node in 1970) the leader is followed as before; a leader a server set
-/// is followed by any step. `vouched` is kept: true once a server's answer (or a leader's with the
-/// mark) is the time stepped to or kept, false when no one answered or the step failed.
+/// either the operator's server set it (`vouched`, this node's own mark, or that server within two
+/// seconds of it in this check) or most voters that answered (three at least: this node, the
+/// leader and the others) are this node with those within two seconds of it. Otherwise (a cluster
+/// of two with no server, a voter of three down, a node in 1970) the leader is followed as before;
+/// a marked leader is followed by any step. `vouched` is kept: true once the operator's server's
+/// answer (or a marked leader's) is the time stepped to or kept, false when no one answered or the
+/// step failed; a network's server never sets it.
 #[allow(clippy::too_many_arguments)]
 async fn ask(
     servers: &[SocketAddr],
@@ -496,14 +498,21 @@ async fn ask(
     }
     let heard = heard.await;
     let agree = 1 + heard.others.iter().filter(|o| o.abs() <= STEP_OVER_US).count();
-    let majority = heard.voters > 0 && agree * 2 > heard.voters;
+    // (Of the voters that answered: this node, the leader and the others. One that is down is
+    // no one's word; under three there is no majority without the leader.)
+    let answered = 2 + heard.others.len();
+    let majority = answered >= 3 && agree * 2 > answered;
     let leader = heard.leader;
+    // This node's own mark, by this check's answer too: the operator's server said its time.
+    let vouched_now = *vouched || told && found.first().is_some_and(|(_, s)| s.offset_us.abs() <= STEP_OVER_US);
     // Why the leader is one source here, not the cluster's time (nothing: it is the time).
     let demoted = match &leader {
-        Ok(said) if !said.vouched && synced && *vouched => Some("a time server set this node's".to_string()),
-        Ok(said) if !said.vouched && synced && majority => {
-            Some(format!("{agree} of {} voters agree with this node's", heard.voters))
+        Ok(said) if !said.vouched && synced && vouched_now => {
+            Some("the operator's time server set this node's".to_string())
         }
+        Ok(said) if !said.vouched && synced && majority => Some(format!(
+            "{agree} of {answered} voters that answered agree with this node's"
+        )),
         _ => None,
     };
     let mut chosen = found.first().cloned();
@@ -534,8 +543,9 @@ async fn ask(
             .iter()
             .any(|said| (said.sample.offset_us - sample.offset_us).abs() <= AGREE_US);
     let operators = from_leader.is_none() && told;
-    // A server's time, or a vouched leader's: what `serve` marks.
-    let a_servers = from_leader.is_none_or(|said| said.vouched);
+    // The operator's server's time, or a marked leader's: what `serve` marks (a network's server
+    // is plain UDP, anyone's on the wire: its time is taken, never vouched for).
+    let a_servers = from_leader.map_or(operators, |said| said.vouched);
     let off = sample.offset_us.abs();
     let corroborated = !synced || trusted || operators || agrees;
     let mut rtc_error = None;
@@ -557,11 +567,14 @@ async fn ask(
             *vouched |= a_servers;
             *spent = if corroborated { 0 } else { *spent + off };
             // (The hardware clock follows a step that was vouched for, so the next boot starts from
-            // it: the operator's server, the leader over mTLS, or a server the leader agrees with.
-            // The first answer of an unsynced clock may be a plain-UDP network's alone, and a
-            // reboot would take what was written for a clock that was set: that one is kept off
-            // the hardware clock. A failed write is said beside the step, which counts.)
-            if trusted || operators || agrees {
+            // it: the operator's server, a marked leader, or a server the leader agrees with. The
+            // first answer of an unsynced clock may be a plain-UDP network's alone, and a reboot
+            // would take what was written for a clock that was set: that one is kept off the
+            // hardware clock. An unmarked leader's step is written only to a clock that was unset:
+            // one followed "as before" over a set clock may be hours off, and a reboot undoes it.
+            // A failed write is said beside the step, which counts.)
+            let leaders = from_leader.is_some_and(|said| said.vouched || !synced);
+            if leaders || operators || agrees {
                 rtc_error = set_rtc(to).err().map(|e| e.to_string());
             }
         } else {
@@ -760,7 +773,6 @@ mod tests {
         Heard {
             leader: leader.await.map(|sample| Said { sample, vouched: false }),
             others: Vec::new(),
-            voters: 0,
         }
     }
 
@@ -1313,14 +1325,13 @@ mod tests {
     const EIGHT_HOURS: i64 = 28_800_000_000;
 
     /// `super::ask` once the clock was set (or not: `synced`), with no server, the leader
-    /// `leader` microseconds ahead (`vouched`: a time server set its clock), the other members at
-    /// `others`, `voters` in all, and this node's own mark `mine`: what it stepped to (as an
-    /// offset), the status, and the mark after.
+    /// `leader` microseconds ahead (`vouched`: a time server set its clock), the other voters that
+    /// answered at `others`, and this node's own mark `mine`: what it stepped to (as an offset),
+    /// the status, and the mark after.
     async fn from_cluster(
         leader: i64,
         vouched: bool,
         others: &[i64],
-        voters: usize,
         mine: bool,
         synced: bool,
         spent: &mut i64,
@@ -1339,7 +1350,6 @@ mod tests {
                 vouched,
             }),
             others: others.to_vec(),
-            voters,
         };
         let mut mark = mine;
         let before = now_us();
@@ -1362,7 +1372,7 @@ mod tests {
     async fn clock_an_unvouched_leader_hours_off_does_not_move_a_node_a_server_set() {
         // The leader came up from a hardware clock eight hours ahead, and no server set it: a node
         // whose own clock a server set keeps its time, and says why.
-        let (to, said, mark) = from_cluster(EIGHT_HOURS, false, &[], 3, true, true, &mut 0).await;
+        let (to, said, mark) = from_cluster(EIGHT_HOURS, false, &[EIGHT_HOURS], true, true, &mut 0).await;
         assert_eq!(to, None, "{said}");
         assert_eq!(
             (said["stepped"].clone(), said["server"].clone()),
@@ -1370,19 +1380,19 @@ mod tests {
         );
         let why = said["error"].as_str().unwrap();
         assert!(
-            why.contains("no time server set its clock") && why.contains("a time server set this node's"),
+            why.contains("no time server set its clock") && why.contains("the operator's time server set this node's"),
             "{said}"
         );
         assert!((said["offsetMs"].as_i64().unwrap() - 28_800_000).abs() < 10, "{said}");
         assert!(mark, "a step not taken leaves the node's mark");
         // In a cluster of two as well: the node's own mark is enough.
-        let (to, said, _) = from_cluster(EIGHT_HOURS, false, &[], 2, true, true, &mut 0).await;
+        let (to, said, _) = from_cluster(EIGHT_HOURS, false, &[], true, true, &mut 0).await;
         assert_eq!(to, None, "{said}");
         // It is one source then: its steps are followed to ten seconds in all.
         let mut spent = 0;
         let mut stepped = Vec::new();
         for _ in 0..3 {
-            let (to, _, mark) = from_cluster(4_000_000, false, &[], 3, true, true, &mut spent).await;
+            let (to, _, mark) = from_cluster(4_000_000, false, &[], true, true, &mut spent).await;
             stepped.push((to.is_some(), mark));
         }
         assert_eq!(stepped, [(true, true), (true, true), (false, true)]);
@@ -1393,61 +1403,65 @@ mod tests {
     async fn clock_an_unvouched_leader_hours_off_does_not_move_a_node_the_members_agree_with() {
         // No server anywhere (the incident's network): the other member agrees with this node,
         // two of three voters, and the leader alone says eight hours.
-        let (to, said, mark) = from_cluster(EIGHT_HOURS, false, &[300_000], 3, false, true, &mut 0).await;
+        let (to, said, mark) = from_cluster(EIGHT_HOURS, false, &[300_000], false, true, &mut 0).await;
         assert_eq!(to, None, "{said}");
         let why = said["error"].as_str().unwrap();
         assert!(
-            why.contains("no time server set its clock") && why.contains("2 of 3 voters"),
+            why.contains("no time server set its clock") && why.contains("2 of 3 voters that answered agree"),
             "{said}"
         );
         assert!(!mark);
         // Five voters: two others agree, one is with the leader: three of five.
-        let (to, said, _) = from_cluster(
-            EIGHT_HOURS,
-            false,
-            &[0, -1_500_000, EIGHT_HOURS],
-            5,
-            false,
-            true,
-            &mut 0,
-        )
-        .await;
+        let (to, said, _) = from_cluster(EIGHT_HOURS, false, &[0, -1_500_000, EIGHT_HOURS], false, true, &mut 0).await;
         assert_eq!(to, None, "{said}");
-        // One of four others agreeing is two of five: no majority, and the leader is followed.
-        let (to, said, _) = from_cluster(EIGHT_HOURS, false, &[0, EIGHT_HOURS], 5, false, true, &mut 0).await;
+        // One of the others agreeing, one with the leader: two of four that answered, no majority,
+        // and the leader is followed.
+        let (to, said, _) = from_cluster(EIGHT_HOURS, false, &[0, EIGHT_HOURS], false, true, &mut 0).await;
         assert!(to.is_some_and(|to| (to - EIGHT_HOURS).abs() < 200_000), "{to:?} {said}");
+        // Five voters, one down: three of the four that answered; two down: two of three. A voter
+        // that does not answer is no one's word, for the leader or against it.
+        for others in [&[0, -1_500_000][..], &[0]] {
+            let (to, said, _) = from_cluster(EIGHT_HOURS, false, others, false, true, &mut 0).await;
+            assert_eq!(to, None, "{others:?}: {said}");
+        }
+        let (_, said, _) = from_cluster(EIGHT_HOURS, false, &[0, 0], false, true, &mut 0).await;
+        assert!(
+            said["error"].as_str().unwrap().contains("3 of 4 voters that answered"),
+            "{said}"
+        );
     }
 
     #[tokio::test]
     async fn clock_with_neither_mark_nor_majority_the_unvouched_leader_is_followed_as_before() {
-        // A cluster of two with no server: no majority without the leader.
-        let (to, said, mark) = from_cluster(EIGHT_HOURS, false, &[], 2, false, true, &mut 0).await;
+        // A cluster of two with no server, or three with the other follower down: no majority
+        // without the leader (two answered).
+        let (to, said, mark) = from_cluster(EIGHT_HOURS, false, &[], false, true, &mut 0).await;
         assert!(to.is_some_and(|to| (to - EIGHT_HOURS).abs() < 200_000), "{to:?} {said}");
         assert_eq!(said["stepped"], true);
         assert!(!mark, "a leader no server set gives no mark");
         // The other member is with the leader.
-        let (to, _, _) = from_cluster(EIGHT_HOURS, false, &[EIGHT_HOURS], 3, false, true, &mut 0).await;
+        let (to, _, _) = from_cluster(EIGHT_HOURS, false, &[EIGHT_HOURS], false, true, &mut 0).await;
         assert!(to.is_some());
         // A node in 1970: the others are decades from it, as the leader is.
         let decades = 1_795_000_000_000_000;
-        let (to, said, _) = from_cluster(decades, false, &[decades], 3, false, false, &mut 0).await;
+        let (to, said, _) = from_cluster(decades, false, &[decades], false, false, &mut 0).await;
         assert!(to.is_some(), "{said}");
     }
 
     #[tokio::test]
     async fn clock_a_vouched_leader_is_followed_by_any_step() {
-        let (to, said, mark) = from_cluster(EIGHT_HOURS, true, &[0], 3, true, true, &mut 0).await;
+        let (to, said, mark) = from_cluster(EIGHT_HOURS, true, &[0], true, true, &mut 0).await;
         assert!(to.is_some_and(|to| (to - EIGHT_HOURS).abs() < 200_000), "{to:?} {said}");
         assert!(said.get("error").is_none(), "{said}");
         assert!(mark, "the time of a leader a server set is a server's");
         // And kept within two seconds of it: the mark too.
-        let (to, _, mark) = from_cluster(500_000, true, &[], 3, false, true, &mut 0).await;
+        let (to, _, mark) = from_cluster(500_000, true, &[], false, true, &mut 0).await;
         assert_eq!((to, mark), (None, true));
     }
 
     #[tokio::test]
     async fn clock_the_mark_is_a_servers_answer_followed_or_kept() {
-        let mark = |servers: Vec<SocketAddr>, leader: Result<Sample, String>, mine: bool| async move {
+        let mark = |servers: Vec<SocketAddr>, leader: Result<Sample, String>, mine: bool, told: bool| async move {
             let mut mark = mine;
             let heard = async { alone(async { leader }).await };
             super::ask(
@@ -1457,7 +1471,7 @@ mod tests {
                 |_| Ok(()),
                 |_| Ok(()),
                 true,
-                false,
+                told,
                 &mut 0,
                 &mut mark,
             )
@@ -1468,14 +1482,18 @@ mod tests {
             offset_us: 300_000,
             delay_us: 1_000,
         };
-        // A server's time, kept or stepped to: a server set this clock.
-        assert!(mark(vec![fake(0, |_| {}).await], Err("none".into()), false).await);
-        assert!(mark(vec![fake(4_000_000, |_| {}).await], Err("none".into()), false).await);
+        // The operator's server's time, kept or stepped to: a server set this clock.
+        assert!(mark(vec![fake(0, |_| {}).await], Err("none".into()), false, true).await);
+        assert!(mark(vec![fake(4_000_000, |_| {}).await], Err("none".into()), false, true).await);
+        // A network's (DHCP's, the gateway's: plain UDP, anyone on the wire): its time is taken,
+        // and vouches for nothing.
+        assert!(!mark(vec![fake(0, |_| {}).await], Err("none".into()), false, false).await);
+        assert!(!mark(vec![fake(4_000_000, |_| {}).await], Err("none".into()), false, false).await);
         // No one answered: no one set it.
-        assert!(!mark(vec![nobody().await], Err("none".into()), true).await);
+        assert!(!mark(vec![nobody().await], Err("none".into()), true, true).await);
         // A leader no server set, within two seconds: the mark stays as it was.
-        assert!(mark(vec![], Ok(near), true).await);
-        assert!(!mark(vec![], Ok(near), false).await);
+        assert!(mark(vec![], Ok(near), true, false).await);
+        assert!(!mark(vec![], Ok(near), false, false).await);
         // A step that failed (a hardened node): the clock is not a server's.
         let mut mark = true;
         let refuse = |_| Err(std::io::Error::from_raw_os_error(1));
@@ -1496,7 +1514,6 @@ mod tests {
                 vouched: false,
             }),
             others: Vec::new(),
-            voters: 3,
         };
         // A server that says this node's time, and an unvouched leader that says eight hours off:
         // the server's is taken, on a node a server set.
@@ -1538,6 +1555,78 @@ mod tests {
         )
         .await;
         assert!(!stepped.get(), "{said}");
+    }
+
+    /// `super::ask` on a set clock with no mark of its own yet, `servers` (`told`: the operator's)
+    /// and a leader `leader` ahead (`marked`: it says `kith-clock: server`), the others at `others`:
+    /// what the system clock and the hardware clock were set to, and the status.
+    async fn fresh(
+        servers: &[SocketAddr],
+        told: bool,
+        leader: i64,
+        marked: bool,
+        others: &[i64],
+        synced: bool,
+    ) -> (Option<i64>, Option<i64>, Value) {
+        let (system, rtc) = (std::cell::Cell::new(None), std::cell::Cell::new(None));
+        let heard = Heard {
+            leader: Ok(Said {
+                sample: Sample {
+                    offset_us: leader,
+                    delay_us: 1_000,
+                },
+                vouched: marked,
+            }),
+            others: others.to_vec(),
+        };
+        let said = super::ask(
+            servers,
+            SOON,
+            async { heard },
+            |us| {
+                system.set(Some(us));
+                Ok(())
+            },
+            |us| {
+                rtc.set(Some(us));
+                Ok(())
+            },
+            synced,
+            told,
+            &mut 0,
+            &mut false,
+        )
+        .await;
+        (system.get(), rtc.get(), said)
+    }
+
+    #[tokio::test]
+    async fn clock_the_operators_server_answering_now_outweighs_an_unmarked_leader_on_a_fresh_node() {
+        // A node just booted (no mark yet): its operator's server says its time in this check, and
+        // the leader, no server's, says eight hours: the server's word is this node's mark already.
+        let (system, _, said) = fresh(&[fake(0, |_| {}).await], true, EIGHT_HOURS, false, &[], true).await;
+        assert_eq!(system, None, "{said}");
+        assert!(said["server"].as_str().unwrap().starts_with("127.0.0.1:"), "{said}");
+        // A network's server says the same: no mark, and no majority: the leader as before.
+        let (system, _, said) = fresh(&[fake(0, |_| {}).await], false, EIGHT_HOURS, false, &[], true).await;
+        assert!(system.is_some(), "{said}");
+    }
+
+    #[tokio::test]
+    async fn clock_an_unmarked_leaders_step_over_a_set_clock_is_not_written_to_the_hardware_clock() {
+        // Followed as before (no mark, no majority) on a clock that was set: a reboot starts from
+        // the hardware clock as it was, not from a leader's hours that no server vouched for.
+        let (system, rtc, said) = fresh(&[], false, EIGHT_HOURS, false, &[], true).await;
+        assert!(system.is_some(), "{said}");
+        assert_eq!(rtc, None, "{said}");
+        // An unset clock (1970) takes it, the hardware clock too, as before.
+        let (system, rtc, said) = fresh(&[], false, EIGHT_HOURS, false, &[], false).await;
+        assert!(system.is_some() && rtc == system, "{said}");
+        // A marked leader's step is written, as the operator's server's is.
+        let (system, rtc, said) = fresh(&[], false, EIGHT_HOURS, true, &[], true).await;
+        assert!(system.is_some() && rtc == system, "{said}");
+        let (system, rtc, said) = fresh(&[fake(4_000_000, |_| {}).await], true, 4_100_000, false, &[], true).await;
+        assert!(system.is_some() && rtc == system, "{said}");
     }
 
     #[tokio::test]
