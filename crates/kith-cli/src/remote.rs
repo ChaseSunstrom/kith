@@ -63,17 +63,23 @@ impl Dir {
         let read = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut random));
         read.or_else(|e| fail(format!("no random numbers: {e}")))?;
         let name: String = random.iter().map(|b| format!("{b:02x}")).collect();
-        let path = std::env::temp_dir().join(format!("kith-run-{name}"));
         // The carrier binds a socket in here (`t` is the longest name it gets): a path past
-        // `sun_path` fails there, and the tunnel never opens; say so now, before anything is made.
-        let longest = path.as_os_str().len() + "/t".len();
-        if longest > SOCKET_PATH_MAX {
-            return fail(format!(
-                "the run's socket would be {}/t, {longest} bytes, and a Unix socket path can be at most \
-                 {SOCKET_PATH_MAX} (set TMPDIR to a shorter directory)",
-                path.display()
-            ));
-        }
+        // `sun_path` fails there, and the tunnel never opens. So the first of the temp dir, the
+        // runtime dir and /tmp where it fits (a long TMPDIR, as a build's, is passed over).
+        let bases = [
+            std::env::temp_dir(),
+            std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            "/tmp".into(),
+        ];
+        let fits = |base: &PathBuf| {
+            !base.as_os_str().is_empty() && base.join(format!("kith-run-{name}/t")).as_os_str().len() <= SOCKET_PATH_MAX
+        };
+        let Some(base) = bases.iter().find(|base| fits(base)) else {
+            return fail("no directory short enough for the run's Unix socket (set TMPDIR to a shorter one)");
+        };
+        let path = base.join(format!("kith-run-{name}"));
         let made = std::fs::DirBuilder::new().mode(0o700).create(&path);
         made.or_else(|e| fail(format!("cannot make {}: {e}", path.display())))?;
         live().0.push(path.clone());

@@ -331,7 +331,12 @@ fn a_silent_daemon_times_out() {
 /// kithd that answers `101` to the ask and then holds the tunnel (`hold`) or closes it. Starts
 /// `kith run` against them, with its temp dir in the sandbox; the receiver says when the tunnel
 /// is up.
-fn kith_run(sb: &Sandbox, after: &str, hold: bool) -> (std::process::Child, std::sync::mpsc::Receiver<()>, PathBuf) {
+fn kith_run(
+    sb: &Sandbox,
+    tmp: &Path,
+    after: &str,
+    hold: bool,
+) -> (std::process::Child, std::sync::mpsc::Receiver<()>, PathBuf) {
     use std::io::{Read, Write};
     let socket = sb.0.join("kithd.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -380,7 +385,7 @@ fn kith_run(sb: &Sandbox, after: &str, hold: bool) -> (std::process::Child, std:
         .arg(&carrier)
         .args(["--", "true"])
         .env("KITH_SOCKET", &socket)
-        .env("TMPDIR", &sb.0)
+        .env("TMPDIR", tmp)
         .env_remove("KITH_STORE")
         .spawn()
         .unwrap();
@@ -398,46 +403,29 @@ fn run_dirs(sb: &Sandbox) -> usize {
 #[test]
 fn kith_run_returns_the_status_the_carrier_ends_with() {
     let sb = Sandbox::short("run-status");
-    let (mut kith, _, _) = kith_run(&sb, "sys.exit(7)", false);
+    let (mut kith, _, _) = kith_run(&sb, &sb.0, "sys.exit(7)", false);
     assert_eq!(kith.wait().unwrap().code(), Some(7));
     assert_eq!(run_dirs(&sb), 0, "the run's directory stays");
 }
 
-/// A temp dir whose run directory's socket would pass the 107 bytes of `sun_path` is refused at
-/// once, naming the path, its length and the limit, and no run directory is left behind.
+/// A TMPDIR too long for the carrier's socket (past the 107 bytes of `sun_path`, as a build's
+/// is) is passed over: the carrier binds, the run goes, and no run directory is made there.
 #[test]
-fn kith_run_refuses_at_once_a_temp_dir_too_long_for_its_socket() {
+fn kith_run_keeps_its_socket_short_whatever_the_temp_dir() {
     let sb = Sandbox::short("run-long");
     let long = sb.0.join("a".repeat(60)).join("b".repeat(60));
     std::fs::create_dir_all(&long).unwrap();
-    let began = std::time::Instant::now();
-    let out = Command::new(env!("CARGO_BIN_EXE_kith"))
-        .args([
-            "--timeout",
-            "60",
-            "run",
-            "--on",
-            "b",
-            "--via",
-            "/bin/true",
-            "--",
-            "true",
-        ])
-        .env("KITH_SOCKET", sb.0.join("none.sock"))
-        .env("TMPDIR", &long)
-        .env_remove("KITH_STORE")
-        .output()
-        .unwrap();
-    let err = String::from_utf8(out.stderr).unwrap();
-    assert_ne!(out.status.code(), Some(0), "{err}");
-    assert!(began.elapsed() < std::time::Duration::from_secs(5), "{err}");
-    assert!(err.contains(&format!("{}/kith-run-", long.display())), "{err}");
-    assert!(
-        err.contains("bytes") && err.contains("107") && err.contains("TMPDIR"),
-        "{err}"
+    let (mut kith, _, _) = kith_run(&sb, &long, "sys.exit(7)", false);
+    assert_eq!(
+        kith.wait().unwrap().code(),
+        Some(7),
+        "the carrier could not bind its socket"
     );
-    let left = std::fs::read_dir(&long).unwrap().count();
-    assert_eq!(left, 0, "a run directory stays: {err}");
+    assert_eq!(
+        std::fs::read_dir(&long).unwrap().count(),
+        0,
+        "a run directory is in the long temp dir"
+    );
 }
 
 /// An interrupt ends the run as an end of the tunnel does: the carrier is killed, the directory
@@ -445,7 +433,7 @@ fn kith_run_refuses_at_once_a_temp_dir_too_long_for_its_socket() {
 #[test]
 fn kith_run_cleans_up_and_exits_130_on_an_interrupt() {
     let sb = Sandbox::short("run-interrupt");
-    let (mut kith, tunnel, carrier) = kith_run(&sb, "time.sleep(300)", true);
+    let (mut kith, tunnel, carrier) = kith_run(&sb, &sb.0, "time.sleep(300)", true);
     tunnel.recv_timeout(std::time::Duration::from_secs(90)).unwrap();
     assert_eq!(run_dirs(&sb), 1, "the run's directory is not there while it runs");
     let pid = std::fs::read_to_string(format!("{}.pid", carrier.display())).unwrap();

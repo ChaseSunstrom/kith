@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::future::Future;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -371,7 +371,13 @@ impl Dir {
         SystemRandom::new()
             .fill(&mut random)
             .map_err(|_| "no random numbers".to_string())?;
-        let path = std::env::temp_dir().join(format!("kith-run-{}", pki::hex(&random)));
+        // The socket in here (`s`) must fit `sun_path` (107 bytes): a long temp dir, as a build's,
+        // is passed over for /tmp.
+        let name = format!("kith-run-{}", pki::hex(&random));
+        let mut path = std::env::temp_dir().join(&name);
+        if path.join("s").as_os_str().len() > 107 {
+            path = Path::new("/tmp").join(&name);
+        }
         let made = std::fs::DirBuilder::new().mode(0o700).create(&path);
         made.map_err(|e| format!("cannot make {}: {e}", path.display()))?;
         Ok(Dir(path))
@@ -438,9 +444,9 @@ impl App {
     // another VIA process needs its own `kith run`.
     // ponytail: VIA and the app run as kithd's user, in a process group of their own and in a
     // cgroup of their own (where one can be made), both killed when the tunnel ends: a program
-    // that makes its own session is caught by the cgroup. VIA is moved in after it is spawned
-    // (std's `Command` has no way into a cgroup short of `pre_exec`, which is unsafe): what it
-    // forked in that moment is not caught, and without delegation only the group is.
+    // that makes its own session is caught by the cgroup. VIA joins it between the fork and the
+    // exec (`kith_dm_sys::join_cgroup_before_exec`, the one place with the unsafe), so nothing it
+    // forks is outside; without delegation only the group is.
     // ponytail: a tunnel whose far end vanishes without a word (a node powered off) is ended by
     // the keepalive on the nodes' connections (`cluster::listen` and reqwest's own), not at once:
     // about a minute.
@@ -472,7 +478,9 @@ impl App {
         let procs = leaf.as_ref().map(|leaf| leaf.0.join("cgroup.procs"));
         let spawned = match start(procs.as_deref()) {
             Err(e) if procs.is_some() => {
-                eprintln!("kithd: run: could not start the app in its cgroup, the process group is all that ends it: {e}");
+                eprintln!(
+                    "kithd: run: could not start the app in its cgroup, the process group is all that ends it: {e}"
+                );
                 start(None)
             }
             other => other,
@@ -1058,7 +1066,11 @@ spec: {role: other-jobber, subjects: [carol]}
             return;
         }
         static PATH: OnceLock<String> = OnceLock::new();
-        let fast = installed(&PATH, "fast", "#!/bin/sh\ncat /proc/self/cgroup > \"$0.cgroup\"\nexec sleep 300\n");
+        let fast = installed(
+            &PATH,
+            "fast",
+            "#!/bin/sh\ncat /proc/self/cgroup > \"$0.cgroup\"\nexec sleep 300\n",
+        );
         let world = World::new("cgroup-fast").await;
         let alice = world.user("alice");
         let spec = json!({"on": "a", "via": fast, "argv": ["true"]});
@@ -1072,7 +1084,10 @@ spec: {role: other-jobber, subjects: [carol]}
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         drop(tunnel);
-        assert!(seen.contains("kith-run-"), "the program's first look at its cgroup: {seen:?}");
+        assert!(
+            seen.contains("kith-run-"),
+            "the program's first look at its cgroup: {seen:?}"
+        );
     }
 
     /// A program that makes its own session leaves the process group, and is still ended with the
