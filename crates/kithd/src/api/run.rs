@@ -606,7 +606,7 @@ spec: {role: other-jobber, subjects: [carol]}
                 cert,
                 key,
             };
-            Self::client(pki::client_config(&me.ca, Some(pki::Live::new(&me).unwrap()), None).unwrap())
+            Self::client(pki::client_config(&me.ca, Some(&me), None).unwrap())
         }
 
         fn client(config: rustls::ClientConfig) -> reqwest::Client {

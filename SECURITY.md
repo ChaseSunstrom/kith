@@ -118,9 +118,7 @@ Only the newest version is fixed. There are no security releases of older ones.
   membership goes on being sent the log at its address, held by its id alone, and the
   deleted node's own certificate (signed by the CA) still answers there until the
   membership change is through: seconds, longer with no leader or majority. A node's
-  certificate outlives its Node: a node that has the delete refuses the certificate
-  when it is shown to it (below), but a node that calls the voter takes what the voter
-  shows as stated here.
+  certificate outlives its Node, and nothing revokes it.
   **A join with a token that names its maker talks only to that node.** A token holds
   that node's name and key print beside the CA's fingerprint, and the joining node, which
   has no store, talks only to the node that made the token: it takes no other
@@ -1254,34 +1252,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     asked node has no Node for. On a worker that runs from a view and is started
     with the flag, that includes the deleted node's word for who asked: do not
     start a worker with it.
-  Certificates still last ten years (a Workload's pod's, two hours: above); a node's is
-  made again before it ends and a deleted Node's or a replaced Identity's is refused at
-  the handshake (next).
-- **A node's certificate: its life, its renewal, and its revocation.**
-  - A node's certificate lasts ten years. A node with under a third of that left (an
-    hour's look, and at the start) asks a node that holds the CA key for a new one over
-    the one it has: members only, the asking node's Node must stand, and the CA node
-    signs for the key and the birth index of the certificate on the link, never for a
-    name or key the request gives. The new one is for the same key and names (so the
-    Node's `status.certificate`, join tokens and pins hold), is written to `node.crt`
-    before it is shown, and is served from the next handshake on, to clients and as the
-    client of calls to other nodes, with no restart; connections already open keep the
-    old one until they end. One certificate a minute for one node, each in the audit
-    log (`renew-certificate`). A failure (no CA node reachable, a certificate that is
-    not for this key or does not end later) leaves the old one in place and is asked
-    again. A certificate that has ended cannot ask: the node joins again. The CA's own
-    certificate (twenty years) is not renewed.
-  - A node refuses at the TLS handshake, not only at each request, the certificate of a
-    node whose Node is deleted or holds another key print, and the certificate of an
-    Identity whose `publicKey` is another (the Identity was made again). This is
-    decided by the store the node has, and only on what it positively shows: a node
-    still catching up, or an Identity it has not heard of, is not refused here, and
-    each request is asked again as before. A node started with
-    `--admit-deleted-nodes` does not refuse at the handshake (and still signs no
-    certificate for a node its store has no Node for). A node resumes no TLS session, so
-    each connection shows the certificate again and is checked. A Workload's pod
-    certificate is checked at each request only. There is no CRL and no OCSP service:
-    the store is the list.
+  Certificates still last ten years (a Workload's pod's, two hours: above); nothing but
+  the Node's deletion ends one.
 - **A Release and a Source act with their writer's rights, as far as these go:**
   - Deleting one removes what it installed as the node does: leave to delete the
     Release or Source is enough, not leave to delete each thing.

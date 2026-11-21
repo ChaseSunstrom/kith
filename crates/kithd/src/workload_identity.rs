@@ -99,14 +99,14 @@ pub fn stands(store: &Store, identity: &str, namespace: &str, name: &str, node: 
 
 /// Whether `node` may be given one more for `what` (a Workload's replica) at `now` (seconds).
 /// A taken node can neither fill the audit log nor mint without end.
-pub(crate) fn due(node: &str, what: &str, now: u64) -> bool {
+fn due(node: &str, what: &str, now: u64) -> bool {
     let mut given = GIVEN.lock().expect("nothing panics holding this");
     given.retain(|_, at| now < *at + AT_MOST_EVERY);
     !given.contains_key(&(node.to_string(), what.to_string()))
 }
 
 /// One was given: no more for a minute.
-pub(crate) fn spend(node: &str, what: &str, now: u64) {
+fn spend(node: &str, what: &str, now: u64) {
     let mut given = GIVEN.lock().expect("nothing panics holding this");
     given.insert((node.to_string(), what.to_string()), now);
 }
@@ -167,7 +167,7 @@ pub async fn issue(
 /// Why a node was not given a certificate: the CA holder refused (the pod may not have one),
 /// or it could not be asked or did not sign this time.
 #[derive(Debug)]
-pub(crate) enum Unmade {
+enum Unmade {
     Refused(String),
     Failed(String),
 }
@@ -195,7 +195,7 @@ fn fresh(pod: &Path, identity: &str) -> bool {
 }
 
 /// The CA holders to ask: every Node that says it holds the CA key and has an address to ask.
-pub(crate) fn holders(store: &Store) -> Vec<Upstream> {
+fn holders(store: &Store) -> Vec<Upstream> {
     let holds = |node: &&kith_api::Resource| node.status.as_ref().is_some_and(|status| status["ca"] == true);
     store
         .list(Some("Node"))
@@ -207,7 +207,7 @@ pub(crate) fn holders(store: &Store) -> Vec<Upstream> {
 /// Asks the CA holders in turn, the one that last answered (`answered`) first, until one
 /// answers: its text, and the address it was asked at. A refusal is an answer too, and stops
 /// the walk. When none answers, the first failure (or that none is known).
-pub(crate) async fn walk<F, Fut>(
+async fn walk<F, Fut>(
     mut holders: Vec<Upstream>,
     answered: &Mutex<Option<String>>,
     ask: F,
