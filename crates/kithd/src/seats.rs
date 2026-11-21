@@ -782,7 +782,12 @@ spec:
             );
             Resource::from_source(&source).unwrap().remove(0).unwrap()
         };
-        let inputs = |tv: &Tv| plan(&tv.store, "a", &tv.dir).remove(0).inputs;
+        let inputs = |tv: &Tv| {
+            plan(&tv.store, "a", &tv.dir)
+                .into_iter()
+                .flat_map(|plan| plan.inputs)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(inputs(&tv), [tv.dir.join("input/event0").to_string_lossy()]);
         for path in [
             "/dev/input/../x",
