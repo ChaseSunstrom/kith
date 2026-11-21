@@ -17,6 +17,7 @@
 | `crates/kith-dm-sys` | The one crate of the workspace with `unsafe`: device-mapper, loop devices, growing a file system and a partition's new length, by ioctl, for encrypted volumes and kith OS's state |
 | `crates/kith-mesh` | The mesh: addresses and peers worked out from the nodes, and the kernel's WireGuard set up over netlink |
 | `crates/kith-kube` | Kubernetes objects read as the kith resources they mean, with a table of what becomes of every field: carried over, taken and said to change nothing, or refused |
+| `crates/kith-docker` | The Docker Engine API over a Unix socket, for `kith docker serve` (cargo feature `docker`): std only, a thread per connection |
 | `crates/kithd` | The daemon: API server, store replica, scheduler, mesh, DNS and Workload controller |
 | `sdk/kith-controller` | The SDK for controllers and admission hooks in WebAssembly, with an example (its own workspace: it builds for wasm32) |
 | `os/` | kith OS: what builds its image (`build.sh`), an update (`update.sh`) and the installer for a rented machine (`vps.sh`), and the kernel's configuration |

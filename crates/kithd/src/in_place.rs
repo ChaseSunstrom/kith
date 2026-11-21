@@ -887,8 +887,17 @@ mod pass {
         let rig = Rig::new(SMALL);
         assert!(rig.cut(Point::HeaderBoth, 3));
         rig.crash(Crash::Kept);
+        // The pass's random id with 0xff at byte 20 of the header, as one pass in 256 has it.
+        let (Some(mut head), _, _) = heads(&rig.journal).unwrap() else {
+            panic!("no header")
+        };
+        head.id[4] = 0xff;
+        for at in [HEAD1, HEAD2] {
+            rig.journal.file.write_all_at(&head.bytes(), at).unwrap();
+        }
+        // So the damage goes in the magic, which 0xff always changes (at byte 20 it changed nothing).
         for head in [HEAD1, HEAD2] {
-            rig.journal.file.write_all_at(&[0xff], head + 20).unwrap();
+            rig.journal.file.write_all_at(&[0xff], head + 4).unwrap();
         }
         let before = (rig.raw.on_disk(), rig.journal.on_disk());
         let why = rig.run(&mut |_| Ok(())).unwrap_err().to_string();

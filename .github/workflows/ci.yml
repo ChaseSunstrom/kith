@@ -32,8 +32,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       # kith's remote feature (--server, TLS to a node) is off in the workspace build: its code is built and tested here.
-      - run: cargo clippy -p kith-cli --all-targets --features remote -- -D warnings
-      - run: cargo test -p kith-cli --features remote
+      # `docker` (kith docker serve) is on in the kith-remote build only, so it is built and tested here too.
+      - run: cargo clippy -p kith-cli --all-targets --features remote,docker -- -D warnings
+      - run: cargo test -p kith-cli --features remote,docker
       # kithd's forge feature (a leader appends an entry it was not asked for; the access VM test) is in no release build: its code is built and tested here.
       - run: cargo clippy -p kithd --all-targets --features forge -- -D warnings
       # kithd's fido2-test feature (a software security key on /dev/uhid; the fido2 VM test) is in no release build either.

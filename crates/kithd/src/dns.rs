@@ -1612,6 +1612,88 @@ spec: { headless: true, selector: { app: db }, ports: [{ port: 80 }] }
         assert_eq!(gone.lookup(client, "db.prod.kith", 28).unwrap().rcode, 3);
     }
 
+    /// The response code, answer count and authority count (the SOA) a Service's names give to A, AAAA
+    /// and TXT, for each shape a Service can be in. A name the zone holds with none of the type asked
+    /// is NODATA (0, no answer, the SOA); a name it does not hold is NXDOMAIN (3, the SOA). As Kubernetes
+    /// answers: a client holds the second for the SOA's minimum, so a wrong one hides a Service.
+    #[test]
+    fn a_services_names_answer_each_type_with_its_rcode_and_counts() {
+        let mut store = store(
+            "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db, namespace: prod, labels: { app: db } }
+spec:
+  replicas: 1
+  template:
+    containers: [{ name: main, image: example.org/db }]
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: headless, namespace: prod }
+spec: { headless: true, selector: { app: db }, ports: [{ port: 80 }] }
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: plain, namespace: prod }
+spec: { selector: { app: db }, ports: [{ port: 80 }] }
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: addressed, namespace: prod }
+spec: { selector: { app: db }, ports: [{ port: 80 }] }
+",
+        );
+        store
+            .set_status("Service/prod/addressed", Some(json!({ "addressV4": "100.87.0.5" })))
+            .unwrap();
+        let client = "10.0.0.1".parse().unwrap();
+        let (a, aaaa, txt) = (1, 28, 16);
+        // Each as (rcode, answers, authority).
+        let nodata = (0, 0, 1);
+        let nxdomain = (3, 0, 1);
+        let answered = (0, 1, 0);
+        let (bare, _) = zones_of(&store, None);
+        let (meshed, _) = zones_of(&store, Some(kith_mesh::prefix(b"test")));
+        // A node with no IPv4 range for Services answers no A for any.
+        let (no_range, _) = zones_serving(&store, None, None);
+        // (the Service asked, the zones asked, what A, AAAA and TXT each give)
+        let cases = [
+            // Headless, no replica ready: the name is there with no records, with or without a mesh.
+            ("headless", &bare, [nodata, nodata, nodata]),
+            ("headless", &meshed, [nodata, nodata, nodata]),
+            // Not headless, no mesh prefix and no IPv4 address: nothing to answer, still there.
+            ("plain", &bare, [nodata, nodata, nodata]),
+            // Not headless, a mesh prefix and no IPv4 address: AAAA is its address, A is NODATA.
+            ("plain", &meshed, [nodata, answered, nodata]),
+            // Not headless, an IPv4 address and no mesh prefix: A answered, AAAA NODATA.
+            ("addressed", &bare, [answered, nodata, nodata]),
+            ("addressed", &meshed, [answered, answered, nodata]),
+            ("addressed", &no_range, [nodata, nodata, nodata]),
+            // A Service that is not there is a missing name, whatever the type.
+            ("missing", &meshed, [nxdomain, nxdomain, nxdomain]),
+            ("missing", &bare, [nxdomain, nxdomain, nxdomain]),
+        ];
+        for (service, zones, expected) in cases {
+            for suffix in ["kith", "svc.cluster.local"] {
+                for (qtype, expected) in [a, aaaa, txt].into_iter().zip(expected) {
+                    let name = format!("{service}.prod.{suffix}");
+                    let found = zones.lookup(client, &name, qtype).unwrap();
+                    let got = (found.rcode, found.answers.len(), found.authority.len());
+                    assert_eq!(got, expected, "{name} type {qtype}");
+                }
+            }
+        }
+        // A namespace that is not there likewise.
+        for name in ["headless.nowhere.kith", "plain.nowhere.svc.cluster.local"] {
+            for qtype in [a, aaaa, txt] {
+                let found = meshed.lookup(client, name, qtype).unwrap();
+                let got = (found.rcode, found.answers.len(), found.authority.len());
+                assert_eq!(got, nxdomain, "{name} type {qtype}");
+            }
+        }
+    }
+
     #[test]
     fn a_service_or_namespace_with_a_dot_in_its_name_is_not_served() {
         // A Service `db-0` in namespace `db.prod` would name `db-0.db.prod.svc.cluster.local`, which
