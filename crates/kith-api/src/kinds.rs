@@ -1619,7 +1619,9 @@ pub fn home_endpoint_refused(text: &str) -> Option<String> {
 /// may not resolve one (DNSSEC checks a signature's dates against it).
 pub fn ntp_server(word: &str) -> Option<std::net::SocketAddr> {
     use std::net::{IpAddr, SocketAddr};
-    word.parse().ok().or_else(|| word.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 123)))
+    word.parse()
+        .ok()
+        .or_else(|| word.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 123)))
 }
 
 impl Spec for ClusterSpec {

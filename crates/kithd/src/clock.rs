@@ -5,7 +5,8 @@
 //! than two seconds. Asked again about every hour, never under a minute apart.
 //!
 //! Whose time: the server the operator told (`kith.ntp=ADDRESS[:PORT]` on the kernel command
-//! line, or the installer's `ntp:`); where none is told, what the network says (a server its
+//! line, or the installer's `ntp:`; where the node has none, the Cluster's `spec.ntp`, read at
+//! each check, and a change to it asked within a minute); where none is told, what the network says (a server its
 //! DHCP names by option 42, then its gateway: anyone on the wire can say these, so they are
 //! not asked while the operator's is); and the cluster's leader (`GET /v1/clock` on the
 //! cluster port, a node asking another over mutual TLS: a closed network with one clock in
@@ -13,7 +14,15 @@
 //! The operator's server is followed alone, by any step. Before the clock was ever set (it reads
 //! before `FLOOR_US`) the first answer is enough; after, a network's word alone moves it by ten
 //! seconds in all (`ONE_SOURCE_US`), and more takes the leader to agree (the servers of one
-//! network do not vouch for each other: see `ask`). While the clock is
+//! network do not vouch for each other: see `ask`).
+//!
+//! A leader's word is only as good as its own clock: `/v1/clock` says `kith-clock: server` beside
+//! the time when a server (or a leader that said so) set or confirmed this node's clock, and
+//! nothing where none did. A leader that does not say it is one source (the ten seconds above)
+//! to a node a server set, and to a voter that most voters agree with (it asks the others, not
+//! the leader, at each check: itself and those within two seconds of it, over half the voters);
+//! otherwise it is followed as before, so a closed network with no server still has one time.
+//! The status says why a step was not taken. While the clock is
 //! unset, `/v1/clock` answers 503: a node that reads 1970 is no one's time. What it found is
 //! in this Node's status as `clock`: `{server, offsetMs, delayMs, stepped, checked}`, or
 //! `{error, checked}` where no one answered. A step is written to the hardware clock too
@@ -308,7 +317,11 @@ async fn time_of(address: &str, client: &reqwest::Client) -> Result<Said, String
 async fn heard(shared: &Shared) -> Heard {
     if shared.cluster.is_none() {
         let leader = Err("this node is not in a cluster".into());
-        return Heard { leader, others: Vec::new(), voters: 0 };
+        return Heard {
+            leader,
+            others: Vec::new(),
+            voters: 0,
+        };
     }
     let upstream = shared
         .upstream
@@ -318,7 +331,11 @@ async fn heard(shared: &Shared) -> Heard {
     // (A worker asks the control node it follows, and no one else: it holds no voter's address.)
     if let Some((address, client)) = upstream {
         let leader = time_of(&address, &client).await;
-        return Heard { leader, others: Vec::new(), voters: 0 };
+        return Heard {
+            leader,
+            others: Vec::new(),
+            voters: 0,
+        };
     }
     let metrics = shared.raft.metrics().borrow().clone();
     let membership = metrics.membership_config.membership().clone();
@@ -528,9 +545,9 @@ async fn ask(
     } else if !corroborated && *spent + off > ONE_SOURCE_US {
         let seconds = sample.offset_us as f64 / 1e6;
         Some(Err(match &demoted {
-            Some(whose) => format!(
-                "{server} says the clock is {seconds:+.1} s off, and no time server set its clock: {whose}"
-            ),
+            Some(whose) => {
+                format!("{server} says the clock is {seconds:+.1} s off, and no time server set its clock: {whose}")
+            }
             None => format!("{server} says the clock is {seconds:+.1} s off and no second source agrees"),
         }))
     } else {
@@ -723,7 +740,18 @@ mod tests {
         told: bool,
     ) -> Value {
         let mark = &mut false;
-        super::ask(servers, wait, alone(leader), set_to, |_| Ok(()), synced, told, &mut 0, mark).await
+        super::ask(
+            servers,
+            wait,
+            alone(leader),
+            set_to,
+            |_| Ok(()),
+            synced,
+            told,
+            &mut 0,
+            mark,
+        )
+        .await
     }
 
     /// What the cluster says when its leader says `leader` with no mark (as one of before the mark
@@ -996,7 +1024,18 @@ mod tests {
                 .ok_or("not in a cluster".to_string())
         };
         let before = now_us();
-        let said = super::ask(&servers, SOON, alone(leader), record, |_| Ok(()), true, told, spent, &mut false).await;
+        let said = super::ask(
+            &servers,
+            SOON,
+            alone(leader),
+            record,
+            |_| Ok(()),
+            true,
+            told,
+            spent,
+            &mut false,
+        )
+        .await;
         (set_to.get().map(|to| to - before), said)
     }
 
@@ -1133,7 +1172,18 @@ mod tests {
                 .ok_or("not in a cluster".to_string())
         };
         let server = fake(skew, |_| {}).await;
-        let said = super::ask(&[server], SOON, alone(leader), set_to, set_rtc, false, told, &mut 0, &mut false).await;
+        let said = super::ask(
+            &[server],
+            SOON,
+            alone(leader),
+            set_to,
+            set_rtc,
+            false,
+            told,
+            &mut 0,
+            &mut false,
+        )
+        .await;
         (system.get(), rtc.get(), said)
     }
 
@@ -1293,7 +1343,18 @@ mod tests {
         };
         let mut mark = mine;
         let before = now_us();
-        let said = super::ask(&[], SOON, async { heard }, record, |_| Ok(()), synced, false, spent, &mut mark).await;
+        let said = super::ask(
+            &[],
+            SOON,
+            async { heard },
+            record,
+            |_| Ok(()),
+            synced,
+            false,
+            spent,
+            &mut mark,
+        )
+        .await;
         (set_to.get().map(|to| to - before), said, mark)
     }
 
@@ -1303,9 +1364,15 @@ mod tests {
         // whose own clock a server set keeps its time, and says why.
         let (to, said, mark) = from_cluster(EIGHT_HOURS, false, &[], 3, true, true, &mut 0).await;
         assert_eq!(to, None, "{said}");
-        assert_eq!((said["stepped"].clone(), said["server"].clone()), (false.into(), "the cluster's leader".into()));
+        assert_eq!(
+            (said["stepped"].clone(), said["server"].clone()),
+            (false.into(), "the cluster's leader".into())
+        );
         let why = said["error"].as_str().unwrap();
-        assert!(why.contains("no time server set its clock") && why.contains("a time server set this node's"), "{said}");
+        assert!(
+            why.contains("no time server set its clock") && why.contains("a time server set this node's"),
+            "{said}"
+        );
         assert!((said["offsetMs"].as_i64().unwrap() - 28_800_000).abs() < 10, "{said}");
         assert!(mark, "a step not taken leaves the node's mark");
         // In a cluster of two as well: the node's own mark is enough.
@@ -1329,10 +1396,22 @@ mod tests {
         let (to, said, mark) = from_cluster(EIGHT_HOURS, false, &[300_000], 3, false, true, &mut 0).await;
         assert_eq!(to, None, "{said}");
         let why = said["error"].as_str().unwrap();
-        assert!(why.contains("no time server set its clock") && why.contains("2 of 3 voters"), "{said}");
+        assert!(
+            why.contains("no time server set its clock") && why.contains("2 of 3 voters"),
+            "{said}"
+        );
         assert!(!mark);
         // Five voters: two others agree, one is with the leader: three of five.
-        let (to, said, _) = from_cluster(EIGHT_HOURS, false, &[0, -1_500_000, EIGHT_HOURS], 5, false, true, &mut 0).await;
+        let (to, said, _) = from_cluster(
+            EIGHT_HOURS,
+            false,
+            &[0, -1_500_000, EIGHT_HOURS],
+            5,
+            false,
+            true,
+            &mut 0,
+        )
+        .await;
         assert_eq!(to, None, "{said}");
         // One of four others agreeing is two of five: no majority, and the leader is followed.
         let (to, said, _) = from_cluster(EIGHT_HOURS, false, &[0, EIGHT_HOURS], 5, false, true, &mut 0).await;
@@ -1371,7 +1450,18 @@ mod tests {
         let mark = |servers: Vec<SocketAddr>, leader: Result<Sample, String>, mine: bool| async move {
             let mut mark = mine;
             let heard = async { alone(async { leader }).await };
-            super::ask(&servers, SOON, heard, |_| Ok(()), |_| Ok(()), true, false, &mut 0, &mut mark).await;
+            super::ask(
+                &servers,
+                SOON,
+                heard,
+                |_| Ok(()),
+                |_| Ok(()),
+                true,
+                false,
+                &mut 0,
+                &mut mark,
+            )
+            .await;
             mark
         };
         let near = Sample {
@@ -1413,7 +1503,18 @@ mod tests {
         let mut mark = true;
         let servers = [fake(0, |_| {}).await];
         let heard = async { leader(EIGHT_HOURS) };
-        let said = super::ask(&servers, SOON, heard, |_| Ok(()), |_| Ok(()), true, false, &mut 0, &mut mark).await;
+        let said = super::ask(
+            &servers,
+            SOON,
+            heard,
+            |_| Ok(()),
+            |_| Ok(()),
+            true,
+            false,
+            &mut 0,
+            &mut mark,
+        )
+        .await;
         assert_eq!(said["stepped"], false, "{said}");
         assert!(said["server"].as_str().unwrap().starts_with("127.0.0.1:"), "{said}");
         assert!(mark);
@@ -1424,7 +1525,18 @@ mod tests {
             Ok(())
         };
         let heard = async { leader(EIGHT_HOURS) };
-        let said = super::ask(&[nobody().await], SOON, heard, record, |_| Ok(()), true, true, &mut 0, &mut mark).await;
+        let said = super::ask(
+            &[nobody().await],
+            SOON,
+            heard,
+            record,
+            |_| Ok(()),
+            true,
+            true,
+            &mut 0,
+            &mut mark,
+        )
+        .await;
         assert!(!stepped.get(), "{said}");
     }
 
@@ -1437,20 +1549,33 @@ mod tests {
             gateway: Some([10, 0, 0, 1].into()),
         };
         // The Cluster's server is the only one asked, and followed alone.
-        assert_eq!(whose(&network, Some(at("10.0.0.7:123"))), (vec![at("10.0.0.7:123")], true));
+        assert_eq!(
+            whose(&network, Some(at("10.0.0.7:123"))),
+            (vec![at("10.0.0.7:123")], true)
+        );
         // The node's own `kith.ntp` (the more specific word) wins over it.
         let told = Sources {
             told: Some(at("10.0.0.9:5123")),
             ..network
         };
-        assert_eq!(whose(&told, Some(at("10.0.0.7:123"))), (vec![at("10.0.0.9:5123")], true));
+        assert_eq!(
+            whose(&told, Some(at("10.0.0.7:123"))),
+            (vec![at("10.0.0.9:5123")], true)
+        );
         // Neither: the network's, not followed alone.
         let network = Sources { told: None, ..told };
-        assert_eq!(whose(&network, None), (vec![at("10.0.0.8:123"), at("10.0.0.1:123")], false));
+        assert_eq!(
+            whose(&network, None),
+            (vec![at("10.0.0.8:123"), at("10.0.0.1:123")], false)
+        );
         // What the Clusters say: the lowest key's, so every node takes the same.
         let mut store = kith_api::store::Store::default();
         assert_eq!(cluster_ntp(&store), None);
-        for (name, spec) in [("b", "{ ntp: 10.0.0.8 }"), ("c", "{}"), ("a", "{ ntp: '10.0.0.7:5123' }")] {
+        for (name, spec) in [
+            ("b", "{ ntp: 10.0.0.8 }"),
+            ("c", "{}"),
+            ("a", "{ ntp: '10.0.0.7:5123' }"),
+        ] {
             let text = format!("apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: {name} }}\nspec: {spec}\n");
             let resource = kith_api::Resource::from_source(&text).unwrap().remove(0);
             store.apply(resource.unwrap()).unwrap();

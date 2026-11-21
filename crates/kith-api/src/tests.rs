@@ -1452,7 +1452,8 @@ fn cluster_fields_nothing_reads_are_named() {
 #[test]
 fn cluster_ntp_is_an_address_or_an_address_and_port() {
     let cluster = |ntp: &str| {
-        let text = format!("apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec:\n  ntp: '{ntp}'\n");
+        let text =
+            format!("apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec:\n  ntp: '{ntp}'\n");
         Resource::from_source(&text)
             .and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>())
             .map(|mut docs| docs.remove(0))

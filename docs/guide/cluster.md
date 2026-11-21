@@ -466,6 +466,39 @@ the mesh's loop, never holding it: until the first answer the holder is called w
 answer is kept and looked up again each minute (each half minute while it does not resolve), and
 kithd logs when it starts or stops resolving, not on each try.
 
+### One time for the cluster
+
+Each node keeps its clock from an SNTP server and from the cluster's leader ([the
+OS](os.md)). Name the time server once for every node in the `Cluster`:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Cluster
+metadata: {name: home}
+spec:
+  ntp: 192.168.1.1        # ADDRESS or ADDRESS:PORT (123 when left out)
+```
+
+Every node reads it at its next check, and asks it alone, as if it had been told
+`kith.ntp=`; a change is asked within a minute. A node's own `kith.ntp` (or its installer's
+`ntp:`) wins over it. Anything but an address, or an address and port, is refused at apply
+naming `spec.ntp`; where two Clusters name different servers, the one with the lowest name is
+taken.
+
+The leader's time outweighs a server's only while a server set the leader's own clock: its
+answer to `/v1/clock` says `kith-clock: server` then. A leader that does not say it (one that
+started hours off, with no server in reach) is held to ten seconds of steps, like any one
+source, by a node a server set and by a voter that most voters agree with: each voter asks the
+other voters too, and when itself and those within two seconds of it are over half of them, the
+leader's step is not taken and the status says why ("no time server set its clock: 2 of 3
+voters agree with this node's"). Otherwise the leader is followed, so a cluster with no server
+still keeps one time. With two voters a follower has no one else to ask: it follows a leader
+no server set unless a server set its own clock, so name one in `spec.ntp`.
+
+- Tested: `sh ci/vm.sh --test clockleader` stops three nodes with no time server, starts one
+  eight hours ahead, and lets it lead: the other two keep their time within five seconds and
+  say why.
+
 ### Usage over time
 
 Each kithd samples its machine every 10 seconds (CPU, memory, the disk under `--state`, disk

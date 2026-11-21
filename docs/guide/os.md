@@ -18,10 +18,17 @@ As process 1, kithd:
 - keeps the time: a machine has no clock battery to trust, so after the network is up kithd asks
   an SNTP server for the time at start and every hour, and sets the clock when it is more than
   two seconds off. The server is the one you name, `kith.ntp=ADDRESS[:PORT]` (the only one asked
-  when set: what a network says is whatever a machine on it sent); where none is named, the one
+  when set: what a network says is whatever a machine on it sent), or for every node at once the
+  Cluster's `spec.ntp` (a node's own `kith.ntp` wins over it; a change is asked within a minute);
+  where none is named, the one
   DHCP names (option 42), then the gateway. The cluster's leader (a worker asks its control node)
   is asked too, over the cluster's own TLS, and its time wins over a server over two seconds
-  from it. The server you name is followed alone, whatever the step. Before the clock was ever
+  from it, as long as a server set the leader's own clock: its answer says so (`kith-clock:
+  server`). A leader whose clock no server set (one restarted hours off, on a network with no
+  server) is one more source, held to the ten seconds below, by a node a server set and by a
+  voter most voters agree with (each voter asks the others at each check); the status says why
+  its step was not taken. With neither, it is followed as before: a closed network with no
+  server still keeps one time. The server you name is followed alone, whatever the step. Before the clock was ever
   set (it reads before 2026) the first answer is enough; after that a network's word alone moves
   it by ten seconds in all (its steps together, until the leader agrees), and more needs the
   leader within a second of the same time (servers a network names do not vouch for each

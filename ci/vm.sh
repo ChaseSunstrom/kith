@@ -10,6 +10,7 @@
 #   sh ci/vm.sh --test image    kith OS's disk image (os/build.sh), booted under UEFI on a longer disk
 #   sh ci/vm.sh --test update   that image updating itself, and going back when it must
 #   sh ci/vm.sh --test clock    the node's clock started hours off, stepped to an SNTP server's time
+#   sh ci/vm.sh --test clockleader  three nodes with no time server: one leads 8 h ahead, the others keep theirs
 #   sh ci/vm.sh --test disk     a disk file made a data disk and mounted, another left alone
 #   sh ci/vm.sh --test encrypt  a plain node's disk file encrypted in place at its start, cut mid-pass, resumed
 #   sh ci/vm.sh --test rollout  three nodes of it taking a release, one at a time
@@ -113,6 +114,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    server on the host's loopback answers (ci/vm/sntp_standin.py), and the
                    node, told of it by kith.ntp=10.0.2.2:PORT, steps its clock to its time;
                    same needs as image, and python3
+  --test clockleader instead: three nodes as for rollout, no time server for any; all lose
+                   power, one starts again eight hours ahead and leads, the others start
+                   after it: each keeps the host's time within 5 s and says why it did not
+                   take the leader's (2 of 3 voters agree with it); same needs as rollout
   --test modules   instead: the 'all' image (its drivers are modules, signed with the key of its
                    build): kithd loads the driver of an HDA controller at start, and of a USB
                    audio device the monitor adds later, in the same boot; the same spec built
@@ -411,7 +416,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | nested | nofile | alone | disk | clock | encrypt | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, encrypt, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, nested, nofile, fido2" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | nested | nofile | alone | disk | clock | clockleader | encrypt | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, clockleader, disk, encrypt, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, nested, nofile, fido2" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1

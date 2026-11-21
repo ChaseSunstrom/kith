@@ -146,6 +146,7 @@ sh ci/vm.sh --test init                                 # and: it serves, then r
 sh ci/vm.sh --test image                                # kith OS's image: UEFI, verity root, DHCP, state, tampering
 sh ci/vm.sh --test update                               # and its two slots: an update, marked good; a broken one, gone back from
 sh ci/vm.sh --test chaos                                # three nodes: each cut off in turn, each reset in turn, all reset at once, while writes go on
+sh ci/vm.sh --test clockleader                          # three nodes, no time server: one leads 8 h ahead, the others keep their time
 sh ci/vm.sh --test access                               # three nodes: a RoleBinding deleted while one is cut off; no write after it is kept
 sh ci/vm.sh --test fido2                                # a test-build kithd's FIDO2 client against its software key (uhid, hidraw): the hmac-secret each seed says, a withheld touch timed out
 sh ci/vm.sh --test pods                                 # two nodes: pods with a network, an address and a root each
