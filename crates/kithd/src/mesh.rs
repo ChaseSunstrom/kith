@@ -351,13 +351,86 @@ pub(crate) fn rotate_name(id: &str) -> bool {
     (1..=64).contains(&id.chars().count()) && !id.chars().any(char::is_control)
 }
 
+/// Where the last rotation this node ended is kept (`mesh.rotated` beside `mesh.key`): a node that
+/// starts again with `spec.mesh.rotate` still naming it does not do it again (T-1056).
+fn rotated_path(key: &std::path::Path) -> PathBuf {
+    key.with_extension("rotated")
+}
+
+/// A rotation given up, with the last one that was done (a node's status may not say it any more).
+fn failure(id: &str, done: Option<&String>) -> Value {
+    match done {
+        Some(done) => json!({ "failed": id, "was": done }),
+        None => json!({ "failed": id }),
+    }
+}
+
+/// `ended` kept: `{"done": id, "key": the new public key}` or `failure`'s (`was`: the last done), whole or not at all, and
+/// not written again when it is what is there. A done one is kept before the commit that makes it so,
+/// so no crash leaves a done rotation unkept. A directory that will not sync is said, and is no
+/// failure once the file is renamed (as `write_key`).
+fn record(key: &std::path::Path, ended: Value) -> Result<(), String> {
+    use std::io::Write;
+    let path = rotated_path(key);
+    let text = ended.to_string();
+    if std::fs::read(&path).is_ok_and(|had| had == text.as_bytes()) {
+        return Ok(());
+    }
+    let new = path.with_extension("rotated.new");
+    let wrote = (|| {
+        let mut file = std::fs::File::create(&new)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&new, &path)
+    })();
+    wrote.map_err(|e| format!("keeping {}: {e}", path.display()))?;
+    let dir = key
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let synced = || std::fs::File::open(dir)?.sync_all();
+    if let Err(e) = synced().or_else(|_| synced()) {
+        eprintln!(
+            "kithd: mesh: {} is written, but its directory is not synced: {e}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// The rotations that were ended before this start, as (given up, done). A done one counts only if
+/// the node runs on the key it made (`public`): a crash between the record and the commit leaves the
+/// old key, and that rotation is given up (not rotated again, nor said done). A file that is not
+/// ours, or torn, is none.
+fn recorded(key: &std::path::Path, public: &Key) -> (Option<String>, Option<String>) {
+    let kept = std::fs::read(rotated_path(key)).ok();
+    let kept = kept.and_then(|text| serde_json::from_slice::<Value>(&text).ok());
+    let id = |field: &str| {
+        kept.as_ref()?[field]
+            .as_str()
+            .filter(|id| rotate_name(id))
+            .map(str::to_string)
+    };
+    match (id("done"), id("failed")) {
+        (Some(id), _) if kept.as_ref().is_some_and(|k| k["key"] == hex(public)) => (None, Some(id)),
+        (Some(id), _) => (Some(id), None),
+        // (A given-up one carries the last done: that one was committed.)
+        (None, failed) => (failed, id("was")),
+    }
+}
+
+/// The rotation `spec.mesh.rotate` asks for, unless it was done or given up.
+fn to_rotate(spec: Option<String>, rotated: Option<&String>, failed: Option<&String>) -> Option<String> {
+    spec.filter(|id| rotated != Some(id) && failed != Some(id))
+}
+
 /// How long each of a key's two waits lasts (for the peers to take the new key, then for them to
 /// shake hands on it) before the node goes back to the old key it never left the file of.
 const ROTATE_WAIT: Duration = Duration::from_secs(120);
 
 /// A rotation of this node's key under way (T-1017), as this node holds it. In memory only: a
 /// node that stops in the middle has `mesh.key` still the old key and starts on it, and what it
-/// says first leaves out the `next` it said.
+/// says first leaves out the `next` it said. (How one ended is kept: `record`.)
 struct Rotation {
     /// What `spec.mesh.rotate` said: made once for each name.
     id: String,
@@ -510,8 +583,10 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     let mut asked = None;
     eprintln!("kithd: mesh address {address} on {}", options.interface);
     let mut base = says_of(&public, address, options.port);
-    // A key's replacement under way, the rotation that was last given up, and the last one that was done.
-    let (mut rotation, mut failed, mut done): (Option<Rotation>, Option<String>, Option<String>) = (None, None, None);
+    // A key's replacement under way, the rotation that was last given up, and the last one that was done
+    // (the last two as kept beside the key file, so a start does not make them again).
+    let mut rotation: Option<Rotation> = None;
+    let (mut failed, mut done) = recorded(&options.key, &public);
     // When each other node first said the `next` it says now.
     let mut said_next: BTreeMap<String, Instant> = BTreeMap::new();
     let node = format!("Node/{me}");
@@ -605,7 +680,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
             let services = crate::services::addresses(&state.store, prefix);
             let home = home_endpoint(&state.store, me, &members, &shook);
-            let turns = (spec.filter(|id| rotated.as_ref() != Some(id)), took, nexts);
+            let turns = (to_rotate(spec, rotated.as_ref(), failed.as_ref()), took, nexts);
             (members, mine, said, edge, services.into_values().collect(), home, turns)
         };
         let (asking, took, nexts) = turns;
@@ -618,9 +693,15 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             .filter_map(|member| Some((member.name.clone(), shook.get(&member.key).copied().flatten()?)))
             .collect();
         let step = |step| crate::root_part::mesh_key_step(&root, &options.interface, step);
+        // A rotation given up is kept (a failure to keep it is said: it may be tried again after a restart).
+        let give_up = |id: &str, done: Option<&String>| {
+            if let Err(e) = record(&options.key, failure(id, done)) {
+                eprintln!("kithd: mesh: {e}");
+            }
+        };
         let mut moved = true;
         match rotation.take() {
-            None => match asking.filter(|id| failed.as_ref() != Some(id)) {
+            None => match asking {
                 // (One node at a time: two that switch together have no key to call each other by.)
                 Some(_) if waiting => moved = false,
                 Some(id) => {
@@ -650,11 +731,13 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
                             eprintln!(
                                 "kithd: mesh: not replacing the key ({id}): no peer is reached to take the new one"
                             );
+                            // (Not kept: no handshake has happened yet on the first pass after a start.)
                             failed = Some(id);
                         }
                         (false, made) => {
                             let why = made.err().unwrap_or_default();
                             eprintln!("kithd: mesh: not replacing the key ({id}): {why}");
+                            give_up(&id, done.as_ref());
                             failed = Some(id);
                         }
                     }
@@ -676,7 +759,10 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
                         Ok(_) => Err("the interface did not answer with the new key".to_string()),
                         Err(e) => Err(e),
                     },
-                    Turn::Commit => step(KeyStep::Commit).map(|_| true),
+                    // (Kept first: a crash between the two has the node on its old key, which `recorded` reads as given up.)
+                    Turn::Commit => record(&options.key, json!({ "done": active.id, "key": hex(&active.next) }))
+                        .and_then(|()| step(KeyStep::Commit))
+                        .map(|_| true),
                     Turn::Revert(why) => Err(why.to_string()),
                 };
                 match went {
@@ -688,21 +774,25 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
                         failed = None;
                     }
                     Ok(false) => rotation = Some(active),
-                    // (The old key back first: only once it is, the others are told to forget the new one.)
-                    Err(why) => match step(KeyStep::Revert) {
-                        Ok(_) => {
-                            eprintln!(
-                                "kithd: mesh: the key replacement {} is given up ({why}): this node keeps its old key",
-                                active.id
-                            );
-                            failed = Some(active.id);
+                    // (Kept first, as the commit is: a revert that fails is tried every pass, and a start in
+                    // between gives up. The old key back before the others are told to forget the new one.)
+                    Err(why) => {
+                        give_up(&active.id, done.as_ref());
+                        match step(KeyStep::Revert) {
+                            Ok(_) => {
+                                eprintln!(
+                                    "kithd: mesh: the key replacement {} is given up ({why}): this node keeps its old key",
+                                    active.id
+                                );
+                                failed = Some(active.id);
+                            }
+                            Err(e) => {
+                                eprintln!("kithd: mesh: going back to the old key: {e}");
+                                rotation = Some(active);
+                                moved = false;
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("kithd: mesh: going back to the old key: {e}");
-                            rotation = Some(active);
-                            moved = false;
-                        }
-                    },
+                    }
                 }
             }
         }
@@ -1530,6 +1620,51 @@ mod tests {
         assert_eq!(said(start).len(), 1);
         assert_eq!(said(start + ROTATE_WAIT - Duration::from_secs(1)).len(), 1);
         assert!(said(start + ROTATE_WAIT).is_empty());
+    }
+
+    /// A rotation ended is kept beside `mesh.key` (T-1056): a node that starts again, with
+    /// `spec.mesh.rotate` still naming it, does not rotate again, whether or not its status said so.
+    #[test]
+    fn a_rotation_ended_is_remembered_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("kith-rotated-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("mesh.key");
+        let (old, new) = ([1; 32], [2; 32]);
+        let read = |public: &Key| recorded(&key, public);
+        // Nothing kept, torn or not ours: nothing ended.
+        assert_eq!(read(&old), (None, None));
+        std::fs::write(rotated_path(&key), b"{\"done\": \"r1\"").unwrap();
+        assert_eq!(read(&old), (None, None));
+        std::fs::write(rotated_path(&key), b"[1]").unwrap();
+        assert_eq!(read(&old), (None, None));
+        // Done: written before the key file is, so it is done only if the node starts on the new key.
+        record(&key, json!({ "done": "r1", "key": hex(&new) })).unwrap();
+        assert_eq!(read(&new), (None, Some("r1".to_string())));
+        // (A crash after the record and before the commit: the old key is still the node's. Given up.)
+        assert_eq!(read(&old), (Some("r1".to_string()), None));
+        // Given up stays so, and a later end replaces the earlier one.
+        record(&key, json!({ "failed": "r2" })).unwrap();
+        assert_eq!(read(&old), (Some("r2".to_string()), None));
+        // A given-up one keeps the last done name too: it is still skipped when the status is gone.
+        record(&key, failure("r2", Some(&"r1".to_string()))).unwrap();
+        assert_eq!(read(&old), (Some("r2".to_string()), Some("r1".to_string())));
+        // The same text again is not written again (a revert that fails is tried every pass).
+        // (A write is a rename: a new file. The one that is there stays.)
+        let inode = || std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(rotated_path(&key)).unwrap());
+        let had = inode();
+        record(&key, failure("r2", Some(&"r1".to_string()))).unwrap();
+        assert_eq!(inode(), had);
+        record(&key, failure("r3", None)).unwrap();
+        assert_ne!(inode(), had);
+        // (No leftover temp file.)
+        assert!(!dir.join("mesh.rotated.new").exists());
+        // What was asked is not asked again when it ended either way; a new name still is.
+        let (r1, r2, r3) = ("r1".to_string(), "r2".to_string(), "r3".to_string());
+        assert_eq!(to_rotate(Some(r1.clone()), Some(&r1), None), None);
+        assert_eq!(to_rotate(Some(r2.clone()), None, Some(&r2)), None);
+        assert_eq!(to_rotate(Some(r3.clone()), Some(&r1), Some(&r2)), Some(r3));
+        assert_eq!(to_rotate(None, None, None), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A key is exactly 64 lower-case hex digits: one text per key, so that comparing the texts
