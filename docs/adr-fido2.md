@@ -97,7 +97,7 @@ and answers the client's CTAPHID frames. Candidates, checked:
 | QEMU `canokey` | the VM's USB bus | CanoKey QEMU (Apache-2.0), a library linked into QEMU | **absent**: not in this QEMU's `-device help`. It would be the best fit (it does CTAP2 with `hmac-secret`); worth re-checking where QEMU is built with it (open, section 8). |
 | OpenSK | a host process, or firmware | Apache-2.0, tens of thousands of lines of Rust | refused: a dependency on a project's tree and `std` build whose uhid or hidraw bridge is not verified here (unverified), to test a client of about 850 lines. |
 | python-fido2 and the like | a host script | Apache-2.0 / BSD, client side | refused: they are clients, and a Python in the guest is not there. |
-| **In-tree, on `/dev/uhid`** | the guest kernel's uhid | ours, Apache-2.0 like the tree (`Cargo.toml:10`), about 400 lines | **chosen.** |
+| **In-tree, on `/dev/uhid`** | the guest kernel's uhid | ours, MIT like the tree (`Cargo.toml:10`), about 400 lines | **chosen.** |
 
 **The choice: write it in this tree**, as a module of kithd behind a cargo feature, `fido2-test`.
 It is the shape `forge` already has: a test-only build of kithd, made in a target directory of its own

@@ -449,7 +449,7 @@ fn cgroup_program(cgroup: &File, program: &[u8], kind: u32, attach: u32) -> Resu
     if program.is_empty() || !program.len().is_multiple_of(8) {
         return Err(Error::other("not a program of whole instructions"));
     }
-    let license = b"Apache-2.0\0";
+    let license = b"MIT\0";
     // BPF_PROG_LOAD: the kind of program, how many instructions, where they are, where
     // the licence's name is; and (at 68) what it is to be attached as.
     let mut load = [0u8; 72];
