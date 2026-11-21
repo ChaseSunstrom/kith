@@ -1,12 +1,16 @@
 //! What a `Seat` gives whatever holds it, and asks of everything else: its `reserve` comes off
 //! its node for every other workload, the holder's units get it as a guarantee in their cgroup,
 //! and a workload that says `yieldTo` is held back while the seat is in a state it names. The
-//! session says what the seat is doing (`POST /v1/seats/NAME/activity`).
+//! node says what a held seat is doing (`watch`: fullscreen while its sound card plays, active for
+//! `ACTIVE_FOR` after its inputs are touched, idle otherwise); a session may say it better
+//! (`POST /v1/seats/NAME/activity`) and wins for `EXPLICIT_FOR`.
 //
 // ponytail: a seat's reserve is taken off its node whether or not anything holds the seat (the
 // screen is there; a session may start any moment), and workloads already placed are not moved.
 // Every unit of a holder gets the whole memory guarantee (not a share of it). A session that
 // hangs while fullscreen keeps the others held back until it goes: a heartbeat if that bites.
+// `watch` polls every `TICK` (a few small files; inotify if that is ever felt), and a session
+// that grabs its inputs (EVIOCGRAB) hides them from it: only sound counts then.
 
 use crate::cluster::refuse;
 use crate::{Shared, access::Caller};
@@ -14,12 +18,13 @@ use axum::extract::{Path as Named, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use kith_api::kinds::{Access, Activity, DeviceClaimSpec, SeatSpec, Template, YieldTo};
+use kith_api::kinds::{Access, Activity, DeviceClaimSpec, DeviceClass, DeviceSpec, SeatSpec, Template, YieldTo};
 use kith_api::store::Store;
 use kith_sched::Amount;
 use kith_store::Command;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 /// What a yielding unit may use of one CPU while the seat is busy, in thousandths: enough to
@@ -160,6 +165,210 @@ pub fn writes(store: &Store) -> Vec<(String, Option<Value>)> {
         says && !held.contains(&seat.metadata.name)
     });
     stale.map(|seat| (seat.key(), saying(seat, None))).collect()
+}
+
+/// How often a node looks at what its held seats do.
+const TICK: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a seat stays `active` after something of its inputs was touched.
+const ACTIVE_FOR: u64 = 180;
+/// How long a seat's activity that a POST set (not what this loop wrote) is left as it is.
+const EXPLICIT_FOR: u64 = 600;
+
+/// A held seat of this node, and what to look at to tell what it does.
+struct Plan {
+    seat: kith_api::Resource,
+    /// Sound cards (`controlC{N}` of its audio devices).
+    cards: Vec<u32>,
+    /// Input device files.
+    inputs: Vec<String>,
+}
+
+/// What the loop keeps of one seat between rounds.
+#[derive(Default)]
+struct Mark {
+    /// What the store said when the loop last wrote or looked (outer `None`: not yet seen).
+    wrote: Option<Option<String>>,
+    /// An activity set from outside is left alone until then.
+    hold_until: Option<u64>,
+    touched: Option<u64>,
+}
+
+/// What the loop keeps between rounds: a mark per seat, and the open input files (only that
+/// something came from them is ever kept, never what).
+#[derive(Default)]
+pub struct Memory {
+    marks: BTreeMap<String, Mark>,
+    inputs: BTreeMap<String, std::fs::File>,
+}
+
+impl Memory {
+    /// The writes did not land: forget they were made, so they are not taken for a POST.
+    fn failed(&mut self, writes: &[(String, Option<Value>)]) {
+        for (key, _) in writes {
+            if let Some(mark) = self.marks.get_mut(key.trim_start_matches("Seat/")) {
+                mark.wrote = None;
+            }
+        }
+    }
+
+    /// Whether anything came from the input file `path` since the last look.
+    fn touched(&mut self, path: &str) -> bool {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        if !self.inputs.contains_key(path) {
+            let flags = nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_NOFOLLOW;
+            let opened = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(flags.bits())
+                .open(path);
+            match opened {
+                Ok(file) => drop(self.inputs.insert(path.to_string(), file)),
+                Err(_) => return false,
+            }
+        }
+        let (mut came, mut buf) = (false, [0u8; 4096]);
+        // (A bounded drain: a device that never runs dry cannot hold the loop.)
+        for _ in 0..64 {
+            match self.inputs.get(path).map(|mut file| file.read(&mut buf)) {
+                Some(Ok(n)) if n > 0 => came = true,
+                Some(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Some(Err(_)) => drop(self.inputs.remove(path)),
+                _ => break,
+            }
+        }
+        came
+    }
+}
+
+/// The held seats of `me`, each with the cards and inputs it has.
+fn plan(store: &Store, me: &str) -> Vec<Plan> {
+    let held: std::collections::BTreeSet<String> = holders(store).into_values().flatten().collect();
+    let mut plans = Vec::new();
+    for name in held {
+        let (Some(seat), Some(spec)) = (store.get(&format!("Seat/{name}")), seat(store, &name)) else {
+            continue;
+        };
+        if spec.node != me {
+            continue;
+        }
+        let mut plan = Plan {
+            seat: seat.clone(),
+            cards: vec![],
+            inputs: vec![],
+        };
+        for device in &spec.devices {
+            let found = store.get(&format!("Device/{device}"));
+            let Some(device) = found.and_then(|d| serde_json::from_value::<DeviceSpec>(d.spec.clone()).ok()) else {
+                continue;
+            };
+            let path = device.path.unwrap_or_default();
+            match device.class {
+                DeviceClass::Audio => plan.cards.extend(
+                    path.strip_prefix("/dev/snd/controlC")
+                        .and_then(|n| n.parse::<u32>().ok()),
+                ),
+                DeviceClass::Input if !path.is_empty() => plan.inputs.push(path),
+                _ => {}
+            }
+        }
+        plans.push(plan);
+    }
+    plans
+}
+
+/// Does any playback substream of card `card` run? (`proc` is `/proc/asound`; a capture one,
+/// a mixer or a closed substream does not count.)
+fn playing(proc: &Path, card: u32) -> bool {
+    let pcms = std::fs::read_dir(proc.join(format!("card{card}")))
+        .into_iter()
+        .flatten()
+        .flatten();
+    let subs = pcms.filter(|pcm| {
+        let name = pcm.file_name();
+        name.to_string_lossy().starts_with("pcm") && name.to_string_lossy().ends_with('p')
+    });
+    let subs = subs.flat_map(|pcm| std::fs::read_dir(pcm.path()).into_iter().flatten().flatten());
+    subs.filter(|sub| sub.file_name().to_string_lossy().starts_with("sub"))
+        .any(|sub| std::fs::read_to_string(sub.path().join("status")).is_ok_and(|s| s.starts_with("state: RUNNING")))
+}
+
+/// What a seat does: `fullscreen` while its sound plays, `active` for `ACTIVE_FOR` after its
+/// inputs were touched, `idle` otherwise.
+fn judge(playing: bool, touched: Option<u64>, now: u64) -> &'static str {
+    match touched {
+        _ if playing => "fullscreen",
+        Some(at) if now.saturating_sub(at) < ACTIVE_FOR => "active",
+        _ => "idle",
+    }
+}
+
+/// One look at the held seats at `now`: what to write (a seat's key and its new status), only
+/// where the activity changes, and not where the store's activity is not what this loop last
+/// wrote (a POST set it: that stays for `EXPLICIT_FOR`).
+fn round(plans: &[Plan], proc: &Path, memory: &mut Memory, now: u64) -> Vec<(String, Option<Value>)> {
+    let names: Vec<&str> = plans.iter().map(|plan| plan.seat.metadata.name.as_str()).collect();
+    memory.marks.retain(|name, _| names.contains(&name.as_str()));
+    let paths: Vec<&String> = plans.iter().flat_map(|plan| &plan.inputs).collect();
+    memory.inputs.retain(|path, _| paths.contains(&path));
+    let mut writes = Vec::new();
+    for plan in plans {
+        let name = plan.seat.metadata.name.clone();
+        // (Each one drained, not only until the first that was touched.)
+        let came = plan.inputs.iter().map(|path| memory.touched(path)).collect::<Vec<_>>();
+        let came = came.contains(&true);
+        let mark = memory.marks.entry(name).or_default();
+        mark.touched = if came { Some(now) } else { mark.touched };
+        let says = plan.seat.status.as_ref().and_then(|status| status["activity"].as_str());
+        let says = says.map(str::to_string);
+        // (On first sight the store's value is taken as the loop's own.)
+        let wrote = mark.wrote.take().unwrap_or_else(|| says.clone());
+        mark.wrote = Some(says.clone());
+        if wrote != says {
+            mark.hold_until = Some(now + EXPLICIT_FOR);
+        }
+        match mark.hold_until {
+            Some(until) if now < until => continue,
+            _ => mark.hold_until = None,
+        }
+        let judged = judge(plan.cards.iter().any(|&card| playing(proc, card)), mark.touched, now);
+        if says.as_deref().unwrap_or("idle") != judged {
+            mark.wrote = Some(Some(judged.to_string()));
+            writes.push((plan.seat.key(), saying(&plan.seat, Some(judged))));
+        }
+    }
+    writes
+}
+
+/// The loop of a node: every `TICK`, what each held seat of it does, written to its status (a
+/// node may write that of its own Seat, and only that).
+pub async fn watch(shared: Arc<Shared>, mut stopping: tokio::sync::watch::Receiver<bool>) {
+    // (Alone, in agent mode, a node has no name to find its seats by.)
+    let Some(cluster) = &shared.cluster else { return };
+    let me = cluster.me.name.as_str();
+    let mut memory = Memory::default();
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(TICK) => {}
+            _ = stopping.changed() => break,
+        }
+        let plans = {
+            let state = shared.store.lock().expect("nothing panics holding the store");
+            plan(&state.store, me)
+        };
+        let statuses = round(&plans, Path::new("/proc/asound"), &mut memory, kith_api::store::now());
+        if statuses.is_empty() {
+            continue;
+        }
+        if let Err(e) = shared
+            .submit(Command::Status {
+                statuses: statuses.clone(),
+            })
+            .await
+        {
+            eprintln!("kithd: seats: saying what a seat does: {e}");
+            memory.failed(&statuses);
+        }
+    }
 }
 
 /// `POST /v1/seats/NAME/activity?state=active|idle|fullscreen`: the session says what the seat
@@ -357,5 +566,144 @@ spec:
             "{log:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A made-up `/proc/asound` and input device file for the seat of `SEATED`, with a sound
+    /// card (3) and a keyboard in it, and a node that holds the seat.
+    struct Tv {
+        dir: std::path::PathBuf,
+        store: Store,
+        memory: Memory,
+    }
+
+    impl Drop for Tv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl Tv {
+        fn new(name: &str) -> Tv {
+            let dir = std::env::temp_dir().join(format!("kithd-seat-watch-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("asound/card3/pcm0p/sub0")).unwrap();
+            std::fs::create_dir_all(dir.join("asound/card3/pcm0c/sub0")).unwrap();
+            std::fs::write(dir.join("event0"), "").unwrap();
+            let more = format!(
+                "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: {{ name: a-snd }}\nspec: {{ node: a, class: audio, path: /dev/snd/controlC3 }}\n\
+                 ---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: {{ name: a-kbd }}\nspec: {{ node: a, class: input, path: {} }}\n",
+                dir.join("event0").display()
+            );
+            let seated = SEATED.replace("devices: [a-gpu-card0]", "devices: [a-gpu-card0, a-snd, a-kbd]");
+            let tv = Tv {
+                store: store(&format!("{seated}{more}")),
+                dir,
+                memory: Memory::default(),
+            };
+            tv.pcm("closed");
+            tv
+        }
+
+        /// What the card's playback substream says (its capture one always says it runs).
+        fn pcm(&self, state: &str) {
+            std::fs::write(self.dir.join("asound/card3/pcm0p/sub0/status"), format!("{state}\n")).unwrap();
+            std::fs::write(self.dir.join("asound/card3/pcm0c/sub0/status"), "state: RUNNING\n").unwrap();
+        }
+
+        fn touch(&self) {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(self.dir.join("event0"))
+                .unwrap();
+            file.write_all(&[0; 24]).unwrap();
+        }
+
+        /// One round of the loop for node `me` at `now`, its writes applied; what it wrote.
+        fn round(&mut self, me: &str, now: u64) -> Vec<(String, Option<Value>)> {
+            let writes = round(&plan(&self.store, me), &self.dir.join("asound"), &mut self.memory, now);
+            let statuses = writes.clone();
+            kith_store::run(&mut self.store, Command::Status { statuses }).unwrap();
+            writes
+        }
+
+        fn batch(&self) -> (Option<u64>, bool) {
+            tunes(&self.store, "a")["Workload/default/batch"]
+        }
+    }
+
+    fn wrote(activity: &str) -> Vec<(String, Option<Value>)> {
+        vec![("Seat/a-seat0".to_string(), Some(json!({ "activity": activity })))]
+    }
+
+    #[test]
+    fn a_held_seat_is_fullscreen_while_its_card_plays_and_idle_after() {
+        let mut tv = Tv::new("sound");
+        // Nothing plays: idle is what an unsaid seat is, so nothing is written.
+        assert_eq!(tv.round("a", 100), []);
+        tv.pcm("state: RUNNING\nowner_pid   : 7");
+        assert_eq!(tv.round("a", 105), wrote("fullscreen"));
+        assert_eq!(tv.batch(), (None, true));
+        // Still playing: nothing to write again.
+        assert_eq!(tv.round("a", 110), []);
+        tv.pcm("closed");
+        assert_eq!(tv.round("a", 115), wrote("idle"));
+        assert_eq!(tv.batch(), (None, false));
+        assert_eq!(tv.round("a", 120), []);
+        // (Another node's loop has no say over this seat.)
+        tv.pcm("state: RUNNING");
+        assert_eq!(tv.round("b", 125), []);
+    }
+
+    #[test]
+    fn a_touched_input_makes_the_seat_active_for_a_while_and_a_seat_nobody_holds_is_never_written() {
+        let mut tv = Tv::new("input");
+        assert_eq!(tv.round("a", 100), []);
+        tv.touch();
+        assert_eq!(tv.round("a", 105), wrote("active"));
+        assert_eq!(tv.round("a", 105 + ACTIVE_FOR - 1), []);
+        assert_eq!(tv.round("a", 105 + ACTIVE_FOR), wrote("idle"));
+        // Sound wins over touch, and a touch is only a moment: the seat goes back to idle.
+        tv.touch();
+        tv.pcm("state: RUNNING");
+        assert_eq!(tv.round("a", 400), wrote("fullscreen"));
+        tv.pcm("closed");
+        assert_eq!(tv.round("a", 405), wrote("active"));
+        // Nobody holds it: no write, whatever plays.
+        tv.pcm("state: RUNNING");
+        tv.store.delete("Workload/default/desktop").unwrap();
+        assert_eq!(tv.round("a", 410), []);
+        assert!(plan(&tv.store, "a").is_empty());
+    }
+
+    #[test]
+    fn a_post_is_left_alone_for_a_while_then_the_loop_judges_again() {
+        let mut tv = Tv::new("post");
+        tv.pcm("state: RUNNING");
+        assert_eq!(tv.round("a", 100), wrote("fullscreen"));
+        // The session says idle: it stays so for EXPLICIT_FOR from when it was seen.
+        says(&mut tv.store, "idle");
+        assert_eq!(tv.round("a", 105), []);
+        assert_eq!(tv.round("a", 105 + EXPLICIT_FOR - 1), []);
+        assert_eq!(tv.batch(), (None, false));
+        assert_eq!(tv.round("a", 105 + EXPLICIT_FOR), wrote("fullscreen"));
+        assert_eq!(tv.batch(), (None, true));
+        // A start of kithd (no memory) takes what the store says as its own, and judges at once.
+        says(&mut tv.store, "active");
+        tv.pcm("closed");
+        tv.memory = Memory::default();
+        assert_eq!(tv.round("a", 2000), wrote("idle"));
+    }
+
+    #[test]
+    fn a_write_that_failed_is_not_taken_for_a_post() {
+        let mut tv = Tv::new("failed");
+        tv.pcm("state: RUNNING");
+        let writes = round(&plan(&tv.store, "a"), &tv.dir.join("asound"), &mut tv.memory, 100);
+        assert_eq!(writes, wrote("fullscreen"));
+        // (The store never got it.) The loop forgets it wrote, and says it again next round.
+        tv.memory.failed(&writes);
+        assert_eq!(tv.round("a", 105), wrote("fullscreen"));
+        assert_eq!(tv.round("a", 110), []);
     }
 }
