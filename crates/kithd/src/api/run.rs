@@ -43,9 +43,12 @@ use tokio::net::UnixListener;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
-/// How long the app has to connect to its socket, and the second node to answer.
-const START: Duration = Duration::from_secs(30);
+/// How long the app has to connect to its socket, the second node to answer (and the caller to
+/// take the connection over), and the caller to send its ask: a few hundred bytes (the tests
+/// shorten two).
+const START: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 30 });
 const HOP: Duration = Duration::from_secs(15);
+const BODY: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
 const PROTOCOL: &str = "kith-run";
 
 #[derive(Serialize, Deserialize)]
@@ -73,12 +76,34 @@ async fn take(mut request: Request) -> Result<(Spec, OnUpgrade, axum::body::Byte
         return Err((StatusCode::BAD_REQUEST, format!("ask with `Upgrade: {PROTOCOL}`")));
     }
     let upgrade = hyper::upgrade::on(&mut request);
-    let bytes = to_bytes(request.into_body(), 64 << 10)
+    // A body that stops half way is answered, not waited on for ever.
+    let bytes = tokio::time::timeout(BODY, to_bytes(request.into_body(), 64 << 10))
         .await
-        .map_err(|e| (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()))?;
+        .map_err(|_| {
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                "the ask's body did not arrive in time".to_string(),
+            )
+        })?
+        .map_err(|e| {
+            // (Too long is 413; a body that broke on the way is the caller's, 400.)
+            let long = std::error::Error::source(&e).is_some_and(|s| s.to_string().contains("length limit"));
+            (
+                if long {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                e.to_string(),
+            )
+        })?;
     let spec: Spec = serde_json::from_slice(&bytes).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     if spec.argv.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "argv names no program".into()));
+    }
+    // (A NUL cannot be in an argument or a path: starting the program would fail on it, late.)
+    if spec.argv.iter().chain(&spec.via).any(|word| word.contains('\0')) {
+        return Err((StatusCode::BAD_REQUEST, "argv and via cannot hold a NUL byte".into()));
     }
     Ok((spec, upgrade, bytes))
 }
@@ -143,15 +168,16 @@ pub async fn run(
     Extension(caller): Extension<Caller>,
     request: Request,
 ) -> Response {
+    // The app runs as kithd's user, outside any container: that is the run of the node, so it
+    // takes a rule for the whole cluster (`exec` on `Node`, no namespaces), never one namespace's.
+    // (Before the body is read: a caller that may not run anything makes kithd buffer nothing.)
+    if let Err(refused) = permit(&shared, &caller, Verb::Exec, |_| vec![("Node".into(), None)]) {
+        return refused.into_response();
+    }
     let (spec, upgrade, _) = match take(request).await {
         Ok(taken) => taken,
         Err((status, why)) => return say(status, why),
     };
-    // The app runs as kithd's user, outside any container: that is the run of the node, so it
-    // takes a rule for the whole cluster (`exec` on `Node`, no namespaces), never one namespace's.
-    if let Err(refused) = permit(&shared, &caller, Verb::Exec, |_| vec![("Node".into(), None)]) {
-        return refused.into_response();
-    }
     let (node, there) = match resolve(&shared, &spec.on) {
         Ok(found) => found,
         Err(e) => return e.into_response(),
@@ -221,7 +247,7 @@ async fn forward(
         );
         return (status, [(header::CONTENT_TYPE, "application/json")], said).into_response();
     }
-    let Ok(far) = reply.upgrade().await else {
+    let Ok(Ok(far)) = tokio::time::timeout(HOP, reply.upgrade()).await else {
         return failed(StatusCode::BAD_GATEWAY, format!("node {node} did not give the tunnel"));
     };
     let stop = shared.stop.subscribe();
@@ -308,7 +334,8 @@ fn switch<F: Future<Output = ()> + Send + 'static>(
     work: impl FnOnce(TokioIo<Upgraded>) -> F + Send + 'static,
 ) -> Response {
     tokio::spawn(async move {
-        if let Ok(upgraded) = upgrade.await {
+        // (An upgrade that is not made in time is let go: the connection is dropped with it.)
+        if let Ok(Ok(upgraded)) = tokio::time::timeout(HOP, upgrade).await {
             work(TokioIo::new(upgraded)).await;
         }
     });
@@ -357,12 +384,51 @@ impl Drop for Dir {
     }
 }
 
+/// A cgroup of a run's own, in the subtree the node was delegated: what the run started is in it
+/// however it left the process group (a `setsid`), and is killed with it. Gone when dropped.
+struct Leaf(PathBuf);
+
+impl Leaf {
+    /// `None` where none can be made (no cgroup v2, no delegation): the process group is all there is.
+    fn make(name: &str) -> Option<Leaf> {
+        match kith_runtime::leaf_cgroup(name) {
+            Ok(leaf) => Some(Leaf(leaf)),
+            Err(e) => {
+                eprintln!("kithd: run: no cgroup for this run, the process group is all that ends it: {e}");
+                None
+            }
+        }
+    }
+
+    fn kill(&self) {
+        let _ = std::fs::write(self.0.join("cgroup.kill"), "1");
+    }
+}
+
+impl Drop for Leaf {
+    fn drop(&mut self) {
+        self.kill();
+        // A cgroup is removed once what was in it is waited for, which is not by this thread:
+        // try for ten seconds, off the runtime's threads, and leave it empty after that.
+        let path = std::mem::take(&mut self.0);
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                if std::fs::remove_dir(&path).is_ok() || !path.exists() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+    }
+}
+
 /// `VIA --socket S server -- ARGV…`, started and waiting for the tunnel's other end.
 struct App {
     /// VIA's process group (VIA leads it): the app and whatever it started are in it.
     group: Option<i32>,
     child: Child,
     listener: UnixListener,
+    leaf: Option<Leaf>,
     _dir: Dir,
 }
 
@@ -370,29 +436,48 @@ impl App {
     // ponytail: one tunnel carries one connection of the app to VIA; the `kith` command
     // starts VIA's client for it, so an app that opens a second Wayland connection through
     // another VIA process needs its own `kith run`.
-    // ponytail: VIA and the app run as kithd's user, in a process group of their own that is
-    // killed as one when the tunnel ends. A program that leaves the group (a daemon that
-    // makes its own session) is not hunted: a cgroup for each run would catch it.
-    // ponytail: a tunnel whose far end vanishes without a word (a node powered off) is
-    // noticed only when something is written to it: an idle app stays until then, or until
-    // kithd stops. Keepalive on the nodes' connections would end it.
+    // ponytail: VIA and the app run as kithd's user, in a process group of their own and in a
+    // cgroup of their own (where one can be made), both killed when the tunnel ends: a program
+    // that makes its own session is caught by the cgroup. VIA is moved in after it is spawned
+    // (std's `Command` has no way into a cgroup short of `pre_exec`, which is unsafe): what it
+    // forked in that moment is not caught, and without delegation only the group is.
+    // ponytail: a tunnel whose far end vanishes without a word (a node powered off) is ended by
+    // the keepalive on the nodes' connections (`cluster::listen` and reqwest's own), not at once:
+    // about a minute.
     fn start(node: &str, spec: &Spec) -> Result<App, String> {
         let via = spec.via.as_deref().unwrap_or("waypipe");
         let dir = Dir::make()?;
+        let leaf = dir.0.file_name().and_then(|name| name.to_str()).and_then(Leaf::make);
         let socket = dir.0.join("s");
         let listener =
             UnixListener::bind(&socket).map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
-        let mut command = Command::new(via);
-        command
-            .arg("--socket")
-            .arg(&socket)
-            .args(["server", "--"])
-            .args(&spec.argv)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .process_group(0)
-            .kill_on_drop(true);
-        let child = command.spawn().map_err(|e| match e.kind() {
+        let start = |procs: Option<&Path>| {
+            let mut command = Command::new(via);
+            command
+                .arg("--socket")
+                .arg(&socket)
+                .args(["server", "--"])
+                .args(&spec.argv)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .process_group(0)
+                .kill_on_drop(true);
+            if let Some(procs) = procs {
+                kith_dm_sys::join_cgroup_before_exec(command.as_std_mut(), procs)?;
+            }
+            command.spawn()
+        };
+        // In the cgroup before its exec (so nothing it forks is outside). If that fails the
+        // program is not started, and it is started again without: the process group still ends it.
+        let procs = leaf.as_ref().map(|leaf| leaf.0.join("cgroup.procs"));
+        let spawned = match start(procs.as_deref()) {
+            Err(e) if procs.is_some() => {
+                eprintln!("kithd: run: could not start the app in its cgroup, the process group is all that ends it: {e}");
+                start(None)
+            }
+            other => other,
+        };
+        let child = spawned.map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => format!("{via} is not installed on node {node} (kith does not ship it)"),
             _ => format!("cannot start {via} on node {node}: {e}"),
         })?;
@@ -400,6 +485,7 @@ impl App {
             group: child.id().and_then(|pid| i32::try_from(pid).ok()),
             child,
             listener,
+            leaf,
             _dir: dir,
         })
     }
@@ -421,10 +507,13 @@ impl App {
     }
 
     /// Kill VIA, the app and what the app started, while VIA (not yet waited for) still holds
-    /// the group's number.
+    /// the group's number; and whatever is in the cgroup, a session of its own or not.
     fn end(&mut self) {
         if let Some(group) = self.group.take() {
             let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), nix::sys::signal::Signal::SIGKILL);
+        }
+        if let Some(leaf) = &self.leaf {
+            leaf.kill();
         }
     }
 }
@@ -441,12 +530,13 @@ pub(crate) mod tests {
     use super::*;
     use crate::cluster::{self, Cluster};
     use crate::pki::{Ca, Identity};
+    use futures_util::StreamExt;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::OnceLock;
     use std::time::Duration;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
     /// What waypipe would be: `--socket S server -- APP…` joins APP's input and output
@@ -462,25 +552,38 @@ os.environ["KITH_TEST_SOCKET"] = args[1]
 sys.exit(subprocess.run(args[4:], stdin=s, stdout=s).returncode)
 "#;
 
-    fn stand_in() -> &'static str {
-        static PATH: OnceLock<String> = OnceLock::new();
-        PATH.get_or_init(|| {
-            let path = std::env::temp_dir().join(format!("kith-run-on-stand-in-{}", std::process::id()));
+    /// A VIA that never connects to its socket: it writes its pid and the socket's path beside
+    /// itself, then waits.
+    const SILENT: &str = "#!/bin/sh\necho \"$$ $2\" > \"$0.said\"\nexec sleep 300\n";
+
+    fn installed(cell: &'static OnceLock<String>, name: &str, body: &str) -> &'static str {
+        cell.get_or_init(|| {
+            let path = std::env::temp_dir().join(format!("kith-run-on-{name}-{}", std::process::id()));
             // Not `fs::write` on `path`: while this process holds it open for writing, another
             // test thread that forks keeps a copy of the descriptor until its exec, and running
             // the file meanwhile fails with ETXTBSY. `cp` is the only writer, and forks nothing.
             let mut draft = path.clone().into_os_string();
             draft.push(".draft");
-            std::fs::write(&draft, STAND_IN).unwrap();
+            std::fs::write(&draft, body).unwrap();
             let copied = std::process::Command::new("cp")
                 .arg(&draft)
                 .arg(&path)
                 .status()
                 .unwrap();
-            assert!(copied.success(), "cp of the stand-in: {copied}");
+            assert!(copied.success(), "cp of {name}: {copied}");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path.display().to_string()
         })
+    }
+
+    fn stand_in() -> &'static str {
+        static PATH: OnceLock<String> = OnceLock::new();
+        installed(&PATH, "stand-in", STAND_IN)
+    }
+
+    fn silent() -> &'static str {
+        static PATH: OnceLock<String> = OnceLock::new();
+        installed(&PATH, "silent", SILENT)
     }
 
     /// Two kithds in this process, `a` and `b`, each serving the node API on a loopback
@@ -909,6 +1012,165 @@ spec: {role: other-jobber, subjects: [carol]}
         // The socket named: let through to the handler (there is no such Workload).
         let (status, why) = ask(&a, Some("local socket")).await;
         assert_eq!(status, 404, "{why}");
+    }
+
+    /// Whether the kernel's keepalive timer is armed (`tr` 2 in /proc/net/tcp, which SO_KEEPALIVE
+    /// sets) on each open connection with `port` at one end: the option, read from the socket.
+    fn keepalive(port: u16) -> Vec<bool> {
+        let want = format!(":{port:04X}");
+        let table = std::fs::read_to_string("/proc/net/tcp").unwrap();
+        let rows = table
+            .lines()
+            .skip(1)
+            .map(|line| line.split_whitespace().collect::<Vec<_>>());
+        rows.filter(|f| f[3] == "01" && (f[1].ends_with(&want) || f[2].ends_with(&want)))
+            .map(|f| f[5].starts_with("02:"))
+            .collect()
+    }
+
+    /// A tunnel to a node that goes quiet (a node powered off) is ended by the kernel's
+    /// keepalive on both nodes' ends of the connection between them, not only on a write.
+    #[tokio::test]
+    async fn run_between_nodes_sets_keepalive_on_both_ends_of_the_connection() {
+        let world = World::new("keepalive").await;
+        let alice = world.user("alice");
+        let spec = json!({"on": "b", "via": stand_in(), "argv": ["sh", "-c", "exec sleep 300"]});
+        let _tunnel = tunnel(&alice, world.a_port, "/v1/run", spec).await.unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            seen = keepalive(world.b_port);
+            if seen.len() >= 2 && seen.iter().all(|armed| *armed) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the connections to node b, armed or not: {seen:?} (two expected: a's end and b's)");
+    }
+
+    /// A VIA that reads its own cgroup as its first act (and forks `cat` to do it, which keeps
+    /// whatever cgroup it is in at that moment): it is in the run's cgroup from its first
+    /// instruction, however fast it forks. (Skipped where no cgroup can be made: no delegation.)
+    #[tokio::test]
+    async fn run_puts_a_program_that_forks_at_once_in_the_runs_cgroup() {
+        let probe = format!("kith-run-probe-{}", std::process::id());
+        if Leaf::make(&probe).is_none() {
+            eprintln!("skipped: no delegated cgroup to make one in (run in a systemd user session or scope)");
+            return;
+        }
+        static PATH: OnceLock<String> = OnceLock::new();
+        let fast = installed(&PATH, "fast", "#!/bin/sh\ncat /proc/self/cgroup > \"$0.cgroup\"\nexec sleep 300\n");
+        let world = World::new("cgroup-fast").await;
+        let alice = world.user("alice");
+        let spec = json!({"on": "a", "via": fast, "argv": ["true"]});
+        let tunnel = tunnel(&alice, world.a_port, "/v1/run", spec).await.unwrap();
+        let mut seen = String::new();
+        for _ in 0..200 {
+            seen = std::fs::read_to_string(format!("{fast}.cgroup")).unwrap_or_default();
+            if !seen.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(tunnel);
+        assert!(seen.contains("kith-run-"), "the program's first look at its cgroup: {seen:?}");
+    }
+
+    /// A program that makes its own session leaves the process group, and is still ended with the
+    /// tunnel: it is in the run's cgroup. (Skipped where no cgroup can be made: no delegation.)
+    #[tokio::test]
+    async fn run_ends_a_program_that_left_its_session_through_the_runs_cgroup() {
+        let probe = format!("kith-run-probe-{}", std::process::id());
+        if Leaf::make(&probe).is_none() {
+            eprintln!("skipped: no delegated cgroup to make one in (run in a systemd user session or scope)");
+            return;
+        }
+        let world = World::new("cgroup").await;
+        let alice = world.user("alice");
+        let line = "setsid sh -c 'echo $$; exec sleep 300' & read line; exec sleep 300";
+        let spec = json!({"on": "a", "via": stand_in(), "argv": ["sh", "-c", line]});
+        let tunnel = tunnel(&alice, world.a_port, "/v1/run", spec).await.unwrap();
+        let mut tunnel = BufReader::new(tunnel);
+        let mut first = String::new();
+        tunnel.read_line(&mut first).await.unwrap();
+        let pid: i32 = first.trim().parse().expect("the daemon's pid");
+        let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+        let cgroup = cgroup.trim().strip_prefix("0::").unwrap().to_string();
+        assert!(cgroup.contains("kith-run-"), "the program is in {cgroup}");
+        drop(tunnel);
+        let ended = gone(&format!("/proc/{pid}")).await;
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+        assert!(ended, "the program that left its session stays");
+        assert!(gone(&format!("/sys/fs/cgroup{cgroup}")).await, "{cgroup} stays");
+    }
+
+    /// Whatever is wrong with the ask, it is answered, not waited on.
+    async fn answered(world: &World, spec: serde_json::Value) -> (u16, String) {
+        let alice = world.user("alice");
+        let asked = tunnel(&alice, world.a_port, "/v1/run", spec);
+        tokio::time::timeout(Duration::from_secs(20), asked)
+            .await
+            .expect("no answer")
+            .expect_err("a tunnel, for an ask that is wrong")
+    }
+
+    #[tokio::test]
+    async fn run_answers_an_ask_that_names_no_program_or_has_a_nul_byte_or_is_too_big() {
+        let world = World::new("asks").await;
+        let (status, why) = answered(&world, json!({"on": "a", "argv": []})).await;
+        assert_eq!((status, why.contains("names no program")), (400, true), "{why}");
+        for spec in [
+            json!({"on": "a", "via": stand_in(), "argv": ["tr\u{0}ue"]}),
+            json!({"on": "a", "via": "way\u{0}pipe", "argv": ["true"]}),
+        ] {
+            let (status, why) = answered(&world, spec).await;
+            assert_eq!((status, why.contains("NUL")), (400, true), "{why}");
+        }
+        let pad = "x".repeat(100 << 10);
+        let (status, _) = answered(&world, json!({"on": "a", "argv": ["true"], "pad": pad})).await;
+        assert_eq!(status, 413);
+        // Nothing was started for any of them.
+        let entries = world.a.audit.tail(10).unwrap_or_default();
+        assert!(entries.iter().all(|entry| entry["verb"] != "run"), "{entries:?}");
+    }
+
+    /// An ask whose body never ends (so the upgrade is never reached) is answered when the time
+    /// for the body is up, and does not hold the connection.
+    #[tokio::test]
+    async fn run_answers_an_ask_whose_body_never_ends() {
+        let world = World::new("stalled").await;
+        let alice = world.user("alice");
+        let begun = Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{\"on\": \"a\", "));
+        let body = futures_util::stream::once(async move { begun }).chain(futures_util::stream::pending());
+        let ask = alice
+            .post(format!("https://127.0.0.1:{}/v1/run", world.a_port))
+            .header(reqwest::header::CONNECTION, "upgrade")
+            .header(reqwest::header::UPGRADE, "kith-run")
+            .body(reqwest::Body::wrap_stream(body))
+            .send();
+        let reply = tokio::time::timeout(Duration::from_secs(20), ask)
+            .await
+            .expect("no answer")
+            .unwrap();
+        assert_eq!(reply.status().as_u16(), 408);
+    }
+
+    /// A VIA that never connects: the tunnel ends when the time for it is up, and the program,
+    /// the directory and the cgroup are gone.
+    #[tokio::test]
+    async fn run_ends_a_tunnel_whose_program_never_connects() {
+        let world = World::new("start-timeout").await;
+        let alice = world.user("alice");
+        let spec = json!({"on": "a", "via": silent(), "argv": ["true"]});
+        let mut tunnel = tunnel(&alice, world.a_port, "/v1/run", spec).await.unwrap();
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(START + Duration::from_secs(20), tunnel.read_to_end(&mut rest));
+        // (Closed, whether with a goodbye or without one.)
+        let _ = read.await.expect("the tunnel stays");
+        let said = std::fs::read_to_string(format!("{}.said", silent())).unwrap();
+        let (pid, socket) = said.trim().split_once(' ').unwrap();
+        assert!(gone(&format!("/proc/{pid}")).await, "the program stays");
+        let dir = Path::new(socket).parent().unwrap();
+        assert!(gone(&dir.display().to_string()).await, "the directory stays");
     }
 
     #[tokio::test]

@@ -20,14 +20,24 @@ fn write_executable(path: &Path, text: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-struct Sandbox(PathBuf);
+/// The second field says the directory is a short one made for a socket, removed when dropped.
+struct Sandbox(PathBuf, bool);
 
 impl Sandbox {
     fn new(name: &str) -> Sandbox {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Sandbox(dir)
+        Sandbox(dir, false)
+    }
+
+    /// A sandbox under the temp dir, not CARGO_TARGET_TMPDIR (a merge train's is long): a path
+    /// that is to hold a Unix socket must stay under the 107 bytes `sun_path` takes.
+    fn short(name: &str) -> Sandbox {
+        let dir = std::env::temp_dir().join(format!("kr-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Sandbox(dir, true)
     }
 
     fn write(&self, file: &str, content: &str) {
@@ -44,6 +54,14 @@ impl Sandbox {
             .unwrap();
         let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
         (out.status.code().unwrap(), text(out.stdout), text(out.stderr))
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -288,7 +306,7 @@ fn examples_and_schemas() {
 
 #[test]
 fn a_silent_daemon_times_out() {
-    let sb = Sandbox::new("silent");
+    let sb = Sandbox::short("silent");
     let socket = sb.0.join("kithd.sock");
     // Accepts connections (the kernel does) and never answers.
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -306,6 +324,146 @@ fn a_silent_daemon_times_out() {
         "error: kithd has not answered for 1 s (--timeout sets how long to wait)\n"
     );
     assert!(began.elapsed() < std::time::Duration::from_secs(10));
+}
+
+/// A fake carrier (what `waypipe client` is to `kith run`) that writes its pid beside itself,
+/// listens on the socket it is given, takes the connection and then does `after`; and a fake
+/// kithd that answers `101` to the ask and then holds the tunnel (`hold`) or closes it. Starts
+/// `kith run` against them, with its temp dir in the sandbox; the receiver says when the tunnel
+/// is up.
+fn kith_run(sb: &Sandbox, after: &str, hold: bool) -> (std::process::Child, std::sync::mpsc::Receiver<()>, PathBuf) {
+    use std::io::{Read, Write};
+    let socket = sb.0.join("kithd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (up, tunnel) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8];
+                if conn.read(&mut byte).unwrap() == 0 {
+                    return;
+                }
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+            let length = head.split("content-length:").nth(1).unwrap().lines().next().unwrap();
+            conn.read_exact(&mut vec![0; length.trim().parse().unwrap()]).unwrap();
+            if head.starts_with("get ") {
+                // kith asks the cluster whether its writes are signed first: they are not.
+                let body = r#"{"signing":"none"}"#;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                conn.write_all(reply.as_bytes()).unwrap();
+                continue;
+            }
+            conn.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: kith-run\r\n\r\n")
+                .unwrap();
+            let _ = up.send(());
+            if hold {
+                // Until kith lets go of it.
+                let _ = conn.read_to_end(&mut Vec::new());
+            }
+            return;
+        }
+    });
+    let carrier = sb.0.join("carrier");
+    let script = format!(
+        "#!/usr/bin/env python3\nimport os, socket, sys, time\nargs = sys.argv[1:]\nif args[0] == \"--secctx\":\n    args = args[2:]\nopen(sys.argv[0] + \".pid\", \"w\").write(str(os.getpid()))\ns = socket.socket(socket.AF_UNIX)\ns.bind(args[1])\ns.listen(1)\ns.accept()\n{after}\n"
+    );
+    write_executable(&carrier, &script);
+    let child = Command::new(env!("CARGO_BIN_EXE_kith"))
+        .args(["--timeout", "60", "run", "--on", "b", "--via"])
+        .arg(&carrier)
+        .args(["--", "true"])
+        .env("KITH_SOCKET", &socket)
+        .env("TMPDIR", &sb.0)
+        .env_remove("KITH_STORE")
+        .spawn()
+        .unwrap();
+    (child, tunnel, carrier)
+}
+
+fn run_dirs(sb: &Sandbox) -> usize {
+    let names = std::fs::read_dir(&sb.0).unwrap().map(|e| e.unwrap().file_name());
+    names
+        .filter(|name| name.to_string_lossy().starts_with("kith-run-"))
+        .count()
+}
+
+/// The carrier's word is the one `kith run` has of how the run went: its exit status is `kith`'s.
+#[test]
+fn kith_run_returns_the_status_the_carrier_ends_with() {
+    let sb = Sandbox::short("run-status");
+    let (mut kith, _, _) = kith_run(&sb, "sys.exit(7)", false);
+    assert_eq!(kith.wait().unwrap().code(), Some(7));
+    assert_eq!(run_dirs(&sb), 0, "the run's directory stays");
+}
+
+/// A temp dir whose run directory's socket would pass the 107 bytes of `sun_path` is refused at
+/// once, naming the path, its length and the limit, and no run directory is left behind.
+#[test]
+fn kith_run_refuses_at_once_a_temp_dir_too_long_for_its_socket() {
+    let sb = Sandbox::short("run-long");
+    let long = sb.0.join("a".repeat(60)).join("b".repeat(60));
+    std::fs::create_dir_all(&long).unwrap();
+    let began = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_kith"))
+        .args([
+            "--timeout",
+            "60",
+            "run",
+            "--on",
+            "b",
+            "--via",
+            "/bin/true",
+            "--",
+            "true",
+        ])
+        .env("KITH_SOCKET", sb.0.join("none.sock"))
+        .env("TMPDIR", &long)
+        .env_remove("KITH_STORE")
+        .output()
+        .unwrap();
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert!(began.elapsed() < std::time::Duration::from_secs(5), "{err}");
+    assert!(err.contains(&format!("{}/kith-run-", long.display())), "{err}");
+    assert!(
+        err.contains("bytes") && err.contains("107") && err.contains("TMPDIR"),
+        "{err}"
+    );
+    let left = std::fs::read_dir(&long).unwrap().count();
+    assert_eq!(left, 0, "a run directory stays: {err}");
+}
+
+/// An interrupt ends the run as an end of the tunnel does: the carrier is killed, the directory
+/// goes, and the exit status is the shell's for the signal (128 + 2).
+#[test]
+fn kith_run_cleans_up_and_exits_130_on_an_interrupt() {
+    let sb = Sandbox::short("run-interrupt");
+    let (mut kith, tunnel, carrier) = kith_run(&sb, "time.sleep(300)", true);
+    tunnel.recv_timeout(std::time::Duration::from_secs(90)).unwrap();
+    assert_eq!(run_dirs(&sb), 1, "the run's directory is not there while it runs");
+    let pid = std::fs::read_to_string(format!("{}.pid", carrier.display())).unwrap();
+    let sent = Command::new("kill")
+        .args(["-INT", &kith.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    assert_eq!(kith.wait().unwrap().code(), Some(130));
+    assert_eq!(run_dirs(&sb), 0, "the run's directory stays after an interrupt");
+    let alive = || Path::new(&format!("/proc/{pid}")).exists();
+    for _ in 0..100 {
+        if !alive() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!alive(), "the carrier stays after an interrupt");
 }
 
 /// The nas package: a Share for the volume, and (when it names SMB users) the Samba
