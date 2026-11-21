@@ -229,6 +229,11 @@ spec! {
         /// answers DNS at it, so a router can name it once (DHCP option 6) and forward to it.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub home: Option<HomeSpec>,
+        /// The operator's time server, `ADDRESS[:PORT]` (port 123 left out): every node asks it
+        /// alone, at its next check, unless its own `kith.ntp` names one. When Clusters say
+        /// different servers, the lowest key's is the one taken.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub ntp: Option<String>,
     }
 
     pub struct HomeSpec {
@@ -1609,8 +1614,21 @@ pub fn home_endpoint_refused(text: &str) -> Option<String> {
     if host_ok { None } else { wrong() }
 }
 
+/// A time server as `kith.ntp` and a Cluster's `spec.ntp` name it: `ADDRESS` (port 123) or
+/// `ADDRESS:PORT` (`[ADDRESS]:PORT` for IPv6). A name is not taken: a clock that is not yet set
+/// may not resolve one (DNSSEC checks a signature's dates against it).
+pub fn ntp_server(word: &str) -> Option<std::net::SocketAddr> {
+    use std::net::{IpAddr, SocketAddr};
+    word.parse().ok().or_else(|| word.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 123)))
+}
+
 impl Spec for ClusterSpec {
     fn check(&self) -> Result<(), String> {
+        if let Some(ntp) = self.ntp.as_deref().filter(|ntp| ntp_server(ntp).is_none()) {
+            return Err(format!(
+                "spec.ntp: `{ntp}` is not an address or an address and port, like `10.0.0.7` or `10.0.0.7:123`"
+            ));
+        }
         if let Some(home) = &self.home {
             home_address(&home.address).map_err(|why| format!("spec.home.address: {why}"))?;
             if let Some(why) = home.endpoint.as_deref().and_then(home_endpoint_refused) {
