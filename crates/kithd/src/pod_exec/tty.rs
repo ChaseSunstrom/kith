@@ -47,7 +47,7 @@ impl AsyncRead for Pty {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         loop {
             let mut ready = ready!(self.0.poll_read_ready(cx))?;
-            if let Ok(read) = ready.try_io(|fd| (&*fd.get_ref()).read(buf.initialize_unfilled())) {
+            if let Ok(read) = ready.try_io(|fd| fd.get_ref().read(buf.initialize_unfilled())) {
                 buf.advance(read?);
                 return Poll::Ready(Ok(()));
             }
@@ -59,7 +59,7 @@ impl AsyncWrite for Pty {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         loop {
             let mut ready = ready!(self.0.poll_write_ready(cx))?;
-            if let Ok(wrote) = ready.try_io(|fd| (&*fd.get_ref()).write(buf)) {
+            if let Ok(wrote) = ready.try_io(|fd| fd.get_ref().write(buf)) {
                 return Poll::Ready(wrote);
             }
         }

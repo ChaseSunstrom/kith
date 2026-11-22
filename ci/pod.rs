@@ -72,6 +72,11 @@
 //!                              (over UDP, and over TCP) where its resolv.conf says, asks its
 //!                              node for a name, tries IPv6 out, sends `kithleak` to two
 //!                              addresses outside, and says how each went
+//!   pod watch NAME HOST PORT   as a phone's (`--test access`): every third of a second, one byte
+//!                              over a connection it keeps to a `pod echo` there (made again
+//!                              when it ends) and one new connection that sends a request and
+//!                              reads a byte back; says `NAME: held=N fresh=N failed=N` each
+//!                              time (bytes the kept one had back, new ones answered, and not)
 //!   pod init SCRIPT            as a machine's first process (that test's provider): mounts
 //!                              /dev and /proc, runs each line of SCRIPT in turn (`NAME=VALUE`
 //!                              words first are its environment; `&` first: left running),
@@ -1245,6 +1250,42 @@ fn main() {
                     eprintln!("shout: {e}");
                 }
                 std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        ["watch", name, host, port] => {
+            let to = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+            let to: SocketAddr = to.parse().expect("an address and a port");
+            let second = Duration::from_secs(1);
+            let connect = || {
+                let stream = TcpStream::connect_timeout(&to, second).ok()?;
+                stream.set_read_timeout(Some(second)).ok()?;
+                Some(stream)
+            };
+            let (mut kept, mut at, mut held, mut fresh, mut failed) = (None::<TcpStream>, 0u64, 0u64, 0u64, 0u64);
+            loop {
+                if kept.is_none() {
+                    // (`pod echo`'s start: a length it will not reach, and an end by close.)
+                    kept = connect().filter(|stream| (&*stream).write_all(&[&[255u8; 8][..], &[0]].concat()).is_ok());
+                    at = 0;
+                }
+                if let Some(stream) = kept.as_mut() {
+                    let mut back = [0];
+                    if stream.write_all(&[byte(at)]).is_ok() && stream.read_exact(&mut back).is_ok() && back[0] == byte(at) {
+                        (at, held) = (at + 1, held + 1);
+                    } else {
+                        kept = None;
+                    }
+                }
+                let answered = connect().is_some_and(|mut stream| {
+                    stream.write_all(b"GET / HTTP/1.0\r\n\r\n").is_ok() && stream.read(&mut [0]).is_ok_and(|n| n == 1)
+                });
+                if answered {
+                    fresh += 1;
+                } else {
+                    failed += 1;
+                }
+                println!("{name}: held={held} fresh={fresh} failed={failed}");
+                std::thread::sleep(Duration::from_millis(300));
             }
         }
         ["init", script] => {

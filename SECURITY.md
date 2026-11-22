@@ -24,6 +24,7 @@ Only the newest version is fixed. There are no security releases of older ones.
 | A workload | Nothing: it is a process on a node | What its container, machine or sandbox lets it reach (see "What is not defended") |
 | A Workload that runs as an Identity | A certificate for `IDENTITY.runs.kith`, `NAME.NAMESPACE.workload.kith` and `NODE.on.kith`, for two hours, while the store says that Workload, placed on that node, runs as that Identity and the Identity names it | What the Identity's Roles say (see "A Workload that runs as an Identity") |
 | Anyone who reaches a node's port | Nothing | Fetch the CA certificate, spend a join token, ask for a locked disk's key by its id |
+| A device that trusts the LAN CA (`kith ca export`) | Nothing: it holds a public certificate | Takes the host certificates the LAN CA signs for the cluster's LAN names, and no others: the certificate is name-constrained to `spec.lanDomains` (default `home.arpa`, `lan`, `internal`, `local`, never `cluster.local` or `kith`) |
 | Whoever writes what kith fetches | Nothing by itself | What follows from it: a Source's repository is applied, a package is rendered, an image is run, an archive is restored |
 
 ## The boundaries, as they are in the code
@@ -38,7 +39,12 @@ Only the newest version is fixed. There are no security releases of older ones.
   browser holds.)
   A connection holds one of 64 slots until it has shown a certificate, and one that
   shows none for at most 15 seconds; one address (an IPv4 address, an IPv6 /64) holds
-  at most 8 of them. The node's own loopback is not counted.
+  at most 8 of them. The node's own loopback is not counted. On a node started with
+  `--people` the people's addresses (`100.89.0.0/16` and their /64) have 16 slots of their
+  own, 2 to an address (an IPv6 peer counted whole, not by its /64), so a crowd of them
+  leaves the 64 free, and a crowd of strangers filling the 64 does not keep them from being
+  picked up. A NetworkPolicy sees a person as the node that serves it (a Service on this node
+  asks it with the node's address), so a person's reach is its level's Services alone.
 - **The API** is behind a layer that works out who calls (the socket, a node, an
   Identity) and refuses what their Roles do not allow. A token is shown once, kept only
   as a hash, good for an hour, and spent by its first use.
@@ -186,6 +192,22 @@ Only the newest version is fixed. There are no security releases of older ones.
   and kithd can hand the dmem controller down: the kernel then keeps the container's use
   of that GPU's memory under the share (`dmem.max`). Elsewhere it is a count the scheduler
   keeps, and a container that takes more is not stopped.
+  A Device cannot grant raw memory or a block device, whoever wrote it: when kithd hands nodes
+  to a container it stats each path (links not followed) and gives the Device's nodes only if
+  all are character devices that are there and not mem, kmem, port, kmsg, oldmem, the
+  device-mapper's control, a TPM, sg (major 21), the misc nodes nvram, watchdog, vfio and
+  mcelog, snapshot, cpu/microcode and hpet (10:144, 10:130, 10:196, 10:227, 10:231, 10:184,
+  10:228: the kernel reports them only as `misc`), or of the
+  kernel subsystems `scsi_generic`,
+  `bsg`, `nvme`, `nvme-generic`, `mtd`, `tpm`, `tpmrm`, `msr`, `dax`, `ubi`, `ublk-char`, `vfio`, `i2c-dev`,
+  `nvram`, `cpuid`, `mei`, `watchdog`, `vfio-dev`, `uio`, `spidev`, `ipmi`, `usbmon` or
+  `drm_dp_aux` or `drm_dp_aux_dev` (read from `/sys/dev/char`; where that is there and a
+  node's subsystem cannot be read the node is refused, and with no `/sys/dev/char` at all only
+  the fixed numbers are known). This is a denylist, not an allowlist, because a Device is set
+  by the admin for hardware no list could name. A block device, a file, a link or a missing node grants nothing, and the
+  workload is not run, its status saying which Device and path. Other character devices that
+  reach hardware (a USB or PCI node, `/dev/input`, `/dev/dri`) are what a Device is for and are
+  given.
   A device node a unit was given (an exclusive Device's, most of all) is not given to another
   unit while the unit that had it still runs: a unit whose stop failed with processes left
   keeps its devices and its name, its stop is retried at a later pass and no more often than
@@ -298,6 +320,33 @@ Only the newest version is fixed. There are no security releases of older ones.
   namespaces ask for a port the node has kept for neither (a first start, a file that
   cannot be read, a node whose state is new), none of them has it. Whoever can write the
   node's state can write that file, as they can everything else of the node's.
+- **A person's device** (a phone, a laptop: a `RemotePeer` of one node, with an
+  `AccessLevel`) gets in only by a node its owner started with `--people` (as root; no
+  store write opens a port or makes the device), over a second WireGuard device `kwg0`
+  that is not the mesh's, and holds what its level names and nothing else.
+  `kith peer add` (`POST /v1/peers`, for whoever may apply a RemotePeer) has kithd make
+  the key and answer once, `Cache-Control: no-store`, with the configuration: the private
+  key is in that answer and nowhere else, not the store, the history, the audit line or
+  the log (a test looks in each), and is wiped where kithd holds it (not the copies the
+  kernel's netlink buffers and hyper's keep). Keys are made at 5 a minute for each node
+  asked, a name that has a key is refused unless asked with `replace`, and a name being added
+  is held so two asks cannot both get a key. A level is held on the node by an nftables
+  table, `inet kith-people`, written whole in one batch and judged on every packet both
+  ways, with no accept on a connection's state alone: a level narrowed or a peer deleted is
+  cut within 5 seconds (every store change wakes it at once; a rule undone by hand is put
+  back within 10), the connections open included, which are flushed by the peer's mark. A peer's allowed addresses on the device
+  are its own /32 and /128, so WireGuard drops a packet sent as another's, and a people
+  address that comes in by another link is dropped before any rule. A peer cannot reach the
+  mesh, another peer, or the node's own ports (kithd's API only with `api`, its `--dns`,
+  ingress, NFS and published ports never), and the table drops between start and the
+  rules. The ranges a level may name are the node's `--people-networks` (the store narrows
+  within them, never widens), cut of the mesh, the people's and the pods' ranges, the
+  link-local ranges and the node's own links; a level's internet is IPv4, out by the
+  home's connection or by the Exit that lists the level and no other, and a named range
+  never leaves by an Exit's link. Kithd's Service proxy serves a person only the
+  Services its level names, 8 places of 4096 each by its own address, and the API's
+  handshakes give the people 16 slots of their own (2 to an address) so neither keeps the
+  others out. The resolver does not forward for the people's ranges.
 - **The Kubernetes API** (`/api`, `/apis`) is behind the same layer as `/v1`. A request
   is checked as the kith kind and namespace it comes to, by the Roles of the
   certificate's Identity; a write is asked for before anything is said of what is
@@ -545,7 +594,17 @@ The nested kithd shares the node's network, so its registry port meets the node'
 Design in `docs/adr-privilege.md` (T-0334). Built today: the node's own policy and the
 typed request list's seam (`crates/kithd/src/root_part.rs`, for listeners, pods and the mesh), in one
 process. There is no second process yet, so everything below is what the split is for,
-not what a node has.
+not what a node has. **No part of a live node is confined today.** The confinement the serving part
+will take is built (T-0811, `crates/kithd/src/confine.rs`: its own mount namespace holding only its
+state directory, no exec, with a `/proc` that shows its own process alone; a user and group that are
+not 0, no capability in any set, `no_new_privs`, a seccomp allow-list last) and held to what it says
+by a probe, `kithd confine-probe`, in a test build that no release has (`sh ci/vm.sh --test privilege`),
+and not applied to the serving part, which is a thread of the root part's process; `--split` is off by
+default, and until the two are processes a node has none of it. What stays open when it is applied: the
+serving part shares the node's network namespace, so it reaches the host's loopback and every abstract
+`AF_UNIX` socket (a `CLONE_NEWNET` after its listeners are open would close that if it makes no outbound
+connection; not done). The filter can be left out alone (`--no-filter`, on the probe only today, for
+a call the list lacks); without it a hole in the serving part has every system call its user may make.
 
 **What the split does not change.** The part that reads the network still reads the
 store: every Secret of every namespace, and on a node that holds it the cluster's CA key.
@@ -732,6 +791,29 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   starting a pod and making its rules (the rules come first; nothing shows the order
   holds under a kill), and names a pod's own resolver library cached before its exit
   changed.
+- **A person's device is its level's, and what a level does not hold is this.** (The
+  bounds are under "A person's device" above.)
+  A level that has the internet can go round the home's resolver: DNS over HTTPS, a resolver
+  on another port, a tunnel inside the tunnel. Past the node a peer is the node: a LAN host,
+  a router or a share that trusts addresses, and every NetworkPolicy, sees the node that
+  ends its tunnel. There is no limit on bandwidth, so a peer can fill the uplink. A copied
+  configuration is the peer until the peer is deleted: nothing expires, an unlocked phone
+  needs no unlock to turn the tunnel on, a QR code photographed into a cloud backup is a
+  copy, and two devices on one key take turns. Rolling a RemotePeer back to a revision with
+  an older key lets that key in again: delete, do not edit back. Who may apply an
+  AccessLevel or a RemotePeer may put any peer on any level (rights go by kind, not name),
+  so a level that holds `api` or the internet is the admin's to write. The node that ends
+  the tunnels holds the people key and sees what is not TLS, and a taken one is the server
+  to every phone: choose a node you trust with their traffic. After kithd crashes the
+  last rules stand until it is back (a peer deleted meanwhile still passes); a connection
+  kithd's proxy holds for a peer that lost its Service stays open, passing nothing, up to
+  an hour. IPv6 to the internet is not carried. People do not reach a Service on the
+  ingress node's ports 80 and 443. A name the resolver answers is not access. Every case
+  of the bounds ran in virtual machines on a kernel's own WireGuard (`sh ci/vm.sh --test
+  access`: two phones, a Service reached and one not, a level narrowed, an Exit's level
+  left by it, an Exit deleted and a peer removed with a connection open, each cut within
+  5 seconds, the Services reached over the phones' IPv6 addresses); none ran with a real
+  phone, a real router or the app, and not an IPv6 range a level names.
 - **A NetworkPolicy's egress rules hold a pod's packets, on kith OS as root and for pod Workloads
   and Jobs only.** The pods of the Workloads and Jobs a policy selects, an exit's pod included,
   pass only what a rule allows, DNS included. Each pod is matched per pod link: its rules are the
@@ -878,6 +960,22 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   is each node's own word (`status.serves`, and the address it joined from): an ingress worker (its
   Node says `ingress`, below) or a worker that is sent the whole store can say it serves ingress and is
   then answered beside the others; any other worker cannot.
+- **`expose.issuer: cluster` has a LAN CA sign a host's certificate, and a device that trusts it takes
+  what it signs.** The LAN CA is apart from the cluster's root: its own key, kept beside the CA key on
+  the CA node and never leaving it, and a self-signed certificate with X.509 name constraints that
+  permit only the cluster's LAN domains (`spec.lanDomains` of a Cluster: the admin's list, by the
+  lowest key's if several name one; `home.arpa`, `lan`, `internal` and `local` where none does) and
+  exclude `kith` and `cluster.local`. `kith ca export` hands out that certificate alone, from the
+  node that holds it, over the local socket. A device that trusts it is bound by those constraints
+  whatever the CA signs; the workloads' `ca.crt` and the mesh never trust it, and a host certificate
+  does not verify against the cluster's root. Within the domains, whoever may write a Service may
+  name a host (key those in a Namespace's `spec.hosts`), and there is no revocation: a certificate
+  lasts 30 days and is made again in its last third. The LAN CA's own certificate lasts ten years;
+  changing the domains makes a new certificate with the same key and another serial, and a device
+  keeps trusting the old, broader one until its owner removes it and imports the new. The name
+  constraints also exclude every IP address, and the LAN CA's key is only read, never made again over
+  a file that is there but unreadable. `kith ca export` only works on the CA node. A
+  refused or failed issuance waits an hour, as ACME's, and the same error is written to the status once.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and
   PipeWire sockets are, and connects as any program the session started would: it can

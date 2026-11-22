@@ -390,15 +390,13 @@ pub fn new_identity(name: &str) -> Resource {
 }
 
 /// May a bare entry (not a signed one) be applied to `store`? Under `spec.signing: required`
-/// in format 4 not one that changes access ([`crate::raft::changes_access`]: a Role,
-/// RoleBinding, Identity, KindDefinition or Cluster, and any import): only a signed entry
-/// does, so a taken leader cannot write what the admin did not sign. Every other bare write
-/// stays bare here (a node's own, a spec a Release or Source writes: later slices).
-///
-/// A cost, until slice 6 (T-0850: `writer_may` for a Release and a Source): a Release or Source
-/// whose render holds a Role, RoleBinding, Identity or KindDefinition (or prunes one) is bare, so
-/// it is refused here too. Their controllers do not propose it under `required`
-/// ([`refuses_render`]) and say so in the status.
+/// in format 4 no bare write of a spec: an Apply, Delete, Rollback or Import, whatever it writes
+/// (curl, kubectl, a Role or a Release's resource alike). A person's write is signed (the
+/// request's, [`admit`]); the leader's controllers and a control node's own writes are signed by
+/// that node's key (`own_writes`), each held at apply to what it is derived from, so a taken
+/// leader cannot write a spec nobody signed. Under `open` they all stay. What stays bare under
+/// `required` is a status (a Patch, Status or Report: slice 4's own, but for a Node's
+/// certificate or raft id), the format marks, and membership.
 pub(crate) fn bare(store: &Store, command: &Command) -> Result<(), String> {
     // A Node's certificate or raft id is what its signature is checked by: a node's own, signed.
     let node = |(key, fields): &(String, serde_json::Map<String, serde_json::Value>)| {
@@ -407,9 +405,32 @@ pub(crate) fn bare(store: &Store, command: &Command) -> Result<(), String> {
                 .iter()
                 .any(|field| fields.contains_key(*field))
     };
+    // A Status replaces a status whole and a Report merges one (`kith_store::reported`): either
+    // changes a Node's certificate or raft id if the status it leaves differs in them from today's.
+    let ids = |status: Option<&serde_json::Value>| {
+        ["certificate", "raftId"].map(|field| status.and_then(|s| s.get(field)).cloned())
+    };
+    let moves = |key: &str, new: Option<serde_json::Value>| {
+        let Some(live) = store.get(key).filter(|_| key.starts_with("Node/")) else {
+            return false;
+        };
+        ids(live.status.as_ref()) != ids(new.as_ref())
+    };
     let what = match command {
-        _ if crate::raft::changes_access(command) => "changes access",
+        Command::Apply { .. } | Command::Delete { .. } | Command::Rollback { .. } => "writes a spec",
+        Command::Import { .. } => "imports a store",
         Command::Patch { statuses } if statuses.iter().any(node) => "sets a Node's certificate or raft id",
+        Command::Status { statuses } if statuses.iter().any(|(key, said)| moves(key, said.clone())) => {
+            "sets a Node's certificate or raft id"
+        }
+        Command::Report { node, statuses }
+            if statuses.iter().any(|(key, said)| {
+                let old = store.get(key).and_then(|live| live.status.clone());
+                moves(key, Some(kith_store::reported(old, node, said.clone())))
+            }) =>
+        {
+            "sets a Node's certificate or raft id"
+        }
         _ => return Ok(()),
     };
     // (The command first: the scan of the store for `required` only runs for such a write.)
@@ -419,13 +440,6 @@ pub(crate) fn bare(store: &Store, command: &Command) -> Result<(), String> {
         )),
         false => Ok(()),
     }
-}
-
-/// Would the cluster refuse `command` bare, a controller's own write (a Release's or a Source's
-/// render), under `spec.signing: required`? Then the controller proposes nothing and says so,
-/// rather than write an entry every node refuses and audits, again each round.
-pub fn refuses_render(store: &Store, command: &Command) -> Option<String> {
-    bare(store, command).err()
 }
 
 /// What a command touches, for the audit log: its resources' keys (an import: the whole store).
@@ -1551,9 +1565,12 @@ mod tests {
         assert_eq!(targets(&Command::Delete { key: "Role/x".into() }), ["Role/x"]);
         assert_eq!(targets(writes.last().unwrap()), ["(the whole store)"]);
         assert!(writes.iter().all(|write| !targets(write).is_empty()));
-        // The scan of the store for `required` is for an access write only: a plain one is not asked.
-        assert_eq!(refuses_render(&required_store(), &applies(vec![map("a")])), None);
-        assert!(refuses_render(&required_store(), &writes[0]).is_some());
+        // A status is no spec write: not refused, so the scan of the store for `required` is not asked.
+        assert_eq!(
+            bare(&required_store(), &Command::Status { statuses: Vec::new() }),
+            Ok(())
+        );
+        assert!(bare(&required_store(), &writes[0]).is_err());
     }
 
     #[test]
@@ -1564,12 +1581,23 @@ mod tests {
             let said = admit(&store, CLUSTER, &write, leader).unwrap_err();
             assert!(said.contains("bare"), "{write:?}: {said}");
         }
+        // A bare write of any spec, a ConfigMap's too (curl, kubectl), is refused as well; a status is not.
         for write in [
             applies(vec![map("a")]),
             Command::Delete {
                 key: "ConfigMap/a".into(),
             },
+        ] {
+            let said = admit(&store, CLUSTER, &write, leader).unwrap_err();
+            assert!(said.contains("writes a spec"), "{write:?}: {said}");
+        }
+        for write in [
             Command::Status { statuses: Vec::new() },
+            Command::Patch { statuses: Vec::new() },
+            Command::Report {
+                node: LEADER.into(),
+                statuses: Vec::new(),
+            },
         ] {
             assert!(admit(&store, CLUSTER, &write, leader).is_ok(), "{write:?}");
         }
@@ -1603,6 +1631,139 @@ mod tests {
             assert!(admit(&open, CLUSTER, &write, leader).is_ok(), "open: {write:?}");
             assert!(admit(&old, CLUSTER, &write, leader).is_ok(), "format 3: {write:?}");
         }
+    }
+
+    /// The one place that holds every kind: under `required` a bare Apply, Delete or Rollback of
+    /// each kind kith has, and of a custom kind (a wasm controller's), is refused at apply on
+    /// every node; under `open` the same writes are kept; a status is neither.
+    #[test]
+    fn signed_required_refuses_every_bare_spec_write_of_every_kind_and_open_keeps_them() {
+        let leader = kith_store::node_id(LEADER);
+        let (required, open) = (required_store(), signing_store());
+        let custom = "GameServer";
+        let kinds = crate::own_writes::CLASSES.iter().map(|(kind, _)| *kind).chain([
+            "Release",
+            "Source",
+            "Package",
+            "Repository",
+            "KindDefinition",
+            custom,
+        ]);
+        let mut named = 0;
+        for kind in kinds {
+            let mut of = map("x");
+            of.kind = kind.to_string();
+            of.spec = serde_json::json!({});
+            let writes = [
+                applies(vec![of]),
+                Command::Delete {
+                    key: format!("{kind}/x"),
+                },
+                Command::Delete {
+                    key: format!("{kind}/default/x"),
+                },
+                Command::Rollback {
+                    key: format!("{kind}/x"),
+                    to: 1,
+                    at: 7,
+                },
+            ];
+            for write in writes {
+                let said = admit(&required, CLUSTER, &write, leader).unwrap_err();
+                assert!(
+                    said.contains("bare") || said.contains("writes a spec"),
+                    "{kind}: {write:?}: {said}"
+                );
+                assert!(
+                    admit(&open, CLUSTER, &write, leader).is_ok(),
+                    "open keeps {kind}: {write:?}"
+                );
+            }
+            named += 1;
+        }
+        assert!(named >= crate::own_writes::CLASSES.len() + 6);
+        // A status is no spec write: taken under both.
+        for store in [&required, &open] {
+            let status = Command::Status { statuses: Vec::new() };
+            assert!(admit(store, CLUSTER, &status, leader).is_ok());
+        }
+    }
+
+    /// A Node's status is what its signature is checked by (`own_writes::admit` reads `certificate`
+    /// from it), and `Command::Status` replaces the whole status and `Report` merges what is said:
+    /// no HTTP route builds either (only the leader's own pipeline, a worker's after
+    /// `worker::checked`, which refuses a Node), but a taken leader could append one. Under
+    /// `required` every node refuses a bare Status or Report on a Node that changes its
+    /// certificate or raft id, and takes one that leaves them (a normal report); `open` keeps both.
+    #[test]
+    fn signed_required_refuses_a_bare_status_or_report_that_changes_a_nodes_certificate() {
+        use serde_json::json;
+        let leader = kith_store::node_id(LEADER);
+        let node = |status: serde_json::Value| {
+            let mut store = required_store();
+            let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: n1}\nspec: {}\n";
+            store.apply(resource(text)).unwrap();
+            store.set_status("Node/n1", Some(status)).unwrap();
+            store
+        };
+        let was = json!({ "certificate": "AA", "raftId": "7", "os": "1" });
+        let status = |said: serde_json::Value| Command::Status {
+            statuses: vec![("Node/n1".into(), Some(said))],
+        };
+        let report = |said: serde_json::Value| Command::Report {
+            node: "n1".into(),
+            statuses: vec![("Node/n1".into(), Some(said))],
+        };
+        let forged = [
+            status(json!({ "certificate": "BB", "raftId": "7" })),
+            status(json!({ "certificate": "AA", "raftId": "8" })),
+            status(json!({ "raftId": "7" })),
+            report(json!({ "certificate": "BB", "raftId": "7", "os": "1" })),
+            report(json!({ "raftId": "9" })),
+            // (A report replaces the status: one that leaves the certificate out takes it away.)
+            report(json!({ "os": "2" })),
+        ];
+        let required = node(was.clone());
+        let open_store = {
+            let mut store = store_with(admin().public_key().as_ref(), "");
+            kith_store::run(&mut store, Command::MarkChecked).unwrap();
+            store
+                .apply(resource(
+                    "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: n1}\nspec: {}\n",
+                ))
+                .unwrap();
+            store.set_status("Node/n1", Some(was.clone())).unwrap();
+            store
+        };
+        for write in &forged {
+            let said = admit(&required, CLUSTER, write, leader).unwrap_err();
+            assert!(said.contains("certificate"), "{write:?}: {said}");
+            assert!(
+                admit(&open_store, CLUSTER, write, leader).is_ok(),
+                "open keeps {write:?}"
+            );
+        }
+        // A normal report keeps them, and another kind's status is as before.
+        let kept = [
+            status(json!({ "certificate": "AA", "raftId": "7", "os": "2" })),
+            report(json!({ "certificate": "AA", "raftId": "7", "os": "2" })),
+        ];
+        for write in &kept {
+            assert!(admit(&required, CLUSTER, write, leader).is_ok(), "{write:?}");
+        }
+        let elsewhere = Command::Status {
+            statuses: vec![("ConfigMap/a".into(), Some(json!({ "certificate": "BB" })))],
+        };
+        assert!(admit(&required, CLUSTER, &elsewhere, leader).is_ok());
+        // Run in a log: the forgeries leave the store as it was.
+        let mut one = node(was.clone());
+        let log: Vec<Command> = forged.into_iter().chain(kept.iter().cloned()).collect();
+        let taken = feed(&mut one, &log);
+        assert_eq!(taken, [vec![false; 6], vec![true; 2]].concat());
+        assert_eq!(
+            one.get("Node/n1").unwrap().status.as_ref().unwrap()["certificate"],
+            "AA"
+        );
     }
 
     /// The entry the certificate route writes for `name`: the admin's signature over `POST

@@ -11,7 +11,7 @@
 #   sh ci/vm.sh --test update   that image updating itself, and going back when it must
 #   sh ci/vm.sh --test clock    the node's clock started hours off, stepped to an SNTP server's time
 #   sh ci/vm.sh --test clockleader  three nodes with no time server: one leads 8 h ahead, the others keep theirs
-#   sh ci/vm.sh --test disk     a disk file made a data disk and mounted, another left alone
+#   sh ci/vm.sh --test disk     disk files added, mounted and removed by the verbs, one with a GPT refused
 #   sh ci/vm.sh --test encrypt  a plain node's disk file encrypted in place at its start, cut mid-pass, resumed
 #   sh ci/vm.sh --test rollout  three nodes of it taking a release, one at a time
 #   sh ci/vm.sh --test install  the installer, onto virtual disks, and what it installed
@@ -43,6 +43,9 @@
 #                               (eight, the media stack's shape) imported with kith import compose, applied,
 #                               ready, each asked for by its compose name; KITH_E2E=1 also runs media.yml
 #                               under docker compose up on an Alpine machine, timed beside kith's
+#   sh ci/vm.sh --test privilege one node with --split: the confined serving process's status and mounts
+#                               read, its tries at setuid, a capability, the node's disk and a mount
+#                               refused; kithd killed under a pod: started again, the pod goes on
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
 #                               kills in a minute restart the machine
@@ -68,10 +71,15 @@
 #   sh ci/vm.sh --test access   three nodes: a write let through by a node that had not heard its
 #                               RoleBinding was deleted is refused where the log is kept; and
 #                               three entries a forging leader appends (bare, a changed body,
-#                               a replayed nonce) are refused at apply by every node
+#                               a replayed nonce) are refused at apply by every node; and a
+#                               phone's tunnel added by POST /v1/peers (--people): its level's
+#                               Service, a narrowed level cut, a removed peer's connection
+#                               ended, an exit level leaving by its Exit
 #   sh ci/vm.sh --test fido2    the client of kithd against a software security key (the fido2-test
 #                               build) through the kernel's uhid and hidraw: the hmac-secret each seed
 #                               says it must be, another seed another secret, a withheld touch timing out
+#   sh ci/vm.sh --test modules-state   a driver kept in a dm-verity image on the state partition is
+#                               loaded at start; a changed, swapped, longer, shorter or absent image loads nothing
 #   sh ci/vm.sh --test policy   two nodes whose policy turns off exec units, VM paths and /v1/run: kithd
 #                               cut its bounding set, and a pod that is root, a container with no filter
 #                               and a sandbox inside a container still run
@@ -123,17 +131,18 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    audio device the monitor adds later, in the same boot; the same spec built
                    with one byte of snd-usb-audio changed is refused on one console line; same
                    needs as image, and the image is built twice
-  --test disk      instead: the image of a kithd built with the cargo feature disk-test
-                   (target/os-disk, never shipped), two more disks that are files: one the
-                   kernel command line makes a data disk at start (the mapping, the seed ext4
-                   grown to the disk, the mount after the state opens), one nobody added.
-                   Expected: the first mounted, again at the next start from its key; the
-                   second listed as left alone and unchanged byte for byte; same needs as image
-  --test encrypt   instead: a plain node's disk file given a lock record and a marker, and its
+  --test encrypt  instead: a plain node's disk file given a lock record and a marker, and its
                    state encrypted in place at the next start (docs/adr-encrypt-in-place.md); the
                    first such start is cut mid-pass (the monitor's quit) and the next resumes it.
                    Expected: the same node, a state the host cannot read, the marker gone, and no
                    pass at a third start; same needs as image, and od
+  --test disk      instead: one node the installer made, its state encrypted, claimed over TLS,
+                   with three more disks that are files: one of 16 GiB (sparse) the add verb
+                   makes a data disk, one with a GPT on it (refused), one nobody names.
+                   Expected: the first added, mounted, listed and audited, mounted again at
+                   the next start from its header and key, then removed (its header zero,
+                   nobody's again); the other two unchanged byte for byte; needs what
+                   install needs (curl, python3, cpio, mtools, socat)
   --test rollout   instead: three nodes on a network of their own, claimed and joined
                    over TLS, their image built with a release key; a first release by
                    another key (refused), one with another file's signature (refused), a signed
@@ -223,6 +232,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    not know to an outside resolver (ci/outside-dns.py, on this machine); a pod
                    on the first finds outside.example.test through both. KITH_POD_NOUPSTREAM=1
                    starts neither with an upstream: the control, where the name is not found
+  --test privilege instead: one node on the mesh with --split, the image of a kithd built with the
+                   cargo feature confine-probe (target/os-probe, never shipped): `kithd confine-probe`
+                   (as an exec unit) confines itself as the serving part does and says its status,
+                   its mounts and what it tried and was refused, with the filter and with
+                   --no-filter (and holding a directory open: refused); then kithd
+                   killed under a pod: started again, the pod the same process
   --test nested    instead: one node with an image that holds bash, bubblewrap and kithd; a Job in it for
                    kith's defaults, then six variants: unconfined seccomp, userNamespaces, both, userNamespaces with cgroupDelegation, runAsUser 0;
                    each starts a user namespace, bubblewrap and kithd in agent mode, and
@@ -332,6 +347,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    seconds are printed), and two cards are never heard answering at
                    once, not when the stopped one goes on again; needs socat and
                    python3 as --test chaos does
+  --test modules-state  instead: an image whose one driver (virtio-input) is a module kept in a
+                   dm-verity image on the state partition, which the root pins: kithd loads
+                   it at start; the same disk with a changed byte, another build's .verity
+                   alone, an image a block longer or shorter, another build's image and
+                   .verity, or none, loads nothing and says why; build.sh refuses a block
+                   or network driver as a module of such a feature, and the root holds no
+                   .ko; same needs as image, and the image is built (a kernel, once)
   --test fido2     instead: the image of a kithd built with the cargo feature fido2-test
                    (and a kernel with /dev/uhid), one machine: it makes three software
                    security keys on uhid in turn and runs the client against each through
@@ -352,6 +374,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    nonce and one with a command its signed body does not make;
                    every node refuses each at apply (and audits it), and the
                    three nodes' lists agree; needs what --test rollout needs.
+                   Also a phone (a VM running the kernel's WireGuard) whose
+                   peer is added by POST /v1/peers on n1, started with
+                   --people: it reaches its level's Service, is cut when the
+                   level narrows, loses its open connection when the peer is
+                   removed, and leaves an exit level by its Exit.
                    The first run per checkout does a cold forge release build
                    (kithd and kith, into a target folder of its own) and an
                    image of it in target/os-forge: far longer than a warm one
@@ -416,7 +443,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | nested | nofile | alone | disk | clock | clockleader | encrypt | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, clockleader, disk, encrypt, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, nested, nofile, fido2" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | modules-state | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | privilege | nested | nofile | alone | disk | clock | clockleader | encrypt | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, modules-state, clock, clockleader, disk, encrypt, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, privilege, nested, nofile, fido2" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -630,7 +657,7 @@ env -u KITH_VM_RUN $setsid sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 1; do
 trap 'st=$?; kill $vms $web 2>/dev/null || true; env -u KITH_VM_RUN sh -c "$reap" sh "$KITH_VM_RUN"; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$work"/wg "$work"/wg.err "$work"/arp "$work"/arp.err "$KITH_VM_LOGS"/ 2>/dev/null || true; if [ "$st" -ne 0 ] && [ -n "${KITH_VM_LOGS:-}" ] && [ ! -e "$KITH_VM_LOGS/fail" ]; then echo "vm.sh: FAIL: exit $st without a fail file: a failure that did not go through fail(), see the log" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; fi; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
 trap 'exit 1' INT TERM
 said() { said_in "$work/log" "$1"; }
-fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; [ -z "${KITH_VM_LOGS:-}" ] || echo "vm.sh: FAIL: $1" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; exit 1; }
+fail() { cat "$work/log" 2>/dev/null || true; echo "vm.sh: FAIL: $1" >&2; [ -z "${KITH_VM_LOGS:-}" ] || echo "vm.sh: FAIL: $1" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; exit 1; }
 
 if [ -n "$test" ] && [ "$test" != init ]; then
     . "$root/ci/vm/tests.sh"

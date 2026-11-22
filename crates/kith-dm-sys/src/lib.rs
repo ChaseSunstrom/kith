@@ -205,6 +205,16 @@ pub fn window(tty: BorrowedFd) -> Result<(u16, u16)> {
 /// gone again when the last thing that has it open closes it, so keep what is returned open
 /// until something else (a mapping over it) holds the device.
 pub fn attach(file: &File) -> Result<(File, PathBuf)> {
+    attach_as(file, 0)
+}
+
+/// [`attach`], and the device read-only (LO_FLAGS_READ_ONLY): nothing writes through it,
+/// whatever `file` was opened for.
+pub fn attach_read_only(file: &File) -> Result<(File, PathBuf)> {
+    attach_as(file, 1)
+}
+
+fn attach_as(file: &File, flags: u32) -> Result<(File, PathBuf)> {
     const GET_FREE: u32 = 0x4C82;
     const CONFIGURE: u32 = 0x4C0A;
     let control = File::options().read(true).write(true).open("/dev/loop-control")?;
@@ -214,10 +224,10 @@ pub fn attach(file: &File) -> Result<(File, PathBuf)> {
         let path = PathBuf::from(format!("/dev/loop{}", ioctl(&control, GET_FREE, &mut [])?));
         let device = File::options().read(true).write(true).open(&path)?;
         // `struct loop_config`: the file, a block size (the default), then `struct
-        // loop_info64`, whose flags are 52 bytes in: LO_FLAGS_AUTOCLEAR.
+        // loop_info64`, whose flags are 52 bytes in: LO_FLAGS_AUTOCLEAR, and `flags`.
         let mut config = [0u8; 304];
         config[0..4].copy_from_slice(&(file.as_raw_fd() as u32).to_ne_bytes());
-        config[60..64].copy_from_slice(&4u32.to_ne_bytes());
+        config[60..64].copy_from_slice(&(4 | flags).to_ne_bytes());
         match ioctl(&device, CONFIGURE, &mut config) {
             Ok(_) => return Ok((device, path)),
             Err(busy) => failed = busy,
@@ -403,6 +413,12 @@ pub fn crypt(name: &str, device: &Path, from: u64, sectors: u64, key: &[u8]) -> 
     let load = request(name, SECURE, Some((sectors, "crypt", &told)));
     // (The key is in `told` and in the request: neither is left lying in memory.)
     told.into_bytes().fill(0);
+    make(name, load)
+}
+
+/// Make the mapping `name` with the one table `load`, and put it in use. Says where the
+/// opened device is (`/dev/dm-N`). A mapping that fails is removed again.
+fn make(name: &str, load: Result<Vec<u8>>) -> Result<PathBuf> {
     let control = control()?;
     let made = call(&control, CREATE, request(name, 0, None)?)?;
     let loaded = load.and_then(|load| call(&control, LOAD, load).map(|mut said| said.fill(0)));
@@ -420,6 +436,144 @@ pub fn crypt(name: &str, device: &Path, from: u64, sectors: u64, key: &[u8]) -> 
 /// Remove the mapping `name`: what it showed is unreadable again. Refused while it is in use.
 pub fn remove(name: &str) -> Result<()> {
     call(&control()?, REMOVE, request(name, 0, None)?).map(drop)
+}
+
+/// DM_READONLY_FLAG: a table no write goes through (dm-verity takes no other).
+const READONLY: u32 = 1;
+
+/// What dm-verity is told of `data` (`data_blocks` of 4096 bytes) and its hash tree in
+/// `hash` from block `hash_start`, under sha256 with the tree's `root` and `salt` (hex, as
+/// veritysetup prints them; an empty salt is none). With no options: a block whose hash is
+/// not the tree's reads as an I/O error.
+///
+/// Every number comes from the caller, never from a superblock on the disk: the root and
+/// salt are what the system pinned, and what is on the disk can only match them or fail.
+fn verity_table(data: &Path, hash: &Path, data_blocks: u64, hash_start: u64, root: &str, salt: &str) -> Result<String> {
+    let path = |device: &Path| {
+        let told = device
+            .to_str()
+            .filter(|path| !path.is_empty() && !path.contains([' ', '\0']));
+        told.map(str::to_owned)
+            .ok_or_else(|| Error::other(format!("{}: cannot be told to the kernel", device.display())))
+    };
+    let hex = |text: &str| text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if data_blocks == 0 || data_blocks.checked_mul(8).is_none() {
+        return Err(Error::other(format!("{data_blocks} blocks of data")));
+    }
+    if root.len() != 64 || !hex(root) {
+        return Err(Error::other("the root hash is not 64 lowercase hex digits"));
+    }
+    // (The kernel takes up to 256 bytes of salt.)
+    if !salt.len().is_multiple_of(2) || salt.len() > 512 || !hex(salt) {
+        return Err(Error::other(
+            "the salt is not whole bytes of lowercase hex, at most 256",
+        ));
+    }
+    let salt = if salt.is_empty() { "-" } else { salt };
+    let (data, hash) = (path(data)?, path(hash)?);
+    Ok(format!(
+        "1 {data} {hash} 4096 4096 {data_blocks} {hash_start} sha256 {root} {salt}"
+    ))
+}
+
+/// Make the mapping `name`: `data` (`data_blocks` of 4096 bytes) read through dm-verity,
+/// each block checked against the tree in `hash` from its block `hash_start` (1, for a tree
+/// file veritysetup wrote with its superblock first) whose top is `root`, salted with `salt`.
+/// Read-only, and a block that does not match is an I/O error. Says where it is (`/dev/dm-N`).
+pub fn verity(
+    name: &str,
+    data: &Path,
+    hash: &Path,
+    data_blocks: u64,
+    hash_start: u64,
+    root: &str,
+    salt: &str,
+) -> Result<PathBuf> {
+    let told = verity_table(data, hash, data_blocks, hash_start, root, salt)?;
+    make(name, request(name, READONLY, Some((data_blocks * 8, "verity", &told))))
+}
+
+#[cfg(test)]
+mod verity_tests {
+    use super::*;
+
+    const ROOT: &str = "4f0b3e6a1c2d5e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7";
+
+    /// A hash tree in a file of its own (veritysetup format IMG IMG.verity): its superblock
+    /// is the file's first block, so the tree starts at block 1.
+    #[test]
+    fn verity_table_of_two_files() {
+        let told = verity_table(Path::new("/dev/loop0"), Path::new("/dev/loop1"), 256, 1, ROOT, "00ff").unwrap();
+        assert_eq!(
+            told,
+            format!("1 /dev/loop0 /dev/loop1 4096 4096 256 1 sha256 {ROOT} 00ff")
+        );
+    }
+
+    /// The tree after the data in one file (veritysetup --hash-offset): the superblock is the
+    /// block after the data's last, and the tree the one after that.
+    #[test]
+    fn verity_table_of_one_file() {
+        let told = verity_table(Path::new("/dev/loop3"), Path::new("/dev/loop3"), 256, 257, ROOT, "").unwrap();
+        assert_eq!(
+            told,
+            format!("1 /dev/loop3 /dev/loop3 4096 4096 256 257 sha256 {ROOT} -")
+        );
+    }
+
+    #[test]
+    fn verity_table_refuses_what_is_not_a_hash_a_salt_a_path_or_data() {
+        let table = |data: &str, blocks, root: &str, salt: &str| {
+            verity_table(Path::new(data), Path::new("/dev/loop1"), blocks, 1, root, salt)
+        };
+        assert!(table("/dev/loop0", 0, ROOT, "00").is_err(), "no data");
+        assert!(table("/dev/loop0", 1, &ROOT[1..], "00").is_err(), "63 digits");
+        assert!(
+            table("/dev/loop0", 1, &ROOT.to_uppercase(), "00").is_err(),
+            "not as veritysetup writes it"
+        );
+        assert!(table("/dev/loop0", 1, &format!("{}g", &ROOT[1..]), "00").is_err());
+        assert!(table("/dev/loop0", 1, ROOT, "0").is_err(), "half a byte of salt");
+        assert!(table("/dev/loop0", 1, ROOT, "zz").is_err());
+        assert!(
+            table("/dev/loop0", 1, ROOT, &"00".repeat(257)).is_err(),
+            "more salt than the kernel takes"
+        );
+        assert!(
+            table("/dev/loop 0", 1, ROOT, "00").is_err(),
+            "a space ends a path in a table"
+        );
+        assert!(table("", 1, ROOT, "00").is_err());
+        assert!(
+            table("/dev/loop0", u64::MAX / 4, ROOT, "00").is_err(),
+            "more sectors than a u64"
+        );
+    }
+
+    /// The table is loaded read-only (dm-verity takes no other), with no options: a block
+    /// that does not match is an I/O error, never logged and let through.
+    #[test]
+    fn verity_requests_are_read_only_and_have_no_options() {
+        let told = verity_table(Path::new("/dev/loop0"), Path::new("/dev/loop1"), 2, 1, ROOT, "ab").unwrap();
+        let load = request("kith-modules", READONLY, Some((16, "verity", &told))).unwrap();
+        assert_eq!(load[28..32], 1u32.to_ne_bytes());
+        assert_eq!(load[312 + 8..312 + 16], 16u64.to_ne_bytes());
+        assert_eq!(&load[312 + 24..312 + 31], b"verity\0");
+        assert!(load[352..].starts_with(format!("{told}\0").as_bytes()));
+        assert!(told.ends_with(&format!("{ROOT} ab")));
+    }
+
+    /// Where device-mapper can be reached (as root): a verity mapping of what is no device
+    /// is the kernel's error, and leaves no mapping behind.
+    #[test]
+    fn verity_refusals_are_errors() {
+        if control().is_err() {
+            return;
+        }
+        let none = Path::new("/dev/null/none");
+        assert!(verity("kith-dm-sys-verity-test", none, none, 1, 1, ROOT, "").is_err());
+        assert!(remove("kith-dm-sys-verity-test").is_err());
+    }
 }
 
 /// `bpf(2)`: `command` with `request` as its `union bpf_attr`, as far as it is filled in
@@ -626,6 +780,7 @@ pub fn send_fds(socket: BorrowedFd, bytes: &[u8], fds: &[BorrowedFd]) -> Result<
             std::ptr::copy_nonoverlapping(raw.as_ptr().cast::<u8>(), libc::CMSG_DATA(cmsg), data as usize);
         }
     }
+    let until = timeout_end(socket, libc::SO_SNDTIMEO);
     loop {
         // SAFETY: `header` points at `iov` (the bytes) and `control`, alive for the call, which
         // only reads them.
@@ -634,10 +789,43 @@ pub fn send_fds(socket: BorrowedFd, bytes: &[u8], fds: &[BorrowedFd]) -> Result<
             n if n as usize == bytes.len() => return Ok(()),
             n if n >= 0 => return Err(Error::other("a message sent in part")),
             _ => match Error::last_os_error() {
-                e if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                e if e.kind() == std::io::ErrorKind::Interrupted => interrupted(until)?,
                 e => return Err(e),
             },
         }
+    }
+}
+
+/// When a send or a receive on `socket` that a signal interrupts must stop being started again: the
+/// end of the socket's own timeout (`SO_SNDTIMEO` or `SO_RCVTIMEO`), counted from now (a signal
+/// restarts the kernel's count, so a stream of them would wait for ever). `None` for a socket with no
+/// timeout, whose caller waits as long as it takes.
+fn timeout_end(socket: BorrowedFd, option: libc::c_int) -> Option<std::time::Instant> {
+    let mut timeout = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut size = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `size` bytes, the size of the `timeval` it is given.
+    let got = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&raw mut timeout).cast(),
+            &raw mut size,
+        )
+    };
+    let wait = std::time::Duration::new(
+        timeout.tv_sec.max(0) as u64,
+        timeout.tv_usec.clamp(0, 999_999) as u32 * 1000,
+    );
+    (got == 0 && !wait.is_zero()).then(|| std::time::Instant::now() + wait)
+}
+
+/// A signal interrupted the call: go on, unless the socket's timeout (`until`) is over, which says
+/// `WouldBlock` as the call itself would have.
+fn interrupted(until: Option<std::time::Instant>) -> Result<()> {
+    match until {
+        Some(end) if std::time::Instant::now() >= end => Err(std::io::ErrorKind::WouldBlock.into()),
+        _ => Ok(()),
     }
 }
 
@@ -661,6 +849,7 @@ pub fn recv_fds(socket: BorrowedFd, buf: &mut [u8], most: usize) -> Result<(usiz
     header.msg_iovlen = 1;
     header.msg_control = control.as_mut_ptr().cast();
     header.msg_controllen = space as _;
+    let until = timeout_end(socket, libc::SO_RCVTIMEO);
     let got = loop {
         // SAFETY: `header` points at `iov` (`buf`) and `control`, alive and writable for the call,
         // which writes no more than their lengths.
@@ -669,7 +858,7 @@ pub fn recv_fds(socket: BorrowedFd, buf: &mut [u8], most: usize) -> Result<(usiz
             break got as usize;
         }
         match Error::last_os_error() {
-            e if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            e if e.kind() == std::io::ErrorKind::Interrupted => interrupted(until)?,
             e => return Err(e),
         }
     };
@@ -790,6 +979,440 @@ pub fn capset(sets: [u64; 3]) -> Result<()> {
         0 => Ok(()),
         _ => Err(Error::last_os_error()),
     }
+}
+
+/// `setresgid(2)` of the process: real, effective and saved group id, as [`setresuid`].
+pub fn setresgid(real: Option<u32>, effective: Option<u32>, saved: Option<u32>) -> Result<()> {
+    let id = |id: Option<u32>| id.unwrap_or(u32::MAX);
+    // SAFETY: setresgid takes three ids by value; u32::MAX is "unchanged".
+    match unsafe { libc::setresgid(id(real), id(effective), id(saved)) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// `setgroups(2)` to none: the supplementary groups of the process emptied. Needs CAP_SETGID.
+pub fn drop_groups() -> Result<()> {
+    // SAFETY: a count of 0 reads no memory.
+    match unsafe { libc::setgroups(0, std::ptr::null()) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// `prctl(PR_SET_KEEPCAPS)`: the calling thread keeps its permitted capabilities through a
+/// change of its user ids from 0 (until the next `execve`).
+pub fn keep_caps(on: bool) -> Result<()> {
+    // SAFETY: PR_SET_KEEPCAPS takes its flag by value and reads no memory.
+    match unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, libc::c_ulong::from(on), 0, 0, 0) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// `prctl(PR_CAP_AMBIENT_CLEAR_ALL)`: the ambient set of the calling thread emptied.
+pub fn ambient_clear() -> Result<()> {
+    // SAFETY: the operation takes no memory.
+    match unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+            0,
+            0,
+            0,
+        )
+    } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// `unshare(CLONE_NEWNS)`: the calling thread is in a mount namespace of its own, a copy of the one
+/// it was in. Needs CAP_SYS_ADMIN. A thread made before keeps the old one.
+pub fn unshare_mounts() -> Result<()> {
+    // SAFETY: unshare takes its flags by value.
+    match unsafe { libc::unshare(libc::CLONE_NEWNS) } {
+        0 => Ok(()),
+        _ => Err(Error::last_os_error()),
+    }
+}
+
+/// The calls a confined serving part makes (a network server's: sockets, files it already has the
+/// right to, memory, threads, time, and what the C library and the runtime take). Everything else,
+/// the ones that change the machine (mount, setuid, ptrace, module and device calls, the key
+/// ring, bpf, `open_by_handle_at` ...), is refused.
+fn serving_calls() -> Vec<i64> {
+    #[allow(unused_mut)]
+    let mut calls = vec![
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_readv,
+        libc::SYS_writev,
+        libc::SYS_pread64,
+        libc::SYS_pwrite64,
+        libc::SYS_close,
+        libc::SYS_close_range,
+        libc::SYS_openat,
+        libc::SYS_newfstatat,
+        libc::SYS_fstat,
+        libc::SYS_statx,
+        libc::SYS_lseek,
+        libc::SYS_fcntl,
+        libc::SYS_flock,
+        libc::SYS_fsync,
+        libc::SYS_fdatasync,
+        libc::SYS_ftruncate,
+        libc::SYS_fallocate,
+        libc::SYS_getdents64,
+        libc::SYS_readlinkat,
+        libc::SYS_unlinkat,
+        libc::SYS_renameat,
+        libc::SYS_renameat2,
+        libc::SYS_mkdirat,
+        libc::SYS_fchmod,
+        libc::SYS_fchmodat,
+        libc::SYS_fchown,
+        libc::SYS_fchownat,
+        libc::SYS_faccessat,
+        libc::SYS_faccessat2,
+        libc::SYS_linkat,
+        libc::SYS_symlinkat,
+        libc::SYS_utimensat,
+        libc::SYS_statfs,
+        libc::SYS_fstatfs,
+        libc::SYS_getcwd,
+        libc::SYS_chdir,
+        libc::SYS_fchdir,
+        libc::SYS_dup,
+        libc::SYS_dup3,
+        libc::SYS_pipe2,
+        libc::SYS_umask,
+        libc::SYS_sync,
+        libc::SYS_syncfs,
+        libc::SYS_copy_file_range,
+        libc::SYS_sendfile,
+        libc::SYS_splice,
+        libc::SYS_eventfd2,
+        libc::SYS_epoll_create1,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_pwait,
+        libc::SYS_ppoll,
+        libc::SYS_pselect6,
+        libc::SYS_inotify_init1,
+        libc::SYS_inotify_add_watch,
+        libc::SYS_inotify_rm_watch,
+        // (`socket` and `socketpair` are rules: only the families the part uses.)
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+        libc::SYS_connect,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+        libc::SYS_sendto,
+        libc::SYS_recvfrom,
+        libc::SYS_sendmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_sendmmsg,
+        libc::SYS_recvmmsg,
+        libc::SYS_setsockopt,
+        libc::SYS_getsockopt,
+        libc::SYS_shutdown,
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_mprotect,
+        libc::SYS_mremap,
+        libc::SYS_madvise,
+        libc::SYS_brk,
+        libc::SYS_mlock,
+        libc::SYS_munlock,
+        libc::SYS_membarrier,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack,
+        libc::SYS_kill,
+        libc::SYS_tgkill,
+        // (No `execve`: nothing in the part's root, a state directory and `/proc`, both mounted
+        // no-exec, can run, and the part starts no program.)
+        libc::SYS_wait4,
+        // What a store that maps its file, a runtime that waits for signals and the allocator ask:
+        libc::SYS_msync,
+        libc::SYS_fadvise64,
+        libc::SYS_signalfd4,
+        libc::SYS_rt_sigtimedwait,
+        libc::SYS_epoll_pwait2,
+        libc::SYS_getcpu,
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+        libc::SYS_futex,
+        libc::SYS_set_robust_list,
+        libc::SYS_get_robust_list,
+        libc::SYS_set_tid_address,
+        libc::SYS_sched_yield,
+        libc::SYS_sched_getaffinity,
+        libc::SYS_sched_setaffinity,
+        libc::SYS_nanosleep,
+        libc::SYS_clock_nanosleep,
+        libc::SYS_clock_gettime,
+        libc::SYS_clock_getres,
+        libc::SYS_gettimeofday,
+        libc::SYS_getpid,
+        libc::SYS_getppid,
+        libc::SYS_gettid,
+        libc::SYS_getuid,
+        libc::SYS_geteuid,
+        libc::SYS_getgid,
+        libc::SYS_getegid,
+        libc::SYS_getgroups,
+        libc::SYS_getresuid,
+        libc::SYS_getresgid,
+        libc::SYS_capget,
+        libc::SYS_prlimit64,
+        libc::SYS_getrlimit,
+        libc::SYS_getrusage,
+        libc::SYS_uname,
+        libc::SYS_sysinfo,
+        libc::SYS_getrandom,
+        libc::SYS_rseq,
+        libc::SYS_timerfd_create,
+        libc::SYS_timerfd_settime,
+        libc::SYS_timerfd_gettime,
+        libc::SYS_pidfd_open,
+        libc::SYS_pidfd_send_signal,
+        libc::SYS_seccomp,
+        libc::SYS_restart_syscall,
+        libc::SYS_setitimer,
+    ];
+    // (The older calls the C library still makes where the architecture has them.)
+    #[cfg(target_arch = "x86_64")]
+    calls.extend([
+        libc::SYS_open,
+        libc::SYS_stat,
+        libc::SYS_lstat,
+        libc::SYS_access,
+        libc::SYS_pipe,
+        libc::SYS_poll,
+        libc::SYS_epoll_wait,
+        libc::SYS_epoll_create,
+        libc::SYS_readlink,
+        libc::SYS_unlink,
+        libc::SYS_rename,
+        libc::SYS_mkdir,
+        libc::SYS_rmdir,
+        libc::SYS_dup2,
+        libc::SYS_chmod,
+        libc::SYS_inotify_init,
+        libc::SYS_eventfd,
+        libc::SYS_getdents,
+        libc::SYS_time,
+        libc::SYS_select,
+        libc::SYS_fork,
+        libc::SYS_vfork,
+        libc::SYS_pause,
+        libc::SYS_alarm,
+        libc::SYS_creat,
+        libc::SYS_chown,
+        libc::SYS_lchown,
+        libc::SYS_link,
+        libc::SYS_symlink,
+        libc::SYS_utimes,
+        libc::SYS_futimesat,
+        libc::SYS_getpgrp,
+        libc::SYS_truncate,
+        libc::SYS_arch_prctl,
+    ]);
+    calls
+}
+
+/// For a probe of a confinement, the calls a compromised process would try: `clone` with
+/// `flags` (and `SIGCHLD`: a fork, so no stack is needed) when `flags` is `Some`, else `clone3`
+/// with no arguments, else `ioctl(TIOCSTI)` on the standard input. Each returns the error it
+/// got (`EPERM` of the filter, `ENOSYS` for `clone3`), or `Ok` when the kernel let it through:
+/// a child that clone made ends at once.
+pub fn try_call(call: Try) -> Result<()> {
+    // SAFETY: each is a raw call with no pointer in it (a null for the `clone3` arguments with
+    // a size of 0, which the kernel refuses); a child of `clone` leaves with `_exit` before it
+    // returns into anything of this program, and the parent waits for it; a socket made is
+    // closed at once.
+    let got = unsafe {
+        match call {
+            Try::Socket(family) => {
+                let fd = libc::syscall(
+                    libc::SYS_socket,
+                    libc::c_long::from(family),
+                    libc::c_long::from(libc::SOCK_DGRAM),
+                    0 as libc::c_long,
+                );
+                if fd >= 0 {
+                    libc::close(fd as libc::c_int);
+                }
+                fd
+            }
+            Try::Clone(flags) => {
+                let pid = libc::syscall(libc::SYS_clone, flags | libc::SIGCHLD as u64, 0, 0, 0, 0);
+                if pid == 0 {
+                    libc::_exit(0);
+                }
+                if pid > 0 {
+                    libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+                }
+                pid
+            }
+            Try::Clone3 => libc::syscall(libc::SYS_clone3, 0, 0),
+            Try::Tiocsti => libc::syscall(libc::SYS_ioctl, 0, libc::TIOCSTI, 0),
+        }
+    };
+    if got < 0 { Err(Error::last_os_error()) } else { Ok(()) }
+}
+
+/// What [`try_call`] tries.
+pub enum Try {
+    /// `socket(family, SOCK_DGRAM, 0)`, closed if made.
+    Socket(i32),
+    Clone(u64),
+    Clone3,
+    Tiocsti,
+}
+
+/// A seccomp filter for the calling process (and every thread of it): the calls in `allowed` pass,
+/// every other answers `EPERM`, and the calls of another architecture's numbering are killed.
+/// Needs `no_new_privs` (or CAP_SYS_ADMIN) first, and cannot be undone.
+pub fn seccomp_allow(allowed: &[i64]) -> Result<()> {
+    seccomp_install(allow_program(allowed, &[]))
+}
+
+fn seccomp_install(mut program: Vec<libc::sock_filter>) -> Result<()> {
+    let fprog = libc::sock_fprog {
+        len: u16::try_from(program.len()).map_err(|_| Error::other("the filter is longer than a filter can be"))?,
+        filter: program.as_mut_ptr(),
+    };
+    // SAFETY: SECCOMP_SET_MODE_FILTER (1) with the TSYNC flag (1) reads the `sock_fprog` and the
+    // `len` instructions it points to, both alive for the call; the kernel copies them.
+    match unsafe { libc::syscall(libc::SYS_seccomp, 1, 1, &raw const fprog) } {
+        0 => Ok(()),
+        // (With TSYNC, a thread that cannot take the filter is answered by its id, not by -1: errno
+        // says nothing then.)
+        -1 => Err(Error::last_os_error()),
+        tid => Err(Error::other(format!(
+            "thread {tid} could not take the seccomp filter (it has one that the new cannot follow)"
+        ))),
+    }
+}
+
+/// [`seccomp_allow`] for what a serving part makes (see `serving_calls`).
+pub fn seccomp_serving() -> Result<()> {
+    seccomp_install(serving_program())
+}
+
+/// A call the serving part makes only in part: what its arguments say decides.
+enum Rule {
+    /// `clone`: refused when its flags (argument 0) hold any `CLONE_NEW*` bit, so no namespace
+    /// is made by it, as `unshare` and `setns` are left out of the list.
+    NoNewSpace,
+    /// Not there (`ENOSYS`): `clone3` keeps its flags behind a pointer a filter cannot read, and
+    /// the C libraries fall back to `clone`.
+    Absent,
+    /// Allowed when the 32 bits at this offset of `seccomp_data` are one of these (an `ioctl`'s
+    /// request, a `prctl`'s option), else `EPERM`.
+    Only(u32, &'static [u32]),
+}
+
+/// The architecture the filter lets through (`AUDIT_ARCH_X86_64`, `AUDIT_ARCH_AARCH64`): the
+/// numbers of the calls are this one's, and another's are killed. A third has none yet.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: u32 = 0xC000_003E;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: u32 = 0xC000_00B7;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("the seccomp filter knows the audit architecture of x86_64 and aarch64 only");
+
+/// Offsets of `struct seccomp_data`: the first argument, and the second.
+const ARG0: u32 = 16;
+const ARG1: u32 = 24;
+/// `CLONE_NEWNS | NEWCGROUP | NEWUTS | NEWIPC | NEWUSER | NEWPID | NEWNET | NEWTIME`.
+const CLONE_NEW: u32 =
+    0x0002_0000 | 0x0200_0000 | 0x0400_0000 | 0x0800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000 | 0x80;
+
+/// What a serving part asks of `ioctl` (the request is the second argument): a socket or pipe
+/// made non-blocking or close-on-exec, the bytes waiting, and whether a stream is a terminal
+/// (`TCGETS`, which the C library asks to decide how to buffer) and its size (`TIOCGWINSZ`, 0x5413). Not `TIOCSTI` (pushing input
+/// into a terminal), `TIOCLINUX`, `TIOCSCTTY`, a terminal's settings, or a device's.
+const SERVING_IOCTLS: &[u32] = &[0x5421, 0x541B, 0x5451, 0x5450, 0x5401, 0x5413];
+/// What it asks of `prctl` (the option is the first): a thread's name, the parent-death signal,
+/// dumpable and no_new_privs as asked or already set, the bounding set as read, the seccomp
+/// mode as read, the timer slack, `PR_SET_VMA` (the allocator names its maps) and the thread's
+/// address as read.
+const SERVING_PRCTLS: &[u32] = &[1, 2, 3, 4, 15, 16, 21, 23, 29, 30, 38, 39, 40, 0x5356_4d41];
+/// The families a serving part makes a socket of (the domain is the first argument): Unix, IPv4 and
+/// IPv6. Not netlink, the kernel's crypto (`AF_ALG`), vsock, packet, keys ...: each of those reaches
+/// kernel code a network server has no use for.
+const SERVING_SOCKETS: &[u32] = &[1, 2, 10];
+/// A pair is of the Unix family (the only one the kernel makes pairs of that it is let).
+const SERVING_PAIRS: &[u32] = &[1];
+
+fn serving_rules() -> Vec<(i64, Rule)> {
+    vec![
+        (libc::SYS_socket, Rule::Only(ARG0, SERVING_SOCKETS)),
+        (libc::SYS_socketpair, Rule::Only(ARG0, SERVING_PAIRS)),
+        (libc::SYS_clone, Rule::NoNewSpace),
+        (libc::SYS_clone3, Rule::Absent),
+        (libc::SYS_ioctl, Rule::Only(ARG1, SERVING_IOCTLS)),
+        (libc::SYS_prctl, Rule::Only(ARG0, SERVING_PRCTLS)),
+    ]
+}
+
+fn serving_program() -> Vec<libc::sock_filter> {
+    allow_program(&serving_calls(), &serving_rules())
+}
+
+/// The classic BPF program of [`seccomp_allow`]: the architecture checked, then for each call a
+/// compare and an allow (a jump of two instructions at most: BPF's are eight bits), then for each
+/// call with a rule a compare and its block (which always ends in an answer, so the number of
+/// the call is still in the accumulator where a block is jumped over), then `EPERM`.
+fn allow_program(allowed: &[i64], rules: &[(i64, Rule)]) -> Vec<libc::sock_filter> {
+    let arch = AUDIT_ARCH;
+    let op = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
+    let mut program = vec![
+        op(0x20, 0, 0, 4),           // A = the architecture
+        op(0x15, 1, 0, arch),        // ours: over the kill
+        op(0x06, 0, 0, 0x8000_0000), // not ours: kill the process
+        op(0x20, 0, 0, 0),           // A = the call's number
+    ];
+    for call in allowed {
+        program.push(op(0x15, 0, 1, *call as u32)); // this one: the allow after it; else over it
+        program.push(op(0x06, 0, 0, 0x7fff_0000));
+    }
+    let (allow, errno) = (0x7fff_0000, |e: i32| 0x0005_0000 | e as u32);
+    for (call, rule) in rules {
+        let block = match rule {
+            Rule::NoNewSpace => vec![
+                op(0x20, 0, 0, ARG0),
+                op(0x45, 0, 1, CLONE_NEW), // a new namespace: the refusal after it; else over it
+                op(0x06, 0, 0, errno(libc::EPERM)),
+                op(0x06, 0, 0, allow),
+            ],
+            Rule::Absent => vec![op(0x06, 0, 0, errno(libc::ENOSYS))],
+            Rule::Only(at, wanted) => {
+                let mut block = vec![op(0x20, 0, 0, *at)];
+                for w in *wanted {
+                    block.push(op(0x15, 0, 1, *w)); // this one: the allow after it; else over it
+                    block.push(op(0x06, 0, 0, allow));
+                }
+                block.push(op(0x06, 0, 0, errno(libc::EPERM)));
+                block
+            }
+        };
+        program.push(op(
+            0x15,
+            0,
+            u8::try_from(block.len()).expect("a block of a rule is short"),
+            *call as u32,
+        ));
+        program.extend(block);
+    }
+    program.push(op(0x06, 0, 0, 0x0005_0000 | libc::EPERM as u32));
+    program
 }
 
 /// A version 3 `__user_cap_header_struct` (the calling thread: pid 0) and room for its two
@@ -1499,11 +2122,51 @@ pub fn relro_ranges(headers: impl Iterator<Item = (u32, usize, usize)> + Clone, 
         .collect()
 }
 
+/// Makes `command`'s child join the cgroup whose `cgroup.procs` is `procs` between the fork and
+/// the exec: from its first instruction, so nothing it forks can be outside. The child writes
+/// `0` (itself) with raw `open`, `write` and `close` (nothing that allocates, as a forked
+/// child of a threaded process may do only async-signal-safe calls). If any of them fails,
+/// `spawn` fails with that error and the program is not started.
+pub fn join_cgroup_before_exec(command: &mut std::process::Command, procs: &Path) -> Result<()> {
+    use std::os::unix::{ffi::OsStrExt, process::CommandExt};
+    let procs = std::ffi::CString::new(procs.as_os_str().as_bytes()).map_err(Error::other)?;
+    // SAFETY: the closure makes only async-signal-safe calls on memory made before the fork.
+    unsafe {
+        command.pre_exec(move || {
+            let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if fd < 0 {
+                return Err(Error::last_os_error());
+            }
+            let written = libc::write(fd, c"0".as_ptr().cast(), 1);
+            let failed = (written != 1).then(Error::last_os_error);
+            libc::close(fd);
+            failed.map_or(Ok(()), Err)
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
     use std::time::Duration;
+
+    #[test]
+    fn a_child_writes_zero_to_the_cgroup_file_before_it_execs_or_does_not_start() {
+        let procs = std::env::temp_dir().join(format!("kith-dm-sys-procs-{}", std::process::id()));
+        std::fs::write(&procs, "").unwrap();
+        let mut command = std::process::Command::new("true");
+        join_cgroup_before_exec(&mut command, &procs).unwrap();
+        assert!(command.status().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&procs).unwrap(), "0");
+        std::fs::remove_file(&procs).unwrap();
+        // A file it cannot open: the spawn fails with that, and `true` does not run.
+        let mut command = std::process::Command::new("true");
+        join_cgroup_before_exec(&mut command, &procs).unwrap();
+        assert_eq!(command.spawn().unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(join_cgroup_before_exec(&mut command, Path::new("a\0b")).is_err());
+    }
 
     #[test]
     fn rtc_time_is_the_civil_time_in_utc() {
@@ -1540,6 +2203,266 @@ mod tests {
     static CHILDREN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn children() -> std::sync::MutexGuard<'static, ()> {
         CHILDREN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What the serving filter does with a call: runs its classic BPF on a `seccomp_data` of
+    /// the call, its architecture and its first two arguments (the ones the filter reads), and
+    /// returns the action (`0x7fff0000` allow, `0x50000 | errno`, `0x80000000` kill).
+    fn filtered(arch: u32, nr: i64, args: [u64; 2]) -> u32 {
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&(nr as u32).to_ne_bytes());
+        data[4..8].copy_from_slice(&arch.to_ne_bytes());
+        data[16..24].copy_from_slice(&args[0].to_ne_bytes());
+        data[24..32].copy_from_slice(&args[1].to_ne_bytes());
+        let program = serving_program();
+        let (mut a, mut pc) = (0u32, 0usize);
+        loop {
+            let i = &program[pc];
+            pc += 1;
+            match i.code {
+                0x20 => a = u32::from_ne_bytes(data[i.k as usize..i.k as usize + 4].try_into().unwrap()),
+                0x15 => pc += usize::from(if a == i.k { i.jt } else { i.jf }),
+                0x45 => pc += usize::from(if a & i.k != 0 { i.jt } else { i.jf }),
+                0x06 => return i.k,
+                other => panic!("an instruction the test does not know: {other:#x}"),
+            }
+        }
+    }
+
+    const ALLOW: u32 = 0x7fff_0000;
+    fn refused(errno: i32) -> u32 {
+        0x0005_0000 | errno as u32
+    }
+    fn ours(nr: i64, args: [u64; 2]) -> u32 {
+        filtered(AUDIT_ARCH, nr, args)
+    }
+
+    #[test]
+    fn serving_filter_refuses_what_is_not_listed_and_kills_a_foreign_architecture() {
+        assert_eq!(ours(libc::SYS_read, [0; 2]), ALLOW);
+        assert_eq!(ours(libc::SYS_mount, [0; 2]), refused(libc::EPERM));
+        assert_eq!(ours(libc::SYS_unshare, [0; 2]), refused(libc::EPERM));
+        assert_eq!(ours(libc::SYS_setns, [0; 2]), refused(libc::EPERM));
+        assert_eq!(filtered(0x4000_0003, libc::SYS_read, [0; 2]), 0x8000_0000);
+    }
+
+    #[test]
+    fn serving_filter_refuses_a_clone_that_makes_a_namespace() {
+        // A thread (what the runtime makes) and a fork pass; each flag of a new namespace is refused.
+        let thread =
+            (libc::CLONE_VM | libc::CLONE_FS | libc::CLONE_FILES | libc::CLONE_SIGHAND | libc::CLONE_THREAD) as u64;
+        assert_eq!(ours(libc::SYS_clone, [thread, 0]), ALLOW);
+        assert_eq!(ours(libc::SYS_clone, [libc::SIGCHLD as u64, 0]), ALLOW);
+        for flag in [
+            libc::CLONE_NEWUSER,
+            libc::CLONE_NEWNS,
+            libc::CLONE_NEWNET,
+            libc::CLONE_NEWPID,
+            libc::CLONE_NEWIPC,
+            libc::CLONE_NEWUTS,
+            libc::CLONE_NEWCGROUP,
+            0x80, // CLONE_NEWTIME
+        ] {
+            assert_eq!(
+                ours(libc::SYS_clone, [thread | flag as u64, 0]),
+                refused(libc::EPERM),
+                "clone with {flag:#x}"
+            );
+            assert_eq!(
+                ours(libc::SYS_clone, [flag as u64 | libc::SIGCHLD as u64, 0]),
+                refused(libc::EPERM)
+            );
+        }
+        // clone3 reads its flags behind a pointer the filter cannot follow: not there at all,
+        // and the C libraries fall back to clone.
+        assert_eq!(ours(libc::SYS_clone3, [0; 2]), refused(libc::ENOSYS));
+    }
+
+    #[test]
+    fn serving_filter_lets_ioctl_and_prctl_ask_only_what_the_serving_part_asks() {
+        for request in [libc::FIONBIO, libc::FIONREAD, libc::FIOCLEX, libc::TCGETS] {
+            assert_eq!(
+                ours(libc::SYS_ioctl, [3, u64::from(request as u32)]),
+                ALLOW,
+                "ioctl {request:#x}"
+            );
+        }
+        for request in [
+            libc::TIOCSTI,
+            0x541C, /* TIOCLINUX */
+            libc::TIOCSCTTY,
+            libc::TCSETS,
+        ] {
+            assert_eq!(
+                ours(libc::SYS_ioctl, [0, u64::from(request as u32)]),
+                refused(libc::EPERM),
+                "ioctl {request:#x}"
+            );
+        }
+        for option in [
+            libc::PR_SET_NAME,
+            libc::PR_GET_NAME,
+            libc::PR_SET_NO_NEW_PRIVS,
+            libc::PR_GET_DUMPABLE,
+        ] {
+            assert_eq!(ours(libc::SYS_prctl, [option as u64, 0]), ALLOW, "prctl {option}");
+        }
+        for option in [
+            libc::PR_SET_MM,
+            libc::PR_SET_SECCOMP,
+            libc::PR_SET_KEEPCAPS,
+            libc::PR_CAP_AMBIENT,
+            0x5961_6d61, /* PR_SET_PTRACER */
+        ] {
+            assert_eq!(
+                ours(libc::SYS_prctl, [option as u64, 0]),
+                refused(libc::EPERM),
+                "prctl {option}"
+            );
+        }
+    }
+
+    #[test]
+    fn serving_filter_lets_socket_make_only_the_families_the_serving_part_uses() {
+        // Unix, IPv4 and IPv6 pass (whatever the type's flags say); netlink, the kernel's crypto,
+        // vsock, packet and the rest are refused, for socket and socketpair alike.
+        for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
+            let args = [family as u64, (libc::SOCK_STREAM | libc::SOCK_NONBLOCK) as u64];
+            assert_eq!(ours(libc::SYS_socket, args), ALLOW, "socket {family}");
+        }
+        for family in [
+            libc::AF_NETLINK,
+            libc::AF_ALG,
+            libc::AF_VSOCK,
+            libc::AF_PACKET,
+            libc::AF_KEY,
+            libc::AF_BLUETOOTH,
+        ] {
+            assert_eq!(
+                ours(libc::SYS_socket, [family as u64, libc::SOCK_RAW as u64]),
+                refused(libc::EPERM),
+                "socket {family}"
+            );
+            assert_eq!(
+                ours(libc::SYS_socketpair, [family as u64, libc::SOCK_DGRAM as u64]),
+                refused(libc::EPERM),
+                "socketpair {family}"
+            );
+        }
+        assert_eq!(
+            ours(libc::SYS_socketpair, [libc::AF_UNIX as u64, libc::SOCK_DGRAM as u64]),
+            ALLOW
+        );
+        assert_eq!(
+            ours(libc::SYS_socketpair, [libc::AF_INET as u64, libc::SOCK_STREAM as u64]),
+            refused(libc::EPERM),
+            "a pair is of the Unix family only"
+        );
+    }
+
+    #[test]
+    fn serving_filter_refuses_a_call_numbered_as_the_x32_ones_are() {
+        // The x32 calls have the x86-64 architecture and bit 30 set in their number: none of the
+        // list's numbers has it, so each, even of an allowed call, falls to the refusal.
+        for nr in [libc::SYS_read, libc::SYS_openat, libc::SYS_socket, libc::SYS_clone] {
+            assert_eq!(
+                ours(nr | 0x4000_0000, [0; 2]),
+                refused(libc::EPERM),
+                "call {nr} as an x32 call"
+            );
+        }
+    }
+
+    #[test]
+    fn serving_filter_lets_a_real_serving_part_make_the_calls_it_needs() {
+        for nr in [
+            libc::SYS_msync,
+            libc::SYS_fadvise64,
+            libc::SYS_signalfd4,
+            libc::SYS_rt_sigtimedwait,
+            libc::SYS_epoll_pwait2,
+            libc::SYS_getcpu,
+        ] {
+            assert_eq!(ours(nr, [0; 2]), ALLOW, "call {nr}");
+        }
+        // Nothing in the serving part's root can run, so nothing is made to run.
+        assert_eq!(ours(libc::SYS_execve, [0; 2]), refused(libc::EPERM));
+        assert_eq!(ours(libc::SYS_execveat, [0; 2]), refused(libc::EPERM));
+    }
+
+    extern "C" fn nothing(_: libc::c_int) {}
+
+    /// A signal (SIGUSR1, no restart of the call) sent to the calling thread every 50 ms until the
+    /// guard drops.
+    struct Pester(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        Option<std::thread::JoinHandle<()>>,
+    );
+
+    fn pester() -> Pester {
+        // SAFETY: a handler that does nothing, set without SA_RESTART, so a blocked call is
+        // ended with EINTR.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = nothing as extern "C" fn(libc::c_int) as usize;
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()), 0);
+        }
+        // SAFETY: pthread_self has no precondition.
+        let target = unsafe { libc::pthread_self() };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                // SAFETY: the target thread is the test's, which outlives this guard.
+                unsafe { libc::pthread_kill(target, libc::SIGUSR1) };
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        Pester(stop, Some(thread))
+    }
+
+    impl Drop for Pester {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(thread) = self.1.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[test]
+    fn recv_fds_interrupted_again_and_again_still_ends_at_the_sockets_timeout() {
+        let (a, _b) = socketpair().unwrap();
+        let socket = std::os::unix::net::UnixDatagram::from(a);
+        socket.set_read_timeout(Some(Duration::from_millis(600))).unwrap();
+        let _pester = pester();
+        let began = std::time::Instant::now();
+        let mut buf = [0u8; 16];
+        let got = recv_fds(socket.as_fd(), &mut buf, 0);
+        assert_eq!(got.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        let waited = began.elapsed();
+        assert!(
+            waited >= Duration::from_millis(550) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn recv_fds_interrupted_after_a_long_wait_goes_on_to_the_message() {
+        // A receive interrupted over and over, with time left of the socket's timeout, goes on
+        // waiting for it (3 s), and gets what is sent at 900 ms.
+        let (a, b) = socketpair().unwrap();
+        let socket = std::os::unix::net::UnixDatagram::from(a);
+        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(900));
+            send_fds(b.as_fd(), b"late", &[]).unwrap();
+        });
+        let _pester = pester();
+        let mut buf = [0u8; 16];
+        let (n, fds) = recv_fds(socket.as_fd(), &mut buf, 0).unwrap();
+        assert_eq!((&buf[..n], fds.len()), (&b"late"[..], 0));
+        sender.join().unwrap();
     }
 
     #[test]

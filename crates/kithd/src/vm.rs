@@ -354,7 +354,8 @@ pub fn control(line: &mut Vec<String>, socket: &Path, incoming: bool) -> Result<
     let at = at.replace(',', ",,");
     let mut flags = vec!["-qmp".to_string(), format!("unix:{at},server=on,wait=off")];
     if incoming {
-        flags.extend(["-incoming".to_string(), "defer".to_string()]);
+        // (-S: paused when the stream is in, until the cutover starts it.)
+        flags.extend(["-S".to_string(), "-incoming".to_string(), "defer".to_string()]);
     }
     line.splice(1..1, flags);
     Ok(())
@@ -377,6 +378,24 @@ mod tests {
 
     fn vm(unit: serde_json::Value) -> VmUnit {
         serde_json::from_value(unit).unwrap()
+    }
+
+    /// A machine that waits for a migration is started paused (`-S`): QEMU would otherwise run it the moment the
+    /// stream completes, and a source that then fails and resumes would leave it running in two places.
+    #[test]
+    fn a_machine_waiting_for_a_migration_starts_paused() {
+        let line = |incoming| {
+            let mut line = vec!["qemu-system-x86_64".to_string(), "-m".to_string(), "64".to_string()];
+            control(&mut line, Path::new("/run/r/qmp.sock"), incoming).unwrap();
+            line
+        };
+        let waiting = line(true);
+        assert!(waiting.contains(&"-S".to_string()), "{waiting:?}");
+        assert!(
+            waiting.windows(2).any(|pair| pair == ["-incoming", "defer"]),
+            "{waiting:?}"
+        );
+        assert!(!line(false).contains(&"-S".to_string()));
     }
 
     /// A kernel started directly under QEMU: the machine as asked, its console on the unit's

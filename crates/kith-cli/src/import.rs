@@ -28,6 +28,21 @@ pub enum Import {
         #[arg(long)]
         node: Option<String>,
     },
+    /// The same for containers made with `docker run`: what `docker inspect` says of them, run
+    /// for the NAMEs, or saved (`docker inspect NAME... > FILE`, or piped to `-f -`). Each named
+    /// volume gets a line on stderr that copies its files in once the resources are applied
+    Docker {
+        /// Containers, by name or id
+        containers: Vec<String>,
+        /// A saved `docker inspect` (JSON), or `-` for stdin, in place of NAMEs
+        #[arg(short = 'f', long = "file", value_name = "PATH")]
+        file: Option<PathBuf>,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// The node that holds the volumes' directories
+        #[arg(long)]
+        node: Option<String>,
+    },
     /// The same for a Helm chart, rendered by the installed `helm template`
     Helm {
         /// A chart directory, archive or `repo/chart`
@@ -58,7 +73,33 @@ fn read(file: &Path) -> Result<(String, String), String> {
 }
 
 pub fn run(what: Import) -> Result<ExitCode, String> {
+    // The docker volumes a container mounts, and the Volumes kith names them.
+    let mut named = Vec::new();
+    let mut copy_into = "default".to_string();
+    let mut has_node = false;
     let (resources, report) = match what {
+        Import::Docker {
+            containers,
+            file,
+            namespace,
+            node,
+        } => {
+            let (name, src) =
+                match (&file, containers.is_empty()) {
+                    (Some(file), true) => read(file)?,
+                    (None, false) => ("docker inspect".to_string(), docker_inspect(&containers)?),
+                    _ => return Err(
+                        "error: name the containers to inspect, or give a saved `docker inspect` as -f FILE (not both)"
+                            .into(),
+                    ),
+                };
+            let (doc, volumes) =
+                kith_kube::compose::from_docker(documents(&name, &src)?).map_err(|e| format!("error: {name}: {e}"))?;
+            named = volumes;
+            has_node = node.is_some();
+            copy_into = namespace.clone().unwrap_or(copy_into);
+            kith_kube::compose::translate(doc, namespace.as_deref(), node.as_deref())
+        }
         Import::K8s { files } => {
             let mut objects = Vec::new();
             for file in files {
@@ -98,10 +139,88 @@ pub fn run(what: Import) -> Result<ExitCode, String> {
         }
     }
     for line in &report {
+        // The input is not trusted: a key with a newline in it would forge a line below, and an
+        // escape would reach the terminal.
+        let line: String = line
+            .chars()
+            .flat_map(|c| {
+                if c.is_control() {
+                    c.escape_default().collect()
+                } else {
+                    vec![c]
+                }
+            })
+            .collect();
         eprintln!("not translated: {line}");
+    }
+    // A volume that no Workload made here mounts (a refused mount, or a name two things make)
+    // is not copied into: it would be a Volume nothing uses.
+    let mounted = |kith: &str| {
+        resources.iter().filter(|r| r.kind == "Workload").any(|r| {
+            let containers = r.spec["template"]["containers"].as_array();
+            containers.into_iter().flatten().any(|c| {
+                let mounts = c["volumeMounts"].as_array();
+                mounts.into_iter().flatten().any(|m| m["volume"] == kith)
+            })
+        })
+    };
+    // Without --node no Volume is made: there is nothing to copy into.
+    // The docker volumes by the kith name they make: two of one name (`web_data`, `web-data`) are
+    // one Volume that a copy of each would mix.
+    let mut by_kith: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> = Default::default();
+    for (docker, kith) in named.iter().filter(|(_, kith)| has_node && mounted(kith)) {
+        by_kith.entry(kith).or_default().insert(docker);
+    }
+    // The line is one to paste into a shell, and a saved inspect is not trusted: docker's own
+    // volume names are these characters, a namespace's are these, and others get no line.
+    let plain = |s: &str, more: &str| {
+        s.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || more.contains(c))
+    };
+    for (kith, dockers) in by_kith {
+        let escaped: Vec<String> = dockers.iter().map(|d| d.escape_default().to_string()).collect();
+        if dockers.len() > 1 {
+            eprintln!("volume {kith}: copy by hand: {} all map to it", escaped.join(", "));
+        } else if !dockers.iter().all(|d| plain(d, "_.-")) || !plain(&copy_into, "-.") {
+            eprintln!(
+                "volume {kith}: its docker name or namespace has characters a name's does not: copy it in by hand"
+            );
+        } else {
+            let docker = escaped[0].as_str();
+            eprintln!(
+                "volume {kith}: once applied, copy the docker volume's files in: \
+                 docker run --rm -v {docker}:/v:ro busybox tar -C /v -c . | kith volume put {kith} - -n {copy_into}"
+            );
+        }
     }
     eprintln!("{} resources, {} things not translated", resources.len(), report.len());
     Ok(ExitCode::from(u8::from(!report.is_empty())))
+}
+
+/// What `docker inspect` prints of the containers. No shell: the names go to docker as they are.
+fn docker_inspect(names: &[String]) -> Result<String, String> {
+    // A name that looks like a flag would be read by docker as one.
+    if let Some(bad) = names.iter().find(|s| s.starts_with('-')) {
+        return Err(format!("error: `{bad}` starts with `-`: it is not a container's name"));
+    }
+    let out = Command::new("docker")
+        .args(["inspect", "--type", "container"])
+        .args(names)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "error: docker is not installed: pipe `docker inspect NAME... | kith import docker -f -` from where it is"
+                    .to_string()
+            } else {
+                format!("error: running docker: {e}")
+            }
+        })?;
+    if !out.status.success() {
+        return Err(format!("error: docker inspect failed ({})", out.status));
+    }
+    String::from_utf8(out.stdout).map_err(|_| "error: docker inspect printed text that is not UTF-8".to_string())
 }
 
 /// What `helm template` prints. No shell: the arguments go to helm as they are.

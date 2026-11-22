@@ -1664,6 +1664,13 @@
             "null"
           ],
           "description": "The operator's time server, `ADDRESS[:PORT]` (port 123 left out): every node asks it\nalone, at its next check, unless its own `kith.ntp` names one. When Clusters say\ndifferent servers, the lowest key's is the one taken."
+        },
+        "lanDomains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The names only the LAN knows: the domains the cluster's LAN CA signs host\ncertificates under (`expose.issuer: cluster`), and no others. Left out, `home.arpa`,\n`lan`, `internal` and `local`. Changing it makes the LAN CA's certificate again (the\nsame key): export it again (`kith ca export`) for the devices that trust it. When\nClusters name some, the lowest key's are taken."
         }
       }
     },
@@ -2360,6 +2367,17 @@
             "type": "string"
           },
           "description": "Headers set on each request on its way to the backend, in place of any of the\nsame name the client sent."
+        },
+        "issuer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExposeIssuer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Who vouches for the host's certificate: `acme` (the default) asks the ACME\nauthority, which needs a name the world can reach; `cluster` has the cluster's own\nCA sign it, for a name only the LAN knows (a phone or laptop trusts `kith ca export`\nonce). The cluster CA then vouches for any name that says so: keep its key safe."
         }
       },
       "required": [
@@ -2367,6 +2385,13 @@
         "via"
       ],
       "description": "Public HTTPS through an edge node."
+    },
+    "ExposeIssuer": {
+      "type": "string",
+      "enum": [
+        "acme",
+        "cluster"
+      ]
     },
     "ExposePath": {
       "type": "object",
@@ -3701,6 +3726,24 @@
         "secret"
       ]
     },
+    "ScaleToZero": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "idle": {
+          "type": "string",
+          "description": "How long without a connection before it sleeps, from `30s` to `30d`: `90s`, `30m`,\n`24h`. Nodes' clocks are taken to agree within a minute, and it is counted to\nwithin about ten seconds."
+        },
+        "start": {
+          "type": "string",
+          "description": "How long a first connection is held for a replica to start (at most `10m`),\nbefore it is closed with the reason."
+        }
+      },
+      "required": [
+        "idle",
+        "start"
+      ]
+    },
     "SeatSpec": {
       "type": "object",
       "additionalProperties": false,
@@ -3849,6 +3892,17 @@
             "null"
           ],
           "description": "No address of its own: its name (`<service>.<namespace>.kith`, and under\n`svc.cluster.local`) answers the addresses of its ready replicas, as a headless\nKubernetes Service does. Off unless true."
+        },
+        "scaleToZero": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScaleToZero"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Sleep the Workloads behind this Service (their `replicas` stay) after no\nconnection to it for `idle`; kithd holds the first TCP connection to a sleeping\none while a replica starts. Off unless set. TCP only: a datagram wakes nothing."
         }
       },
       "required": [

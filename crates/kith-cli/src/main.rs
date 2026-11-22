@@ -186,6 +186,11 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    /// The cluster's certificate authority: its public certificate, for a phone or laptop to trust
+    Ca {
+        #[command(subcommand)]
+        command: CaCommand,
+    },
     /// The admin's key: what signs the cluster's writes under `spec.signing: required`
     Admin {
         #[command(subcommand)]
@@ -328,6 +333,15 @@ enum IdentityCommand {
         #[arg(long, default_value = ".")]
         out: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum CaCommand {
+    /// Write the LAN CA's certificate (public: never a key) to FILE, or print it; run it on the
+    /// node that holds the CA. It vouches only for the cluster's LAN names (`spec.lanDomains`), so
+    /// trust it once on a device and the hosts that say `expose.issuer: cluster` open there
+    /// without a warning, and no other name does
+    Export { file: Option<PathBuf> },
 }
 
 #[derive(Subcommand)]
@@ -608,6 +622,11 @@ enum NodeCommand {
         #[arg(long)]
         cancel: bool,
     },
+    /// A second disk for NAME's data: add one, take one away, or list what it holds (docs/adr-second-disk.md)
+    Disk {
+        #[command(subcommand)]
+        command: DiskCommand,
+    },
     /// Make a duress code for NAME and show it, once: typed at NAME's waiting console in place of
     /// the recovery key, it erases what that disk opens with and has the cluster forget its key,
     /// and the console answers as it does a wrong key. There is no way back
@@ -623,6 +642,63 @@ enum NodeCommand {
         #[arg(long)]
         off: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum DiskCommand {
+    /// Make the disk of this serial NODE's data disk: it is overwritten, so what is on it is gone, and
+    /// its key is kept in NODE's encrypted state (a node whose state is not encrypted adds none). Run
+    /// where kithd runs (kithd's own socket): NODE is the node that kithd is
+    Add {
+        node: String,
+        /// The disk's serial, as `kith node disk list` or the installer shows it; nothing else names a disk
+        #[arg(long)]
+        serial: String,
+        /// Overwrite a disk that holds a partition table, a filesystem or any data. Never the disk the
+        /// system runs from, a stick or a card reader
+        #[arg(long)]
+        wipe: bool,
+        /// Discard the disk's blocks instead of writing zeros through the encryption: fast on a large
+        /// virtual or flash disk, and not a wipe of what a disk without discard held before
+        #[arg(long)]
+        quick: bool,
+    },
+    /// Take a data disk away from NODE: its header is zeroed, its key forgotten here, and what it holds
+    /// can no more be read (the disk is not erased)
+    Remove {
+        node: String,
+        /// The disk's id, as `kith node disk list` shows it (32 hex digits)
+        id: String,
+    },
+    /// List the disks NODE has, mounted or not, and the ones it left alone
+    List { node: String },
+}
+
+/// What `kith node disk list` says of the answer's `known` and `unknown`.
+fn disks_said(said: &serde_json::Value) -> String {
+    let text = |one: &serde_json::Value, key: &str| one[key].as_str().unwrap_or("").to_string();
+    let mut out = String::new();
+    for (title, none, key) in [
+        ("data disks:", "no data disks", "known"),
+        ("left alone:", "no other disks", "unknown"),
+    ] {
+        let all = said[key].as_array().cloned().unwrap_or_default();
+        if all.is_empty() {
+            out.push_str(&format!("{none}\n"));
+            continue;
+        }
+        out.push_str(&format!("{title}\n"));
+        for one in all {
+            let who = match (one["disk"].as_str(), one["serial"].as_str()) {
+                (Some(disk), _) => disk.to_string(),
+                (None, serial) => format!("serial {}", serial.unwrap_or("?")),
+            };
+            let id = one["id"].as_str().map(|id| format!("  id {id}")).unwrap_or_default();
+            let why = one["why"].as_str().map(|why| format!(": {why}")).unwrap_or_default();
+            out.push_str(&format!("  {who}  {}{why}{id}\n", text(&one, "state")));
+        }
+    }
+    out
 }
 
 #[derive(Args)]
@@ -1470,6 +1546,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("remote apps go through kithd: leave out --store");
             };
+            remote::watch();
             return remote::run(&kithd, &on, via.as_deref(), &argv);
         }
         Command::Logs {
@@ -1888,6 +1965,48 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             );
         }
         Command::Node {
+            command: NodeCommand::Disk { command },
+        } => {
+            let Backend::Daemon(mut kithd) = backend()? else {
+                return fail("disks are added by kithd: leave out --store");
+            };
+            match command {
+                DiskCommand::Add {
+                    node,
+                    serial,
+                    wipe,
+                    quick,
+                } => {
+                    // (Zeroing a disk through its encryption takes as long as writing the disk.)
+                    kithd.timeout = kithd.timeout.max(std::time::Duration::from_secs(24 * 3600));
+                    let body = serde_json::json!({ "serial": serial, "wipe": wipe, "quick": quick }).to_string();
+                    let said: serde_json::Value =
+                        request(&kithd, "POST", &format!("/v1/disks/{node}"), body.as_bytes())?;
+                    let (id, disk) = (said["id"].as_str().unwrap_or("?"), said["disk"].as_str().unwrap_or("?"));
+                    println!("{node}: {disk} (serial {serial}) is now a data disk, id {id}");
+                    match said["why"].as_str() {
+                        Some(why) => println!("{why}"),
+                        None => println!("it is mounted: the node mounts it at every start"),
+                    }
+                }
+                DiskCommand::Remove { node, id } => {
+                    let said: serde_json::Value = request(&kithd, "DELETE", &format!("/v1/disks/{node}/{id}"), b"")?;
+                    match said["absent"].as_bool() {
+                        Some(true) => println!(
+                            "{node}: disk {id} was not in the machine: it is no longer a data disk, its key is forgotten and nothing could be zeroed"
+                        ),
+                        _ => println!(
+                            "{node}: disk {id} is no longer a data disk: its header is zeroed and its key forgotten"
+                        ),
+                    }
+                }
+                DiskCommand::List { node } => {
+                    let said: serde_json::Value = request(&kithd, "GET", &format!("/v1/disks/{node}"), b"")?;
+                    print!("{}", disks_said(&said));
+                }
+            }
+        }
+        Command::Node {
             command: NodeCommand::Pin { name, untried_tpm, off },
         } => {
             let Backend::Daemon(kithd) = backend()? else {
@@ -1962,6 +2081,33 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 "Identity/{name} can call the API with {out}/{name}.crt and {out}/{name}.key (nodes show {out}/ca.crt, as `kith`)"
             );
             println!("It may do what Roles bound to it allow: nothing, until a RoleBinding names it.");
+        }
+        Command::Ca {
+            command: CaCommand::Export { file },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("the CA is kithd's: leave out --store");
+            };
+            let on_the_node = "kith ca export runs on the node that holds the CA (kithd's admin socket serves the certificate, no remote context does)";
+            if matches!(kithd.route, Route::Node { .. }) {
+                return fail(format!("error: {on_the_node}"));
+            }
+            let reply = raw(&kithd, "GET", "/v1/ca/lan", b"").map_err(|e| format!("{e}\n(note: {on_the_node})"))?;
+            let pem = String::from_utf8(reply).map_err(|_| "error: kithd's reply is not text".to_string())?;
+            // (A certificate and nothing else: what is written for the world to trust holds no key.)
+            if pem.contains("PRIVATE KEY") || !pem.contains("BEGIN CERTIFICATE") {
+                return fail("kithd's reply is not a certificate alone (a private key is never exported)");
+            }
+            match file {
+                Some(file) => {
+                    std::fs::write(&file, &pem).map_err(|e| format!("error: writing {}: {e}", file.display()))?;
+                    println!(
+                        "The LAN CA's certificate is in {}: trust it once on each device (it vouches only for the cluster's LAN names)",
+                        file.display()
+                    );
+                }
+                None => print!("{pem}"),
+            }
         }
         Command::Controller {
             command:

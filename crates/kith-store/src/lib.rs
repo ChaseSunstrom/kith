@@ -414,7 +414,7 @@ async fn scrub(raft: &Raft, index: u64, key: &str) {
 /// The status of a resource after `node` said `said` of it. Several nodes run replicas of
 /// one Workload: each node's `containers` are kept apart by their `node` and replaced only
 /// by that node, `ready` is counted over all of them, and what the scheduler wrote (`nodes`,
-/// `unschedulable`) stays. Every other field is as the node says, so it must be one that
+/// `unschedulable`) and the leader's `asleep` stay. Every other field is as the node says, so it must be one that
 /// every node says the same (it follows from the spec) or the resource must be run by one
 /// node (a Job: its status has a `state`). `None` takes the node's containers out.
 pub fn reported(old: Option<serde_json::Value>, node: &str, said: Option<serde_json::Value>) -> serde_json::Value {
@@ -446,7 +446,7 @@ pub fn reported(old: Option<serde_json::Value>, node: &str, said: Option<serde_j
     // Stable: the units of one replica stay in the order its node gave them.
     containers.sort_by_key(place);
     let mut status = said.unwrap_or_else(|| old.clone());
-    for kept in ["nodes", "unschedulable"] {
+    for kept in ["nodes", "unschedulable", "asleep"] {
         match old.get(kept) {
             Some(value) => status.insert(kept.into(), value.clone()),
             None => status.remove(kept),
