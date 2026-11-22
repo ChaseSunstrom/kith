@@ -128,13 +128,24 @@ export function at(value, path) {
 
 const firstLine = (text) => String(text).split('\n')[0];
 
+/** How far an image pull is, as a container's `pull` says it: "pulling 3 of 7 layers, 12 of 40 MB". */
+export function pullText(pull) {
+  if (!pull || ![pull.layers, pull.layersTotal, pull.bytes, pull.bytesTotal].every(Number.isInteger)) return '';
+  const [unit, size] = [['GB', 1e9], ['MB', 1e6], ['KB', 1e3]].find(([, size]) => pull.bytesTotal >= size) ?? ['B', 1];
+  const show = (n) => (n / size >= 10 || size === 1 ? Math.round(n / size) : (n / size).toFixed(1));
+  return `pulling ${pull.layers} of ${pull.layersTotal} layers, ${show(pull.bytes)} of ${show(pull.bytesTotal)} ${unit}`;
+}
+
 /** A resource's status in a few words, as `kith get` says it. */
 export function summary(resource) {
   const status = resource.status;
   if (!status || typeof status !== 'object') return '';
   if (Number.isInteger(status.ready) && Number.isInteger(status.replicas)) {
-    const why = (status.containers ?? []).map((unit) => unit.message).find(Boolean);
-    return `${status.ready}/${status.replicas} ready${why ? `: ${firstLine(why)}` : ''}`;
+    const units = status.containers ?? [];
+    // A pull that goes on is the news; a message beside it is from before.
+    const pull = units.map((unit) => pullText(unit.pull)).find(Boolean);
+    const why = pull ?? firstLine(units.map((unit) => unit.message).find(Boolean) ?? '');
+    return `${status.ready}/${status.replicas} ready${why ? `: ${why}` : ''}`;
   }
   const state = status.state ?? status.controller?.state;
   const message = status.message ?? status.controller?.message;

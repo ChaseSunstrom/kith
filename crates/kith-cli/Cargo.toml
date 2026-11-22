@@ -21,6 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 # A passphrase is typed unseen (`kith node passphrase`).
+# (`signal`: `machine shell` follows the window and puts the terminal back on a hangup.)
 nix = { version = "0.29", features = ["term", "signal"] }
 # The admin's key, from the passphrase: PBKDF2 and Ed25519 (`signing.rs`, kithd's `access_sign.rs`).
 ring = "0.17"

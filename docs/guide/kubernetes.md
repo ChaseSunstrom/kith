@@ -48,7 +48,7 @@ helm install site ./chart --wait
 | ConfigMap, Secret | a ConfigMap, a Secret (Helm keeps its releases in Secrets: they are kith Secrets) |
 | PersistentVolumeClaim | a VolumeClaim that says `provision: true`: a Volume is made for it on a node |
 | ServiceAccount, Role, RoleBinding, ClusterRole, ClusterRoleBinding, PodDisruptionBudget, IngressClass | kept as sent (a `KubeObject`), read back, and said to give nothing |
-| A bare Pod (a `Pod` sent by `POST` or server-side apply) | a Job when its `restartPolicy` is `Never` or `OnFailure`, a one-replica Workload when it is `Always` or none is said, marked `kith.dev/pod`, with its fields carried as a Deployment's template's are. It is read back as the Pod sent, by its own name (not `NAME-j0`), owned by nothing; `nodeName`, `hostNetwork`, `activeDeadlineSeconds` and the rest kith does not carry are refused by name. Its name is one name space with Jobs, Workloads and their pods (a taken one is a 409 `AlreadyExists`), and sending it needs `apply` on the Job or the Workload it becomes. A change to one that is there is refused. `kubectl delete pod NAME` deletes it (it needs `delete` on the Job or the Workload it is held as; the `kith.dev/pod` mark is what tells it from a pod an owner runs, which a delete restarts) |
+| A bare Pod (a `Pod` sent by `POST` or server-side apply) | a Job when its `restartPolicy` is `Never` or `OnFailure`, a one-replica Workload when it is `Always` or none is said, marked `kith.dev/pod`, with its fields carried as a Deployment's template's are. It is read back as the Pod sent, by its own name (not `NAME-j0`), owned by nothing; `nodeName`, `hostNetwork`, `activeDeadlineSeconds` and the rest kith does not carry are refused by name. Its name is one name space with Jobs, Workloads and their pods (a taken one is a 409 `AlreadyExists`, in either order: a Deployment, StatefulSet, DaemonSet or Job made after a bare Pod named as one of its pods, `NAME-0`, `NAME-j0` or `NAME-n0`, is refused too, whichever replica number), and sending it needs `apply` on the Job or the Workload it becomes. A change to one that is there is refused. `kubectl logs` finds it by its own name, and `exec` finds it as it does any pod (the same 403 for any name when the caller has no right on Jobs or Workloads; a caller with the right on one of them is told 404 for every name the other holds, there or not). `kubectl delete pod NAME` deletes it (it needs `delete` on the Job or the Workload it is held as; the `kith.dev/pod` mark is what tells it from a pod an owner runs, which a delete restarts) |
 | Pod, ReplicaSet, Node, Event | made for reading from what kith runs: `kubectl get pods`, `describe`, `logs` (a Deployment's kept revisions are ReplicaSets too, one for each template they held, numbered by the revision that last held it and read only: a write or a delete of one is a `MethodNotAllowed`; a pod's name says what runs it, so a Deployment and a Job of one name make two: a Deployment's or StatefulSet's pods are `NAME-0`, a Job's `NAME-j0` and a DaemonSet's `NAME-n0`) |
 
 What works, by the real clients in the tests (`sh ci/kube.sh`, and `sh ci/kube.sh --vm` for what
@@ -61,7 +61,7 @@ needs pods that run):
 | Field managers | `kubectl apply --server-side` keeps who set which field (`metadata.managedFields`, up to 64 managers an object). Managers that apply one object each keep their own fields; a second manager's different value for a field the first set is a `409 Conflict` in Kubernetes's words, unless it says `--force-conflicts` (it then takes the field). A field a manager leaves out of its next apply goes, when no other manager has it. Fields are owned by their exact path, a list with no one key to merge by is owned whole, and only an apply makes a manager (a `replace` or a `patch` takes a field from whoever had it). Applying onto an object that exists, or replacing one, needs `get` as well as `apply`, as a patch does |
 | AGE | `kubectl get namespaces` and `get nodes` show the time of the oldest revision the store kept: when it was made, unless the history was trimmed or the node is a worker that runs from a view and holds only what the view carried (an implicit namespace, one that only holds objects, has none) |
 | Watches | `kubectl get --watch` reads what the store says changed, so one change among 2000 objects makes and compares one object, not 2000 (it shows what a list shows: the same Roles apply). It reads the kind again when it cannot know what changed: on a worker node that runs from a view, after a change to an Identity, a Role or a RoleBinding, after more than 4096 changed keys, after the store was replaced, and for Namespaces |
-| exec, cp | `kubectl exec` (stdin, stdout, stderr and the exit status; no TTY) and `kubectl cp`, both ways (a `tar` run by exec, so the image needs one), for a pod of a Workload or a Job, as the caller who has the `exec` right on what owns the pod. The process runs in the replica's own mount, pid and net namespaces on the node that runs it; asked of another node, the request crosses by the one route that port-forward uses too (`/v1/pod-hop`, between control nodes), which checks the caller and the `exec` right again at the replica's node. A kithd that is not root has one id in a replica: a `tar` that gives files their senders' ids needs `--no-same-owner`. A kube request is unsigned, so where `signing: required` the other node may refuse the hop. `vm.sh --test kube` runs both across two kith OS nodes with the real kubectl, and a person who may only read is refused |
+| exec, cp | `kubectl exec`, also `kubectl exec -it` (stdin, stdout, stderr and the exit status; with `-t` the process has a terminal of its own and follows the window `kubectl` sends) and `kubectl cp`, both ways (a `tar` run by exec, so the image needs one), for a pod of a Workload or a Job, as the caller who has the `exec` right on what owns the pod. The process runs in the replica's own mount, pid and net namespaces on the node that runs it; asked of another node, the request crosses by the one route that port-forward uses too (`/v1/pod-hop`, between control nodes), which checks the caller and the `exec` right again at the replica's node. A kithd that is not root has one id in a replica: a `tar` that gives files their senders' ids needs `--no-same-owner`. A kube request is unsigned, so where `signing: required` the other node may refuse the hop. `vm.sh --test kube` runs both across two kith OS nodes with the real kubectl, and a person who may only read is refused |
 | port-forward | `kubectl port-forward POD LOCAL:REMOTE` (the WebSocket kubectl asks for first; the older `POST` upgrade is refused), for a pod of a Workload or a Job, as the caller who has the `exec` right on what owns the pod (`get` alone is refused, before anything is upgraded). The bytes go both ways to the pod's own address and the port asked, over the node that runs the replica; a connection that moves no byte for 5 minutes ends, and so does a session with no connection that hears nothing (kubectl's pings are heard); a session carries 16 connections and a caller has 8 sessions at a node. The `exec` right is asked again for each new connection (here, and again at the node that runs the replica): a binding taken away refuses the next connection, and ends none that is open. A pod that is not made on its node yet (still starting) is refused, never answered by the host's own ports. TCP only, and not to a NodeWorkload's host unit |
 | GitOps | a [Source](packages.md#sources-gitops) follows a repository of Kubernetes manifests as they are; a file's objects are read exactly as the API reads them |
 | Every field | accounted for by one table (`crates/kith-kube/src/lib.rs`): carried into the kith resource, or taken with a `Warning:` that it changes nothing (kubectl prints it), or the object is refused with a status that names the field. Nothing is dropped in silence, and `kubectl get -o yaml` gives back what was sent |
@@ -71,7 +71,7 @@ Not answered, each refused in words:
 | What | Note |
 |---|---|
 | A write to a resource's `/status` (a controller's, or `kubectl patch --subresource=status`) | `status is kithd's own`, written from what runs, not taken from a client. Reading works |
-| `kubectl exec` with `-t` (a TTY), `attach`; `exec` or `cp` into a Job's finished run or a NodeWorkload's host unit | `attach` and a TTY are refused by name, as is a NodeWorkload's host unit and a run that is over |
+| `attach`; `exec` or `cp` into a Job's finished run or a NodeWorkload's host unit | `attach` is refused by name, as is a NodeWorkload's host unit and a run that is over |
 | `kubectl run -it` (an attach), `kubectl top`; CustomResourceDefinitions (so other people's operators), admission webhooks, NetworkPolicy, HorizontalPodAutoscaler | |
 | What it is not, and is not meant to become | kith is not a conformant Kubernetes (the conformance tests are not run and would not pass). It takes no CNI, CSI or device plugin (a pod's network, a volume and a device are kith's own), serves no aggregated API, and never starts, fetches or packages Kubernetes: what needs the real thing needs a real cluster |
 | In a pod: `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, `privileged`, added capabilities | kith gives no Workload these, by any API |
@@ -170,10 +170,45 @@ The Docker Engine API in front of kith, begun: `kith docker serve [--listen PATH
 (`docker.sock` beside kithd's, mode 0600 from its first moment; a socket a dead run left is
 replaced, one in use is refused) and the `docker` command talks to it with
 `DOCKER_HOST=unix://PATH`. It is in the `kith-remote` build (cargo feature `docker`), not in the
-default `kith` or in kithd: nothing in the daemon changed.
+default `kith` or in kithd: nothing in the daemon changed. Against a kithd with `signing: required`
+it asks for the admin's passphrase once, before it serves (at a terminal, or one line on stdin),
+and refuses to start without it; it never asks in the middle of a call.
 
-Today it answers `docker version` and `docker info`, each under any `/v1.40/` to `/v1.47/` prefix
-(a client newer or older is told so with a 400, as dockerd does). Everything else, containers and
-images included, is answered 501 with a JSON `message`, never left waiting; so is a request body
-sent chunked. A container will be a Workload, its ID the SHA-256 of its namespace and name: the
-same on every run.
+Today it answers `docker version`, `docker info` and these container calls, each under any
+`/v1.40/` to `/v1.47/` prefix (a client newer or older is told so with a 400, as dockerd does):
+
+- `docker run -d --name NAME IMAGE CMD` (create, then start), `ps`, `ps -a`, `inspect`, `stop`,
+  `start`, `restart`, `kill`, `rm -f` and `wait`.
+- `docker logs [-f] [--tail N] NAME`: what the container wrote, its two outputs kept apart, and
+  with `-f` what it writes after, until it stops. kithd keeps no times, so `--timestamps`,
+  `--since` and `--until` are 501, and a container that is a stopped Workload (`replicas: 0`) has
+  no logs for kithd to read (one that never started has none to show).
+- `docker run IMAGE CMD` without `-d` (and with `-t`): it prints the output as it comes and
+  exits with the container's exit code. With `-t` the output is raw, as it is on a terminal.
+- `docker exec [-i] [-t] NAME CMD`, and `docker exec -it NAME sh` on a terminal: the command runs in
+  the container's unit through kithd's exec connection, its input is what you type (with `-i`), the
+  window size follows your terminal, and its exit code is the command's. Not carried: `exec -d`,
+  `--env`, `--workdir`, `--user` and `--privileged` (each is 501, with the reason).
+
+Stdin to a container's main process (`docker run -i`, `docker attach` with stdin) is refused with a
+501 that says why: kithd starts the main process with no input and has no way to attach to it.
+Give a command its input with `docker exec -i`.
+
+A container is a kith resource in the namespace `docker`, labelled `kith.dev/docker=NAME`, with the
+labels its create body gave kept as they are. `kith delete` removes it. A container with
+`--restart always` or `unless-stopped` is a Workload (`replicas: 0` while created or stopped, 1
+while running): `kith get workload NAME -n docker` shows it. One with `no` (the default, so a plain
+`docker run -d`) or `on-failure` is a Job while it runs: `kith get job NAME -n docker` shows it, and
+once stopped it is a Workload at `replicas: 0` again, until `docker start` makes the Job anew. A
+name is at most 61 characters. Its ID is the SHA-256 of its namespace and name, the same on every run.
+
+Refused with a 400 and a JSON `message` in Docker's shape: a name Docker or kith would not take; a
+security-changing HostConfig field (`privileged`, `capAdd`, `securityOpt`, devices, binds and
+mounts, host PID, IPC, UTS, user or cgroup namespaces, `networkMode` host or `container:`); and a
+name another resource in the store already has (a 409).
+
+Answered 501 with a JSON `message`, never left waiting: `ps` with filters; port bindings; ulimits;
+`--rm`; memory, CPU and PID limits; DNS, extra hosts and links; a hostname, exposed ports, a
+health check and a stop signal; volumes, `--tmpfs`, `--volumes-from`, a read-only root and
+`--runtime`; other network modes; images; and any other call not listed above.
+A request body sent chunked is 501 too.
