@@ -302,6 +302,12 @@ Only the newest version is fixed. There are no security releases of older ones.
   give nothing; a pod is given no token and no API to ask. `privileged`, the host's
   namespaces, `hostPath` and added capabilities have no field in kith, and an object
   that asks for one is refused by its name. Of a body in protobuf 50,000 fields are read.
+- **A terminal and `--root` in an exec add no right.** `kubectl exec -it` and `kith machine shell`
+  are the same `exec` right as without a terminal; the process gets a pseudo-terminal of its own
+  (kithd keeps the master end), and kith puts its own terminal back when it ends. `--root`
+  (`root=true` in the request, which any client may send) runs as uid 0 of the pod's own user
+  namespace only: it is refused, with the reason, when that uid 0 would be the node's root or the
+  user kithd runs as, so a pod with no user namespace of its own is never entered as root of the node.
 - **`kubectl exec`, `cp` and `port-forward` are one right, `exec`, on the Workload or Job that
   owns the pod.** `get` alone reads a pod and is refused all three. A `port-forward` reaches
   any port of the pod, whatever listens there and whatever a NetworkPolicy says: a policy holds
