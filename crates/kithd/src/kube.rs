@@ -99,13 +99,16 @@ static BARE: [Kind; 2] = [
     kind("", "pods", "Pod", "po", true, Held::As("Job")),
     kind("", "pods", "Pod", "po", true, Held::As("Workload")),
 ];
+/// Where each row is in [`BARE`].
+const BARE_JOB: usize = 0;
+const BARE_WORKLOAD: usize = 1;
 
 /// The row a Pod sent is held as: Job when it is not run again, else a Workload (as Kubernetes
 /// says of a missing `restartPolicy`).
 fn bare(pod: &Value) -> &'static Kind {
     match kith_kube::pod_holder(pod.pointer("/spec/restartPolicy").and_then(Value::as_str)) {
-        "Job" => &BARE[0],
-        _ => &BARE[1],
+        "Job" => &BARE[BARE_JOB],
+        _ => &BARE[BARE_WORKLOAD],
     }
 }
 
@@ -934,6 +937,16 @@ pub(crate) fn pod_owner(pod: &str) -> Option<(&'static str, &str, u32)> {
         (pod_name(holder, owner, replica.into()) == pod).then_some((*holder, replica))
     })?;
     (!owner.is_empty()).then_some((holder, owner, replica))
+}
+
+/// What a pod named `pod` in `namespace` is, as [`pod_owner`] says it, but a bare Pod's name first: it is
+/// its own Job's or Workload's run 0, held under the name sent. The one resolver of every verb that
+/// reaches a pod (logs, exec, port-forward and the hop to the node that runs it).
+pub(crate) fn resolve_pod<'a>(store: &Store, namespace: &str, pod: &'a str) -> Option<(&'static str, &'a str, u32)> {
+    match held_bare(store, Some(namespace), pod) {
+        Some(row) => Some((holder(row), pod, 0)),
+        None => pod_owner(pod),
+    }
 }
 
 /// The pods of what `owner` runs: one for each replica its status tells of, named by
@@ -2866,7 +2879,7 @@ async fn delete(
         // (Before the store is looked at, for a bare Pod's name or any other: who holds no right to
         // delete a Job or a Workload, or to restart a replica, is told that and nothing of which names exist.)
         let place = Some(namespace.unwrap_or(kith_api::DEFAULT_NAMESPACE));
-        if let Err(refused) = call.allowed(&BARE[1], place, Verb::Apply)
+        if let Err(refused) = call.allowed(&BARE[BARE_WORKLOAD], place, Verb::Apply)
             && !BARE.iter().any(|row| call.allowed(row, place, Verb::Delete).is_ok())
         {
             return Err(refused);
@@ -3347,13 +3360,13 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
 /// store is, so a caller with none is told the same of every name, a pod's or not.
 /// (`any`, for the UI's terminal: what `kith apply` made is held too, not only what the Kubernetes API sent.)
 fn pod_run(call: &Call, namespace: &str, pod: &str, verb: Verb, any: bool) -> Result<(String, u32), No> {
-    let may = |holder: &str| {
-        let place = vec![(holder.to_string(), Some(namespace.to_string()))];
+    let may = |of: &str| {
+        let place = vec![(of.to_string(), Some(namespace.to_string()))];
         api::permit(&call.shared, &call.caller, verb.clone(), |_| place).map_err(refusal)
     };
     // (Any of the holders a pod might be of; the first refusal, the Workload's, is what is said.)
     if let Err(refused) = may("Workload")
-        && ["Job", "NodeWorkload"].into_iter().all(|holder| may(holder).is_err())
+        && ["Job", "NodeWorkload"].into_iter().all(|of| may(of).is_err())
     {
         return Err(refused);
     }
@@ -3361,26 +3374,22 @@ fn pod_run(call: &Call, namespace: &str, pod: &str, verb: Verb, any: bool) -> Re
         let state = call.shared.store.lock().expect("a handler panicked holding the store");
         state.store.get(key).is_some_and(|held| any || raw(held).is_some())
     };
-    let bare = {
-        let state = call.shared.store.lock().expect("a handler panicked holding the store");
-        held_bare(&state.store, Some(namespace), pod).map(holder)
-    };
     // (Past that gate, a caller who lacks the right on the holder a name points to is told 404, as of a
     // name that is nothing, whether the pod is there or not.)
     let nothing = || not_found(&KINDS[0], pod);
-    if let Some(holder) = bare {
-        may(holder).map_err(|_| nothing())?;
-        return Ok((format!("{holder}/{namespace}/{pod}"), 0));
-    }
-    let (holder, owner, replica) = pod_owner(pod).ok_or_else(nothing)?;
-    may(holder).map_err(|_| nothing())?;
+    let named = {
+        let state = call.shared.store.lock().expect("a handler panicked holding the store");
+        resolve_pod(&state.store, namespace, pod)
+    };
+    let (of, owner, replica) = named.ok_or_else(nothing)?;
+    may(of).map_err(|_| nothing())?;
     // A NodeWorkload's pod runs on the host, as `kith run` runs there: that takes Exec on `Node`, cluster-wide.
-    if holder == "NodeWorkload" && matches!(verb, Verb::Exec) {
+    if of == "NodeWorkload" && matches!(verb, Verb::Exec) {
         let node = vec![("Node".to_string(), None)];
         // (Said as a refusal, not as 404: this caller holds the right on the NodeWorkload, so it knows the pod's kind.)
         api::permit(&call.shared, &call.caller, verb, |_| node).map_err(refusal)?;
     }
-    let key = format!("{holder}/{namespace}/{owner}");
+    let key = format!("{of}/{namespace}/{owner}");
     found(&key).then_some((key, replica)).ok_or_else(nothing)
 }
 
@@ -4872,6 +4881,47 @@ spec: {role: writer, subjects: [carol]}
                 answers.push(said);
             }
             assert!(answers.windows(2).all(|two| two[0] == two[1]), "{verb}: {answers:?}");
+        }
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An exec session past the upgrade (the WebSocket's own stage, where the pod is placed) finds a bare
+    /// Pod by its name as it finds any pod: what it says of one is not "not found"; of a ghost it is.
+    #[tokio::test]
+    async fn bare_pod_exec_session_places_the_pod() {
+        use tokio::io::AsyncReadExt;
+        let dir = std::env::temp_dir().join(format!("kithd-kube-barepod-session-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        for (name, policy) in [("once", Some("Never")), ("always", None)] {
+            let (code, said) = send_pod(&shared, Caller::Admin, a_pod(name, policy)).await;
+            assert_eq!(code, StatusCode::CREATED, "{name}: {said}");
+        }
+        for (name, found) in [("once", true), ("always", true), ("ghost", false)] {
+            let (server, mut client) = tokio::io::duplex(1 << 16);
+            let session = tokio::spawn(crate::pod_exec::session(
+                shared.clone(),
+                Caller::Admin,
+                "exec".into(),
+                "default".into(),
+                name.into(),
+                "command=true".into(),
+                server,
+            ));
+            let mut said = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // (The Status frame, whose code ends the failure; a pod found goes on to enter a unit this test never made.)
+            while !String::from_utf8_lossy(&said).contains("\"code\":") {
+                let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut chunk))
+                    .await
+                    .unwrap_or_else(|_| panic!("{name}: the session says something; so far {:?}", String::from_utf8_lossy(&said)))
+                    .unwrap();
+                assert!(n > 0, "{name}: the session ended without a word");
+                said.extend_from_slice(&chunk[..n]);
+            }
+            let said = String::from_utf8_lossy(&said);
+            assert_eq!(said.contains("is not found"), !found, "{name}: {said}");
+            session.abort();
         }
         drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
