@@ -369,7 +369,12 @@ async fn git(limit: u64, dir: &Path, local: bool, pins: &[String], args: &[&str]
             let _ = tokio::io::copy(&mut stderr.into_inner(), &mut tokio::io::sink()).await;
         };
         let mut stdout = stdout.take(OUTPUT_LIMIT + 1);
-        let _ = tokio::join!(stdout.read_to_end(&mut out), said);
+        let drained = async {
+            let _ = stdout.read_to_end(&mut out).await;
+            // (What is said past the limit is read and dropped: left in the pipe it holds git.)
+            let _ = tokio::io::copy(&mut stdout.into_inner(), &mut tokio::io::sink()).await;
+        };
+        let _ = tokio::join!(drained, said);
         child.wait().await
     };
     let ran = match tokio::time::timeout(PATIENCE, ran).await {
@@ -839,6 +844,52 @@ fn backed_off(every: Duration, failed: u32) -> Duration {
     every.saturating_mul(1 << failed.min(10)).min(BACKOFF_LIMIT).max(every)
 }
 
+/// Whether a Source is to be fetched: it never was, its spec changed, or its wait (see
+/// [`backed_off`]) is over. `prev` is the spec it was fetched from, how long ago, and how
+/// many fetches in a row failed. (`approve` is no reason to fetch again: the caller leaves
+/// it out of `about`, it is about what was fetched.)
+fn is_due(prev: Option<(&Value, Duration, u32)>, about: &Value, every: Duration) -> bool {
+    prev.is_none_or(|(was, ago, failed)| was != about || ago >= backed_off(every, failed))
+}
+
+/// How many fetches in a row of this spec have failed, once one more has `ok`ed or not. A
+/// changed Source starts again: what failed was another spec.
+fn failures_after(prev: Option<(&Value, u32)>, about: &Value, ok: bool) -> u32 {
+    let was = prev.filter(|(was, _)| *was == about).map_or(0, |(_, n)| n);
+    if ok { 0 } else { was.saturating_add(1) }
+}
+
+/// Run `start` on each of `due`, `at_once` at a time (a slow or dead one holds the rest no
+/// longer than its own time) and say what they gave; `None` if `stopping` said so first:
+/// the fetches still going are dropped. A fetch that panicked gives nothing, and is tried
+/// again next time.
+async fn fetch_all<D, T, F>(
+    due: Vec<D>,
+    at_once: usize,
+    start: impl Fn(D) -> F,
+    stopping: &mut watch::Receiver<bool>,
+) -> Option<Vec<T>>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (mut waiting, mut running, mut done) = (due.into_iter(), tokio::task::JoinSet::new(), Vec::new());
+    loop {
+        while running.len() < at_once
+            && let Some(one) = waiting.next()
+        {
+            running.spawn(start(one));
+        }
+        tokio::select! {
+            finished = running.join_next() => match finished {
+                None => return Some(done),
+                Some(finished) => done.extend(finished),
+            },
+            _ = stopping.changed() => return None,
+        }
+    }
+}
+
 /// Fetch what `source` (the Source `key`, of the spec `about`) points at.
 async fn fetch_one(
     state: PathBuf,
@@ -902,34 +953,19 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, local: bool, mut stopping:
                 // (`approve` is no reason to fetch again: it is about what was fetched.)
                 let mut about = spec.clone();
                 about.as_object_mut().map(|about| about.remove("approve"));
-                let ready = fetched.get(key).is_none_or(|(was, at, failed)| {
-                    *was != about || at.elapsed() >= backed_off(interval(&source), *failed)
-                });
-                if ready {
+                let prev = fetched.get(key).map(|(was, at, failed)| (was, at.elapsed(), *failed));
+                if is_due(prev, &about, interval(&source)) {
                     due.push((key.clone(), source, about));
                 }
             }
-            // (Several at once: a slow or dead one holds the rest no longer than its own
-            // time. A fetch that panicked is not in `done`, and is tried again next time.)
-            let (mut waiting, mut running, mut done) = (due.into_iter(), tokio::task::JoinSet::new(), Vec::new());
-            loop {
-                while running.len() < FETCHES_AT_ONCE
-                    && let Some((key, source, about)) = waiting.next()
-                {
-                    running.spawn(fetch_one(state.clone(), local, key, source, about));
-                }
-                match running.join_next().await {
-                    None => break,
-                    Some(finished) => done.extend(finished),
-                }
-            }
+            // (A stop does not wait for the fetches: they are dropped, and git with them.)
+            let start = |(key, source, about)| fetch_one(state.clone(), local, key, source, about);
+            let Some(done) = fetch_all(due, FETCHES_AT_ONCE, start, &mut stopping).await else {
+                return;
+            };
             for (key, about, got) in done {
-                // (A changed Source starts again: what failed was another spec.)
-                let was = fetched
-                    .get(&key)
-                    .filter(|(was, ..)| *was == about)
-                    .map_or(0, |(.., n)| *n);
-                let failed = if got.is_err() { was.saturating_add(1) } else { 0 };
+                let prev = fetched.get(&key).map(|(was, _, failed)| (was, *failed));
+                let failed = failures_after(prev, &about, got.is_ok());
                 fetches.insert(key.clone(), got);
                 fetched.insert(key, (about, tokio::time::Instant::now(), failed));
             }
@@ -1798,6 +1834,82 @@ mod tests {
         assert_eq!(backed_off(long, 5), long);
     }
 
+    /// A Source is due when it never was fetched, when its spec changed, or when its
+    /// wait (longer for each failure) is over.
+    #[test]
+    fn run_loop_is_due_when_new_changed_or_waited_out() {
+        let (every, spec) = (Duration::from_secs(60), json!({ "path": "a" }));
+        assert!(is_due(None, &spec, every));
+        assert!(!is_due(Some((&spec, Duration::from_secs(59), 0)), &spec, every));
+        assert!(is_due(Some((&spec, Duration::from_secs(60), 0)), &spec, every));
+        // (Failed twice: 240 s.)
+        assert!(!is_due(Some((&spec, Duration::from_secs(239), 2)), &spec, every));
+        assert!(is_due(Some((&spec, Duration::from_secs(240), 2)), &spec, every));
+        // (Changed: at once, whatever the wait.)
+        assert!(is_due(Some((&spec, Duration::ZERO, 9)), &json!({ "path": "b" }), every));
+    }
+
+    /// Failures in a row are counted up, a success ends them, and a changed spec starts
+    /// the count again.
+    #[test]
+    fn run_loop_failures_count_in_a_row_and_start_again_on_a_changed_spec() {
+        let (spec, other) = (json!({ "path": "a" }), json!({ "path": "b" }));
+        assert_eq!(failures_after(None, &spec, false), 1);
+        assert_eq!(failures_after(Some((&spec, 1)), &spec, false), 2);
+        assert_eq!(failures_after(Some((&spec, 5)), &spec, true), 0);
+        assert_eq!(failures_after(Some((&spec, 5)), &other, false), 1);
+        assert_eq!(failures_after(Some((&spec, 5)), &other, true), 0);
+        assert_eq!(failures_after(Some((&spec, u32::MAX)), &spec, false), u32::MAX);
+    }
+
+    /// No more fetches go at once than are allowed, all are made, and what each gave is
+    /// kept.
+    #[tokio::test]
+    async fn run_loop_batches_fetches_at_most_so_many_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (going, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (_stop, mut stopping) = watch::channel(false);
+        let start = |n: u32| {
+            let (going, most) = (going.clone(), most.clone());
+            async move {
+                most.fetch_max(going.fetch_add(1, SeqCst) + 1, SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                going.fetch_sub(1, SeqCst);
+                n * 2
+            }
+        };
+        let mut done = fetch_all((0..10).collect(), 3, start, &mut stopping).await.unwrap();
+        done.sort();
+        assert_eq!(done, (0..10).map(|n| n * 2).collect::<Vec<_>>());
+        assert_eq!(most.load(SeqCst), 3);
+    }
+
+    /// A stop while fetches hang ends the loop at once (not after they are done), and a
+    /// fetch that panicked is left out.
+    #[tokio::test]
+    async fn a_stop_while_a_fetch_hangs_ends_it_promptly() {
+        let (stop, mut stopping) = watch::channel(false);
+        let hang = |_: u32| std::future::pending::<u32>();
+        let stopped = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stop.send(true).unwrap();
+            stop
+        });
+        let done = tokio::time::timeout(
+            Duration::from_secs(10),
+            fetch_all(vec![1, 2, 3], 2, hang, &mut stopping),
+        )
+        .await;
+        assert!(done.expect("a stop is not waited out by a hanging fetch").is_none());
+        let _ = stopped.await;
+
+        let (_stop, mut stopping) = watch::channel(false);
+        let boom = |n: u32| async move { if n == 1 { panic!("a fetch that panicked") } else { n } };
+        let mut done = fetch_all(vec![0, 1, 2], 2, boom, &mut stopping).await.unwrap();
+        done.sort();
+        assert_eq!(done, [0, 2]);
+    }
+
     fn sh(dir: &Path, script: &str) {
         let done = std::process::Command::new("sh")
             .current_dir(dir)
@@ -1845,6 +1957,48 @@ mod tests {
         std::fs::write(held.join("x"), [0; 3000]).unwrap();
         std::fs::write(held.join("in/y"), [0; 5000]).unwrap();
         assert_eq!(disk_used(&held), 8000);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other arm of the disk bound: no file is over it (git is not stopped), but the
+    /// repository as a whole is, and it is dropped.
+    #[tokio::test]
+    async fn a_fetch_whose_total_is_over_the_bound_is_refused() {
+        let root = std::env::temp_dir().join(format!("kith-total-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("a.yaml"), map("a", "red")).unwrap();
+        sh(
+            &origin,
+            "git init -q . && git add . && git -c user.name=t -c user.email=t@t commit -qm x",
+        );
+        let url = format!("file://{}", origin.display());
+
+        // (A bare repository is some 20 KB of templates and a pack: many files, each far
+        // under 16 KB.)
+        let refused = fetch_within(16 << 10, &root.join("total.git"), &url, None, None, true, &[]).await;
+        let said = refused.expect_err("the total is over the bound");
+        assert!(said.contains("on disk"), "{said}");
+        assert!(!root.join("total.git").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What git says past `OUTPUT_LIMIT` is read and thrown away: left in the pipe it
+    /// would hold git until `PATIENCE` ran out.
+    #[tokio::test]
+    async fn git_stdout_past_the_limit_does_not_block_git() {
+        let root = std::env::temp_dir().join(format!("kith-noisy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // (Some 40 MB that is a few bytes in the repository.)
+        let commit = "git init -q . && head -c 40000000 /dev/zero > big && git add . && git -c user.name=t -c user.email=t@t commit -qm x";
+        sh(&root, commit);
+        let said = git(64 << 20, &root, false, &[], &["cat-file", "blob", "HEAD:big"]);
+        let said = tokio::time::timeout(Duration::from_secs(30), said)
+            .await
+            .expect("git is not held by a full pipe");
+        assert!(said.unwrap_err().contains("bytes to say"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
