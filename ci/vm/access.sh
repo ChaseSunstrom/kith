@@ -241,10 +241,10 @@ sys.exit(0 if any(r["kind"] == "Node" and r["metadata"]["name"] == "n1" and ((r.
             # A phone: its LAN address (N), then its link as its configuration makes it (what
             # the WireGuard app does), then what it watches: NAME HOST PORT each.
             phone() { # N NAME PEER WATCH...
-                local n=$1 name=$2 peer=$3
+                pn=$1 pname=$2 ppeer=$3
                 shift 3
-                cp -a "$work/vmroot" "$work/$name"
-                python3 -I - "$work/$peer.conf" "$work/$name" "$n" "$@" <<'PY'
+                cp -a "$work/vmroot" "$work/$pname"
+                python3 -I - "$work/$ppeer.conf" "$work/$pname" "$pn" "$@" <<'PY'
 import sys
 conf, out, n = sys.argv[1:4]
 have = {}
@@ -264,7 +264,7 @@ lines += ["/bin/ip " + " ".join(inet(a) + ["route", "add", a, "dev", "wg0"]) for
 lines += ["& /bin/pod watch " + watch for watch in sys.argv[4:]]
 open(out + "/script", "w").write("\n".join(lines) + "\n")
 PY
-                lanbox "$n" "$name"
+                lanbox "$pn" "$pname"
             }
             phone 8 phone-a-box phone-a "a-echo $echo_at 80" "a-hidden $hidden_at 80"
             phone 7 phone-b-box phone-b "b-echo $echo_at 80" "b-out 198.51.100.1 80"
