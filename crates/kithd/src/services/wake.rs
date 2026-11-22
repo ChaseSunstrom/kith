@@ -27,6 +27,9 @@ use tokio::sync::{Notify, watch};
 const HELD: usize = 256;
 /// How often a node says what it met, and so how much later than `idle` the leader acts.
 const TICK: u64 = 10;
+/// How often a node says what it met while only the times move: half of `TICK`, so what the
+/// leader reads is never `TICK` stale (it would put to sleep a Workload with a connection open).
+const REFRESH: Duration = Duration::from_secs(TICK / 2);
 /// How far a node's clock may be from the leader's: ahead, its word is believed up to this far;
 /// behind, its `wake` is believed for this long more.
 const SKEW: u64 = 60;
@@ -151,6 +154,8 @@ pub(super) enum Closed {
     Late(String, Duration),
     /// The client hung up while it waited.
     Gone,
+    /// The Service was changed or removed: it may no longer sleep, so nothing is waited for.
+    Removed(String),
 }
 
 impl std::fmt::Display for Closed {
@@ -159,6 +164,7 @@ impl std::fmt::Display for Closed {
             Closed::Full(service) => write!(f, "{HELD} connections already wait for {service} to start"),
             Closed::Late(service, start) => write!(f, "{service} did not start within {}s", start.as_secs()),
             Closed::Gone => write!(f, "the client hung up"),
+            Closed::Removed(service) => write!(f, "{service} was removed or no longer scales to zero"),
         }
     }
 }
@@ -216,15 +222,22 @@ impl Naps {
         })
     }
 
-    /// Hold a place for one more connection of `service`, if fewer than [`HELD`] wait.
-    fn hold<'a>(&'a self, service: &'a str) -> Option<Held<'a>> {
+    /// Hold a place for one more connection of `service`, if fewer than [`HELD`] wait (and the
+    /// Service is still one that may sleep).
+    fn hold<'a>(&'a self, service: &'a str) -> Result<Held<'a>, Closed> {
         let mut inner = self.inner.lock().expect("nothing panics holding the naps");
-        let held = inner.services.get_mut(service).filter(|held| held.held < HELD)?;
+        let held = inner
+            .services
+            .get_mut(service)
+            .ok_or_else(|| Closed::Removed(service.to_string()))?;
+        if held.held >= HELD {
+            return Err(Closed::Full(service.to_string()));
+        }
         held.held += 1;
         if held.held == 1 {
             self.asked.notify_one();
         }
-        Some(Held(self, service))
+        Ok(Held(self, service))
     }
 
     /// What this node says now: `seen` (now for a Service with a connection open) and `wake`.
@@ -246,9 +259,7 @@ impl Naps {
 /// `met` is held while a replica starts, or until `gone` is done (the client hung up: its place, and
 /// the Workload's wake, are let go at once). Waiting is polled (a replica takes seconds to start).
 pub(super) async fn hold(met: &Met<'_>, view: impl Fn() -> bool, gone: impl Future<Output = ()>) -> Result<(), Closed> {
-    let Some(_place) = met.naps.hold(&met.service) else {
-        return Err(Closed::Full(met.service.clone()));
-    };
+    let _place = met.naps.hold(&met.service)?;
     let deadline = tokio::time::Instant::now() + met.start;
     let wait = async {
         while !view() {
@@ -363,6 +374,21 @@ pub(super) fn decide(
     writes
 }
 
+/// Is `said` worth a write to the cluster? Each write is a Raft commit that wakes every node, so
+/// not while only the times in `seen` move (a connection open says "now" each time it is asked):
+/// when the Services or the wake set change, at once; otherwise when what `told` says is
+/// `REFRESH` old (`since` it was told; `None`: never).
+fn due(
+    said: &(Map<String, Value>, Map<String, Value>),
+    told: &(Map<String, Value>, Map<String, Value>),
+    since: Option<Duration>,
+) -> bool {
+    said != told
+        && (said.0.keys().ne(told.0.keys())
+            || said.1.keys().ne(told.1.keys())
+            || since.is_none_or(|since| since >= REFRESH))
+}
+
 /// Say what this node met, and, on the node that leads the store, put to sleep and wake the
 /// Workloads, until stopped.
 pub(super) async fn run(proxy: Arc<Proxy>, mut stopping: watch::Receiver<bool>) {
@@ -370,11 +396,12 @@ pub(super) async fn run(proxy: Arc<Proxy>, mut stopping: watch::Receiver<bool>) 
     let Some(cluster) = &shared.cluster else { return };
     let node = format!("Node/{}", cluster.me.name);
     let (mut told, mut since) = ((Map::new(), Map::new()), BTreeMap::new());
+    let mut told_at: Option<tokio::time::Instant> = None;
     let mut generation = shared.generation.subscribe();
     loop {
         let now = unix();
         let said = proxy.naps.say(now);
-        if said != told {
+        if due(&said, &told, told_at.map(|at| at.elapsed())) {
             let fields = Map::from_iter([
                 ("seen".to_string(), Value::Object(said.0.clone())),
                 ("wake".to_string(), Value::Object(said.1.clone())),
@@ -385,7 +412,7 @@ pub(super) async fn run(proxy: Arc<Proxy>, mut stopping: watch::Receiver<bool>) 
                 })
                 .await
             {
-                Ok(_) => told = said,
+                Ok(_) => (told, told_at) = (said, Some(tokio::time::Instant::now())),
                 Err(e) => eprintln!("kithd: services: telling the cluster what this node met: {e}"),
             }
         }
@@ -409,7 +436,7 @@ pub(super) async fn run(proxy: Arc<Proxy>, mut stopping: watch::Receiver<bool>) 
         tokio::select! {
             _ = generation.changed() => {}
             () = proxy.naps.asked.notified() => {}
-            () = tokio::time::sleep(Duration::from_secs(TICK)) => {}
+            () = tokio::time::sleep(REFRESH) => {}
             _ = stopping.changed() => break,
         }
     }
@@ -785,8 +812,39 @@ spec:
         drop(met);
         // Ended: seen no longer moves with the clock.
         assert_ne!(naps.say(1).0["Service/default/web"], 1);
+        let still = naps.meet(key, 7, |_| true).unwrap();
         naps.set(BTreeMap::new());
         assert!(!naps.has(&key) && naps.say(1).0.is_empty());
+        // A Service removed while a connection waits is a different reason from a full one.
+        let closed = hold(&still, || false, std::future::pending()).await.unwrap_err();
+        assert_eq!(closed, Closed::Removed("Service/default/web".into()));
+    }
+
+    /// An open connection moves `seen` with the clock, but the node says so only every `TICK`
+    /// (and at once when the Services or the wake set change), not on every pass of its loop.
+    #[test]
+    fn held_connection_is_told_to_the_cluster_at_most_every_tick() {
+        let (naps, key) = naps();
+        let _open = naps.meet(key, 1, |_| true).unwrap();
+        let (mut told, mut said_at, mut tells) = ((Map::new(), Map::new()), None::<u64>, 0);
+        // Ten simulated seconds, a pass of the loop every 600 ms.
+        for ms in (0..10_000).step_by(600) {
+            let said = naps.say(100 + ms / 1000);
+            if due(&said, &told, said_at.map(|at| Duration::from_millis(ms - at))) {
+                (told, said_at, tells) = (said, Some(ms), tells + 1);
+            }
+        }
+        assert_eq!(tells, 2, "at 0 s and at 5.4 s, not at each of the 17 passes");
+        // A connection held (a wake) is said at once, and its time again each REFRESH.
+        let held = naps.hold("Service/default/web").unwrap();
+        assert!(due(&naps.say(110), &told, Some(Duration::from_secs(1))));
+        drop(held);
+        // Nothing changed, as far as the leader reads it: not said again.
+        assert!(!due(
+            &naps.say(100),
+            &naps.say(100),
+            Some(Duration::from_secs(TICK * 5))
+        ));
     }
 
     #[test]

@@ -793,10 +793,13 @@ impl Proxy {
         // A Service that may sleep (T-1210) counts the connection, and holds one that finds no
         // replica while the Workload wakes: until one is ready, or the Service's `start` is up.
         // (Only a client the Workload's NetworkPolicies let in: the others are not activity.)
-        let met = {
+        // (Asked before the store's lock: most Services never sleep.)
+        let met = if self.naps.has(&key) {
             let state = self.shared.store.lock().expect("nothing panics holding the store");
             let admits = |behind: &[_]| wake::admitted(&state.store, self.prefix, self.me(), behind);
             self.naps.meet(key, wake::unix(), admits)
+        } else {
+            None
         };
         if let Some(met) = met.as_ref().filter(|_| backends.is_empty()) {
             match wake::hold(met, || !backends_of().is_empty(), wake::hung_up(&client)).await {
@@ -1541,7 +1544,13 @@ pub async fn run(
             for policy in state.store.list(Some("NetworkPolicy")) {
                 reports.extend(policy_unsaid(policy, unsent).map(|fields| (policy.key(), fields)));
             }
-            proxy.naps.set(wake::ports(&state.store, prefix, &table));
+            // (Without a cluster nothing tells the Workload to sleep or wake: none is held.)
+            let ports = if shared.cluster.is_some() {
+                wake::ports(&state.store, prefix, &table)
+            } else {
+                Default::default()
+            };
+            proxy.naps.set(ports);
             let mut plans = match kernel {
                 Kernel::Has(..) => kernel_plan(&state.store, &table, proxy.me()),
                 Kernel::Off | Kernel::Stuck(_) => Vec::new(),
