@@ -176,12 +176,15 @@ impl Grants {
 
 /// What an Identity can reach on the TLS port. A new route is not open to them until it
 /// is named here: name it once its handler asks [`Grants`].
-const FOR_IDENTITIES: [&str; 27] = [
+const FOR_IDENTITIES: [&str; 28] = [
     "/v1/duress",
     "/v1/peers",
     "/v1/backups",
     "/v1/blobs",
+    // (The Volume's files and its listing, `.../ls`, for the UI: the Apply rights on the Volume and its Workload, as `kith volume cp`.)
     "/v1/volumes",
+    // (The UI's terminal, a WebSocket: the Exec right on the Workload whose pod it is, as `kubectl exec`; kube.rs `ui_exec`.)
+    "/v1/exec",
     "/v1/seats",
     "/v1/drain",
     "/v1/tokens",

@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// The page: name under `/ui/`, content type, content.
-const FILES: [(&str, &str, &[u8]); 8] = [
+const FILES: [(&str, &str, &[u8]); 9] = [
     ("", "text/html; charset=utf-8", include_bytes!("../ui/index.html")),
     ("app.css", "text/css; charset=utf-8", include_bytes!("../ui/app.css")),
     (
@@ -49,6 +49,12 @@ const FILES: [(&str, &str, &[u8]); 8] = [
         "dash.js",
         "text/javascript; charset=utf-8",
         include_bytes!("../ui/dash.js"),
+    ),
+    // The Terminal and Files tabs: a shell over a WebSocket and a Volume's files, in the page's own code.
+    (
+        "shell.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../ui/shell.js"),
     ),
     // The page's face (Overpass, SIL OFL: its copyright and licence are in the file's own
     // name table and in docs/fonts/OFL.txt). The website's copy: there is one in the tree.
@@ -288,7 +294,15 @@ mod tests {
         );
         assert!(run.status.success(), "{said}");
         // Every script the page loads is one node could read.
-        for script in ["app.js", "forms.js", "install.js", "qr.js", "dash.js", "fixture.mjs"] {
+        for script in [
+            "app.js",
+            "forms.js",
+            "install.js",
+            "qr.js",
+            "dash.js",
+            "shell.js",
+            "fixture.mjs",
+        ] {
             let check = std::process::Command::new("node")
                 .arg("--check")
                 .arg(dir.join(script))
@@ -394,6 +408,43 @@ mod tests {
         };
         let said = String::from_utf8_lossy(&run.stderr);
         assert!(run.status.success() && run.stdout.starts_with(b"ok"), "{said}");
+    }
+
+    /// The Terminal and Files tabs: the page's own script (no library, which the policy would stop), a shell
+    /// asked for as `kubectl exec` asks, the files of a Volume through the two calls `kith volume cp` is
+    /// made of, and nothing typed or listed kept in the browser.
+    #[test]
+    fn ui_has_terminal_and_files_tabs() {
+        let text = |name: &str| {
+            let (.., content) = FILES.iter().find(|(file, ..)| *file == name).unwrap();
+            std::str::from_utf8(content).unwrap()
+        };
+        let (shell, app) = (text("shell.js"), text("app.js"));
+        assert!(
+            app.contains("from './shell.js'")
+                && app.contains("['terminal', 'Terminal'")
+                && app.contains("['files', 'Files'")
+        );
+        for call in [
+            "../v1/exec/",
+            "v4.channel.k8s.io",
+            "/ls?path=",
+            "/files?path=",
+            "`${base()}/files`",
+        ] {
+            assert!(shell.contains(call), "shell.js does not make {call}");
+        }
+        for kept in [
+            "localStorage",
+            "sessionStorage",
+            "document.cookie",
+            "history.",
+            "location",
+            "indexedDB",
+        ] {
+            assert!(!shell.contains(kept), "shell.js has {kept}");
+        }
+        assert!(!shell.contains("import "), "shell.js loads something");
     }
 
     /// The Install part (a join token, netboot, a recovery key): every place the script draws

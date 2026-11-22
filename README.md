@@ -112,7 +112,7 @@ is still there when it starts again.
 | Run a Flatpak app in a seat's window | [Running a Flatpak app in a session](docs/guide/hardware.md#running-a-flatpak-app-in-a-session) |
 | Keep data: volumes, shares, replicas, backups | [Storage](docs/guide/storage.md#storage) |
 | Copy files into a volume or out of it, or move a guest's data in | [Files in and out of a volume](docs/guide/storage.md#files-in-and-out-of-a-volume) |
-| See it and change it in a browser | [Web UI](docs/guide/ui.md#web-ui) |
+| See it and change it in a browser, with a shell and the files of a Volume | [Web UI](docs/guide/ui.md#web-ui) |
 | Make a machine nothing but a node, and keep it updated | [kith OS](docs/guide/os.md#kith-os-kithd-as-the-machines-first-process) |
 | Know what it costs beside Kubernetes | [Beside k3s](#beside-k3s), and [how it was measured](docs/guide/numbers.md#how-the-numbers-beside-k3s-were-taken) |
 | Find your way in the code and test it | [Layout](docs/guide/development.md#layout), [Development](docs/guide/development.md#development) |

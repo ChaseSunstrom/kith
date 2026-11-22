@@ -31,6 +31,18 @@ browser), `ca.crt` trusted, and the name `kith` pointing at a node (a line in `/
 - It asks kithd as you: the same API, rules and audit log as `kith` and `curl`; `POST /v1/diff`
   is the dry run it shows. A field the form cannot draw (a free-form object, `oneOf`) is a JSON
   box; the YAML tab edits anything.
+- A Workload, Job or NodeWorkload has a **Terminal** tab: a shell in one of its replicas, over a
+  WebSocket to `GET /v1/exec/NAMESPACE/POD` (the pod is named as `kubectl` names it). It is a
+  line at a time, with no tty: no editor, no prompt, no colours. It takes the `exec` right on
+  the owning Workload or Job (and on `Node` for a NodeWorkload), asked again on the node that
+  runs the replica, like `kubectl exec` ([SECURITY.md](../../SECURITY.md)); and it opens only
+  from the page's own origin, never from another site's page.
+- A Workload or Volume has a **Files** tab: the Volume's directories (`GET
+  /v1/volumes/NAMESPACE/NAME/ls?path=DIR`), a file downloaded (`GET …/files?path=FILE`) and a
+  file uploaded into the directory in view (up to 64 MiB; a larger one goes with
+  [`kith volume cp`](storage.md#files-in-and-out-of-a-volume)). It takes `apply` on `Volume` and
+  on `Workload`, as `kith volume put` and `get` do, and never follows a link out of the Volume: a
+  link is shown as one, not opened.
 - Usage graphs have their data in `GET /v1/metrics?range=15m|1h|6h|24h` (default `1h`): each node's
   CPU (0 to 1), memory, state disk, disk read and write, network receive and send (bytes per
   second, every interface but `lo`) and 1-minute load, and each Workload's CPU (cores) and

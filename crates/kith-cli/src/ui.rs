@@ -34,7 +34,7 @@ fn admit(head: &str, secret: &str) -> Result<(String, u64), &'static str> {
         return Err("this is not the address `kith ui` gave");
     };
     let mut passed = format!("{method} {path} {version}\r\n");
-    let (mut host, mut origin, mut length) = (None, None, None);
+    let (mut host, mut origin, mut length, mut upgrades) = (None, None, None, false);
     for line in lines {
         let (name, value) = line.split_once(':').ok_or(ODD)?;
         // (Said once each: of two, kithd and this could each believe another. No line ends within a line.)
@@ -49,6 +49,7 @@ fn admit(head: &str, secret: &str) -> Result<(String, u64), &'static str> {
             "host" | "origin" | "content-length" => return Err(ODD),
             "transfer-encoding" => return Err("a body in chunks: the page sends none"),
             "connection" => continue,
+            "upgrade" => upgrades |= value.trim().eq_ignore_ascii_case("websocket"),
             _ => {}
         }
         passed.push_str(line);
@@ -62,6 +63,12 @@ fn admit(head: &str, secret: &str) -> Result<(String, u64), &'static str> {
     }
     if origin.is_some_and(|origin| origin.strip_prefix("http://") != Some(host)) {
         return Err("asked for by another site's page");
+    }
+    // The terminal is the one WebSocket the page opens: a GET with no body that stays open, both ways, until
+    // either end closes it (the rest of the connection is passed on as it comes, so "its length" is unbounded).
+    if upgrades && method == "GET" && path.starts_with("/v1/exec/") && length.is_none() {
+        passed.push_str("Connection: Upgrade\r\n\r\n");
+        return Ok((passed, u64::MAX));
     }
     passed.push_str("Connection: close\r\n\r\n");
     Ok((passed, length.unwrap_or(0)))
@@ -240,5 +247,35 @@ mod tests {
         ] {
             assert!(admit(&head("/s3cret/v1/apply", more), "s3cret").is_err(), "{more}");
         }
+        // The terminal's WebSocket stays open (no end to its length, the connection not closed); nothing else upgrades.
+        let ws = "\r\nConnection: Upgrade\r\nUpgrade: websocket";
+        let (passed, length) = admit(&head("/s3cret/v1/exec/default/web-0?tty=true", ws), "s3cret").unwrap();
+        assert!(
+            passed.ends_with("Connection: Upgrade\r\n\r\n") && !passed.contains("close"),
+            "{passed}"
+        );
+        assert_eq!(length, u64::MAX);
+        for (target, more) in [
+            ("/s3cret/v1/apply", ws),
+            ("/s3cret/v1/exec/default/web-0", "\r\nUpgrade: h2c"),
+            (
+                "/s3cret/v1/exec/default/web-0",
+                "\r\nContent-Length: 0\r\nUpgrade: websocket",
+            ),
+        ] {
+            let (passed, length) = admit(&head(target, more), "s3cret").unwrap();
+            assert!(
+                passed.ends_with("Connection: close\r\n\r\n") && length < u64::MAX,
+                "{target} {more}"
+            );
+        }
+        let evil = admit(
+            &head(
+                "/s3cret/v1/exec/default/web-0",
+                &format!("{ws}\r\nOrigin: http://evil.example"),
+            ),
+            "s3cret",
+        );
+        assert_eq!(evil, Err("asked for by another site's page"));
     }
 }

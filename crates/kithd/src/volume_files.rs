@@ -1,9 +1,10 @@
 //! A Volume's files, into it and out of it over the API, as a tar stream.
 //!
 //! PUT /v1/volumes/NS/NAME/files   a tar: its files into the Volume, beside what is there
-//! GET /v1/volumes/NS/NAME/files   the Volume's files, as a tar
+//! GET /v1/volumes/NS/NAME/files   the Volume's files, as a tar (`?path=FILE`: that one file's bytes)
+//! GET /v1/volumes/NS/NAME/ls      what a directory of it holds (`?path=DIR`), as JSON: the web UI's Files tab
 //!
-//! Both are for whoever may apply a Volume and a Workload in the namespace: a workload that
+//! All are for whoever may apply a Volume and a Workload in the namespace: a workload that
 //! mounts the Volume reads and writes the same files. Any node is asked; the node that has
 //! the Volume does it.
 //!
@@ -24,7 +25,7 @@ use crate::view::Upstream;
 use crate::volumes::{Dir, SYSTEM};
 use axum::Json;
 use axum::body::{Body, Bytes};
-use axum::extract::{Extension, Path as UrlPath, State};
+use axum::extract::{Extension, Path as UrlPath, Query, State};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use kith_api::kinds::Verb;
@@ -369,6 +370,8 @@ async fn elsewhere(
     caller: &Caller,
     dir: &Dir,
     there: Option<Upstream>,
+    route: &str,
+    query: &[(&str, &str)],
     body: Option<Body>,
 ) -> Result<reqwest::Response, String> {
     let (Some(cluster), Some(there)) = (&shared.cluster, there) else {
@@ -377,14 +380,14 @@ async fn elsewhere(
     // (The node that has the Volume, and not another at its address: the files are its own.)
     let client = cluster.to(&there)?;
     let url = format!(
-        "https://{}/v1/volumes/{}/{}/files",
+        "https://{}/v1/volumes/{}/{}/{route}",
         there.address, dir.namespace, dir.name
     );
     let asked = match body {
         Some(body) => client
             .put(url)
             .body(reqwest::Body::wrap_stream(body.into_data_stream())),
-        None => client.get(url),
+        None => client.get(url).query(query),
     };
     let failed = |e: reqwest::Error| format!("asking node {}: {}", dir.node, crate::cluster::why(&e));
     // (For whoever asked this node: the node that has the Volume asks what they may.)
@@ -411,7 +414,7 @@ pub async fn put(
     let done = if dir.node == shared.members.me() {
         here(&shared, dir, bound, body).await
     } else {
-        match elsewhere(&shared, &caller, &dir, there, Some(body)).await {
+        match elsewhere(&shared, &caller, &dir, there, "files", &[], Some(body)).await {
             Ok(answer) => answer.json().await.map_err(|e| e.to_string()),
             Err(why) => Err(why),
         }
@@ -465,32 +468,203 @@ async fn here(shared: &Shared, dir: Dir, bound: u64, body: Body) -> Result<Value
     Ok(json!({ "files": put.files, "bytes": put.bytes, "leftOut": put.left_out, "node": node }))
 }
 
-/// `GET /v1/volumes/NS/NAME/files`: the Volume's files as a tar.
+/// The most entries one listing carries: a directory with more is cut, and says so.
+const LISTED: usize = 5000;
+
+/// What `path` in the Volume `root` is open at holds: each entry's name, kind (`dir`, `file`,
+/// `link`, `other`), size, mode and mtime, and for a link what it says (`to`: text, never
+/// followed). The directories on the way are opened through handles and never through a link,
+/// whoever put one there; a link, a file or a name that leaves the Volume is refused.
+fn list(root: &File, path: &str) -> Result<Value, String> {
+    let parts =
+        inside(Path::new(path)).ok_or_else(|| format!("{path}: a path that leaves the volume, or is too deep"))?;
+    if parts.first().is_some_and(|top| top == STAGING) {
+        return Err(format!("{path}: {STAGING} is a name kithd keeps for a put"));
+    }
+    let mut dir = root.try_clone().map_err(|e| format!("{path}: {e}"))?;
+    for part in &parts {
+        dir = sub(&dir, part, false).map_err(|e| format!("{}: {e}", part.to_string_lossy()))?;
+    }
+    let said = |e: io::Error| format!("{path}: {e}");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(within(&dir, ".".as_ref())).map_err(said)? {
+        let name = entry.map_err(said)?.file_name();
+        if parts.is_empty() && name == STAGING {
+            continue;
+        }
+        // (One that is gone since it was listed is no part of the listing.)
+        let Ok(seen) = std::fs::symlink_metadata(within(&dir, &name)) else {
+            continue;
+        };
+        let kind = match seen.file_type() {
+            kind if kind.is_dir() => "dir",
+            kind if kind.is_file() => "file",
+            kind if kind.is_symlink() => "link",
+            _ => "other",
+        };
+        let mut shown = json!({
+            "name": name.to_string_lossy(), "kind": kind, "size": seen.len(),
+            "mode": seen.mode() & 0o7777, "mtime": seen.mtime(),
+        });
+        if kind == "link" {
+            let to = std::fs::read_link(within(&dir, &name)).unwrap_or_default();
+            shown["to"] = json!(to.to_string_lossy());
+        }
+        found.push((kind != "dir", name, shown));
+        if found.len() > LISTED {
+            break;
+        }
+    }
+    found.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let truncated = found.len() > LISTED;
+    found.truncate(LISTED);
+    let entries: Vec<Value> = found.into_iter().map(|(_, _, shown)| shown).collect();
+    Ok(
+        json!({ "path": parts.iter().collect::<std::path::PathBuf>().to_string_lossy(), "entries": entries, "truncated": truncated }),
+    )
+}
+
+/// The file `path` in the Volume `root` is open at, to read: its directories and the file are opened through
+/// handles and never through a link, and a directory, a device or a pipe is not a file.
+fn open_file(root: &File, path: &str) -> Result<File, String> {
+    let mut parts =
+        inside(Path::new(path)).ok_or_else(|| format!("{path}: a path that leaves the volume, or is too deep"))?;
+    let name = parts.pop().ok_or_else(|| format!("{path:?} names no file"))?;
+    if parts.first().unwrap_or(&name) == STAGING {
+        return Err(format!("{path}: {STAGING} is a name kithd keeps for a put"));
+    }
+    let mut dir = root.try_clone().map_err(|e| format!("{path}: {e}"))?;
+    for part in &parts {
+        dir = sub(&dir, part, false).map_err(|e| format!("{}: {e}", part.to_string_lossy()))?;
+    }
+    let said = |e: io::Error| match e.raw_os_error() {
+        Some(code) if code == nix::errno::Errno::ELOOP as i32 => format!("{path}: a link is in the way"),
+        _ => format!("{path}: {e}"),
+    };
+    let file = open_in(&dir, &name).map_err(said)?;
+    if !file.metadata().map_err(said)?.is_file() {
+        return Err(format!("{path}: is not a file"));
+    }
+    Ok(file)
+}
+
+/// Which directory of the Volume `GET /v1/volumes/NS/NAME/ls` lists, or which file of it
+/// `GET .../files` sends alone (the whole Volume as a tar, when there is none): a path inside it.
+#[derive(serde::Deserialize, Default)]
+pub struct Where {
+    #[serde(default)]
+    path: String,
+}
+
+/// `GET /v1/volumes/NS/NAME/ls?path=DIR`: what a directory of the Volume holds, as JSON. For the
+/// same callers as the files, and asked the same way: of any node, answered by the one that has
+/// the Volume.
+pub async fn ls(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    UrlPath((namespace, name)): UrlPath<(String, String)>,
+    Query(at): Query<Where>,
+) -> Result<Json<Value>, ApiError> {
+    let (dir, _, there) = held(&shared, &caller, &namespace, &name)?;
+    let what = vec![format!("listing of Volume/{namespace}/{name}/{}", at.path)];
+    let done = if dir.node == shared.members.me() {
+        listing(&shared, &dir, at.path.clone()).await
+    } else {
+        match elsewhere(&shared, &caller, &dir, there, "ls", &[("path", &at.path)], None).await {
+            Ok(answer) => answer.json().await.map_err(|e| e.to_string()),
+            Err(why) => Err(why),
+        }
+    };
+    let outcome = done.as_ref().map(drop).map_err(Clone::clone);
+    shared.audit.record(&caller, "get", what, outcome);
+    done.map(Json).map_err(invalid)
+}
+
+/// A listing of a Volume this node has.
+async fn listing(shared: &Shared, dir: &Dir, path: String) -> Result<Value, String> {
+    let state = shared
+        .logs
+        .parent()
+        .ok_or("kithd has no state directory")?
+        .to_path_buf();
+    let (dir, node) = (dir.clone(), dir.node.clone());
+    let mut listed = tokio::task::spawn_blocking(move || {
+        let from = crate::root_part::volume(&state, &dir)?;
+        list(&File::open(from.held()).map_err(|e| e.to_string())?, &path)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    listed["node"] = json!(node);
+    Ok(listed)
+}
+
+/// `GET /v1/volumes/NS/NAME/files`: the Volume's files as a tar; with `?path=FILE`, that one file's bytes.
 pub async fn get(
     State(shared): State<Arc<Shared>>,
     Extension(caller): Extension<Caller>,
     UrlPath((namespace, name)): UrlPath<(String, String)>,
+    Query(at): Query<Where>,
 ) -> Result<Response, ApiError> {
     let (dir, _, there) = held(&shared, &caller, &namespace, &name)?;
-    let what = vec![format!("files of Volume/{namespace}/{name}")];
-    let started = if dir.node == shared.members.me() {
-        out(&shared, &dir)
+    let what = vec![if at.path.is_empty() {
+        format!("files of Volume/{namespace}/{name}")
     } else {
-        elsewhere(&shared, &caller, &dir, there, None).await.map(|answer| {
-            let chunks = futures_util::stream::unfold(answer, |mut answer| async move {
-                answer.chunk().await.transpose().map(|chunk| (chunk, answer))
-            });
-            Body::from_stream(chunks).into_response()
-        })
+        format!("file {} of Volume/{namespace}/{name}", at.path)
+    }];
+    let started = if dir.node == shared.members.me() {
+        if at.path.is_empty() {
+            out(&shared, &dir)
+        } else {
+            one(&shared, &dir, &at.path)
+        }
+    } else {
+        elsewhere(&shared, &caller, &dir, there, "files", &[("path", &at.path)], None)
+            .await
+            .map(|answer| {
+                let chunks = futures_util::stream::unfold(answer, |mut answer| async move {
+                    answer.chunk().await.transpose().map(|chunk| (chunk, answer))
+                });
+                Body::from_stream(chunks).into_response()
+            })
     };
     let outcome = started.as_ref().map(drop).map_err(Clone::clone);
     shared.audit.record(&caller, "get", what, outcome);
     started.map_err(invalid)
 }
 
+/// The gets a node is answering now (see [`GETS`]).
+static PACKING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(GETS);
+
+/// A get of one file of a Volume this node has: sent as it is read.
+fn one(shared: &Shared, dir: &Dir, path: &str) -> Result<Response, String> {
+    let busy = |_| format!("this node is packing {GETS} volumes already: ask again when one is done");
+    let one = PACKING.try_acquire().map_err(busy)?;
+    let state = shared.logs.parent().ok_or("kithd has no state directory")?;
+    let from = crate::root_part::volume(state, dir)?;
+    let mut file = open_file(&File::open(from.held()).map_err(|e| e.to_string())?, path)?;
+    let (to, sent) = mpsc::channel(16);
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        // (The Volume's handle is kept open as long as the file is read.)
+        let _held = (one, from);
+        let (failed, waiting) = (to.clone(), runtime.clone());
+        if let Err(e) = io::copy(&mut file, &mut Out { to, runtime }) {
+            let _ = waiting.block_on(failed.send_timeout(Err(e), QUIET));
+        }
+    });
+    let chunks = futures_util::stream::unfold(
+        sent,
+        |mut sent| async move { sent.recv().await.map(|chunk| (chunk, sent)) },
+    );
+    Ok((
+        [("content-type", "application/octet-stream")],
+        Body::from_stream(chunks),
+    )
+        .into_response())
+}
+
 /// A get of a Volume this node has: packed as it is read.
 fn out(shared: &Shared, dir: &Dir) -> Result<Response, String> {
-    static PACKING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(GETS);
     let busy = |_| format!("this node is packing {GETS} volumes already: ask again when one is done");
     let one = PACKING.try_acquire().map_err(busy)?;
     let state = shared.logs.parent().ok_or("kithd has no state directory")?;
@@ -764,6 +938,183 @@ mod tests {
         assert!(read(false).is_err());
     }
 
+    /// The `name`s of a listing's entries, each with its kind: `dir/`, `file`, `link`.
+    fn listed(at: &Path, path: &str) -> Result<Vec<String>, String> {
+        let root = File::open(at).unwrap();
+        let listing = list(&root, path)?;
+        let shown = listing["entries"].as_array().unwrap().iter();
+        Ok(shown
+            .map(|e| format!("{}:{}", e["name"].as_str().unwrap(), e["kind"].as_str().unwrap()))
+            .collect())
+    }
+
+    #[test]
+    fn volume_ls_lists_a_directory_and_never_goes_through_a_link() {
+        let root = temp("ls");
+        let (into, outside) = (root.join("volume"), root.join("outside"));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"not the volume's").unwrap();
+        std::fs::create_dir_all(into.join("a/b")).unwrap();
+        std::fs::write(into.join("a/file"), b"12345").unwrap();
+        std::fs::write(into.join("top"), b"x").unwrap();
+        std::fs::create_dir(into.join(STAGING)).unwrap();
+        // A container's doing: links in the Volume, out of it and into itself.
+        std::os::unix::fs::symlink(&outside, into.join("out")).unwrap();
+        std::os::unix::fs::symlink("a", into.join("in")).unwrap();
+        std::os::unix::fs::symlink("../../outside", into.join("a/up")).unwrap();
+
+        // Directories first, then by name; a link is a link (not what it points at); kithd's own
+        // staging directory is not the Volume's.
+        let all = ["a:dir", "in:link", "out:link", "top:file"];
+        assert_eq!(listed(&into, "").unwrap(), all);
+        assert_eq!(listed(&into, ".").unwrap(), all);
+        assert_eq!(listed(&into, "a").unwrap(), ["b:dir", "file:file", "up:link"]);
+        assert_eq!(listed(&into, "a/b/").unwrap(), [""; 0]);
+        let root_listing = list(&File::open(&into).unwrap(), "a").unwrap();
+        let file = &root_listing["entries"][1];
+        assert_eq!(
+            (file["size"].as_u64(), file["mtime"].as_i64().is_some()),
+            (Some(5), true)
+        );
+        let up = &root_listing["entries"][2];
+        assert_eq!(up["to"], "../../outside", "what a link says, not what it holds");
+
+        // Nothing goes through a link, however it is reached.
+        for through in ["out", "in", "a/up", "in/b", "out/secret", "a/up/secret"] {
+            let refused = listed(&into, through).unwrap_err();
+            assert!(refused.contains("a link is in the way"), "{through}: {refused}");
+        }
+        // Nor out by name, nor by a root, nor to a file, nor too deep.
+        for out in ["..", "a/../..", "/etc", "../outside"] {
+            let refused = listed(&into, out).unwrap_err();
+            assert!(refused.contains("leaves the volume"), "{out}: {refused}");
+        }
+        assert!(listed(&into, "top").unwrap_err().contains("a file is in the way"));
+        assert!(listed(&into, "nowhere").unwrap_err().contains("nowhere"));
+        let deep = vec!["d"; DEEPEST + 1].join("/");
+        assert!(
+            listed(&into, &deep)
+                .unwrap_err()
+                .contains("leaves the volume, or is too deep")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn volume_ls_reads_one_file_and_never_through_a_link() {
+        let root = temp("one-file");
+        let (into, outside) = (root.join("volume"), root.join("outside"));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"not the volume's").unwrap();
+        std::fs::create_dir_all(into.join("a")).unwrap();
+        std::fs::write(into.join("a/file"), b"12345").unwrap();
+        std::fs::create_dir(into.join(STAGING)).unwrap();
+        std::fs::write(into.join(STAGING).join("half"), b"a put's").unwrap();
+        std::os::unix::fs::symlink(&outside, into.join("out")).unwrap();
+        std::os::unix::fs::symlink("a/file", into.join("is")).unwrap();
+        std::os::unix::fs::symlink("../outside/secret", into.join("a/up")).unwrap();
+        let read = |path: &str| {
+            let mut all = Vec::new();
+            open_file(&File::open(&into).unwrap(), path)
+                .and_then(|mut file| file.read_to_end(&mut all).map(|_| all).map_err(|e| e.to_string()))
+        };
+        assert_eq!(read("a/file").unwrap(), b"12345");
+        assert_eq!(read("./a//file").unwrap(), b"12345");
+        // Not a link (the file's own, or a directory's, or out), nor a directory, nor out by name.
+        for through in ["is", "a/up", "out", "out/secret"] {
+            let refused = read(through).unwrap_err();
+            assert!(refused.contains("a link is in the way"), "{through}: {refused}");
+        }
+        for out in ["", "..", "a/../../outside/secret", "/etc/passwd"] {
+            let refused = read(out).unwrap_err();
+            assert!(
+                refused.contains("leaves the volume") || refused.contains("names no file"),
+                "{out}: {refused}"
+            );
+        }
+        assert!(read("a").unwrap_err().contains("is not a file"));
+        assert!(read("nowhere").unwrap_err().contains("nowhere"));
+        // A put's own directory is no part of the Volume.
+        assert!(read(&format!("{STAGING}/half")).unwrap_err().contains(STAGING));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn volume_ls_stops_at_a_most_and_says_so() {
+        let root = temp("ls-most");
+        let into = root.join("volume");
+        for n in 0..LISTED + 3 {
+            std::fs::write(into.join(format!("f{n:05}")), b"").unwrap();
+        }
+        let listing = list(&File::open(&into).unwrap(), "").unwrap();
+        assert_eq!(listing["entries"].as_array().unwrap().len(), LISTED);
+        assert_eq!(listing["truncated"], true);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn volume_ls_is_for_who_may_mount_the_volume() {
+        let dir = std::env::temp_dir().join(format!("kithd-volume-ls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let me = shared.members.me().to_string();
+        let volume = |namespace: &str, path: &str| {
+            let volume = json!({
+                "apiVersion": "kith.dev/v1", "kind": "Volume",
+                "metadata": { "name": "data", "namespace": namespace },
+                "spec": { "node": me, "path": path },
+            });
+            serde_json::from_value(volume).unwrap()
+        };
+        let resources = vec![
+            volume("default", "d"),
+            volume(SYSTEM, dir.join("host").to_str().unwrap()),
+        ];
+        let at = kith_api::store::now();
+        shared
+            .write(kith_store::Command::Apply { resources, at })
+            .await
+            .unwrap();
+        let inside = dir.join("volumes/default/data/d");
+        std::fs::create_dir_all(inside.join("sub")).unwrap();
+        std::fs::write(inside.join("file"), b"abc").unwrap();
+        std::os::unix::fs::symlink("/etc", inside.join("etc")).unwrap();
+        let ask = |caller: Caller, namespace: &str, name: &str, path: &str| {
+            let route = (namespace.to_string(), name.to_string());
+            let at = Where { path: path.to_string() };
+            ls(State(shared.clone()), Extension(caller), UrlPath(route), Query(at))
+        };
+
+        let refused = ask(Caller::Identity("carol".into()), "default", "data", "").await;
+        let Err(ApiError::Refused(why)) = refused else {
+            panic!("carol was let in")
+        };
+        assert!(why.contains("carol may not apply Volume in namespace default"), "{why}");
+        let Err(ApiError::Store(Error::Invalid(why))) = ask(Caller::Admin, SYSTEM, "data", "").await else {
+            panic!("a host directory was read")
+        };
+        assert!(why.contains("a directory of the host's"), "{why}");
+        let Err(ApiError::Store(Error::NotFound(_))) = ask(Caller::Admin, "default", "none", "").await else {
+            panic!("a Volume that is not there was listed")
+        };
+
+        let Json(done) = ask(Caller::Admin, "default", "data", "").await.ok().unwrap();
+        let names: Vec<_> = done["entries"].as_array().unwrap().iter().map(|e| &e["name"]).collect();
+        assert_eq!(names, ["sub", "etc", "file"]);
+        assert_eq!(done["node"].as_str(), Some(&*me));
+        let Err(ApiError::Store(Error::Invalid(why))) = ask(Caller::Admin, "default", "data", "etc").await else {
+            panic!("a link was gone through")
+        };
+        assert!(why.contains("a link is in the way"), "{why}");
+        let Err(ApiError::Store(Error::Invalid(why))) = ask(Caller::Admin, "default", "data", "../x").await else {
+            panic!("a path out was listed")
+        };
+        assert!(why.contains("leaves the volume"), "{why}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn the_routes_are_for_who_may_mount_the_volume_and_carry_its_files() {
         let dir = std::env::temp_dir().join(format!("kithd-volume-files-{}", std::process::id()));
@@ -824,11 +1175,33 @@ mod tests {
         };
         assert!(why.contains("../evil"), "{why}");
 
-        let route = UrlPath(("default".to_string(), "data".to_string()));
-        let got = get(State(shared.clone()), Extension(Caller::Admin), route)
+        let route = || UrlPath(("default".to_string(), "data".to_string()));
+        let at = |path: &str| Query(Where { path: path.to_string() });
+        let got = get(State(shared.clone()), Extension(Caller::Admin), route(), at(""))
             .await
             .ok()
             .unwrap();
+        // One file alone: its bytes as they are; a carol who may not mount the Volume reads none.
+        let one = get(
+            State(shared.clone()),
+            Extension(Caller::Admin),
+            route(),
+            at("deep/file"),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(one.ok().unwrap().into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"what was sent");
+        let carol = Extension(Caller::Identity("carol".into()));
+        let refused = get(State(shared.clone()), carol, route(), at("deep/file")).await;
+        assert!(matches!(refused, Err(ApiError::Refused(_))));
+        let Err(ApiError::Store(Error::Invalid(why))) =
+            get(State(shared.clone()), Extension(Caller::Admin), route(), at("deep")).await
+        else {
+            panic!("a directory was read as a file")
+        };
+        assert!(why.contains("is not a file"), "{why}");
         let packed = axum::body::to_bytes(got.into_body(), 1 << 20).await.unwrap();
         let mut out = tar::Archive::new(&packed[..]);
         let mut read = String::new();

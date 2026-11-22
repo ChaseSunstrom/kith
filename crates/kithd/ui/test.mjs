@@ -10,6 +10,8 @@ import { installPart } from './install.js';
 import { MOST, draw as drawCode, qr } from './qr.js';
 import { PANELS, RANGES, busiest, dashPart, format, hues, line, rangeOf, scale, tiles, times } from './dash.js';
 import { STEPS, fixture } from './fixture.mjs';
+// The Terminal and Files tabs have a file of their own: it runs as it is loaded.
+import './shell.test.mjs';
 
 // ── The QR code: the matrix a reference encoder makes ─────────────────────────────────
 // Each fixture is `qrencode -8 -l L -m 0` (qrencode 4.1, ISO 18004 byte mode, the lowest
@@ -578,4 +580,5 @@ assert.equal(summary({}), '');
 // A diff, line by line.
 const diff = '--- a (live)\n+++ a (desired)\n@@ -1,2 +1,2 @@\n spec:\n-  map: dust\n+  map: ice\n';
 assert.deepEqual(diffLines(diff).map((line) => line.what), ['head', 'head', 'hunk', 'same', 'del', 'add']);
+
 console.log('ok');
