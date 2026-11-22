@@ -9,6 +9,10 @@
 //!
 //! ponytail: nothing calls `migrate_out` yet (slice C2 picks the node and switches the placement after
 //! it), and it takes the pod's name to be the same on both nodes (a replica's name is its owner's).
+//!
+//! The target's QEMU starts paused (`-S`, `vm::control`) and stays so after the stream completes: slice C2
+//! starts it (`cont`) only after `migrate_out` returned `Ok`, and must quit it whenever `migrate_out` fails
+//! (the source is then running again, and the target holds a complete copy that nothing else quits).
 
 use crate::Shared;
 use crate::access::Caller;
@@ -167,20 +171,34 @@ async fn quit(path: &Path, why: &str) {
 }
 
 /// Quits the QEMU at its path when dropped armed: `incoming`'s future is dropped if the hop's request is (the
-/// peer hung up), and a QEMU told to listen would wait for ever.
-struct QuitOnDrop(Option<PathBuf>);
+/// peer hung up), and a QEMU told to listen would wait for ever. The machine's `Busy` goes with it into the
+/// cleanup, so a second migration cannot start (and be quit by this one) before it is done.
+struct QuitOnDrop(Option<(PathBuf, Busy)>);
+
+impl QuitOnDrop {
+    /// Nothing is left to undo: the `Busy` is given back.
+    fn disarm(&mut self) -> Option<Busy> {
+        self.0.take().map(|(_, busy)| busy)
+    }
+}
 
 impl Drop for QuitOnDrop {
     fn drop(&mut self) {
-        if let (Some(path), Ok(runtime)) = (self.0.take(), tokio::runtime::Handle::try_current()) {
-            runtime.spawn(async move { quit(&path, "the hop was dropped").await });
+        if let Some((path, busy)) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                quit(&path, "the hop was dropped").await;
+                drop(busy);
+            });
         }
     }
 }
 
 /// The target's: the QEMU at `qmp_path` must be waiting for a migration (`-incoming defer`); it is told to
-/// listen at a socket of its replica's directory, and the connection to it is given.
-async fn incoming(qmp_path: &Path) -> Result<UnixStream, (StatusCode, String)> {
+/// listen at a socket of its replica's directory, and the connection to it is given (with the machine's `busy`,
+/// which a refusal or a failure lets go of).
+async fn incoming(qmp_path: &Path, busy: Busy) -> Result<(UnixStream, Option<Busy>), (StatusCode, String)> {
     let down = |what: &str, e: String| (StatusCode::BAD_GATEWAY, format!("{what}: {e}"));
     let state = ask(qmp_path, |qmp| qmp.status())
         .await
@@ -193,9 +211,9 @@ async fn incoming(qmp_path: &Path) -> Result<UnixStream, (StatusCode, String)> {
     // (Ours to remove: the directory is the replica's own, and a QEMU that listens there makes it new.)
     let _ = std::fs::remove_file(&sock);
     let uri = format!("unix:{}", sock.display());
-    let mut guard = QuitOnDrop(Some(qmp_path.to_path_buf()));
+    let mut guard = QuitOnDrop(Some((qmp_path.to_path_buf(), busy)));
     if let Err(e) = ask(qmp_path, move |qmp| qmp.migrate_incoming(&uri)).await {
-        guard.0 = None; // (refused: it does not listen)
+        guard.disarm(); // (refused: it does not listen)
         return Err(down("migrate-incoming", e));
     }
     let reached = async {
@@ -209,9 +227,9 @@ async fn incoming(qmp_path: &Path) -> Result<UnixStream, (StatusCode, String)> {
         }
     };
     let reached = timeout(CALL, reached).await;
-    guard.0 = None;
+    let busy = guard.disarm();
     match reached {
-        Ok(Ok(stream)) => Ok(stream),
+        Ok(Ok(stream)) => Ok((stream, busy)),
         failed => {
             let e = failed.map_or_else(
                 |_| "timed out".to_string(),
@@ -280,7 +298,7 @@ async fn receive(
             "a migration into this machine is already going".into(),
         ));
     };
-    let qemu = incoming(&qmp_path).await?;
+    let (qemu, busy) = incoming(&qmp_path, busy).await?;
     let stop = shared.stop.subscribe();
     tokio::spawn(async move {
         let _busy = busy;
@@ -328,6 +346,7 @@ async fn near<S>(
     far: S,
     pace: Pace,
     mut cancel: watch::Receiver<bool>,
+    busy: Busy,
 ) -> Result<u64, String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -338,6 +357,7 @@ where
         was,
         relaying: None,
         armed: true,
+        busy: Some(busy),
     };
     let outcome = 'go: {
         let started = async {
@@ -410,20 +430,24 @@ where
             Err(why)
         }
     };
-    undo.armed = false;
-    match outcome {
+    // (Disarmed only once the machine is resumed: a drop during `resume` has it resumed again, which is no change.)
+    let outcome = match outcome {
         Ok(sent) => Ok(sent),
         Err(why) => Err(resume(qmp_path, was, why).await),
-    }
+    };
+    undo.armed = false;
+    outcome
 }
 
 /// What `near` leaves undone if its future is dropped (the caller gave up): the stream is cut and the machine
-/// resumed, as for a failure.
+/// resumed, as for a failure. The machine's `Busy` goes with it into the cleanup, so a second migration cannot
+/// start (and be cancelled by this one) before it is done.
 struct Undo {
     qmp: PathBuf,
     was: bool,
     relaying: Option<tokio::task::JoinHandle<io::Result<()>>>,
     armed: bool,
+    busy: Option<Busy>,
 }
 
 impl Drop for Undo {
@@ -432,12 +456,14 @@ impl Drop for Undo {
             carrying.abort();
         }
         if self.armed
+            && let Some(busy) = self.busy.take()
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
             let (qmp, was) = (self.qmp.clone(), self.was);
             runtime.spawn(async move {
                 eprintln!("kithd: migration out of {} was dropped", qmp.display());
                 resume(&qmp, was, String::new()).await;
+                drop(busy);
             });
         }
     }
@@ -471,7 +497,7 @@ pub(crate) async fn migrate_out(
 ) -> Result<u64, String> {
     let dir = replica_dir(shared, namespace, pod).map_err(|(_, why)| why)?;
     let qmp_path = dir.join(crate::vm::CONTROL);
-    let Some(_busy) = Busy::take(&qmp_path) else {
+    let Some(busy) = Busy::take(&qmp_path) else {
         return Err("a migration of this machine is already going".into());
     };
     let Some(cluster) = &shared.cluster else {
@@ -481,7 +507,15 @@ pub(crate) async fn migrate_out(
     let far = pod_exec::send(shared, &me, namespace, pod, Spec::Migrate, node, there)
         .await
         .map_err(|failed| failed.message)?;
-    near(&qmp_path, &dir.join(OUT), far, Pace::LIVE, shared.stop.subscribe()).await
+    near(
+        &qmp_path,
+        &dir.join(OUT),
+        far,
+        Pace::LIVE,
+        shared.stop.subscribe(),
+        busy,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -526,6 +560,8 @@ mod fakes {
         pub received: Vec<u8>,
         /// A command it answers with an error.
         pub refuse: Option<&'static str>,
+        /// A command it takes its time (ms) to answer, and has not recorded until then.
+        pub slow: Option<(&'static str, u64)>,
     }
 
     pub type Machine = Arc<Mutex<Sim>>;
@@ -540,6 +576,7 @@ mod fakes {
             sent: 0,
             received: Vec::new(),
             refuse: None,
+            slow: None,
         }))
     }
 
@@ -624,6 +661,12 @@ mod fakes {
     }
 
     fn command_result(machine: &Machine, role: &Role, command: &str, arguments: &Value) -> Result<Value, String> {
+        let slow = machine.lock().unwrap().slow;
+        if let Some((slow, ms)) = slow
+            && slow == command
+        {
+            std::thread::sleep(Duration::from_millis(ms)); // (the lock is free: the others are answered)
+        }
         let mut sim = machine.lock().unwrap();
         if command != "qmp_capabilities" {
             sim.calls.push(command.to_string());
@@ -753,6 +796,24 @@ mod relay {
             .unwrap();
     }
 
+    /// One direction ending cleanly and the other failing (within the grace) is a failure: a hop that breaks over the
+    /// tail of the stream must not read as delivered.
+    #[tokio::test]
+    async fn relay_fails_when_one_direction_ends_well_and_the_other_breaks() {
+        let (mut left, a) = tokio::io::duplex(1 << 12);
+        let (b, mut right) = tokio::io::duplex(1 << 12);
+        let relaying = tokio::spawn(relay(a, b, Duration::from_secs(5)));
+        left.shutdown().await.unwrap(); // (left to right ends: Ok)
+        drop(left); // (and nothing can be written to left any more)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        right.write_all(b"too late").await.unwrap(); // (right to left: a broken pipe)
+        let ended = tokio::time::timeout(Duration::from_secs(5), relaying)
+            .await
+            .expect("the relay ended in its grace")
+            .unwrap();
+        assert_eq!(ended.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
     /// Either side hanging up ends the relay (the other, still open, is given the grace and then let go),
     /// and what the closed side had sent is delivered first.
     #[tokio::test]
@@ -828,7 +889,7 @@ mod drive {
             cap: Duration::from_millis(cap_ms),
             end: Duration::from_millis(500),
         };
-        let qemu = incoming(&b_qmp).await.unwrap();
+        let (qemu, _busy) = incoming(&b_qmp, Busy::take(&b_qmp).unwrap()).await.unwrap();
         let (near_end, far_end) = tokio::io::duplex(1 << 16);
         let (_stop, stop_rx) = watch::channel(false);
         let b_side = tokio::spawn(finish(b_qmp, qemu, async move { Ok(far_end) }, pace, stop_rx));
@@ -841,7 +902,8 @@ mod drive {
         } else {
             std::mem::forget(cancel);
         }
-        let result = near(&a_qmp, &a_dir.join("out.sock"), near_end, pace, cancel_rx).await;
+        let busy = Busy::take(&a_qmp).unwrap();
+        let result = near(&a_qmp, &a_dir.join("out.sock"), near_end, pace, cancel_rx, busy).await;
         tokio::time::timeout(Duration::from_secs(10), b_side)
             .await
             .expect("B's end finished")
@@ -939,11 +1001,68 @@ mod drive {
             cap: Duration::from_secs(10),
             end: Duration::from_millis(200),
         };
-        let result = near(&a_qmp, &a_dir.join("out.sock"), near_end, pace, cancel_rx).await;
+        let busy = Busy::take(&a_qmp).unwrap();
+        let result = near(&a_qmp, &a_dir.join("out.sock"), near_end, pace, cancel_rx, busy).await;
         assert!(result.as_ref().is_err_and(|why| why.contains("stream")), "{result:?}");
         let calls = calls(&a);
         assert!(has(&calls, "cont"), "A was not resumed: {calls:?}");
         assert!(a.lock().unwrap().running);
+    }
+
+    /// A `near` the caller gives up on (its future dropped mid-migration) still cancels the migration and resumes A,
+    /// and the machine stays `Busy` until that is done: a second migration cannot start into the old one's cleanup.
+    #[tokio::test]
+    async fn drive_a_dropped_move_resumes_a_and_holds_the_machine_until_it_has() {
+        let a_dir = dir("undo");
+        let a = machine(true, "running");
+        let role = Role::Source {
+            payload: payload(1 << 20),
+            end: End::Hang,
+        };
+        let a_qmp = serve(&a_dir, a.clone(), role);
+        let (near_end, _far_end) = tokio::io::duplex(1 << 16);
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let pace = Pace {
+            tick: Duration::from_millis(20),
+            cap: Duration::from_secs(60),
+            end: Duration::from_millis(200),
+        };
+        let busy = Busy::take(&a_qmp).unwrap();
+        let out = a_dir.join("out.sock");
+        let moving = near(&a_qmp, &out, near_end, pace, cancel_rx, busy);
+        let gone = tokio::time::timeout(Duration::from_millis(200), moving).await;
+        assert!(gone.is_err(), "the migration was to hang");
+        // (Nothing has yielded since the drop: the cleanup is queued, not done.)
+        assert!(
+            Busy::take(&a_qmp).is_none(),
+            "the machine was let go before its cleanup"
+        );
+        until("A is resumed", || {
+            let calls = calls(&a);
+            has(&calls, "migrate_cancel") && has(&calls, "cont")
+        })
+        .await;
+        assert!(a.lock().unwrap().running);
+        until("the machine is free", || Busy::take(&a_qmp).is_some()).await;
+    }
+
+    /// An `incoming` the caller gives up on while QEMU is still being told to listen quits that QEMU, and holds the
+    /// machine `Busy` until it has.
+    #[tokio::test]
+    async fn drive_a_dropped_incoming_quits_b_and_holds_the_machine_until_it_has() {
+        let b_dir = dir("quit-on-drop");
+        let b = machine(false, "inmigrate");
+        b.lock().unwrap().slow = Some(("migrate-incoming", 1000));
+        let b_qmp = serve(&b_dir, b.clone(), Role::Target { expect: 1 << 30 });
+        let busy = Busy::take(&b_qmp).unwrap();
+        let listening = tokio::time::timeout(Duration::from_millis(300), incoming(&b_qmp, busy)).await;
+        assert!(listening.is_err(), "the listen was to be slow");
+        assert!(
+            Busy::take(&b_qmp).is_none(),
+            "the machine was let go before its cleanup"
+        );
+        until("B is quit", || has(&calls(&b), "quit")).await;
+        until("the machine is free", || Busy::take(&b_qmp).is_some()).await;
     }
 
     /// A that refuses `migrate` fails the move, and a machine that was not running is not started by it.
