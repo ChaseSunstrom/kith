@@ -862,6 +862,11 @@ mod tests {
     /// (os/build.sh's built-in firmware): its exit status's success and its stderr.
     /// None when there is no tar or xz here.
     fn firmware(name: &str, globs: &[&str]) -> Option<(PathBuf, Result<(), String>)> {
+        firmware_with(name, globs, None)
+    }
+
+    /// `firmware`, with `path` (a directory of stand-in programs) first in the script's PATH.
+    fn firmware_with(name: &str, globs: &[&str], path: Option<&str>) -> Option<(PathBuf, Result<(), String>)> {
         let sh = |script: &str| std::process::Command::new("sh").args(["-c", script]).output().unwrap();
         if !(sh("command -v tar && command -v xz").status.success()) {
             eprintln!("skipped: no tar or xz here");
@@ -889,6 +894,8 @@ mod tests {
              Link: abs/out -> /etc/passwd\n\
              Link: dangling/x -> ../b/missing\n\
              Link: long/a -> b/../../../etc/passwd\n\
+             Link: dirlink -> b\n\
+             Link: dirlink/z -> x\n\
              Link: this line is prose, not a link\n",
         );
         for file in ["b/x", "b/z", "b/other", "a/file", "d/f", "d/deep/m", "e/one/f", "e/two/g"] {
@@ -899,11 +906,12 @@ mod tests {
         assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
         let dir = base.join("out");
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../os/firmware.sh");
-        let ran = std::process::Command::new("sh")
-            .args([script, tarball.to_str().unwrap(), dir.to_str().unwrap()])
-            .args(globs)
-            .output()
-            .unwrap();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args([script, tarball.to_str().unwrap(), dir.to_str().unwrap()]).args(globs);
+        if let Some(path) = path {
+            cmd.env("PATH", format!("{path}:{}", std::env::var("PATH").unwrap_or_default()));
+        }
+        let ran = cmd.output().unwrap();
         let said = String::from_utf8_lossy(&ran.stderr).to_string();
         Some((dir, if ran.status.success() { Ok(()) } else { Err(said) }))
     }
@@ -984,8 +992,40 @@ mod tests {
             let Some((dir, said)) = firmware("out-of-tree", &[glob]) else { return };
             let said = said.unwrap_err();
             assert!(said.contains(why), "{glob}: {said}");
-            assert!(!dir.join("etc").exists());
+            // Nothing leaves the tree: no link was made for it, in the directory or beside it.
+            assert!(!dir.join("etc").exists() && !dir.parent().unwrap().join("etc").exists(), "{glob}");
+            assert!(found(&dir).iter().all(|f| !f.starts_with("bad/") && !f.starts_with("abs/") && !f.starts_with("long/")), "{glob}");
         }
+    }
+
+    /// A link in a directory that is itself a link (WHENCE: `dirlink -> b`, `dirlink/z -> x`) lands
+    /// where the lexical walk does not say, so it is refused.
+    #[test]
+    fn built_in_firmware_refuses_a_link_whose_directory_is_a_link() {
+        let Some((_, said)) = firmware("dirlink", &["dirlink/*"]) else { return };
+        assert!(said.unwrap_err().contains("directory that is a link"));
+    }
+
+    /// A glob that matches only a directory takes nothing (tar does not recurse here): an error that
+    /// says so, not an empty directory and a build without its firmware.
+    #[test]
+    fn built_in_firmware_dies_for_a_glob_that_names_only_directories() {
+        let Some((_, said)) = firmware("dirs", &["e/*"]) else { return };
+        let said = said.unwrap_err();
+        assert!(said.contains("e/*") && said.contains("directories"), "{said}");
+    }
+
+    /// An awk that fails is a build that stops, not one without its links.
+    #[test]
+    fn built_in_firmware_stops_when_awk_fails() {
+        let fake = std::env::temp_dir().join(format!("kithd-fake-awk-{}", std::process::id()));
+        std::fs::create_dir_all(&fake).unwrap();
+        std::fs::write(fake.join("awk"), "#!/bin/sh\nexit 2\n").unwrap();
+        let mut mode = std::fs::metadata(fake.join("awk")).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(fake.join("awk"), mode).unwrap();
+        let Some((_, said)) = firmware_with("awk-fails", &["a/*"], fake.to_str()) else { return };
+        assert!(said.is_err(), "an awk that failed was not noticed");
     }
 
     /// `*` stands for one piece of a path, as tar's does here: `d/*` takes d/f and no link or

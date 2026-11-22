@@ -53,7 +53,17 @@ function norm(base, t,    n, p, i, c, s, out) { # a link in directory BASE to T:
     for (i = 2; i <= c; i++) out = out "/" s[i]
     return out
 }
-function bad(text) { print "E " text; exit 1 }
+# (Exit 0: an E line is how a refusal is said; a status that is not 0 is awk itself failing.)
+function bad(text) { print "E " text; exit 0 }
+function linked(p,    n, a, i, s) { # does a directory on the way to P (not P) hold a link of WHENCE
+    n = split(p, a, "/")
+    s = a[1]
+    for (i = 2; i <= n; i++) {
+        if (s in target) return 1
+        s = s "/" a[i]
+    }
+    return 0
+}
 BEGIN {
     n = split(globs, g, " ")
     for (i = 1; i <= n; i++) {
@@ -85,15 +95,21 @@ END {
                 bad("a link out of the linux-firmware tree: " w " -> " t)
             if (w !~ /^[A-Za-z0-9_.\/+-]+$/ || r !~ /^[A-Za-z0-9_.\/+-]+$/)
                 bad("a link that is not a path in linux-firmware: " w " -> " t)
+            # (A path through the directory of a link lands elsewhere than the walk above says.)
+            if (linked(w) || linked(r))
+                bad("a link in or to a directory that is a link: " w " -> " t)
             print "L " w " " t
             if (r in target) next_[r] = 1; else print "F " r
         }
         split("", todo)
         for (w in next_) todo[w] = 1
     }
-}' "$dir/.whence" >"$dir/.plan" || true
+    print "Z"
+}' "$dir/.whence" >"$dir/.plan" || die "awk failed reading WHENCE"
 err=$(sed -n 's/^E //p' "$dir/.plan" | head -n 1)
 [ -z "$err" ] || die "$err"
+# (The plan ends with Z: a plan that stops short is an awk that did, and no links.)
+[ "$(tail -n 1 "$dir/.plan")" = Z ] || die "awk's plan of the links is incomplete"
 files=$(sed -n 's/^F //p' "$dir/.plan" | sort -u)
 
 # The files: what the globs name and what the links come to, in one read of the tarball. A glob
@@ -110,6 +126,15 @@ for g in "$@"; do
 done
 for f in $files; do
     [ -e "$dir/$f" ] || [ -L "$dir/$f" ] || die "a link points at what linux-firmware lacks: $f"
+done
+# tar does not recurse here, so a glob that matches a directory takes the directory, empty: a glob
+# that names no file and no link, and a directory, is a mistake (write `DIR/*` for its files).
+for g in "$@"; do
+    ! grep -qxF "M $g" "$dir/.plan" || continue
+    # (Globs are words here, `set +f` lets this one stand for the paths it names.)
+    if (set +f; for p in "$dir"/$g; do [ -f "$p" ] && exit 1; done; for p in "$dir"/$g; do [ -d "$p" ] && exit 0; done; exit 1); then
+        die "'$g' names only directories in linux-firmware (tar takes no files in them): write '$g/*' for their files"
+    fi
 done
 
 # The links, made as WHENCE writes them; one that leads nowhere is the tarball's fault.
