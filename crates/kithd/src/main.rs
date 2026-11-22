@@ -17,6 +17,10 @@ mod blocklist;
 mod claims;
 mod clock;
 mod cluster;
+// The serving part's confinement: in unit tests and in the `confine-probe` build, in no release.
+// Nothing applies it to a live serving part yet (docs/adr-privilege.md, "Built so far").
+#[cfg(any(test, feature = "confine-probe"))]
+mod confine;
 mod controller;
 mod controllers;
 mod cron;
@@ -413,6 +417,9 @@ fn main() -> ExitCode {
     kith_runtime::exec_shim();
     // Started again to render a package's templates? Then this never returns either.
     releases::render_shim();
+    // Started again to hold the serving part's confinement to what it says? Never returns either.
+    #[cfg(feature = "confine-probe")]
+    confine::probe_shim();
     // Then, before the runtime and its listeners, the limit of open files they share.
     raise_nofile();
     // A test build says so, loudly, each time it starts (ci/vm/access.sh looks for the line).
@@ -1055,7 +1062,18 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let held = shared.clone();
         std::thread::Builder::new()
             .name("root-part".into())
-            .spawn(move || root_part::serve_split(&held.pods, end))
+            .spawn(move || {
+                // Tied lives: the root part ends (it returns, or panics) and kithd ends with it,
+                // for the keeper to start both again; the containers go on and are adopted.
+                let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    root_part::serve_split(&held.pods, end);
+                }));
+                eprintln!(
+                    "kithd: the root part ended{}: ending, to start both parts again",
+                    if ended.is_err() { " in a panic" } else { "" }
+                );
+                std::process::exit(1);
+            })
             .map_err(|e| fail("starting the root part", &e))?;
     }
     // A viewed worker serves ingress only where its Node says so (as the join of a token for

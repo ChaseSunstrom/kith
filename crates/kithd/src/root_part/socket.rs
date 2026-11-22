@@ -151,10 +151,30 @@ impl Socket {
         Ok((Socket::new(mine, deadline), theirs))
     }
 
+    /// The call lock, held: a call in flight that does not end. (For the tests.)
+    #[cfg(test)]
+    pub(super) fn stuck(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.call.lock().unwrap()
+    }
+
     /// One call: sent with `fds` beside it, and the answer to it (and its descriptors) waited for
     /// as long as `wait`. A reply to an earlier call, that gave up, is read and let go.
     fn ask(&self, call: Call, fds: &[BorrowedFd], wait: Duration) -> Result<(Back, Vec<OwnedFd>), String> {
-        let mut count = self.call.lock().unwrap_or_else(|e| e.into_inner());
+        // (One time for the whole call: the wait for the call in flight, a stuck one holds the lock,
+        // and the wait for the answer share `wait`, and the send is bounded by the socket's own.)
+        let until = Instant::now() + wait;
+        let mut count = loop {
+            match self.call.try_lock() {
+                Ok(count) => break count,
+                Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err("the root part's call in flight did not end in time".into());
+                }
+            }
+        };
         *count += 1;
         let seq = *count;
         let bytes = serde_json::to_vec(&Ask { seq, call }).map_err(|e| format!("the root part's request: {e}"))?;
@@ -162,7 +182,6 @@ impl Socket {
             return Err(format!("request of {} bytes: at most {MAX_REQUEST}", bytes.len()));
         }
         send_fds(self.end.as_fd(), &bytes, fds).map_err(|e| format!("asking the root part: {e}"))?;
-        let until = Instant::now() + wait;
         let mut buf = vec![0u8; MAX_REQUEST];
         loop {
             let left = until
