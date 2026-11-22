@@ -511,27 +511,55 @@ const HTTP_PORT: u16 = 8069;
 /// Connections served at once: the file is a few dozen MB, and one machine needs one.
 const HTTP_CONNECTIONS: usize = 16;
 
+/// Of those, the most that one address may hold: a machine needs one, and firmware may keep a second.
+const HTTP_PER_PEER: usize = 2;
+
+/// The whole of the request's head must arrive in this long, however it is cut up.
+const HTTP_HEAD_SECS: u64 = 10;
+
 /// Serve the boot file to the machines named, over HTTP, on `listener` for as long as netboot is
 /// on. Each connection is a task of this one, so they all end with it.
 ///
 // ponytail: a hand-read GET and HEAD of one path, no Range (firmware that sends one gets the
 // whole file, as HTTP/1.1 allows), no keep-alive; a second GET of one machine's file may run
-// beside the first, as a second TFTP read could not.
+// beside the first, as a second TFTP read could not. The limits (16 connections, 2 of them from
+// one address) are those of one listener: one task per card address, so a host with several
+// cards allows that much on each.
 async fn http(listener: tokio::net::TcpListener) {
     let mut connections = tokio::task::JoinSet::new();
+    // (The peers of the connections that are open: a task gives its peer back when it ends.)
+    let mut open: BTreeMap<std::net::IpAddr, usize> = BTreeMap::new();
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok((stream, peer)) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
-        while connections.try_join_next().is_some() {}
-        if connections.len() < HTTP_CONNECTIONS {
+        while let Some(done) = connections.try_join_next() {
+            if let Ok(ip) = done
+                && let Some(count) = open.get_mut(&ip)
+            {
+                *count -= 1;
+                if *count == 0 {
+                    open.remove(&ip);
+                }
+            }
+        }
+        let ip = peer.ip();
+        // (Closed at once, when it is dropped: one peer cannot hold every place.)
+        if connections.len() < HTTP_CONNECTIONS && open.get(&ip).copied().unwrap_or(0) < HTTP_PER_PEER {
+            *open.entry(ip).or_default() += 1;
             connections.spawn(async move {
-                // (Not for longer than a slow network needs for the file.)
-                let _ = tokio::time::timeout(Duration::from_secs(600), http_connection(stream)).await;
+                let _ = http_connection(stream).await;
+                ip
             });
         }
     }
+}
+
+/// The longest a machine may take to read a file of `len` bytes: 30 seconds and a megabyte a
+/// second. A transfer slower than that ends.
+fn transfer_time(len: usize) -> Duration {
+    Duration::from_secs(30 + len as u64 / 1_000_000)
 }
 
 /// `what` for at most `secs`: a peer that stops reading or writing is let go.
@@ -550,12 +578,19 @@ async fn http_connection(mut stream: tokio::net::TcpStream) -> std::io::Result<(
     };
     // The request's head (its first line is all that is read of it), at most 8 KiB of it.
     let mut heard = Vec::new();
-    let mut chunk = [0; 1024];
-    while !heard.windows(4).any(|window| window == b"\r\n\r\n") && heard.len() < 8192 {
-        match within(10, stream.read(&mut chunk)).await? {
-            0 => return Ok(()),
-            len => heard.extend(&chunk[..len]),
+    let hear = async {
+        let mut chunk = [0; 1024];
+        while !heard.windows(4).any(|window| window == b"\r\n\r\n") && heard.len() < 8192 {
+            match stream.read(&mut chunk).await? {
+                0 => return Ok(false),
+                len => heard.extend(&chunk[..len]),
+            }
         }
+        Ok(true)
+    };
+    // (One limit on all of it, not one per read: a byte every few seconds is no faster.)
+    if !within(HTTP_HEAD_SECS, hear).await? {
+        return Ok(());
     }
     let line = String::from_utf8_lossy(heard.split(|byte| *byte == b'\r').next().unwrap_or_default()).into_owned();
     let mut words = line.split(' ');
@@ -572,13 +607,18 @@ async fn http_connection(mut stream: tokio::net::TcpStream) -> std::io::Result<(
     let len = wanted.image.len();
     within(10, stream.write_all(head("200 OK", len).as_bytes())).await?;
     if method == "GET" {
-        for from in (0..len).step_by(64 << 10) {
-            within(
-                30,
-                stream.write_all(&read(&wanted.image, wanted.at, &answers, from, 64 << 10)),
-            )
-            .await?;
-        }
+        let send = async {
+            for from in (0..len).step_by(64 << 10) {
+                stream
+                    .write_all(&read(&wanted.image, wanted.at, &answers, from, 64 << 10))
+                    .await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        let limit = transfer_time(len);
+        tokio::time::timeout(limit, send)
+            .await
+            .map_err(|_| std::io::Error::other("the machine is too slow"))??;
     }
     stream.shutdown().await?;
     if method == "GET" {
@@ -651,12 +691,21 @@ pub async fn on(
         bound(69).map_err(failed("port 69 (TFTP)"))?,
         bound(4011).map_err(failed("port 4011"))?,
     );
-    let web = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, HTTP_PORT))
-        .and_then(|listener| {
-            listener.set_nonblocking(true)?;
-            tokio::net::TcpListener::from_std(listener)
-        })
-        .map_err(failed("port 8069 (HTTP)"))?;
+    // HTTP is on the cards' own addresses, the ones the answers name in the URL, not on every one.
+    let cards = cards();
+    let mut webs = Vec::new();
+    for (_, address) in &cards {
+        let web = std::net::TcpListener::bind((*address, HTTP_PORT))
+            .and_then(|listener| {
+                listener.set_nonblocking(true)?;
+                tokio::net::TcpListener::from_std(listener)
+            })
+            .map_err(failed("port 8069 (HTTP)"))?;
+        webs.push(web);
+    }
+    if webs.is_empty() {
+        return Err("netboot found no card with an IPv4 address to serve HTTP on".into());
+    }
     let mut held = BTreeMap::new();
     for mac in machines {
         let (token, served, transfer) = (token()?, false, None);
@@ -669,12 +718,11 @@ pub async fn on(
             },
         );
     }
-    let mut tasks = vec![
-        tokio::spawn(tftp(files)),
-        tokio::spawn(dhcp(asked, None)),
-        tokio::spawn(http(web)),
-    ];
-    for (card, address) in cards() {
+    let mut tasks = vec![tokio::spawn(tftp(files)), tokio::spawn(dhcp(asked, None))];
+    tasks.extend(webs.into_iter().map(|web| tokio::spawn(http(web))));
+    // ponytail: the addresses are those the cards have now; one that changes while netboot is on
+    // is not followed (a machine on it is told a URL that does not answer). Turn netboot on again.
+    for (card, address) in cards {
         match crate::dhcp::socket(&card, 67) {
             Ok(socket) => tasks.push(tokio::spawn(dhcp(socket, Some(address)))),
             Err(e) => eprintln!("kithd: netboot: not answering on {card}: {e}"),
@@ -1289,6 +1337,74 @@ mod tests {
             assert!(task.await.unwrap_err().is_cancelled());
         }
         assert_eq!(status()["on"], false);
+    }
+
+    /// A peer that dribbles its request, a byte now and then, is let go when the head's time is
+    /// up, not a read's time after each byte.
+    #[tokio::test]
+    async fn netboot_http_closes_a_slow_head_after_one_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let serving = tokio::spawn(http(listener));
+        let (mut reader, mut writer) = tokio::net::TcpStream::connect(server).await.unwrap().into_split();
+        let dribble = tokio::spawn(async move {
+            for _ in 0..20 {
+                if writer.write_all(b"G").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        let began = Instant::now();
+        let mut heard = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(15), reader.read_to_end(&mut heard));
+        let _ = read.await.expect("the server lets a slow head go");
+        let took = began.elapsed();
+        assert!(
+            took >= Duration::from_secs(9) && took < Duration::from_secs(12),
+            "{took:?}"
+        );
+        dribble.abort();
+        serving.abort();
+    }
+
+    /// One address holds two connections at most: a third is closed at once, and the places
+    /// are free again when they end. Others are as they were, and a time is set by the file.
+    #[tokio::test]
+    async fn netboot_http_refuses_a_third_connection_from_one_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let serving = tokio::spawn(http(listener));
+        let first = tokio::net::TcpStream::connect(server).await.unwrap();
+        let mut second = tokio::net::TcpStream::connect(server).await.unwrap();
+        let mut third = tokio::net::TcpStream::connect(server).await.unwrap();
+        let mut heard = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(2), third.read_to_end(&mut heard)).await;
+        assert!(matches!(closed, Ok(Ok(0))), "{closed:?}");
+        // (The two that are open are waiting for their request, not closed.)
+        let waiting = tokio::time::timeout(Duration::from_millis(300), second.read_u8()).await;
+        assert!(waiting.is_err(), "{waiting:?}");
+        // A place that is let go is given to the next one.
+        drop(first);
+        let mut served = None;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut next = tokio::net::TcpStream::connect(server).await.unwrap();
+            next.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+            let mut heard = Vec::new();
+            let _ = next.read_to_end(&mut heard).await;
+            if heard.starts_with(b"HTTP/1.1 404 ") {
+                served = Some(heard);
+                break;
+            }
+        }
+        assert!(served.is_some(), "a freed place is not given again");
+        serving.abort();
+
+        assert_eq!(transfer_time(0), Duration::from_secs(30));
+        assert_eq!(transfer_time(50_000_000), Duration::from_secs(80));
     }
 
     /// Turned off, the HTTP port is closed: nothing answers there, not even a refusal.

@@ -678,11 +678,13 @@ curl --cacert ca.pem --cert cert.pem --key key.pem --data-binary @target/os/kith
     -X PUT 'https://NODE:7443/v1/netboot?macs=52:54:00:12:34:56,52:54:00:12:34:57&minutes=30&disk=only'
 ```
 
-The boot file goes over TFTP, or over plain HTTP (TCP port 8069 on the node) to firmware that
+The boot file goes over TFTP, or over plain HTTP (TCP port 8069, on the node's card addresses only) to firmware that
 does UEFI HTTP boot, which is faster: such a machine's DHCP question says `HTTPClient`, and the
 node answers it with the URL of its file (`http://NODE:8069/kith-netboot-525400123456.efi`).
 Either way it is unencrypted and unsigned, with the machine's join token in it, and it goes once,
 to a named machine only; any other request gets a 404, and the port is closed when netboot is off.
+A request must arrive within 10 seconds, one address may hold two connections, and a transfer
+slower than 1 MB/s (after 30 seconds) is ended, so a peer cannot hold the port shut.
 Anyone on that network segment who claims a named card's address while netboot is on gets that
 token (it lets one node join, for an hour), and can answer network boots faster than the node:
 use it on a network you trust, for as short as it takes. Machines must start by UEFI on x86-64
