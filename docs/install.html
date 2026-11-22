@@ -51,7 +51,7 @@
   <div class="head">
     <p class="no"><b>01</b> The stick</p>
     <h2>Start with a USB stick.</h2>
-    <p>Write the installer to it: <code>dd if=kith-os-installer.raw of=/dev/sdX</code>. <code>sh os/build.sh</code> makes the file. Everything on that stick is lost. The answers go on it as one more file, at "Writing" below.</p>
+    <p>Write the installer to it: <code>dd if=kith-os-installer.raw of=/dev/sdX</code>. <code>sh os/build.sh</code> makes the file. Everything on that stick is lost. The answers go on it as one more file, at "Writing" below. A machine or hypervisor that only takes a CD image takes <code>kith-installer.iso</code> (UEFI, 1 GB of memory), which the same build writes: it asks at the console, with no answers.</p>
   </div>
   <div class="net">
     <h3>Several machines, no stick?</h3>
