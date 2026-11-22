@@ -803,11 +803,11 @@ mod tests {
     #[test]
     fn the_sockets_admin_may_apply_a_node_key_with_no_cluster() {
         let grants = crate::access::Grants::of(&Caller::Admin, &kith_api::store::Store::default());
-        assert!(grants.may(&Verb::Apply, "NodeKey", None) && grants.may(&Verb::Get, "NodeKey", None));
-        assert!(grants.may(&Verb::Delete, "NodeKey", None), "a remove is a delete");
+        assert!(grants.may(&Verb::Apply, "NodeKey", None, None) && grants.may(&Verb::Get, "NodeKey", None, None));
+        assert!(grants.may(&Verb::Delete, "NodeKey", None, None), "a remove is a delete");
         // (Someone else is not: no Identity is no right.)
         let nobody = crate::access::Grants::of(&Caller::Identity("nobody".into()), &kith_api::store::Store::default());
-        assert!(!nobody.may(&Verb::Apply, "NodeKey", None));
+        assert!(!nobody.may(&Verb::Apply, "NodeKey", None, None));
     }
 
     /// A claimed Identity (what `kith --server` and the VM test are) reaches the verbs' paths over
