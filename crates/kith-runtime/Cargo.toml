@@ -24,7 +24,7 @@ tar = { version = "0.4", default-features = false }
 flate2 = "1"
 serde.workspace = true
 serde_json.workspace = true
-nix = { version = "0.29", features = ["process", "user", "signal", "sched", "fs", "mount", "time"] }
+nix = { version = "0.29", features = ["process", "user", "signal", "sched", "fs", "mount", "time", "term"] }
 # Already in the tree through libcontainer.
 caps = "0.5"
 # What a container's init process logs at error level, read back when its create fails (see
@@ -43,6 +43,10 @@ webpki = { package = "rustls-webpki", version = "0.103", default-features = fals
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 # The seccomp filter, written out in Rust: no C libseccomp (kithd is one static binary).
 seccompiler = "0.5"
+
+[features]
+# `Entered::on_host`, for the tests of what drives one (kithd's exec): no container needed.
+host = []
 
 [dev-dependencies]
 # An authority and its certificates, made in the tests (in the tree through kithd).

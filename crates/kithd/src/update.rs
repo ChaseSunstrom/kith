@@ -398,7 +398,8 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
     waiting.sort_by_key(|node| (node.voter, node.leader, node.name.clone()));
     let voters_up = nodes.iter().filter(|node| node.voter).all(|node| node.up);
     // With `waitForIdleSeats` a node whose seat is busy is not picked, until `idleWaitSeconds` from
-    // when it was first held back (a seat that says idle, or none, ends the wait).
+    // when it was first held back (a seat that says idle, or none, lets it go once it fits, and
+    // does not restart the count while it does not).
     let idle_patience = spec["idleWaitSeconds"]
         .as_u64()
         .unwrap_or(IDLE_SECONDS)
@@ -413,7 +414,9 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
         let busy = node.seat.as_ref().filter(|_| idle_wait);
         // (The count runs while it waits for its turn too.)
         let began = idle_before.get(&node.name).copied().unwrap_or(now);
-        if busy.is_some() {
+        // (Kept while it waits, though its seat says idle for a pass: that does not restart the
+        // count. It ends when the node is picked or leaves the plan.)
+        if busy.is_some() || (idle_wait && idle_before.contains_key(&node.name)) {
             idle.insert(node.name.clone(), began);
         }
         if !(if node.voter { alone && voters_up } else { fits }) {
@@ -432,8 +435,8 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
                 node.name
             );
             held.gave.insert(node.name.clone(), why);
-            idle.remove(&node.name);
         }
+        idle.remove(&node.name);
         since.insert(node.name.clone(), now);
         if spec["drain"].as_bool() == Some(true) {
             // Cordoned and drained, then restarted once what moves is running elsewhere.
@@ -1799,11 +1802,8 @@ mod tests {
     use super::*;
 
     /// An empty directory of this test's own.
-    pub(super) fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kithd-release-keys-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    pub(super) fn scratch(name: &str) -> crate::scratch::Scratch {
+        crate::scratch::Scratch::new(&format!("kithd-release-keys-{name}"))
     }
 
     /// Check 3 of docs/adr-unlock.md: the running system's header, kept for its slot, is signed
@@ -1996,7 +1996,7 @@ mod tests {
         assert!(given.refused(Some("dd44")).is_ok() && given.refused(Some("aa11")).is_err());
         // A file of the system's keys that cannot be read takes nothing.
         let unread = Keys {
-            image: Some(dir.clone()),
+            image: Some(dir.to_path_buf()),
             ..Keys::new(Vec::new(), &dir.join("elsewhere"))
         };
         assert!(unread.refused(Some("aa11")).is_err());
@@ -2117,7 +2117,8 @@ mod tests {
         // And the fetch, by a name it looks up, goes on to the address that was vetted.
         // (This thread takes loopback for outside: it stands for a server elsewhere.)
         crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
-        let keys = Keys::new(vec!["aa11".into()], &scratch("vetted-out"));
+        let _dir = scratch("vetted-out");
+        let keys = Keys::new(vec!["aa11".into()], &_dir);
         let release = json!({ "publicKey": "aa11", "signature": "00" });
         let url = format!("http://localhost:{}/kith-os.update", at.port());
         let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, false).await;
@@ -2138,7 +2139,8 @@ mod tests {
 
     #[test]
     fn handover_makes_the_named_keys_this_nodes_once_it_runs_the_release() {
-        let keys = Keys::new(Vec::new(), &scratch("handover"));
+        let _dir = scratch("handover");
+        let keys = Keys::new(Vec::new(), &_dir);
         let ((old, old_public), (new, new_public), (_, spare_public)) = (pair(), pair(), pair());
         crate::pki::write_whole(&keys.kept, format!("{old_public}\n").as_bytes()).unwrap();
         let header = [b' '; 64];
@@ -2256,7 +2258,8 @@ mod tests {
         assert!(!keys.next().exists() && keys.taken("1.7") == Ok(false));
 
         // A node started with its keys takes them from nobody else.
-        let given = Keys::new(vec![old_public.clone()], &scratch("handover-given"));
+        let _given_dir = scratch("handover-given");
+        let given = Keys::new(vec![old_public.clone()], &_given_dir);
         let text = handover_text("1.6", &header, &named);
         assert_eq!(given.handed(&good, "1.6", &header), Ok(None));
         assert!(text.starts_with(b"kith os-release keys v1\n1.6\n"));
@@ -2306,7 +2309,8 @@ mod tests {
 
     #[test]
     fn floor_is_the_newest_version_called_good_and_is_never_lowered() {
-        let keys = Keys::new(Vec::new(), &scratch("floor"));
+        let _dir = scratch("floor");
+        let keys = Keys::new(Vec::new(), &_dir);
         let kept = || std::fs::read_to_string(&keys.floor).unwrap();
         // None yet: anything is above it.
         assert!(above(&keys.floor, "0.1").is_ok());
@@ -2343,7 +2347,8 @@ mod tests {
 
     #[tokio::test]
     async fn floor_holds_on_an_older_slot_and_under_a_plan_that_allows_going_back() {
-        let keys = Keys::new(vec!["aa11".into()], &scratch("floor-held"));
+        let _dir = scratch("floor-held");
+        let keys = Keys::new(vec!["aa11".into()], &_dir);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/kith-os.update", listener.local_addr().unwrap());
         let release = json!({ "publicKey": "aa11", "signature": "00" });
@@ -2420,7 +2425,8 @@ mod tests {
     /// writer, which finds no slot here: that is what "followed to the image" says.
     async fn fetched(url: &str, lan: bool) -> Result<String, String> {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let keys = Keys::new(vec!["aa11".into()], &scratch("redirect"));
+        let _dir = scratch("redirect");
+        let keys = Keys::new(vec!["aa11".into()], &_dir);
         let release = json!({ "publicKey": "aa11", "signature": "00" });
         crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
         let said = fetch(url, "2".into(), &release, 'a', &keys, "1", true, lan).await;
@@ -3332,6 +3338,33 @@ mod tests {
         assert_eq!(told(&go(&long, Some(&first), &nodes, 86_400)), ["a"]);
     }
 
+    /// A seat that flaps between busy and idle while its node is not picked does not restart the
+    /// clock: `idleWaitSeconds` counts from the node's first wait (T-1128).
+    #[test]
+    fn update_idle_wait_is_not_reset_by_a_seat_that_flaps() {
+        let go = |last: Option<&Decided>, nodes: &[Node], at: u64| {
+            let spec = json!({ "waitForIdleSeats": true, "idleWaitSeconds": 60 });
+            step(&plan(spec, last), Some(("2", "next@1")), nodes, at)
+        };
+        // (A voter goes only while the other voter is up, so `a` is held back by `b` being down.)
+        let voter = |a: Node| Node { voter: true, ..a };
+        let down = Node {
+            up: false,
+            ..voter(node("b", "1", true))
+        };
+        let busy = vec![voter(seated("a", "active")), down.clone()];
+        let idle = vec![voter(node("a", "1", true)), down];
+        let first = go(None, &busy, 1000);
+        assert!(told(&first).is_empty());
+        let flap = go(Some(&first), &idle, 1030);
+        assert!(told(&flap).is_empty());
+        let again = go(Some(&flap), &busy, 1050);
+        assert!(told(&again).is_empty());
+        // 60 seconds from the first wait, though only 10 from the last time the seat was busy.
+        let up = vec![busy[0].clone(), voter(node("b", "1", true))];
+        assert_eq!(told(&go(Some(&again), &up, 1060)), ["a"]);
+    }
+
     /// The wait for a seat counts continuous picking: a pause or a closed window restarts it.
     #[test]
     fn update_idle_wait_restarts_after_a_pause_or_a_closed_window() {
@@ -3475,8 +3508,7 @@ mod tests {
 
     #[test]
     fn update_reports_what_a_node_runs_and_what_it_failed_to_become() {
-        let state = std::env::temp_dir().join(format!("kith-update-{}", std::process::id()));
-        std::fs::create_dir_all(&state).unwrap();
+        let state = crate::scratch::Scratch::new("kith-update");
         let runs = |version: &str, slot: &str| json!({ "version": version, "slot": slot, "releaseKeys": "kept" });
         assert_eq!(report(&state, "1", 'a', "kept"), runs("1", "a"));
         // It became what it tried: nothing to say, and the note is gone.
@@ -3506,8 +3538,7 @@ mod tests {
 
     #[test]
     fn whole_torn_or_empty_marker_is_read_as_none() {
-        let state = std::env::temp_dir().join(format!("kith-whole-update-{}", std::process::id()));
-        std::fs::create_dir_all(&state).unwrap();
+        let state = crate::scratch::Scratch::new("kith-whole-update");
         for torn in ["", "{", r#"{"version":"2","why":"the rel"#] {
             crate::pki::write_whole(&tried(&state), torn.as_bytes()).unwrap();
             assert_eq!(
@@ -3641,18 +3672,18 @@ mod kithd_vouched {
     use crate::os::Way;
 
     /// A node whose slot b runs `IMAGE`, written by the update `kept` signed by its key.
-    fn node(name: &str, kept: &[u8]) -> (Keys, String) {
+    fn node(name: &str, kept: &[u8]) -> (Keys, String, crate::scratch::Scratch) {
         let state = scratch(name);
         let (sign, public) = pair();
         let signature = sign(kept);
         crate::os::keep_signed(&state, 'b', Some(&signature), Some(&public), kept).unwrap();
-        (Keys::new(vec![public.clone()], &state), public)
+        (Keys::new(vec![public.clone()], &state), public, state)
     }
 
     #[test]
     fn decides_by_the_kept_header_of_the_running_slot() {
         let now = block("1", Some([&digest('a'), &digest('b'), &digest('c')]));
-        let (keys, _) = node("kithd-vouched", &now);
+        let (keys, _, _dir) = node("kithd-vouched", &now);
         // (The kept header of the running slot is signed by a key the node takes.)
         let same = block("2", Some([&digest('f'), &digest('b'), &digest('c')]));
         let kernel = block("2", Some([&digest('f'), &digest('d'), &digest('c')]));
@@ -3667,12 +3698,12 @@ mod kithd_vouched {
     #[test]
     fn a_kept_header_without_the_object_or_not_signed_is_full() {
         let old = block("1", None);
-        let (keys, _) = node("kithd-vouched-old", &old);
+        let (keys, _, _dir) = node("kithd-vouched-old", &old);
         let next = block("2", Some([&digest('f'), &digest('b'), &digest('c')]));
         assert_eq!(keys.way('b', IMAGE, &next), Way::Full);
         // A signature that is not the kept header's.
         let now = block("1", Some([&digest('a'), &digest('b'), &digest('c')]));
-        let (keys, public) = node("kithd-vouched-forged", &now);
+        let (keys, public, _dir) = node("kithd-vouched-forged", &now);
         let (forge, _) = pair();
         crate::os::keep_signed(&keys.state, 'b', Some(&forge(&now)), Some(&public), &now).unwrap();
         assert_eq!(keys.way('b', IMAGE, &next), Way::Full);
@@ -3681,7 +3712,7 @@ mod kithd_vouched {
     #[test]
     fn says_why_it_is_a_full_update() {
         let now = block("1", Some([&digest('a'), &digest('b'), &digest('c')]));
-        let (keys, _) = node("kithd-vouched-why", &now);
+        let (keys, _, _dir) = node("kithd-vouched-why", &now);
         let same = block("2", Some([&digest('f'), &digest('b'), &digest('c')]));
         let kernel = block("2", Some([&digest('f'), &digest('d'), &digest('c')]));
         let rest = block("2", Some([&digest('f'), &digest('b'), &digest('e')]));
@@ -3712,13 +3743,13 @@ mod stage {
     const KITHD: &[u8] = b"#!/bin/sh\nexit 0\n";
 
     /// A staging folder (mode 0700, as the mount is) and a file holding `KITHD` beside it.
-    fn folders(name: &str) -> (PathBuf, PathBuf) {
+    fn folders(name: &str) -> (crate::scratch::Scratch, PathBuf, PathBuf) {
         let root = tests::scratch(&format!("stage-{name}"));
         let (dir, from) = (root.join("bin"), root.join("sbin-init"));
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(&from, KITHD).unwrap();
-        (dir, from)
+        (root, dir, from)
     }
 
     fn sum(bytes: &[u8]) -> String {
@@ -3727,7 +3758,7 @@ mod stage {
 
     #[test]
     fn refuses_a_binary_whose_sha256_differs_from_the_signed_digest_and_leaves_the_mount_root_only() {
-        let (dir, from) = folders("differs");
+        let (_root, dir, from) = folders("differs");
         // An older staged file stays what it was (it may be the one that runs).
         std::fs::write(dir.join("kithd"), b"older").unwrap();
         let why = stage(&from, &sum(b"another kithd"), &dir).unwrap_err();
@@ -3740,7 +3771,7 @@ mod stage {
 
     #[test]
     fn stages_what_the_digest_names_as_an_executable_only_its_owner_has() {
-        let (dir, from) = folders("matches");
+        let (_root, dir, from) = folders("matches");
         std::fs::write(dir.join("kithd"), b"older").unwrap();
         // (Upper case, as a header may write it.)
         let staged = stage(&from, &sum(KITHD).to_ascii_uppercase(), &dir).unwrap();
@@ -3755,13 +3786,13 @@ mod stage {
 
     #[test]
     fn refuses_a_place_that_others_could_write_or_that_is_not_there() {
-        let (dir, from) = folders("open");
+        let (_root, dir, from) = folders("open");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let why = stage(&from, &sum(KITHD), &dir).unwrap_err();
         assert!(why.contains("only"), "{why}");
         assert!(!dir.join("kithd").exists());
         assert!(stage(&from, &sum(KITHD), &dir.join("nowhere")).is_err());
-        let (dir, _) = folders("no-file");
+        let (_root, dir, _) = folders("no-file");
         assert!(stage(&dir.join("not-there"), &sum(KITHD), &dir).is_err());
     }
 
@@ -3820,7 +3851,7 @@ mod stage {
 
     #[test]
     fn refuses_a_file_larger_than_most_and_leaves_nothing_staged() {
-        let (dir, from) = folders("large");
+        let (_root, dir, from) = folders("large");
         let big = vec![7u8; STAGE_MOST as usize + 1];
         std::fs::write(&from, &big).unwrap();
         let why = stage(&from, &sum(&big), &dir).unwrap_err();

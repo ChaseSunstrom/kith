@@ -12,8 +12,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod context;
+#[cfg(feature = "docker")]
+mod docker_store;
 mod import;
 mod launch;
+mod machine;
 mod remote;
 mod signing;
 mod ui;
@@ -229,6 +232,11 @@ enum Command {
     Source {
         #[command(subcommand)]
         command: SourceCommand,
+    },
+    /// Dev machines: a Workload that runs as you, its home on a replicated Volume
+    Machine {
+        #[command(subcommand)]
+        command: machine::Machine,
     },
     /// Translate Kubernetes manifests or a Helm chart into kith resources
     Import {
@@ -1113,6 +1121,32 @@ fn request<T: serde::de::DeserializeOwned>(kithd: &Kithd, method: &str, path: &s
 /// The passphrase typed for this run's signed writes: asked for once, when the first is signed.
 static PASSPHRASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Set by a long-running verb (`docker serve`) once it serves: a request thread never prompts.
+static NO_PROMPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// For a verb that serves: where kithd needs the admin's signature, ask for the passphrase now,
+/// once, before the first request (never in a request thread), and derive the key. A passphrase
+/// that comes out empty (no terminal, nothing on stdin) is refused here with a clear message.
+#[cfg(feature = "docker")]
+fn sign_before_serving(backend: &Backend) -> Result<(), String> {
+    if let Backend::Daemon(kithd) = backend {
+        // (A kithd that is not up yet is no reason not to serve: its calls fail as they come.)
+        match request::<serde_json::Value>(kithd, "GET", "/v1/cluster", b"") {
+            Err(e) => eprintln!("kith: kithd does not answer yet ({e}): serving; calls fail until it does"),
+            Ok(_) => {
+                signed(kithd, "POST", "/v1/apply", b"")?;
+                if PASSPHRASE.get().is_some_and(String::is_empty) {
+                    return fail(
+                        "this cluster requires the admin's signature (spec.signing: required): give the passphrase at a terminal or as one line on stdin, as kith docker serve asks for it once, before it serves",
+                    );
+                }
+            }
+        }
+    }
+    NO_PROMPT.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
 /// The admin's key from it, for the cluster kithd named: one cluster per run.
 static KEY: std::sync::OnceLock<ring::signature::Ed25519KeyPair> = std::sync::OnceLock::new();
 
@@ -1138,6 +1172,11 @@ fn signed(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Option
         Some(key) => key,
         None => {
             if PASSPHRASE.get().is_none() {
+                if NO_PROMPT.load(std::sync::atomic::Ordering::SeqCst) {
+                    return fail(
+                        "this cluster began requiring the admin's signature after kith docker serve started: restart it",
+                    );
+                }
                 let typed = admin_passphrase("The admin's passphrase, which signs this change: ", false)?;
                 let _ = PASSPHRASE.set(typed);
             }
@@ -1277,15 +1316,20 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 Some(path) => path,
                 None => return fail("no place for the socket: set --listen PATH"),
             };
+            // (The backend first: one that cannot be reached makes no socket.)
+            let backend = backend()?;
+            sign_before_serving(&backend)?;
+            let store = docker_store::DockerStore(backend);
             let listener = kith_docker::listen(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             eprintln!(
                 "kith: the Docker API is on {}: DOCKER_HOST=unix://{} docker version",
                 path.display(),
                 path.display()
             );
-            kith_docker::serve(listener);
+            kith_docker::serve_with(listener, Some(Box::new(store)));
             return Ok(ExitCode::SUCCESS);
         }
+        Command::Machine { command } => return machine::run(command, &backend),
         Command::Lint { files } => {
             let n = load(&files)?.len();
             println!("{n} resource{} ok", if n == 1 { "" } else { "s" });
@@ -2328,6 +2372,30 @@ fn watch_get(kithd: &Kithd, kind: Option<&str>, keep: impl Fn(&Resource) -> bool
     }
 }
 
+/// How far an image pull is, as a container's `pull` says it: "pulling 3 of 7 layers, 12 of 40 MB".
+fn pull_text(pull: &serde_json::Value) -> Option<String> {
+    let said = |field: &str| pull[field].as_u64();
+    let (layers, of, bytes, total) = (
+        said("layers")?,
+        said("layersTotal")?,
+        said("bytes")?,
+        said("bytesTotal")?,
+    );
+    let (unit, size) = [("GB", 1e9), ("MB", 1e6), ("KB", 1e3)]
+        .into_iter()
+        .find(|(_, size)| total as f64 >= *size)
+        .unwrap_or(("B", 1.0));
+    let show = |n: u64| match n as f64 / size {
+        x if x >= 10.0 || size == 1.0 => format!("{x:.0}"),
+        x => format!("{x:.1}"),
+    };
+    Some(format!(
+        "pulling {layers} of {of} layers, {} of {} {unit}",
+        show(bytes),
+        show(total)
+    ))
+}
+
 /// The STATUS column: what a controller reported, in a few words.
 fn status_summary(resource: &Resource) -> String {
     // First line only, and nothing that could drive the terminal: messages quote image names and output.
@@ -2350,8 +2418,11 @@ fn status_summary(resource: &Resource) -> String {
         (Some(ready), Some(replicas)) => {
             // Why it is not ready, if a container said so.
             let containers = status["containers"].as_array().into_iter().flatten();
-            let why = containers.filter_map(|c| c["message"].as_str()).next();
-            let why = why.map(|m| format!(": {}", clean(m))).unwrap_or_default();
+            let containers: Vec<_> = containers.collect();
+            // A pull that goes on is the news; a message beside it is from before.
+            let why = containers.iter().find_map(|c| pull_text(&c["pull"]));
+            let why = why.or_else(|| containers.iter().find_map(|c| c["message"].as_str()).map(clean));
+            let why = why.map(|m| format!(": {m}")).unwrap_or_default();
             format!("{ready}/{replicas} ready{why}")
         }
         // A Job or a DNS record; a Node: its state and where it is.
@@ -2652,7 +2723,7 @@ fn encrypt_text(name: &str, cancel: bool, said: &serde_json::Value) -> Result<St
         "No recovery key was shown. If {name} marked its state before this failed, `kith node encrypt {name} --cancel` takes the mark away until it starts."
     ))?;
     Ok(format!(
-        "{name}'s recovery key, shown this once and kept nowhere: write it down. {name} restarts now and encrypts its state as it starts, which takes a while: it is down until that is done. Typed at {name}'s console when it starts and no node hands its key out, the key opens its state. `kith node encrypt {name} --cancel` takes the encryption away only until it starts.\n\n    {key}\n"
+        "{name}'s recovery key, shown this once and kept nowhere: write it down. {name} restarts now and encrypts its state as it starts, which takes a while: it is down until that is done. Typed at {name}'s console when it starts and no node hands its key out, the key opens its state. `kith node encrypt {name} --cancel` takes the encryption away only until it starts. On flash, old plain blocks may survive: see the cluster guide.\n\n    {key}\n"
     ))
 }
 
@@ -2685,6 +2756,7 @@ mod node_encrypt_tests {
         let text = encrypt_text("n1", false, &json!({ "node": "n1", "recovery": key })).unwrap();
         assert_eq!(text.matches(key).count(), 1, "{text}");
         assert!(text.contains("restarts") && text.contains("--cancel"), "{text}");
+        assert!(text.contains("On flash, old plain blocks may survive"), "{text}");
         assert!(encrypt_text("n1", false, &json!({ "node": "n1" })).is_err());
     }
 
@@ -2779,6 +2851,36 @@ mod peer_tests {
 mod drain_tests {
     use super::drain_text;
     use serde_json::json;
+
+    #[test]
+    fn pull_progress_shows_in_the_status_column_while_an_image_is_pulled() {
+        use kith_api::Resource;
+        let workload = |status: serde_json::Value| {
+            let workload = json!({
+                "apiVersion": "kith.dev/v1", "kind": "Workload", "metadata": { "name": "web" },
+                "spec": {}, "status": status,
+            });
+            super::status_summary(&serde_json::from_value::<Resource>(workload).unwrap())
+        };
+        let pull = json!({ "layers": 3, "layersTotal": 7, "bytes": 12_000_000, "bytesTotal": 40_000_000 });
+        let pulling = workload(json!({ "ready": 0, "replicas": 1, "containers": [
+            { "name": "web", "message": "pending", "pull": pull },
+        ]}));
+        assert_eq!(pulling, "0/1 ready: pulling 3 of 7 layers, 12 of 40 MB");
+        // Small images count in KB; a container that does not pull says what it said.
+        let small = json!({ "layers": 0, "layersTotal": 1, "bytes": 0, "bytesTotal": 4_500 });
+        let said = workload(json!({ "ready": 0, "replicas": 1, "containers": [
+            { "name": "a", "message": "stopped" }, { "name": "b", "pull": small },
+        ]}));
+        assert_eq!(said, "0/1 ready: pulling 0 of 1 layers, 0.0 of 4.5 KB");
+        let plain =
+            workload(json!({ "ready": 0, "replicas": 1, "containers": [{ "name": "a", "message": "stopped" }] }));
+        assert_eq!(plain, "0/1 ready: stopped");
+        assert_eq!(
+            workload(json!({ "ready": 1, "replicas": 1, "containers": [{ "name": "a" }] })),
+            "1/1 ready"
+        );
+    }
 
     #[test]
     fn drain_says_what_moves_stays_and_what_is_lost_before_anything_changes() {

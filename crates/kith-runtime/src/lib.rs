@@ -20,7 +20,7 @@ pub mod signed;
 pub mod timeline;
 
 pub use container::*;
-pub use image::{Image, ImageStore, Local, PullPolicy, Unpacking, registry, repository, sha256_hex, warm_reference};
+pub use image::{Image, ImageStore, Local, Progress, PullPolicy, Unpacking, registry, repository, sha256_hex, warm_reference};
 pub use outside::{Patience, read_capped};
 pub use seccomp::REFUSED;
 

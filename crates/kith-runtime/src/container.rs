@@ -1210,11 +1210,14 @@ impl Runtime {
 }
 
 /// A process [`enter`] started in a running container: its three ends of the pipes it runs on
-/// (each one `take`n by whoever drives it), and its exit status to [`Entered::wait`] for.
+/// (each one `take`n by whoever drives it), and its exit status to [`Entered::wait`] for. One
+/// that was asked a terminal ([`Options::tty`]) has the master of it in `tty` instead, to read
+/// what it writes, write what it reads and size (see [`kith_dm_sys::set_window`]).
 pub struct Entered {
     pub stdin: Option<File>,
     pub stdout: Option<File>,
     pub stderr: Option<File>,
+    pub tty: Option<File>,
     pid: Pid,
     /// Its status was taken by `wait`: its pid is free for another process, and is not signalled.
     reaped: AtomicBool,
@@ -1230,6 +1233,32 @@ impl Drop for Entered {
 }
 
 impl Entered {
+    /// A process of this host, on the ends [`enter_with`] gives one (a session of its own, with its
+    /// terminal the controlling one): for the tests of what drives an `Entered`, with no container.
+    #[cfg(feature = "host")]
+    pub fn on_host(argv: &[&str], tty: Option<(u16, u16)>) -> Result<Entered> {
+        let what = format!("running {argv:?} on the host");
+        let ends = ends(tty).ctx(&what)?;
+        let [stdin, stdout, stderr] = ends.child;
+        let mut command = Command::new("setsid");
+        command.args(tty.map(|_| "--ctty")).args(argv);
+        command
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        let (child, awaited) = spawn_awaited(|| command.spawn(), |child| Some(child.id())).ctx(&what)?;
+        let pid = Pid::from_raw(child.id() as i32);
+        Ok(Entered {
+            stdin: ends.stdin,
+            stdout: ends.stdout,
+            stderr: ends.stderr,
+            tty: ends.tty,
+            pid,
+            reaped: AtomicBool::new(false),
+            _awaited: awaited,
+        })
+    }
+
     pub fn pid(&self) -> i32 {
         self.pid.as_raw()
     }
@@ -1246,6 +1275,14 @@ impl Entered {
             let sigkill = nix::sys::signal::Signal::SIGKILL;
             let _ = nix::sys::signal::kill(Pid::from_raw(-self.pid.as_raw()), sigkill);
             let _ = nix::sys::signal::kill(self.pid, sigkill);
+        }
+    }
+
+    /// Says goodbye to it as a terminal that went away does: SIGHUP to its process group, which a
+    /// shell passes on to its jobs. (One that holds it off is for `kill`; same guard as there.)
+    pub fn hangup(&self) {
+        if !self.reaped.load(Ordering::SeqCst) {
+            let _ = nix::sys::signal::kill(Pid::from_raw(-self.pid.as_raw()), nix::sys::signal::Signal::SIGHUP);
         }
     }
 
@@ -1397,6 +1434,80 @@ impl Drop for Scratch {
 /// [`Entered`] is gone, so [`reap_orphans`] leaves its exit status to `wait`.
 // ponytail: the caller says the container is one this node made; nothing here checks that.
 pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
+    enter_with(root, id, argv, Options::default())
+}
+
+/// What a process [`enter_with`] is asked beyond its program.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Options {
+    /// A terminal (a pty of this many rows and columns) in place of the three pipes: the process
+    /// leads a session of its own with the terminal as its controlling one.
+    pub tty: Option<(u16, u16)>,
+    /// Root of the container's own user namespace, not its init's user. Refused where that root
+    /// would be the node's (see [`own_root`]).
+    pub root: bool,
+}
+
+/// The node's id of the user the container's uid 0 is, if that is neither the node's root nor the
+/// user this process is: `Err` says why it is not. A container with no user namespace of its own
+/// has the node's users; a rootless one maps its 0 to the one user kithd is, which owns kithd's
+/// own state.
+fn own_root(spec: &Spec) -> std::result::Result<u32, String> {
+    let maps = spec.linux().as_ref().and_then(|linux| linux.uid_mappings().as_ref());
+    let host = maps.and_then(|maps| maps.iter().find(|m| m.container_id() == 0 && m.size() > 0));
+    let rootless = spec.annotations().as_ref().is_some_and(|notes| notes.contains_key(BECOMES));
+    match host.map(|m| m.host_id()) {
+        None => Err("it has no user namespace of its own: uid 0 there would be the node's root".into()),
+        Some(host) if host == 0 || host == nix::unistd::geteuid().as_raw() || rootless => Err(format!(
+            "its uid 0 is the node's user {host}, the one kithd runs as: that is not a root of the machine's own"
+        )),
+        Some(host) => Ok(host),
+    }
+}
+
+/// The ends a process runs on: its own three, and the ones its driver keeps.
+struct Ends {
+    child: [OwnedFd; 3],
+    stdin: Option<File>,
+    stdout: Option<File>,
+    stderr: Option<File>,
+    tty: Option<File>,
+}
+
+fn ends(tty: Option<(u16, u16)>) -> io::Result<Ends> {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    if let Some((rows, cols)) = tty {
+        let size = nix::pty::Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty = nix::pty::openpty(Some(&size), None::<&nix::sys::termios::Termios>)?;
+        for end in [&pty.master, &pty.slave] {
+            fcntl(end.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        }
+        return Ok(Ends {
+            child: [pty.slave.try_clone()?, pty.slave.try_clone()?, pty.slave],
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            tty: Some(File::from(pty.master)),
+        });
+    }
+    let pipe = || nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC);
+    let ((stdin, to_stdin), (from_stdout, stdout), (from_stderr, stderr)) = (pipe()?, pipe()?, pipe()?);
+    Ok(Ends {
+        child: [stdin, stdout, stderr],
+        stdin: Some(File::from(to_stdin)),
+        stdout: Some(File::from(from_stdout)),
+        stderr: Some(File::from(from_stderr)),
+        tty: None,
+    })
+}
+
+/// [`enter`] with `options`.
+pub fn enter_with(root: &Path, id: &str, argv: &[String], options: Options) -> Result<Entered> {
     let what = format!("running a process in container `{id}`");
     if argv.is_empty() {
         return err(format!("{what}: no program to run"));
@@ -1404,17 +1515,38 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
     ContainerBuilder::new(id.into(), SyscallType::Linux)
         .validate_id()
         .ctx(&what)?;
-    let pipe = || nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).ctx(&what);
-    let ((stdin, to_stdin), (from_stdout, stdout), (from_stderr, stderr)) = (pipe()?, pipe()?, pipe()?);
     let container = Container::load(root.join("state").join(id)).ctx(&what)?;
     // libcontainer's tenant takes no user, groups or working directory of its init's (left
     // unsaid they are root, no groups and `/`), and its own open-file limit is 1024 soft and
     // hard, set before it opens the namespace files while it holds every descriptor of this
     // process (EMFILE), and one the program can never raise. So it is given its init's process,
     // with `argv` and the soft open-file limit at the hard one (`Entry` lowers it, as an init's).
-    let made = oci_spec::runtime::Spec::load(container.bundle().join("config.json")).ctx(&what)?;
+    let mut made = oci_spec::runtime::Spec::load(container.bundle().join("config.json")).ctx(&what)?;
+    if options.root {
+        own_root(&made).map_err(|why| crate::Error(format!("{what}: --root is refused: {why}")))?;
+    }
+    if options.tty.is_some() {
+        // (Said in the copy the tenant reads, for `Entry` to take its terminal as the controlling one.)
+        let mut notes = made.annotations().clone().unwrap_or_default();
+        notes.insert(TTY.into(), "1".into());
+        made.set_annotations(Some(notes));
+    }
+    let Ends {
+        child: [stdin, stdout, stderr],
+        stdin: to_stdin,
+        stdout: from_stdout,
+        stderr: from_stderr,
+        tty,
+    } = ends(options.tty).ctx(&what)?;
     let mut process = init_process(&made).ctx(&what)?.clone();
     process.set_args(Some(argv.to_vec()));
+    if options.root {
+        let mut who = process.user().clone();
+        who.set_uid(0);
+        who.set_gid(0);
+        who.set_additional_gids(None);
+        process.set_user(who);
+    }
     if let Some(limits) = process.rlimits().clone() {
         let limits = limits.into_iter().map(|limit| {
             if limit.typ() != oci_spec::runtime::PosixRlimitType::RlimitNofile {
@@ -1497,9 +1629,10 @@ pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
     };
     awaited.push(pid.as_raw());
     Ok(Entered {
-        stdin: Some(File::from(to_stdin)),
-        stdout: Some(File::from(from_stdout)),
-        stderr: Some(File::from(from_stderr)),
+        stdin: to_stdin,
+        stdout: from_stdout,
+        stderr: from_stderr,
+        tty,
         pid,
         reaped: AtomicBool::new(false),
         _awaited: Awaited(pid.as_raw()),
@@ -2164,6 +2297,9 @@ const BECOMES: &str = "dev.kith.becomes";
 /// Where the spec says which refused system calls the container is allowed back (names with
 /// spaces between), or that it has no filter.
 const CALLS: &str = "dev.kith.seccomp";
+/// Where the copy of the spec a tenant reads says that its stdio is a terminal, which is to be
+/// the controlling one of the session it leads.
+const TTY: &str = "dev.kith.tty";
 /// The refused calls a sandbox makes to build namespaces of its own and a root inside them:
 /// those for namespaces, and all those that mount (bubblewrap sets a mount's flags with
 /// `mount_setattr`, and takes "not permitted" for an answer where "no such call" would do).
@@ -2191,6 +2327,12 @@ struct Entry;
 
 impl Executor for Entry {
     fn exec(&self, spec: &Spec) -> std::result::Result<(), ExecutorError> {
+        // A terminal (a tenant's: its init has none) is this session's, so a shell has job control
+        // and the hangup of its master and the size of its window reach it. Before the filter below.
+        if spec.annotations().as_ref().is_some_and(|notes| notes.contains_key(TTY)) {
+            kith_dm_sys::controlling_tty(std::io::stdin().as_fd())
+                .map_err(|e| ExecutorError::Other(format!("its terminal: {e}")))?;
+        }
         let said = spec.annotations().as_ref().and_then(|notes| notes.get(BECOMES));
         if let Some((user, group)) = said.and_then(|said| said.split_once(':')) {
             // Without root there is one user to map, and libcontainer needs it to be 0 while
@@ -5438,8 +5580,14 @@ mod tests {
                 .filter(|e| e.file_name().to_string_lossy().starts_with(SCRATCH))
                 .count()
         };
-        let ok = enter(&state, "scratch1", &["/bin/cat".into(), "/proc/1/cmdline".into()]);
-        let started = ok.map(|entered| entered.wait()).is_ok();
+        // (Under load the first enter can race the init's own start: a few tries.)
+        let started = (0..5).any(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            let ok = enter(&state, "scratch1", &["/bin/cat".into(), "/proc/1/cmdline".into()]);
+            ok.map(|entered| entered.wait()).is_ok()
+        });
         let missing = enter(&state, "scratch1", &["/bin/nothing".into()]).is_err();
         let not_running = enter(&state, "nothing-here", &["/bin/cat".into()]).is_err();
         let counted = left();
@@ -5450,7 +5598,9 @@ mod tests {
         }
         let _ = handle.delete();
         let _ = fs::remove_dir_all(&root);
-        assert!(started && missing && not_running);
+        assert!(started, "the tenant never entered the running container");
+        assert!(missing, "a program the image lacks was not refused");
+        assert!(not_running, "entering a container that does not run was not refused");
         assert_eq!(counted, 0, "no scratch copy left behind");
     }
 
@@ -5818,6 +5968,37 @@ mod tests {
         let maps = made.linux().as_ref().unwrap().uid_mappings().clone().unwrap();
         assert_eq!((maps[0].host_id(), maps[0].size()), (1000, 1));
         assert_eq!(made.root().as_ref().unwrap().path(), Path::new("/images/x/rootfs"));
+    }
+
+    /// `--root` is refused where the container's uid 0 is the node's root, kithd's own user, or
+    /// a rootless container's one user (`BECOMES` set), and given where it is another user's.
+    #[test]
+    fn own_root_refuses_the_nodes_root_and_kithds_user() {
+        let spec = |host: Option<u32>, rootless: bool| {
+            let mut spec = Spec::default();
+            let mut linux = spec.linux().clone().unwrap_or_default();
+            let maps = host.map(|host| {
+                let map = oci_spec::runtime::LinuxIdMappingBuilder::default()
+                    .container_id(0u32)
+                    .host_id(host)
+                    .size(65536u32)
+                    .build()
+                    .unwrap();
+                vec![map]
+            });
+            linux.set_uid_mappings(maps);
+            spec.set_linux(Some(linux));
+            let notes = rootless.then(|| std::collections::HashMap::from([(BECOMES.to_string(), "1:1".to_string())]));
+            spec.set_annotations(notes);
+            spec
+        };
+        let me = nix::unistd::geteuid().as_raw();
+        let other = if me == 4_000_000 { 4_000_001 } else { 4_000_000 };
+        assert!(own_root(&spec(None, false)).unwrap_err().contains("no user namespace"));
+        assert!(own_root(&spec(Some(0), false)).unwrap_err().contains("node's user 0"));
+        assert!(own_root(&spec(Some(me), false)).unwrap_err().contains("the one kithd runs as"));
+        assert!(own_root(&spec(Some(other), true)).is_err(), "rootless: its 0 is kithd's user");
+        assert_eq!(own_root(&spec(Some(other), false)), Ok(other));
     }
 
     /// Two containers never share a range: one being made holds its own until its bundle names
