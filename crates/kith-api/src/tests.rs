@@ -855,6 +855,25 @@ fn expose_asks_for_the_proxy_protocol() {
     let off = service("{ host: a.example.org, via: edge }").unwrap();
     assert_eq!(off.expose.unwrap().proxy_protocol, None);
     assert!(service("{ host: a.example.org, via: edge, proxyProtocol: yes please }").is_err());
+    // Who vouches for the certificate: ACME unless it says `cluster`; nobody else.
+    let issued = |issuer: &str| service(&format!("{{ host: a.home.lan, via: edge, issuer: {issuer} }}"));
+    assert_eq!(
+        issued("cluster").unwrap().expose.unwrap().issuer,
+        Some(kinds::ExposeIssuer::Cluster)
+    );
+    assert_eq!(
+        issued("acme").unwrap().expose.unwrap().issuer,
+        Some(kinds::ExposeIssuer::Acme)
+    );
+    assert_eq!(
+        service("{ host: a.home.lan, via: edge }")
+            .unwrap()
+            .expose
+            .unwrap()
+            .issuer,
+        None
+    );
+    assert!(issued("letsencrypt").is_err());
 }
 
 #[test]
@@ -1512,6 +1531,75 @@ fn cluster_ntp_is_an_address_or_an_address_and_port() {
     assert_eq!(kinds::ntp_server("[fd00::7]:99"), Some("[fd00::7]:99".parse().unwrap()));
     // Port 0 is no server's: nothing answers there (kith.ntp reads the same).
     assert_eq!(kinds::ntp_server("[fd00::7]:0"), None);
+}
+
+/// The LAN domains the cluster's LAN CA signs under (`spec.lanDomains`) are domain names that are
+/// none of the cluster's own zones, and the one rule that says which host `issuer: cluster` may
+/// have is shared by the apply of a Service and the signer.
+#[test]
+fn lan_domains_and_the_hosts_the_cluster_issuer_signs_for() {
+    let apply = |kind_spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\n{kind_spec}");
+        Resource::from_source(&text)
+            .and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>())
+            .map(|mut docs| docs.remove(0))
+            .map_err(|e| e.msg)
+    };
+    let cluster = |domains: &str| {
+        apply(&format!(
+            "kind: Cluster\nmetadata: {{ name: home }}\nspec:\n  lanDomains: {domains}\n"
+        ))
+    };
+    let read = cluster("[home.arpa, Lan]").unwrap();
+    assert_eq!(read.spec["lanDomains"], serde_json::json!(["home.arpa", "Lan"]));
+    assert!(read.not_acted_on().is_empty());
+    for wrong in [
+        "[cluster.local]",
+        "[kith]",
+        "[a.kith]",
+        "[x.cluster.local]",
+        "['a b']",
+        "['']",
+    ] {
+        let e = cluster(wrong).expect_err(wrong);
+        assert!(e.contains("spec.lanDomains"), "{wrong}: {e}");
+    }
+    assert!(cluster("[a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q]").is_err());
+    // The apply of a Service: what the signer would refuse, whatever the domains.
+    let service = |host: &str, issuer: &str| {
+        apply(&format!(
+            "kind: Service\nmetadata: {{ name: web }}\nspec:\n  selector: {{ app: web }}\n  \
+             ports: [{{ port: 80 }}]\n  expose: {{ host: {host}, via: edge{issuer} }}\n"
+        ))
+    };
+    for host in ["nas", "a.kith", "kith", "a.cluster.local", "cluster.local", "A.Kith"] {
+        let e = service(host, ", issuer: cluster").expect_err(host);
+        assert!(e.contains("issuer: `cluster`"), "{host}: {e}");
+        // (ACME has its own say: these pass its apply check or fail on their own account.)
+        assert!(
+            !service(host, "").err().is_some_and(|e| e.contains("issuer: `cluster`")),
+            "{host}"
+        );
+    }
+    service("nas.lan", ", issuer: cluster").unwrap();
+    service("nas.example.com", ", issuer: cluster").unwrap();
+    // The shared rule: known domains refuse what is outside them.
+    let own = |names: &[&str]| names.iter().map(|d| d.to_string()).collect::<Vec<_>>();
+    assert_eq!(kinds::cluster_host_refused("nas.lan", Some(&own(&[]))), None);
+    assert_eq!(kinds::cluster_host_refused("a.b.home.arpa", Some(&own(&[]))), None);
+    assert_eq!(kinds::cluster_host_refused("nas.local", Some(&own(&[]))), None);
+    let e = kinds::cluster_host_refused("nas.example.com", Some(&own(&[]))).unwrap();
+    assert!(e.contains("home.arpa, lan, internal, local"), "{e}");
+    assert!(kinds::cluster_host_refused("nas.lan", Some(&own(&["home.arpa"]))).is_some());
+    assert_eq!(
+        kinds::cluster_host_refused("nas.home.arpa", Some(&own(&["home.arpa"]))),
+        None
+    );
+    assert_eq!(kinds::cluster_host_refused("nas.lan", Some(&own(&["LAN"]))), None);
+    assert!(kinds::cluster_host_refused("notlan", Some(&own(&[]))).is_some());
+    assert!(kinds::cluster_host_refused("xlan.example", Some(&own(&["lan"]))).is_some());
+    assert!(kinds::cluster_host_refused("a.cluster.local", Some(&own(&[]))).is_some());
+    assert!(kinds::cluster_host_refused("a.kith", Some(&own(&["kith"]))).is_some());
 }
 
 /// The house address and its endpoint are checked when a Cluster is applied, by the one parser

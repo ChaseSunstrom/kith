@@ -24,6 +24,7 @@ Only the newest version is fixed. There are no security releases of older ones.
 | A workload | Nothing: it is a process on a node | What its container, machine or sandbox lets it reach (see "What is not defended") |
 | A Workload that runs as an Identity | A certificate for `IDENTITY.runs.kith`, `NAME.NAMESPACE.workload.kith` and `NODE.on.kith`, for two hours, while the store says that Workload, placed on that node, runs as that Identity and the Identity names it | What the Identity's Roles say (see "A Workload that runs as an Identity") |
 | Anyone who reaches a node's port | Nothing | Fetch the CA certificate, spend a join token, ask for a locked disk's key by its id |
+| A device that trusts the LAN CA (`kith ca export`) | Nothing: it holds a public certificate | Takes the host certificates the LAN CA signs for the cluster's LAN names, and no others: the certificate is name-constrained to `spec.lanDomains` (default `home.arpa`, `lan`, `internal`, `local`, never `cluster.local` or `kith`) |
 | Whoever writes what kith fetches | Nothing by itself | What follows from it: a Source's repository is applied, a package is rendered, an image is run, an archive is restored |
 
 ## The boundaries, as they are in the code
@@ -876,6 +877,22 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   is each node's own word (`status.serves`, and the address it joined from): an ingress worker (its
   Node says `ingress`, below) or a worker that is sent the whole store can say it serves ingress and is
   then answered beside the others; any other worker cannot.
+- **`expose.issuer: cluster` has a LAN CA sign a host's certificate, and a device that trusts it takes
+  what it signs.** The LAN CA is apart from the cluster's root: its own key, kept beside the CA key on
+  the CA node and never leaving it, and a self-signed certificate with X.509 name constraints that
+  permit only the cluster's LAN domains (`spec.lanDomains` of a Cluster: the admin's list, by the
+  lowest key's if several name one; `home.arpa`, `lan`, `internal` and `local` where none does) and
+  exclude `kith` and `cluster.local`. `kith ca export` hands out that certificate alone, from the
+  node that holds it, over the local socket. A device that trusts it is bound by those constraints
+  whatever the CA signs; the workloads' `ca.crt` and the mesh never trust it, and a host certificate
+  does not verify against the cluster's root. Within the domains, whoever may write a Service may
+  name a host (key those in a Namespace's `spec.hosts`), and there is no revocation: a certificate
+  lasts 30 days and is made again in its last third. The LAN CA's own certificate lasts ten years;
+  changing the domains makes a new certificate with the same key and another serial, and a device
+  keeps trusting the old, broader one until its owner removes it and imports the new. The name
+  constraints also exclude every IP address, and the LAN CA's key is only read, never made again over
+  a file that is there but unreadable. `kith ca export` only works on the CA node. A
+  refused or failed issuance waits an hour, as ACME's, and the same error is written to the status once.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and
   PipeWire sockets are, and connects as any program the session started would: it can

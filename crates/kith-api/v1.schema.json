@@ -1664,6 +1664,13 @@
             "null"
           ],
           "description": "The operator's time server, `ADDRESS[:PORT]` (port 123 left out): every node asks it\nalone, at its next check, unless its own `kith.ntp` names one. When Clusters say\ndifferent servers, the lowest key's is the one taken."
+        },
+        "lanDomains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The names only the LAN knows: the domains the cluster's LAN CA signs host\ncertificates under (`expose.issuer: cluster`), and no others. Left out, `home.arpa`,\n`lan`, `internal` and `local`. Changing it makes the LAN CA's certificate again (the\nsame key): export it again (`kith ca export`) for the devices that trust it. When\nClusters name some, the lowest key's are taken."
         }
       }
     },
@@ -2353,6 +2360,17 @@
             "type": "string"
           },
           "description": "Headers set on each request on its way to the backend, in place of any of the\nsame name the client sent."
+        },
+        "issuer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExposeIssuer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Who vouches for the host's certificate: `acme` (the default) asks the ACME\nauthority, which needs a name the world can reach; `cluster` has the cluster's own\nCA sign it, for a name only the LAN knows (a phone or laptop trusts `kith ca export`\nonce). The cluster CA then vouches for any name that says so: keep its key safe."
         }
       },
       "required": [
@@ -2360,6 +2378,13 @@
         "via"
       ],
       "description": "Public HTTPS through an edge node."
+    },
+    "ExposeIssuer": {
+      "type": "string",
+      "enum": [
+        "acme",
+        "cluster"
+      ]
     },
     "ExposePath": {
       "type": "object",

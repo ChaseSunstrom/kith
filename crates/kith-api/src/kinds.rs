@@ -234,6 +234,13 @@ spec! {
         /// different servers, the lowest key's is the one taken.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub ntp: Option<String>,
+        /// The names only the LAN knows: the domains the cluster's LAN CA signs host
+        /// certificates under (`expose.issuer: cluster`), and no others. Left out, `home.arpa`,
+        /// `lan`, `internal` and `local`. Changing it makes the LAN CA's certificate again (the
+        /// same key): export it again (`kith ca export`) for the devices that trust it. When
+        /// Clusters name some, the lowest key's are taken.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub lan_domains: Vec<String>,
     }
 
     pub struct HomeSpec {
@@ -821,6 +828,12 @@ spec! {
         /// same name the client sent.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pub headers: BTreeMap<String, String>,
+        /// Who vouches for the host's certificate: `acme` (the default) asks the ACME
+        /// authority, which needs a name the world can reach; `cluster` has the cluster's own
+        /// CA sign it, for a name only the LAN knows (a phone or laptop trusts `kith ca export`
+        /// once). The cluster CA then vouches for any name that says so: keep its key safe.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub issuer: Option<ExposeIssuer>,
     }
 
     /// Where requests under one path go.
@@ -837,6 +850,8 @@ spec! {
     }
 
     pub enum ExposeVia { Edge }
+
+    pub enum ExposeIssuer { Acme, Cluster }
 
     // ---- DNS ----
 
@@ -1644,6 +1659,22 @@ impl Spec for ClusterSpec {
             return Err(format!(
                 "spec.ntp: `{ntp}` is not an address or an address and port, like `10.0.0.7` or `10.0.0.7:123`"
             ));
+        }
+        if self.lan_domains.len() > 16 {
+            return Err("spec.lanDomains: at most 16 domains".into());
+        }
+        for domain in &self.lan_domains {
+            let domain = domain.to_ascii_lowercase();
+            if !dns_name(&domain) {
+                return Err(format!(
+                    "spec.lanDomains: `{domain}` is not a domain name like `home.arpa`"
+                ));
+            }
+            if let Some(zone) = RESERVED_ZONES.iter().find(|zone| under_zone(&domain, zone)) {
+                return Err(format!(
+                    "spec.lanDomains: `{domain}` is under `{zone}`, a zone of the cluster's own"
+                ));
+            }
         }
         if let Some(home) = &self.home {
             home_address(&home.address).map_err(|why| format!("spec.home.address: {why}"))?;
@@ -2715,6 +2746,12 @@ impl Spec for ServiceSpec {
         if let Some(refused) = expose_host_refused(&expose.host) {
             return Err(refused);
         }
+        // (The Cluster's own domains are not known here: the signer checks them too.)
+        if expose.issuer == Some(ExposeIssuer::Cluster) {
+            if let Some(refused) = cluster_host_refused(&expose.host.to_ascii_lowercase(), None) {
+                return Err(refused);
+            }
+        }
         if expose.proxy_protocol == Some(true) && !(expose.paths.is_empty() && expose.headers.is_empty()) {
             return Err(
                 "expose.proxyProtocol: not with paths or headers, whose requests say the client's address in \
@@ -2856,6 +2893,51 @@ pub fn expose_host_refused(host: &str) -> Option<String> {
     };
     Some(format!(
         "expose.host: `{host}` is {why}: no certificate authority issues for it"
+    ))
+}
+
+/// The domains the LAN CA signs under when no Cluster says (`spec.lanDomains`).
+pub const LAN_DOMAINS: [&str; 4] = ["home.arpa", "lan", "internal", "local"];
+
+/// The zones kithd answers for itself: no certificate for a name in them is signed by the LAN CA,
+/// and no Namespace or Cluster may hand them out.
+pub const RESERVED_ZONES: [&str; 2] = ["kith", "cluster.local"];
+
+/// The domains a Cluster's `spec.lanDomains` names, lower case; [`LAN_DOMAINS`] where it names none.
+pub fn lan_domains(named: &[String]) -> Vec<String> {
+    match named.is_empty() {
+        true => LAN_DOMAINS.iter().map(|d| d.to_string()).collect(),
+        false => named.iter().map(|d| d.to_ascii_lowercase()).collect(),
+    }
+}
+
+/// Is the lower case `name` the `zone`, or a name under it?
+pub fn under_zone(name: &str, zone: &str) -> bool {
+    name == zone || name.strip_suffix(zone).is_some_and(|front| front.ends_with('.'))
+}
+
+/// Why the cluster's LAN CA would not sign a certificate for `host` (lower case, a name that passes
+/// `dns_name`), if it would not: what `expose_host_refused` says, a name of one label, the
+/// cluster's own zones ([`RESERVED_ZONES`]), and, when the Cluster's domains are known (`domains`,
+/// where none is [`LAN_DOMAINS`]), a name under none of them. One rule, for the apply and for the
+/// signer.
+pub fn cluster_host_refused(host: &str, domains: Option<&[String]>) -> Option<String> {
+    if let Some(refused) = expose_host_refused(host) {
+        return Some(refused);
+    }
+    let why = if !host.contains('.') {
+        "a name of one label".to_string()
+    } else if let Some(zone) = RESERVED_ZONES.iter().find(|zone| under_zone(host, zone)) {
+        format!("under `{zone}`, a zone of the cluster's own")
+    } else {
+        let listed = lan_domains(domains.unwrap_or(&[]));
+        if domains.is_none() || listed.iter().any(|zone| under_zone(host, zone)) {
+            return None;
+        }
+        format!("not under one of the cluster's LAN domains ({})", listed.join(", "))
+    };
+    Some(format!(
+        "expose.issuer: `cluster` does not sign for `{host}`: it is {why}"
     ))
 }
 

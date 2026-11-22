@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! GET  /v1/ca                          -> the CA certificate (PEM)     no certificate needed
+//! GET  /v1/ca/lan                      -> the LAN CA certificate (PEM)   local socket only (`kith ca export`)
 //! POST /v1/join {token, name, port}    -> {ca, cert, key}              no certificate needed
 //! POST /v1/claim {token, name}         -> {ca, cert, key}              no certificate needed
 //! POST /v1/tokens                      -> {token}                      local socket, or an Identity that may apply Nodes, Roles and RoleBindings
@@ -840,7 +841,26 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
 /// What only the local socket serves.
 pub fn admin_router(shared: Arc<Shared>) -> Router {
     let admin = Router::new().route("/v1/identities/{name}/certificate", post(certificate));
+    // (The LAN CA's certificate is public, and is all `kith ca export` hands out: not the cluster
+    // CA's, which every node and Workload trusts.)
+    let admin = admin.route("/v1/ca/lan", get(lan_ca));
     admin.route("/v1/cluster", get(status)).with_state(shared)
+}
+
+/// The certificate of the LAN CA, made on first asking (`kith ca export`). Only the node that
+/// holds the cluster CA key has the LAN CA's.
+async fn lan_ca(State(shared): State<Arc<Shared>>) -> Result<String, Refusal> {
+    let Some(ca) = &cluster(&shared)?.ca else {
+        return Err(refuse(StatusCode::CONFLICT, CA_ELSEWHERE));
+    };
+    let domains = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        crate::ingress::lan_domains(&state.store)
+    };
+    let lan = ca
+        .lan(&domains)
+        .map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    Ok(lan.cert.clone())
 }
 
 pub(crate) const CA_ELSEWHERE: &str =

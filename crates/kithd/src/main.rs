@@ -700,7 +700,7 @@ async fn membership(
             (me, None)
         }
         None => {
-            let ca = pki::Ca::create()?;
+            let ca = pki::Ca::create()?.keep_in(&dir);
             let (cert, key) = ca.issue(&name)?;
             eprintln!("kithd: new cluster; `kith node token` lets another node join");
             let me = pki::Identity {
