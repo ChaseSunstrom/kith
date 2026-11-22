@@ -177,14 +177,14 @@ mod tests {
     use super::*;
     use crate::pki::{Ca, Identity};
 
-    /// A node `b` whose certificate ended in `left` seconds, from an hour ago, in a directory.
-    fn node(ca: &Ca, left: u64) -> (Identity, Vec<u8>, std::path::PathBuf) {
+    /// A node `b` whose certificate ends `left` seconds after `now` (the test's own, so a second that
+    /// ticks between the two reads cannot move it), from an hour before, in a directory.
+    fn node(ca: &Ca, now: u64, left: u64) -> (Identity, Vec<u8>, std::path::PathBuf) {
         let (cert, key) = ca.issue("b").unwrap();
         let der = rustls::pki_types::CertificateDer::from_pem_slice(cert.as_bytes()).unwrap();
         let Some(Subject::Node(_, public, _)) = pki::subject_of(&der) else {
             panic!("a node's certificate");
         };
-        let now = kith_api::store::now();
         let short = ca
             .renew_node("b", None, &public, now - 3600, Duration::from_secs(3600 + left))
             .unwrap();
@@ -207,13 +207,13 @@ mod tests {
         let ca = Ca::create().unwrap();
         let now = kith_api::store::now();
         // Ten minutes left of the hour and ten minutes, with a third of that gone.
-        let (me, public, dir) = node(&ca, 600);
+        let (me, public, dir) = node(&ca, now, 600);
         let live = pki::Live::new(&me).unwrap();
         let ends = |live: &pki::Live| pki::validity(&live.current().cert[0]).unwrap().1;
         assert_eq!(ends(&live), now + 600);
 
         // A third of its life left or more: nothing is asked.
-        let (young, _, early) = node(&ca, 6000);
+        let (young, _, early) = node(&ca, now, 6000);
         let fresh = pki::Live::new(&young).unwrap();
         let asked = renew_if_due(&fresh, &early, now, || async { panic!("asked too early") }).await;
         assert_eq!(asked, Ok(Renewed::NotYet));
@@ -247,7 +247,7 @@ mod tests {
     async fn a_certificate_that_is_not_valid_yet_is_not_taken() {
         let ca = Ca::create().unwrap();
         let now = kith_api::store::now();
-        let (me, public, dir) = node(&ca, 500);
+        let (me, public, dir) = node(&ca, now, 500);
         let live = pki::Live::new(&me).unwrap();
         let old = std::fs::read_to_string(dir.join("node.crt")).unwrap();
         // (Made as of an hour from now: it begins at 59 minutes from now.)
