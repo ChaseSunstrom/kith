@@ -514,7 +514,8 @@ Only the newest version is fixed. There are no security releases of older ones.
   What a get gives was written by whatever ran in the Volume: unpacked as root it keeps
   their owners and setuid bits.
 - **An encrypted disk or Volume** cannot be read by whoever takes it out of its machine:
-  the key is with the other nodes.
+  the key is with the other nodes. A node encrypted in place (`kith node encrypt`) is
+  short of that on flash: the controller may keep the old plain blocks (cluster guide).
 
 ## Running a runtime inside a container
 

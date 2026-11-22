@@ -666,7 +666,9 @@ dm-crypt, with the key not on the machine: the cluster holds it. At each start t
 its network up, asks the nodes it knows for its key and only then opens its state. A disk taken
 out of its cluster, thrown away, or sent back under warranty opens for nobody. It is chosen when
 the machine is installed: `encrypt: true` in the [installer's
-answers](#installing-on-a-machine), or `kith node netboot --encrypt`.
+answers](#installing-on-a-machine), or `kith node netboot --encrypt`. A node installed plain can be
+encrypted where it stands with `kith node encrypt` ([how, how long, and why an SSD keeps old plain
+blocks](cluster.md#encrypting-a-node-that-was-installed-plain)); installing with `encrypt: true` is better.
 
 ```sh
 kith node lock beta                    # the cluster stops handing beta's key out: beta restarts, and waits
@@ -795,7 +797,7 @@ What is and is not protected:
 - The config partition (name, address, the spent join token) and the system are not encrypted.
 
 Not yet: a passphrase and the TPM both asked for, the cluster's key and the TPM both asked for,
-a keyboard layout at the console, encrypting a node not installed that way, the disk's secret
+a keyboard layout at the console, the disk's secret
 kept in the TPM, a duress code that opens a decoy.
 
 ### Not in kith OS yet

@@ -2,8 +2,9 @@
 
 Status: the engine is built (T-1136, `crates/kithd/src/in_place.rs`, tested on files with every
 cut), and init runs it at boot (T-1137: a marker 64 KiB into the config partition, a lock record
-with the key, the pass before the state is mounted; `ci/vm/encrypt.sh` cuts it mid-pass). The
-verb that writes the marker is the slice after. This record is the part of T-1106 that the cuts depend on. Where the code differs
+with the key, the pass before the state is mounted; `ci/vm/encrypt.sh` cuts it mid-pass), and
+`kith node encrypt` writes the marker. The user's side (time, a power cut, the SSD caveat) is in
+[the cluster guide](guide/cluster.md#encrypting-a-node-that-was-installed-plain). This record is the part of T-1106 that the cuts depend on. Where the code differs
 from a line here, the code is the word. It builds on [adr-unlock.md](adr-unlock.md) (the lock
 record, at 512 KiB into the config partition) and on the order of writes of
 [adr-second-disk.md](adr-second-disk.md).
@@ -149,6 +150,13 @@ goes on.
 - Four syncs per chunk, and the 260 KiB slot rewritten at each chunk: on a raw NAND that wears
   the slot's blocks over a pass; behind an eMMC or SD card's controller, which levels the wear,
   it is a few hundred MiB of writes over a pass of a gigabyte-class partition and nothing more.
+- **Flash keeps the plain blocks.** The pass overwrites by address, and an SSD, NVMe drive, eMMC
+  or SD card maps an address to a new block at each write: the old plain block stays in flash
+  until the controller erases it, out of the engine's reach. After a pass the interface reads
+  ciphertext; the chips may still hold plain. No pass in software can change that. The remedy is
+  outside the engine: a secure erase of the whole drive (`nvme sanitize`, `blkdiscard --secure`,
+  ATA secure erase, or an SED's key change) and a reinstall with `encrypt: true`. The guide says
+  so beside the verb.
 - No online pass: the partition is not mounted while it runs. No decrypt.
 - The sealed backup is under the state's key, so it is as strong as the state, and no stronger.
   A lock record that is erased does not erase a backup left in the journal; the engine zeroes the
