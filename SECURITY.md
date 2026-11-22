@@ -309,7 +309,7 @@ Only the newest version is fixed. There are no security releases of older ones.
   (kithd keeps the master end), and kith puts its own terminal back when it ends. `--root`
   (`root=true` in the request, which any client may send) needs `apply` on the Workload, Job or NodeWorkload
   that owns the pod as well as `exec`, asked on the Kubernetes exec route and again by the node the hop
-  arrives at (a caller with `exec` alone is refused 403, in the audit log, and still gets a plain exec). It runs as
+  arrives at (a caller with `exec` alone is refused with a 403, audited; the same caller without `--root` gets a plain exec). It runs as
   uid 0 of the pod's own user namespace only: it is refused, with the reason, when that uid 0 would be the node's
   root or the user kithd runs as, so a pod with no user namespace of its own is never entered as root of the node.
 - **`kubectl exec`, `cp` and `port-forward` are one right, `exec`, on the Workload or Job that
