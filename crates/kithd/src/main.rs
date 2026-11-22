@@ -70,6 +70,7 @@ mod registry;
 mod releases;
 mod renew;
 mod replicas;
+mod resolver;
 mod root_part;
 mod sched;
 mod seats;
@@ -184,6 +185,9 @@ struct Args {
     /// The name of the mesh's network interface
     #[arg(long, env = "KITH_MESH_INTERFACE", value_name = "NAME", default_value = "kith0")]
     mesh_interface: String,
+    /// Give this machine's own programs the cluster's .kith names: serve DNS at 127.0.0.87:53 and, while the mesh is up, have systemd-resolved send .kith (and nothing else) there. Answers this machine only; needs the mesh (--mesh, or the Cluster's mesh switch) and systemd-resolved
+    #[arg(long, env = "KITH_RESOLVER")]
+    resolver: bool,
     /// Run the people's WireGuard device on this UDP port (docs/adr-people.md): kwg0, beside the
     /// mesh's interface. Needs --mesh, and root
     #[arg(long, env = "KITH_PEOPLE", value_name = "PORT", num_args = 0..=1, default_missing_value = "51821", requires = "mesh", value_parser = clap::value_parser!(u16).range(1..))]
@@ -275,6 +279,7 @@ fn mesh_options(args: &Args, state: &std::path::Path, port: u16) -> mesh::Option
         interface: args.mesh_interface.clone(),
         port,
         key: state.join("pki").join("mesh.key"),
+        resolver: args.resolver,
     }
 }
 
@@ -858,7 +863,7 @@ fn strip_node_keys(kept: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
+fn run(mut args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     let first_process = boot.is_some();
     if let Some(why) = people_refusal(&args, nix::unistd::getuid().is_root()) {
         return Err(why);
@@ -1038,6 +1043,16 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             None => Ok(None),
         }
     })?;
+    // (Not fatal: a desktop's kithd is not to be lost to someone else's DNS on 127.0.0.87:53.)
+    // (And then nothing is registered with systemd-resolved: it would send names to no one.)
+    let resolving = match args.resolver {
+        true => rt
+            .block_on(dns::bind(resolver::SERVER))
+            .map_err(|e| eprintln!("kithd: --resolver: {e}: this machine's programs do not get .kith names"))
+            .ok(),
+        false => None,
+    };
+    args.resolver = resolving.is_some();
     let shared = rt.block_on(replica(
         membership,
         &state,
@@ -1257,10 +1272,15 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let pods = pods::names(shared.clone(), upstreams.clone(), stopping.clone());
             let asked = async {
                 if let Some(sockets) = names {
-                    dns::run(shared.clone(), sockets, upstreams, stopping.clone()).await;
+                    dns::run(shared.clone(), sockets, upstreams.clone(), stopping.clone()).await;
                 }
             };
-            tokio::join!(pods, asked);
+            let resolver = async {
+                if let Some(sockets) = resolving {
+                    dns::run(shared.clone(), sockets, upstreams.clone(), stopping.clone()).await;
+                }
+            };
+            tokio::join!(pods, asked, resolver);
         };
         let mesh = mesh::follow(shared.clone(), args.mesh, stopping.clone(), |port, ended| {
             let shared = shared.clone();
@@ -1867,5 +1887,22 @@ spec: {}
         let args = Args::from_arg_matches(&matched).unwrap();
         assert_eq!(args.dns_upstream, ["9.9.9.9", "1.1.1.1"]);
         assert_eq!(args.listen.map(|at| at.to_string()).as_deref(), Some("127.0.0.1:1"));
+    }
+
+    /// `--resolver` is a switch (off unless given) that `KITH_RESOLVER` also sets.
+    #[test]
+    fn resolver_flag_is_off_unless_given_and_reads_its_variable() {
+        let parse =
+            |given: &[&str]| Args::from_arg_matches(&Args::command().try_get_matches_from(given).unwrap()).unwrap();
+        assert!(!parse(&["kithd"]).resolver);
+        assert!(parse(&["kithd", "--resolver"]).resolver);
+        assert!(
+            Args::command()
+                .try_get_matches_from(["kithd", "--resolver=yes"])
+                .is_err()
+        );
+        let command = Args::command();
+        let flag = command.get_arguments().find(|arg| arg.get_id() == "resolver").unwrap();
+        assert_eq!(flag.get_env().and_then(|env| env.to_str()), Some("KITH_RESOLVER"));
     }
 }
