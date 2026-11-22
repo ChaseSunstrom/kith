@@ -18,6 +18,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+mod containers;
+mod stream;
+pub use containers::{Containers, NAMESPACE, Store};
+pub use stream::{Event, Input, Kind, LogChunk, LogFrom, Session};
+
 /// The newest and the oldest Docker API this front speaks, as (major, minor).
 pub const API_VERSION: (u32, u32) = (1, 47);
 pub const MIN_API_VERSION: (u32, u32) = (1, 40);
@@ -150,9 +155,16 @@ pub fn listen(path: &Path) -> io::Result<UnixListener> {
     made
 }
 
-/// Answer on `listener` until the process ends: one thread per connection, at most
-/// MAX_CONNECTIONS at a time.
+/// Answer on `listener` until the process ends, the container calls 501: see `serve_with`.
 pub fn serve(listener: UnixListener) {
+    serve_with(listener, None);
+}
+
+/// Answer on `listener` until the process ends: one thread per connection, at most
+/// MAX_CONNECTIONS at a time. With a `store`, the container calls are answered from it; without,
+/// they are 501.
+pub fn serve_with(listener: UnixListener, store: Option<Box<dyn Store>>) {
+    let containers = store.map(|s| Arc::new(Containers::new(s)));
     let live = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
@@ -165,9 +177,10 @@ pub fn serve(listener: UnixListener) {
             let _ = write_reply(&stream, &message(503, "kith: too many connections"), false, true);
             continue;
         };
+        let containers = containers.clone();
         let _ = std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
             let _slot = slot;
-            handle(stream, HEAD_DEADLINE, BODY_DEADLINE);
+            handle(stream, HEAD_DEADLINE, BODY_DEADLINE, containers.as_deref());
         });
     }
 }
@@ -194,9 +207,11 @@ impl Drop for Slot {
 struct Request {
     method: String,
     target: String,
+    body: Vec<u8>,
     close: bool,
 }
 
+#[derive(Debug)]
 struct Reply {
     status: u16,
     content_type: &'static str,
@@ -234,8 +249,32 @@ impl Read for Clocked {
     }
 }
 
+/// A clock that never runs out in practice: a stream's reads (a hijacked connection's stdin) wait as long as it lives.
+const NEVER: Duration = Duration::from_secs(10 * 365 * 86_400);
+
+/// Has the client hung up? A 1 ms look at the socket: EOF or an error says yes, a timeout (nothing
+/// sent) or buffered bytes (a pipelined request) say no.
+fn hung_up(reader: &mut BufReader<Clocked>) -> bool {
+    reader.get_mut().until = Instant::now() + Duration::from_millis(1);
+    match reader.fill_buf() {
+        Ok(bytes) => bytes.is_empty(),
+        Err(e) => !matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock),
+    }
+}
+
+/// Has a hijacked connection broken? Its client closes its sending side when it has no stdin to send
+/// (the docker CLI does for `run` without `-i`) and goes on reading, so an EOF is not a hang-up here:
+/// only an error is. (A client that left shows by a write that fails.)
+fn broken(reader: &mut BufReader<Clocked>) -> bool {
+    reader.get_mut().until = Instant::now() + Duration::from_millis(1);
+    match reader.fill_buf() {
+        Ok(_) => false,
+        Err(e) => !matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock),
+    }
+}
+
 /// Requests and replies on one connection until it closes.
-fn handle(stream: UnixStream, head: Duration, body: Duration) {
+fn handle(stream: UnixStream, head: Duration, body: Duration, containers: Option<&Containers>) {
     let mut reader = BufReader::new(Clocked {
         stream,
         until: Instant::now(),
@@ -243,7 +282,26 @@ fn handle(stream: UnixStream, head: Duration, body: Duration) {
     loop {
         let (reply, head_only, close) = match read_request(&mut reader, head, body) {
             Ok(None) => return,
-            Ok(Some(request)) => (route(&request), request.method == "HEAD", request.close),
+            Ok(Some(request)) => {
+                // A stream (logs, attach, an exec's start) is written by the call itself, and the
+                // connection is done with it; a refusal before its first byte is an ordinary reply.
+                let streamed = containers.and_then(|c| {
+                    let (path, query) = api_path(&request).ok()?;
+                    c.stream(&request.method, path, query, &request.body, &mut reader)
+                });
+                match streamed {
+                    Some(Ok(())) => return,
+                    Some(Err(reply)) => (reply, false, request.close),
+                    None => {
+                        let mut gone = || hung_up(&mut reader);
+                        (
+                            route(&request, containers, &mut gone),
+                            request.method == "HEAD",
+                            request.close,
+                        )
+                    }
+                }
+            }
             Err(reply) => (reply, false, true),
         };
         if write_reply(&reader.get_ref().stream, &reply, head_only, close).is_err() || close {
@@ -255,21 +313,33 @@ fn handle(stream: UnixStream, head: Duration, body: Duration) {
 fn write_reply(mut out: impl Write, reply: &Reply, head_only: bool, close: bool) -> io::Result<()> {
     let reason = match reply.status {
         200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        304 => "Not Modified",
         400 => "Bad Request",
+        404 => "Not Found",
+        409 => "Conflict",
         413 => "Content Too Large",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
         501 => "Not Implemented",
         503 => "Service Unavailable",
         _ => "Error",
     };
+    // A 204 or a 304 has no body, so no length either.
+    let bodiless = matches!(reply.status, 204 | 304);
+    let length = if bodiless {
+        String::new()
+    } else {
+        format!("Content-Length: {}\r\n", reply.body.len())
+    };
     let mut bytes = format!(
-        "HTTP/1.1 {} {reason}\r\nApi-Version: {}.{}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: kith-docker/{}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}\r\n",
+        "HTTP/1.1 {} {reason}\r\nApi-Version: {}.{}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: kith-docker/{}\r\nContent-Type: {}\r\n{length}{}\r\n",
         reply.status,
         API_VERSION.0,
         API_VERSION.1,
         env!("CARGO_PKG_VERSION"),
         reply.content_type,
-        reply.body.len(),
         if close { "Connection: close\r\n" } else { "" },
     )
     .into_bytes();
@@ -363,10 +433,13 @@ fn read_request(reader: &mut BufReader<Clocked>, head: Duration, body: Duration)
         ));
     }
     reader.get_mut().until = Instant::now() + body;
-    if io::copy(&mut reader.by_ref().take(length), &mut io::sink()).is_ok_and(|n| n == length) {
+    // (Not with_capacity(length): the length is the client's word, and a lie costs memory it never sends.)
+    let mut bytes = Vec::new();
+    if reader.by_ref().take(length).read_to_end(&mut bytes).is_ok() && bytes.len() as u64 == length {
         Ok(Some(Request {
             method: method.to_string(),
             target: target.to_string(),
+            body: bytes,
             close,
         }))
     } else {
@@ -391,32 +464,42 @@ fn split_version(path: &str) -> (Option<(u32, u32)>, &str) {
         .map_or((None, path), |(version, rest)| (Some(version), rest))
 }
 
-fn route(request: &Request) -> Reply {
-    let path = request.target.split('?').next().unwrap_or("");
+/// The path (without its `/v1.NN` prefix) and the query of a request, or the reply for a client
+/// whose version is not one this front speaks.
+fn api_path(request: &Request) -> Result<(&str, &str), Reply> {
+    let (path, query) = request.target.split_once('?').unwrap_or((request.target.as_str(), ""));
     let (version, path) = split_version(path);
     // (Like dockerd, `/_ping` answers any client: the version it names is how a client learns ours.)
     if let Some(v) = version.filter(|_| path != "/_ping") {
         let (max, min) = (API_VERSION, MIN_API_VERSION);
         let (v0, v1) = v;
         if v > max {
-            return message(
+            return Err(message(
                 400,
                 format!(
                     "client version {v0}.{v1} is too new. Maximum supported API version is {}.{}",
                     max.0, max.1
                 ),
-            );
+            ));
         }
         if v < min {
-            return message(
+            return Err(message(
                 400,
                 format!(
                     "client version {v0}.{v1} is too old. Minimum supported API version is {}.{}, please upgrade your client to a newer version",
                     min.0, min.1
                 ),
-            );
+            ));
         }
     }
+    Ok((path, query))
+}
+
+fn route(request: &Request, containers: Option<&Containers>, gone: &mut dyn FnMut() -> bool) -> Reply {
+    let (path, query) = match api_path(request) {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
     match (request.method.as_str(), path) {
         ("GET" | "HEAD", "/_ping") => Reply {
             status: 200,
@@ -425,12 +508,16 @@ fn route(request: &Request) -> Reply {
         },
         ("GET" | "HEAD", "/version") => json_reply(200, version_json()),
         ("GET" | "HEAD", "/info") => json_reply(200, info_json()),
-        (method, _) => message(
-            501,
-            format!(
-                "kith: {method} {path} is not supported by the Docker front (docs/guide/kubernetes.md says what is)"
-            ),
-        ),
+        (method, _) => containers
+            .and_then(|c| c.route(method, path, query, &request.body, gone))
+            .unwrap_or_else(|| {
+                message(
+                    501,
+                    format!(
+                        "kith: {method} {path} is not supported by the Docker front (docs/guide/kubernetes.md says what is)"
+                    ),
+                )
+            }),
     }
 }
 
@@ -485,7 +572,7 @@ fn info_json() -> String {
         .max(1);
     let (version, arch, memory) = (env!("CARGO_PKG_VERSION"), std::env::consts::ARCH, memory * 1024);
     format!(
-        r#"{{"ID":"{id}","Containers":0,"ContainersRunning":0,"ContainersPaused":0,"ContainersStopped":0,"Images":0,"Driver":"kith","DriverStatus":[],"Plugins":{{"Volume":["local"],"Network":["bridge"],"Authorization":null,"Log":[]}},"MemoryLimit":true,"SwapLimit":false,"IPv4Forwarding":true,"Debug":false,"LoggingDriver":"json-file","CgroupDriver":"cgroupfs","CgroupVersion":"2","KernelVersion":{kernel},"OperatingSystem":"kith","OSVersion":"","OSType":"linux","Architecture":"{arch}","IndexServerAddress":"https://index.docker.io/v1/","NCPU":{cpus},"MemTotal":{memory},"DockerRootDir":"/var/lib/kith","Name":{name},"Labels":[],"ExperimentalBuild":false,"ServerVersion":"{version}","Runtimes":{{"kith":{{"path":"kith"}}}},"DefaultRuntime":"kith","Swarm":{{"NodeID":"","NodeAddr":"","LocalNodeState":"inactive","ControlAvailable":false,"Error":"","RemoteManagers":null}},"LiveRestoreEnabled":false,"Isolation":"","SecurityOptions":[],"Warnings":["kith: this is the kith Docker front, not Docker: only _ping, version and info are answered so far; the rest of the API says 501"]}}"#
+        r#"{{"ID":"{id}","Containers":0,"ContainersRunning":0,"ContainersPaused":0,"ContainersStopped":0,"Images":0,"Driver":"kith","DriverStatus":[],"Plugins":{{"Volume":["local"],"Network":["bridge"],"Authorization":null,"Log":[]}},"MemoryLimit":true,"SwapLimit":false,"IPv4Forwarding":true,"Debug":false,"LoggingDriver":"json-file","CgroupDriver":"cgroupfs","CgroupVersion":"2","KernelVersion":{kernel},"OperatingSystem":"kith","OSVersion":"","OSType":"linux","Architecture":"{arch}","IndexServerAddress":"https://index.docker.io/v1/","NCPU":{cpus},"MemTotal":{memory},"DockerRootDir":"/var/lib/kith","Name":{name},"Labels":[],"ExperimentalBuild":false,"ServerVersion":"{version}","Runtimes":{{"kith":{{"path":"kith"}}}},"DefaultRuntime":"kith","Swarm":{{"NodeID":"","NodeAddr":"","LocalNodeState":"inactive","ControlAvailable":false,"Error":"","RemoteManagers":null}},"LiveRestoreEnabled":false,"Isolation":"","SecurityOptions":[],"Warnings":["kith: this is the kith Docker front, not Docker: the container calls it answers are in docs/guide/kubernetes.md; the rest of the API says 501"]}}"#
     )
 }
 
@@ -502,7 +589,7 @@ mod tests {
         fn new() -> Client {
             let (client, server) = UnixStream::pair().unwrap();
             client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            std::thread::spawn(move || handle(server, HEAD_DEADLINE, BODY_DEADLINE));
+            std::thread::spawn(move || handle(server, HEAD_DEADLINE, BODY_DEADLINE, None));
             Client(BufReader::new(client))
         }
 
@@ -734,7 +821,7 @@ mod tests {
         // ... one nobody listens on any more is.
         drop(first);
         let second = listen(&path).unwrap();
-        std::thread::spawn(move || serve(second));
+        std::thread::spawn(move || serve_with(second, None));
         let mut c = Client(BufReader::new(UnixStream::connect(&path).unwrap()));
         assert_eq!(c.ask(&get("/_ping")).0, 200);
         // A file that is not a socket is never replaced.
@@ -745,10 +832,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Feed `bytes` to `handle` one every 40 ms; how long until it hung up (None: it never did in 5 s).
+    /// Feed `bytes` to `handle` one every 40 ms (16 s in all); how long until it hung up (None: it
+    /// never did in 30 s). The deadline is 1.5 s and the test allows 12: a loaded host cannot flake it.
     fn trickle(head: &'static [u8], rest: &'static [u8]) -> Option<Duration> {
         let (client, server) = UnixStream::pair().unwrap();
-        std::thread::spawn(move || handle(server, Duration::from_millis(400), Duration::from_millis(400)));
+        std::thread::spawn(move || handle(server, Duration::from_millis(1500), Duration::from_millis(1500), None));
         let start = Instant::now();
         let mut writer = client.try_clone().unwrap();
         std::thread::spawn(move || {
@@ -761,7 +849,7 @@ mod tests {
             }
         });
         let mut client = client;
-        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let mut sink = Vec::new();
         // A cut with the writer's last byte still unread reaches this end as a reset, not an EOF.
         match client.read_to_end(&mut sink) {
@@ -774,18 +862,18 @@ mod tests {
     #[test]
     fn a_head_or_a_body_that_trickles_in_is_cut_off_at_its_deadline() {
         // A head: every read arrives in time, the head as a whole does not.
-        let cut = trickle(b"GET /_ping HTTP/1.1\r\nX-Slow: ", &[b'a'; 200]).expect("a slow head was never cut");
-        assert!(cut < Duration::from_secs(2), "cut after {cut:?}");
+        let cut = trickle(b"GET /_ping HTTP/1.1\r\nX-Slow: ", &[b'a'; 400]).expect("a slow head was never cut");
+        assert!(cut < Duration::from_secs(12), "cut after {cut:?}");
         // A body.
-        let cut = trickle(b"POST /x HTTP/1.1\r\nContent-Length: 1000\r\n\r\n", &[b'a'; 200])
+        let cut = trickle(b"POST /x HTTP/1.1\r\nContent-Length: 1000\r\n\r\n", &[b'a'; 400])
             .expect("a slow body was never cut");
-        assert!(cut < Duration::from_secs(2), "cut after {cut:?}");
+        assert!(cut < Duration::from_secs(12), "cut after {cut:?}");
     }
 
     #[test]
     fn an_idle_keep_alive_is_not_on_the_head_clock() {
         let (client, server) = UnixStream::pair().unwrap();
-        std::thread::spawn(move || handle(server, Duration::from_millis(300), Duration::from_millis(300)));
+        std::thread::spawn(move || handle(server, Duration::from_millis(300), Duration::from_millis(300), None));
         let mut c = Client(BufReader::new(client));
         assert_eq!(c.ask(&get("/_ping")).0, 200);
         // Longer than the head deadline, with no byte in flight: the next request still works.

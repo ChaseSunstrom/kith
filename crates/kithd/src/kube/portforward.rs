@@ -1,6 +1,6 @@
 //! `kubectl port-forward POD LOCAL:REMOTE`: `/api/v1/namespaces/NS/pods/NAME/portforward`, a WebSocket
 //! that speaks SPDY/3.1 (`SPDY/3.1+portforward.k8s.io`, spdy.rs). The Exec right on the Workload or Job
-//! that owns the pod is checked before anything is upgraded (`pod_access`); the plain `POST` + `Upgrade:
+//! that owns the pod is checked before anything is upgraded (`pod_run`); the plain `POST` + `Upgrade:
 //! SPDY/3.1` kubectl falls back to is not carried.
 //!
 //! One session is one WebSocket. Each local connection kubectl takes is a pair of streams with one
@@ -16,7 +16,7 @@
 //! Bounds: a caller has [`SESSIONS_MAX`] sessions at a node (counted at the upgrade, not by streams), a
 //! session [`STREAMS_MAX`] connections, and a connection that moves no byte for [`idle`] ends.
 
-use super::{Call, No, pod_access, status};
+use super::{Call, No, pod_run, status};
 use crate::Shared;
 use crate::access::Caller;
 use crate::cluster::refuse;
@@ -132,8 +132,8 @@ fn decide(
     headers: &HeaderMap,
     upgrade: Option<OnUpgrade>,
 ) -> Result<Response, No> {
-    let (holder, key, replica) = pod_access(call, namespace, pod, false)?;
-    if holder == "NodeWorkload" {
+    let (key, replica) = pod_run(call, namespace, pod, Verb::Exec, false)?;
+    if key.starts_with("NodeWorkload/") {
         let why = "port-forward does not reach a NodeWorkload's unit, which runs on the host";
         return Err(status(StatusCode::NOT_IMPLEMENTED, "NotImplemented", why.into()));
     }

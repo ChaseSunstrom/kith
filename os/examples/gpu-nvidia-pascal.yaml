@@ -1,0 +1,7 @@
+# kith OS for a node with an NVIDIA card before Turing (a GeForce GTX 10xx, Pascal) for a screen
+# and its HDMI sound, through nouveau, built in:
+#   KITH_OS_VERSION=1.0.1+gpu-nvidia-pascal sh os/build.sh --spec os/examples/gpu-nvidia-pascal.yaml
+# A feature brings its driver's firmware: list more under `firmware:` only for what
+# no feature knows (paths or globs in linux-firmware).
+features: [gpu-nvidia-pascal]
+firmware: []

@@ -1283,6 +1283,43 @@ spec: { node: b, devices: [b-usb0] }
         let _ = std::fs::remove_dir_all(&empty);
     }
 
+    /// A sound card's Device lists its playback PCM nodes (a control node alone plays nothing):
+    /// a claim of it gives the container those with the control node.
+    #[test]
+    fn a_claim_of_an_audio_device_grants_its_pcm_nodes() {
+        let audio = "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: { name: a-audio-card1 }\n\
+                     spec: { node: a, class: audio, path: /dev/snd/controlC1, nodes: [/dev/snd/pcmC1D3p, /dev/snd/pcmC1D7p] }\n";
+        // (A seat with the card, as a TV's seat has its speakers, given to the namespace.)
+        let seat = "---\napiVersion: kith.dev/v1\nkind: Seat\nmetadata: { name: a-seat1, labels: { kith.dev/namespaces: default } }\n\
+                    spec: { node: a, devices: [a-audio-card1] }\n";
+        let source = [
+            audio,
+            seat,
+            &claim("tv", "{ seat: a-seat1 }"),
+            &workload("player", "[tv]"),
+        ]
+        .concat();
+        let empty = sys("audio-pcm");
+        std::fs::remove_dir_all(empty.join("class")).unwrap();
+        assert_eq!(
+            granted(&store(&source), "a", &empty)["Workload/default/player"].devices,
+            ["/dev/snd/controlC1", "/dev/snd/pcmC1D3p", "/dev/snd/pcmC1D7p"].map(PathBuf::from)
+        );
+        // The card on its own, claimed by name, gives the same to a namespace its label names.
+        let source = source.replace(
+            "name: a-audio-card1 }",
+            "name: a-audio-card1, labels: { kith.dev/namespaces: default } }",
+        );
+        let source = source.replace("{ seat: a-seat1 }", "{ device: a-audio-card1 }");
+        assert_eq!(
+            granted(&store(&source), "a", &empty)["Workload/default/player"]
+                .devices
+                .len(),
+            3
+        );
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
     /// A Device the store holds with a path or node outside /dev, or with a `..`, grants nothing.
     #[test]
     fn forged_device_outside_dev_grants_nothing() {
