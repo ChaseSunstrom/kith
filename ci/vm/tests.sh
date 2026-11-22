@@ -17,8 +17,12 @@
     # (KITH_OS_SPEC=os/examples/all.yaml tries the image of a spec instead of the plain one.)
     # (modules: the 'all' image, whose drivers are modules.)
     [ "$test" != modules ] || KITH_OS_SPEC=os/examples/all.yaml
+    # (modules-state: a spec whose one driver is a module on the state partition, in an image of its
+    # own; in a folder of its own, so the 'all' image stays what modules tests.)
+    [ "$test" != modules-state ] || KITH_OS_SPEC=os/examples/modules-state-test.yaml
     osdir=$root/target/os
     [ -z "${KITH_OS_SPEC:-}" ] || osdir=$root/target/os-spec
+    [ "$test" != modules-state ] || osdir=$root/target/os-modules-state
     # (access: the image of a kithd built with the feature forge, whose leader can append an entry it
     # was not asked for (ci/vm/access.sh); in a folder of its own, so the plain image stays plain.)
     [ "$test" != access ] || { KITHD_FEATURES=forge osdir=$root/target/os-forge; export KITHD_FEATURES; }
@@ -26,15 +30,15 @@
     # key on /dev/uhid (docs/adr-fido2.md section 2), and of a kernel with that device (the uhid-test
     # spec); in a folder of its own, so the plain image stays plain, and no other test has either.)
     [ "$test" != fido2 ] || { KITHD_FEATURES=fido2-test KITH_OS_SPEC=os/examples/fido2-test.yaml osdir=$root/target/os-fido2; export KITHD_FEATURES; }
-    # (disk: the image of a kithd built with the cargo feature disk-test, which makes the disk named on
-    # the kernel command line a data disk at start (kith.disk-add=SERIAL), so the real mapping and the
-    # mount are seen without the verbs; in a folder of its own, so the plain image stays plain.)
-    [ "$test" != disk ] || { KITHD_FEATURES=disk-test osdir=$root/target/os-disk; export KITHD_FEATURES; }
+    # (privilege: the image of a kithd built with the cargo feature confine-probe, whose
+    # `confine-probe` subcommand confines itself as the serving part does (ci/vm/privilege.sh); in a
+    # folder of its own, so the plain image stays plain.)
+    [ "$test" != privilege ] || { KITHD_FEATURES=confine-probe osdir=$root/target/os-probe; export KITHD_FEATURES; }
     sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC"} --out "$osdir" >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = clockleader ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ] || [ "$test" = latecard ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = clockleader ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = privilege ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ] || [ "$test" = latecard ]; then
         . "$root/ci/vm/cluster.sh"
     fi
-    if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ] || [ "$test" = blackout ] || [ "$test" = alone ]; then
+    if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ] || [ "$test" = blackout ] || [ "$test" = alone ] || [ "$test" = disk ]; then
         . "$root/ci/vm/machines.sh"
     fi
     # A copy: the node writes its state to the disk, and this test damages its root.
@@ -84,11 +88,11 @@
     if [ "$test" = modules ]; then
         . "$root/ci/vm/modules.sh"
     fi
+    if [ "$test" = modules-state ]; then
+        . "$root/ci/vm/modules-state.sh"
+    fi
     if [ "$test" = clock ]; then
         . "$root/ci/vm/clock.sh"
-    fi
-    if [ "$test" = disk ]; then
-        . "$root/ci/vm/disk.sh"
     fi
     if [ "$test" = encrypt ]; then
         . "$root/ci/vm/encrypt.sh"

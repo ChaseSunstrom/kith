@@ -332,6 +332,38 @@ egress rules, which decide where a pod may connect, are below.
   says `partial` and why until every rule is written on the node, then `enforced`. Not tested:
   a policy changing under a running pod; access returning after the policy is deleted.
 
+### Scale to zero: a Service that lets its Workload sleep
+
+A Service may opt in with `spec.scaleToZero: { idle: 15m, start: 60s }` (both durations like
+`90s` or `30m`; `idle` from `30s` to `30d`, `start` at most `10m`; unset means off). Its Workload then sleeps after no
+connection to the Service for `idle`: no replica runs, `status.asleep` is `true`, and
+`spec.replicas` stays as it is (sleep is state, not a spec edit, so `kith apply` of the same file
+changes nothing). The first connection to a sleeping Service is held by the kithd it reached
+while a replica starts, up to `start`, then passed on as any other; at the deadline, or when 256
+connections to that Service already wait, the connection is closed after one line saying why. A
+client that hangs up while it waits gives up its place and its wake. Only a client the Workload's
+NetworkPolicies let in counts as a connection or wakes anything; a refused one is closed at once.
+
+- **TCP only.** Only a TCP connection to the Service's address wakes it. A datagram wakes
+  nothing, so a Service with a `udp` port is refused when applied, and so is a headless one (no
+  address a connection could reach). A Workload with no Service, or with any Service that has no
+  `scaleToZero`, never sleeps; a sleeping one whose Service loses `scaleToZero` is woken.
+- **How idle is counted.** Each node says in its own Node's status which Services it met a
+  connection to (`seen`, now while one is open) and which it holds one for (`wake`); the node
+  that leads the store reads them. The idle time is therefore right to within about ten seconds
+  (the sleep comes `idle` plus ten seconds after the last connection), and the nodes' clocks are
+  taken to agree to within a minute (a word dated further ahead than that is ignored, one older
+  than a minute and a half is stale). A node that is down stops saying, so its old word does not
+  keep a Workload awake.
+- **Who can say it.** A node can only keep awake or wake the Services whose Workloads its
+  NetworkPolicies let it connect to, those it serves or relays for (a Workload with no policy lets
+  every node in). Its word about any other Service is not read. `status.asleep` is the leader's
+  alone: a worker's report cannot set, clear or flip it.
+- **Kernel path.** A Service that may sleep is passed by kithd, not by the kernel's connect
+  hook (the kernel would not count the connection), so it does not have the same-node fast path.
+- A Workload that was never seen idle is counted from when the leader first saw it awake, so a
+  new Workload does not sleep at once.
+
 ### Rolling updates
 
 A changed Workload is replaced one replica at a time, on the node that runs it. The replacement
@@ -371,8 +403,23 @@ port 80 redirects. The ports need CAP_NET_BIND_SERVICE.
   accepts its terms) to get and renew one from Let's Encrypt. Point the host's DNS at the
   ingress nodes first, and give `--acme` to every control node that may lead (the leader orders
   for ingress workers; under `spec.signing: required` a control node that does not lead orders only once the admin has set `spec.ingress: true` on its Node). `kith get service/NAME -o yaml` shows `tls`; a failure is retried an
-  hour later. Keys, and the ACME account's (`Secret/kith-system/acme-account`), are Secrets in
+  hour later, for either issuer, and the same failure is not written to the status twice. Keys, and the ACME account's (`Secret/kith-system/acme-account`), are Secrets in
   the store.
+- **A name only the LAN knows:** `expose.issuer: cluster` (the default is `acme`) has a CA of
+  the cluster's own sign the host's certificate, with no authority asked: the node that holds
+  the CA key makes it for 30 days, keeps it in `tls-<host>`, says `tls.source: cluster` in the
+  Service's status, and makes a new one in the last third of its life. The signer is a LAN CA,
+  apart from the cluster's root: its own key (which never leaves that node) and a certificate
+  with X.509 name constraints for the cluster's LAN domains, `home.arpa`, `lan`, `internal` and
+  `local` unless a Cluster's `spec.lanDomains` names others. `kith ca export [FILE]`, run on the
+  CA's node, writes that certificate (never a key) for a phone or laptop to trust once; a device
+  that trusts it takes nothing outside those domains from it. Change the domains and the CA's
+  certificate is made again (another serial, the same key): on each device remove the old
+  certificate, which keeps vouching for the old domains, and import the new. A host outside them, under
+  `cluster.local` or `kith`, a single label, a wildcard or an address is refused when applied
+  (the domains are checked too once a Cluster names them) and again when signed, and a
+  Namespace's `spec.hosts` still keeps the hosts it names. The workloads' `ca.crt` and the mesh
+  do not trust the LAN CA. There is no revocation: the short life is it.
 - **Bytes as they are:** TLS ends at the ingress and nothing is added; NetworkPolicy sees the
   ingress node. `expose.proxyProtocol: true` sends a PROXY v1 line (`PROXY TCP4 <client>
   <ingress> <client port> <ingress port>`) first; clients inside the mesh send none, so the

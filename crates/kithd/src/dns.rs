@@ -21,7 +21,7 @@ use kith_api::store::Store;
 use kith_dns::{Cidr, Rdata, Record, Records, View, Zones};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
@@ -180,7 +180,7 @@ pub fn zones_serving(
 
     // Our own names. Having the zone means a name that is not in it is answered "no
     // such name" here, and never sent to the internet to ask.
-    let mut own = vec![soa("kith"), soa("cluster.local")];
+    let mut own: Vec<_> = kith_api::kinds::RESERVED_ZONES.into_iter().map(soa).collect();
     let mut empty: Vec<String> = Vec::new();
     for node in store.list(Some("Node")) {
         // (`<node>.node.kith` stays its LAN address, not the mesh one the leader may have moved it to.)
@@ -599,6 +599,22 @@ pub fn leads(shared: &Shared) -> bool {
     metrics.current_leader == Some(metrics.id)
 }
 
+/// The networks the resolver forwards for: the local ones and the pods', less the people's (their
+/// IPv4 range and /64, which fc00::/7 holds): a person is a guest of the Services, not of the
+/// resolver (docs/adr-people.md, Review 8).
+fn forwarders(pods: &str, people64: Option<Ipv6Addr>) -> Vec<Cidr> {
+    let nets = kith_dns::LOCAL_NETWORKS.into_iter().chain([pods]);
+    let nets: Vec<Cidr> = nets.filter_map(|net| net.parse().ok()).collect();
+    let range = format!("{}/16", crate::people::RANGE);
+    let people = people64.map(|net| format!("{net}/64"));
+    let denied: Vec<Cidr> = [Some(range), people]
+        .into_iter()
+        .flatten()
+        .filter_map(|net| net.parse().ok())
+        .collect();
+    Cidr::without(&nets, &denied)
+}
+
 /// Serve DNS until kithd stops.
 pub async fn run(
     shared: Arc<Shared>,
@@ -610,8 +626,11 @@ pub async fn run(
     // takes the place of the local networks, so they are named with it: a list of the pods'
     // network alone had every other client refused.)
     let pods = crate::pods::range().to_string();
-    let forwarders = kith_dns::LOCAL_NETWORKS.into_iter().chain([pods.as_str()]);
-    let forwarders: Vec<Cidr> = forwarders.filter_map(|net| net.parse().ok()).collect();
+    let people = shared
+        .cluster
+        .as_ref()
+        .map(|cluster| crate::people::prefix(&cluster.me.ca));
+    let forwarders = forwarders(&pods, people);
     let listen = tcp.local_addr().expect("a bound socket has an address");
     // The house address the Clusters name (held by this node or not): a resolver list that names
     // it (a router's DHCP) must not be asked by the node that holds it, nor dropped for good by
@@ -754,6 +773,50 @@ pub async fn run(
 mod tests {
     use super::*;
 
+    /// The resolver forwards for a mesh source (inside fc00::/7), not for a person: the people's
+    /// IPv4 range and /64 are refused, though fc00::/7 holds the /64 (docs/adr-people.md,
+    /// Review 8). Cidr::contains is what the server asks of each network.
+    #[test]
+    fn people_resolver_refuses_the_people_prefixes_and_forwards_for_the_mesh() {
+        let people64 = crate::people::prefix("a cluster");
+        let mesh = crate::mesh::prefix("a cluster");
+        let nets = forwarders("10.244.0.0/16", Some(people64));
+        let may = |ip: IpAddr| nets.iter().any(|net| net.contains(ip));
+        let at = |prefix: Ipv6Addr, id: u128| IpAddr::V6((u128::from(prefix) | id).into());
+        // Both families, and a person as the dual-stack socket shows it.
+        for person in [
+            at(people64, 2),
+            at(people64, 0xffff_ffff_ffff_fffe),
+            "100.89.0.2".parse().unwrap(),
+            "100.89.255.253".parse().unwrap(),
+            "::ffff:100.89.0.2".parse().unwrap(),
+        ] {
+            assert!(!may(person), "{person} is a person");
+        }
+        // The /64 is inside fc00::/7: it is the deny that wins, and the rest of fc00::/7 stays.
+        let unique_local: Cidr = "fc00::/7".parse().unwrap();
+        assert!(unique_local.contains(at(people64, 2)), "the allow would take a person");
+        for ours in [
+            at(mesh, 0x10),
+            at(Ipv6Addr::from(u128::from(people64) ^ (1 << 64)), 2),
+            "fd00::1".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+            "10.1.2.3".parse().unwrap(),
+            "10.244.1.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            "::1".parse().unwrap(),
+        ] {
+            assert!(may(ours), "{ours} is not a person");
+        }
+        for stranger in ["8.8.8.8", "100.88.0.1", "2001:db8::1"] {
+            assert!(!may(stranger.parse().unwrap()), "{stranger}");
+        }
+        // With no cluster there is no /64 to name: the IPv4 range alone is refused.
+        let alone = forwarders("10.244.0.0/16", None);
+        assert!(!alone.iter().any(|net| net.contains("100.89.0.2".parse().unwrap())));
+        assert!(alone.iter().any(|net| net.contains("fd00::1".parse().unwrap())));
+    }
+
     /// The socket on every address and the one on the house address share a port, and the
     /// second binds an address no card has yet.
     #[test]
@@ -836,6 +899,63 @@ mod tests {
         assert_eq!(reply[3] & 0x0f, 0, "answered, not refused or failed");
         assert_eq!(reply[6..8], [0, 1], "one answer");
         assert!(reply.ends_with(&[198, 51, 100, 7]), "the upstream's address: {reply:?}");
+    }
+
+    /// The server itself, not only the list: a client in a denied network is REFUSED over UDP and
+    /// its question never reaches the upstream, while one in the rest of the allowed network is
+    /// forwarded. (A test cannot send from a person's address: 127.0.0.2 is the denied one here,
+    /// the list built as [`forwarders`] builds it, by `Cidr::without`.)
+    #[tokio::test]
+    async fn people_resolver_refuses_a_denied_client_over_udp() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let told = upstream.local_addr().unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = upstream.recv_from(&mut buf).await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut reply = buf[..n].to_vec();
+                reply[2..4].copy_from_slice(&[0x81, 0x80]);
+                let _ = upstream.send_to(&reply, from).await;
+            }
+        });
+        let nets = Cidr::without(&["127.0.0.0/8".parse().unwrap()], &["127.0.0.2".parse().unwrap()]);
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = udp.local_addr().unwrap();
+        let (_zones, served) = watch::channel(Arc::new(Zones::default()));
+        let (_, upstreams) = watch::channel(Arc::from(vec![told]));
+        let cache = Arc::new(kith_dns::Cache::default());
+        tokio::spawn(kith_dns::serve(udp, tcp, served, upstreams, nets, cache));
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in ["outside", "example", "test"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let rcode = |from: &'static str| {
+            let (query, from) = (query.clone(), from.parse::<IpAddr>().unwrap());
+            async move {
+                let client = UdpSocket::bind((from, 0)).await.unwrap();
+                client.send_to(&query, listen).await.unwrap();
+                let mut buf = [0u8; 512];
+                let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), client.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(n > 3);
+                buf[3] & 0x0f
+            }
+        };
+        assert_eq!(rcode("127.0.0.2").await, 5, "REFUSED");
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the upstream was not asked"
+        );
+        assert_eq!(rcode("127.0.0.3").await, 0, "the rest of the network is forwarded for");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// `--resolver`: systemd-resolved sends kithd the names under `.kith` and would hand a forwarded one
