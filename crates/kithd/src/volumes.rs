@@ -426,6 +426,15 @@ pub fn wipe(state: &Path, dir: &Dir) -> Result<(), String> {
     if crate::encrypted::made(&state, &dir.namespace, &dir.name) {
         return Err("it was made encrypted and its file is on this node: not removed".into());
     }
+    // (The links to a VM's images, kithd's own: each would keep its file's blocks after the Volume went.)
+    if let Err(e) = std::fs::remove_dir_all(images(&state, dir)?)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(format!(
+            "cannot remove the VM images of {}/{}: {e}",
+            dir.namespace, dir.name
+        ));
+    }
     let mut path = state.clone();
     for part in ["volumes", &dir.namespace, &dir.name] {
         path.push(part);
@@ -762,17 +771,17 @@ impl VolumeDir {
     }
 }
 
-/// Where [`host_dir`] puts the directory of `dir`, as `state` (the state directory as it really is,
-/// canonical) has it: for a path a command line names before the directory is made.
-pub fn planned(state: &Path, dir: &Dir) -> PathBuf {
-    if dir.namespace == SYSTEM {
-        return PathBuf::from(&dir.path);
+/// Where kithd keeps the links to the VM disk images of the Volume `dir`, as `state` (canonical)
+/// has it: `<state>/vm-images/<namespace>/<name>`, which no container mounts (T-1283).
+pub fn images(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
+    let plain = |part: &str| !matches!(part, "" | "." | "..") && !part.contains(['/', '\0']);
+    if !plain(&dir.namespace) || !plain(&dir.name) {
+        return Err(format!(
+            "Volume {}/{} has no name to keep images under",
+            dir.namespace, dir.name
+        ));
     }
-    state
-        .join("volumes")
-        .join(&dir.namespace)
-        .join(&dir.name)
-        .join(&dir.path)
+    Ok(state.join("vm-images").join(&dir.namespace).join(&dir.name))
 }
 
 /// Make the directory a volume is on this node, and hold it. In `kith-system` it is the path as

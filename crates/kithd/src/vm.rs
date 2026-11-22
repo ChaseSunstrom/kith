@@ -13,11 +13,14 @@
 // the node or in a Volume's directory on the node that has the Volume ([`resolve`]); x86-64
 // and arm64 machine types only. Each is left for later.
 //
-// ponytail: a disk in a Volume is opened by the hypervisor by name, after kithd checked it is a
-// regular file ([`make_images`]): a container that mounts the same Volume could swap it for a
-// link in between. Keep a Volume that holds a disk mounted by no container, and run the machine
-// as one replica (two would write one image). Open it by descriptor (QEMU's `fd=` protocol,
-// cloud-hypervisor's `fd=`) when a Volume is shared with anything else.
+// A disk in a Volume is opened by the hypervisor at kithd's own hard link to the image, in
+// `<state>/vm-images` that no container mounts, made at every start from the file kithd opened
+// without following a link and found regular ([`make_images`]): a container of the same Volume
+// that swaps the image for a link afterwards changes nothing the hypervisor opens (T-1283).
+//
+// ponytail: run the machine as one replica (two would write one image); a Volume on another file
+// system than the state directory's (an encrypted one) cannot have a link there, so holds no disk
+// (a descriptor handed over the root part's socket, QEMU's `-add-fd`, would lift that).
 //
 // A template that is `confidential` runs its machines with their memory encrypted by the
 // processor (AMD SEV-SNP or Intel TDX), where the node has one of the two; nothing of it
@@ -126,13 +129,14 @@ pub fn resolve(
             ));
         }
         let file = disk.file.clone().unwrap_or_else(|| VmDisk::FILE.into());
-        let at = crate::volumes::planned(&state, dir).join(&file);
+        // (The machine is given kithd's own link to the image, never a path a container writes.)
+        let at = crate::volumes::images(&state, dir)?.join(&file);
         // (It goes into an option of the hypervisor's: a comma would start another.)
         let at = at
             .to_str()
             .filter(|at| !at.contains(',') && !at.contains(char::is_control));
         disk.path = Some(
-            at.ok_or("disks: the Volume's directory has a comma or a control character in its path")?
+            at.ok_or("disks: the state directory has a comma or a control character in its path")?
                 .into(),
         );
         let size = disk.size.as_ref().map_or(0.0, |size| size.value()) as u64;
@@ -149,19 +153,11 @@ pub fn resolve(
 /// kithd can read. A file that is there is left as the machine wrote it, whatever its size; one
 /// that is no regular file (a link, a directory put in its place) is refused. Blocking file I/O.
 pub fn make_images(state: &Path, images: &[Image]) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     for Image { dir, file, size } in images {
         let said = |why: &dyn std::fmt::Display| format!("volume {}: {file}: {why}", dir.name);
         let root = crate::volumes::host_dir(state, dir).map_err(|e| format!("volume {}: {e}", dir.name))?;
-        // (Where the machine's command line says it is, and not elsewhere.)
-        let planned = crate::volumes::planned(&state.canonicalize().map_err(|e| said(&e))?, dir);
-        if root.real() != planned {
-            return Err(said(&format!(
-                "the directory is at {}, not {}",
-                root.real().display(),
-                planned.display()
-            )));
-        }
         let at = root.held().join(file);
         // (`create_new` is O_EXCL: it makes nothing where a link is, and does not follow one.)
         let made = std::fs::OpenOptions::new()
@@ -176,14 +172,44 @@ pub fn make_images(state: &Path, images: &[Image]) -> Result<(), String> {
                     return Err(said(&e));
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // (Not opened: a FIFO put there would block it.)
-                if !std::fs::symlink_metadata(&at).is_ok_and(|kind| kind.is_file()) {
-                    return Err(said(&"it is not a regular file"));
-                }
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(said(&e)),
         }
+        // The file itself, never what a link there names (O_NOFOLLOW), and not opened (O_PATH: a
+        // FIFO put there would block it): the descriptor is what is checked and what is linked.
+        let flags = nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_NOFOLLOW;
+        let found = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags.bits())
+            .open(&at)
+            .map_err(|e| said(&e))?;
+        if !found.metadata().is_ok_and(|kind| kind.is_file()) {
+            return Err(said(&"it is not a regular file"));
+        }
+        // The machine is given kithd's own link to that file, in a directory no container mounts
+        // (made fresh at every start, so a start after the Volume's file was replaced takes the
+        // one that is there): a container that swaps the Volume's file for a link afterwards
+        // changes nothing the hypervisor opens (T-1283). Another file system than the state
+        // directory's (an encrypted Volume's) has no link to make: refused.
+        // ponytail: kept until the Volume is wiped (`volumes::wipe`), where its blocks go too.
+        let kept = crate::volumes::images(&state.canonicalize().map_err(|e| said(&e))?, dir)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&kept)
+            .map_err(|e| said(&e))?;
+        let to = kept.join(file);
+        match std::fs::remove_file(&to) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(said(&e)),
+            _ => {}
+        }
+        let from = format!("/proc/self/fd/{}", found.as_raw_fd());
+        nix::unistd::linkat(None, Path::new(&from), None, to.as_path(), nix::fcntl::AtFlags::AT_SYMLINK_FOLLOW).map_err(|e| {
+            said(&format!(
+                "cannot link it into {} ({e}): a Volume on another file system than the state directory's holds no VM disk",
+                kept.display()
+            ))
+        })?;
     }
     Ok(())
 }
@@ -444,13 +470,15 @@ mod tests {
         let root = state.join("volumes/default/home/data");
         let line = command(&placed, &[], None);
         let has = |words: &[&str]| line.windows(words.len()).any(|at| at == words);
+        // (Kithd's own links to the images, where no container mounts: T-1283.)
+        let kept = state.join("vm-images/default/home");
         assert!(has(&[
             "-drive",
-            &format!("file={}/disk.img,format=raw,if=virtio", root.display())
+            &format!("file={}/disk.img,format=raw,if=virtio", kept.display())
         ]));
         assert!(has(&[
             "-drive",
-            &format!("file={}/scratch.img,format=raw,if=virtio,readonly=on", root.display())
+            &format!("file={}/scratch.img,format=raw,if=virtio,readonly=on", kept.display())
         ]));
         assert!(has(&["-drive", "file=/var/d.raw,format=raw,if=virtio"]));
         assert_eq!(images.len(), 2, "the disk at a path is no image of the Volume's");
@@ -464,11 +492,15 @@ mod tests {
         assert_eq!(made.permissions().mode() & 0o777, 0o600);
         assert!(made.blocks() * 512 < made.len(), "sparse: {} blocks", made.blocks());
         assert_eq!(std::fs::metadata(root.join("scratch.img")).unwrap().len(), 1 << 20);
+        // The machine's path is a link to that very file, in a directory only kithd enters.
+        assert_eq!(std::fs::metadata(kept.join("disk.img")).unwrap().ino(), made.ino());
+        assert_eq!(std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o700);
 
         // A second start leaves what the guest wrote, and its size, as they are.
         std::fs::write(&image, b"guest").unwrap();
         make_images(&state, &images).unwrap();
         assert_eq!(std::fs::read(&image).unwrap(), b"guest");
+        assert_eq!(std::fs::read(kept.join("disk.img")).unwrap(), b"guest");
 
         // A link put where the image is, or a directory, is refused and nothing behind it is touched.
         let outside = state.join("outside");
@@ -487,6 +519,66 @@ mod tests {
         assert!(lacking.contains("home") && lacking.contains("this node"), "{lacking}");
         let elsewhere = resolve(&unit, &state, "b", &volumes).unwrap_err();
         assert!(elsewhere.contains("on node a, not on this node"), "{elsewhere}");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A container of the Volume swaps the image for a link to a node's file after kithd checked
+    /// it (T-1283): the path the hypervisor is given is kithd's own and never reaches the link.
+    #[test]
+    fn a_link_put_in_the_volume_after_the_check_never_reaches_the_hypervisor() {
+        use std::os::unix::fs::MetadataExt;
+        let state = std::env::temp_dir().join(format!("kith-vm-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+        let state = state.canonicalize().unwrap();
+        let dir = crate::volumes::Dir {
+            namespace: "default".into(),
+            name: "home".into(),
+            path: "data".into(),
+            node: "a".into(),
+            encrypted: false,
+        };
+        let volumes = BTreeMap::from([("home".to_string(), dir)]);
+        let unit = vm(json!({ "name": "vm", "memory": "1Gi", "disks": [{ "volume": "home", "size": "1Mi" }] }));
+        let (placed, images) = resolve(&unit, &state, "a", &volumes).unwrap();
+        make_images(&state, &images).unwrap();
+        let root = state.join("volumes/default/home/data");
+        let image = root.join("disk.img");
+        std::fs::write(&image, b"guest").unwrap();
+        // (Checked at every start, so the one a restart makes finds it again, as it is now.)
+        make_images(&state, &images).unwrap();
+
+        let (qemu, cloud) = (command(&placed, &[], None), {
+            let mut other = placed.clone();
+            other.hypervisor = Some(Hypervisor::CloudHypervisor);
+            command(&other, &[], None)
+        });
+        // The node's file the container would have the machine write, and the swap.
+        let outside = state.join("outside");
+        std::fs::write(&outside, b"mine").unwrap();
+        std::fs::remove_file(&image).unwrap();
+        std::os::unix::fs::symlink(&outside, &image).unwrap();
+
+        for line in [qemu, cloud] {
+            let named = line
+                .iter()
+                .filter_map(|word| {
+                    let at = word.strip_prefix("file=").or_else(|| word.strip_prefix("path="))?;
+                    Some(at.split(',').next()?.to_string())
+                })
+                .find(|at| at.ends_with("disk.img"))
+                .expect("the line names the disk");
+            assert!(
+                !Path::new(&named).starts_with(&root),
+                "the hypervisor is given a path a container writes: {named}"
+            );
+            assert_eq!(std::fs::read(&named).unwrap(), b"guest", "{named}");
+            assert_ne!(
+                std::fs::metadata(&named).unwrap().ino(),
+                std::fs::metadata(&outside).unwrap().ino()
+            );
+        }
+        assert_eq!(std::fs::read(&outside).unwrap(), b"mine");
         let _ = std::fs::remove_dir_all(&state);
     }
 
