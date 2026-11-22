@@ -20,9 +20,9 @@
     stateoff=$(off state)
     [ -n "$rootoff" ] && [ -n "$stateoff" ] || fail "no root-a or state partition in the image's table"
     unsquashfs -o "$rootoff" -l "$disk" >"$work/root.list" 2>"$work/root.err" || fail "the root's file list: $(cat "$work/root.err")"
-    grep -q ' usr/share/kith/modules$' "$work/root.list" || fail "the root has no /usr/share/kith/modules, the pin of the modules image"
+    grep -q '/usr/share/kith/modules$' "$work/root.list" || fail "the root has no /usr/share/kith/modules, the pin of the modules image"
     ! grep -Eq '\.ko(\.|$)' "$work/root.list" || fail "a kernel module is in the root: $(grep -E '\.ko(\.|$)' "$work/root.list" | head -n 3)"
-    ! grep -q ' lib/modules' "$work/root.list" || fail "the root has a lib/modules: the modules are on the state partition"
+    ! grep -q '/lib/modules' "$work/root.list" || fail "the root has a lib/modules: the modules are on the state partition"
     echo "vm.sh: ok: the root pins its modules image (/usr/share/kith/modules) and holds no .ko"
 
     # --- build.sh refuses a driver of the network or the disk as a module, with modules on state.
@@ -121,9 +121,31 @@ CONFIG_VIRTIO_NET=m' >"$bad"
     put
     refused 'is [0-9]* bytes, and this system pinned' "an image of another size"
 
+    # A shorter one: a block less.
+    fresh
+    take
+    truncate -s -4096 "$work/m.img"
+    put
+    refused 'is [0-9]* bytes, and this system pinned' "an image of another size, shorter"
+
+    # Another build's tree alone: the image of this build, the tree made from a changed copy.
+    fresh
+    take
+    cp "$work/m.img" "$work/other.img"
+    old=$(od -An -tu1 -j5000 -N1 "$work/other.img" | tr -d ' ')
+    printf "\\$(printf %o $(((old + 1) % 256)))" | dd of="$work/other.img" bs=1 seek=5000 count=1 conv=notrunc status=none
+    rm -f "$work/m.verity"
+    veritysetup format "$work/other.img" "$work/m.verity" >/dev/null || fail "veritysetup cannot make another build's tree"
+    put
+    refused 'blocks do not match the hash' "another build's .verity alone"
+
     fresh
     fs 'rm /os/modules-a.img'
     refused 'No such file' "the image missing"
+
+    fresh
+    fs 'rm /os/modules-a.img.verity'
+    refused 'os/modules-a.img.verity' "the tree missing"
 
     fresh
     fs 'rm /os/modules-a.img'

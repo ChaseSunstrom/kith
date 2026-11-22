@@ -334,7 +334,7 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    seconds are printed), and two cards are never heard answering at
                    once, not when the stopped one goes on again; needs socat and
                    python3 as --test chaos does
-  --test modules-state  instead: an image whose one driver (virtio-rng) is a module kept in a
+  --test modules-state  instead: an image whose one driver (virtio-input) is a module kept in a
                    dm-verity image on the state partition, which the root pins: kithd loads
                    it at start; the same disk with a changed byte, another build's .verity
                    alone, an image a block longer or shorter, another build's image and
@@ -639,7 +639,7 @@ env -u KITH_VM_RUN $setsid sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 1; do
 trap 'st=$?; kill $vms $web 2>/dev/null || true; env -u KITH_VM_RUN sh -c "$reap" sh "$KITH_VM_RUN"; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$work"/wg "$work"/wg.err "$work"/arp "$work"/arp.err "$KITH_VM_LOGS"/ 2>/dev/null || true; if [ "$st" -ne 0 ] && [ -n "${KITH_VM_LOGS:-}" ] && [ ! -e "$KITH_VM_LOGS/fail" ]; then echo "vm.sh: FAIL: exit $st without a fail file: a failure that did not go through fail(), see the log" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; fi; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
 trap 'exit 1' INT TERM
 said() { said_in "$work/log" "$1"; }
-fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; [ -z "${KITH_VM_LOGS:-}" ] || echo "vm.sh: FAIL: $1" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; exit 1; }
+fail() { cat "$work/log" 2>/dev/null || true; echo "vm.sh: FAIL: $1" >&2; [ -z "${KITH_VM_LOGS:-}" ] || echo "vm.sh: FAIL: $1" >"$KITH_VM_LOGS/fail" 2>/dev/null || true; exit 1; }
 
 if [ -n "$test" ] && [ "$test" != init ]; then
     . "$root/ci/vm/tests.sh"
