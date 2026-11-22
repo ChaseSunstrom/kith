@@ -40,9 +40,6 @@
 //!   pod link TARGET PATH       make PATH a link to TARGET, and say how it went
 //!   pod tick [N]               say which process it is and when it started, then `tick N`
 //!                              each second, for as long as it runs (or N times, then end)
-//!   pod net                    run on a node: its global IPv6 addresses (SLAAC), its cards
-//!                              ("link: NAME"), its default routes ("default: IFACE GATEWAY") and
-//!                              the name servers in /run/resolv.conf, a line each
 //!   pod memory                 run on a node: process 1's and kithd's resident memory
 //!                              ("memory: PID COMM VmRSS RssAnon", kB)
 //!   pod kill N SECONDS         run on a node (an exec unit): N times, SECONDS apart, kill
@@ -911,39 +908,6 @@ fn main() {
             // This boot of the machine (the kernel's, the same for every container on it).
             let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
             println!("bootid: {}", id.trim());
-        }
-        ["net"] => {
-            // What this machine's network is, as the host's: "inet6: IFACE ADDRESS" for each
-            // address (not link-local, scope 20, nor host's, 10: those prove no router; QEMU's
-            // router advertises fec0::/64, which is site scope), and "resolv: SERVER" for
-            // each name server in /run/resolv.conf.
-            let inet6 = std::fs::read_to_string("/proc/net/if_inet6").unwrap_or_default();
-            for line in inet6.lines() {
-                let f: Vec<&str> = line.split_whitespace().collect();
-                if f.len() == 6 && f[3] != "20" && f[3] != "10" {
-                    println!("inet6: {} {}", f[5], f[0]);
-                }
-            }
-            // ("link: NAME" for each card the kernel has, from /proc/net/dev.)
-            let dev = std::fs::read_to_string("/proc/net/dev").unwrap_or_default();
-            for name in dev.lines().filter_map(|l| l.split_once(':')).map(|(n, _)| n.trim()) {
-                println!("link: {name}");
-            }
-            // ("default: IFACE GATEWAY" for each default route: the gateway as /proc/net/route's
-            // hex, the bytes of the address from the first, so 10.0.2.2 is 0202000A.)
-            let routes = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
-            for line in routes.lines().skip(1) {
-                let f: Vec<&str> = line.split_whitespace().collect();
-                if f.len() > 7 && f[1] == "00000000" && f[7] == "00000000" {
-                    println!("default: {} {}", f[0], f[2]);
-                }
-            }
-            let resolv = std::fs::read_to_string("/run/resolv.conf");
-            println!("file: /run/resolv.conf {resolv:?}");
-            let resolv = resolv.unwrap_or_default();
-            for server in resolv.lines().filter_map(|l| l.strip_prefix("nameserver ")) {
-                println!("resolv: {}", server.trim());
-            }
         }
         ["memory"] => {
             // Process 1 and kithd: "memory: PID COMM VmRSS RssAnon" (kB).

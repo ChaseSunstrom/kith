@@ -11,7 +11,6 @@
         [ "$test" != kube ] || [ -x "$kubectl" ] || skip "no kubectl (KITH_KUBECTL names one; sh ci/kube.sh --vm fetches one)"
         [ "$test" != quota ] || command -v socat >/dev/null 2>&1 || skip "no socat to restart a node with"
         [ "$test" != home ] || command -v socat >/dev/null 2>&1 || skip "no socat to reset and stop a node with"
-        [ "$test" != latecard ] || command -v socat >/dev/null 2>&1 || skip "no socat to plug a card in with"
         if [ "$test" = pods ]; then
             command -v socat >/dev/null 2>&1 || skip "no socat to plug a keyboard in with"
         fi
@@ -49,15 +48,11 @@
         # (access: the nodes run the image tests.sh built with the forge feature; privilege: with the
         # confine-probe feature.)
         { [ "$test" != access ] && [ "$test" != privilege ]; } || base=$osdir
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = privilege ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ] || [ "$test" = access ] || [ "$test" = latecard ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = privilege ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ] || [ "$test" = access ]; then
         others=2 more=--mesh project=''
         # (access: three nodes on the mesh, pod's image in each; people on the first, below.)
         [ "$test" != access ] || others='2 3'
-        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != privilege ] && [ "$test" != nested ] && [ "$test" != nofile ] && [ "$test" != handover ] && [ "$test" != latecard ] || others=''
-        # (latecard: a PCIe root port to plug a card into after the boot: the q35 root bus takes none. Hot-plug is
-        # the kernel's own (pciehp): QEMU's ACPI says it supports none unless that is off, and with a power
-        # controller the kernel waits 5 s after the "button press" a plug makes, which a power-less slot spares.)
-        [ "$test" != latecard ] || ports='-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off -device pcie-root-port,id=rp1,chassis=1,power_controller_present=off'
+        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != privilege ] && [ "$test" != nested ] && [ "$test" != nofile ] && [ "$test" != handover ] || others=''
         # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
         # as a node's state from before had none: kithd counts what their pods write.)
         [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
@@ -129,7 +124,7 @@
                     chmod 755 "$image/rootfs/bin/tar"
                 fi
                 # (outlive: pod on the node's own disk as well, for its exec units.)
-                { [ "$test" != outlive ] && [ "$test" != privilege ] && [ "$test" != latecard ]; } || { mkdir -p "$work/seed/tools" && cp "$work/pod" "$work/seed/tools/pod"; }
+                { [ "$test" != outlive ] && [ "$test" != privilege ]; } || { mkdir -p "$work/seed/tools" && cp "$work/pod" "$work/seed/tools/pod"; }
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:user"
                 for tag in serve again; do
@@ -313,7 +308,7 @@ EOF
             timeout --foreground "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$lanport,localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
-                -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside${https:+,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:443}$guest${net_restrict-,restrict=on}" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $dumps ${ports-} \
+                -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside${https:+,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:443}$guest${net_restrict-,restrict=on}" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $dumps \
                 -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway${nolink:+ KITH_NO_LINK=1} -- --listen ${listen:-0.0.0.0:7443} --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 8>&- &
             vms="$vms $!"
@@ -383,8 +378,7 @@ EOF
         # (access: the first node ends the people's tunnels, which phones on its LAN reach.)
         [ "$test" != access ] || first='--people --people-endpoint 10.9.0.1:51821'
         keep=${net_restrict-,restrict=on}
-        # (latecard: the same, for a lease with a name server: a restricted network gives none, as it gives no router.)
-        { [ "$test" != pods ] && [ "$test" != latecard ]; } || net_restrict=''
+        [ "$test" != pods ] || net_restrict=''
         # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
         # (home: every joined one serves DNS too; node 4 roams (--roaming, as a laptop joins): it is reset, and dials the house endpoint.)
         [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353'; }
@@ -500,9 +494,6 @@ EOF
         fi
         if [ "$test" = privilege ]; then
             . "$root/ci/vm/privilege.sh"
-        fi
-        if [ "$test" = latecard ]; then
-            . "$root/ci/vm/latecard.sh"
         fi
         if [ "$test" = nested ]; then
             . "$root/ci/vm/nested.sh"
