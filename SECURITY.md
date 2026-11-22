@@ -1768,6 +1768,12 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   says so once on its error output and goes on, as a node that cannot protect itself
   still has to boot. `python3 ci/budgets.py` runs both shipped programs and fails when
   any byte of the part is still writable in `/proc/PID/maps`.
+- **`kith image scan` sends an image's package names and versions to api.osv.dev, and trusts its answer
+  only as text.** Whoever may Get the node reads, from an image already on it, the package list (kithd's
+  root part opens only that file, from inside the unpacked root, never following a link out of it) and
+  node-side kithd asks OSV over HTTPS with them (no proxy, no redirect, a capped reply, ids kept only
+  when they look like advisory ids). Nothing else leaves the node, nothing is pulled or stored, and a
+  scan says nothing of a package the list does not name (a language package, a binary put there by hand).
 
 ## The review before 1.0
 

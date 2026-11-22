@@ -228,6 +228,11 @@ enum Command {
         #[command(subcommand)]
         command: BackupCommand,
     },
+    /// Images: what a node holds, checked on request
+    Image {
+        #[command(subcommand)]
+        command: ImageCommand,
+    },
     /// Work on a package: a directory of resource templates and default values
     Package {
         #[command(subcommand)]
@@ -395,6 +400,21 @@ enum BackupCommand {
         /// Which one: the `at` of one in the Backup's status [default: the last]
         #[arg(long, value_name = "SECONDS")]
         at: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImageCommand {
+    /// Check the packages of an image NODE has against OSV (osv.dev), and print the advisories
+    /// that name them. Only an image the node already has is looked at (nothing is pulled), and what
+    /// OSV is sent is the release's ecosystem and each package's name and version: see the
+    /// workloads guide, "Is an image known to be vulnerable"
+    Scan {
+        /// The image, as a unit names it (`docker.io/library/debian:12`)
+        image: String,
+        /// The node that has it
+        #[arg(long)]
+        node: String,
     },
 }
 
@@ -672,6 +692,55 @@ enum DiskCommand {
     },
     /// List the disks NODE has, mounted or not, and the ones it left alone
     List { node: String },
+}
+
+/// What `kith image scan` says of the answer: how many packages were looked at, and a row for each
+/// advisory id of each package OSV has any for, with the id's osv.dev link. (Package names and ids
+/// come out of an image: what is not printable is a `?`, whatever a node sent.)
+fn scan_said(said: &serde_json::Value) -> String {
+    let text = |value: &serde_json::Value| -> String {
+        value
+            .as_str()
+            .unwrap_or("?")
+            .chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect()
+    };
+    let hits = said["vulnerable"].as_array().cloned().unwrap_or_default();
+    let mut out = format!(
+        "{} on {}: {} packages ({}), {} with advisories in OSV\n",
+        text(&said["image"]),
+        text(&said["node"]),
+        said["packages"].as_u64().unwrap_or(0),
+        text(&said["ecosystem"]),
+        hits.len()
+    );
+    let mut rows = vec![];
+    for hit in &hits {
+        let ids = hit["ids"].as_array().cloned().unwrap_or_default();
+        for (n, id) in ids.iter().enumerate() {
+            let (name, version) = if n == 0 {
+                (text(&hit["name"]), text(&hit["version"]))
+            } else {
+                (String::new(), String::new())
+            };
+            let id = text(id);
+            rows.push((name, version, format!("{id}  https://osv.dev/vulnerability/{id}")));
+        }
+    }
+    if rows.is_empty() {
+        return out;
+    }
+    rows.insert(0, ("PACKAGE".into(), "VERSION".into(), "ADVISORY".into()));
+    let width = |pick: fn(&(String, String, String)) -> &String| {
+        rows.iter().map(|r| pick(r).chars().count()).max().unwrap_or(0)
+    };
+    let (a, b) = (width(|r| &r.0), width(|r| &r.1));
+    for (name, version, id) in &rows {
+        out.push_str(format!("{name:a$}  {version:b$}  {id}").trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 /// What `kith node disk list` says of the answer's `known` and `unknown`.
@@ -1639,6 +1708,16 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 done["volume"].as_str().unwrap_or_default(),
                 done["node"].as_str().unwrap_or_default()
             );
+        }
+        Command::Image {
+            command: ImageCommand::Scan { image, node },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("an image is scanned by the node that has it: leave out --store");
+            };
+            let path = format!("/v1/scan/{}?image={}", escape(&node), escape(&image));
+            let said: serde_json::Value = request(&kithd, "GET", &path, b"")?;
+            print!("{}", scan_said(&said));
         }
         Command::Blob { command } => {
             let Backend::Daemon(kithd) = backend()? else {
@@ -3158,5 +3237,42 @@ mod drain_tests {
         assert!(features_spec(&node(json!({ "state": "ready" }))).is_err());
         // A name that is not a feature name is refused, so none can add a feature to the spec.
         assert!(features_spec(&node(json!({ "os": { "wants": ["a, gpu"] } }))).is_err());
+    }
+
+    #[test]
+    fn scan_said_has_a_row_for_each_id_with_its_link_and_prints_nothing_a_node_sent_raw() {
+        let said = json!({
+            "node": "alpha", "image": "debian:12", "ecosystem": "Debian:12", "packages": 90,
+            "vulnerable": [
+                { "name": "openssl", "version": "3.0.11-1", "ids": ["CVE-2023-5678", "DSA-5532-1"] },
+                { "name": "ba\u{1b}sh", "version": "5.2", "ids": ["CVE-1"] },
+            ],
+        });
+        let out = super::scan_said(&said);
+        let lines: Vec<_> = out.lines().collect();
+        assert_eq!(
+            lines[0],
+            "debian:12 on alpha: 90 packages (Debian:12), 2 with advisories in OSV"
+        );
+        assert!(
+            lines[1].starts_with("PACKAGE") && lines[1].ends_with("ADVISORY"),
+            "{out}"
+        );
+        assert!(
+            lines[2].ends_with("CVE-2023-5678  https://osv.dev/vulnerability/CVE-2023-5678"),
+            "{out}"
+        );
+        // (A package's name and version come once, on its first row.)
+        assert!(
+            lines[3].starts_with(' ') && lines[3].ends_with("https://osv.dev/vulnerability/DSA-5532-1"),
+            "{out}"
+        );
+        assert!(lines[4].starts_with("ba?sh"), "{out}");
+        assert!(!out.contains('\u{1b}'));
+        // Nothing found: the header alone.
+        let clean = super::scan_said(
+            &json!({ "node": "a", "image": "i", "ecosystem": "Alpine:v3.19", "packages": 3, "vulnerable": [] }),
+        );
+        assert_eq!(clean, "i on a: 3 packages (Alpine:v3.19), 0 with advisories in OSV\n");
     }
 }
