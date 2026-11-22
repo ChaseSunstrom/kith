@@ -588,7 +588,12 @@ fn served(resource: &Resource) -> Option<(&'static Kind, Value)> {
         // Its address on the mesh; with none it is found by its name alone, which is what
         // Kubernetes calls a Service with `None` here. A headless one has no address, whatever
         // it had before it was made so. (Helm waits for this field to say something.)
-        "Service" if object.pointer("/spec/clusterIP").is_none() => {
+        // (Helm sends `clusterIP: ""` for "allocate": it is read as absent.)
+        "Service"
+            if object
+                .pointer("/spec/clusterIP")
+                .is_none_or(|ip| ip.as_str() == Some("")) =>
+        {
             let address = match crate::services::headless(resource) {
                 true => "None",
                 false => said("address").unwrap_or("None"),
@@ -3749,31 +3754,52 @@ spec: {role: rooter, subjects: [dana]}
     /// not headless reads the address kithd gave it.
     #[test]
     fn a_headless_service_reads_none_whatever_its_stale_address() {
-        let service = |headless: &str| {
-            let sent = json!({
-                "apiVersion": "v1", "kind": "Service",
-                "metadata": { "name": "web", "namespace": "default" },
-                "spec": { "selector": { "app": "web" }, "ports": [{ "port": 80 }] },
-            });
-            let sent = serde_json::to_string(&sent.to_string()).unwrap();
-            let source = format!(
-                "apiVersion: kith.dev/v1\nkind: Service\n\
-                 metadata: {{name: web, namespace: default, annotations: {{{SENT}: {sent}}}}}\n\
-                 spec: {{{headless} selector: {{app: web}}, ports: [{{port: 80}}]}}\n"
-            );
-            let mut resource = kith_api::Resource::from_source(&source)
-                .unwrap()
-                .pop()
-                .unwrap()
-                .unwrap();
-            resource.status = Some(json!({"address": "fd00::7"}));
-            served(&resource).unwrap().1
-        };
+        let service = |headless: &str| service_served(headless, json!({}));
         let headless = service("headless: true,");
         assert_eq!(headless.pointer("/spec/clusterIP"), Some(&json!("None")));
         assert_eq!(headless.pointer("/spec/clusterIPs"), Some(&json!(["None"])));
         let mesh = service("");
         assert_eq!(mesh.pointer("/spec/clusterIP"), Some(&json!("fd00::7")));
+    }
+
+    /// Helm renders `clusterIP: ""` to mean "allocate"; it reads back with the address, or
+    /// `helm --wait` (a Service is ready once its ClusterIP is not "") never finishes.
+    #[test]
+    fn a_service_sent_with_an_empty_cluster_ip_reads_its_address() {
+        let empty = json!({ "clusterIP": "", "clusterIPs": [""] });
+        let mesh = service_served("", empty.clone());
+        assert_eq!(mesh.pointer("/spec/clusterIP"), Some(&json!("fd00::7")));
+        assert_eq!(mesh.pointer("/spec/clusterIPs"), Some(&json!(["fd00::7"])));
+        let headless = service_served("headless: true,", empty);
+        assert_eq!(headless.pointer("/spec/clusterIP"), Some(&json!("None")));
+        assert_eq!(headless.pointer("/spec/clusterIPs"), Some(&json!(["None"])));
+    }
+
+    /// A Service as the Kubernetes API serves it: what was sent (`extra` merged into its
+    /// spec), with the status address `fd00::7`.
+    fn service_served(headless: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut sent = json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": { "selector": { "app": "web" }, "ports": [{ "port": 80 }] },
+        });
+        sent["spec"]
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let sent = serde_json::to_string(&sent.to_string()).unwrap();
+        let source = format!(
+            "apiVersion: kith.dev/v1\nkind: Service\n\
+             metadata: {{name: web, namespace: default, annotations: {{{SENT}: {sent}}}}}\n\
+             spec: {{{headless} selector: {{app: web}}, ports: [{{port: 80}}]}}\n"
+        );
+        let mut resource = kith_api::Resource::from_source(&source)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap();
+        resource.status = Some(json!({"address": "fd00::7"}));
+        served(&resource).unwrap().1
     }
 
     /// Who may write a kind and not read it is not answered with what is there by a
