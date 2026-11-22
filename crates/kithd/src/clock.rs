@@ -447,13 +447,6 @@ fn render(
     said
 }
 
-/// The mark after a check: one lost datagram or a short outage (one check with no answer) keeps
-/// it; two in a row drop it. `missed` counts the checks in a row with no answer.
-fn keep_mark(vouched: bool, missed: &mut u32, answered: bool) -> bool {
-    *missed = if answered { 0 } else { *missed + 1 };
-    vouched && *missed <= 1
-}
-
 /// The status of a check that found no time.
 fn nothing(why: &str, at: i64) -> Value {
     json!({ "error": why, "checked": at / 1_000_000 })
@@ -475,12 +468,12 @@ fn nothing(why: &str, at: i64) -> Value {
 /// answer has no mark: it came up from a hardware clock hours off, on a network with no server)
 /// is one source like a network's, within the same budget, once this node's clock was set and
 /// either the operator's server set it (`vouched`, this node's own mark, or that server within two
-/// seconds of it in this check, or at any offset: it answered) or most voters that answered (three at least: this node, the
+/// seconds of it in this check) or most voters that answered (three at least: this node, the
 /// leader and the others) are this node with those within two seconds of it. Otherwise (a cluster
 /// of two with no server, a voter of three down, a node in 1970) the leader is followed as before;
 /// a marked leader is followed by any step. `vouched` is kept: true once the operator's server's
-/// answer (or a marked leader's) is the time stepped to or kept, false when the step failed (and
-/// when `run` saw two checks in a row with no answer); a network's server never sets it.
+/// answer (or a marked leader's) is the time stepped to or kept, false when no one answered or the
+/// step failed; a network's server never sets it.
 #[allow(clippy::too_many_arguments)]
 async fn ask(
     servers: &[SocketAddr],
@@ -511,8 +504,7 @@ async fn ask(
     let majority = answered >= 3 && agree * 2 > answered;
     let leader = heard.leader;
     // This node's own mark, by this check's answer too: the operator's server said its time.
-    // (At any offset: a node whose own clock is off is the one that needs its server's word.)
-    let vouched_now = *vouched || (told && !found.is_empty());
+    let vouched_now = *vouched || told && found.first().is_some_and(|(_, s)| s.offset_us.abs() <= STEP_OVER_US);
     // Why the leader is one source here, not the cluster's time (nothing: it is the time).
     let demoted = match &leader {
         Ok(said) if !said.vouched && synced && vouched_now => {
@@ -539,7 +531,7 @@ async fn ask(
         _ => {}
     }
     let Some((server, sample)) = chosen else {
-        // (The mark is kept: `run` drops it at a second check in a row with no answer.)
+        *vouched = false;
         return nothing(&format!("no time server answered ({})", why.join("; ")), now_us());
     };
     let trusted = from_leader.is_some() && demoted.is_none();
@@ -651,7 +643,6 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         let mut said = String::new();
         let mut spent = 0;
         let mut vouched = false;
-        let mut missed = 0u32;
         let mut generation = shared.generation.subscribe();
         loop {
             let ntp = cluster_ntp(&shared.store.lock().expect("nothing panics holding the store").store);
@@ -668,7 +659,6 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 &mut vouched,
             )
             .await;
-            vouched = keep_mark(vouched, &mut missed, now["server"].is_string());
             VOUCHED.store(vouched, Ordering::Relaxed);
             if now["error"].is_null() && now["server"].is_string() {
                 synced = true;
@@ -1499,8 +1489,8 @@ mod tests {
         // and vouches for nothing.
         assert!(!mark(vec![fake(0, |_| {}).await], Err("none".into()), false, false).await);
         assert!(!mark(vec![fake(4_000_000, |_| {}).await], Err("none".into()), false, false).await);
-        // No one answered: the mark stays for this check (`run` drops it at a second miss).
-        assert!(mark(vec![nobody().await], Err("none".into()), true, true).await);
+        // No one answered: no one set it.
+        assert!(!mark(vec![nobody().await], Err("none".into()), true, true).await);
         // A leader no server set, within two seconds: the mark stays as it was.
         assert!(mark(vec![], Ok(near), true, false).await);
         assert!(!mark(vec![], Ok(near), false, false).await);
@@ -1620,34 +1610,6 @@ mod tests {
         // A network's server says the same: no mark, and no majority: the leader as before.
         let (system, _, said) = fresh(&[fake(0, |_| {}).await], false, EIGHT_HOURS, false, &[], true).await;
         assert!(system.is_some(), "{said}");
-    }
-
-    #[test]
-    fn clock_the_mark_survives_one_missed_check_and_not_two() {
-        let mut missed = 0;
-        // One check with no answer keeps it; the next one that answers resets the count.
-        assert!(keep_mark(true, &mut missed, false));
-        assert!(keep_mark(true, &mut missed, true));
-        assert!(keep_mark(true, &mut missed, false));
-        // Two in a row drop it, and it stays dropped while no one answers.
-        assert!(!keep_mark(true, &mut missed, false));
-        assert!(!keep_mark(true, &mut missed, false));
-        // No mark is never made by a miss.
-        assert!(!keep_mark(false, &mut 0, false));
-    }
-
-    #[tokio::test]
-    async fn clock_the_operators_server_wins_over_an_unvouched_leader_at_any_offset() {
-        // This node is 30 s off, the operator's server says so, and the leader no server set says
-        // eight hours: the node steps toward the server, never to the leader's hours.
-        let (system, rtc, said) = fresh(&[fake(30_000_000, |_| {}).await], true, EIGHT_HOURS, false, &[], true).await;
-        let step = system.map(|to| to - now_us());
-        assert!(
-            step.is_some_and(|s| (s - 30_000_000).abs() < 2_000_000),
-            "{step:?} {said}"
-        );
-        assert_eq!(rtc, system, "{said}");
-        assert!(said["server"].as_str().unwrap().starts_with("127.0.0.1:"), "{said}");
     }
 
     #[tokio::test]
