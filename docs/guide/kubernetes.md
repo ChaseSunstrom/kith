@@ -170,10 +170,32 @@ The Docker Engine API in front of kith, begun: `kith docker serve [--listen PATH
 (`docker.sock` beside kithd's, mode 0600 from its first moment; a socket a dead run left is
 replaced, one in use is refused) and the `docker` command talks to it with
 `DOCKER_HOST=unix://PATH`. It is in the `kith-remote` build (cargo feature `docker`), not in the
-default `kith` or in kithd: nothing in the daemon changed.
+default `kith` or in kithd: nothing in the daemon changed. Against a kithd with `signing: required`
+it asks for the admin's passphrase once, before it serves (at a terminal, or one line on stdin),
+and refuses to start without it; it never asks in the middle of a call.
 
-Today it answers `docker version` and `docker info`, each under any `/v1.40/` to `/v1.47/` prefix
-(a client newer or older is told so with a 400, as dockerd does). Everything else, containers and
-images included, is answered 501 with a JSON `message`, never left waiting; so is a request body
-sent chunked. A container will be a Workload, its ID the SHA-256 of its namespace and name: the
-same on every run.
+Today it answers `docker version`, `docker info` and these container calls, each under any
+`/v1.40/` to `/v1.47/` prefix (a client newer or older is told so with a 400, as dockerd does):
+
+- `docker run -d --name NAME IMAGE CMD` (create, then start), `ps`, `ps -a`, `inspect`, `stop`,
+  `start`, `restart`, `kill`, `rm -f` and `wait`.
+
+A container is a kith resource in the namespace `docker`, labelled `kith.dev/docker=NAME`, with the
+labels its create body gave kept as they are. `kith delete` removes it. A container with
+`--restart always` or `unless-stopped` is a Workload (`replicas: 0` while created or stopped, 1
+while running): `kith get workload NAME -n docker` shows it. One with `no` (the default, so a plain
+`docker run -d`) or `on-failure` is a Job while it runs: `kith get job NAME -n docker` shows it, and
+once stopped it is a Workload at `replicas: 0` again, until `docker start` makes the Job anew. A
+name is at most 61 characters. Its ID is the SHA-256 of its namespace and name, the same on every run.
+
+Refused with a 400 and a JSON `message` in Docker's shape: a name Docker or kith would not take; a
+security-changing HostConfig field (`privileged`, `capAdd`, `securityOpt`, devices, binds and
+mounts, host PID, IPC, UTS, user or cgroup namespaces, `networkMode` host or `container:`); and a
+name another resource in the store already has (a 409).
+
+Answered 501 with a JSON `message`, never left waiting: `docker run` without `-d`, which attaches
+to the container's output and waits for step 3; `ps` with filters; port bindings; ulimits;
+`--rm`; memory, CPU and PID limits; DNS, extra hosts and links; a hostname, exposed ports, a
+health check and a stop signal; volumes, `--tmpfs`, `--volumes-from`, a read-only root and
+`--runtime`; other network modes; images; and any other call not listed above.
+A request body sent chunked is 501 too.

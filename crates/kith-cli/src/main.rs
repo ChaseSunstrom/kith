@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod context;
+#[cfg(feature = "docker")]
+mod docker_store;
 mod import;
 mod launch;
 mod remote;
@@ -1113,6 +1115,32 @@ fn request<T: serde::de::DeserializeOwned>(kithd: &Kithd, method: &str, path: &s
 /// The passphrase typed for this run's signed writes: asked for once, when the first is signed.
 static PASSPHRASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Set by a long-running verb (`docker serve`) once it serves: a request thread never prompts.
+static NO_PROMPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// For a verb that serves: where kithd needs the admin's signature, ask for the passphrase now,
+/// once, before the first request (never in a request thread), and derive the key. A passphrase
+/// that comes out empty (no terminal, nothing on stdin) is refused here with a clear message.
+#[cfg(feature = "docker")]
+fn sign_before_serving(backend: &Backend) -> Result<(), String> {
+    if let Backend::Daemon(kithd) = backend {
+        // (A kithd that is not up yet is no reason not to serve: its calls fail as they come.)
+        match request::<serde_json::Value>(kithd, "GET", "/v1/cluster", b"") {
+            Err(e) => eprintln!("kith: kithd does not answer yet ({e}): serving; calls fail until it does"),
+            Ok(_) => {
+                signed(kithd, "POST", "/v1/apply", b"")?;
+                if PASSPHRASE.get().is_some_and(String::is_empty) {
+                    return fail(
+                        "this cluster requires the admin's signature (spec.signing: required): give the passphrase at a terminal or as one line on stdin, as kith docker serve asks for it once, before it serves",
+                    );
+                }
+            }
+        }
+    }
+    NO_PROMPT.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
 /// The admin's key from it, for the cluster kithd named: one cluster per run.
 static KEY: std::sync::OnceLock<ring::signature::Ed25519KeyPair> = std::sync::OnceLock::new();
 
@@ -1138,6 +1166,11 @@ fn signed(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Option
         Some(key) => key,
         None => {
             if PASSPHRASE.get().is_none() {
+                if NO_PROMPT.load(std::sync::atomic::Ordering::SeqCst) {
+                    return fail(
+                        "this cluster began requiring the admin's signature after kith docker serve started: restart it",
+                    );
+                }
                 let typed = admin_passphrase("The admin's passphrase, which signs this change: ", false)?;
                 let _ = PASSPHRASE.set(typed);
             }
@@ -1277,13 +1310,17 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 Some(path) => path,
                 None => return fail("no place for the socket: set --listen PATH"),
             };
+            // (The backend first: one that cannot be reached makes no socket.)
+            let backend = backend()?;
+            sign_before_serving(&backend)?;
+            let store = docker_store::DockerStore(backend);
             let listener = kith_docker::listen(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             eprintln!(
                 "kith: the Docker API is on {}: DOCKER_HOST=unix://{} docker version",
                 path.display(),
                 path.display()
             );
-            kith_docker::serve(listener);
+            kith_docker::serve_with(listener, Some(Box::new(store)));
             return Ok(ExitCode::SUCCESS);
         }
         Command::Lint { files } => {
