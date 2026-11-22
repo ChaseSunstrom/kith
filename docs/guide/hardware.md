@@ -253,7 +253,7 @@ spec:
 
 The seat's sound card is a Device with its playback PCM nodes (`/dev/snd/pcmC1D3p`, one per
 output), so the claim gives the container the sound as well as the screen. What this taught on a
-spare PC (n22, a GTX 1060) and on n20:
+spare PC (a GTX 1060) and on a Ryzen's GPU:
 
 - **Memory only.** A container's `resources.cpu` is a hard `cpu.max`, and drawing in software
   uses every core. The seat's `reserve` is the browser's guarantee; a Workload beside it that must
@@ -267,7 +267,7 @@ spare PC (n22, a GTX 1060) and on n20:
   control's name at its comma, so ask for the ELD). A container does not see `/proc/asound`
   (masked): read `/dev/snd/pcmC*D*p` and ask `amixer`.
 - **nouveau.** On Pascal it has no reclocking and no video decode: 4K and HEVC play better on a
-  GPU with VAAPI (n20's Radeon 780M). With the firmware built in, cage needs no `WLR_RENDERER`;
+  GPU with VAAPI (a Ryzen's Radeon 780M). With the firmware built in, cage needs no `WLR_RENDERER`;
   Chromium needs `--ignore-gpu-blocklist` on nouveau.
 - **The image.** It comes from a registry (kith reaches a plain-HTTP registry only on the same
   machine), or from a stock Alpine as above, with `apk add` into the Volume so the next start
