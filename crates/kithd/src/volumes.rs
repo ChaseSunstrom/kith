@@ -713,6 +713,12 @@ pub fn dir(store: &Store, namespace: &str, name: &str) -> Option<Dir> {
     vol.refused.is_none().then_some(vol.dir)
 }
 
+/// What each Volume says it holds, in bytes, by its (namespace, name): one that says none is not in it.
+pub fn sizes(store: &Store) -> BTreeMap<(String, String), u64> {
+    let kept = |vol: Vol| Some(((vol.dir.namespace, vol.dir.name), vol.size? as u64));
+    volumes(store).into_values().filter_map(kept).collect()
+}
+
 /// How many bytes the Volume `name` of `namespace` says it holds, if it says.
 pub fn size(store: &Store, namespace: &str, name: &str) -> Option<u64> {
     let vol = volumes(store).remove(&format!("Volume/{namespace}/{name}"))?;
