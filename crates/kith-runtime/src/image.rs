@@ -299,7 +299,9 @@ impl ImageStore {
     }
 
     /// How far the pull of `reference` (as the pull was asked) is, while it fetches: none before
-    /// the registry has named the layers, and none once it is done.
+    /// the registry has named the layers, and none once it is done. Keyed by the reference alone: a
+    /// second pull of the same reference (an API pull) reads as the first's, and the later one's
+    /// counts replace the earlier's while both go on.
     pub fn pull_progress(&self, reference: &str) -> Option<Progress> {
         let pulls = self.pulls.lock().unwrap_or_else(|e| e.into_inner());
         let counts = pulls.get(reference)?;
@@ -741,29 +743,30 @@ impl ImageStore {
 
         // The layers, in order, and which of them are to be fetched (once each: an image may name one twice).
         let mut layers = Vec::new();
-        let mut fetch: Vec<(&oci_client::manifest::OciDescriptor, &PathBuf)> = Vec::new();
+        // (Each with how many times the image names it.)
+        let mut fetch: Vec<(&oci_client::manifest::OciDescriptor, &PathBuf, usize)> = Vec::new();
         for layer in &manifest.layers {
             layers.push(self.root.join("blobs/sha256").join(sha256_hex(&layer.digest)?));
         }
-        let mut seen = std::collections::BTreeSet::new();
+        // What is stored already counts as done, and only what is stored (a registry's sizes are
+        // its word: summed so that none overflows).
+        let (mut stored, mut stored_bytes, mut bytes_total) = (0, 0u64, 0u64);
         for (layer, blob) in manifest.layers.iter().zip(&layers) {
-            if !blob.exists() && seen.insert(&layer.digest) {
-                fetch.push((layer, blob));
+            let size = u64::try_from(layer.size).unwrap_or(0);
+            bytes_total = bytes_total.saturating_add(size);
+            if blob.exists() {
+                stored += 1;
+                stored_bytes = stored_bytes.saturating_add(size);
+            } else if let Some(again) = fetch.iter_mut().find(|(other, ..)| other.digest == layer.digest) {
+                again.2 += 1;
+            } else {
+                fetch.push((layer, blob, 1));
             }
         }
-        // (A registry's sizes are its word: summed so that none overflows.)
-        let todo: i64 = fetch
-            .iter()
-            .fold(0, |sum, (layer, _)| sum.saturating_add(layer.size.max(0)));
-        // What is stored already counts as done.
-        let bytes_total: u64 = manifest
-            .layers
-            .iter()
-            .fold(0, |sum, l| sum.saturating_add(u64::try_from(l.size).unwrap_or(0)));
         let counts = Arc::new(Counts {
-            layers: AtomicUsize::new(manifest.layers.len() - fetch.len()),
+            layers: AtomicUsize::new(stored),
             layers_total: manifest.layers.len(),
-            bytes: Arc::new(AtomicU64::new(bytes_total.saturating_sub(todo as u64))),
+            bytes: Arc::new(AtomicU64::new(stored_bytes)),
             bytes_total,
         });
         self.pulls
@@ -778,7 +781,7 @@ impl ImageStore {
         let downloaded = fetch.len();
         at_once(
             LAYERS_AT_ONCE,
-            fetch.into_iter().map(|(layer, blob)| {
+            fetch.into_iter().map(|(layer, blob, times)| {
                 let (reference, remote, counts) = (&reference, &remote, &counts);
                 async move {
                     // oci-client checks the bytes against the layer digest as they stream; the writer
@@ -792,7 +795,12 @@ impl ImageStore {
                     // On disk before it gets its final name: a crash must not leave half a layer there.
                     file.sync_all().await.ctx("storing a layer")?;
                     fs::rename(&partial.0, blob).ctx("storing a layer")?;
-                    counts.layers.fetch_add(1, Ordering::Relaxed);
+                    // Stored: every place the image names it is done (its bytes were counted once, as they came).
+                    let size = u64::try_from(layer.size).unwrap_or(0);
+                    counts
+                        .bytes
+                        .fetch_add(size.saturating_mul(times as u64 - 1), Ordering::Relaxed);
+                    counts.layers.fetch_add(times, Ordering::Relaxed);
                     Ok(())
                 }
             }),
@@ -3721,6 +3729,43 @@ mod tests {
             "{said:?}"
         );
         assert!(store.pull_progress(&second).is_none(), "an ended pull is still listed");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A digest an image lists twice is not counted done before it is fetched: its two entries
+    /// count together once it is stored.
+    #[tokio::test]
+    async fn pull_progress_a_digest_listed_twice_is_done_when_stored() {
+        let (dir, _) = sandbox("pull-progress-twice");
+        let registry = Layers::start();
+        let (a, c): (&[u8], &[u8]) = (b"aaaaaaaaaa", b"cccccccccccc");
+        registry.publish("3", &[(a, 300), (a, 300), (c, 700)], &[]);
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let seen = Arc::default();
+        let reference = format!("127.0.0.1:{}/team/hello:3", registry.port);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let unpack = unpacking(&store, &seen);
+        let (image, said) = tokio::join!(
+            async {
+                let image = store.pull_with(&reference, PullPolicy::Always, &[], &unpack).await;
+                done.store(true, Ordering::SeqCst);
+                image
+            },
+            async {
+                let mut said = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    said.extend(store.pull_progress(&reference));
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                said
+            }
+        );
+        assert_eq!(image.unwrap().downloaded, 2);
+        let first = said.first().unwrap();
+        assert_eq!((first.layers, first.layers_total), (0, 3), "{said:?}");
+        assert!(first.bytes < 2 * a.len() as u64, "{said:?}");
+        assert!(said.iter().all(|p| p.layers != 1), "{said:?}");
+        assert!(said.iter().any(|p| p.layers == 2), "{said:?}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
