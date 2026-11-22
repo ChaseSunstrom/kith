@@ -313,7 +313,9 @@ Only the newest version is fixed. There are no security releases of older ones.
   with the sender's signature: the node that runs the replica checks the signature, the named
   caller and the `exec` right on that node, from its own copy of the Roles, before it enters
   the pod or opens a connection. A pod not yet made on its node is refused, never answered by
-  the host's own ports.
+  the host's own ports. The `exec` right on a NodeWorkload opens nothing:
+  a NodeWorkload's pod runs on the host, not in a container, so `exec`, `cp` and `port-forward`
+  into it are refused (501), and `kith run` is the way onto its node.
 - **The web UI's Terminal tab is `kubectl exec` over a WebSocket, `GET /v1/exec/NAMESPACE/POD`,
   and asks the same.** The `exec` right on the owning Workload or Job (and on `Node` for a
   NodeWorkload) is asked before anything of the request is read, again on the replica's node
