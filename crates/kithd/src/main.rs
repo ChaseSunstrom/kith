@@ -81,6 +81,7 @@ mod ui;
 mod update;
 mod view;
 mod vm;
+mod vm_migrate;
 mod volume_files;
 mod volumes;
 mod wasm;
