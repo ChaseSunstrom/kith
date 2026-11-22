@@ -64,12 +64,19 @@ spec:
   node only if it is a character device that is there, whoever wrote the Device. One path that
   is not (or is missing, an unplugged camera or a driver not yet loaded) stops the unit, and
   its status says which Device and path.
-  The kernel subsystems refused, read from `/sys/dev/char`, are `scsi_generic`, `bsg`, `nvme`,
-  `nvme-generic`, `mtd`, `msr`, `dax`, `ubi`, `ublk-char`, `vfio`, `i2c-dev`, `nvram`, `cpuid`,
-  `mei` and `watchdog`, and so is char major 21 (sg). Where `/sys/dev/char` is there and a
-  node's subsystem cannot be read, the node is refused too. This is a list of what to refuse,
-  not of what to allow: a Device is set by the admin for hardware no list could name, and an
-  allowlist would break it.
+  The kernel subsystems refused are `scsi_generic`, `bsg`, `nvme`, `nvme-generic`, `mtd`,
+  `tpm`, `tpmrm`, `msr`, `dax`, `ubi`, `ublk-char`, `vfio`, `i2c-dev`, `nvram`, `cpuid`, `mei`, `watchdog`,
+  `vfio-dev`, `uio`, `spidev`, `ipmi`, `usbmon` and `drm_dp_aux` (read from `/sys/dev/char`),
+  and so are char major 21 (sg) and the misc nodes the kernel reports only as `misc`: nvram
+  (10:144), watchdog (10:130), vfio (10:196) and mcelog (10:227). Where `/sys/dev/char` is there
+  and a node's subsystem cannot be read, the node is refused too. This is a list of what to
+  refuse, not of what to allow: a Device is set by the admin for hardware no list could name,
+  and an allowlist would break it. Given on purpose:
+  - `/dev/kvm` (10:232) is given: VM workloads need it.
+  - `hidraw` nodes are given: security keys and gamepads are such devices.
+  - `/dev/loop-control` (10:237) is given: it does nothing without a block device, which is never granted.
+  - `userfaultfd` is given: it is a syscall, not a node a Device grants.
+  - `/dev/hwrng` (10:183) is given: it only reads random bytes.
 - **On kith OS** a device filter on each container's cgroup checks every open and `mknod`: it
   lets through the usual few, the terminals of the container's own `/dev/pts` and each device it
   was given, and refuses the rest, even to a root pod. A pod that made its own node

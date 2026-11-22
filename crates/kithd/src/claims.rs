@@ -525,7 +525,7 @@ fn in_dev(p: &str) -> bool {
 /// access to a disk, flash, a TPM, persistent or physical memory, a bus or the CPU's registers;
 /// their majors are not fixed. (A list to deny, not one to allow: a Device is set by the admin
 /// for hardware no list could name, so an allowlist would break it.)
-const RAW_SUBSYSTEMS: [&str; 17] = [
+const RAW_SUBSYSTEMS: [&str; 23] = [
     "scsi_generic",
     "bsg",
     "nvme",
@@ -543,6 +543,12 @@ const RAW_SUBSYSTEMS: [&str; 17] = [
     "cpuid",
     "mei",
     "watchdog",
+    "vfio-dev",
+    "uio",
+    "spidev",
+    "ipmi",
+    "usbmon",
+    "drm_dp_aux",
 ];
 
 /// Why the character device `major:minor` may not be given: it is raw memory, the kernel's log,
@@ -552,8 +558,13 @@ const RAW_SUBSYSTEMS: [&str; 17] = [
 fn denied(major: u64, minor: u64, sys: &Path) -> Option<&'static str> {
     const RAW: &str =
         "is raw memory, the kernel's log, or raw access to a disk, flash, a TPM or a bus, which no Device gives";
-    // 1:1 mem, 1:2 kmem, 1:4 port, 1:11 kmsg, 1:12 oldmem, 10:224 tpm0, 10:236 mapper/control, 21 sg
-    if matches!((major, minor), (1, 1 | 2 | 4 | 11 | 12) | (10, 224 | 236) | (21, _)) {
+    // 1:1 mem, 1:2 kmem, 1:4 port, 1:11 kmsg, 1:12 oldmem, 10:224 tpm0, 10:236 mapper/control,
+    // 21 sg; and misc nodes whose subsystem is just "misc": 10:144 nvram, 10:130 watchdog,
+    // 10:196 vfio, 10:227 mcelog. (10:183 hwrng, 10:232 kvm and 10:237 loop-control are given.)
+    if matches!(
+        (major, minor),
+        (1, 1 | 2 | 4 | 11 | 12) | (10, 130 | 144 | 196 | 224 | 227 | 236) | (21, _)
+    ) {
         return Some(RAW);
     }
     let link = sys.join(format!("dev/char/{major}:{minor}/subsystem"));
@@ -1419,10 +1430,76 @@ spec: { node: b, devices: [b-usb0] }
             "cpuid",
             "mei",
             "watchdog",
+            "vfio-dev",
+            "uio",
+            "spidev",
+            "ipmi",
+            "usbmon",
+            "drm_dp_aux",
         ] {
             assert!(RAW_SUBSYSTEMS.contains(&new), "{new}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// nvram, watchdog, vfio's container node and mcelog report the subsystem `misc` on real
+    /// kernels, so they are denied by number; the other misc nodes that are allowed on purpose
+    /// (hwrng, kvm, loop-control) and hidraw and userfaultfd stay given.
+    #[test]
+    fn misc_nodes_that_reach_raw_hardware_are_denied_by_number() {
+        let root = sys("misc-numbers");
+        let links = root.join("dev/char");
+        let nodes = [
+            (10, 144, "misc", true),  // nvram
+            (10, 130, "misc", true),  // watchdog
+            (10, 196, "misc", true),  // vfio
+            (10, 227, "misc", true),  // mcelog
+            (10, 183, "misc", false), // hwrng
+            (10, 232, "misc", false), // kvm
+            (10, 237, "misc", false), // loop-control
+            (10, 200, "misc", false), // a misc node nobody denies (userfaultfd is one)
+            (241, 0, "hidraw", false),
+        ];
+        for (major, minor, subsystem, refused) in nodes {
+            let dir = links.join(format!("{major}:{minor}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::os::unix::fs::symlink(format!("../../../class/{subsystem}"), dir.join("subsystem")).unwrap();
+            assert_eq!(
+                denied(major, minor, &root).is_some(),
+                refused,
+                "{major}:{minor} {subsystem}"
+            );
+        }
+        for allowed in ["kvm", "hidraw", "loop-control", "userfaultfd"] {
+            assert!(!RAW_SUBSYSTEMS.contains(&allowed), "{allowed}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The subsystems the two docs name as refused are the constant's, no more and no fewer: the
+    /// list runs from "kernel subsystems" to the " (read" that follows it.
+    #[test]
+    fn the_docs_name_the_refused_subsystems_the_code_has() {
+        for (doc, text) in [
+            ("SECURITY.md", include_str!("../../../SECURITY.md")),
+            (
+                "docs/guide/hardware.md",
+                include_str!("../../../docs/guide/hardware.md"),
+            ),
+        ] {
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let from = flat
+                .find("kernel subsystems")
+                .unwrap_or_else(|| panic!("{doc}: no list"));
+            let list = &flat[from..];
+            let list = &list[..list.find(" (read").unwrap_or_else(|| panic!("{doc}: list unended"))];
+            let named: Vec<&str> = list.split('`').skip(1).step_by(2).collect();
+            let mut want = RAW_SUBSYSTEMS.to_vec();
+            want.sort_unstable();
+            let mut got = named.clone();
+            got.sort_unstable();
+            assert_eq!(got, want, "{doc}");
+        }
     }
 
     /// A made-up `/sys` with a render node for `card0`.
