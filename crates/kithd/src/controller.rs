@@ -1536,6 +1536,7 @@ impl Controller {
                 seat,
                 classes,
                 dmem,
+                refused: unusable,
             } = granted.get(&key).cloned().unwrap_or_default();
             let allowed = !claimed || (resource.kind != "NodeWorkload" && granted.contains_key(&key));
             // What this node's own policy refuses of it is not run here, whoever wrote it and
@@ -1546,6 +1547,8 @@ impl Controller {
                 !crate::vm::pci(&devices).is_empty(),
                 resource.kind == "NodeWorkload",
             );
+            // A Device node that is not there or may not be given: not run without it, and said.
+            refused.extend(unusable);
             let kept = |(name, class): &&(String, kith_api::kinds::DeviceClass)| {
                 !node_policy.device(class) || found.as_ref().is_some_and(|found| !found.contains(name))
             };

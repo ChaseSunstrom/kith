@@ -185,6 +185,22 @@ Only the newest version is fixed. There are no security releases of older ones.
   and kithd can hand the dmem controller down: the kernel then keeps the container's use
   of that GPU's memory under the share (`dmem.max`). Elsewhere it is a count the scheduler
   keeps, and a container that takes more is not stopped.
+  A Device cannot grant raw memory or a block device, whoever wrote it: when kithd hands nodes
+  to a container it stats each path (links not followed) and gives the Device's nodes only if
+  all are character devices that are there and not mem, kmem, port, kmsg, oldmem, the
+  device-mapper's control, a TPM, sg (major 21), the misc nodes nvram, watchdog, vfio and
+  mcelog, snapshot, cpu/microcode and hpet (10:144, 10:130, 10:196, 10:227, 10:231, 10:184,
+  10:228: the kernel reports them only as `misc`), or of the
+  kernel subsystems `scsi_generic`,
+  `bsg`, `nvme`, `nvme-generic`, `mtd`, `tpm`, `tpmrm`, `msr`, `dax`, `ubi`, `ublk-char`, `vfio`, `i2c-dev`,
+  `nvram`, `cpuid`, `mei`, `watchdog`, `vfio-dev`, `uio`, `spidev`, `ipmi`, `usbmon` or
+  `drm_dp_aux` or `drm_dp_aux_dev` (read from `/sys/dev/char`; where that is there and a
+  node's subsystem cannot be read the node is refused, and with no `/sys/dev/char` at all only
+  the fixed numbers are known). This is a denylist, not an allowlist, because a Device is set
+  by the admin for hardware no list could name. A block device, a file, a link or a missing node grants nothing, and the
+  workload is not run, its status saying which Device and path. Other character devices that
+  reach hardware (a USB or PCI node, `/dev/input`, `/dev/dri`) are what a Device is for and are
+  given.
   A device node a unit was given (an exclusive Device's, most of all) is not given to another
   unit while the unit that had it still runs: a unit whose stop failed with processes left
   keeps its devices and its name, its stop is retried at a later pass and no more often than
