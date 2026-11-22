@@ -469,8 +469,7 @@ fn node_disk_list_asks_its_route_and_shows_the_disks() {
     );
     assert_eq!(listed.status.code(), Some(0), "{err}");
     assert_eq!(
-        out,
-        "data disks:\n  sdb  open  id ab12\nleft alone:\n  sda  holds the system\n",
+        out, "data disks:\n  sdb  open  id ab12\nleft alone:\n  sda  holds the system\n",
         "{err}"
     );
     let refused = run(&["node", "disk", "list", "n1"]);
@@ -479,6 +478,8 @@ fn node_disk_list_asks_its_route_and_shows_the_disks() {
     assert!(err.contains("not running as the machine's init"), "{err}");
     let seen = server.join().unwrap();
     assert!(seen.iter().all(|l| l.starts_with("GET /v1/disks/n1 ")), "{seen:?}");
+}
+
 /// A fake carrier (what `waypipe client` is to `kith run`) that writes its pid beside itself,
 /// listens on the socket it is given, takes the connection and then does `after`; and a fake
 /// kithd that answers `101` to the ask and then holds the tunnel (`hold`) or closes it. Starts
