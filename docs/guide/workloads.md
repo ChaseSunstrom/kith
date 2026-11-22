@@ -529,11 +529,11 @@ kith machine rm dev              # its Jobs and the Workload; the home Volume st
   `rm --purge` leaves the home when another Workload or Job mounts it. `rm` can be run again
   to finish what stopped midway.
 - **A command** is `kith machine run`, which runs a Job of its own with the machine's container
-  and mount (there is no interactive shell yet); read it with `kith logs job NAME-run-N -f`. The
+  and mount (an interactive `machine shell` comes with T-1243); read it with `kith logs job NAME-run-N -f`. The
   machine's own container only sleeps.
-- **Not yet.** There is no way into a running container, so no interactive `shell`; `sudo` does
-  not work, since a container has `no_new_privs` and a setuid program is an ordinary program;
-  `userNamespaces: true` is not set. Your real home is not mounted: an absolute host path is a
+- **Not yet.** The way into a running container is the web UI's Terminal tab (`GET
+  /v1/exec/NAMESPACE/POD`); an interactive `machine shell` and `sudo` come with T-1243 (a container
+  has `no_new_privs`, so a setuid program is an ordinary program, and `userNamespaces: true` is not set). Your real home is not mounted: an absolute host path is a
   `kith-system` Volume, which cannot be replicated, so the machine's home is its own. No images
   built from a spec, no dotfile sync, no ports opened, no snapshots.
 

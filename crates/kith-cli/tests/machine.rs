@@ -139,6 +139,10 @@ fn machine_create_never_overwrites_what_is_not_its_own() {
     assert_eq!(code, 2);
     assert!(err.contains("other settings"), "{err}");
     assert!(sb.kith(&args("dev", "alpine")).1.contains("unchanged"));
+    // Another home, the Volume kept: named, and what changes it says it deletes.
+    let (code, _, err) = sb.kith(&["machine", "create", "dev", "--node", "alpha", "--distro", "alpine", "--replicas", "3"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("dev-home") && err.contains("rm dev --purge") && err.contains("data"), "{err}");
     // A home that is copied nowhere is not what a machine is.
     let (code, _, err) = sb.kith(&["machine", "create", "one", "--replicas", "1", "--node", "alpha"]);
     assert_eq!(code, 2);
@@ -170,6 +174,8 @@ fn machine_lifecycle_lists_runs_and_removes() {
     let (_, jobs, _) = sb.kith(&["get", "job"]);
     let job = jobs.lines().find(|l| l.contains("dev-run-")).expect("a Job");
     let name = job.split_whitespace().nth(2).unwrap();
+    // A command that fails is not run again behind the user's back.
+    assert_eq!(sb.json(&format!("job/{name}"))["spec"]["retries"], 0);
     let c = &sb.json(&format!("job/{name}"))["spec"]["template"]["containers"][0];
     assert_eq!(c["command"], serde_json::json!(["make", "index"]));
     assert_eq!(c["volumeMounts"][0]["volume"], "dev-home");
@@ -193,8 +199,9 @@ fn machine_lifecycle_lists_runs_and_removes() {
     assert_eq!(sb.kith(&["delete", "workload/other"]).0, 0);
 
     // rm takes the machine and its Jobs, and keeps the home unless told.
-    let (code, _, err) = sb.kith(&["machine", "rm", "dev"]);
+    let (code, out, err) = sb.kith(&["machine", "rm", "dev"]);
     assert_eq!(code, 0, "{err}");
+    assert!(out.contains("dev-home") && out.contains("--purge"), "{out}");
     let (_, workloads, _) = sb.kith(&["get", "workload"]);
     assert!(workloads.contains("web") && !workloads.contains("dev"), "{workloads}");
     assert!(!sb.kith(&["get", "job"]).1.contains("dev-run-"));
@@ -231,4 +238,60 @@ fn machine_user_is_the_caller_never_root_and_the_home_is_theirs() {
         sb.json("workload/dev")["spec"]["template"]["containers"][0]["runAsUser"],
         0
     );
+}
+
+/// A read kithd refuses (403) is an error, not "no such resource": nothing is written over what
+/// could not be read, and no Volume is called deleted that was skipped.
+#[test]
+fn machine_get_error_is_not_absent() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    if caller() == 0 {
+        return;
+    }
+    let sb = Sandbox::new("machine_get_error");
+    let socket = sb.0.join("kithd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut line = String::new();
+            let mut reader = BufReader::new(&stream);
+            reader.read_line(&mut line).unwrap();
+            log.lock().unwrap().push(line.trim().to_string());
+            // The cluster is open (a write would go through unsigned); every resource read is refused.
+            let (status, body) = if line.contains("/v1/cluster") {
+                ("200 OK", r#"{"signing":"open"}"#)
+            } else {
+                ("403 Forbidden", r#"{"error":"denied by role"}"#)
+            };
+            let mut stream = &stream;
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    for args in [
+        &["machine", "create", "dev", "--node", "alpha"][..],
+        &["machine", "rm", "dev", "--purge"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_kith"))
+            .args(args)
+            .env_remove("KITH_STORE")
+            .env("KITH_SOCKET", &socket)
+            .env("HOME", &sb.0)
+            .env("USER", "ada")
+            .output()
+            .unwrap();
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains("denied by role"), "{err}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("deleted"));
+    }
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().all(|l| l.starts_with("GET ")), "only reads were sent: {seen:?}");
 }
