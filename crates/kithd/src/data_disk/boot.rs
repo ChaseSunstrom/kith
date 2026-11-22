@@ -104,7 +104,7 @@ pub fn missing(state: &Path, seen: &[Id]) -> Vec<Gone> {
 }
 
 /// The id of the disk when it is a known one (opened or not).
-fn id_of(what: &What) -> Option<&Id> {
+pub fn id_of(what: &What) -> Option<&Id> {
     match what {
         What::Mounted(id) | What::Failed(id, _) => Some(id),
         _ => None,
@@ -205,6 +205,40 @@ fn open_unless_abandoned(
 /// The disks mounted, as (kernel name, mount point): what [`close`] lets go of.
 static OPEN_NOW: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
 
+/// `name` (a kernel name) is mounted at `at` now: [`close`] lets go of it. The verbs' add does this
+/// for the disk it mounts after the start's scan has run.
+pub fn keep(name: &str, at: &Path) {
+    let mut open = OPEN_NOW.lock().unwrap_or_else(|e| e.into_inner());
+    open.retain(|(kept, _)| kept != name);
+    open.push((name.to_string(), at.to_path_buf()));
+}
+
+/// Forget that `name` is mounted (the verbs' remove unmounted it).
+pub fn forget_open(name: &str) {
+    OPEN_NOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(kept, _)| kept != name);
+}
+
+/// Whether `name` is mounted by this kithd.
+pub fn is_open(name: &str) -> bool {
+    OPEN_NOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(kept, _)| kept == name)
+}
+
+/// The disks this machine could use for data: every one besides the one it runs from (and the one
+/// the state is on), and a stick. What the scan at start and `list` look at.
+pub fn offered(verity: bool, ours: Option<&str>, state_disk: Option<&str>) -> Vec<Disk> {
+    crate::install::disks(Path::new("/sys/block"), ours)
+        .into_iter()
+        .filter(|disk| !disk.removable && off_ours(verity, ours, state_disk, &disk.name))
+        .collect()
+}
+
 /// Unmount the data disks and remove their mappings: before the state is unmounted (they are
 /// mounted under it), at the end of the machine's run. Each is tried, and one that is busy is said.
 pub fn close() {
@@ -225,13 +259,10 @@ pub async fn run(state: PathBuf) {
     if !crate::init::is_init() {
         return;
     }
+    // (A disk verb and this scan would race for the mappings and the state's `disks/`.)
+    let _turn = super::verbs::wait().await;
     let (verity, ours, state_disk) = crate::init::whose_disks();
-    #[cfg(feature = "disk-test")]
-    test_hook::from_cmdline(&state, ours.as_deref());
-    let disks: Vec<Disk> = crate::install::disks(Path::new("/sys/block"), ours.as_deref())
-        .into_iter()
-        .filter(|disk| !disk.removable && off_ours(verity, ours.as_deref(), state_disk.as_deref(), &disk.name))
-        .collect();
+    let disks = offered(verity, ours.as_deref(), state_disk.as_deref());
     let mut tasks = tokio::task::JoinSet::new();
     // The ids opened so far: one id is one disk, a second disk with it (a copy) is not opened.
     let claimed = Arc::new(Mutex::new(HashSet::new()));
@@ -283,56 +314,6 @@ pub async fn run(state: PathBuf) {
     let gone = missing(&state, &ids);
     eprintln!("{}", line(&seen, &gone));
     let _ = SAID.set(status(&seen, &gone));
-}
-
-/// The disk-test build's one way to make a data disk before the add verb exists (T-0958): the
-/// word `kith.disk-add=SERIAL` on the kernel's command line adds the disk of that serial
-/// (quickly: a discard, not zeros), and lets go of its mapping, so the scan after it mounts it as
-/// it does at any start. It goes through the same refusals as the verb will.
-#[cfg(feature = "disk-test")]
-mod test_hook {
-    use super::*;
-    use crate::data_disk::{AddError, Mapper, Root, add, seed::Real};
-
-    pub fn from_cmdline(state: &Path, ours: Option<&str>) {
-        let Some(serial) = std::fs::read_to_string("/proc/cmdline").ok().and_then(|line| {
-            line.split_whitespace()
-                .find_map(|word| word.strip_prefix("kith.disk-add=").map(str::to_string))
-        }) else {
-            return;
-        };
-        eprintln!(
-            "kithd: built with disk-test: adding the disk with serial {serial} from the command line; never ship this"
-        );
-        let disks = crate::install::disks(Path::new("/sys/block"), ours);
-        let found = match crate::install::by_serial(&serial, &disks) {
-            Ok(found) => found,
-            Err(why) => return eprintln!("kithd: disk-test: {why}"),
-        };
-        let Some(root) = ours.and_then(Root::new) else {
-            return eprintln!("kithd: disk-test: this system's own disk is not known");
-        };
-        let (Some(disk), Some(own)) = (
-            RealDisk::new(&found.name, found.removable),
-            RealDisk::new(&found.name, found.removable),
-        ) else {
-            return;
-        };
-        if let Err(e) = disk.unheld() {
-            eprintln!("kithd: disk-test: {} is held by something else: {e}", found.name);
-            return;
-        }
-        let mut mapper = Real::new(own, None);
-        match add(state, &disk, Some(&root), &serial, (false, true), &mut mapper) {
-            Ok(id) => eprintln!("kithd: disk-test: added {} as {}", found.name, crate::pki::hex(&id)),
-            Err(AddError::Added) => eprintln!("kithd: disk-test: {} is added already", found.name),
-            Err(e) => eprintln!("kithd: disk-test: not added: {e:?}"),
-        }
-        // (The mapping `add` leaves open is the scan's to make again, from its key.)
-        if let Err(e) = mapper.unmap() {
-            eprintln!("kithd: disk-test: unmapping it: {e}");
-        }
-    }
 }
 
 #[cfg(test)]

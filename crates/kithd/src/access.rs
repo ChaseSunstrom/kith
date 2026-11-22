@@ -178,6 +178,8 @@ impl Grants {
 /// is named here: name it once its handler asks [`Grants`].
 const FOR_IDENTITIES: [&str; 28] = [
     "/v1/duress",
+    // (A second disk's verbs, data_disk/verbs.rs: asked as a NodeKey is, like /v1/lock.)
+    "/v1/disks",
     "/v1/peers",
     "/v1/backups",
     "/v1/blobs",

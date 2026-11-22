@@ -109,6 +109,9 @@ impl Dev for RealDisk {
     }
     fn write_first(&self, room: &[u8; ROOM]) -> io::Result<()> {
         // (Not exclusive: the header is written with the mapping open, which holds the disk.)
+        // ponytail: the path is opened again here, after the core read the disk through it: a disk
+        // pulled and another put in its name between the two is written (docs/adr-second-disk.md,
+        // "Known limits"). Closing it takes one handle through read, check and write.
         let disk = File::options()
             .write(true)
             .custom_flags(nix::fcntl::OFlag::O_SYNC.bits())
@@ -215,6 +218,9 @@ impl Mapper for Real {
                 Ok(()) | Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT) => {}
                 Err(e) => return Err(e.into()),
             }
+            // The mount is gone: the disk is not open now, whatever the mapping's removal says
+            // next (it may be busy, and a second remove goes on from here).
+            super::boot::forget_open(&self.disk.name);
         }
         match kith_dm_sys::remove(&self.name()) {
             Ok(()) => Ok(()),

@@ -147,7 +147,7 @@ in it). A node that also has an AMD Phoenix GPU wants `all` alone, which build.s
 KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
 KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
 sh ci/vm.sh --test modules   # the same image: drivers load at start, on a device added, and a bad signature is refused
-sh ci/vm.sh --test disk      # a disk file made a data disk (a build with the feature disk-test) and mounted; another file left alone, unchanged
+sh ci/vm.sh --test disk      # kith node disk add on a disk file, mounted after a restart and listed, removed; a file with a signature refused, another file left alone
 ```
 
 For a node whose hardware is not known when the image is built, `features: [all]` turns on
