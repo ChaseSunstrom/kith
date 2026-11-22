@@ -101,7 +101,7 @@
             hears alpha 'kithd: netboot: on for 10 minutes'
 
             beta() { # LOG [disk]: the machine: an empty disk at first, and its card, which it starts from (or: from its disk)
-                vm "$1" -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device "virtio-blk-pci,drive=d${2+,bootindex=0}" \
+                vm "$1" -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device "virtio-blk-pci,drive=d${2+,bootindex=0}${2-,bootindex=2}" \
                     -netdev "socket,id=n,connect=127.0.0.1:$((port + 8))" -device "virtio-net-pci,netdev=n,mac=$mac${2-,bootindex=1}"
             }
             blank beta
