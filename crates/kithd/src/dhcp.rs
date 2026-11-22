@@ -152,6 +152,12 @@ pub fn socket(card: &str, port: u16) -> Result<UdpSocket> {
 /// How many DISCOVERs [`ask`] sends, a second apart, before it gives up on an OFFER.
 const DISCOVERS: u32 = 4;
 
+/// Whether `got` is told of a lease the card has: it is new, or its router became the node's
+/// way out (`now`) when it was not (`routed`) at the last one.
+fn tell(changed: bool, now: bool, routed: bool) -> bool {
+    changed || (now && !routed)
+}
+
 /// Whether to send the DISCOVER again: nothing was heard (the wait ran out) and fewer than
 /// [`DISCOVERS`] have been sent. Any other error, or an answer, is the end of it.
 fn resend(heard: &Result<Lease>, sent: u32) -> bool {
@@ -257,7 +263,7 @@ pub async fn keep(
     way: impl Fn() -> bool,
     admit: impl Fn(&Lease) -> Result<()>,
 ) {
-    let (mut wait, mut had) = (1, None);
+    let (mut wait, mut had, mut routed) = (1, None, false);
     loop {
         let lease = ask(&card, &hostname).await.and_then(|lease| {
             admit(&lease)?;
@@ -266,13 +272,20 @@ pub async fn keep(
         });
         let pause = match lease {
             Ok(lease) => {
-                if had.as_ref() != Some(&lease) {
+                let changed = had.as_ref() != Some(&lease);
+                if changed {
                     eprintln!(
                         "kithd: init: {} has {}/{} by DHCP",
                         card.name, lease.address, lease.bits
                     );
+                }
+                // (The same lease is told again when its router is the node's way out now:
+                // the card that was is gone, and what this one gave was not taken.)
+                let now = lease.router.is_some() && way();
+                if tell(changed, now, routed) {
                     got(&lease);
                 }
+                routed = now;
                 wait = 1;
                 let pause = (lease.secs / 2).clamp(30, 86_400);
                 had = Some(lease);
@@ -294,6 +307,17 @@ pub async fn keep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_dhcp_an_unchanged_lease_is_told_again_when_its_router_becomes_the_way_out() {
+        assert!(tell(true, false, false));
+        assert!(!tell(false, false, false));
+        // The card that was the way out went: this one's router may be it now.
+        assert!(tell(false, true, false));
+        assert!(!tell(false, true, true));
+        // Not again when it was the way out and is no longer only because it took it itself.
+        assert!(!tell(false, false, true));
+    }
 
     #[test]
     fn init_dhcp_discover_is_sent_again_only_when_nothing_was_heard_and_tries_are_left() {

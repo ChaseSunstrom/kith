@@ -24,8 +24,8 @@ As process 1, kithd:
   169.254/16) that overlaps no route the node has; a lease of another is refused and said so.
   The card that had `kith.ip`, plugged in again, gets that address, not a lease. A veth,
   bridge or tunnel that kithd makes is never asked. (The kernel has PCIe hot-plug, so a card
-  put in a slot of a running machine appears; the IOMMU is off by default, so a PCIe or
-  ExpressCard device plugged into a running machine can read all its memory.) IPv6 on a link is the
+  put in a slot of a running machine appears; on Intel the IOMMU is off by default, so a PCIe or
+  ExpressCard device plugged into a running machine can read all its memory there.) IPv6 on a link is the
   kernel's (router advertisements); there is no DHCPv6;
 - keeps the time: a machine has no clock battery to trust, so after the network is up kithd asks
   an SNTP server for the time at start and every hour, and sets the clock when it is more than

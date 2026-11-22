@@ -751,6 +751,7 @@ impl Boot {
         let mut asking = std::collections::HashMap::new();
         for card in self.asking {
             let index = card.index;
+            waiting().push(index);
             let keep = crate::dhcp::keep(
                 card,
                 self.name.clone(),
@@ -852,7 +853,10 @@ fn took(has: Has, may: Has, gave: Has) -> Has {
 /// `index` is the card's: what it gave is kept under it, for when it is unplugged.
 fn got(told: Option<IpAddr>, late: bool, index: u32) -> impl Fn(&crate::dhcp::Lease) + Send + 'static {
     move |lease| {
-        if sets_address(late, ADDRESS.get().is_some()) {
+        if !late {
+            waiting().retain(|card| *card != index);
+        }
+        if sets_address(late, ADDRESS.get().is_some(), !waiting().is_empty()) {
             let _ = ADDRESS.set(lease.address);
         }
         let servers: Vec<IpAddr> = match told {
@@ -878,10 +882,29 @@ fn got(told: Option<IpAddr>, late: bool, index: u32) -> impl Fn(&crate::dhcp::Le
     }
 }
 
+/// The cards of the boot that ask by DHCP and have no lease yet (or are gone).
+static WAITING: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+fn waiting() -> std::sync::MutexGuard<'static, Vec<u32>> {
+    WAITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Whether a lease sets the address the node tells the cluster it has ([`ADDRESS`], once):
-/// any card of the boot does, a card that came after it only when none has yet.
-fn sets_address(late: bool, set: bool) -> bool {
-    !late || !set
+/// any card of the boot does, a card that came after it only when none has yet and no card
+/// of the boot is still asking (its lease, a moment later, is the node's address, not a
+/// rogue card's).
+fn sets_address(late: bool, set: bool, boot_asking: bool) -> bool {
+    !late || (!set && !boot_asking)
+}
+
+/// What the card that the command line gave an address supplies: its gateway is the way out
+/// (and a time server), and `--dns` the name servers.
+fn fixed_gave(gateway: Option<Ipv4Addr>, dns: bool) -> Has {
+    Has {
+        way: gateway.is_some(),
+        dns,
+        ntp: gateway.is_some(),
+    }
 }
 
 /// May a lease of a card that came after the boot set the default route?
@@ -1012,6 +1035,7 @@ async fn rescan(
         for index in gone(&seen, &found) {
             seen.retain(|seen| *seen != index);
             held().forget(index);
+            waiting().retain(|card| *card != index);
             if let Some(task) = asking.remove(&index) {
                 task.abort();
             }
@@ -1028,10 +1052,14 @@ async fn rescan(
             seen.push(card.index);
             if let Some((address, bits, gateway)) = fixed_for(&card, &found, fixed) {
                 match kith_mesh::address4(card.index, address, bits, gateway) {
-                    Ok(()) => eprintln!(
-                        "kithd: init: {} came after boot: it has {address}/{bits} from the command line",
-                        card.name
-                    ),
+                    Ok(()) => {
+                        // (What it supplies is the node's again: held() was cleared when it went.)
+                        held().add(card.index, fixed_gave(gateway, dns.is_some()));
+                        eprintln!(
+                            "kithd: init: {} came after boot: it has {address}/{bits} from the command line",
+                            card.name
+                        );
+                    }
                     Err(e) => {
                         // (Not seen: the next scan gives it again.)
                         seen.retain(|seen| *seen != card.index);
@@ -1079,12 +1107,7 @@ fn links(options: &Options) -> (Vec<kith_mesh::Card>, Vec<u32>, Option<Fixed>) {
             Err(e) => eprintln!("kithd: init: giving {} {address}/{bits}: {e}", card.name),
         }
         resolvers(&options.dns.into_iter().collect::<Vec<_>>());
-        let gave = Has {
-            way: gateway.is_some(),
-            dns: options.dns.is_some(),
-            ntp: gateway.is_some(),
-        };
-        held().add(card.index, gave);
+        held().add(card.index, fixed_gave(gateway, options.dns.is_some()));
         let fixed = Fixed {
             mac: card.mac,
             ip: (address, bits, gateway),
@@ -1599,10 +1622,37 @@ mod tests {
 
     #[test]
     fn init_a_late_card_may_not_name_the_node_before_a_boot_card_does() {
-        assert!(sets_address(false, true));
-        assert!(sets_address(false, false));
-        assert!(sets_address(true, false));
-        assert!(!sets_address(true, true));
+        // (late, set already, a boot card still asking)
+        assert!(sets_address(false, true, true));
+        assert!(sets_address(false, false, true));
+        assert!(sets_address(true, false, false));
+        assert!(!sets_address(true, true, false));
+        // The boot card has no lease yet: the late card's is not the node's address.
+        assert!(!sets_address(true, false, true));
+    }
+
+    #[test]
+    fn init_a_replugged_fixed_card_is_the_way_out_again() {
+        let gateway = Some(Ipv4Addr::new(10, 9, 0, 254));
+        let mut held = Held::default();
+        held.add(1, fixed_gave(gateway, false));
+        assert!(!may(true, held.all()).way);
+        // Unplugged, replugged: set again, and a late card may not take the route from it.
+        held.forget(1);
+        assert!(may(true, held.all()).way);
+        held.add(1, fixed_gave(gateway, false));
+        assert!(!may(true, held.all()).way);
+        assert!(!may(true, held.all()).ntp);
+        assert!(may(true, held.all()).dns);
+        // With no gateway it supplies nothing of the way out.
+        assert_eq!(
+            fixed_gave(None, true),
+            Has {
+                way: false,
+                dns: true,
+                ntp: false
+            }
+        );
     }
 
     #[test]
