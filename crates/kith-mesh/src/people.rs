@@ -600,7 +600,7 @@ fn set_mark(mark: u32) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::pod::has_table;
 
@@ -936,7 +936,7 @@ mod tests {
     }
 
     /// A netfilter message's attributes, as (kind, payload), in order.
-    type Attributes = Vec<(u16, Vec<u8>)>;
+    pub(crate) type Attributes = Vec<(u16, Vec<u8>)>;
 
     /// The attributes of one netfilter message.
     fn attributes(mut rest: &[u8]) -> Attributes {
@@ -955,7 +955,7 @@ mod tests {
 
     /// Every message of a netfilter dump of `kind` (a GET), each one's attributes, in the
     /// kernel's order: the table's chains are listed in the order they were made.
-    fn dump(kind: u16) -> std::io::Result<Vec<Attributes>> {
+    pub(crate) fn dump(kind: u16) -> std::io::Result<Vec<Attributes>> {
         // (A dump request: the nfgenmsg's family, INET; the flags, a request that dumps.)
         let mut request = Vec::new();
         request.extend(20u32.to_ne_bytes());
@@ -1000,7 +1000,7 @@ mod tests {
     }
 
     /// The name in `message`'s attribute `kind`, NUL-terminated as nftables has it.
-    fn name_of(message: &[(u16, Vec<u8>)], kind: u16) -> Option<String> {
+    pub(crate) fn name_of(message: &[(u16, Vec<u8>)], kind: u16) -> Option<String> {
         let (_, name) = message.iter().find(|(k, _)| *k == kind)?;
         Some(String::from_utf8_lossy(name).trim_end_matches('\0').to_string())
     }
