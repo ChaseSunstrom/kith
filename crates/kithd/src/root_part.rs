@@ -912,12 +912,12 @@ pub fn usage(pod: &str) -> Option<(u64, u64, u64)> {
 // ponytail: not a request of the `Root` trait (the ADR names `Exec(id, argv, tty)`): as the one
 // part of kithd that is root or the node's user, kithd enters it in its own process, and the
 // trait takes it when a root part of its own does (then TTY too).
-pub fn enter(id: &str, argv: &[String]) -> Result<kith_runtime::Entered, String> {
+pub fn enter(id: &str, argv: &[String], options: kith_runtime::Options) -> Result<kith_runtime::Entered, String> {
     if !BOOK.units.lock().expect("nothing panics holding the book").contains(id) {
         return Err(format!("`{id}` is not a unit made here"));
     }
     let state = BOOK.state().ok_or("the state directory is not told yet")?;
-    kith_runtime::enter(&state.join("runtime"), id, argv).map_err(|e| e.to_string())
+    kith_runtime::enter_with(&state.join("runtime"), id, argv, options).map_err(|e| e.to_string())
 }
 
 /// This process's mesh interface, once it is up: one per node.

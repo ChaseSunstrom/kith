@@ -502,6 +502,56 @@ What each restart of the node costs:
   running process of a `vms` unit carried to another node) is a later, separate feature, and the
   costs above are for a container, not a VM.
 
+#### Dev machines
+
+`kith machine` writes [that recipe](#a-workload-that-outlives-its-node) for you: one Workload of
+one replica and a replicated home Volume, applied through the same call as `kith apply`. Nothing is
+new on kithd's side; `kith get workload/dev` shows the machine as it shows any Workload.
+
+```sh
+kith machine create dev --distro debian --node alpha   # debian, alpine, ubuntu or REGISTRY/NAME:TAG
+kith machine shell dev          # a shell in the running machine, on a terminal
+kith machine shell dev -- make -C project index   # or one command there; its exit code is kith's
+kith machine shell dev --root   # root of the machine's own user namespace, where it has one
+kith machine run dev -- sh -c 'cd project && make index'   # a Job in its image, as its user, on its home
+kith machine list
+kith machine rm dev              # its Jobs and the Workload; the home Volume stays unless --purge
+```
+
+- **Your user.** The container runs as your numeric user, read from the process and never 0: kith
+  as root is refused, and so is a `$HOME` that is not yours. Where kithd is your service that user
+  is yours on the node, and [its users](#what-a-container-is-kept-from) say what it is elsewhere.
+  Its `$HOME` is `/home/$USER` there; `$USER` falls back to `dev` when it is unset, has an
+  uppercase letter or is longer than 32 characters.
+- **Its home** is the Volume `NAME-home` with `replicas: 2` (`--replicas`, 2 or more, `sync: 10s`),
+  mounted at `/home/$USER`: the machine's own replicated Volume, not your host home. The node that
+  holds it first is `--node`, or the cluster's only node. When that node is lost the Volume's other
+  copy takes over and the Workload follows it, as above.
+- **Yours stays yours.** `create` refuses a Workload or Volume of that name that is not a machine's,
+  and a machine that exists with other settings (`rm` it first); the same settings are `unchanged`.
+  `rm --purge` leaves the home when another Workload or Job mounts it. `rm` can be run again
+  to finish what stopped midway.
+- **A shell** is `kith machine shell NAME`: a process in the running machine (bash where the image
+  has it, else `sh`; or the command after `--`) on a terminal of its own when kith's input and
+  output are terminals, so a full-screen program and `^C` work. The terminal is raw while it
+  runs and put back when it ends, also on a hangup or a kill; the window follows yours; the
+  command's exit code is kith's. With a pipe on either end it runs on pipes, with the standard
+  error apart. It is the same call as `kubectl exec -it`, so `--server` reaches a node as every
+  other kith command does, and the right it asks is `exec` on the machine's Workload.
+- **`--root`** is root of the machine's own user namespace and nothing more: it is refused, with
+  the reason, where uid 0 there would be the node's root or the user kithd runs as (a container
+  with no user namespace of its own, or a rootless kithd's). `--root` needs a machine with a user
+  namespace of its own (`userNamespaces: true`), and `kith machine create` does not make one
+  (that setting lets the calls a container is refused back), so today `--root` is refused with
+  that reason on every machine; it is not `sudo`.
+- **A command in a Job** is `kith machine run`, which runs a Job of its own with the machine's
+  container and mount; read it with `kith logs job NAME-run-N -f`. The machine's own container
+  only sleeps.
+- **Not yet.** `sudo` does not work, since a container has `no_new_privs` and a setuid program is
+  an ordinary program; `userNamespaces: true` is not set on a machine (so no `--root`). Your real home is not mounted: an absolute host path is a
+  `kith-system` Volume, which cannot be replicated, so the machine's home is its own. No images
+  built from a spec, no dotfile sync, no ports opened, no snapshots.
+
 ### What a container is given
 
 Files from a ConfigMap or a Secret, directories of its replica's own, what it is told from maps
