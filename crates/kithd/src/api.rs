@@ -445,7 +445,8 @@ fn writer(caller: &Caller) -> &Caller {
 }
 
 /// `resources` with each Release, Source, KindDefinition (its controller acts as the writer) and
-/// Package (a Release renders it with no more than its pusher's rights) written down as
+/// Package (a Release renders it with no more than its pusher's rights) and Repository (its
+/// credentials Secret is read with no more than its writer's rights) written down as
 /// `caller`'s, and, for an Identity, the print of the key it has in `store`: what the client
 /// said of either is not taken. (None, as the local socket's: it acts for no key.)
 pub(crate) fn stamped(store: &Store, caller: &Caller, mut resources: Vec<Resource>) -> Vec<Resource> {
@@ -457,7 +458,7 @@ pub(crate) fn stamped(store: &Store, caller: &Caller, mut resources: Vec<Resourc
     for resource in &mut resources {
         if matches!(
             resource.kind.as_str(),
-            "Release" | "Source" | "KindDefinition" | "Package"
+            "Release" | "Source" | "KindDefinition" | "Package" | "Repository"
         ) {
             let annotations = &mut resource.metadata.annotations;
             annotations.insert(crate::releases::WRITER.into(), who.to_string());

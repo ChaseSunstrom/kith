@@ -60,7 +60,7 @@ pub fn print_of(store: &Store, name: &str) -> Option<String> {
 /// one with the key it had then. One written down with no key, or another key (an Identity
 /// made again under that name, or given a new certificate), is not acted on. One that is
 /// not there is for the rights to say (it has none); the local socket has no key.
-fn same_writer(store: &Store, owner: &Resource, caller: &crate::access::Caller) -> Result<(), String> {
+pub(crate) fn same_writer(store: &Store, owner: &Resource, caller: &crate::access::Caller) -> Result<(), String> {
     let crate::access::Caller::Identity(name) = caller else {
         return Ok(());
     };

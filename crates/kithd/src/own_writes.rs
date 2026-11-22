@@ -549,9 +549,9 @@ fn owned(store: &Store, leads: bool, of: &str, resource: &Resource) -> Result<()
     }
     let writer = writer_of(store, of).map_err(|why| not_made(&key, why))?;
     within(store, of, resource).map_err(|why| not_made(&key, why))?;
-    // A Release, Source or Package says who wrote it and with what key, and what it renders says
+    // A Release, Source, Package or Repository says who wrote it and with what key, and what it renders says
     // what its owner says (`sources`): another would be written as a writer that is not its owner's.
-    if is(&resource.kind, &["Release", "Source", "Package"]) {
+    if is(&resource.kind, &["Release", "Source", "Package", "Repository"]) {
         use crate::releases::{KEY, WRITER};
         for note in [WRITER, KEY] {
             if resource.metadata.annotations.get(note) != writer.metadata.annotations.get(note) {

@@ -1293,6 +1293,15 @@ spec! {
         /// Key the repository's packages must be signed with.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub public_key: Option<String>,
+        /// The Secret whose `username` and `password` the registry is asked with (Basic, or
+        /// to its token service). Read as whoever applied the Repository may read it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub credentials: Option<RegistryCredentials>,
+    }
+
+    pub struct RegistryCredentials {
+        pub namespace: String,
+        pub secret: String,
     }
 
     /// Exactly one of `git` or `oci`.
