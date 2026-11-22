@@ -170,7 +170,7 @@ async fn make(shared: &Shared, state: &Path, job: &Job) -> Result<Value, String>
     }
     if !resources.is_empty() {
         let at = kith_api::store::now();
-        let applied = shared.write(Command::Apply { resources, at }).await;
+        let applied = crate::raft::as_node(shared.write(Command::Apply { resources, at })).await;
         applied.map_err(|e| e.to_string())?;
     }
     let [layer, config, manifest] = &pieces;
@@ -202,7 +202,7 @@ async fn forget(shared: &Shared, job: &Job, kept: &Value) {
                 .is_some_and(|blob| blob.metadata.annotations.contains_key(MADE));
             made && !crate::backups::listed(&state.store, &job.namespace, &job.key, blob)
         };
-        if ours && let Err(e) = shared.submit(Command::Delete { key: key.clone() }).await {
+        if ours && let Err(e) = shared.submit_node(Command::Delete { key: key.clone() }).await {
             eprintln!("kithd: image {}: {key} was not removed: {e}", job.key);
         }
     }

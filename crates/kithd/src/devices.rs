@@ -596,12 +596,12 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>, dmem:
         }
         if !resources.is_empty() {
             let at = kith_api::store::now();
-            if let Err(e) = shared.submit(Command::Apply { resources, at }).await {
+            if let Err(e) = shared.submit_node(Command::Apply { resources, at }).await {
                 eprintln!("kithd: devices: listing this node's hardware: {e}");
             }
         }
         for key in gone {
-            if let Err(e) = shared.submit(Command::Delete { key: key.clone() }).await {
+            if let Err(e) = shared.submit_node(Command::Delete { key: key.clone() }).await {
                 // (The rest wait for the next round: each would wait out the same trouble.)
                 eprintln!("kithd: devices: taking {key} away: {e}");
                 break;

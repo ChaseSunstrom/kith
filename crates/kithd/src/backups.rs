@@ -777,12 +777,11 @@ async fn make(shared: &Shared, state: &Path, job: &Job, at: u64) -> Result<Value
                 "spec": spec,
             });
             let resources = vec![serde_json::from_value(wanted).map_err(|e| e.to_string())?];
-            let applied = shared
-                .write(Command::Apply {
-                    resources,
-                    at: kith_api::store::now(),
-                })
-                .await;
+            let applied = crate::raft::as_node(shared.write(Command::Apply {
+                resources,
+                at: kith_api::store::now(),
+            }))
+            .await;
             applied.map_err(|e| e.to_string())?;
         }
         return Ok(json!({ "at": at, "size": size, "blob": blob }));
@@ -828,7 +827,7 @@ async fn forget(shared: &Shared, job: &Job, old: &Value) -> Result<(), String> {
         if !ours {
             return Ok(());
         }
-        return match shared.submit(Command::Delete { key }).await {
+        return match shared.submit_node(Command::Delete { key }).await {
             Ok(_) | Err(Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e.to_string()),
         };

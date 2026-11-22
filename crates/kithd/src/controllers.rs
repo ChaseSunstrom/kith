@@ -338,11 +338,13 @@ async fn carry_out(shared: &Shared, steps: Vec<Step>) -> Vec<String> {
         let mut done = Ok(());
         if !step.apply.is_empty() {
             let (resources, at) = (step.apply, kith_api::store::now());
-            done = shared.submit(Command::Apply { resources, at }).await.map(drop);
+            // (Signed by this node under `spec.signing: required`: every node holds each write to
+            // what the writer of the KindDefinition may, `own_writes`.)
+            done = shared.submit_node(Command::Apply { resources, at }).await.map(drop);
         }
         for key in step.delete {
             if done.is_ok() {
-                done = match shared.submit(Command::Delete { key }).await {
+                done = match shared.submit_node(Command::Delete { key }).await {
                     Ok(_) | Err(Error::NotFound(_)) => Ok(()),
                     Err(e) => Err(e),
                 };
