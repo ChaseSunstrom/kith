@@ -96,7 +96,7 @@ Every change made through a node, and every refusal (a missing certificate, or o
 stands for its Identity, too), is one line in its audit log (`audit.log` in its state directory,
 4 MB, and four older files `.1` to `.4`): when, who, what, how it went. `kith audit` shows the
 last lines, as does `GET /v1/audit` for an Identity with `get` on `Audit` (no custom kind may take
-that name). A watch ends when its Identity is deleted or given another certificate. Permission is
+that name). A watch, and a followed `kubectl logs -f`, ends when its Identity is deleted or given another certificate. Permission is
 asked again on the leader as an apply, delete or rollback is put in the log, so a RoleBinding
 deleted meanwhile stops it; a write already in the log stays.
 
