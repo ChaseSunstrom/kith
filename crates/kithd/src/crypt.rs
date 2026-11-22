@@ -99,6 +99,16 @@ use std::time::{Duration, Instant};
 pub const AT: u64 = 512 << 10;
 const ROOM: usize = 4096;
 const FIRST: &str = "kith-lock v1";
+/// The newest record format this build reads: the number in `FIRST`.
+const LOCK_FORMAT: u32 = 1;
+
+/// The format a room's first line names (`kith-lock v<N>`) when it is newer than [`LOCK_FORMAT`].
+fn newer_format(room: &[u8]) -> Option<u32> {
+    let digits = room.strip_prefix(b"kith-lock v")?;
+    let digits = &digits[..digits.iter().take_while(|byte| byte.is_ascii_digit()).count()];
+    let format = std::str::from_utf8(digits).ok()?.parse().unwrap_or(u32::MAX);
+    (!digits.is_empty() && format > LOCK_FORMAT).then_some(format)
+}
 /// What an erased lock record's room begins with (see `erase`).
 const TOMBSTONE: &[u8] = b"kith-lock erased\n";
 /// What [`Record::read`] says of an erased record: init powers off on it, as a restart would
@@ -550,6 +560,11 @@ impl Record {
         // (The copy, where a write was cut in the record: it was written first.)
         let said = &mut |line: &str| eprintln!("{line}");
         let parsed = Record::parse_said(record, said).or_else(|| Record::parse_said(copy, said));
+        // A record a newer kithd wrote (its first line says so) is refused by name, not called
+        // damaged (T-0219).
+        if let (Ok(()), None, Some(format)) = (&read, &parsed, [record, copy].into_iter().find_map(newer_format)) {
+            return kith_store::refuse_newer(config, format, LOCK_FORMAT).map(|()| None);
+        }
         Ok(match (read, parsed) {
             (Ok(()), None) if record.starts_with(FIRST.as_bytes()) || copy.starts_with(FIRST.as_bytes()) => {
                 return Err("this node's state is encrypted, and its lock record is damaged".into());
@@ -3223,6 +3238,35 @@ mod tests {
         assert_eq!(Pass::parse("19456"), None);
         let record = b"kith-lock v1\nsecret: 0707070707070707070707070707070707070707070707070707070707070707\npassphrase: later\n"; // pragma: allowlist secret
         assert_eq!(Record::parse(record).map(|record| record.pass), Some(None));
+    }
+
+    /// The lock record's first line is its format (`kith-lock v1`): a record of a newer one is
+    /// refused with the format said, not called damaged (T-0219).
+    #[test]
+    fn state_file_format_lock_record_newer_is_refused() {
+        let path = std::env::temp_dir().join(format!("kith-crypt-format-{}", std::process::id()));
+        let mut disk = vec![0; AT as usize + 2 * ROOM];
+        let newer = LOCK_FORMAT + 1;
+        let text = format!("kith-lock v{newer}\nsecret: {}\n", hex(&[7; 32]));
+        for room in 0..2 {
+            let at = AT as usize + room * ROOM;
+            disk[at..at + text.len()].copy_from_slice(text.as_bytes());
+        }
+        std::fs::write(&path, &disk).unwrap();
+        let said = Record::read(&path).unwrap_err();
+        assert!(
+            said.contains(&format!("format {newer}")) && said.contains(&format!("up to format {LOCK_FORMAT}")),
+            "{said}"
+        );
+        // And its own format is read, as before.
+        let own = Record {
+            secret: vec![7; 32],
+            ..Record::default()
+        };
+        own.write(&File::options().read(true).write(true).open(&path).unwrap(), AT)
+            .unwrap();
+        assert_eq!(Record::read(&path), Ok(Some(own)));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Against a software TPM: a seal of the old form (no tpm-parent:) is sealed again with

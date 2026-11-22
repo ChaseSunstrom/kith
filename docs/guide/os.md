@@ -360,7 +360,17 @@ Where that matters, keep the host with its Namespace's `hosts` before updating.
   number, adds a fixture and keeps the old ones.
 - A kithd refuses a newer format and leaves the files as they were. Going back to an older
   release is sure only while the state is in a format that release reads.
-- Not numbered yet: what nodes say to each other, and the other files in a state. A node that
+- Every `kith_store::Command` is mapped, with no wildcard, to the format that brought it (the
+  test `every_command_has_a_format`): adding, renaming or removing one does not compile until it
+  is placed, and the newest must equal `FORMAT`.
+- The other files of a state carry a format too, and a kithd refuses one newer than it reads, with
+  the same words as the store: the audit log (`"format"` on each entry), the image index (`"format"`
+  in each `refs/` note) and the lock record (its first line, `kith-lock v1`). A file with no number
+  is format 1. The volume key files are format 1: the bare key, with no stamp, so that going back
+  to an older kithd still finds the key; a later format begins `kith-volume-key format N`.
+  Going back is sure only while every file is in a format that release reads: a kithd that
+  refuses a file says which, and the one that wrote it, or a newer, reads it.
+- Not numbered yet: what nodes say to each other. A node that
   passes a request on (`kith logs` of a replica elsewhere, `kith volume put` and `get`, `kith
   node passphrase`, a restore) now says who asked, and a node told nothing refuses it: mid-update,
   ask the node that has the thing.
