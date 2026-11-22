@@ -373,7 +373,8 @@ passed as written, never through a shell.
   one delegated to it), so a program that left its session with `setsid()` is ended too. Node to
   node, the connection has TCP keepalive, so a node that vanishes without a word is noticed in
   about a minute. If kithd is killed or restarted, the runs it had are left going until the next
-  kithd starts, which ends them and removes what they left. The command line is in the audit
+  kithd starts with the same state directory, which ends them and removes what they left (a
+  kithd with another state directory beside it keeps its own runs). The command line is in the audit
   log: pass no secret.
 - **Exit status:** `kith run` ends with the carrier's exit status (the local `waypipe client`,
   or the `--via` program), not the app's: the app's own status does not cross the tunnel. A

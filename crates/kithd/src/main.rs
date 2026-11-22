@@ -995,7 +995,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         eprintln!("kithd: {said}");
     }
     // What a kithd before left of `kith run` (before any run is made here).
-    api::run::sweep_stale();
+    api::run::sweep_stale(&state);
     // Started again by process 1: a container the kithd before made and did not start holds
     // its sockets (this one's address among them) until it is gone.
     if let (Ok(runtime), Some((2.., _))) = (&runtime, keeper::kept()) {

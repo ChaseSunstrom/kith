@@ -1173,7 +1173,7 @@ fn bare(
 /// comes and exits with the unit's code; its name is the first free `IMAGE-N`.
 #[test]
 fn launch_makes_a_job_follows_its_logs_and_exits_with_its_code() {
-    let sb = Sandbox::new("launch-job");
+    let sb = Sandbox::short("launch-job");
     let polled = std::sync::atomic::AtomicUsize::new(0);
     let (socket, seen) = fake_kithd(&sb, move |method, path, body| match (method, path) {
         ("GET", "/v1/resources?kind=Job") => serde_json::json!([bare(
@@ -1244,7 +1244,7 @@ fn launch_makes_a_job_follows_its_logs_and_exits_with_its_code() {
 /// A Job that succeeded exits 0.
 #[test]
 fn launch_exits_0_for_a_job_that_succeeded() {
-    let sb = Sandbox::new("launch-ok");
+    let sb = Sandbox::short("launch-ok");
     let (socket, _) = fake_kithd(&sb, |method, path, body| match (method, path) {
         ("GET", "/v1/resources?kind=Job") => "[]".into(),
         ("POST", "/v1/apply") => {
@@ -1269,7 +1269,7 @@ fn launch_exits_0_for_a_job_that_succeeded() {
 /// `-d` makes a Workload of one replica and returns: no logs are asked for.
 #[test]
 fn launch_detached_makes_a_workload_of_one_replica() {
-    let sb = Sandbox::new("launch-detached");
+    let sb = Sandbox::short("launch-detached");
     let (socket, seen) = fake_kithd(&sb, |method, path, body| match (method, path) {
         ("GET", "/v1/resources?kind=Workload") => "[]".into(),
         ("POST", "/v1/apply") => {

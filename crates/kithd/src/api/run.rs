@@ -376,7 +376,7 @@ impl Dir {
         // is passed over for /tmp.
         // (Not `kith-run-`: the `kith` command makes those in the same temp dir, and the sweep
         // at start must not take a live one of theirs.)
-        let name = format!("{DIR_PREFIX}{}", pki::hex(&random));
+        let name = format!("{DIR_PREFIX}{}-{}", owner(), pki::hex(&random));
         let mut path = std::env::temp_dir().join(&name);
         if path.join("s").as_os_str().len() > 107 {
             path = Path::new("/tmp").join(&name);
@@ -393,9 +393,25 @@ impl Drop for Dir {
     }
 }
 
-/// The names a run's directory and its cgroup start with.
+/// The names a run's directory and its cgroup start with; then the owner and a random part.
 const DIR_PREFIX: &str = "kithd-run-";
 const CGROUP_PREFIX: &str = "kith-run-";
+
+/// Which kithd made a run: eight hex digits of a hash of its state directory, set at start
+/// ([`sweep_stale`]). Many kithds of one user can be on one machine (a dev one beside a node's,
+/// the test suites'), and each sweeps only what carries its own.
+static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn owner_of(state: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    pki::hex(&ring::digest::digest(&ring::digest::SHA256, state.as_os_str().as_bytes()).as_ref()[..4])
+}
+
+/// (Before `sweep_stale` no owner is set, as in a test: the runs' names carry a fixed `none`,
+/// which no sweep takes.)
+fn owner() -> &'static str {
+    OWNER.get().map_or("none", String::as_str)
+}
 
 /// True the first time it is asked of `flag`: for a line every run would repeat.
 fn first(flag: &AtomicBool) -> bool {
@@ -469,12 +485,11 @@ fn remove_when_empty(path: PathBuf) {
 }
 
 /// At kithd's start, what a kithd before left of runs (it was killed, or crashed, with runs going:
-/// their cgroups are beside kithd's own, not in it, and live on): the `kith-run-*` cgroups in
-/// `cgroups` are killed and removed, and the `kithd-run-*` directories in `tmps` removed.
-/// Nothing of this kithd's is yet there, and what is not this user's is left.
-// ponytail: a second kithd of the same user on this machine (not a deployment) would lose its
-// live runs to this; a pid in the name would tell them apart.
-fn sweep(cgroups: Option<&Path>, tmps: &[&Path]) {
+/// their cgroups are beside kithd's own, not in it, and live on): the `kith-run-OWNER-*` cgroups
+/// in `cgroups` are killed and removed, and the `kithd-run-OWNER-*` directories in `tmps`
+/// removed. Nothing of this kithd's is yet there; what is not this user's, what another kithd's
+/// state directory made, and a name with no owner (one a kithd before this wrote) are left.
+fn sweep(cgroups: Option<&Path>, tmps: &[&Path], owner: &str) {
     use std::os::unix::fs::MetadataExt;
     let ours = |path: &Path, prefix: &str| {
         let name = path
@@ -490,26 +505,27 @@ fn sweep(cgroups: Option<&Path>, tmps: &[&Path]) {
         .flatten()
         .flatten()
     {
-        if ours(&entry.path(), CGROUP_PREFIX) {
+        if ours(&entry.path(), &format!("{CGROUP_PREFIX}{owner}-")) {
             kill_cgroup(&entry.path());
             remove_when_empty(entry.path());
         }
     }
     for tmp in tmps {
         for entry in std::fs::read_dir(tmp).ok().into_iter().flatten().flatten() {
-            if ours(&entry.path(), DIR_PREFIX) {
+            if ours(&entry.path(), &format!("{DIR_PREFIX}{owner}-")) {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
     }
 }
 
-/// [`sweep`] where runs go.
-pub(crate) fn sweep_stale() {
+/// Names this kithd's runs after its `state` directory, and [`sweep`]s where runs go.
+pub(crate) fn sweep_stale(state: &Path) {
+    let owner = OWNER.get_or_init(|| owner_of(state));
     let cgroups = kith_runtime::units_cgroup_dir();
     let temp = std::env::temp_dir();
     // (`Dir::make` falls back to /tmp for a long temp dir.)
-    sweep(cgroups.as_deref(), &[&temp, Path::new("/tmp")]);
+    sweep(cgroups.as_deref(), &[&temp, Path::new("/tmp")], owner);
 }
 
 impl Drop for Leaf {
@@ -1212,47 +1228,67 @@ spec: {role: other-jobber, subjects: [carol]}
         assert!(gone(&format!("/sys/fs/cgroup{cgroup}")).await, "{cgroup} stays");
     }
 
-    /// At start, what an earlier kithd left (runs' cgroups and directories) goes; what is not
-    /// a run's, and what is a `kith` command's own directory, stays.
+    /// At start, what an earlier kithd of the same state directory left (runs' cgroups and
+    /// directories) goes; what is not a run's, what is a `kith` command's own directory, and what
+    /// another kithd (another state directory) or one whose owner cannot be told has going, stays.
     #[tokio::test]
     async fn sweep_removes_the_runs_a_kithd_before_left_and_nothing_else() {
         let root = std::env::temp_dir().join(format!("kithd-sweep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (cgroups, tmp) = (root.join("cgroup"), root.join("tmp"));
         for dir in [
-            "cgroup/kith-run-stale",
+            "cgroup/kith-run-aaaaaaaa-stale",
+            "cgroup/kith-run-bbbbbbbb-live",
+            "cgroup/kith-run-noowner",
             "cgroup/kith-unit-1",
-            "tmp/kithd-run-stale",
+            "tmp/kithd-run-aaaaaaaa-stale",
+            "tmp/kithd-run-bbbbbbbb-live",
+            "tmp/kithd-run-noowner",
             "tmp/kith-run-cli",
             "tmp/other",
         ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
-        std::fs::write(tmp.join("kithd-run-stale/s"), "").unwrap();
-        std::fs::write(cgroups.join("kith-run-file"), "").unwrap();
-        sweep(Some(&cgroups), &[&tmp]);
+        std::fs::write(tmp.join("kithd-run-aaaaaaaa-stale/s"), "").unwrap();
+        std::fs::write(cgroups.join("kith-run-aaaaaaaa-file"), "").unwrap();
+        sweep(Some(&cgroups), &[&tmp], "aaaaaaaa");
         assert!(
-            gone(cgroups.join("kith-run-stale").to_str().unwrap()).await,
+            gone(cgroups.join("kith-run-aaaaaaaa-stale").to_str().unwrap()).await,
             "the stale cgroup stays"
         );
         assert!(
-            gone(tmp.join("kithd-run-stale").to_str().unwrap()).await,
+            gone(tmp.join("kithd-run-aaaaaaaa-stale").to_str().unwrap()).await,
             "the stale directory stays"
         );
         for kept in [
+            "cgroup/kith-run-bbbbbbbb-live",
+            "cgroup/kith-run-noowner",
             "cgroup/kith-unit-1",
-            "cgroup/kith-run-file",
+            "cgroup/kith-run-aaaaaaaa-file",
+            "tmp/kithd-run-bbbbbbbb-live",
+            "tmp/kithd-run-noowner",
             "tmp/kith-run-cli",
             "tmp/other",
         ] {
             assert!(root.join(kept).exists(), "{kept} was removed");
         }
-        sweep(None, &[&root.join("nowhere")]); // nothing to read is nothing to do
+        sweep(None, &[&root.join("nowhere")], "aaaaaaaa"); // nothing to read is nothing to do
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Where `cgroup.kill` cannot be written (before Linux 5.14: here a directory stands for it),
     /// each pid in `cgroup.procs` is killed.
+    /// A run's names carry its kithd's owner id, so the sweep of one state directory can tell
+    /// them from another's.
+    #[test]
+    fn owners_differ_by_state_directory_and_a_runs_dir_carries_its_owner() {
+        let (a, b) = (owner_of(Path::new("/var/a")), owner_of(Path::new("/var/b")));
+        assert!(a != b && a.len() == 8 && a == owner_of(Path::new("/var/a")), "{a} {b}");
+        let dir = Dir::make().unwrap();
+        let name = dir.0.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with(&format!("{DIR_PREFIX}{}-", owner())), "{name}");
+    }
+
     #[tokio::test]
     async fn kill_cgroup_kills_the_pids_listed_where_cgroup_kill_cannot_be_written() {
         let dir = std::env::temp_dir().join(format!("kithd-kill-{}", std::process::id()));
