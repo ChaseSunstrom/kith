@@ -2372,6 +2372,30 @@ fn watch_get(kithd: &Kithd, kind: Option<&str>, keep: impl Fn(&Resource) -> bool
     }
 }
 
+/// How far an image pull is, as a container's `pull` says it: "pulling 3 of 7 layers, 12 of 40 MB".
+fn pull_text(pull: &serde_json::Value) -> Option<String> {
+    let said = |field: &str| pull[field].as_u64();
+    let (layers, of, bytes, total) = (
+        said("layers")?,
+        said("layersTotal")?,
+        said("bytes")?,
+        said("bytesTotal")?,
+    );
+    let (unit, size) = [("GB", 1e9), ("MB", 1e6), ("KB", 1e3)]
+        .into_iter()
+        .find(|(_, size)| total as f64 >= *size)
+        .unwrap_or(("B", 1.0));
+    let show = |n: u64| match n as f64 / size {
+        x if x >= 10.0 || size == 1.0 => format!("{x:.0}"),
+        x => format!("{x:.1}"),
+    };
+    Some(format!(
+        "pulling {layers} of {of} layers, {} of {} {unit}",
+        show(bytes),
+        show(total)
+    ))
+}
+
 /// The STATUS column: what a controller reported, in a few words.
 fn status_summary(resource: &Resource) -> String {
     // First line only, and nothing that could drive the terminal: messages quote image names and output.
@@ -2394,8 +2418,11 @@ fn status_summary(resource: &Resource) -> String {
         (Some(ready), Some(replicas)) => {
             // Why it is not ready, if a container said so.
             let containers = status["containers"].as_array().into_iter().flatten();
-            let why = containers.filter_map(|c| c["message"].as_str()).next();
-            let why = why.map(|m| format!(": {}", clean(m))).unwrap_or_default();
+            let containers: Vec<_> = containers.collect();
+            // A pull that goes on is the news; a message beside it is from before.
+            let why = containers.iter().find_map(|c| pull_text(&c["pull"]));
+            let why = why.or_else(|| containers.iter().find_map(|c| c["message"].as_str()).map(clean));
+            let why = why.map(|m| format!(": {m}")).unwrap_or_default();
             format!("{ready}/{replicas} ready{why}")
         }
         // A Job or a DNS record; a Node: its state and where it is.
@@ -2824,6 +2851,36 @@ mod peer_tests {
 mod drain_tests {
     use super::drain_text;
     use serde_json::json;
+
+    #[test]
+    fn pull_progress_shows_in_the_status_column_while_an_image_is_pulled() {
+        use kith_api::Resource;
+        let workload = |status: serde_json::Value| {
+            let workload = json!({
+                "apiVersion": "kith.dev/v1", "kind": "Workload", "metadata": { "name": "web" },
+                "spec": {}, "status": status,
+            });
+            super::status_summary(&serde_json::from_value::<Resource>(workload).unwrap())
+        };
+        let pull = json!({ "layers": 3, "layersTotal": 7, "bytes": 12_000_000, "bytesTotal": 40_000_000 });
+        let pulling = workload(json!({ "ready": 0, "replicas": 1, "containers": [
+            { "name": "web", "message": "pending", "pull": pull },
+        ]}));
+        assert_eq!(pulling, "0/1 ready: pulling 3 of 7 layers, 12 of 40 MB");
+        // Small images count in KB; a container that does not pull says what it said.
+        let small = json!({ "layers": 0, "layersTotal": 1, "bytes": 0, "bytesTotal": 4_500 });
+        let said = workload(json!({ "ready": 0, "replicas": 1, "containers": [
+            { "name": "a", "message": "stopped" }, { "name": "b", "pull": small },
+        ]}));
+        assert_eq!(said, "0/1 ready: pulling 0 of 1 layers, 0.0 of 4.5 KB");
+        let plain =
+            workload(json!({ "ready": 0, "replicas": 1, "containers": [{ "name": "a", "message": "stopped" }] }));
+        assert_eq!(plain, "0/1 ready: stopped");
+        assert_eq!(
+            workload(json!({ "ready": 1, "replicas": 1, "containers": [{ "name": "a" }] })),
+            "1/1 ready"
+        );
+    }
 
     #[test]
     fn drain_says_what_moves_stays_and_what_is_lost_before_anything_changes() {
