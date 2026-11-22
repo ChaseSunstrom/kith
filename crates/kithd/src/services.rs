@@ -2169,16 +2169,53 @@ fn start() -> Vec<tokio::runtime::Handle> {
 /// A thread called `name` with a runtime of its own, for as long as kithd runs (what is
 /// on it is stopped, not the thread).
 pub fn thread(name: String) -> std::io::Result<tokio::runtime::Handle> {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let handle = runtime.handle().clone();
-    let run = move || runtime.block_on(std::future::pending::<()>());
-    std::thread::Builder::new().name(name).spawn(run)?;
-    Ok(handle)
+    thread_by(name, |name, run| std::thread::Builder::new().name(name).spawn(run).map(drop))
+}
+
+/// [`thread`] with the spawn given. The runtime is built on the new thread, never on the caller:
+/// a failed spawn would drop it on the async thread, where tokio panics.
+fn thread_by(
+    name: String,
+    spawn: impl FnOnce(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) -> std::io::Result<tokio::runtime::Handle> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let run = move || match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => {
+            let _ = tx.send(Ok(runtime.handle().clone()));
+            runtime.block_on(std::future::pending::<()>());
+        }
+        Err(e) => {
+            let _ = tx.send(Err(e));
+        }
+    };
+    spawn(name, Box::new(run))?;
+    rx.recv().map_err(std::io::Error::other)?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A spawn that fails (EAGAIN at a thread limit) on the async thread: an error back, and no
+    /// runtime to drop there (tokio panics on that).
+    #[tokio::test]
+    async fn a_thread_that_cannot_be_spawned_is_an_error_not_a_panic() {
+        let refused = |_: String, _: Box<dyn FnOnce() + Send>| {
+            Err(std::io::Error::from_raw_os_error(nix::errno::Errno::EAGAIN as i32))
+        };
+        let e = thread_by("refused".into(), refused).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(nix::errno::Errno::EAGAIN as i32));
+    }
+
+    #[tokio::test]
+    async fn a_thread_gives_a_handle_that_runs_tasks() {
+        let handle = thread("runs-tasks".into()).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle.spawn(async move {
+            let _ = tx.send(std::thread::current().name().map(str::to_owned));
+        });
+        assert_eq!(rx.await.unwrap().as_deref(), Some("runs-tasks"));
+    }
 
     /// What a killed kithd left on the loopback goes: the Services' addresses of this cluster that
     /// are not wanted; the wanted ones, a node's, another cluster's and ::1 stay.
