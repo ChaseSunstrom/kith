@@ -2571,3 +2571,25 @@ fn session_recipe_costs_are_said() {
     let job = row("A Job that was running");
     assert!(job.contains("waits") && job.contains("starts over"), "{job}");
 }
+
+/// `cgroupDelegation` is a container's own opening: parsed, written back as it was, and off
+/// (None, never written) when not said.
+#[test]
+fn cgroup_delegation_round_trips() {
+    let container = |extra: serde_json::Value| -> Result<kinds::Container, serde_json::Error> {
+        let mut c = json!({ "name": "a", "image": "x" });
+        c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(c)
+    };
+    let on = container(json!({ "cgroupDelegation": true })).unwrap();
+    assert_eq!(on.cgroup_delegation, Some(true));
+    assert_eq!(serde_json::to_value(&on).unwrap()["cgroupDelegation"], json!(true));
+    let off = container(json!({})).unwrap();
+    assert_eq!(off.cgroup_delegation, None);
+    assert!(serde_json::to_value(&off).unwrap().get("cgroupDelegation").is_none());
+    // The schema the CLI checks a file against knows it.
+    assert!(
+        kind("Workload").unwrap().schema().to_string().contains("\"cgroupDelegation\""),
+        "v1.schema.json has no cgroupDelegation"
+    );
+}

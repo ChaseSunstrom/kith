@@ -3701,6 +3701,7 @@ async fn start(
                 (unit.unconfined, unit.allow) = (seccomp.unconfined == Some(true), seccomp.allow.clone());
             }
             unit.nested = c.user_namespaces == Some(true);
+            unit.delegated_cgroup = c.cgroup_delegation == Some(true);
             let policy = match c.pull_policy {
                 None | Some(PullPolicy::IfNotPresent) => kith_runtime::PullPolicy::IfNotPresent,
                 Some(PullPolicy::Always) => kith_runtime::PullPolicy::Always,

@@ -166,6 +166,11 @@ pub struct Unit {
     /// of [`NESTED`] go through, and its `/proc` hides nothing, without which no `/proc`
     /// can be mounted inside. Refused where it would be the node's root.
     pub nested: bool,
+    /// Its `/sys/fs/cgroup` is read-write, and its cgroup's directory and the files that
+    /// make a child of it and move a process into one are its user's ([`delegate`]), so a
+    /// program in it (a runtime for containers of its own) can make cgroups below its own.
+    /// Not the cgroup's limits: they stay the node's, on the parent.
+    pub delegated_cgroup: bool,
     /// As any container runtime runs an image with nothing said: it is the user its image
     /// names (root where it names none), and root has what such a runtime gives root
     /// ([`ROOTS`]). Without it, only `user` makes a container root.
@@ -1116,6 +1121,16 @@ impl Runtime {
         {
             handle.discard(&state);
             return Err(e).ctx(&what);
+        }
+        // (Where kithd is not root the cgroup is already its own user's, which the container's
+        // user is inside the namespace it made: nothing to hand.)
+        if unit.delegated_cgroup
+            && uid.is_root()
+            && let Some(user) = user
+            && let Err(e) = delegate(&handle.cgroup, shift.unwrap_or(0) + user.uid(), shift.unwrap_or(0) + user.gid())
+        {
+            handle.discard(&state);
+            return Err(e).ctx(format!("{what}: delegating its cgroup"));
         }
         match handle.no_swap(unit, &what) {
             Ok(()) => {
@@ -2586,6 +2601,20 @@ fn give_slots() -> &'static GiveSlots {
     })
 }
 
+/// Hands a container's cgroup directory, and the three files a user of it writes to make a child
+/// cgroup and move into it (`cgroup.procs`, `cgroup.subtree_control`, `cgroup.threads`), to the
+/// node's `uid` and `gid` of its user: the kernel lets a user who owns these move its own
+/// processes into a cgroup below, and never above. The limits (`memory.max`…) stay root's.
+/// A file that is not there is an error: the cgroup was not made as a cgroup 2 makes one.
+fn delegate(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    for name in ["", "cgroup.procs", "cgroup.subtree_control", "cgroup.threads"] {
+        let path = dir.join(name);
+        std::os::unix::fs::lchown(&path, Some(uid), Some(gid))
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    }
+    Ok(())
+}
+
 /// [`give_volume`] for a directory named by path (a volume that is not held, one file of a map).
 fn give_path(dir: &Path, namespace: &str, uid: u32, gid: u32) -> io::Result<u32> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -2871,6 +2900,11 @@ fn spec_shifted(
         let why = "userNamespaces: this container is the node's root (runAsUser 0, or its image's user), who is not given a /proc that hides nothing: name another user";
         return Err(why.into());
     }
+    // The node's root owns every cgroup of the node already: a read-write cgroup mount would be its own.
+    if unit.delegated_cgroup && uid.is_root() && shift.is_none() && user == 0 {
+        let why = "cgroupDelegation: this container is the node's root (runAsUser 0, or its image's user), who is given no cgroup of its own to write: name another user";
+        return Err(why.into());
+    }
     let calls = if unit.unconfined {
         UNCONFINED.to_string()
     } else {
@@ -3091,6 +3125,15 @@ fn spec_shifted(
             volume.host.clone()
         };
         mounts.push(bind.source(source).options(options).build()?);
+    }
+    if unit.delegated_cgroup {
+        // (Read-only by default; the user it is delegated to may then write what `delegate` gave.)
+        for mount in mounts.iter_mut().filter(|m| m.destination() == Path::new("/sys/fs/cgroup")) {
+            let mut options = mount.options().clone().unwrap_or_default();
+            options.retain(|option| option != "ro");
+            options.push("rw".into());
+            mount.set_options(Some(options));
+        }
     }
     spec.set_mounts(Some(mounts));
 
@@ -3438,6 +3481,70 @@ mod tests {
             "ptrace unshare setns clone clone3 mount umount2 pivot_root open_tree move_mount fsopen fsconfig fsmount fspick mount_setattr"
         );
         assert_eq!(nested.process().as_ref().unwrap().no_new_privileges(), Some(true));
+    }
+
+    /// A container the cgroup of which is delegated has `/sys/fs/cgroup` read-write; any other keeps it
+    /// read-only, whatever else it asks (`nested` does not open it).
+    #[test]
+    fn delegated_cgroup_mounts_cgroup_rw() {
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            user: Some("1000".into()),
+            ..Image::default()
+        };
+        let options = |unit: &Unit| {
+            let made = spec("a", &image, unit, "/kith/a", Path::new("/b")).unwrap();
+            let all = made.mounts().clone().unwrap();
+            let found = all.iter().filter(|m| m.destination() == Path::new("/sys/fs/cgroup"));
+            let found = found.collect::<Vec<_>>();
+            assert_eq!(found.len(), 1, "one cgroup mount");
+            assert_eq!(found[0].typ().as_deref(), Some("cgroup"));
+            found[0].options().clone().unwrap()
+        };
+        let plain = options(&Unit::default());
+        assert!(plain.iter().any(|o| o == "ro"), "{plain:?}");
+        let nested = options(&Unit {
+            nested: true,
+            ..Unit::default()
+        });
+        assert!(nested.iter().any(|o| o == "ro"), "{nested:?}");
+        let delegated = options(&Unit {
+            delegated_cgroup: true,
+            ..Unit::default()
+        });
+        assert!(!delegated.iter().any(|o| o == "ro"), "{delegated:?}");
+        assert!(delegated.iter().any(|o| o == "rw"), "{delegated:?}");
+        // The rest of its options stay as they were.
+        assert!(delegated.iter().any(|o| o == "nosuid") && delegated.iter().any(|o| o == "nodev"));
+    }
+
+    /// The directory of the container's cgroup and the three files that move a process into it,
+    /// make a child of it and move threads, are the container's user's; nothing else of it is.
+    #[test]
+    fn delegate_hands_the_files() {
+        use std::os::unix::fs::MetadataExt;
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-delegate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for file in ["cgroup.procs", "cgroup.subtree_control", "cgroup.threads", "memory.max"] {
+            fs::write(dir.join(file), "").unwrap();
+        }
+        delegate(&dir, uid, other).unwrap();
+        let group = |name: &str| fs::metadata(dir.join(name)).unwrap().gid();
+        assert_eq!(fs::metadata(&dir).unwrap().gid(), other);
+        for file in ["cgroup.procs", "cgroup.subtree_control", "cgroup.threads"] {
+            assert_eq!(group(file), other, "{file}");
+        }
+        // Its limits stay the node's: the user may not raise them.
+        assert_eq!(group("memory.max"), gid);
+        // A cgroup that has no such file is not delegated, and says which.
+        fs::remove_file(dir.join("cgroup.threads")).unwrap();
+        let said = delegate(&dir, uid, other).unwrap_err().to_string();
+        assert!(said.contains("cgroup.threads"), "{said}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5958,6 +6065,15 @@ mod tests {
         };
         assert!(spec_shifted("a", &image, &nested, "/kith/a", Path::new("/b"), (uid, gid), Some(base)).is_ok());
         assert!(spec_shifted("a", &image, &nested, "/kith/a", Path::new("/b"), (uid, gid), None).is_err());
+        // So does a delegated cgroup: of root's own range, not the node's.
+        let delegated = Unit {
+            delegated_cgroup: true,
+            user: Some(0),
+            ..Unit::default()
+        };
+        assert!(spec_shifted("a", &image, &delegated, "/kith/a", Path::new("/b"), (uid, gid), Some(base)).is_ok());
+        let said = spec_shifted("a", &image, &delegated, "/kith/a", Path::new("/b"), (uid, gid), None);
+        assert!(said.unwrap_err().to_string().contains("cgroupDelegation"));
         // A user past the range has no id in it: refused, never the node's.
         let far = Unit {
             user: Some(RANGE + 4),

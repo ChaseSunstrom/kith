@@ -224,7 +224,7 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    on the first finds outside.example.test through both. KITH_POD_NOUPSTREAM=1
                    starts neither with an upstream: the control, where the name is not found
   --test nested    instead: one node with an image that holds bash, bubblewrap and kithd; a Job in it for
-                   kith's defaults, then five variants: unconfined seccomp, userNamespaces, both, runAsUser 0;
+                   kith's defaults, then six variants: unconfined seccomp, userNamespaces, both, userNamespaces with cgroupDelegation, runAsUser 0;
                    each starts a user namespace, bubblewrap and kithd in agent mode, and
                    says what refused it, the guest kernel's settings and the smallest opening
                    that let it run. It changes no default (KITH_NESTED_OUT: where the rows go)
