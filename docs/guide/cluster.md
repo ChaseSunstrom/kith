@@ -776,4 +776,25 @@ kithd then sees the resolver, not each device, as the client: include it in the 
 (`[192.0.2.1/32]`). `dig @<house resolver> www.apps.example.test` should give kithd's answer,
 and other names the same answer as before.
 
+### This machine's own programs: `--resolver`
+
+`kithd --listen --mesh --resolver` makes `.kith` names work for programs on that machine
+(`getent hosts web.default.kith`, `curl`, a browser):
+
+- **What it needs:** the mesh (`--mesh`), systemd-resolved running, and programs that ask it (the
+  usual ones do, through `/etc/resolv.conf` or `nss-resolve`). A program that reads its own
+  server list does not.
+- **What it does:** kithd answers on `127.0.0.87:53` and, while the mesh interface is up, tells
+  systemd-resolved (`resolvectl`) to send the domain `~kith` there on that link, with no default
+  route: no other name goes to kithd and no other link changes. It writes no file and never
+  touches `/etc/resolv.conf`.
+- **It answers this machine only:** `127.0.0.0/8` is not reachable from any other machine. An
+  unknown name under `.kith` is answered `NXDOMAIN` by kithd, not forwarded.
+- **How it goes:** kithd takes the entry back (`resolvectl revert`) before it takes the interface
+  down, and the entry is in resolved's memory, so a machine that loses power loses it too (a kithd killed outright leaves it while the link
+  stays, and the next one sets it again). It is
+  looked at every half minute and set again if resolved forgot it (a restart of resolved). Without
+  `/run/systemd/resolve`, kithd says so once and does nothing else. If `127.0.0.87:53` is taken,
+  kithd says so and registers nothing.
+
 Not yet: DNSSEC and zone transfers.

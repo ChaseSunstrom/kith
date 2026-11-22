@@ -30,7 +30,13 @@ pub struct Options {
     pub port: u16,
     /// Where this node's private key is kept.
     pub key: PathBuf,
+    /// `--resolver`: systemd-resolved sends `~kith` to kithd while the interface is up.
+    pub resolver: bool,
 }
+
+/// How often the resolver entry on the link is read, and set again if it is gone (NetworkManager or a
+/// restart of systemd-resolved drops a link's DNS that was set from outside).
+const RESOLVER_EVERY: Duration = Duration::from_secs(30);
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -581,6 +587,9 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     };
     // What the root part was last asked for the interface: not asked again while it is the same.
     let mut asked = None;
+    // `--resolver`: when the entry was last read, whether it was set (so it is taken back), and whether
+    // a failure to set it was said.
+    let (mut resolver_at, mut resolver_on, mut resolver_said): (Option<Instant>, bool, bool) = (None, false, false);
     eprintln!("kithd: mesh address {address} on {}", options.interface);
     let mut base = says_of(&public, address, options.port);
     // A key's replacement under way, the rotation that was last given up, and the last one that was done
@@ -827,6 +836,17 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             Ok(_) => {}
             Err(e) => eprintln!("kithd: mesh: setting {}: {e}", options.interface),
         }
+        if options.resolver && resolver_at.is_none_or(|at| at.elapsed() >= RESOLVER_EVERY) {
+            resolver_at = Some(Instant::now());
+            match crate::root_part::mesh_resolver(&root, &options.interface, true) {
+                Ok(()) => (resolver_on, resolver_said) = (true, false),
+                // (Said once: asked again every half minute, in case resolved comes up.)
+                Err(e) if !std::mem::replace(&mut resolver_said, true) => {
+                    eprintln!("kithd: mesh: --resolver on {}: {e}", options.interface);
+                }
+                Err(_) => {}
+            }
+        }
         // For `kith node status`.
         let path = |member: &Member| {
             let peer = peers.iter().find(|peer| peer.key == member.key)?;
@@ -849,6 +869,10 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     }
     // (What this node said of itself stays: it is back with the same key when kithd
     // starts again, and the others need not forget it for a restart. See `left`.)
+    // (The entry goes before the link does: resolved is not left sending .kith to a server that is going.)
+    if resolver_on && let Err(e) = crate::root_part::mesh_resolver(&root, &options.interface, false) {
+        eprintln!("kithd: mesh: --resolver off {}: {e}", options.interface);
+    }
     if let Err(e) = crate::root_part::mesh_down(&root, &options.interface) {
         eprintln!("kithd: mesh: removing {}: {e}", options.interface);
     }
@@ -1102,6 +1126,7 @@ mod spec_tests {
             port: 4000,
             // (Not made: its directory is not there, so the interface is not either.)
             key: PathBuf::from("/nonexistent/kithd-test/mesh.key"),
+            resolver: false,
         };
         let (_stop, stopping) = watch::channel(false);
         run(shared.clone(), options, stopping).await;

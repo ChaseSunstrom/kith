@@ -838,6 +838,49 @@ mod tests {
         assert!(reply.ends_with(&[198, 51, 100, 7]), "the upstream's address: {reply:?}");
     }
 
+    /// `--resolver`: systemd-resolved sends kithd the names under `.kith` and would hand a forwarded one
+    /// straight back (a loop), so a name no zone has is NXDOMAIN from kithd, even for a client that is
+    /// let through to the upstream, and the upstream is never asked.
+    #[tokio::test]
+    async fn resolver_unknown_name_under_kith_is_nxdomain_and_never_forwarded() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let told = upstream.local_addr().unwrap();
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = udp.local_addr().unwrap();
+        let forwarders: Vec<Cidr> = kith_dns::LOCAL_NETWORKS
+            .into_iter()
+            .filter_map(|net| net.parse().ok())
+            .collect();
+        assert!(!forwarders.is_empty());
+        let (zones, _) = zones_of(&Store::default(), None);
+        let (_zones, served) = watch::channel(Arc::new(zones));
+        let (_, asked) = watch::channel(Arc::from(vec![told]));
+        let cache = Arc::new(kith_dns::Cache::default());
+        tokio::spawn(kith_dns::serve(udp, tcp, served, asked, forwarders, cache));
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in ["nothing", "default", "kith"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&query, listen).await.unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("an answer")
+            .unwrap();
+        assert_eq!(buf[3] & 0x0f, 3, "NXDOMAIN: {:?}", &buf[..n]);
+        let mut forwarded = [0u8; 512];
+        let asked = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            upstream.recv_from(&mut forwarded),
+        )
+        .await;
+        assert!(asked.is_err(), "the upstream was asked");
+    }
+
     fn store(yaml: &str) -> Store {
         let mut store = Store::default();
         for resource in Resource::from_source(yaml).unwrap() {
