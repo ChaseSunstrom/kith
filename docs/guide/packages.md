@@ -153,6 +153,11 @@ kith apply -f - <<< '{"apiVersion": "kith.dev/v1", "kind": "Secret", "metadata":
 kith package render packages/selkies --name desk | kith apply -f -
 ```
 
+A workspace to develop in: [`packages/kith-dev`](../../packages/kith-dev) renders a replicated
+Volume and one pod that mounts it, as the `user` you name, with the DeviceClaims you list (for
+`/dev/kvm`, say). The image is yours and no credential is in it
+([Developing from inside the cluster](development.md#developing-from-inside-the-cluster)).
+
 ## Sources (GitOps)
 
 A `Source` keeps what is in a git repository (or an OCI artifact) applied:

@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["node", "image"],
+  "properties": {
+    "node": { "type": "string" },
+    "image": { "type": "string", "minLength": 1 },
+    "user": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "mountPath": { "type": "string", "minLength": 2 },
+    "command": { "type": "array", "items": { "type": "string" } },
+    "replicas": { "type": "integer", "minimum": 1 },
+    "deviceClaims": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "reserve": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "cpu": { "type": "string" }, "memory": { "type": "string" } }
+    }
+  }
+}

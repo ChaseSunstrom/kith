@@ -101,6 +101,7 @@ kith package render packages/hyprland --name office -n desktop \
 <pre><code class="language-sh">kith apply -f - &lt;&lt;&lt; '{"apiVersion": "kith.dev/v1", "kind": "Secret", "metadata": {"name": "selkies-password"}, "spec": {"data": {"password": "YOURS"}}}'
 kith package render packages/selkies --name desk | kith apply -f -
 </code></pre>
+<p>A workspace to develop in: <a href="https://github.com/ChaseSunstrom/kith/tree/main/packages/kith-dev"><code>packages/kith-dev</code></a> renders a replicated Volume and one pod that mounts it, as the <code>user</code> you name, with the DeviceClaims you list (for <code>/dev/kvm</code>, say). The image is yours and no credential is in it (<a href="development.html#developing-from-inside-the-cluster">Developing from inside the cluster</a>).</p>
 <h2 id="sources-gitops">Sources (GitOps) <a class="anchor" href="#sources-gitops" aria-label="Link to this section">#</a></h2>
 <p>A <code>Source</code> keeps what is in a git repository (or an OCI artifact) applied:</p>
 <pre><code class="language-yaml">apiVersion: kith.dev/v1

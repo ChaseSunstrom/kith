@@ -98,6 +98,7 @@
 {"u":"guide/development.html","t":"Working on kith","h":""},
 {"u":"guide/development.html#layout","t":"Working on kith","h":"Layout"},
 {"u":"guide/development.html#development","t":"Working on kith","h":"Development"},
+{"u":"guide/development.html#developing-from-inside-the-cluster","t":"Working on kith","h":"Developing from inside the cluster"},
 {"u":"guide/development.html#testing-on-several-nodes","t":"Working on kith","h":"Testing on several nodes"},
 {"u":"guide/numbers.html","t":"How the numbers beside k3s were taken","h":""},
 {"u":"guide/numbers.html#the-numbers-drawn","t":"How the numbers beside k3s were taken","h":"The numbers, drawn"},

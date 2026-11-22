@@ -1,0 +1,7 @@
+# A workspace to develop in from inside the cluster: one replicated Volume (the checkout and the
+# home) and one long-lived pod that mounts it. The image, its tools and its credentials are
+# yours. See docs/guide/packages.md.
+name: kith-dev
+version: 0.1.0
+description: A development workspace on a replicated Volume, with the devices you claim for it
+kithVersion: ">=0.0.1"

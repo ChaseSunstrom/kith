@@ -651,6 +651,38 @@ fn the_kith_build_package_renders_a_volume_a_job_and_an_image() {
     assert!(notes.contains(&format!("localhost:5000/default/{name}:v2")), "{notes}");
 }
 
+/// The kith-dev package: a replicated Volume for the checkout and the home, and one pod
+/// Workload that mounts it as the user the caller names, with the claims the caller names.
+#[test]
+fn the_kith_dev_package_renders_a_volume_and_a_pod_workload() {
+    let sandbox = Sandbox::new("kith-dev");
+    let package = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/kith-dev");
+    let (code, out, err) = sandbox.kith(&["package", "lint", package]);
+    assert_eq!((code, out.as_str()), (0, "kith-dev 0.1.0 ok\n"), "{err}");
+    let mine = "node: n1\nimage: registry.example/dev:1\nuser: 1234\ndeviceClaims: [ci-kvm-n1, seat]\nreplicas: 3\n";
+    sandbox.write("mine.yaml", mine);
+    let (code, out, notes) = sandbox.kith(&["package", "render", package, "--name", "dev", "-f", "mine.yaml"]);
+    assert_eq!(code, 0, "{notes}");
+    let kinds: Vec<&str> = out.lines().filter(|line| line.starts_with("kind: ")).collect();
+    assert_eq!(kinds, ["kind: Volume", "kind: Workload"], "{out}");
+    assert!(out.contains("  node: n1\n  path: dev\n  replicas: 3\n"), "{out}");
+    assert!(out.contains("    pod: true\n"), "{out}");
+    assert!(out.contains("    deviceClaims:\n      - ci-kvm-n1\n      - seat\n"), "{out}");
+    assert!(out.contains("        runAsUser: 1234\n"), "{out}");
+    assert!(out.contains("image: registry.example/dev:1"), "{out}");
+    assert!(out.contains("volume: dev-kith-dev-work\n            path: /work\n"), "{out}");
+    // With no claims named, none is asked for.
+    let (code, out, err) =
+        sandbox.kith(&["package", "render", package, "--name", "dev", "--set", "node=n1", "--set", "image=x:1"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains("deviceClaims"), "{out}");
+    assert!(out.contains("        runAsUser: 1000\n") && out.contains("replicas: 2\n"), "{out}");
+    // What it renders is what `kith apply` takes.
+    sandbox.write("rendered.yaml", &out);
+    let (code, _, err) = sandbox.kith(&["apply", "-f", "rendered.yaml"]);
+    assert_eq!(code, 0, "{err}");
+}
+
 #[test]
 fn the_nas_package_renders_a_share_and_its_smb_server() {
     let sandbox = Sandbox::new("nas");
