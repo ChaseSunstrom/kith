@@ -3,6 +3,10 @@
     name: "web",
     image: values.image,
     ports: [{ name: "http", port: values.port }],
+    readiness: { tcp: { port: "http" } },
+    volumeMounts: if (values.page ?? "") != ""
+        then [{ configMap: "${name}-page", path: "/usr/share/nginx/html" }]
+        else null,
     env: if len(values.env) > 0
         then [for name in sort(keys(values.env)): { name, value: values.env[name] }]
         else null,

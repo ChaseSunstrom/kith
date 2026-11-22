@@ -1,6 +1,11 @@
 - name: web
   image: {{ values.image | tojson }}
   ports: [{ name: http, port: {{ values.port }} }]
+  readiness: { tcp: { port: http } }
+  {%- if values.page %}
+  volumeMounts:
+    - { configMap: {{ (name ~ "-page") | tojson }}, path: /usr/share/nginx/html }
+  {%- endif %}
   {%- if values.env %}
   env:
     {%- for name, value in values.env | items %}
