@@ -73,6 +73,8 @@ mod replicas;
 mod resolver;
 mod root_part;
 mod sched;
+#[cfg(test)]
+mod scratch;
 mod seats;
 mod services;
 mod share;
@@ -337,6 +339,9 @@ pub struct Shared {
     pub upstream: Mutex<Option<(String, reqwest::Client)>>,
     /// How long a node may be out of contact before its replicas move (`--lost-after`).
     pub lost_after: std::time::Duration,
+    /// A test's data directory, removed with the last hold of this state.
+    #[cfg(test)]
+    pub scratch: std::sync::OnceLock<scratch::Scratch>,
 }
 
 /// How many dry runs at once.
@@ -781,6 +786,8 @@ async fn replica(
         view: watch::channel(None).0,
         upstream: Mutex::default(),
         lost_after,
+        #[cfg(test)]
+        scratch: std::sync::OnceLock::new(),
     });
     // (Raft's links look a voter's Node up in the store; the state holds Raft, so by a weak hold.)
     let _ = reach.set(Arc::downgrade(&shared));

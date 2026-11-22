@@ -1697,10 +1697,11 @@ pub(crate) mod pinned_peer {
 
     /// [`shared_with`] of a cluster already made.
     pub async fn shared_of(tag: &str, cluster: Cluster, nodes: &[Upstream]) -> Arc<Shared> {
-        let dir = std::env::temp_dir().join(format!("kithd-pinned-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::scratch::Scratch::new(&format!("kithd-pinned-{tag}"));
         let shared = crate::replica(Some(cluster), &dir, Duration::from_secs(300)).await;
         let shared = shared.unwrap();
+        // The directory goes when the last hold of the state does.
+        assert!(shared.scratch.set(dir).is_ok());
         for node in nodes {
             let text = format!(
                 "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: {}}}\nspec: {{}}\n",
