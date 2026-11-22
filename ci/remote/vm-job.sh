@@ -52,7 +52,7 @@ EOF
     # its owner in the archive, a uid not mapped, and fail on it. TAR_OPTIONS keeps the files ours.)
     export LD_PRELOAD="$shim" TAR_OPTIONS=--no-same-owner HOME="$work" TMPDIR=/tmp CARGO_HOME="$cache/cargo" \
         CARGO_TARGET_DIR="$cache/target" KITH_OS_CACHE="$cache/os" XDG_CACHE_HOME="$cache/xdg" \
-        KITH_VM_NO_TPM_LOG=1
+        KITH_VM_NO_TPM_LOG=1 KITH_VM_BUILD_KERNEL=1
     # (What a machine of one's own has: rollout signs with the checkout's kith from target/debug;
     # kube wants kubectl and helm, which ci/kube.sh --vm fetches, checked by their hashes.)
     case $TEST in

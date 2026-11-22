@@ -522,9 +522,11 @@ nothing for fifteen minutes counts as failed. With `waitForIdleSeats: true` a no
 while its Seats last said `idle` (a Seat that has said nothing, or has no holder, is idle, and so is a
 node with no Seat); one that says `active` or `fullscreen` is passed over and the plan's `reason`
 names the Seat and that it waits. A seat that stays busy lets the node go after `idleWaitSeconds`
-(3600 unless said, 86400 at most), and the `reason` says so. `idleWaitSeconds` counts continuous
-waiting while the plan is picking: a pause, a closed window or a node that drops out (unreachable, off
-the selector, its seat idle for a moment) starts the count again. Unset or false, a Seat is not
+(3600 unless said, 86400 at most), and the `reason` says so. `idleWaitSeconds` counts from the node's first wait
+while the plan is picking, and that includes the time the node waits for its turn (another node going,
+a voter away): a seat that says idle for a moment does not start the count again, but a pause, a closed
+window or a node that drops out (unreachable, off the selector) does. A seat that is busy for the
+first time when the node's turn has come starts its count there. Unset or false, a Seat is not
 looked at. A kithd older than this one, as leader during a mixed-version update, ignores the flag.
 
 With `drain: true` a node picked is drained as `kith node drain` does it: it is cordoned, the

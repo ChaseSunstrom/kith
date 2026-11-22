@@ -1706,7 +1706,7 @@ fn access_first_exec_attach_and_cp_are_refused_before_any_upgrade() {
     let roles = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: reader }\nspec:\n  rules:\n    - kinds: [Workload, Job]\n      verbs: [get, list, watch]\n      namespaces: [team]\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: runner }\nspec:\n  rules:\n    - kinds: [Workload, Job]\n      verbs: [get, list, exec]\n      namespaces: [team]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob-reader }\nspec:\n  role: reader\n  subjects: [bob]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: carol-runner }\nspec:\n  role: runner\n  subjects: [carol]\n";
     cluster.write("roles.yaml", roles);
     cluster.kith(&["apply", "-f", "roles.yaml"]);
-    // A Deployment `web` of two replicas and a Job `tidy`: their pods are web-0 and tidy-j0.
+    // A Deployment `web` of two replicas and a Job `tidy`: their pods are `{web}-0` and `{tidy}-j0` (the names `unique` gives).
     let json = ["Content-Type: application/json"];
     let (web, tidy) = (unique("web"), unique("tidy"));
     cluster.write("web.json", &web_json(&web));
@@ -2164,7 +2164,7 @@ fn with_running(test: &str, host: bool) -> Option<(Cluster, String)> {
         }
         let status = held.to_string();
         // A container's create says "cgroup error"; an exec unit's says it could not make its dir under /sys/fs/cgroup
-        // (CI: "failed to create dir /sys/fs/cgroup/system.slice/kith-w_team_tool_0_main: Permission denied").
+        // (CI: "failed to create dir /sys/fs/cgroup/system.slice/kith-w_team_<tool>_0_main: Permission denied").
         if status.contains("cgroup error") || status.contains("failed to create dir /sys/fs/cgroup") {
             // Straight to stderr: the harness captures eprintln! and drops a passing test's output.
             let _ = writeln!(
@@ -2250,7 +2250,7 @@ fn workflows_kubectl_port_forward_carries_bytes_both_ways() {
     if !has_kubectl() {
         return;
     }
-    // Without a delegated cgroup kithd runs no workloads, so tool-0 never runs (CI's runner).
+    // Without a delegated cgroup kithd runs no workloads, so the unique("tool") Workload's pod never runs (CI's runner).
     if !kith_runtime::has_delegated_cgroup() {
         eprintln!("skipped: no delegated cgroup here");
         return;
@@ -2281,7 +2281,7 @@ fn workflows_kubectl_port_forward_ends_a_silent_stream_and_bounds_its_streams() 
     if !has_kubectl() {
         return;
     }
-    // Without a delegated cgroup kithd runs no workloads, so tool-0 never runs (CI's runner).
+    // Without a delegated cgroup kithd runs no workloads, so the unique("tool") Workload's pod never runs (CI's runner).
     if !kith_runtime::has_delegated_cgroup() {
         eprintln!("skipped: no delegated cgroup here");
         return;
@@ -2321,7 +2321,7 @@ fn workflows_kubectl_port_forward_does_not_reach_the_host_through_a_pod_that_is_
     if !has_kubectl() {
         return;
     }
-    // Without a delegated cgroup kithd runs no workloads, so tool-0 never runs (CI's runner).
+    // Without a delegated cgroup kithd runs no workloads, so the unique("tool") Workload's pod never runs (CI's runner).
     if !kith_runtime::has_delegated_cgroup() {
         eprintln!("skipped: no delegated cgroup here");
         return;
@@ -2401,7 +2401,7 @@ fn workflows_kubectl_port_forward_asks_the_right_again_for_each_connection() {
     if !has_kubectl() {
         return;
     }
-    // Without a delegated cgroup kithd runs no workloads, so tool-0 never runs (CI's runner).
+    // Without a delegated cgroup kithd runs no workloads, so the unique("tool") Workload's pod never runs (CI's runner).
     if !kith_runtime::has_delegated_cgroup() {
         eprintln!("skipped: no delegated cgroup here");
         return;

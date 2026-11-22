@@ -3422,6 +3422,44 @@ mod tests {
         assert_eq!(told(&go(Some(&again), &up, 1060)), ["a"]);
     }
 
+    /// Time a busy seat spends while its node does not fit (another voter is down) counts toward
+    /// `idleWaitSeconds`: the node is let go at once when it fits, the seat still busy. A seat that
+    /// was idle all that time has no count: busy only when the node fits, it waits the whole time.
+    #[test]
+    fn update_idle_wait_counts_a_busy_seat_while_the_node_does_not_fit() {
+        let go = |last: Option<&Decided>, nodes: &[Node], at: u64| {
+            let spec = json!({ "waitForIdleSeats": true, "idleWaitSeconds": 60 });
+            step(&plan(spec, last), Some(("2", "next@1")), nodes, at)
+        };
+        let voter = |a: Node| Node { voter: true, ..a };
+        let down = Node {
+            up: false,
+            ..voter(node("b", "1", true))
+        };
+        let up = voter(node("b", "1", true));
+        // Busy for 100 s with the node held back by `b` being down: its count is 100 s when `b` is back.
+        let held = go(None, &[voter(seated("a", "active")), down.clone()], 1000);
+        assert!(told(&held).is_empty());
+        let held = go(Some(&held), &[voter(seated("a", "active")), down.clone()], 1100);
+        assert_eq!(held.status["idleSince"], json!({ "a": 1000 }));
+        let freed = go(Some(&held), &[voter(seated("a", "active")), up.clone()], 1101);
+        assert_eq!(told(&freed), ["a"]);
+        assert!(
+            freed.status["gaveUp"]["a"]
+                .as_str()
+                .unwrap()
+                .contains("still said active")
+        );
+        // Idle for 100 s while it did not fit, then busy once it does: the count starts there.
+        let idle = go(None, &[voter(node("a", "1", true)), down.clone()], 1000);
+        let idle = go(Some(&idle), &[voter(node("a", "1", true)), down], 1100);
+        assert_eq!(idle.status["idleSince"], json!({}));
+        let busy = go(Some(&idle), &[voter(seated("a", "active")), up.clone()], 1101);
+        // (`a` waits for its seat, so `b`, the other voter, goes first.)
+        assert_eq!(told(&busy), ["b"]);
+        assert_eq!(busy.status["idleSince"], json!({ "a": 1101 }));
+    }
+
     /// The wait for a seat counts continuous picking: a pause or a closed window restarts it.
     #[test]
     fn update_idle_wait_restarts_after_a_pause_or_a_closed_window() {
