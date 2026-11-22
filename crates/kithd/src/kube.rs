@@ -3260,7 +3260,6 @@ impl Watch {
             self.event("BOOKMARK", &mark, at);
         }
     }
-
 }
 
 impl Call {
@@ -3390,7 +3389,10 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
             // no more, as a watch is told no more; unlike a watch's, this end is written in the audit log.
             if follow && !own.0.stands() {
                 let why = "this certificate does not stand for its Identity any more".to_string();
-                own.0.shared.audit.record(&own.0.caller, "logs", vec![own.1.clone()], Err(why));
+                own.0
+                    .shared
+                    .audit
+                    .record(&own.0.caller, "logs", vec![own.1.clone()], Err(why));
                 return None;
             }
             let (text, more) = reading.more().await.ok()?;
@@ -4561,11 +4563,7 @@ spec: {role: writer, subjects: [carol]}
 
     /// A followed log of the pod `x-0`, asked by Identity `alice` showing a certificate of `public`'s
     /// key; `alice` may read what runs pods. The replica's output file is written with `first`.
-    async fn followed_log_of_alice(
-        shared: &Arc<crate::Shared>,
-        public: &str,
-        first: &str,
-    ) -> Chunks {
+    async fn followed_log_of_alice(shared: &Arc<crate::Shared>, public: &str, first: &str) -> Chunks {
         use rustls::pki_types::pem::PemObject;
         let reader = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: reader}\nspec:\n  rules:\n    - {kinds: ['*'], verbs: [get, list]}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: alice-reader}\nspec: {role: reader, subjects: [alice]}\n---\napiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: alice}\nspec: {publicKey: PUBLIC}\n";
         let reader = reader.replace("PUBLIC", &serde_json::to_string(public).unwrap());
@@ -4581,13 +4579,16 @@ spec: {role: writer, subjects: [carol]}
         let der = rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(public.as_bytes()).unwrap();
         let mut request = axum::http::Request::builder().method("GET").body(()).unwrap();
         request.extensions_mut().insert(Caller::Identity("alice".into()));
-        request
-            .extensions_mut()
-            .insert(Certificate(crate::pki::Subject::User("alice".into(), der.as_ref().to_vec())));
+        request.extensions_mut().insert(Certificate(crate::pki::Subject::User(
+            "alice".into(),
+            der.as_ref().to_vec(),
+        )));
         let (parts, ()) = request.into_parts();
         let asked = Asked::from([("follow".to_string(), "true".to_string())]);
         let rest = "namespaces/default/pods/x-0/log";
-        let answer = serve(shared.clone(), parts, "", rest, asked, b"").await.unwrap_or_else(|no| panic!("{}", no.why));
+        let answer = serve(shared.clone(), parts, "", rest, asked, b"")
+            .await
+            .unwrap_or_else(|no| panic!("{}", no.why));
         assert_eq!(answer.status(), StatusCode::OK);
         Box::pin(answer.into_body().into_data_stream())
     }
@@ -4595,7 +4596,8 @@ spec: {role: writer, subjects: [carol]}
     async fn next_of(chunks: &mut Chunks) -> Option<String> {
         use futures_util::StreamExt;
         let next = tokio::time::timeout(Duration::from_secs(10), chunks.next()).await;
-        next.expect("no chunk and no end in 10 s").map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+        next.expect("no chunk and no end in 10 s")
+            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
     }
 
     /// A followed `kubectl logs` goes on reading while the Identity's certificate stands.
@@ -4625,7 +4627,9 @@ spec: {role: writer, subjects: [carol]}
         std::fs::write(shared.logs.join("w_default_x_0_main.out"), "one\ntwo\n").unwrap();
         assert_eq!(next_of(&mut chunks).await, None, "the stream went on");
         let entries = shared.audit.tail(10).unwrap();
-        let said = entries.iter().any(|e| e["verb"] == "logs" && e["who"] == "alice" && e["ok"] == false);
+        let said = entries
+            .iter()
+            .any(|e| e["verb"] == "logs" && e["who"] == "alice" && e["ok"] == false);
         assert!(said, "{entries:?}");
         drop(chunks);
         drop(shared);
@@ -4646,11 +4650,19 @@ spec: {role: writer, subjects: [carol]}
             "apiVersion": kith_api::API_VERSION, "kind": "Identity",
             "metadata": { "name": "alice" }, "spec": { "publicKey": given },
         });
-        shared.store.lock().unwrap().store.apply(serde_json::from_value(new).unwrap()).unwrap();
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .apply(serde_json::from_value(new).unwrap())
+            .unwrap();
         std::fs::write(shared.logs.join("w_default_x_0_main.out"), "one\ntwo\n").unwrap();
         assert_eq!(next_of(&mut chunks).await, None, "the stream went on");
         let entries = shared.audit.tail(10).unwrap();
-        let said = entries.iter().any(|e| e["verb"] == "logs" && e["who"] == "alice" && e["ok"] == false);
+        let said = entries
+            .iter()
+            .any(|e| e["verb"] == "logs" && e["who"] == "alice" && e["ok"] == false);
         assert!(said, "{entries:?}");
         drop(chunks);
         drop(shared);

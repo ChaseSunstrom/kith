@@ -2055,7 +2055,9 @@ fn start() -> Vec<tokio::runtime::Handle> {
 /// A thread called `name` with a runtime of its own, for as long as kithd runs (what is
 /// on it is stopped, not the thread).
 pub fn thread(name: String) -> std::io::Result<tokio::runtime::Handle> {
-    thread_by(name, |name, run| std::thread::Builder::new().name(name).spawn(run).map(drop))
+    thread_by(name, |name, run| {
+        std::thread::Builder::new().name(name).spawn(run).map(drop)
+    })
 }
 
 /// [`thread`] with the spawn given. The runtime is built on the new thread, never on the caller:
