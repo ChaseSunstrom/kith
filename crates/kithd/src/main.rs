@@ -76,6 +76,7 @@ mod renew;
 mod replicas;
 mod resolver;
 mod root_part;
+mod scan;
 mod sched;
 #[cfg(test)]
 mod scratch;
