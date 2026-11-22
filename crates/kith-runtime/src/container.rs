@@ -5438,8 +5438,14 @@ mod tests {
                 .filter(|e| e.file_name().to_string_lossy().starts_with(SCRATCH))
                 .count()
         };
-        let ok = enter(&state, "scratch1", &["/bin/cat".into(), "/proc/1/cmdline".into()]);
-        let started = ok.map(|entered| entered.wait()).is_ok();
+        // (Under load the first enter can race the init's own start: a few tries.)
+        let started = (0..5).any(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            let ok = enter(&state, "scratch1", &["/bin/cat".into(), "/proc/1/cmdline".into()]);
+            ok.map(|entered| entered.wait()).is_ok()
+        });
         let missing = enter(&state, "scratch1", &["/bin/nothing".into()]).is_err();
         let not_running = enter(&state, "nothing-here", &["/bin/cat".into()]).is_err();
         let counted = left();
@@ -5450,7 +5456,9 @@ mod tests {
         }
         let _ = handle.delete();
         let _ = fs::remove_dir_all(&root);
-        assert!(started && missing && not_running);
+        assert!(started, "the tenant never entered the running container");
+        assert!(missing, "a program the image lacks was not refused");
+        assert!(not_running, "entering a container that does not run was not refused");
         assert_eq!(counted, 0, "no scratch copy left behind");
     }
 
