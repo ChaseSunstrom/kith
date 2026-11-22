@@ -172,7 +172,7 @@ logged naming it, on both nodes):
   an encrypted Volume of it is not open: a text of at most 1 KiB without control
   characters, or null, and no other field in the same write), and its own Node's
   `shares` (the NFS Shares it serves, as names) and `encrypted` (the files of encrypted
-  Volumes it holds, as `NS/NAME`: null or up to 4096 names). Such a status may name only a Blob the worker
+  Volumes it holds, as `NS/NAME`: null or up to 1024 names). Such a status may name only a Blob the worker
   made, or one that status named before.
 - **A new Blob** for an image or a backup it just made, in the namespace of a Volume that
   is on it. The control node writes the worker's name on it (`kith.dev/made-on`). It is

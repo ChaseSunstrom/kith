@@ -316,13 +316,14 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
                     "encrypted",
                 ],
             )?;
-            // (The volume files it holds, by `NAMESPACE/NAME`: its keepers keep their copies of the key while it holds one.)
+            // (The volume files it holds, by `NAMESPACE/NAME` (a name is at most 63 characters): its keepers
+            // keep their copies of the key while it holds one.)
             if let Some(files) = fields.get("encrypted") {
                 let names = files.as_array().filter(|names| names.len() <= crate::encrypted::HELD);
                 if !files.is_null()
-                    && !names.is_some_and(|names| names.iter().all(|n| n.as_str().is_some_and(|n| n.len() <= 320)))
+                    && !names.is_some_and(|names| names.iter().all(|n| n.as_str().is_some_and(|n| n.len() <= 127)))
                 {
-                    return Err(refused(key, "`encrypted` is null or up to 4096 names"));
+                    return Err(refused(key, "`encrypted` is null or up to 1024 names"));
                 }
             }
             // (The Shares it serves over NFS, by name: for the leader to say a Share is served.)

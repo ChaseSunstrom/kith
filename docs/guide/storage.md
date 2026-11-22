@@ -206,8 +206,11 @@ spec:
 - While it is not open, `status.reason` says why (no node has handed over the key, or the key
   the cluster keeps does not open the file), and `kith get volumes` shows it beside the state.
 - **A Volume gone from the store for a day has its key copies and its file erased, and that
-  cannot be undone.** A node that keeps the key waits for the volume's node to say it no longer
-  holds the file, and a day more. Apply the Volume again inside that day and it is as it was.
+  cannot be undone.** The volume's node closes it if it is open (unmounts it and removes its
+  mapping; one still in use is left and tried again) and unlinks its file. A node that keeps the
+  key waits for the volume's node to say it no longer holds the file (a node that has said
+  nothing of its files keeps the copy), and a day more. Apply the Volume again inside that day
+  and it is as it was.
 - Not yet: someone with the volume's node's disk *and* another node's disk can open it, unless
   that node's state is [encrypted too](os.md#encrypted-state). A Backup or an Image of it is not
   encrypted. It cannot be `shared`, have `replicas`, or be in `kith-system`; it is not resized;
