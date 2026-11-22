@@ -1321,7 +1321,7 @@ fn launch_against_a_store_file() {
 /// code, what it runs and its age; `-n` and `-A` choose the namespaces.
 #[test]
 fn ps_lists_replicas_job_runs_and_exec_units() {
-    let sb = Sandbox::new("ps");
+    let sb = Sandbox::short("ps");
     let three_hours_ago = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
