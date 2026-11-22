@@ -520,6 +520,15 @@ spec! {
         /// is the node's root.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub user_namespaces: Option<bool>,
+        /// The container's `/sys/fs/cgroup` is read-write, and its cgroup's directory and the
+        /// files that make a child cgroup and move a process into it are its user's, so a
+        /// program in it (a runtime for containers of its own) can make cgroups below its
+        /// own and move itself into them. It cannot leave its subtree, and the limits stay
+        /// the node's, on the container. It makes cgroups on the node: off unless said,
+        /// refused where the node has no `unconfined`, and for a container that is the
+        /// node's root.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cgroup_delegation: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub resources: Option<Resources>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

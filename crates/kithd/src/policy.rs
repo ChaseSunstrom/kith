@@ -27,7 +27,7 @@ pub const KEYS: [(&str, &str, &str); 11] = [
     (
         "unconfined",
         "unconfined",
-        "containers with no system call filter, or with refused calls allowed back",
+        "containers with no system call filter, or with refused calls allowed back, or a writable cgroup subtree",
     ),
     (
         "host-users",
@@ -340,8 +340,13 @@ pub fn needs(template: &Template, pci: bool, node_workload: bool) -> Vec<&'stati
             "unconfined",
             template
                 .containers()
-                // (`userNamespaces` lets the refused calls back: `nested`.)
-                .any(|c| c.user_namespaces == Some(true) || c.seccomp.as_ref().is_some_and(unconfined)),
+                // (`userNamespaces` lets the refused calls back: `nested`; `cgroupDelegation` makes
+                // cgroups on the node.)
+                .any(|c| {
+                    c.user_namespaces == Some(true)
+                        || c.cgroup_delegation == Some(true)
+                        || c.seccomp.as_ref().is_some_and(unconfined)
+                }),
         ),
         ("hostUsers", node_workload && template.containers().next().is_some()),
         (
@@ -582,6 +587,25 @@ mod tests {
         let vms: Policy = "hardened,vms".parse().unwrap();
         assert_eq!(vms.refuses(&vm, false, false), Vec::<String>::new());
         assert_eq!(vms.refuses(&vm_disk, false, false).len(), 1);
+    }
+
+    /// A container with a cgroup subtree of its own to write makes cgroups on the node: the same ask as
+    /// `userNamespaces`, and no more when it is not said or said off.
+    #[test]
+    fn cgroup_delegation_needs_unconfined() {
+        use serde_json::json;
+        let of = |extra: &str| {
+            let mut c = json!({ "name": "a", "image": "x" });
+            c.as_object_mut()
+                .unwrap()
+                .insert("cgroupDelegation".into(), json!(extra == "on"));
+            template(json!({ "pod": true, "containers": [c] }))
+        };
+        assert!(needs(&of("on"), false, false).contains(&"unconfined"));
+        assert!(!needs(&of("off"), false, false).contains(&"unconfined"));
+        let hardened = Policy::hardened();
+        assert!(hardened.refuses(&of("on"), false, false)[0].contains("(unconfined is off"));
+        assert_eq!(hardened.refuses(&of("off"), false, false), Vec::<String>::new());
     }
 
     #[test]

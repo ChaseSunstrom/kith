@@ -695,8 +695,9 @@ pub fn check_unit(id: &str, unit: &Unit, ground: &Ground, owns: &dyn Fn(&Path) -
     {
         return Err(refusal);
     }
-    // (`nested` lets the calls of `NESTED` back through the filter.)
-    if (unit.unconfined || unit.nested || !unit.allow.is_empty())
+    // (`nested` lets the calls of `NESTED` back through the filter; a delegated cgroup makes cgroups
+    // on the node.)
+    if (unit.unconfined || unit.nested || unit.delegated_cgroup || !unit.allow.is_empty())
         && let Some(refusal) = policy.refusal("unconfined")
     {
         return Err(refusal);
@@ -2902,6 +2903,23 @@ mod tests {
         };
         let why = refused(&unit, &ground(&state, "no-unconfined")).expect("nested was made");
         assert!(why.contains("no system call filter"), "{why}");
+        assert_eq!(refused(&unit, &ground(&state, "")), None);
+        assert_eq!(refused(&unit, &ground(&state, "no-root-containers")), None);
+    }
+
+    /// The root part asks `unconfined` again of a unit with a delegated cgroup, as of a nested one.
+    #[test]
+    fn check_create_cgroup_delegation() {
+        let (_, state) = book("delegated");
+        let unit = Unit {
+            no_node_root: true,
+            delegated_cgroup: true,
+            netns: Some(NETNS.into()),
+            ..plain()
+        };
+        let why = refused(&unit, &ground(&state, "no-unconfined")).expect("delegation was made");
+        assert!(why.contains("no system call filter"), "{why}");
+        assert!(why.contains("a writable cgroup subtree"), "{why}");
         assert_eq!(refused(&unit, &ground(&state, "")), None);
         assert_eq!(refused(&unit, &ground(&state, "no-root-containers")), None);
     }

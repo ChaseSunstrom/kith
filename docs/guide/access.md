@@ -86,7 +86,7 @@ RoleBindings (it could give itself every right anyway).
       - { kinds: [OSRelease], verbs: [get, list, apply, delete], names: [canary] }
   ```
 - A template with `seccomp` unconfined or allowing calls, or a container with `userNamespaces`
-  (which lets the refused calls back), also needs the right to apply `Unconfined` (in no namespace).
+  (which lets the refused calls back) or `cgroupDelegation` (which makes cgroups on the node), also needs the right to apply `Unconfined` (in no namespace).
 - The certificate stands while the Identity's `publicKey` is its key: `kith identity cert` again
   ends the old one, `kith delete identity/alice` all access.
 - Grant with care: `apply` on Role, RoleBinding or Identity grants oneself anything, and whoever may apply a Workload runs programs on your nodes. A Release or a Source acts with the rights of whoever applied
@@ -295,7 +295,7 @@ kithd --node-policy no-exec-units,no-run  # everything but exec units and `kith 
 
 The words: `exec-units`; `root-containers` (off: no container is root without an id range of its
 own, as a pod's on kith OS); `unconfined` (a `seccomp` that is unconfined or allows refused
-calls back, which `userNamespaces` does); `host-users` (containers with `host_users`, a
+calls back, which `userNamespaces` does, or a `cgroupDelegation`); `host-users` (containers with `host_users`, a
 NodeWorkload's: the node's own users; off, no NodeWorkload runs); `node-network` (containers that are no pod); `vms`; `vm-paths` (a VM's kernel,
 firmware or disks as node paths, or a hypervisor other than qemu; `vms` alone runs none of use); `passthrough`; `host-paths` (a Volume in `kith-system` at any path on the node);
 `run` (`kith run`); `wipe` (the cluster erasing this node's key or setting duress codes);
