@@ -170,7 +170,9 @@ The Docker Engine API in front of kith, begun: `kith docker serve [--listen PATH
 (`docker.sock` beside kithd's, mode 0600 from its first moment; a socket a dead run left is
 replaced, one in use is refused) and the `docker` command talks to it with
 `DOCKER_HOST=unix://PATH`. It is in the `kith-remote` build (cargo feature `docker`), not in the
-default `kith` or in kithd: nothing in the daemon changed.
+default `kith` or in kithd: nothing in the daemon changed. Against a kithd with `signing: required`
+it asks for the admin's passphrase once, before it serves (at a terminal, or one line on stdin),
+and refuses to start without it; it never asks in the middle of a call.
 
 Today it answers `docker version`, `docker info` and these container calls, each under any
 `/v1.40/` to `/v1.47/` prefix (a client newer or older is told so with a 400, as dockerd does):

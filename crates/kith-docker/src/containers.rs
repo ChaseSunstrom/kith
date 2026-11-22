@@ -98,9 +98,11 @@ impl Containers {
     }
 
     /// The container named `id`, or whose ID starts with `id` (hex, and only one of them). A name
-    /// is two single-key reads; only an ID prefix lists.
+    /// is two single-key reads; only an ID prefix lists. Where both a Job and a Workload of that name
+    /// are ours (a crash in the middle of a conversion), the Job is the one found: it is the one made
+    /// last when a container starts, and the one `halt` takes away last.
     fn find(&self, id: &str) -> Result<Value, Reply> {
-        for kind in ["Workload", "Job"] {
+        for kind in ["Job", "Workload"] {
             if let Some(doc) = self.get(&key(kind, id))?.filter(|doc| ours(doc) == Some(id)) {
                 return Ok(doc);
             }
@@ -205,7 +207,14 @@ impl Containers {
             if gone() {
                 return Err(message(499, "kith: the client hung up"));
             }
-            let doc = self.find(&name)?;
+            let doc = match self.find(&name) {
+                Ok(doc) => doc,
+                // Gone while it ran: it was removed with force, which stops with 137.
+                Err(not_found) if not_found.status == 404 => {
+                    return Ok(json_reply(200, json!({"StatusCode": 137, "Error": null}).to_string()));
+                }
+                Err(other) => return Err(other),
+            };
             let st = state(&doc);
             if !st.running {
                 return Ok(json_reply(
@@ -256,10 +265,13 @@ impl Containers {
             }
             self.halt(&doc, 137)?;
         }
-        let doc = self.find(&name)?;
-        self.store
-            .delete(&key(doc["kind"].as_str().unwrap_or("Workload"), &name))
-            .map_err(store_failed)?;
+        // (Both kinds: after a crash in a conversion, both may be ours, and neither is left behind.)
+        for kind in ["Job", "Workload"] {
+            let at = key(kind, &name);
+            if self.get(&at)?.is_some_and(|doc| ours(&doc).is_some()) {
+                self.store.delete(&at).map_err(store_failed)?;
+            }
+        }
         Ok(empty(204))
     }
 
@@ -269,21 +281,8 @@ impl Containers {
         if state(&doc).running {
             return Ok(false);
         }
-        let name = name_of(&doc).to_string();
         if doc["kind"] == "Job" {
-            // (A finished Job runs again: its status goes with it, so it is taken away first.)
-            // (A kept status cannot be cleared by an apply, so delete comes first: if the new Job
-            // is refused, the container goes back as a stopped one rather than being lost.)
-            // The parked Workload must be ours to write, so that is checked before anything goes.
-            let parked_key = key("Workload", &name);
-            self.not_foreign(&parked_key)?;
-            self.store.delete(&key("Job", &name)).map_err(store_failed)?;
-            if let Err(e) = self.put(doc.clone()) {
-                if self.not_foreign(&parked_key).is_ok() {
-                    let _ = self.put(parked(&doc));
-                }
-                return Err(store_failed(e));
-            }
+            self.restart_job(doc)?;
         } else if is_job(annotation(&doc, ANN_RESTART)) {
             self.convert("Workload", job_from(&doc))?;
         } else {
@@ -293,6 +292,30 @@ impl Containers {
             self.put(doc).map_err(store_failed)?;
         }
         Ok(true)
+    }
+
+    /// A finished Job runs again. An apply keeps a Job's old status, so the Job has to go and be made
+    /// anew; the stopped Workload is made first and taken away last, so every step leaves a
+    /// container, and a failure says which one is left.
+    fn restart_job(&self, doc: Value) -> Result<(), Reply> {
+        let name = name_of(&doc).to_string();
+        let (job_key, parked_key) = (key("Job", &name), key("Workload", &name));
+        let failed = |e: String, left: &str| {
+            message(
+                500,
+                format!("kith: restarting {name} failed ({e}); it is left as {left}"),
+            )
+        };
+        self.not_foreign(&parked_key)?;
+        self.put(parked(&doc)).map_err(|e| failed(e, &job_key))?;
+        // (Whatever is at the Job's key now must still be ours: it is read again before it goes.)
+        self.not_foreign(&job_key)?;
+        let both = format!("{job_key} and {parked_key}");
+        self.store.delete(&job_key).map_err(|e| failed(e, &both))?;
+        self.put(doc).map_err(|e| failed(e, &parked_key))?;
+        self.store
+            .delete(&parked_key)
+            .map_err(|e| failed(e, &format!("{job_key}, running, with {parked_key} left over")))
     }
 
     /// Stop a running container with `exit` as its code. A Workload goes to zero replicas; a Job is
@@ -462,6 +485,8 @@ fn parked(job: &Value) -> Value {
     let mut doc = job.clone();
     doc["kind"] = json!("Workload");
     doc["spec"] = json!({"replicas": 0, "template": template});
+    // (The code the Job last ended with, which a Job's status holds and a Workload's annotation does.)
+    set_annotation(&mut doc, ANN_EXIT, &state(job).exit.to_string());
     doc
 }
 
@@ -988,6 +1013,52 @@ mod tests {
         }
     }
 
+    /// A store that refuses the operations it is told to ("apply Job/docker/once", "delete
+    /// Workload/docker/once") and logs the ones it took, in order.
+    struct Failing {
+        mem: MemStore,
+        refuse: &'static [&'static str],
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Failing {
+        fn refused(&self, op: &str, key: &str) -> Result<(), String> {
+            let line = format!("{op} {key}");
+            if self.refuse.contains(&line.as_str()) {
+                return Err(format!("refused: {line}"));
+            }
+            self.log.lock().unwrap().push(line);
+            Ok(())
+        }
+    }
+
+    impl Store for Failing {
+        fn get(&self, key: &str) -> Result<Option<Value>, String> {
+            self.mem.get(key)
+        }
+        fn list(&self, kind: &str, namespace: &str) -> Result<Vec<Value>, String> {
+            self.mem.list(kind, namespace)
+        }
+        fn apply(&self, doc: Value) -> Result<(), String> {
+            self.refused("apply", &key_of(&doc))?;
+            self.mem.apply(doc)
+        }
+        fn delete(&self, key: &str) -> Result<(), String> {
+            self.refused("delete", key)?;
+            self.mem.delete(key)
+        }
+    }
+
+    fn failing(refuse: &'static [&'static str]) -> (MemStore, Arc<Mutex<Vec<String>>>, Containers) {
+        let (mem, log) = (MemStore::default(), Arc::new(Mutex::new(Vec::new())));
+        let store = Failing {
+            mem: mem.clone(),
+            refuse,
+            log: log.clone(),
+        };
+        (mem, log, Containers::new(Box::new(store)))
+    }
+
     /// One call as `docker` makes it: the status, and the body as JSON (Null when there is none).
     fn call(c: &Containers, method: &str, target: &str, body: &str) -> (u16, Value) {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -1146,65 +1217,135 @@ mod tests {
 
     #[test]
     fn a_finished_job_that_cannot_be_made_again_stays_a_stopped_container() {
-        struct Refusing(MemStore);
-        impl Store for Refusing {
-            fn get(&self, key: &str) -> Result<Option<Value>, String> {
-                self.0.get(key)
-            }
-            fn list(&self, kind: &str, namespace: &str) -> Result<Vec<Value>, String> {
-                self.0.list(kind, namespace)
-            }
-            fn apply(&self, doc: Value) -> Result<(), String> {
-                if doc["kind"] == "Job" {
-                    return Err("refused".into());
-                }
-                self.0.apply(doc)
-            }
-            fn delete(&self, key: &str) -> Result<(), String> {
-                self.0.delete(key)
-            }
-        }
-        let mem = MemStore::default();
-        let c = Containers::new(Box::new(Refusing(mem.clone())));
-        mem.apply(json!({"apiVersion": "kith.dev/v1", "kind": "Job",
-            "metadata": {"name": "once", "namespace": "docker", "labels": {LABEL: "once"}},
-            "spec": {"template": {"containers": [{"name": "once", "image": "alpine"}], "restartPolicy": "never"}},
-            "status": {"state": "succeeded", "containers": [{"name": "once", "exitCode": 0}]}}))
-            .unwrap();
-        assert_eq!(call(&c, "POST", "/containers/once/start", "").0, 500);
+        let (mem, _log, c) = failing(&["apply Job/docker/once"]);
+        mem.apply(finished_job("once", 3)).unwrap();
+        let (status, reply) = call(&c, "POST", "/containers/once/start", "");
+        assert_eq!(status, 500);
+        let said = reply["message"].as_str().unwrap();
+        assert!(
+            said.contains("Workload/docker/once"),
+            "the error says what is left: {said}"
+        );
+        let (_, inspect) = call(&c, "GET", "/containers/once/json", "");
+        assert_eq!(inspect["State"]["Status"], "exited", "the container is kept");
         assert_eq!(
-            call(&c, "GET", "/containers/once/json", "").1["State"]["Status"],
-            "exited",
-            "the container is kept"
+            inspect["State"]["ExitCode"], 3,
+            "with the code the Job had finished with"
+        );
+    }
+
+    /// A finished Job of the front's, as a store keeps it.
+    fn finished_job(name: &str, exit: i64) -> Value {
+        json!({"apiVersion": "kith.dev/v1", "kind": "Job",
+            "metadata": {"name": name, "namespace": "docker", "labels": {LABEL: name}},
+            "spec": {"template": {"containers": [{"name": name, "image": "alpine"}], "restartPolicy": "never"}},
+            "status": {"state": if exit == 0 { "succeeded" } else { "failed" },
+                "containers": [{"name": name, "exitCode": exit}]}})
+    }
+
+    #[test]
+    fn a_job_restart_makes_the_stopped_workload_first_and_takes_it_away_last() {
+        let (mem, log, c) = failing(&[]);
+        mem.apply(finished_job("once", 0)).unwrap();
+        assert_eq!(call(&c, "POST", "/containers/once/start", "").0, 204);
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "apply Workload/docker/once",
+                "delete Job/docker/once",
+                "apply Job/docker/once",
+                "delete Workload/docker/once"
+            ],
+            "there is a container at every step"
+        );
+        assert!(mem.get("Workload/docker/once").unwrap().is_none());
+        assert!(mem.get("Job/docker/once").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_job_restart_that_fails_at_any_step_keeps_the_container_and_names_where() {
+        for (refused, left) in [
+            ("apply Workload/docker/once", "Job/docker/once"),
+            ("delete Job/docker/once", "Job/docker/once"),
+            ("apply Job/docker/once", "Workload/docker/once"),
+            ("delete Workload/docker/once", "Job/docker/once"),
+        ] {
+            let refuse: &'static [&'static str] = Box::leak(Box::new([refused]));
+            let (mem, _log, c) = failing(refuse);
+            mem.apply(finished_job("once", 0)).unwrap();
+            let (status, reply) = call(&c, "POST", "/containers/once/start", "");
+            assert_eq!(status, 500, "{refused}: {reply}");
+            let said = reply["message"].as_str().unwrap();
+            assert!(said.contains(refused), "{refused}: the error names the step: {said}");
+            assert!(said.contains(left), "{refused}: the error names what is left: {said}");
+            assert!(
+                mem.get(left).unwrap().is_some(),
+                "{refused}: {left} is still there: {:?}",
+                mem.0.lock().unwrap().keys().collect::<Vec<_>>()
+            );
+            assert_eq!(call(&c, "GET", "/containers/once/json", "").0, 200, "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_job_that_is_no_longer_ours_at_the_restart_is_not_deleted() {
+        let (mem, c) = fixture();
+        mem.apply(finished_job("once", 0)).unwrap();
+        let mut theirs = finished_job("once", 0);
+        theirs["metadata"]["labels"] = json!({});
+        // The doc `start` was handed is ours; by the time it deletes, the Job at the key is not.
+        let doc = mem.get("Job/docker/once").unwrap().unwrap();
+        mem.apply(theirs.clone()).unwrap();
+        let _held = c.lock();
+        let reply = c.start(doc).unwrap_err();
+        assert_eq!(reply.status, 409);
+        assert_eq!(
+            mem.get("Job/docker/once").unwrap(),
+            Some(theirs),
+            "their Job is as it was"
         );
     }
 
     #[test]
-    fn a_foreign_workload_survives_a_failing_job_restart_untouched() {
-        struct Refusing(MemStore);
-        impl Store for Refusing {
-            fn get(&self, key: &str) -> Result<Option<Value>, String> {
-                self.0.get(key)
-            }
-            fn list(&self, kind: &str, namespace: &str) -> Result<Vec<Value>, String> {
-                self.0.list(kind, namespace)
-            }
-            fn apply(&self, doc: Value) -> Result<(), String> {
-                if doc["kind"] == "Job" {
-                    return Err("refused".into());
+    fn both_a_workload_and_a_job_of_ours_read_as_the_job_and_go_together() {
+        let (mem, c) = fixture();
+        call(&c, "POST", "/containers/create?name=once", r#"{"Image":"alpine"}"#);
+        // A crash between the two writes of a conversion leaves both.
+        mem.apply(finished_job("once", 5)).unwrap();
+        let (_, inspect) = call(&c, "GET", "/containers/once/json", "");
+        assert_eq!(inspect["State"]["ExitCode"], 5, "the Job is the one that is read");
+        assert_eq!(call(&c, "DELETE", "/containers/once", "").0, 204);
+        assert!(mem.get("Job/docker/once").unwrap().is_none());
+        assert!(mem.get("Workload/docker/once").unwrap().is_none());
+        assert_eq!(call(&c, "GET", "/containers/once/json", "").0, 404);
+    }
+
+    #[test]
+    fn a_wait_on_a_container_that_is_removed_meanwhile_answers_as_a_kill() {
+        let (mem, c) = fixture();
+        call(&c, "POST", "/containers/create?name=web", WEB);
+        call(&c, "POST", "/containers/web/start", "");
+        let mut polls = 0;
+        let reply = c
+            .route("POST", "/containers/web/wait", "", b"", &mut || {
+                polls += 1;
+                if polls == 2 {
+                    mem.delete("Workload/docker/web").unwrap();
                 }
-                self.0.apply(doc)
-            }
-            fn delete(&self, key: &str) -> Result<(), String> {
-                self.0.delete(key)
-            }
-        }
-        let mem = MemStore::default();
-        let c = Containers::new(Box::new(Refusing(mem.clone())));
-        let job = json!({"apiVersion": "kith.dev/v1", "kind": "Job",
-            "metadata": {"name": "once", "namespace": "docker", "labels": {LABEL: "once"}},
-            "spec": {"template": {"containers": [{"name": "once", "image": "alpine"}], "restartPolicy": "never"}},
-            "status": {"state": "succeeded", "containers": [{"name": "once", "exitCode": 0}]}});
+                false
+            })
+            .expect("answered");
+        assert_eq!(reply.status, 200);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body, json!({"StatusCode": 137, "Error": null}));
+        // (Before the wait starts, a container that is not there is Docker's 404.)
+        assert_eq!(call(&c, "POST", "/containers/web/wait", "").0, 404);
+    }
+
+    #[test]
+    fn a_foreign_workload_survives_a_failing_job_restart_untouched() {
+        let (mem, _log, c) = failing(&["apply Job/docker/once"]);
+        let job = finished_job("once", 0);
         mem.apply(job.clone()).unwrap();
         let theirs = json!({"apiVersion": "kith.dev/v1", "kind": "Workload",
             "metadata": {"name": "once", "namespace": "docker"},
@@ -1446,15 +1587,11 @@ mod tests {
         );
         assert!(c.route("GET", "/images/json", "", b"", &mut || false).is_none());
         let attached = r#"{"Image":"alpine","AttachStdout":true,"HostConfig":{}}"#;
-        let (status, reply) = call_refusal(&c, "POST", "/containers/create?name=web", attached);
+        let (status, reply) = call(&c, "POST", "/containers/create?name=web", attached);
         assert_eq!(status, 501, "docker run without -d needs attach: not yet");
         assert!(reply["message"].is_string());
-        let (status, _) = call_refusal(&c, "GET", "/containers/json?filters=%7B%7D", "");
+        let (status, _) = call(&c, "GET", "/containers/json?filters=%7B%7D", "");
         assert_eq!(status, 501, "filters are not answered yet");
-    }
-
-    fn call_refusal(c: &Containers, method: &str, target: &str, body: &str) -> (u16, Value) {
-        call(c, method, target, body)
     }
 
     #[test]

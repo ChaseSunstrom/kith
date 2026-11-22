@@ -41,6 +41,48 @@ fn docker_serve_listens_on_a_private_socket_and_answers_ping() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A kithd that requires the admin's signature: `docker serve` asks for the passphrase before it
+/// serves, or refuses to start with a message. Here there is no terminal and nothing on stdin, so it
+/// refuses, and no Docker socket is ever made (a request thread would have had to prompt).
+#[test]
+fn docker_serve_against_a_signing_cluster_asks_before_serving_or_refuses() {
+    use std::os::unix::net::UnixListener;
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("docker-sign-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (kithd, docker) = (dir.join("kithd.sock"), dir.join("docker.sock"));
+    let listener = UnixListener::bind(&kithd).unwrap();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = [0u8; 1024];
+            let _ = stream.read(&mut head);
+            let body = r#"{"signing":"required","clusterId":"c1"}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    // (`setsid`: no controlling terminal, so a run from a terminal does not wait for typing.)
+    let out = Command::new("setsid")
+        .args(["-w", env!("CARGO_BIN_EXE_kith"), "--socket"])
+        .arg(&kithd)
+        .args(["docker", "serve", "--listen"])
+        .arg(&docker)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "it must not start: {err}");
+    assert!(
+        err.contains("spec.signing: required") && err.contains("before it serves"),
+        "{err}"
+    );
+    assert!(!docker.exists(), "no Docker socket before the passphrase is known");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A child killed when the test ends, however it ends.
 struct Stop(std::process::Child);
 
