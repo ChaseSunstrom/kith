@@ -230,8 +230,11 @@ spec:
   `size` big, if the file is missing; it never resizes or overwrites one that exists. A node
   without the Volume is not given the machine: it says why in the unit's note. When the Volume
   is handed over to another replica, the machine follows it and starts from the same image. Keep
-  one replica of the machine, and mount the Volume nowhere else: a container that shares its
-  directory could swap the image for a link between kithd's check and the hypervisor's open.
+  one replica of the machine. The hypervisor opens kithd's own hard link to the image (in
+  `<state>/vm-images`, which no container mounts, made at every start), so a container that
+  shares the Volume cannot swap the image for a link to a node's file. A Volume on another file
+  system than the state directory's, and an encrypted Volume, holds no machine's disk: the unit's
+  note says so and the machine does not start.
 - kithd supervises the hypervisor; the serial console (`console=ttyS0`) is the unit's log: `kith
   logs Workload/windows --unit machine`. `hypervisor: qemu` (default, with KVM) or
   `cloudHypervisor`; the node needs `qemu-system-x86_64` (`-aarch64` on arm64) or
