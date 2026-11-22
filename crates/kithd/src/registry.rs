@@ -595,7 +595,7 @@ pub async fn run(shared: Arc<Shared>, poll: Duration, mut stopping: watch::Recei
                             Some(package) => {
                                 let at = kith_api::store::now();
                                 let resources = vec![package];
-                                let stored = shared.submit(Command::Apply { resources, at }).await;
+                                let stored = shared.submit_node(Command::Apply { resources, at }).await;
                                 stored.map(|_| ()).map_err(|e| e.to_string())
                             }
                         };

@@ -26,8 +26,12 @@
     # key on /dev/uhid (docs/adr-fido2.md section 2), and of a kernel with that device (the uhid-test
     # spec); in a folder of its own, so the plain image stays plain, and no other test has either.)
     [ "$test" != fido2 ] || { KITHD_FEATURES=fido2-test KITH_OS_SPEC=os/examples/fido2-test.yaml osdir=$root/target/os-fido2; export KITHD_FEATURES; }
+    # (privilege: the image of a kithd built with the cargo feature confine-probe, whose
+    # `confine-probe` subcommand confines itself as the serving part does (ci/vm/privilege.sh); in a
+    # folder of its own, so the plain image stays plain.)
+    [ "$test" != privilege ] || { KITHD_FEATURES=confine-probe osdir=$root/target/os-probe; export KITHD_FEATURES; }
     sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC"} --out "$osdir" >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = clockleader ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = clockleader ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = privilege ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ]; then
         . "$root/ci/vm/cluster.sh"
     fi
     if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ] || [ "$test" = blackout ] || [ "$test" = alone ] || [ "$test" = disk ]; then

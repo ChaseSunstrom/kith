@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! GET  /v1/ca                          -> the CA certificate (PEM)     no certificate needed
+//! GET  /v1/ca/lan                      -> the LAN CA certificate (PEM)   local socket only (`kith ca export`)
 //! POST /v1/join {token, name, port}    -> {ca, cert, key}              no certificate needed
 //! POST /v1/claim {token, name}         -> {ca, cert, key}              no certificate needed
 //! POST /v1/tokens                      -> {token}                      local socket, or an Identity that may apply Nodes, Roles and RoleBindings
@@ -288,6 +289,17 @@ impl Drop for Place {
     }
 }
 
+/// Has the kernel probe a connection that has been quiet for 15 s, three times 15 s apart, and
+/// drop it when none is answered: a peer that vanished (powered off) ends what it held, such as
+/// a run's tunnel (reqwest does the same for the connections this node makes). Best effort.
+fn keep_alive(stream: &tokio::net::TcpStream) {
+    use nix::sys::socket::{setsockopt, sockopt};
+    let _ = setsockopt(stream, sockopt::KeepAlive, &true);
+    let _ = setsockopt(stream, sockopt::TcpKeepIdle, &15);
+    let _ = setsockopt(stream, sockopt::TcpKeepInterval, &15);
+    let _ = setsockopt(stream, sockopt::TcpKeepCount, &3);
+}
+
 /// Whether a connection that came in to `local` on a socket bound to every address is one this
 /// node answers: to an IPv4 address (or an IPv4 one in IPv6's clothes), to loopback, or to its own
 /// address on the mesh (`mesh`). Not to another IPv6 address of the machine: a global one that
@@ -330,6 +342,7 @@ pub fn listen_on(
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
+            keep_alive(&stream);
             // (Asked of the socket, not the peer: which of this machine's addresses it called.)
             if hung_up_on(stream.local_addr(), mesh) {
                 continue;
@@ -828,7 +841,26 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
 /// What only the local socket serves.
 pub fn admin_router(shared: Arc<Shared>) -> Router {
     let admin = Router::new().route("/v1/identities/{name}/certificate", post(certificate));
+    // (The LAN CA's certificate is public, and is all `kith ca export` hands out: not the cluster
+    // CA's, which every node and Workload trusts.)
+    let admin = admin.route("/v1/ca/lan", get(lan_ca));
     admin.route("/v1/cluster", get(status)).with_state(shared)
+}
+
+/// The certificate of the LAN CA, made on first asking (`kith ca export`). Only the node that
+/// holds the cluster CA key has the LAN CA's.
+async fn lan_ca(State(shared): State<Arc<Shared>>) -> Result<String, Refusal> {
+    let Some(ca) = &cluster(&shared)?.ca else {
+        return Err(refuse(StatusCode::CONFLICT, CA_ELSEWHERE));
+    };
+    let domains = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        crate::ingress::lan_domains(&state.store)
+    };
+    let lan = ca
+        .lan(&domains)
+        .map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    Ok(lan.cert.clone())
 }
 
 pub(crate) const CA_ELSEWHERE: &str =
@@ -1319,7 +1351,7 @@ async fn register(
     };
     if !known {
         let (resources, at) = (vec![node], kith_api::store::now());
-        shared.submit(Command::Apply { resources, at }).await?;
+        shared.submit_node(Command::Apply { resources, at }).await?;
     }
     let status = serde_json::json!({ "address": address, "raftId": id.to_string(), "certificate": print });
     let serde_json::Value::Object(mut status) = status else {
@@ -1514,8 +1546,7 @@ async fn join(
     });
     let resources = vec![serde_json::from_value(node).expect("a Node with a valid name")];
     let at = kith_api::store::now();
-    let (_, born) = shared
-        .write_at(Command::Apply { resources, at })
+    let (_, born) = crate::raft::as_node(shared.write_at(Command::Apply { resources, at }))
         .await
         .map_err(unavailable)?;
     let (cert, key) = ca.issue_born(&request.name, born).map_err(failed)?;
