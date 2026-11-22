@@ -1018,33 +1018,71 @@ fn pet(device: &mut impl std::io::Write, every: std::time::Duration, mut alive: 
 /// machine, and the loader counts that as a failed start of the slot (os.rs). Whether there is one:
 /// a machine with none is said so and goes on. A kithd started again finds the device open if
 /// the one before it still runs it (or the kernel, which never closes it, lets it be opened).
+/// (Once: `main` arms it before it looks at how often kithd has failed, and `early` asks again.)
 fn watchdog(path: &std::path::Path) -> bool {
-    let started = *STARTED.get_or_init(std::time::Instant::now);
-    let mut device = match std::fs::OpenOptions::new().write(true).open(path) {
-        Ok(device) => device,
-        Err(e) => {
-            eprintln!("kithd: init: no watchdog {}: {e}", path.display());
-            return false;
-        }
-    };
-    match kith_dm_sys::watchdog_timeout(&device, WATCHDOG_SECS) {
-        Ok(secs) => eprintln!(
-            "kithd: init: watchdog {}: reset after {secs} s unless petted",
-            path.display()
-        ),
-        Err(e) => eprintln!("kithd: init: watchdog {}: its time is not set: {e}", path.display()),
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| arm(path))
+}
+
+/// The beat as stored in `BEAT` at `elapsed` after kithd started: in ms, plus one (0 is none yet).
+fn beat_value(elapsed: std::time::Duration) -> u64 {
+    elapsed.as_millis() as u64 + 1
+}
+
+/// How long ago the beat stored as `beat` was, `elapsed` after kithd started (None: there was none).
+fn since_beat(beat: u64, elapsed: std::time::Duration) -> Option<std::time::Duration> {
+    let at = std::time::Duration::from_millis(beat.checked_sub(1)?);
+    Some(elapsed.saturating_sub(at))
+}
+
+/// Says that kithd runs: the runtime's heartbeat, and the wait of `end`, whose runtime is gone
+/// and which is longer than `STALE` (the pet stops when a beat is older).
+fn beat() {
+    if let Some(started) = STARTED.get() {
+        BEAT.store(beat_value(started.elapsed()), Ordering::Relaxed);
     }
-    let alive = move || {
-        let beat = BEAT
-            .load(Ordering::Relaxed)
-            .checked_sub(1)
-            .map(std::time::Duration::from_millis);
-        alive(started.elapsed(), beat.map(|at| started.elapsed().saturating_sub(at)))
-    };
-    let spawned = std::thread::Builder::new()
-        .stack_size(128 << 10)
-        .spawn(move || pet(&mut device, PET_EVERY, alive));
-    spawned.is_ok()
+}
+
+fn arm(path: &std::path::Path) -> bool {
+    let started = *STARTED.get_or_init(std::time::Instant::now);
+    // (The thread opens the device: one that cannot start has not armed what nothing would then pet,
+    // and a device that was armed would reset the machine in a minute, over and over.)
+    let (told, hears) = std::sync::mpsc::channel();
+    let path = path.to_owned();
+    let spawned = std::thread::Builder::new().stack_size(128 << 10).spawn(move || {
+        let mut device = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(device) => device,
+            Err(e) => {
+                eprintln!("kithd: init: no watchdog {}: {e}", path.display());
+                let _ = told.send(false);
+                return;
+            }
+        };
+        match kith_dm_sys::watchdog_timeout(&device, WATCHDOG_SECS) {
+            Ok(secs) => eprintln!(
+                "kithd: init: watchdog {}: reset after {secs} s unless petted",
+                path.display()
+            ),
+            Err(e) => eprintln!("kithd: init: watchdog {}: its time is not set: {e}", path.display()),
+        }
+        let _ = told.send(true);
+        pet(&mut device, PET_EVERY, || {
+            let elapsed = started.elapsed();
+            alive(elapsed, since_beat(BEAT.load(Ordering::Relaxed), elapsed))
+        });
+    });
+    match spawned {
+        Ok(_) => hears.recv().unwrap_or(false),
+        Err(e) => {
+            eprintln!("kithd: init: no watchdog: its thread did not start: {e}");
+            false
+        }
+    }
+}
+
+/// The watchdog of the machine, armed (see `watchdog`).
+pub fn arm_watchdog() -> bool {
+    watchdog(std::path::Path::new(WATCHDOG))
 }
 
 /// Beats for as long as the runtime it is spawned on runs (`Boot::network`), which the
@@ -1054,9 +1092,7 @@ fn heartbeat() {
         let mut tick = tokio::time::interval(PET_EVERY);
         loop {
             tick.tick().await;
-            if let Some(started) = STARTED.get() {
-                BEAT.store(started.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
-            }
+            beat();
         }
     });
 }
@@ -1067,7 +1103,7 @@ fn heartbeat() {
 /// state is mounted, the TPM measured, the disk grown already.
 pub fn early(again: bool) -> Boot {
     // (Before anything that can hang: the disk checks and the encryption below.)
-    watchdog(std::path::Path::new(WATCHDOG));
+    arm_watchdog();
     // Drivers first (a started-again kithd finds them loaded, and only listens again).
     crate::modules::start();
     // (Before anything is read from the root's disk: see `check_boot_disk`.)
@@ -1260,7 +1296,10 @@ pub fn end(failed: bool) -> ! {
         // the wait, and the machine powers off.
         // ponytail: Ctrl-Alt-Del (SIGINT) restarts at the end of the wait, not at once.
         hear_term();
+        // (The wait is up to 600 s and no runtime beats in it: each second does, so the watchdog,
+        // armed, does not reset the machine before the file systems are let go of below.)
         rest(wait.as_secs(), std::time::Duration::from_secs(1), || {
+            beat();
             POWER_OFF.load(Ordering::Relaxed)
         });
     }
@@ -1326,6 +1365,26 @@ mod tests {
         // Serving: petted while the beat is fresh, however long ago kithd started.
         assert!(alive(BOOT_DEADLINE * 2, Some(D::from_secs(10))));
         assert!(!alive(BOOT_DEADLINE * 2, Some(STALE + D::from_secs(1))));
+    }
+
+    #[test]
+    fn init_since_beat_reads_what_a_beat_stores() {
+        use std::time::Duration as D;
+        // None yet.
+        assert_eq!(since_beat(0, D::from_secs(5)), None);
+        // A beat at the very start is stored as 1, not as none.
+        assert_eq!(beat_value(D::ZERO), 1);
+        assert_eq!(since_beat(beat_value(D::ZERO), D::from_secs(5)), Some(D::from_secs(5)));
+        // A beat at 3 s, read at 10 s: 7 s ago; a clock that reads earlier than the beat says 0.
+        assert_eq!(
+            since_beat(beat_value(D::from_secs(3)), D::from_secs(10)),
+            Some(D::from_secs(7))
+        );
+        assert_eq!(since_beat(beat_value(D::from_secs(3)), D::from_secs(2)), Some(D::ZERO));
+        // The wait of `end` beats each second for up to 600 s, and the file systems are let go of
+        // within STALE of its last beat: the pet is alive through all of it.
+        let last = D::from_secs(600);
+        assert!(alive(last * 2, since_beat(beat_value(last), last + D::from_secs(60))));
     }
 
     #[test]

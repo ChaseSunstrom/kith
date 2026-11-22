@@ -481,6 +481,8 @@ fn main() -> ExitCode {
         // (What `pod kill` and a reader of ps find it by: it was started as /proc/self/exe.)
         let _ = nix::sys::prctl::set_name(c"kithd");
         if end {
+            // (Armed here too: the wait of `end` is petted by this process, not the one before it.)
+            init::arm_watchdog();
             eprintln!("kithd: init: kithd failed 10 times in a minute");
             init::end(true);
         }
