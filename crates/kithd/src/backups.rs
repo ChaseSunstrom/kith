@@ -810,7 +810,8 @@ pub(crate) fn listed(store: &Store, namespace: &str, but: &str, blob: &str) -> b
 /// Lets go of a backup that is no longer kept. (What fails here is left behind, and said.)
 /// Only a Blob a backup made is deleted, not one an Image made or one put by hand. (So when
 /// an image adopts a backup's identical bytes, one Blob under one name made by whichever
-/// came first, a Blob the image made is left behind when the backup lets go of it.)
+/// came first, a Blob the image made is not deleted here when the backup lets go of it: the
+/// leader lets go of it ten minutes after no Image or Backup lists it, see `images::released`.)
 async fn forget(shared: &Shared, job: &Job, old: &Value) -> Result<(), String> {
     if let Some(blob) = old["blob"].as_str() {
         let key = format!("Blob/{}/{blob}", job.namespace);
