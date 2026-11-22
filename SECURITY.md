@@ -182,6 +182,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   and kithd can hand the dmem controller down: the kernel then keeps the container's use
   of that GPU's memory under the share (`dmem.max`). Elsewhere it is a count the scheduler
   keeps, and a container that takes more is not stopped.
+  A Device can never grant raw memory or a disk, whoever wrote it: when kithd hands nodes to a
+  container it stats each path (links not followed) and gives the Device's nodes only if all
+  are character devices that are not `/dev/mem`, `/dev/kmem`, `/dev/port`, `/dev/kmsg` or
+  `/dev/oldmem`; a block device, a file, a link or a missing node grants nothing.
   A device node a unit was given (an exclusive Device's, most of all) is not given to another
   unit while the unit that had it still runs: a unit whose stop failed with processes left
   keeps its devices and its name, its stop is retried at a later pass and no more often than
