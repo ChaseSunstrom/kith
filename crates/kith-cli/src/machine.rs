@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::os::unix::fs::MetadataExt;
 use std::process::ExitCode;
 
-mod shell;
+pub(crate) mod shell;
 
 const LABEL: &str = "kith.dev/machine";
 

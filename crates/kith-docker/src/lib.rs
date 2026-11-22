@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 mod containers;
-pub use containers::{Containers, Store};
+mod stream;
+pub use containers::{Containers, NAMESPACE, Store};
+pub use stream::{Event, Input, Kind, LogChunk, LogFrom, Session};
 
 /// The newest and the oldest Docker API this front speaks, as (major, minor).
 pub const API_VERSION: (u32, u32) = (1, 47);
@@ -209,6 +211,7 @@ struct Request {
     close: bool,
 }
 
+#[derive(Debug)]
 struct Reply {
     status: u16,
     content_type: &'static str,
@@ -246,6 +249,30 @@ impl Read for Clocked {
     }
 }
 
+/// A clock that never runs out in practice: a stream's reads (a hijacked connection's stdin) wait as long as it lives.
+const NEVER: Duration = Duration::from_secs(10 * 365 * 86_400);
+
+/// Has the client hung up? A 1 ms look at the socket: EOF or an error says yes, a timeout (nothing
+/// sent) or buffered bytes (a pipelined request) say no.
+fn hung_up(reader: &mut BufReader<Clocked>) -> bool {
+    reader.get_mut().until = Instant::now() + Duration::from_millis(1);
+    match reader.fill_buf() {
+        Ok(bytes) => bytes.is_empty(),
+        Err(e) => !matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock),
+    }
+}
+
+/// Has a hijacked connection broken? Its client closes its sending side when it has no stdin to send
+/// (the docker CLI does for `run` without `-i`) and goes on reading, so an EOF is not a hang-up here:
+/// only an error is. (A client that left shows by a write that fails.)
+fn broken(reader: &mut BufReader<Clocked>) -> bool {
+    reader.get_mut().until = Instant::now() + Duration::from_millis(1);
+    match reader.fill_buf() {
+        Ok(_) => false,
+        Err(e) => !matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock),
+    }
+}
+
 /// Requests and replies on one connection until it closes.
 fn handle(stream: UnixStream, head: Duration, body: Duration, containers: Option<&Containers>) {
     let mut reader = BufReader::new(Clocked {
@@ -256,20 +283,24 @@ fn handle(stream: UnixStream, head: Duration, body: Duration, containers: Option
         let (reply, head_only, close) = match read_request(&mut reader, head, body) {
             Ok(None) => return,
             Ok(Some(request)) => {
-                // Has the client hung up? A 1 ms look at the socket: EOF or an error says yes, a
-                // timeout (nothing sent) or buffered bytes (a pipelined request) say no.
-                let mut gone = || {
-                    reader.get_mut().until = Instant::now() + Duration::from_millis(1);
-                    match reader.fill_buf() {
-                        Ok(bytes) => bytes.is_empty(),
-                        Err(e) => !matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock),
+                // A stream (logs, attach, an exec's start) is written by the call itself, and the
+                // connection is done with it; a refusal before its first byte is an ordinary reply.
+                let streamed = containers.and_then(|c| {
+                    let (path, query) = api_path(&request).ok()?;
+                    c.stream(&request.method, path, query, &request.body, &mut reader)
+                });
+                match streamed {
+                    Some(Ok(())) => return,
+                    Some(Err(reply)) => (reply, false, request.close),
+                    None => {
+                        let mut gone = || hung_up(&mut reader);
+                        (
+                            route(&request, containers, &mut gone),
+                            request.method == "HEAD",
+                            request.close,
+                        )
                     }
-                };
-                (
-                    route(&request, containers, &mut gone),
-                    request.method == "HEAD",
-                    request.close,
-                )
+                }
             }
             Err(reply) => (reply, false, true),
         };
@@ -433,7 +464,9 @@ fn split_version(path: &str) -> (Option<(u32, u32)>, &str) {
         .map_or((None, path), |(version, rest)| (Some(version), rest))
 }
 
-fn route(request: &Request, containers: Option<&Containers>, gone: &mut dyn FnMut() -> bool) -> Reply {
+/// The path (without its `/v1.NN` prefix) and the query of a request, or the reply for a client
+/// whose version is not one this front speaks.
+fn api_path(request: &Request) -> Result<(&str, &str), Reply> {
     let (path, query) = request.target.split_once('?').unwrap_or((request.target.as_str(), ""));
     let (version, path) = split_version(path);
     // (Like dockerd, `/_ping` answers any client: the version it names is how a client learns ours.)
@@ -441,24 +474,32 @@ fn route(request: &Request, containers: Option<&Containers>, gone: &mut dyn FnMu
         let (max, min) = (API_VERSION, MIN_API_VERSION);
         let (v0, v1) = v;
         if v > max {
-            return message(
+            return Err(message(
                 400,
                 format!(
                     "client version {v0}.{v1} is too new. Maximum supported API version is {}.{}",
                     max.0, max.1
                 ),
-            );
+            ));
         }
         if v < min {
-            return message(
+            return Err(message(
                 400,
                 format!(
                     "client version {v0}.{v1} is too old. Minimum supported API version is {}.{}, please upgrade your client to a newer version",
                     min.0, min.1
                 ),
-            );
+            ));
         }
     }
+    Ok((path, query))
+}
+
+fn route(request: &Request, containers: Option<&Containers>, gone: &mut dyn FnMut() -> bool) -> Reply {
+    let (path, query) = match api_path(request) {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
     match (request.method.as_str(), path) {
         ("GET" | "HEAD", "/_ping") => Reply {
             status: 200,
@@ -531,7 +572,7 @@ fn info_json() -> String {
         .max(1);
     let (version, arch, memory) = (env!("CARGO_PKG_VERSION"), std::env::consts::ARCH, memory * 1024);
     format!(
-        r#"{{"ID":"{id}","Containers":0,"ContainersRunning":0,"ContainersPaused":0,"ContainersStopped":0,"Images":0,"Driver":"kith","DriverStatus":[],"Plugins":{{"Volume":["local"],"Network":["bridge"],"Authorization":null,"Log":[]}},"MemoryLimit":true,"SwapLimit":false,"IPv4Forwarding":true,"Debug":false,"LoggingDriver":"json-file","CgroupDriver":"cgroupfs","CgroupVersion":"2","KernelVersion":{kernel},"OperatingSystem":"kith","OSVersion":"","OSType":"linux","Architecture":"{arch}","IndexServerAddress":"https://index.docker.io/v1/","NCPU":{cpus},"MemTotal":{memory},"DockerRootDir":"/var/lib/kith","Name":{name},"Labels":[],"ExperimentalBuild":false,"ServerVersion":"{version}","Runtimes":{{"kith":{{"path":"kith"}}}},"DefaultRuntime":"kith","Swarm":{{"NodeID":"","NodeAddr":"","LocalNodeState":"inactive","ControlAvailable":false,"Error":"","RemoteManagers":null}},"LiveRestoreEnabled":false,"Isolation":"","SecurityOptions":[],"Warnings":["kith: this is the kith Docker front, not Docker: only _ping, version and info are answered so far; the rest of the API says 501"]}}"#
+        r#"{{"ID":"{id}","Containers":0,"ContainersRunning":0,"ContainersPaused":0,"ContainersStopped":0,"Images":0,"Driver":"kith","DriverStatus":[],"Plugins":{{"Volume":["local"],"Network":["bridge"],"Authorization":null,"Log":[]}},"MemoryLimit":true,"SwapLimit":false,"IPv4Forwarding":true,"Debug":false,"LoggingDriver":"json-file","CgroupDriver":"cgroupfs","CgroupVersion":"2","KernelVersion":{kernel},"OperatingSystem":"kith","OSVersion":"","OSType":"linux","Architecture":"{arch}","IndexServerAddress":"https://index.docker.io/v1/","NCPU":{cpus},"MemTotal":{memory},"DockerRootDir":"/var/lib/kith","Name":{name},"Labels":[],"ExperimentalBuild":false,"ServerVersion":"{version}","Runtimes":{{"kith":{{"path":"kith"}}}},"DefaultRuntime":"kith","Swarm":{{"NodeID":"","NodeAddr":"","LocalNodeState":"inactive","ControlAvailable":false,"Error":"","RemoteManagers":null}},"LiveRestoreEnabled":false,"Isolation":"","SecurityOptions":[],"Warnings":["kith: this is the kith Docker front, not Docker: the container calls it answers are in docs/guide/kubernetes.md; the rest of the API says 501"]}}"#
     )
 }
 

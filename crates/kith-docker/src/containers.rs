@@ -4,10 +4,17 @@
 //! A created container is a Workload at zero replicas until it starts; a stopped one stays one.
 //! Nothing here reads or writes kithd directly: the store is the seam (the CLI implements it).
 
-use super::{Reply, container_id, json_reply, message, sha256_hex};
+use super::stream::{Carrier, Event, Input, Kind, LogFrom, Session, Writer};
+use super::{Clocked, Reply, broken, container_id, hung_up, json_reply, message, sha256_hex};
 use serde_json::{Map, Value, json};
-use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::io::{BufReader, Read};
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, mpsc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub use super::stream::LogChunk;
 
 pub const NAMESPACE: &str = "docker";
 pub const LABEL: &str = "kith.dev/docker";
@@ -23,13 +30,44 @@ pub trait Store: Send + Sync {
     fn apply(&self, doc: Value) -> Result<(), String>;
     /// Remove the document at `key`, if there is one.
     fn delete(&self, key: &str) -> Result<(), String>;
+    /// What the container at `key` (its first unit, its first copy) wrote to stdout, or to stderr,
+    /// from `from`: at most a chunk of it; empty when nothing more is written yet.
+    fn logs(&self, key: &str, stderr: bool, from: LogFrom) -> Result<LogChunk, String> {
+        let _ = (key, stderr, from);
+        Err("this store keeps no logs".into())
+    }
+    /// Run `command` in the pod `pod`, with a terminal when `tty`, and with stdin when `stdin`.
+    fn exec(&self, pod: &str, command: &[String], tty: bool, stdin: bool) -> Result<Session, String> {
+        let _ = (pod, command, tty, stdin);
+        Err("this store cannot run a command in a container".into())
+    }
 }
+
+/// An exec the client made and may start, and what became of it.
+struct Exec {
+    container: String,
+    pod: String,
+    command: Vec<String>,
+    tty: bool,
+    stdin: bool,
+    started: bool,
+    exit: Option<i64>,
+    /// A window size told before the command was running.
+    size: Option<(u16, u16)>,
+    /// The way to the running command, for the window.
+    input: Option<mpsc::Sender<Input>>,
+}
+
+/// The execs a front remembers at most (the ones that ended go first).
+const MAX_EXECS: usize = 1024;
 
 /// The container calls, answered from a store.
 pub struct Containers {
     store: Box<dyn Store>,
     /// One change at a time (create, start, stop, remove): a name is checked and then taken.
     lock: Mutex<()>,
+    execs: Mutex<HashMap<String, Exec>>,
+    made: AtomicU64,
 }
 
 impl Containers {
@@ -37,6 +75,8 @@ impl Containers {
         Containers {
             store,
             lock: Mutex::new(()),
+            execs: Mutex::new(HashMap::new()),
+            made: AtomicU64::new(0),
         }
     }
 
@@ -55,7 +95,12 @@ impl Containers {
             ("POST", ["", "containers", "create"]) => self.create(query, body),
             ("GET", ["", "containers", "json"]) => self.list(query),
             ("GET", ["", "containers", id, "json"]) => self.inspect(id),
-            ("POST", ["", "containers", id, "wait"]) => self.wait(id, gone),
+            ("POST", ["", "containers", id, "wait"]) => self.wait(id, query, gone),
+            // (Nothing here has a terminal of its own to resize: the main process runs without one.)
+            ("POST", ["", "containers", id, "resize"]) => self.find(id).map(|_| empty(200)),
+            ("POST", ["", "containers", id, "exec"]) => self.exec_create(id, body),
+            ("POST", ["", "exec", id, "resize"]) => self.exec_resize(id, query),
+            ("GET", ["", "exec", id, "json"]) => self.exec_inspect(id),
             ("POST", ["", "containers", id, action @ ("start" | "stop" | "restart" | "kill")]) => {
                 self.act(id, action, query)
             }
@@ -65,8 +110,36 @@ impl Containers {
         Some(answer.unwrap_or_else(|failed| failed))
     }
 
+    /// The calls that answer with a stream (`logs`, `attach`, an exec's `start`) and so write to the
+    /// connection themselves: None when the call is not one. `Ok` says the stream was written and
+    /// the connection is done; `Err` is a reply to send in its place (nothing was written yet).
+    pub(crate) fn stream(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        reader: &mut BufReader<Clocked>,
+    ) -> Option<Result<(), Reply>> {
+        let parts: Vec<&str> = path.split('/').collect();
+        Some(match (method, parts.as_slice()) {
+            ("GET", ["", "containers", id, "logs"]) => self.logs(id, query, reader),
+            ("POST", ["", "containers", id, "attach"]) => self.attach(id, query, reader),
+            ("POST", ["", "exec", id, "start"]) => self.exec_start(id, body, reader),
+            // (The one `wait` that answers its head first: the client waits for the head before it starts the container.)
+            ("POST", ["", "containers", id, "wait"]) if param(query, "condition") == Some("next-exit") => {
+                self.wait_next(id, reader)
+            }
+            _ => return None,
+        })
+    }
+
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn execs(&self) -> MutexGuard<'_, HashMap<String, Exec>> {
+        self.execs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn get(&self, key: &str) -> Result<Option<Value>, Reply> {
@@ -159,12 +232,16 @@ impl Containers {
                 ));
             }
         }
-        let annotations = annotations(&[
+        let mut own = vec![
             (ANN_STATE, "created".to_string()),
             (ANN_RESTART, restart.to_string()),
             (ANN_RETRIES, retries.to_string()),
             (ANN_CREATED, now().to_string()),
-        ]);
+        ];
+        if config["Tty"].as_bool() == Some(true) {
+            own.push((ANN_TTY, "1".to_string()));
+        }
+        let annotations = annotations(&own);
         let doc = resource(
             "Workload",
             &name,
@@ -201,26 +278,33 @@ impl Containers {
     }
 
     /// `POST /containers/{id}/wait`: blocks until the container is not running, as Docker's does.
-    fn wait(&self, id: &str, gone: &mut dyn FnMut() -> bool) -> Out {
+    fn wait(&self, id: &str, query: &str, gone: &mut dyn FnMut() -> bool) -> Out {
+        if param(query, "condition") == Some("removed") {
+            return Err(message(
+                501,
+                "kith: waiting for a container to be removed is not supported",
+            ));
+        }
         let name = name_of(&self.find(id)?).to_string();
+        let code = self.exit_of(&name, None, gone)?;
+        Ok(json_reply(200, wait_json(code)))
+    }
+
+    /// The code `name` stops with: once it is not running, and, with `after`, has been started since
+    /// that many starts. A container removed meanwhile stopped with 137 (removed with force).
+    fn exit_of(&self, name: &str, after: Option<u64>, gone: &mut dyn FnMut() -> bool) -> Result<i64, Reply> {
         loop {
             if gone() {
                 return Err(message(499, "kith: the client hung up"));
             }
-            let doc = match self.find(&name) {
+            let doc = match self.find(name) {
                 Ok(doc) => doc,
-                // Gone while it ran: it was removed with force, which stops with 137.
-                Err(not_found) if not_found.status == 404 => {
-                    return Ok(json_reply(200, json!({"StatusCode": 137, "Error": null}).to_string()));
-                }
+                Err(not_found) if not_found.status == 404 => return Ok(137),
                 Err(other) => return Err(other),
             };
             let st = state(&doc);
-            if !st.running {
-                return Ok(json_reply(
-                    200,
-                    json!({"StatusCode": st.exit, "Error": null}).to_string(),
-                ));
+            if !st.running && after.is_none_or(|n| starts(&doc) > n) {
+                return Ok(st.exit);
             }
             std::thread::sleep(WAIT_POLL);
         }
@@ -281,12 +365,14 @@ impl Containers {
         if state(&doc).running {
             return Ok(false);
         }
+        let mut doc = doc;
+        let count = (starts(&doc) + 1).to_string();
+        set_annotation(&mut doc, ANN_STARTS, &count);
         if doc["kind"] == "Job" {
             self.restart_job(doc)?;
         } else if is_job(annotation(&doc, ANN_RESTART)) {
             self.convert("Workload", job_from(&doc))?;
         } else {
-            let mut doc = doc;
             doc["spec"]["replicas"] = json!(1);
             unset_annotation(&mut doc, ANN_STATE);
             self.put(doc).map_err(store_failed)?;
@@ -371,6 +457,12 @@ impl Containers {
 /// What a call answers: its reply, or the reply that says why not.
 type Out = Result<Reply, Reply>;
 
+mod live;
+
+fn wait_json(code: i64) -> String {
+    json!({"StatusCode": code, "Error": null}).to_string()
+}
+
 /// The annotations a container keeps for itself: its state while created, the code it stopped with,
 /// when it was created (Unix seconds), its restart policy and its retries.
 const ANN_STATE: &str = "kith.dev/docker-state";
@@ -378,6 +470,10 @@ const ANN_EXIT: &str = "kith.dev/docker-exit";
 const ANN_CREATED: &str = "kith.dev/docker-created";
 const ANN_RESTART: &str = "kith.dev/docker-restart";
 const ANN_RETRIES: &str = "kith.dev/docker-retries";
+/// How many times it was started (a `wait` for the next exit counts from the number it found), and
+/// whether it was made with a terminal (`1`): what its streams look like to `docker logs`.
+const ANN_STARTS: &str = "kith.dev/docker-starts";
+const ANN_TTY: &str = "kith.dev/docker-tty";
 /// How often `wait` looks again.
 const WAIT_POLL: Duration = Duration::from_millis(200);
 const ZERO_TIME: &str = "0001-01-01T00:00:00Z";
@@ -572,6 +668,10 @@ fn created(doc: &Value) -> i64 {
     annotation(doc, ANN_CREATED).parse().unwrap_or(0)
 }
 
+fn starts(doc: &Value) -> u64 {
+    annotation(doc, ANN_STARTS).parse().unwrap_or(0)
+}
+
 fn retries(doc: &Value) -> u64 {
     annotation(doc, ANN_RETRIES).parse().unwrap_or(0)
 }
@@ -670,7 +770,7 @@ fn inspect_json(doc: &Value) -> Value {
             "WorkingDir": c["workingDir"],
             "User": c["runAsUser"].as_u64().map(|u| u.to_string()).unwrap_or_default(),
             "Labels": doc["metadata"]["labels"],
-            "Tty": false,
+            "Tty": annotation(doc, ANN_TTY) == "1",
             "OpenStdin": false,
             "AttachStdout": false,
             "AttachStderr": false,
@@ -917,15 +1017,13 @@ fn refuse_config(config: &Value) -> Result<(), Reply> {
     Ok(())
 }
 
-/// Attaching to the container's streams, or a terminal, is `docker run` without -d: not yet.
+/// Output to the client is fine (`docker run`, `docker logs`); stdin to the container's main process
+/// is not: kithd starts it with its input closed, and has no way to attach to one that runs.
 fn refuse_streams(config: &Value) -> Result<(), Reply> {
-    if ["AttachStdin", "AttachStdout", "AttachStderr", "OpenStdin", "Tty"]
-        .iter()
-        .any(|f| set(&config[*f]))
-    {
+    if ["AttachStdin", "OpenStdin"].iter().any(|f| set(&config[*f])) {
         return Err(message(
             501,
-            "kith: attaching to a container's streams is not supported yet: start it with docker run -d",
+            "kith: stdin to a container's main process is not supported (kithd starts it with no input and cannot attach to it): leave out -i, or give a command its input with docker exec -i",
         ));
     }
     Ok(())
@@ -1580,18 +1678,437 @@ mod tests {
     #[test]
     fn calls_and_options_that_are_not_here_are_not_answered_here() {
         let (_mem, c) = fixture();
+        // (The streams are answered by `stream`, not `route`.)
         assert!(c.route("GET", "/containers/web/logs", "", b"", &mut || false).is_none());
         assert!(
             c.route("POST", "/containers/web/attach", "", b"", &mut || false)
                 .is_none()
         );
         assert!(c.route("GET", "/images/json", "", b"", &mut || false).is_none());
-        let attached = r#"{"Image":"alpine","AttachStdout":true,"HostConfig":{}}"#;
-        let (status, reply) = call(&c, "POST", "/containers/create?name=web", attached);
-        assert_eq!(status, 501, "docker run without -d needs attach: not yet");
-        assert!(reply["message"].is_string());
+        let stdin = r#"{"Image":"alpine","AttachStdin":true,"OpenStdin":true,"HostConfig":{}}"#;
+        let (status, reply) = call(&c, "POST", "/containers/create?name=web", stdin);
+        assert_eq!(status, 501, "docker run -i: stdin to a main process is refused");
+        assert!(reply["message"].as_str().unwrap().contains("docker exec -i"), "{reply}");
+        let attached = r#"{"Image":"alpine","AttachStdout":true,"AttachStderr":true,"Tty":true,"HostConfig":{}}"#;
+        let (status, _) = call(&c, "POST", "/containers/create?name=web", attached);
+        assert_eq!(
+            status, 201,
+            "docker run without -d is a create that asks for the output"
+        );
+        let (_, reply) = call(&c, "GET", "/containers/web/json", "");
+        assert_eq!(reply["Config"]["Tty"], true);
         let (status, _) = call(&c, "GET", "/containers/json?filters=%7B%7D", "");
         assert_eq!(status, 501, "filters are not answered yet");
+    }
+
+    /// A store with logs and exec: what each of the two outputs holds, and the session the next exec gets.
+    struct Live {
+        mem: MemStore,
+        out: Arc<Mutex<[Vec<u8>; 2]>>,
+        session: Mutex<Option<Session>>,
+        ran: Arc<Mutex<Vec<(String, Vec<String>, bool, bool)>>>,
+    }
+
+    impl Store for Live {
+        fn get(&self, key: &str) -> Result<Option<Value>, String> {
+            self.mem.get(key)
+        }
+        fn list(&self, kind: &str, namespace: &str) -> Result<Vec<Value>, String> {
+            self.mem.list(kind, namespace)
+        }
+        fn apply(&self, doc: Value) -> Result<(), String> {
+            self.mem.apply(doc)
+        }
+        fn delete(&self, key: &str) -> Result<(), String> {
+            self.mem.delete(key)
+        }
+        fn logs(&self, key: &str, stderr: bool, from: LogFrom) -> Result<LogChunk, String> {
+            // (kithd reads the logs of a resource that is there, by its kind: a Job is not its Workload.)
+            if self.mem.get(key)?.is_none() {
+                return Err(format!("{key} not found"));
+            }
+            let all = self.out.lock().unwrap()[usize::from(stderr)].clone();
+            let at = match from {
+                LogFrom::Start => 0,
+                LogFrom::Offset(n) => n as usize,
+                LogFrom::Tail(n) => {
+                    let lines: Vec<&[u8]> = all.split_inclusive(|b| *b == b'\n').collect();
+                    all.len() - lines[lines.len().saturating_sub(n as usize)..].concat().len()
+                }
+            };
+            Ok(LogChunk {
+                data: all[at.min(all.len())..].to_vec(),
+                next: all.len() as u64,
+            })
+        }
+        fn exec(&self, pod: &str, command: &[String], tty: bool, stdin: bool) -> Result<Session, String> {
+            self.ran
+                .lock()
+                .unwrap()
+                .push((pod.to_string(), command.to_vec(), tty, stdin));
+            self.session
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| "no session".to_string())
+        }
+    }
+
+    struct Rig {
+        mem: MemStore,
+        c: Containers,
+        out: Arc<Mutex<[Vec<u8>; 2]>>,
+        ran: Arc<Mutex<Vec<(String, Vec<String>, bool, bool)>>>,
+    }
+
+    /// Containers over a `Live` store; `session` is what the first exec is given.
+    fn live(session: Option<Session>) -> Rig {
+        let mem = MemStore::default();
+        let (out, ran) = (
+            Arc::new(Mutex::new([Vec::new(), Vec::new()])),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let store = Live {
+            mem: mem.clone(),
+            out: out.clone(),
+            session: Mutex::new(session),
+            ran: ran.clone(),
+        };
+        Rig {
+            mem,
+            c: Containers::new(Box::new(store)),
+            out,
+            ran,
+        }
+    }
+
+    /// A stream call as `docker` makes it: what the server wrote until it let go of the connection.
+    fn streamed(c: &Containers, method: &str, target: &str, body: &str, sent: &[u8]) -> (Result<(), Reply>, Vec<u8>) {
+        use std::io::Write as _;
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(sent).unwrap();
+        let mut got = Vec::new();
+        let result = std::thread::scope(|scope| {
+            let call = scope.spawn(move || {
+                let mut reader = BufReader::new(Clocked {
+                    stream: server,
+                    until: Instant::now() + Duration::from_secs(60),
+                });
+                c.stream(method, path, query, body.as_bytes(), &mut reader)
+                    .expect("a stream call")
+            });
+            let result = call.join().unwrap();
+            client.read_to_end(&mut got).unwrap();
+            result
+        });
+        (result, got)
+    }
+
+    fn after_head(raw: &[u8]) -> &[u8] {
+        let at = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("a head");
+        &raw[at + 4..]
+    }
+
+    const RUNNING: &str = r#"{"Image":"alpine","Cmd":["sleep","1"],"HostConfig":{"RestartPolicy":{"Name":"always"}}}"#;
+
+    fn running(rig: &Rig, name: &str, config: &str) {
+        assert_eq!(
+            call(&rig.c, "POST", &format!("/containers/create?name={name}"), config).0,
+            201
+        );
+        assert_eq!(call(&rig.c, "POST", &format!("/containers/{name}/start"), "").0, 204);
+    }
+
+    #[test]
+    fn logs_are_chunked_frames_of_what_each_output_holds() {
+        let rig = live(None);
+        running(&rig, "web", RUNNING);
+        *rig.out.lock().unwrap() = [b"one\ntwo\n".to_vec(), b"oops\n".to_vec()];
+        let (result, raw) = streamed(&rig.c, "GET", "/containers/web/logs?stdout=1&stderr=1", "", b"");
+        result.unwrap();
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        assert!(text.contains("Transfer-Encoding: chunked"));
+        assert!(raw.ends_with(b"0\r\n\r\n"), "the zero chunk ends it");
+        assert_eq!(
+            unframe(&dechunk(after_head(&raw))),
+            [(1, "one\ntwo\n".to_string()), (2, "oops\n".to_string())]
+        );
+        // --tail 1 of stdout only.
+        let (_, raw) = streamed(&rig.c, "GET", "/containers/web/logs?stdout=1&tail=1", "", b"");
+        assert_eq!(unframe(&dechunk(after_head(&raw))), [(1, "two\n".to_string())]);
+        // Neither output is a mistake; times and ranges are not kept.
+        let (status, _) = streamed(&rig.c, "GET", "/containers/web/logs?timestamps=1&stdout=1", "", b"");
+        assert_eq!(status.unwrap_err().status, 501);
+        let (status, _) = streamed(&rig.c, "GET", "/containers/web/logs?since=5&stdout=1", "", b"");
+        assert_eq!(status.unwrap_err().status, 501);
+        let (status, _) = streamed(&rig.c, "GET", "/containers/web/logs", "", b"");
+        assert_eq!(status.unwrap_err().status, 400);
+        let (status, _) = streamed(&rig.c, "GET", "/containers/nope/logs?stdout=1", "", b"");
+        assert_eq!(status.unwrap_err().status, 404);
+    }
+
+    #[test]
+    fn a_followed_log_ends_when_the_container_does_and_has_its_last_words() {
+        let rig = live(None);
+        assert_eq!(
+            call(
+                &rig.c,
+                "POST",
+                "/containers/create?name=once",
+                r#"{"Image":"alpine","HostConfig":{"RestartPolicy":{"Name":"no"}}}"#
+            )
+            .0,
+            201
+        );
+        assert_eq!(call(&rig.c, "POST", "/containers/once/start", "").0, 204);
+        *rig.out.lock().unwrap() = [b"a\n".to_vec(), Vec::new()];
+        let (mem, out) = (rig.mem.clone(), rig.out.clone());
+        let ender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            out.lock().unwrap()[0].extend(b"b\n");
+            let mut job = mem.get("Job/docker/once").unwrap().unwrap();
+            job["status"] = json!({"state": "succeeded"});
+            mem.apply(job).unwrap();
+        });
+        let (result, raw) = streamed(&rig.c, "GET", "/containers/once/logs?stdout=1&follow=1", "", b"");
+        ender.join().unwrap();
+        result.unwrap();
+        let said: String = unframe(&dechunk(after_head(&raw)))
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(said, "a\nb\n", "what it said when it stopped is not lost");
+    }
+
+    #[test]
+    fn attach_waits_for_the_start_then_sends_only_what_is_written_after() {
+        let rig = live(None);
+        assert_eq!(
+            call(
+                &rig.c,
+                "POST",
+                "/containers/create?name=once",
+                r#"{"Image":"alpine","AttachStdout":true,"HostConfig":{"RestartPolicy":{"Name":"no"}}}"#
+            )
+            .0,
+            201
+        );
+        let (c, mem, out) = (&rig.c, rig.mem.clone(), rig.out.clone());
+        let (_, raw) = std::thread::scope(|scope| {
+            let starter = scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(400));
+                assert_eq!(call(c, "POST", "/containers/once/start", "").0, 204);
+                out.lock().unwrap()[0].extend(b"hello\n");
+                std::thread::sleep(Duration::from_millis(400));
+                let mut job = mem.get("Job/docker/once").unwrap().unwrap();
+                job["status"] = json!({"state": "succeeded"});
+                mem.apply(job).unwrap();
+            });
+            let got = streamed(c, "POST", "/containers/once/attach?stream=1&stdout=1&stderr=1", "", b"");
+            starter.join().unwrap();
+            got
+        });
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        assert!(text.starts_with("HTTP/1.1 101 UPGRADED\r\n"), "{text}");
+        assert!(text.contains("Upgrade: tcp"));
+        assert_eq!(unframe(after_head(&raw)), [(1, "hello\n".to_string())]);
+        // Stdin is refused, with the reason.
+        let (refused, _) = streamed(c, "POST", "/containers/once/attach?stream=1&stdin=1&stdout=1", "", b"");
+        let refused = refused.unwrap_err();
+        assert_eq!(refused.status, 501);
+        assert!(String::from_utf8_lossy(&refused.body).contains("docker exec -i"));
+    }
+
+    #[test]
+    fn a_wait_for_the_next_exit_answers_its_head_at_once_and_the_code_after_the_start() {
+        let rig = live(None);
+        assert_eq!(
+            call(
+                &rig.c,
+                "POST",
+                "/containers/create?name=once",
+                r#"{"Image":"alpine","HostConfig":{"RestartPolicy":{"Name":"no"}}}"#
+            )
+            .0,
+            201
+        );
+        let (c, mem) = (&rig.c, rig.mem.clone());
+        let (result, raw) = std::thread::scope(|scope| {
+            let ender = scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(400));
+                assert_eq!(call(c, "POST", "/containers/once/start", "").0, 204);
+                std::thread::sleep(Duration::from_millis(400));
+                let mut job = mem.get("Job/docker/once").unwrap().unwrap();
+                job["status"] = json!({"state": "failed", "containers": [{"exitCode": 7}]});
+                mem.apply(job).unwrap();
+            });
+            let got = streamed(c, "POST", "/containers/once/wait?condition=next-exit", "", b"");
+            ender.join().unwrap();
+            got
+        });
+        result.unwrap();
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        let body: Value = serde_json::from_slice(after_head(&raw)).unwrap();
+        assert_eq!(body["StatusCode"], 7);
+    }
+
+    #[test]
+    fn an_exec_is_created_resized_started_and_inspected_with_its_code() {
+        let (events, ev_in) = mpsc::channel();
+        let (input, sent) = mpsc::channel();
+        let rig = live(Some(Session { events: ev_in, input }));
+        running(&rig, "web", RUNNING);
+        let (status, reply) = call(
+            &rig.c,
+            "POST",
+            "/containers/web/exec",
+            r#"{"Cmd":["ls","/"],"AttachStdout":true,"AttachStderr":true}"#,
+        );
+        assert_eq!(status, 201, "{reply}");
+        let id = reply["Id"].as_str().unwrap().to_string();
+        assert_eq!(call(&rig.c, "POST", &format!("/exec/{id}/resize?h=24&w=80"), "").0, 200);
+        let (_, before) = call(&rig.c, "GET", &format!("/exec/{id}/json"), "");
+        assert_eq!(
+            (before["Running"].clone(), before["ExitCode"].clone()),
+            (json!(false), json!(0))
+        );
+        events.send(Event::Out(b"bin\n".to_vec())).unwrap();
+        events.send(Event::Err(b"warn\n".to_vec())).unwrap();
+        events.send(Event::Done(3)).unwrap();
+        let (result, raw) = streamed(
+            &rig.c,
+            "POST",
+            &format!("/exec/{id}/start"),
+            r#"{"Detach":false,"Tty":false}"#,
+            b"",
+        );
+        result.unwrap();
+        assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 101 UPGRADED\r\n"));
+        assert_eq!(
+            unframe(after_head(&raw)),
+            [(1, "bin\n".to_string()), (2, "warn\n".to_string())]
+        );
+        let (_, after) = call(&rig.c, "GET", &format!("/exec/{id}/json"), "");
+        assert_eq!(
+            (after["Running"].clone(), after["ExitCode"].clone()),
+            (json!(false), json!(3))
+        );
+        assert_eq!(
+            *rig.ran.lock().unwrap(),
+            [(
+                "web-0".to_string(),
+                vec!["ls".to_string(), "/".to_string()],
+                false,
+                false
+            )]
+        );
+        // The size asked for before the start went in with it, and the end of the session is told.
+        let inputs: Vec<Input> = sent.try_iter().collect();
+        assert!(matches!(inputs.first(), Some(Input::Resize(80, 24))));
+        assert!(matches!(inputs.last(), Some(Input::Close)));
+        // Started once.
+        let (again, _) = streamed(&rig.c, "POST", &format!("/exec/{id}/start"), "{}", b"");
+        assert_eq!(again.unwrap_err().status, 409);
+    }
+
+    #[test]
+    fn an_exec_with_a_terminal_and_stdin_is_raw_and_passes_what_the_client_types() {
+        let (events, ev_in) = mpsc::channel();
+        let (input, sent) = mpsc::channel();
+        let rig = live(Some(Session { events: ev_in, input }));
+        running(&rig, "web", RUNNING);
+        let (_, reply) = call(
+            &rig.c,
+            "POST",
+            "/containers/web/exec",
+            r#"{"Cmd":["sh"],"AttachStdin":true,"AttachStdout":true,"Tty":true}"#,
+        );
+        let id = reply["Id"].as_str().unwrap().to_string();
+        events.send(Event::Out(b"$ ".to_vec())).unwrap();
+        let feed = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            events.send(Event::Done(0)).unwrap();
+        });
+        let (result, raw) = streamed(&rig.c, "POST", &format!("/exec/{id}/start"), r#"{"Tty":true}"#, b"ls\n");
+        feed.join().unwrap();
+        result.unwrap();
+        assert_eq!(after_head(&raw), b"$ ");
+        assert!(String::from_utf8_lossy(&raw).contains("application/vnd.docker.raw-stream"));
+        let typed: Vec<u8> = sent
+            .try_iter()
+            .filter_map(|i| if let Input::Data(d) = i { Some(d) } else { None })
+            .flatten()
+            .collect();
+        assert_eq!(typed, b"ls\n");
+        assert!(rig.ran.lock().unwrap()[0].2 && rig.ran.lock().unwrap()[0].3);
+    }
+
+    #[test]
+    fn an_exec_that_cannot_be_made_says_why() {
+        let rig = live(None);
+        assert_eq!(
+            call(&rig.c, "POST", "/containers/nope/exec", r#"{"Cmd":["ls"]}"#).0,
+            404
+        );
+        assert_eq!(call(&rig.c, "POST", "/containers/create?name=idle", RUNNING).0, 201);
+        let (status, _) = call(&rig.c, "POST", "/containers/idle/exec", r#"{"Cmd":["ls"]}"#);
+        assert_eq!(status, 409, "not running");
+        running(&rig, "web", RUNNING);
+        assert_eq!(
+            call(
+                &rig.c,
+                "POST",
+                "/containers/web/exec",
+                r#"{"Cmd":["ls"],"Env":["A=1"]}"#
+            )
+            .0,
+            501
+        );
+        assert_eq!(call(&rig.c, "POST", "/containers/web/exec", r#"{"Cmd":[]}"#).0, 400);
+        assert_eq!(call(&rig.c, "GET", "/exec/nothing/json", "").0, 404);
+        assert_eq!(call(&rig.c, "POST", "/exec/nothing/resize?h=1&w=1", "").0, 404);
+        let (status, _) = call(&rig.c, "POST", "/containers/web/exec", r#"{"Cmd":["ls"]}"#);
+        assert_eq!(status, 201);
+        // No session to be had: the start says so and the exec can be started again.
+        let id = {
+            let execs = rig.c.execs();
+            execs.keys().next().unwrap().clone()
+        };
+        let (result, _) = streamed(&rig.c, "POST", &format!("/exec/{id}/start"), "{}", b"");
+        assert_eq!(result.unwrap_err().status, 500);
+        assert!(!rig.c.execs()[&id].started);
+    }
+
+    /// The body of a chunked answer, put together.
+    fn dechunk(mut body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let eol = body.windows(2).position(|w| w == b"\r\n").expect("a chunk size");
+            let size = usize::from_str_radix(std::str::from_utf8(&body[..eol]).unwrap(), 16).unwrap();
+            if size == 0 {
+                return out;
+            }
+            out.extend(&body[eol + 2..eol + 2 + size]);
+            body = &body[eol + 2 + size + 2..];
+        }
+    }
+
+    /// Docker's 8-byte-header frames as (stream, text), the frames of one stream put together.
+    fn unframe(mut bytes: &[u8]) -> Vec<(u8, String)> {
+        let mut out: Vec<(u8, String)> = Vec::new();
+        while !bytes.is_empty() {
+            let size = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
+            let text = String::from_utf8_lossy(&bytes[8..8 + size]).into_owned();
+            match out.last_mut() {
+                Some((kind, so_far)) if *kind == bytes[0] => so_far.push_str(&text),
+                _ => out.push((bytes[0], text)),
+            }
+            bytes = &bytes[8 + size..];
+        }
+        out
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 use crate::Backend;
 use kith_api::Resource;
-use kith_docker::Store;
+use kith_docker::{LogChunk, LogFrom, Session, Store};
 use serde_json::Value;
 
 pub struct DockerStore(pub Backend);
@@ -35,6 +35,36 @@ impl Store for DockerStore {
 
     fn delete(&self, key: &str) -> Result<(), String> {
         self.0.delete(key).map(|_| ())
+    }
+
+    /// kithd's `/v1/logs` of the container's first unit (a stopped Workload has none to read).
+    fn logs(&self, key: &str, stderr: bool, from: LogFrom) -> Result<LogChunk, String> {
+        let Backend::Daemon(kithd) = &self.0 else {
+            return Err("logs are read from kithd: leave out --store".into());
+        };
+        let place = match from {
+            LogFrom::Start => "&offset=0".to_string(),
+            LogFrom::Tail(lines) => format!("&tail={lines}"),
+            LogFrom::Offset(at) => format!("&offset={at}"),
+        };
+        let which = if stderr { "&stderr=true" } else { "" };
+        let reply: Value = crate::request(
+            kithd,
+            "GET",
+            &format!("/v1/logs/{}?replica=0{which}{place}", crate::escape(key)),
+            b"",
+        )?;
+        Ok(LogChunk {
+            data: reply["data"].as_str().unwrap_or_default().as_bytes().to_vec(),
+            next: reply["next"].as_u64().unwrap_or(0),
+        })
+    }
+
+    fn exec(&self, pod: &str, command: &[String], tty: bool, stdin: bool) -> Result<Session, String> {
+        let Backend::Daemon(kithd) = &self.0 else {
+            return Err("exec is a connection to kithd: leave out --store".into());
+        };
+        crate::machine::shell::session(kithd, pod, command, tty, stdin)
     }
 }
 
