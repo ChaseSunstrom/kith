@@ -513,7 +513,9 @@ Only the newest version is fixed. There are no security releases of older ones.
   the volume from it and never names the path again, so swapping the directory for a link
   after it is opened gets no bind or chown of what the link points at; the chown does not
   follow a link and leaves a file with another hard link alone (the start logs how many
-  files it left, as it is not given them). A kithd that is not root has no clone to bind
+  files it left, as it is not given them). That chown walk, and the wait on the root part's
+  helper, run on the blocking pool: a start with a huge volume does not stop the API or the
+  other units meanwhile (T-1274). A kithd that is not root has no clone to bind
   from: it refuses the start when the path is no longer the directory held (device and
   inode, checked just before the container's init binds it), but a tenant that swaps the
   directory for a link in the short time after that check is bound what the link names,
