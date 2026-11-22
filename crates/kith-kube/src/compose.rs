@@ -240,6 +240,171 @@ pub fn translate(root: Value, namespace: Option<&str>, node: Option<&str>) -> (V
     (out, [cx.refused, cx.hints].concat())
 }
 
+/// What `docker inspect` printed (an array of containers, or one) as a compose file, for
+/// [`translate`] to refuse and carry by its own rules, so a container made with `docker run` is
+/// read as a compose service of its name. Also each named volume mounted: its docker name and
+/// the name kith gives the Volume.
+/// ponytail: the fields compose has a key for; limits (Memory, NanoCpus, Ulimits), Dns, ExtraHosts
+/// and the like are not read: add a key here, and the translator says it by path.
+pub fn from_docker(inspected: Vec<Value>) -> Result<(Value, Vec<(String, String)>), String> {
+    let (mut services, mut volumes, mut named) = (Map::new(), Map::new(), Vec::new());
+    for c in inspected
+        .iter()
+        .flat_map(|v| v.as_array().map_or_else(|| vec![v], |a| a.iter().collect()))
+    {
+        let (cfg, host) = (&c["Config"], &c["HostConfig"]);
+        let name = c["Name"].as_str().unwrap_or("").trim_start_matches('/');
+        if name.is_empty() || !c.is_object() {
+            return Err("a container of the input has no Name: is it `docker inspect` of containers?".into());
+        }
+        // A saved inspect is not trusted: the name goes into paths and lines on a terminal, and
+        // docker's own container names are these characters.
+        if !name.starts_with(|c: char| c.is_ascii_alphanumeric())
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+        {
+            return Err(format!(
+                "a container's Name ({}) has characters a docker container's does not",
+                name.escape_default()
+            ));
+        }
+        // What is there, and not the empty or false it stands for.
+        let on = |v: &Value| (!is_empty(v) && *v != json!(false)).then(|| v.clone());
+        let secs = |ns: &Value| {
+            ns.as_u64()
+                .filter(|n| *n > 0)
+                .map(|n| json!(format!("{}s", n.div_ceil(1_000_000_000))))
+        };
+        let id = c["Id"].as_str().unwrap_or("");
+        let h = &cfg["Healthcheck"];
+        let restart = match (
+            host["RestartPolicy"]["Name"].as_str().unwrap_or(""),
+            &host["RestartPolicy"]["MaximumRetryCount"],
+        ) {
+            ("", _) => json!("no"),
+            (r, n) if n.as_u64().unwrap_or(0) > 0 => json!(format!("{r}:{n}")),
+            (r, _) => json!(r),
+        };
+        // `bridge` (`default`) is what a container has without a word; a network of its own
+        // name is one network; the rest (host, none, container:ID) are said as they are.
+        let (network_mode, networks) = match host["NetworkMode"].as_str().unwrap_or("") {
+            "" | "default" | "bridge" => (None, None),
+            m if m == "host" || m == "none" || m.starts_with("container:") => (Some(json!(m)), None),
+            m => (None, Some(json!([m]))),
+        };
+        let devices: Vec<Value> = host["Devices"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|d| {
+                json!(format!(
+                    "{}:{}",
+                    d["PathOnHost"].as_str().unwrap_or(""),
+                    d["PathInContainer"].as_str().unwrap_or("")
+                ))
+            })
+            .collect();
+        let mut ports = Vec::new();
+        for (key, _) in cfg["ExposedPorts"].as_object().into_iter().flatten() {
+            let (port, proto) = key.split_once('/').unwrap_or((key, "tcp"));
+            match host["PortBindings"][key.as_str()].as_array().filter(|b| !b.is_empty()) {
+                Some(bound) => ports.extend(bound.iter().map(|b| {
+                    json!(format!("{}:{port}/{proto}", b["HostPort"].as_str().unwrap_or("")))
+                    // (the address a port is bound to is not carried)
+                })),
+                None => ports.push(json!(key)),
+            }
+        }
+        let mut vols = Vec::new();
+        let mut tmpfs = Vec::new();
+        for m in c["Mounts"].as_array().into_iter().flatten() {
+            let (dest, read_only) = (&m["Destination"], m["RW"] == json!(false));
+            match m["Type"].as_str() {
+                Some("volume") => {
+                    let docker = m["Name"].as_str().unwrap_or("");
+                    volumes.insert(docker.to_string(), json!({}));
+                    if !named.iter().any(|(d, _)| d == docker) {
+                        named.push((docker.to_string(), slug(docker)));
+                    }
+                    vols.push(json!({"type": "volume", "source": docker, "target": dest, "read_only": read_only}));
+                }
+                Some("tmpfs") => tmpfs.push(dest.clone()),
+                // A bind (and a type nobody knows of) is refused by compose's own rule for it.
+                _ => {
+                    vols.push(json!({"type": m["Type"], "source": m["Source"], "target": dest, "read_only": read_only}))
+                }
+            }
+        }
+        let logging = host["LogConfig"]["Type"]
+            .as_str()
+            .filter(|t| !["", "json-file", "local"].contains(t));
+        let service = obj([
+            ("image", on(&cfg["Image"])),
+            ("environment", on(&cfg["Env"])),
+            ("command", on(&cfg["Cmd"])),
+            ("entrypoint", on(&cfg["Entrypoint"])),
+            ("working_dir", on(&cfg["WorkingDir"])),
+            ("user", on(&cfg["User"])),
+            ("labels", on(&cfg["Labels"])),
+            // (A container's hostname is its id's start unless it was given one.)
+            (
+                "hostname",
+                cfg["Hostname"]
+                    .as_str()
+                    .filter(|h| !h.is_empty() && !id.starts_with(h))
+                    .map(|h| json!(h)),
+            ),
+            ("tty", on(&cfg["Tty"])),
+            ("stdin_open", on(&cfg["OpenStdin"])),
+            (
+                "stop_grace_period",
+                cfg["StopTimeout"]
+                    .as_u64()
+                    .filter(|n| *n > 0)
+                    .map(|n| json!(format!("{n}s"))),
+            ),
+            ("ports", nonempty(json!(ports))),
+            (
+                "healthcheck",
+                on(h).map(|h| {
+                    obj([
+                        ("test", on(&h["Test"])),
+                        ("interval", secs(&h["Interval"])),
+                        ("timeout", secs(&h["Timeout"])),
+                        ("retries", on(&h["Retries"])),
+                        ("start_period", secs(&h["StartPeriod"])),
+                        ("start_interval", secs(&h["StartInterval"])),
+                    ])
+                }),
+            ),
+            ("restart", Some(restart)),
+            ("network_mode", network_mode),
+            ("networks", networks),
+            ("privileged", on(&host["Privileged"])),
+            ("cap_add", on(&host["CapAdd"])),
+            ("cap_drop", on(&host["CapDrop"])),
+            ("security_opt", on(&host["SecurityOpt"])),
+            ("sysctls", on(&host["Sysctls"])),
+            ("devices", nonempty(json!(devices))),
+            ("read_only", on(&host["ReadonlyRootfs"])),
+            ("init", on(&host["Init"])),
+            ("logging", logging.map(|driver| json!({ "driver": driver }))),
+            ("tmpfs", nonempty(json!(tmpfs))),
+            ("volumes", nonempty(json!(vols))),
+        ]);
+        if services.insert(name.to_string(), service).is_some() {
+            return Err(format!("two containers of the name `{name}`: a name is one service"));
+        }
+    }
+    if services.is_empty() {
+        return Err("no containers in the input".into());
+    }
+    let doc = obj([
+        ("services", Some(Value::Object(services))),
+        ("volumes", nonempty(Value::Object(volumes))),
+    ]);
+    Ok((doc, named))
+}
+
 /// A value that asks the shell compose runs in is not one kith can read: said where it is,
 /// and left out (a null), so that what reads the key does not say it twice.
 fn variables(cx: &mut Cx, v: &mut Value, at: &str) {

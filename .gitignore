@@ -6,6 +6,8 @@ __pycache__/
 # (ci/site_shots.py makes whole pages and pieces of them to look at: only docs/shots/top/ is kept.)
 docs/shots/site-*.png
 docs/shots/install-*.png
+# (A Secure Boot signing key: docs/guide/os.md keeps it in ~/kith-sb, never in the repo.)
+db.key
 # (Edit lists a session leaves behind.)
 .fm-scratch/
 # (Sampo points a lane's cargo at its own build folder through this file.)

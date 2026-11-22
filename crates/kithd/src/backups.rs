@@ -738,9 +738,6 @@ async fn s3(
 /// One at a time on a node, a backup or a restore: neither reads what the other half wrote.
 static BUSY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Said of a Blob a backup made, so that pruning never takes one that was put by hand.
-const MADE: &str = "kith.dev/made-by";
-
 /// One backup of `job`: what `status.backups` says of it.
 async fn make(shared: &Shared, state: &Path, job: &Job, at: u64) -> Result<Value, String> {
     // (Before the volume is read: a Secret that is not there fails at once, every time.)
@@ -773,16 +770,15 @@ async fn make(shared: &Shared, state: &Path, job: &Job, at: u64) -> Result<Value
             }
             let wanted = json!({
                 "apiVersion": "kith.dev/v1", "kind": "Blob",
-                "metadata": { "name": blob, "namespace": job.namespace, "annotations": { MADE: "backup" } },
+                "metadata": { "name": blob, "namespace": job.namespace, "annotations": { crate::blobs::MADE_BY: crate::blobs::BACKUP } },
                 "spec": spec,
             });
             let resources = vec![serde_json::from_value(wanted).map_err(|e| e.to_string())?];
-            let applied = shared
-                .write(Command::Apply {
-                    resources,
-                    at: kith_api::store::now(),
-                })
-                .await;
+            let applied = crate::raft::as_node(shared.write(Command::Apply {
+                resources,
+                at: kith_api::store::now(),
+            }))
+            .await;
             applied.map_err(|e| e.to_string())?;
         }
         return Ok(json!({ "at": at, "size": size, "blob": blob }));
@@ -812,6 +808,9 @@ pub(crate) fn listed(store: &Store, namespace: &str, but: &str, blob: &str) -> b
 }
 
 /// Lets go of a backup that is no longer kept. (What fails here is left behind, and said.)
+/// Only a Blob a backup made is deleted, not one an Image made or one put by hand. (So when
+/// an image adopts a backup's identical bytes, one Blob under one name made by whichever
+/// came first, a Blob the image made is left behind when the backup lets go of it.)
 async fn forget(shared: &Shared, job: &Job, old: &Value) -> Result<(), String> {
     if let Some(blob) = old["blob"].as_str() {
         let key = format!("Blob/{}/{blob}", job.namespace);
@@ -822,13 +821,13 @@ async fn forget(shared: &Shared, job: &Job, old: &Value) -> Result<(), String> {
             let made = state
                 .store
                 .get(&key)
-                .is_some_and(|blob| blob.metadata.annotations.contains_key(MADE));
+                .is_some_and(|blob| crate::blobs::made_by(blob, crate::blobs::BACKUP));
             made && !listed(&state.store, &job.namespace, &job.key, blob)
         };
         if !ours {
             return Ok(());
         }
-        return match shared.submit(Command::Delete { key }).await {
+        return match shared.submit_node(Command::Delete { key }).await {
             Ok(_) | Err(Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e.to_string()),
         };
@@ -2033,6 +2032,45 @@ mod tests {
         assert_eq!(download_cap(100), 1_048_776);
         assert_eq!(download_cap(u64::MAX), u64::MAX);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_backup_forget_leaves_a_blob_of_another_maker() {
+        use crate::blobs::{BACKUP, IMAGE};
+        let (own, theirs, hand) = ("aa".repeat(31), "bb".repeat(31), "cc".repeat(31));
+        let blobs = [(&*own, BACKUP), (&*theirs, IMAGE), (&*hand, "mine")];
+        let (shared, _dir) = crate::blobs::shared_with_blobs("backup-forget", &blobs).await;
+        let job = Job {
+            key: "Backup/default/nightly".into(),
+            namespace: "default".into(),
+            name: "nightly".into(),
+            dir: Dir {
+                namespace: "default".into(),
+                name: "data".into(),
+                path: "d".into(),
+                node: "n".into(),
+                encrypted: false,
+            },
+            spec: serde_json::from_value(json!({ "volume": "data", "every": "24h" })).unwrap(),
+            backups: vec![],
+        };
+        for blob in [&theirs, &hand, &own] {
+            forget(&shared, &job, &json!({ "at": 1, "size": 2, "blob": blob }))
+                .await
+                .unwrap();
+        }
+        let has = |name: &str| {
+            shared
+                .store
+                .lock()
+                .unwrap()
+                .store
+                .get(&format!("Blob/default/{name}"))
+                .is_some()
+        };
+        assert!(!has(&own), "a backup's own Blob is let go");
+        assert!(has(&theirs), "an Image's Blob is not a backup's to delete");
+        assert!(has(&hand), "nor is one put by hand");
     }
 
     #[tokio::test]

@@ -22,8 +22,8 @@
                 command -v "$tool" >/dev/null 2>&1 || skip "no $tool for the second runtime inside a container"
             done
         fi
-        if [ "$test" = tunnel ]; then
-            # (The provider's: this machine's ip and wg, run there; and keys made by wg here.)
+        if [ "$test" = tunnel ] || [ "$test" = access ]; then
+            # (The provider's, and access's phones': this machine's ip and wg, run there; and keys made by wg here.)
             for tool in ip wg cpio ldd socat; do
                 command -v "$tool" >/dev/null 2>&1 || skip "no $tool for the WireGuard provider"
             done
@@ -31,6 +31,7 @@
         [ "$time" -gt 60 ] || time=900
         [ "$test" != kube ] || time=$((time * 2))
         [ "$test" != tunnel ] || time=$((time * 2))
+        [ "$test" != access ] || time=$((time * 2))
         port=$((20000 + $$ % 20000))
         fail() { tail -n 30 "$work"/n?.log || true; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
@@ -44,11 +45,14 @@
         # learner, and the cluster says four nodes.)
         nodes=three four=''
         [ "$test" != home ] || { more='--mesh --ingress' others='2 3 4' nodes=four four=',[^,? ]+'; }
-        # (access: the nodes run the image tests.sh built with the forge feature.)
-        [ "$test" != access ] || base=$osdir
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ]; then
+        # (access: the nodes run the image tests.sh built with the forge feature; privilege: with the
+        # confine-probe feature.)
+        { [ "$test" != access ] && [ "$test" != privilege ]; } || base=$osdir
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = privilege ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ] || [ "$test" = access ]; then
         others=2 more=--mesh project=''
-        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != nested ] && [ "$test" != nofile ] && [ "$test" != handover ] || others=''
+        # (access: three nodes on the mesh, pod's image in each; people on the first, below.)
+        [ "$test" != access ] || others='2 3'
+        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != privilege ] && [ "$test" != nested ] && [ "$test" != nofile ] && [ "$test" != handover ] || others=''
         # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
         # as a node's state from before had none: kithd counts what their pods write.)
         [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
@@ -76,6 +80,8 @@
         # (policy: no way left to be root with all of the kernel's capabilities, so kithd gives up the rest.
         # QEMU reads a comma in -smbios as the end of a value, so each one here is doubled.)
         [ "$test" != policy ] || more='--mesh --node-policy no-exec-units,,no-vm-paths,,no-run'
+        # (privilege: the root part and the serving part split, and the serving part's confinement held to what it says.)
+        [ "$test" != privilege ] || more='--mesh --split'
         # A container image the nodes have without asking anybody (they reach no registry
         # here): kith itself, put where a node keeps an image it has pulled, in a state
         # partition made again with that in it.
@@ -118,7 +124,7 @@
                     chmod 755 "$image/rootfs/bin/tar"
                 fi
                 # (outlive: pod on the node's own disk as well, for its exec units.)
-                [ "$test" != outlive ] || { mkdir -p "$work/seed/tools" && cp "$work/pod" "$work/seed/tools/pod"; }
+                { [ "$test" != outlive ] && [ "$test" != privilege ]; } || { mkdir -p "$work/seed/tools" && cp "$work/pod" "$work/seed/tools/pod"; }
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:user"
                 for tag in serve again; do
@@ -369,6 +375,8 @@ EOF
         # (pods: a pod's egress may not reach the node's own subnet (kith's guard refuses it), so
         # the server its pods ask sits behind the gateway, 10.0.2.2, which restrict=on blocks.
         # unrestricted: this test's nodes keep their card out open; the value is put back after.)
+        # (access: the first node ends the people's tunnels, which phones on its LAN reach.)
+        [ "$test" != access ] || first='--people --people-endpoint 10.9.0.1:51821'
         keep=${net_restrict-,restrict=on}
         [ "$test" != pods ] || net_restrict=''
         # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
@@ -483,6 +491,9 @@ EOF
         fi
         if [ "$test" = outlive ]; then
             . "$root/ci/vm/outlive.sh"
+        fi
+        if [ "$test" = privilege ]; then
+            . "$root/ci/vm/privilege.sh"
         fi
         if [ "$test" = nested ]; then
             . "$root/ci/vm/nested.sh"

@@ -180,6 +180,106 @@ A node's own certificate is not part of a context: kithd makes it again before i
 refuses a deleted Node's or a replaced Identity's at the next handshake (SECURITY.md, "A node's
 certificate: its life, its renewal, and its revocation").
 
+## Let a person's phone in
+
+A phone or a laptop that is not a node gets in over WireGuard, with the stock app and nothing
+installed on it. It is not on the mesh and not an Identity: it is a **peer** of one node, and
+the **level** it is given says what that node lets it reach. Nothing is open until you start a
+node for it, as root, on a cluster with `--mesh`:
+
+```sh
+kithd --mesh --people --people-endpoint home.example.net:51821 ...
+```
+
+`--people` (or `--people=PORT`; 51821 bare) makes the node's second WireGuard device and
+its rules; `--people-endpoint` is the address the phone is told to dial, and you forward that UDP
+port on your router (kith opens none). A node without the flag has no such device and no such
+port, and a peer that names it is on nothing.
+
+A level is a file; the five things it can name are all optional, and a level that names
+nothing reaches nothing:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: AccessLevel
+metadata: { name: guest }
+spec:
+  services: [media/films]   # namespace/name: every TCP port of that Service
+  dns: 10.1.0.53            # the resolver the phone is given
+  internet: true            # out by the home's own connection (IPv4); or exit: nl-1
+---
+apiVersion: kith.dev/v1
+kind: AccessLevel
+metadata: { name: family }
+spec: { networks: [10.1.0.0/24], services: ["*"], dns: 10.1.0.53, exit: nl-1 }
+```
+
+`networks` are ranges of the home (only inside what `--people-networks A,B` names on that node;
+none named, none reached), `api: true` the node's API port, and `exit` an [Exit](workloads.md#a-pod-behind-a-vpn-exit)
+that lists the level (`levels: [family]`), so the level's internet leaves by that VPN
+provider's tunnel and by no other.
+
+Then add the phone, from the one command or from the web UI's "Add a peer", which draws a QR
+code to scan:
+
+```sh
+kith apply -f levels.yaml
+kith peer add phone-1 --node n1 --level guest     # prints the configuration, once
+```
+
+kithd makes the phone's key and keeps only its public half: the private key is in that one
+answer, never in the store, the history, the audit or kithd's log, so paste or scan it
+before you lose it (`--replace` gives the same name a new key and ends the old
+configuration). Whoever has the configuration is that peer, until you take it away:
+
+```sh
+kith delete RemotePeer phone-1
+```
+
+What bounds a peer is on the node that ends its tunnel, in the kernel's own table
+(`inet kith-people`), judged on every packet both ways:
+
+- It reaches **what its level names and nothing else**: the Services, the ranges, the
+  resolver, the internet or the Exit. Not the mesh, not another peer, not the node's own ports
+  (the API's only with `api`), not a Service of another level.
+- Its address is its own: WireGuard drops a packet whose source is another's.
+- **A level narrowed, or a peer deleted, holds within 5 seconds**, a connection it has open
+  included: no rule lets a reply through on the strength of the connection alone.
+- Past the node, a peer is that node: a host or a NetworkPolicy sees the node's address.
+- A peer holds 8 of the Service proxy's places and 2 of 16 API handshakes; keys kithd makes are
+  rationed to 5 a minute.
+
+Writing a level or a peer is a cluster-wide right, by kind: whoever may apply an AccessLevel
+may widen any level, and put any peer on it. Give it as you would an admin's. What a level does
+not hold (DNS over HTTPS around the filter, bandwidth, IPv6 to the internet, a copied
+configuration until it is deleted) is in [SECURITY.md](../../SECURITY.md) ("A person's device").
+`sh ci/vm.sh --test access` drives it with two phones in virtual machines: a Service reached, a
+level narrowed and a peer removed with a connection open, and an Exit's level leaving by it.
+## Signed writes: `spec.signing: required` and `open`
+
+`spec.signing` on the Cluster is `open` (the default) or `required`. Under `open` a write the
+admin did not sign is kept, as it always was: a `curl`, a `kubectl apply`, a registry push,
+`kith node claim`, a restore. Under `required` every such write that changes a spec is
+refused on every node, when it is applied: an `Apply`, a `Delete`, a rollback or an import
+with no signature. A change of status is not one, and is kept, but for one that changes a
+Node's certificate or raft id: that is refused too. A refused write changes
+nothing and is audited. To make a change under `required`, sign it as a change with the
+admin's key; or set `spec.signing: open` first, and back after.
+
+What the cluster writes for itself is signed by the node's own key and held to what it comes
+from: a Release's or a Source's renders, a fetched package, a rolling update's cordon, a
+custom-kind controller's writes, cron's Jobs, the scheduler's Volumes. Each must have its
+owner in the store and stay within the rights of whoever wrote that owner and within what its render may make (its own
+namespace, nothing that is in no namespace, no Release, Source or KindDefinition from a Release
+or a controller; a Source in `kith-system` alone may make what is in no namespace), so a taken
+control node cannot write more than the owner could. A node never signs a change of access (a Role, a
+RoleBinding, an Identity, a KindDefinition, the Cluster) nor one of the mesh or the network
+policy (an AccessLevel, a RemotePeer, a NetworkPolicy, an Exit), so a Source that brings a KindDefinition
+or a Release that renders a NetworkPolicy is refused under `required`: apply those yourself,
+signed. Under `required` a Release step that renders a NetworkPolicy applies nothing, and the Release's status says so once. A worker node cannot sign, so the spec writes it
+makes for itself (its Devices, Images and Backups) are refused under `required`, and so is a
+Blob put through the API.
+
 ## What a node refuses, whatever the cluster says
 
 Some of what the store tells a node to run is the node's own root (an `exec` unit, a root
@@ -203,6 +303,15 @@ firmware or disks as node paths, or a hypervisor other than qemu; `vms` alone ru
 with classes named, only Devices the node listed itself). `no-` before a word turns it off; they
 are read left to right. On kith OS they go at the end of what the config partition says (` --
 --node-policy hardened`); elsewhere `KITH_NODE_POLICY` does too.
+
+`kithd --split` (or `KITH_SPLIT`, off by default) puts what needs root behind a typed request list
+and a socket, and holds the part that reads the network to a confinement of its own: its state
+directory alone in its mount namespace, a user that is not root, no capability, `no_new_privs` and
+a system call filter. It is not complete:
+until the two parts are processes the confinement is built and tested but not applied, and a node
+that runs `--split` has the socket and no more. Even applied, the serving part shares the node's
+network namespace (the host's loopback and abstract `AF_UNIX` sockets stay reachable).
+`docs/adr-privilege.md` says what is done.
 
 `hardened` also stops NodeWorkloads (DaemonSets): turn `host-users` back on to run them. A
 container given a Device, or a mount on a file system that cannot be id-mapped, keeps the node's
