@@ -68,6 +68,7 @@ mod qmp;
 mod raft;
 mod registry;
 mod releases;
+mod renew;
 mod replicas;
 mod root_part;
 mod sched;
@@ -1154,8 +1155,12 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 cluster::ADMIT_DELETED.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             let mesh_me = kith_mesh::node_address(mesh::prefix(&cluster.me.ca), &cluster.me.name);
-            let listener = cluster::listen_on(tcp, pki::server_config(&cluster.me)?, Some(mesh_me))
-                .map_err(|e| fail("listening", &e))?;
+            // (A certificate this node knows is revoked is refused in the handshake: it weakly holds the node.)
+            let knows = Arc::downgrade(&shared);
+            let revoked: pki::Revoked =
+                Arc::new(move |cert| knows.upgrade().is_some_and(|shared| cluster::revoked(&shared, cert)));
+            let serving = pki::served(&cluster.me.ca, cluster.live.clone(), Some(revoked))?;
+            let listener = cluster::listen_on(tcp, serving, Some(mesh_me)).map_err(|e| fail("listening", &e))?;
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();
             let served = axum::serve(listener, app).with_graceful_shutdown(async move { drop(stop.changed().await) });
@@ -1310,6 +1315,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         // The second disk's known disks, mounted once, now that the state is open.
         let data = data_disk::boot::run(state.clone());
         let identities = workload_identity::run(shared.clone(), stopping.clone());
+        let renewing = renew::run(shared.clone(), state.join("pki"), stopping.clone());
         let registry = images::serve(shared.clone(), door, stopping.clone());
         let storage = async {
             tokio::join!(
@@ -1321,7 +1327,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 apart(registry),
                 apart(encrypted),
                 apart(data),
-                apart(identities)
+                apart(identities),
+                apart(renewing)
             )
         };
         let says = vec![

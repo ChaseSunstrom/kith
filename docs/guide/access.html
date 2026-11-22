@@ -117,7 +117,7 @@ kith context ls             # the current one is starred
 kith context rm lab
 </code></pre>
 <p>A second <code>add</code> of a name replaces it, and the identity directory is kept as a full path. A flag given as well wins over the entry, each of <code>--server</code> and <code>--identity</code> on its own. The current context is left alone when <code>--store</code>, <code>--socket</code> or <code>--server</code> is given (a context named with <code>--context</code> is not). A name the file does not hold, or an identity directory that is gone, is an error that names the file. The identity is held to its Roles exactly as over <code>--server</code>: what they do not allow is refused.</p>
-<p>Renewal and revocation of a node's own certificate is not here: it is a change to kithd's PKI, and is T-1014.</p>
+<p>A node's own certificate is not part of a context: kithd makes it again before it ends and refuses a deleted Node's or a replaced Identity's at the next handshake (SECURITY.md, "A node's certificate: its life, its renewal, and its revocation").</p>
 <h2 id="what-a-node-refuses-whatever-the-cluster-says">What a node refuses, whatever the cluster says <a class="anchor" href="#what-a-node-refuses-whatever-the-cluster-says" aria-label="Link to this section">#</a></h2>
 <p>Some of what the store tells a node to run is the node's own root (an <code>exec</code> unit, a root container, a VM from a node path), so an admin's credential reaches every node. Its owner can turn each off, there and nowhere else:</p>
 <pre><code class="language-sh">kithd --node-policy hardened              # none of it, and a GPU the only Device handed out
