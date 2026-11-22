@@ -138,7 +138,11 @@ pub fn run(what: Import) -> Result<ExitCode, String> {
             break;
         }
     }
-    for line in &report {
+    // A note is said, and is not a thing left out: it does not change the exit status.
+    let (notes, report): (Vec<String>, Vec<String>) = report
+        .into_iter()
+        .partition(|l| l.starts_with(kith_kube::compose::NOTE));
+    for line in notes.iter().chain(&report) {
         // The input is not trusted: a key with a newline in it would forge a line below, and an
         // escape would reach the terminal.
         let line: String = line
@@ -151,7 +155,12 @@ pub fn run(what: Import) -> Result<ExitCode, String> {
                 }
             })
             .collect();
-        eprintln!("not translated: {line}");
+        let label = if line.starts_with(kith_kube::compose::NOTE) {
+            ""
+        } else {
+            "not translated: "
+        };
+        eprintln!("{label}{line}");
     }
     // A volume that no Workload made here mounts (a refused mount, or a name two things make)
     // is not copied into: it would be a Volume nothing uses.

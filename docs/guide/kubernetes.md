@@ -140,6 +140,17 @@ being an absolute host path). `-f FILE` reads a saved `docker inspect` instead, 
 stdin; with no docker installed, pipe it: `docker inspect web db | kith import docker -f -`.
 The exit status is the same: 0, 1 when something was left out, 2 for input that could not be read.
 
+What `docker inspect` says of a container's HostConfig that kith has no setting for is left out
+and said by path under compose's name for it, when it is not what docker fills in for nothing:
+`mem_limit`, `memswap_limit`, `mem_reservation`, `cpus`, `cpu_shares`, `cpuset`, `blkio_config`,
+`pids_limit`, `shm_size`, `oom_kill_disable`, `runtime`, `cgroup_parent`, `pid`, `ipc` and `uts`
+(other than private), `userns_mode`, `group_add`, `volumes_from`, `gpus` (DeviceRequests),
+`ulimits`, `dns`, `dns_search`, `extra_hosts` and `tmpfs` (`--tmpfs`). A volume name longer than
+63 characters (an anonymous docker volume's is 64 hex) is cut to its start and a hash of the whole,
+so the Volume's name is one `kith apply` takes. With `-n kith-system` a bind mount is carried as
+the node's own host path, and a `note:` line says so: it is not a thing left out, and the exit
+status does not change.
+
 The image reference is kept and kith pulls it: no image is moved. A bind mount is not copied.
 A container's labels, its image's `Env`, `Cmd` and `Entrypoint` are all in what `docker inspect`
 prints, and are carried or said like a compose service's.

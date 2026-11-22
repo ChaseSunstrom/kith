@@ -30,6 +30,9 @@ const SAID: &[&str] = &[
     "stop_grace_period",
 ];
 
+/// A report line that starts with this is a word to the reader, not something left out.
+pub const NOTE: &str = "note: ";
+
 const NOTHING: &str = "changes nothing: kith has no use for it";
 
 /// A shell would have to read these: a command with one is written as a list.
@@ -244,8 +247,9 @@ pub fn translate(root: Value, namespace: Option<&str>, node: Option<&str>) -> (V
 /// [`translate`] to refuse and carry by its own rules, so a container made with `docker run` is
 /// read as a compose service of its name. Also each named volume mounted: its docker name and
 /// the name kith gives the Volume.
-/// ponytail: the fields compose has a key for; limits (Memory, NanoCpus, Ulimits), Dns, ExtraHosts
-/// and the like are not read: add a key here, and the translator says it by path.
+/// ponytail: the fields compose has a key for, and the HostConfig settings kith does not carry
+/// (Memory, NanoCpus, host modes, DeviceRequests...) under compose's names, so the translator
+/// says each by path; Ulimits, Dns, ExtraHosts and the like are not read: add a key here.
 pub fn from_docker(inspected: Vec<Value>) -> Result<(Value, Vec<(String, String)>), String> {
     let (mut services, mut volumes, mut named) = (Map::new(), Map::new(), Vec::new());
     for c in inspected
@@ -334,6 +338,8 @@ pub fn from_docker(inspected: Vec<Value>) -> Result<(Value, Vec<(String, String)
                 }
             }
         }
+        // `docker run --tmpfs` is in HostConfig, not Mounts.
+        tmpfs.extend(host["Tmpfs"].as_object().into_iter().flatten().map(|(d, _)| json!(d)));
         let logging = host["LogConfig"]["Type"]
             .as_str()
             .filter(|t| !["", "json-file", "local"].contains(t));
@@ -391,6 +397,43 @@ pub fn from_docker(inspected: Vec<Value>) -> Result<(Value, Vec<(String, String)
             ("tmpfs", nonempty(json!(tmpfs))),
             ("volumes", nonempty(json!(vols))),
         ]);
+        // What else HostConfig sets, that kith has no key for: under compose's name for it, so
+        // the translator says each by path. (A value docker fills in for nothing is not a setting.)
+        let swap = host["Memory"].as_i64().map_or(0, |m| m.saturating_mul(2)).to_string();
+        let mut service = service;
+        for (key, compose, own) in [
+            ("Memory", "mem_limit", &[][..]),
+            ("MemorySwap", "memswap_limit", &[swap.as_str()]),
+            ("MemoryReservation", "mem_reservation", &[]),
+            ("NanoCpus", "cpus", &[]),
+            ("CpuShares", "cpu_shares", &[]),
+            ("CpusetCpus", "cpuset", &[]),
+            ("BlkioWeight", "blkio_config", &[]),
+            ("PidsLimit", "pids_limit", &["-1"]),
+            ("ShmSize", "shm_size", &["67108864"]),
+            ("OomKillDisable", "oom_kill_disable", &[]),
+            ("Runtime", "runtime", &["runc"]),
+            ("CgroupParent", "cgroup_parent", &[]),
+            ("PidMode", "pid", &["private"]),
+            ("IpcMode", "ipc", &["private", "shareable"]),
+            ("UTSMode", "uts", &["private"]),
+            ("UsernsMode", "userns_mode", &["private"]),
+            ("GroupAdd", "group_add", &[]),
+            ("VolumesFrom", "volumes_from", &[]),
+            ("DeviceRequests", "gpus", &[]),
+            ("Ulimits", "ulimits", &[]),
+            ("Dns", "dns", &[]),
+            ("DnsSearch", "dns_search", &[]),
+            ("ExtraHosts", "extra_hosts", &[]),
+        ] {
+            let v = &host[key];
+            let text = v.as_str().map_or_else(|| v.to_string(), String::from);
+            if let (Some(v), false, Value::Object(m)) =
+                (on(v).filter(|v| *v != 0), own.contains(&text.as_str()), &mut service)
+            {
+                m.insert(compose.into(), v);
+            }
+        }
         if services.insert(name.to_string(), service).is_some() {
             return Err(format!("two containers of the name `{name}`: a name is one service"));
         }
@@ -731,7 +774,16 @@ fn slug(s: &str) -> String {
             out.push(c);
         }
     }
-    out.trim_matches('-').to_string()
+    let out = out.trim_matches('-');
+    if out.len() <= 63 {
+        return out.to_string();
+    }
+    // Too long for a name: its start, and a hash of all of `s` so that two long ones stay two.
+    let hash = s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    });
+    let head: String = out.chars().take(50).collect();
+    format!("{}-{:012x}", head.trim_end_matches('-'), hash & 0xffff_ffff_ffff)
 }
 
 /// The Volume of a directory: its name, or none, the reason said at `at`.
@@ -754,6 +806,11 @@ fn claim(cx: &mut Cx, env: &mut Env, at: &str, path: &str, named: Option<&str>) 
                 );
                 return None;
             }
+            // A note, not a thing left out: `kith import` prints it apart and exits as without it.
+            cx.hints.push(format!(
+                "{NOTE}{}: {at} is a host path of the node, held as it is: check it is the one meant",
+                cx.who
+            ));
             path.to_string()
         }
         (true, true) => {
