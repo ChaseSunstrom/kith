@@ -70,6 +70,11 @@ images hold alike is one file on the node, hard-linked into each: three nginx im
 base took 44% less disk. An image no unit uses is removed (kithd's log says so), with its layers
 no other image has.
 
+- **Pulling.** The layers of one image are fetched side by side, four at a time; one that fails
+  stops the rest and leaves no half-written file. While a unit pulls, its Workload's status says
+  how far, once a second: `containers[].pull` holds `layers`, `layersTotal`, `bytes` and
+  `bytesTotal` (a layer already on the node counts as done), and `kith get` and the UI show it in
+  the status, `0/1 ready: pulling 3 of 7 layers, 12 of 40 MB`. The field is gone once the pull ends.
 - **When.** After `--image-grace` seconds unused; or, while the state disk is under
   `--storage-reserve`, oldest first, after two minutes. kithd looks once a minute.
 - **What stays.** An image a unit has a slot for or a container is made from, and every image

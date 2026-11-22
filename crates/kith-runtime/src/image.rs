@@ -18,11 +18,16 @@ use oci_client::Reference;
 use oci_client::config::ConfigFile;
 use oci_client::manifest::OciImageManifest;
 use oci_client::secrets::RegistryAuth;
+use std::collections::BTreeMap;
 use std::fs::{self, File};
+use std::future::Future;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::SystemTime;
 
 #[derive(Clone)]
@@ -35,6 +40,85 @@ pub struct ImageStore {
     /// that stalls would hold every unit's start with it; past these, the pull fails with its
     /// reason instead. Tests shorten them.
     pub patience: Patience,
+    /// The pulls under way, by the reference they were asked with: what [`pull_progress`](Self::pull_progress) reads.
+    pulls: Arc<Mutex<BTreeMap<String, Arc<Counts>>>>,
+}
+
+/// How far a pull is: the layers of its image and their bytes, those already stored counted done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub layers: usize,
+    pub layers_total: usize,
+    pub bytes: u64,
+    pub bytes_total: u64,
+}
+
+/// A pull's counts, written by the layers being fetched and read by whoever asks.
+struct Counts {
+    layers: AtomicUsize,
+    layers_total: usize,
+    bytes: Arc<AtomicU64>,
+    bytes_total: u64,
+}
+
+/// Takes a pull off `pulls` when it ends, however it ends.
+struct Listed<'a>(&'a Mutex<BTreeMap<String, Arc<Counts>>>, String, Arc<Counts>);
+
+impl Drop for Listed<'_> {
+    fn drop(&mut self) {
+        let mut pulls = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        // (Only its own entry: a second pull of the same reference may have replaced it.)
+        if pulls.get(&self.1).is_some_and(|c| Arc::ptr_eq(c, &self.2)) {
+            pulls.remove(&self.1);
+        }
+    }
+}
+
+/// A layer's file while it is fetched: gone with the fetch, whether it ended, failed or was given up on.
+struct Partial(PathBuf);
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// The most layers of one image fetched at once.
+const LAYERS_AT_ONCE: usize = 4;
+
+/// Runs `jobs`, at most `limit` at a time, on this task: the first to fail ends the rest (they are
+/// dropped where they stand) and is the answer. (No task of its own and no `Send` for the borrowed
+/// registry: the jobs only wait on the network, which is what runs side by side.)
+async fn at_once<F: Future<Output = Result<()>>>(limit: usize, mut jobs: impl Iterator<Item = F>) -> Result<()> {
+    let mut running: Vec<Pin<Box<F>>> = Vec::new();
+    std::future::poll_fn(|cx| {
+        loop {
+            while running.len() < limit
+                && let Some(job) = jobs.next()
+            {
+                running.push(Box::pin(job));
+            }
+            if running.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            let before = running.len();
+            let mut at = 0;
+            while at < running.len() {
+                match running[at].as_mut().poll(cx) {
+                    Poll::Ready(Ok(())) => drop(running.swap_remove(at)),
+                    Poll::Ready(Err(e)) => {
+                        running.clear();
+                        return Poll::Ready(Err(e));
+                    }
+                    Poll::Pending => at += 1,
+                }
+            }
+            if running.len() == before {
+                return Poll::Pending;
+            }
+        }
+    })
+    .await
 }
 
 /// This node's own registry of the cluster's Images, as its kithd made it at this start.
@@ -210,7 +294,21 @@ impl ImageStore {
             root: root.into(),
             local: None,
             patience: Patience::default(),
+            pulls: Arc::default(),
         }
+    }
+
+    /// How far the pull of `reference` (as the pull was asked) is, while it fetches: none before
+    /// the registry has named the layers, and none once it is done.
+    pub fn pull_progress(&self, reference: &str) -> Option<Progress> {
+        let pulls = self.pulls.lock().unwrap_or_else(|e| e.into_inner());
+        let counts = pulls.get(reference)?;
+        Some(Progress {
+            layers: counts.layers.load(Ordering::Relaxed),
+            layers_total: counts.layers_total,
+            bytes: counts.bytes.load(Ordering::Relaxed).min(counts.bytes_total),
+            bytes_total: counts.bytes_total,
+        })
     }
 
     /// Removes the shared files no image links any more, and says how many. Waits for an
@@ -572,6 +670,7 @@ impl ImageStore {
         signed_by: &[String],
         unpack: &(dyn Fn(String, String, Vec<File>) -> Unpacking + Sync),
     ) -> Result<Image> {
+        let asked = reference.to_string();
         let reference: Reference = reference.parse().ctx(format!("image reference `{reference}`"))?;
         let keys: Vec<crate::signed::Key> = signed_by
             .iter()
@@ -640,38 +739,65 @@ impl ImageStore {
         let config: ConfigFile =
             serde_json::from_str(&config).ctx(format!("reading the image config of {reference}"))?;
 
+        // The layers, in order, and which of them are to be fetched (once each: an image may name one twice).
         let mut layers = Vec::new();
-        let mut downloaded = 0;
+        let mut fetch: Vec<(&oci_client::manifest::OciDescriptor, &PathBuf)> = Vec::new();
         for layer in &manifest.layers {
-            let blob = self.root.join("blobs/sha256").join(sha256_hex(&layer.digest)?);
-            if !blob.exists() {
-                // oci-client checks the bytes against the layer digest as they stream; the writer
-                // refuses more than the layer's descriptor says it is.
-                let partial = blob.with_extension(scratch_name("partial"));
-                let mut file = tokio::fs::File::create(&partial).await.ctx("storing a layer")?;
-                let what = format!("pulling layer {} of {reference} ({} bytes)", layer.digest, layer.size);
-                let wait = layer_wait(self.patience.metadata, layer.size);
-                let mut pulled = within(
-                    wait,
-                    what,
-                    remote
-                        .oci
-                        .pull_blob(&reference, layer, &mut Capped::new(&mut file, layer.size)),
-                )
-                .await;
-                if pulled.is_ok() {
-                    // On disk before it gets its final name: a crash must not leave half a layer there.
-                    pulled = file.sync_all().await.ctx("storing a layer");
-                }
-                if pulled.is_err() {
-                    let _ = fs::remove_file(&partial);
-                }
-                pulled?;
-                fs::rename(&partial, &blob).ctx("storing a layer")?;
-                downloaded += 1;
-            }
-            layers.push(blob);
+            layers.push(self.root.join("blobs/sha256").join(sha256_hex(&layer.digest)?));
         }
+        let mut seen = std::collections::BTreeSet::new();
+        for (layer, blob) in manifest.layers.iter().zip(&layers) {
+            if !blob.exists() && seen.insert(&layer.digest) {
+                fetch.push((layer, blob));
+            }
+        }
+        // (A registry's sizes are its word: summed so that none overflows.)
+        let todo: i64 = fetch
+            .iter()
+            .fold(0, |sum, (layer, _)| sum.saturating_add(layer.size.max(0)));
+        // What is stored already counts as done.
+        let bytes_total: u64 = manifest
+            .layers
+            .iter()
+            .fold(0, |sum, l| sum.saturating_add(u64::try_from(l.size).unwrap_or(0)));
+        let counts = Arc::new(Counts {
+            layers: AtomicUsize::new(manifest.layers.len() - fetch.len()),
+            layers_total: manifest.layers.len(),
+            bytes: Arc::new(AtomicU64::new(bytes_total.saturating_sub(todo as u64))),
+            bytes_total,
+        });
+        self.pulls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(asked.clone(), counts.clone());
+        let _listed = Listed(&self.pulls, asked, counts.clone());
+        // Side by side, so a slow one is not waited for by the rest. (They share the link: each is
+        // given the time its own size takes at the slowest rate, for as many sharing it as there are.)
+        let sharing = LAYERS_AT_ONCE.min(fetch.len());
+        let metadata = self.patience.metadata;
+        let downloaded = fetch.len();
+        at_once(
+            LAYERS_AT_ONCE,
+            fetch.into_iter().map(|(layer, blob)| {
+                let (reference, remote, counts) = (&reference, &remote, &counts);
+                async move {
+                    // oci-client checks the bytes against the layer digest as they stream; the writer
+                    // refuses more than the layer's descriptor says it is.
+                    let partial = Partial(blob.with_extension(scratch_name("partial")));
+                    let mut file = tokio::fs::File::create(&partial.0).await.ctx("storing a layer")?;
+                    let what = format!("pulling layer {} of {reference} ({} bytes)", layer.digest, layer.size);
+                    let mut into = Capped::new(&mut file, layer.size, counts.bytes.clone());
+                    let wait = layer_wait(metadata, layer.size, sharing);
+                    within(wait, what, remote.oci.pull_blob(reference, layer, &mut into)).await?;
+                    // On disk before it gets its final name: a crash must not leave half a layer there.
+                    file.sync_all().await.ctx("storing a layer")?;
+                    fs::rename(&partial.0, blob).ctx("storing a layer")?;
+                    counts.layers.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+            }),
+        )
+        .await?;
 
         let dir = self.root.join("images").join(sha256_hex(&digest)?);
         if !dir.join("config.json").exists() {
@@ -3326,6 +3452,275 @@ mod tests {
         assert_eq!(again.downloaded, 1, "its layer was not fetched again");
         assert_eq!(fs::read_to_string(again.rootfs.join("bin/hello")).unwrap(), "hello");
         drop(registry);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A registry on 127.0.0.1 that answers each connection on a thread of its own, so layers can
+    /// be asked for side by side. A blob is held `delay` before it is sent; `peak` is the most
+    /// held at once.
+    /// What a path of the registry answers: how long to hold it, and its body.
+    type Served = Arc<Mutex<std::collections::HashMap<String, (Duration, Vec<u8>)>>>;
+
+    struct Layers {
+        port: u16,
+        files: Served,
+        live: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        blobs: Arc<AtomicUsize>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Layers {
+        fn start() -> Layers {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let me = Layers {
+                port: listener.local_addr().unwrap().port(),
+                files: Arc::default(),
+                live: Arc::default(),
+                peak: Arc::default(),
+                blobs: Arc::default(),
+                stop: Arc::default(),
+            };
+            let (files, live, peak, blobs, stop) = (
+                me.files.clone(),
+                me.live.clone(),
+                me.peak.clone(),
+                me.blobs.clone(),
+                me.stop.clone(),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let Ok((mut tcp, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    let _ = tcp.set_nonblocking(false);
+                    let _ = tcp.set_read_timeout(Some(Duration::from_secs(2)));
+                    let (files, live, peak, blobs) = (files.clone(), live.clone(), peak.clone(), blobs.clone());
+                    std::thread::spawn(move || {
+                        let mut head = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
+                            match tcp.read(&mut byte) {
+                                Ok(1) => head.push(byte[0]),
+                                _ => return,
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&head).into_owned();
+                        let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                        let found = files.lock().unwrap().get(&path).cloned();
+                        let (status, delay, body) = match (path.as_str(), found) {
+                            ("/v2/", _) => ("200 OK", Duration::ZERO, b"{}".to_vec()),
+                            (_, Some((delay, body))) => ("200 OK", delay, body),
+                            _ => ("404 Not Found", Duration::ZERO, b"{}".to_vec()),
+                        };
+                        let blob = path.contains("/blobs/") && !delay.is_zero();
+                        if blob {
+                            blobs.fetch_add(1, Ordering::SeqCst);
+                            peak.fetch_max(live.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                            std::thread::sleep(delay);
+                            live.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        let reply = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nDocker-Content-Digest: {}\r\nConnection: close\r\n\r\n",
+                            body.len(),
+                            sha(&body)
+                        );
+                        let _ = tcp.write_all(reply.as_bytes());
+                        let _ = tcp.write_all(&body);
+                    });
+                }
+            });
+            me
+        }
+
+        /// Publishes `team/hello:tag` of `layers` (each a body and how long its blob is held); a
+        /// layer named in `corrupt` is served as other bytes of its length.
+        fn publish(&self, tag: &str, layers: &[(&[u8], u64)], corrupt: &[usize]) {
+            let mut files = self.files.lock().unwrap();
+            let mut put = |name: String, delay: u64, body: Vec<u8>| {
+                files.insert(format!("/v2/team/hello/{name}"), (Duration::from_millis(delay), body));
+            };
+            let config =
+                br#"{"architecture":"amd64","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":[]}}"#;
+            put(format!("blobs/{}", sha(config)), 0, config.to_vec());
+            let mut described = Vec::new();
+            for (at, (body, delay)) in layers.iter().enumerate() {
+                let sent = if corrupt.contains(&at) {
+                    vec![b'x'; body.len()]
+                } else {
+                    body.to_vec()
+                };
+                put(format!("blobs/{}", sha(body)), *delay, sent);
+                described.push(format!(
+                    r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{}","size":{}}}"#,
+                    sha(body),
+                    body.len()
+                ));
+            }
+            let manifest = format!(
+                r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{}","size":{}}},"layers":[{}]}}"#,
+                sha(config),
+                config.len(),
+                described.join(",")
+            );
+            put(format!("manifests/{tag}"), 0, manifest.into_bytes());
+        }
+    }
+
+    impl Drop for Layers {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// What unpacks in these tests: the layer files read in order into `seen`, and an image made empty.
+    fn unpacking(
+        store: &ImageStore,
+        seen: &Arc<Mutex<Vec<Vec<u8>>>>,
+    ) -> impl Fn(String, String, Vec<File>) -> Unpacking {
+        let (root, seen) = (store.root.clone(), seen.clone());
+        move |digest, _, files| {
+            for mut file in files {
+                let mut body = Vec::new();
+                file.read_to_end(&mut body).unwrap();
+                seen.lock().unwrap().push(body);
+            }
+            let dir = root.join("images").join(sha256_hex(&digest).unwrap());
+            fs::create_dir_all(dir.join("rootfs")).unwrap();
+            fs::write(dir.join("config.json"), "{}").unwrap();
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Layers are fetched side by side, four at most, and unpacked in the image's order.
+    #[tokio::test]
+    async fn pull_layers_parallel_four_at_once_and_unpacked_in_order() {
+        let (dir, _) = sandbox("pull-layers-parallel");
+        let registry = Layers::start();
+        let bodies: Vec<Vec<u8>> = (0..6).map(|n| format!("layer number {n}").into_bytes()).collect();
+        let layers: Vec<(&[u8], u64)> = bodies.iter().map(|b| (b.as_slice(), 300)).collect();
+        registry.publish("1", &layers, &[]);
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let seen = Arc::default();
+        let reference = format!("127.0.0.1:{}/team/hello:1", registry.port);
+        let started = std::time::Instant::now();
+        let image = store
+            .pull_with(&reference, PullPolicy::Always, &[], &unpacking(&store, &seen))
+            .await
+            .unwrap();
+        let took = started.elapsed();
+        assert_eq!(image.downloaded, 6);
+        assert_eq!(registry.peak.load(Ordering::SeqCst), LAYERS_AT_ONCE, "layers at once");
+        assert_eq!(*seen.lock().unwrap(), bodies, "unpacked out of order");
+        // Two rounds of 300 ms, not six: a sequential pull takes at least 1.8 s.
+        assert!(took < Duration::from_millis(1500), "took {took:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A layer that fails stops the others, and no layer is stored half: the one that failed, and
+    /// those still arriving, leave no file; those that were not begun are not asked for.
+    #[tokio::test]
+    async fn pull_layers_parallel_a_failed_layer_stops_the_rest_and_leaves_no_partial() {
+        let (dir, _) = sandbox("pull-layers-failed");
+        let registry = Layers::start();
+        let bodies: Vec<Vec<u8>> = (0..6).map(|n| format!("layer number {n}").into_bytes()).collect();
+        // The second is bad once it arrives (at 100 ms); the rest are still arriving then (at 3 s).
+        let layers: Vec<(&[u8], u64)> = bodies
+            .iter()
+            .enumerate()
+            .map(|(at, b)| (b.as_slice(), if at == 1 { 100 } else { 3000 }))
+            .collect();
+        registry.publish("1", &layers, &[1]);
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let seen = Arc::default();
+        let reference = format!("127.0.0.1:{}/team/hello:1", registry.port);
+        let started = std::time::Instant::now();
+        let failed = store
+            .pull_with(&reference, PullPolicy::Always, &[], &unpacking(&store, &seen))
+            .await;
+        assert!(failed.is_err(), "a corrupt layer was taken");
+        assert!(started.elapsed() < Duration::from_millis(2500), "waited for the rest");
+        assert!(seen.lock().unwrap().is_empty(), "unpacked");
+        let left: Vec<_> = fs::read_dir(dir.join("store/blobs/sha256")).unwrap().collect();
+        assert!(left.is_empty(), "files left: {left:?}");
+        assert!(
+            registry.blobs.load(Ordering::SeqCst) <= LAYERS_AT_ONCE,
+            "layers past the four were asked for"
+        );
+        assert!(
+            store.pull_progress(&reference).is_none(),
+            "a failed pull is still listed"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// While layers are fetched the pull says how many of them and how many bytes are done, those
+    /// the store had already counted from the start; when it ends, it says nothing.
+    #[tokio::test]
+    async fn pull_progress_says_layers_and_bytes_while_it_fetches() {
+        let (dir, _) = sandbox("pull-progress");
+        let registry = Layers::start();
+        let (a, b, c, d): (&[u8], &[u8], &[u8], &[u8]) = (b"aaaaaaaaaa", b"bbbbbbbbbbbb", b"cccc", b"dddddd");
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let seen = Arc::default();
+        let (first, second) = (
+            format!("127.0.0.1:{}/team/hello:1", registry.port),
+            format!("127.0.0.1:{}/team/hello:2", registry.port),
+        );
+        registry.publish("1", &[(a, 10), (b, 10)], &[]);
+        registry.publish("2", &[(a, 10), (b, 10), (c, 200), (d, 400)], &[]);
+        assert!(store.pull_progress(&first).is_none(), "no pull yet");
+        store
+            .pull_with(&first, PullPolicy::Always, &[], &unpacking(&store, &seen))
+            .await
+            .unwrap();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let unpack = unpacking(&store, &seen);
+        let (image, said) = tokio::join!(
+            async {
+                let image = store.pull_with(&second, PullPolicy::Always, &[], &unpack).await;
+                done.store(true, Ordering::SeqCst);
+                image
+            },
+            async {
+                let mut said = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    said.extend(store.pull_progress(&second));
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                said
+            }
+        );
+        assert_eq!(image.unwrap().downloaded, 2);
+        let total = (a.len() + b.len() + c.len() + d.len()) as u64;
+        let (first_said, last_said) = (said.first().unwrap(), said.last().unwrap());
+        assert_eq!((first_said.layers, first_said.layers_total), (2, 4), "{said:?}");
+        assert_eq!(first_said.bytes_total, total);
+        assert!(
+            first_said.bytes >= (a.len() + b.len()) as u64,
+            "stored layers were not counted: {said:?}"
+        );
+        assert!(
+            said.iter().any(|p| p.layers == 3 && p.bytes == total - d.len() as u64),
+            "{said:?}"
+        );
+        // The last look may come just before the last layer is renamed into place.
+        assert!(
+            last_said.layers >= 3 && last_said.bytes >= total - d.len() as u64,
+            "{said:?}"
+        );
+        assert!(
+            said.iter().all(|p| p.layers_total == 4 && p.bytes_total == total),
+            "{said:?}"
+        );
+        assert!(
+            said.windows(2)
+                .all(|w| w[0].layers <= w[1].layers && w[0].bytes <= w[1].bytes),
+            "{said:?}"
+        );
+        assert!(store.pull_progress(&second).is_none(), "an ended pull is still listed");
         fs::remove_dir_all(&dir).unwrap();
     }
 
