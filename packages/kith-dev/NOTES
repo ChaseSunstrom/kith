@@ -1,0 +1,3 @@
+{{ name }} is a workspace: the Volume {{ name }}-work ({{ values.replicas }} copies) is mounted at {{ values.mountPath }} (also HOME) in the pod {{ name }}, which runs {{ values.image }} as user {{ values.user }}{% if values.deviceClaims %} and holds the claims {{ values.deviceClaims | join(", ") }}{% endif %}.
+Open a shell in it, then clone the repository into {{ values.mountPath }}:
+  kith exec {{ name }} -n {{ release.namespace }} -- sh

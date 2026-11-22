@@ -1,0 +1,20 @@
+# The node the Volume begins on. Set it.
+node: ""
+# Your image: the tools you work with (a shell, git, a toolchain, your agent) are in it. Set it
+# (this one is a placeholder that no registry serves).
+image: registry.example/dev:1
+# The user the session runs as (a number, below 65536: it is a pod).
+user: 1000
+# Where the Volume is mounted. It is also HOME: the checkout and the home survive in one place.
+mountPath: /work
+# What the pod runs. The image's own entrypoint, if this is empty.
+command: [sleep, infinity]
+# Copies of the Volume in all (this node and others): the work survives its node.
+replicas: 2
+# The DeviceClaims (in this namespace) the pod holds, such as one for /dev/kvm: it must run on
+# the node that has the device.
+deviceClaims: []
+# What the session is promised on its node.
+reserve:
+  cpu: "2"
+  memory: 4Gi

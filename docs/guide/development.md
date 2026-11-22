@@ -21,7 +21,7 @@
 | `crates/kithd` | The daemon: API server, store replica, scheduler, mesh, DNS and Workload controller |
 | `sdk/kith-controller` | The SDK for controllers and admission hooks in WebAssembly, with an example (its own workspace: it builds for wasm32) |
 | `os/` | kith OS: what builds its image (`build.sh`), an update (`update.sh`) and the installer for a rented machine (`vps.sh`), and the kernel's configuration |
-| `packages/` | Packages that come with kith: `web`, `nas`, `kith-build`, `kith-panel`, and the desktops (`gnome`, `hyprland`, `kiosk`) |
+| `packages/` | Packages that come with kith: `web`, `nas`, `kith-build`, `kith-dev`, `kith-panel`, and the desktops (`gnome`, `hyprland`, `kiosk`) |
 | `examples/` | Resources to apply as they are; `examples/session/` is a set of files (a Containerfile, a script, a manifest), and `-f examples/` does not read it |
 | `ci/` | The budgets, the benchmark, the VM tests (`vm.sh`), and what measures and photographs the website (`site_numbers.py`, `site_shots.py`) |
 | `dist/` | A systemd user unit for agent mode |
@@ -197,6 +197,34 @@ MB with it (`python3 ci/budgets.py`; budget 9.00 MB).
 | **Toolchain** | The order is of the one compiler `rust-toolchain.toml` names (rustup installs it): Rust 1.100.0 gave a tenth of these functions other names, and kithd built with it held 5.96 MB, measured right after the build. After naming another, run `python3 ci/order.py` again. With no lld, kithd is linked in the compiler's order with a warning and holds 10.50 MB again (the check then fails, saying there is no lld). |
 | **As init** | As the first process of kith OS, kithd does more before it serves (mounts, the state partition, DHCP), none of it in the order file, which is traced from a kithd that is not first and needs no root. What a node does in its first minute is traced: `ci/order.py` asks the traced kithd, on 127.0.0.1, for a TLS request on the node listener, a join token, an apply of a small Workload, a DNS answer and a write through Raft. It says on its console what it holds when told to stop (`kithd: init: told to stop: 10248 kB resident, 8996 kB of it files`), and the VM tests print it: `sh ci/vm.sh --test image`, from the image's own root after one TLS request, 9.3 MB, 8.0 of them files (three runs: 9564, 8924 and 9432 kB; 10.2 to 10.7 MB before the first minute was traced); `sh ci/vm.sh --test init`, from a memory disk and told to stop as soon as it serves, 6.4 MB, 5.4 of them files. No budget holds the VM's number (no VM runs in CI); the 9.00 MB budget is of the build machine's. |
 | **Tried, not kept** | Telling the kernel the code is read at random (`MADV_RANDOM`) changed nothing (10.3 to 10.6 MB): the pages it maps around a fault are not read-ahead. Mapping one page a fault where it maps 64 kB (a setting of the whole node, which kith OS leaves) gave 7.7 MB, 5.4 of them code, so most of what kithd holds is code it ran, a page here and there, not the pages around it. Not tried: dropping the pages once it serves, which lowers the number until each is used again. These pages are the kernel's copy of a file, taken back when memory is short; what would lower them is that code linked together too, which the order file does not do yet. |
+
+### Developing from inside the cluster
+
+[`packages/kith-dev`](../../packages/kith-dev) is a workspace to work on kith in, on a kith OS
+node (beside a desktop seat, if it has one): a Volume for the checkout and the home, kept on
+`replicas` nodes, and one long-lived pod that mounts it at `mountPath` (also `HOME`), as the
+`user` you name. The image is yours (your agent, the Rust toolchain, git, `sh`): kith ships none,
+and no credential or Secret is made or named here; put yours in a Secret and add it to the pod
+yourself.
+
+```sh
+kith package render packages/kith-dev --name dev --set node=alpha --set image=registry.example/me/dev:1 \
+    --set user=1000 --set 'deviceClaims=[ci-kvm-alpha]' | kith apply -f -
+```
+
+- **/dev/kvm.** A DeviceClaim in the namespace for the node's `/dev/kvm` (the Device and claim
+  `ci-kvm-NODE` that [`sh ci/remote.sh --vm`](#testing-on-several-nodes) applies show the shape)
+  goes in `deviceClaims`, and the pod runs on that node, so `sh ci/vm.sh` boots there. The tests
+  that start containers need that node's kernel, not the pod's: run them in a VM
+  ([Virtual machines](hardware.md#virtual-machines)) or with `ci/remote.sh --vm`.
+- **The node's loss.** The pod restarts on the copy that synced last, the work as of its last
+  `sync` (5 minutes unless set on the Volume: commit and push what matters). The session itself
+  does not resume: the shell is new, the files are as the Volume had them.
+- **Updating the cluster** is the [OSRelease and UpdatePlan](os.md#rolling-a-release-through-the-cluster) recipe from a
+  shell in the pod, with a plan's `selector` leaving the node the pod runs on for last (a label
+  the other nodes have and it lacks, then a second plan with no `selector`). The plan restarts
+  that node with the pod on it, which moves with a `drain: true`. Not yet: this has been rendered
+  and applied to a store, **not run on a cluster here**.
 
 ### Testing on several nodes
 

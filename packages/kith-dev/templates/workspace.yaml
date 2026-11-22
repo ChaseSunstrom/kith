@@ -1,0 +1,37 @@
+# The checkout and the home, kept on {{ values.replicas }} nodes: when its node is lost the
+# Volume, and the pod with it, move to the copy that synced last.
+apiVersion: kith.dev/v1
+kind: Volume
+metadata:
+  name: {{ name }}-work
+spec:
+  node: {{ values.node | tojson }}
+  path: dev
+  replicas: {{ values.replicas }}
+---
+# The session: one replica, a pod (a root of its own to write), restarted if it ends.
+apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: {{ name }}
+  labels:
+    app: {{ name }}
+spec:
+  replicas: 1
+  template:
+    pod: true
+    {%- if values.deviceClaims %}
+    deviceClaims: {{ values.deviceClaims | tojson }}
+    {%- endif %}
+    containers:
+      - name: dev
+        image: {{ values.image | tojson }}
+        {%- if values.command %}
+        command: {{ values.command | tojson }}
+        {%- endif %}
+        runAsUser: {{ values.user }}
+        resources: {{ values.reserve | tojson }}
+        env:
+          - { name: HOME, value: {{ values.mountPath | tojson }} }
+        volumeMounts:
+          - { volume: {{ name }}-work, path: {{ values.mountPath | tojson }} }
