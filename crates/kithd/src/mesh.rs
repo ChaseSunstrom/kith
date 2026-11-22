@@ -837,10 +837,10 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             Err(e) => eprintln!("kithd: mesh: setting {}: {e}", options.interface),
         }
         if options.resolver && resolver_at.is_none_or(|at| at.elapsed() >= RESOLVER_EVERY) {
-            resolver_at = Some(Instant::now());
             match crate::root_part::mesh_resolver(&root, &options.interface, true) {
-                Ok(()) => (resolver_on, resolver_said) = (true, false),
-                // (Said once: asked again every half minute, in case resolved comes up.)
+                Ok(()) => (resolver_at, resolver_on, resolver_said) = (Some(Instant::now()), true, false),
+                // (Said once: asked again on every pass until it works, in case resolved comes up, and
+                // then every half minute.)
                 Err(e) if !std::mem::replace(&mut resolver_said, true) => {
                     eprintln!("kithd: mesh: --resolver on {}: {e}", options.interface);
                 }

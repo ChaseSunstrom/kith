@@ -184,7 +184,7 @@ struct Args {
     /// The name of the mesh's network interface
     #[arg(long, env = "KITH_MESH_INTERFACE", value_name = "NAME", default_value = "kith0")]
     mesh_interface: String,
-    /// Give this machine's own programs the cluster's .kith names: serve DNS at 127.0.0.87:53 and, while the mesh is up, have systemd-resolved send .kith (and nothing else) there. Answers this machine only; needs --mesh and systemd-resolved
+    /// Give this machine's own programs the cluster's .kith names: serve DNS at 127.0.0.87:53 and, while the mesh is up, have systemd-resolved send .kith (and nothing else) there. Answers this machine only; needs the mesh (--mesh, or the Cluster's mesh switch) and systemd-resolved
     #[arg(long, env = "KITH_RESOLVER")]
     resolver: bool,
     /// Run the people's WireGuard device on this UDP port (docs/adr-people.md): kwg0, beside the
@@ -1880,5 +1880,22 @@ spec: {}
         let args = Args::from_arg_matches(&matched).unwrap();
         assert_eq!(args.dns_upstream, ["9.9.9.9", "1.1.1.1"]);
         assert_eq!(args.listen.map(|at| at.to_string()).as_deref(), Some("127.0.0.1:1"));
+    }
+
+    /// `--resolver` is a switch (off unless given) that `KITH_RESOLVER` also sets.
+    #[test]
+    fn resolver_flag_is_off_unless_given_and_reads_its_variable() {
+        let parse =
+            |given: &[&str]| Args::from_arg_matches(&Args::command().try_get_matches_from(given).unwrap()).unwrap();
+        assert!(!parse(&["kithd"]).resolver);
+        assert!(parse(&["kithd", "--resolver"]).resolver);
+        assert!(
+            Args::command()
+                .try_get_matches_from(["kithd", "--resolver=yes"])
+                .is_err()
+        );
+        let command = Args::command();
+        let flag = command.get_arguments().find(|arg| arg.get_id() == "resolver").unwrap();
+        assert_eq!(flag.get_env().and_then(|env| env.to_str()), Some("KITH_RESOLVER"));
     }
 }

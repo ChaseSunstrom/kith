@@ -781,9 +781,9 @@ and other names the same answer as before.
 `kithd --listen --mesh --resolver` makes `.kith` names work for programs on that machine
 (`getent hosts web.default.kith`, `curl`, a browser):
 
-- **What it needs:** the mesh (`--mesh`), systemd-resolved running, and programs that ask it (the
-  usual ones do, through `/etc/resolv.conf` or `nss-resolve`). A program that reads its own
-  server list does not.
+- **What it needs:** the mesh (`--mesh`, or the Cluster's mesh switch; without a mesh nothing is
+  registered), systemd-resolved running, and programs that ask it (the usual ones do, through
+  `/etc/resolv.conf` or `nss-resolve`). A program that reads its own server list does not.
 - **What it does:** kithd answers on `127.0.0.87:53` and, while the mesh interface is up, tells
   systemd-resolved (`resolvectl`) to send the domain `~kith` there on that link, with no default
   route: no other name goes to kithd and no other link changes. It writes no file and never
@@ -793,7 +793,8 @@ and other names the same answer as before.
 - **How it goes:** kithd takes the entry back (`resolvectl revert`) before it takes the interface
   down, and the entry lives in resolved's memory only, so a reboot loses it too (a kithd killed
   outright leaves it while the link stays, and the next one sets it again). It is looked at every
-  half minute and set again if resolved forgot it (a restart of resolved). Without
+  half minute and set again if resolved forgot it (a restart of resolved). The server is set after
+  the domain, so a failure part way never leaves a link that sends every name to kithd. Without
   `/run/systemd/resolve`, kithd says so once and does nothing else. If `127.0.0.87:53` is taken,
   kithd says so and registers nothing.
 
