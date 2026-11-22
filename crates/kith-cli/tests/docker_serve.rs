@@ -437,15 +437,16 @@ fn answer(mut stream: UnixStream, stand: &Shared) {
             for doc in serde_json::from_slice::<Vec<Value>>(&body).unwrap() {
                 let before = s.resources.insert(key_of(&doc), doc.clone());
                 let name = doc["metadata"]["name"].as_str().unwrap_or_default().to_string();
-                if doc["kind"] == "Job" && before.is_none() {
-                    if let Some((code, out)) = s.script.get(&name).cloned() {
-                        s.logs.insert(name.clone(), out);
-                        let stand = stand.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(Duration::from_millis(600));
-                            finish(&stand, &name, code);
-                        });
-                    }
+                if doc["kind"] == "Job"
+                    && before.is_none()
+                    && let Some((code, out)) = s.script.get(&name).cloned()
+                {
+                    s.logs.insert(name.clone(), out);
+                    let stand = stand.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(600));
+                        finish(&stand, &name, code);
+                    });
                 }
                 let action = if before.is_some() { "updated" } else { "created" };
                 changes.push(json!({"action": action, "before": before, "after": doc}));
