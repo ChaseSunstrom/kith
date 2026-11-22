@@ -112,6 +112,8 @@
     took=$((($(date +%s%N) - began) / 1000000))
     said 'Mounted root (squashfs filesystem) readonly on device 25[0-9]:0' || fail "the root is not the verity device"
     said 'kithd: init: state on /dev/vda7' || fail "the state partition was not mounted"
+    # (T-0095: the kernel locks itself down at integrity from its config, with no command line to ask for it.)
+    said 'Kernel is locked down from kernel config' || fail "the booted kernel is not locked down at integrity"
     # The state partition is the image's 32 MB no longer: it ends where the disk does, the
     # file system fills it, and a tool that reads partition tables finds nothing to say.
     said 'kithd: init: the state partition now ends where its disk does: '"$want"'[0-9][0-9] MB' || fail "the state partition was not made to end where its disk does"
