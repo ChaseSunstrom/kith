@@ -459,8 +459,7 @@ fn main() -> ExitCode {
             });
         return match done {
             Ok(config) => {
-                // (Not the words: they hold the join token.)
-                println!("{image}: wrote the node's config ({} bytes)", config.len());
+                println!("{}", install::wrote(image, &config));
                 ExitCode::SUCCESS
             }
             Err(e) => {

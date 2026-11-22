@@ -16,7 +16,8 @@ usage: sh os/config.sh IMAGE ANSWERS
 Writes into IMAGE (kith-os.raw, changed in place) the config the installer would write
 for ANSWERS (kith-install.yaml: see docs/guide/os.md). Nothing else in IMAGE changes, and
 a second call replaces the first. `disk:` is needed and not used. `encrypt: true` and
-`size:` mean a machine: they are refused.
+`size:` mean a machine: they are refused. The image is made readable by you alone first:
+it holds the join token in plain text.
 
   KITHD   the kithd binary to run (default: built by ci/musl.sh)
 EOF
@@ -35,4 +36,6 @@ esac
 if [ -z "${KITHD:-}" ]; then
     KITHD=$(sh "$(dirname "$0")/../ci/musl.sh")/kithd
 fi
+# (The image will hold the join token in plain text: nobody else reads it.)
+chmod go-rwx "$1"
 exec "$KITHD" config-image "$1" "$2"

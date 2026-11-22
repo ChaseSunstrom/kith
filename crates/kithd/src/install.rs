@@ -569,11 +569,21 @@ fn put_config(file: &File, at: u64, room: u64, config: &str) -> Result<(), Strin
         .ok_or("the node's config did not stay on the disk as written".into())
 }
 
+/// What `kithd config-image` says it did: how long the config is, never its words (they hold the join token).
+pub fn wrote(image: &str, config: &str) -> String {
+    format!("{image}: wrote the node's config ({} bytes)", config.len())
+}
+
 /// Write into the built image `image` the config the installer would write for `yaml` (its
 /// answers), and say it: so a cloud image starts as the node meant. Only the image's `config`
 /// partition changes. What needs a machine (`encrypt`, `size`) is refused: there is none.
 pub fn config_image(image: &File, yaml: &str) -> Result<String, String> {
-    let answers = answers(yaml)?;
+    // (Not `answers()`: its error shows the offending source line, which may hold the join token.)
+    let answers: Answers = kith_yaml::from_str(yaml).map_err(|e| format!("the answers: {e}"))?;
+    let mut magic = [0; 4];
+    if image.read_exact_at(&mut magic, 0).is_ok() && &magic == b"QFI\xfb" {
+        return Err("give a raw image (kith-os.raw): this is a qcow2; convert it after, with qemu-img".into());
+    }
     if answers.encrypt {
         return Err(
             "`encrypt: true` is for a machine: its key is held by its cluster, and an image has no machine yet".into(),
@@ -1793,7 +1803,24 @@ mod tests {
             .unwrap()
     }
 
-    const NODE: &str = "disk: sda\nhostname: alpha\nip: 10.0.0.5/24\njoin:\n  address: 10.0.0.1:7443\n  token: abc.def-node\nmesh: true\n";
+    const NODE: &str = "disk: sda\nhostname: alpha\nip: 10.0.0.5/24\njoin:\n  address: 10.0.0.1:7443\n  token: abc.def-node\nmesh: true\n"; // pragma: allowlist secret
+
+    #[test]
+    fn install_config_image_never_echoes_the_token_and_takes_raw_images_only() {
+        let dir = std::env::temp_dir().join(format!("kith-config-image-secret-{}", std::process::id()));
+        let made = opened(&dir, "made", &image("config"));
+        // A mistyped key under `join:` is a YAML error on the line that holds the token.
+        let bad = "disk: sda\njoin:\n  address: 10.0.0.1:7443\n  tokne: abc.def-node\n  token: abc.def-node\n"; // pragma: allowlist secret
+        let err = config_image(&made, bad).unwrap_err();
+        assert!(!err.contains("abc.def-node") && err.contains("line "), "{err}"); // pragma: allowlist secret
+        // What it says when it works holds neither the token nor the word that takes it.
+        let said = wrote("node.raw", &config_image(&made, NODE).unwrap());
+        assert!(!said.contains("--token") && !said.contains("abc.def-node"), "{said}"); // pragma: allowlist secret
+        // A qcow2 is told to be raw.
+        let qcow2 = opened(&dir, "qcow2", b"QFI\xfb\0\0\0\x03 and the rest");
+        assert!(config_image(&qcow2, NODE).unwrap_err().contains("give a raw image"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn install_config_image_writes_what_the_installer_would() {
