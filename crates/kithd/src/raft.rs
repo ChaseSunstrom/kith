@@ -1231,6 +1231,11 @@ fn nodes_of(store: &kith_api::store::Store) -> BTreeMap<NodeId, BasicNode> {
 
 /// The header a node answers Raft's calls with: the newest store format its kithd reads.
 pub(crate) const READS: &str = "x-kith-store";
+/// What a node says it reads: this build's format, but on trial (its slot not yet good, so it may
+/// fall back to a kithd that reads less) only the store's `current` one (T-0222).
+pub(crate) fn reads(current: u32, on_trial: bool) -> u32 {
+    if on_trial { current } else { kith_store::FORMAT }
+}
 /// What each member last answered with ([`READS`]; 1 where it said nothing, as a kithd from
 /// before does), and when: heard by the links, so only the member itself can say it.
 static HEARD: Mutex<BTreeMap<NodeId, (u32, Instant)>> = Mutex::new(BTreeMap::new());
@@ -1276,7 +1281,7 @@ pub async fn tend_format(shared: Arc<Shared>, mut stopping: watch::Receiver<bool
         if format >= kith_store::FORMAT {
             return;
         }
-        if let Err(e) = mark(&shared, &mut said).await {
+        if let Err(e) = mark(&shared, &mut said, crate::os::on_trial()).await {
             eprintln!("kithd: {e}");
         }
         tokio::select! {
@@ -1287,10 +1292,21 @@ pub async fn tend_format(shared: Arc<Shared>, mut stopping: watch::Receiver<bool
 }
 
 /// One look: where this node leads, move the store a format on, or say (in `said`, and in
-/// the log when it changes) who is waited for.
-async fn mark(shared: &Shared, said: &mut Vec<String>) -> Result<(), String> {
+/// the log when it changes) who is waited for. Not while this node's own slot is `on_trial`:
+/// it may fall back to a kithd that cannot read the new format (T-0222).
+async fn mark(shared: &Shared, said: &mut Vec<String>, on_trial: bool) -> Result<(), String> {
     let metrics = shared.raft.metrics().borrow().clone();
     if metrics.current_leader != Some(metrics.id) {
+        return Ok(());
+    }
+    if on_trial {
+        let waiting = vec!["this node's own slot".to_string()];
+        if *said != waiting {
+            eprintln!(
+                "kithd: the store stays in its format until this node's slot is marked good: a slot that fails before then falls back to a kithd that may not read the next one"
+            );
+            *said = waiting;
+        }
         return Ok(());
     }
     // The members, and the Nodes about to be: one that joined on an older kithd is waited for.
@@ -2395,12 +2411,39 @@ mod tests {
         HEARD.lock().unwrap().insert(id, (3, Instant::now()));
         let format = |shared: &Shared| kith_store::format_of(&shared.store.lock().unwrap().store);
         let mut said = Vec::new();
-        mark(&shared, &mut said).await.unwrap();
+        mark(&shared, &mut said, false).await.unwrap();
         assert_eq!((format(&shared), said.len()), (3, 1), "{said:?}");
         // Once it says 4, the store moves.
         HEARD.lock().unwrap().insert(id, (4, Instant::now()));
-        mark(&shared, &mut said).await.unwrap();
+        mark(&shared, &mut said, false).await.unwrap();
         assert_eq!(format(&shared), 4);
+    }
+
+    /// A leader whose own slot is still on trial does not move the store's format: if the slot
+    /// fails before it is marked good the node falls back to a slot that may not read it (T-0222).
+    /// Once the slot is good, it does.
+    #[tokio::test]
+    async fn format_waits_for_a_good_slot() {
+        let (shared, _ca) = leading("format-good-slot", &[]).await;
+        let format = |shared: &Shared| kith_store::format_of(&shared.store.lock().unwrap().store);
+        let before = format(&shared);
+        let mut said = Vec::new();
+        mark(&shared, &mut said, true).await.unwrap();
+        assert_eq!(format(&shared), before, "{said:?}");
+        mark(&shared, &mut said, false).await.unwrap();
+        assert_eq!(format(&shared), before + 1);
+    }
+
+    /// A node on trial answers Raft's calls that it reads only the store's current format, so no
+    /// leader counts it as reading the next; a good one says what this build reads.
+    #[test]
+    fn reads_only_the_current_format_on_trial() {
+        assert_eq!(reads(2, true), 2);
+        assert_eq!(reads(2, false), kith_store::FORMAT);
+        let now = Instant::now();
+        let heard = BTreeMap::from([(2, (reads(2, true), now))]);
+        let members = BTreeSet::from([1, 2]);
+        assert_eq!(not_reading(&heard, &members, 1, now, 3), BTreeSet::from([2]));
     }
 
     /// Under `required` a node's own write that cannot be signed fails at once: written bare, a

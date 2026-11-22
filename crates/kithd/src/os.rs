@@ -298,6 +298,16 @@ pub fn wait(failures: u32) -> std::time::Duration {
 /// Whether the slot this node runs from is marked good: `settle` has found it so, or made it so.
 pub static GOOD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether this node runs from a kith OS slot (set at start, where the command line names one).
+pub static ON_SLOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this node runs from a slot not yet marked good: if it fails before that the node falls
+/// back to its other slot, which may not read a store format this one moves on to (T-0222). False
+/// on any host that is not a kith OS.
+pub fn on_trial() -> bool {
+    ON_SLOT.load(std::sync::atomic::Ordering::Relaxed) && !GOOD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// This node came up from `slot`: mark it good (the boot loader stops counting its
 /// tries), and say what became of a slot that did not come up. What to say is returned.
 /// The count of failed starts is cleared too: this start came up.
