@@ -40,7 +40,12 @@ use tokio_rustls::server::TlsStream;
 
 /// This node as a member of a cluster.
 pub struct Cluster {
+    /// As this node was made or joined. Its certificate is the one it began with: what it shows
+    /// now is `live` (the same key, so every print of it is the same).
     pub me: Identity,
+    /// The certificate this node shows, as a server and as a client: swapped when it is renewed
+    /// (`renew`), with no restart.
+    pub live: Arc<pki::Live>,
     /// Held by the node that can admit others.
     pub ca: Option<pki::Ca>,
     pub tokens: pki::Tokens,
@@ -61,12 +66,12 @@ pub struct Cluster {
 
 type Fallible<T> = Result<T, String>;
 
-fn client(ca: &str, me: Option<&Identity>) -> Fallible<reqwest::Client> {
+fn client(ca: &str, me: Option<Arc<pki::Live>>) -> Fallible<reqwest::Client> {
     client_for(ca, me, None)
 }
 
 /// A client that calls one node as `me`: no other node's certificate is taken at its address.
-pub(crate) fn client_for(ca: &str, me: Option<&Identity>, pin: Option<pki::Held>) -> Fallible<reqwest::Client> {
+pub(crate) fn client_for(ca: &str, me: Option<Arc<pki::Live>>, pin: Option<pki::Held>) -> Fallible<reqwest::Client> {
     let builder = reqwest::Client::builder()
         .use_preconfigured_tls(pki::client_config(ca, me, pin)?)
         .connect_timeout(Duration::from_secs(5))
@@ -76,8 +81,10 @@ pub(crate) fn client_for(ca: &str, me: Option<&Identity>, pin: Option<pki::Held>
 
 impl Cluster {
     pub fn new(me: Identity, ca: Option<pki::Ca>) -> Fallible<Cluster> {
+        let live = pki::Live::new(&me)?;
         Ok(Cluster {
-            client: client(&me.ca, Some(&me))?,
+            client: client(&me.ca, Some(live.clone()))?,
+            live,
             me,
             ca,
             tokens: pki::Tokens::default(),
@@ -117,7 +124,7 @@ impl Cluster {
         {
             return Ok(client.clone());
         }
-        let client = client_for(&self.me.ca, Some(&self.me), Some((who, print.clone())))?;
+        let client = client_for(&self.me.ca, Some(self.live.clone()), Some((who, print.clone())))?;
         made.insert(key, (print, client.clone()));
         Ok(client)
     }
@@ -340,7 +347,7 @@ pub fn listen_on(
                     let certs = stream.get_ref().1.peer_certificates();
                     let subject = certs.and_then(|certs| pki::subject_of(certs.first()?));
                     // Whoever the CA vouches for gives the slot back; a guest keeps it, for a short while.
-                    // ponytail: that includes an Identity or a node since deleted (each request of theirs is refused, the slot is not kept), until certificates expire or are revoked by more than the store.
+                    // (An Identity or a node this node knows to be revoked never got here: `revoked`, in the handshake.)
                     let guest = subject
                         .is_none()
                         .then(|| (slot, Box::pin(tokio::time::sleep(GUEST_TIME))));
@@ -415,8 +422,43 @@ pub fn admitted(shared: &Shared, name: &str, key: &[u8]) -> bool {
     stands(&state.store, name, &pki::key_print(key))
 }
 
+/// Is the certificate `cert` one this node knows to be revoked: a node's whose Node was deleted
+/// (or joined again with another key), an Identity's whose `publicKey` is another now? Asked in
+/// the TLS handshake ([`pki::served`]), so one that is revoked is refused before a request is
+/// read, and not only when its request is checked ([`members_only`], [`crate::access`]). It says
+/// yes only on what this node's store shows: a node that is not caught up yet (it has not heard
+/// of the Node, [`behind`]) or an Identity it has not heard of says no, and the request is
+/// checked as before. A Workload's pod certificate lasts two hours and is checked per request.
+pub fn revoked(shared: &Shared, cert: &rustls::pki_types::CertificateDer<'_>) -> bool {
+    if ADMIT_DELETED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let Some(cluster) = &shared.cluster else {
+        return false;
+    };
+    // (Read before the store, as in `catching_up`.)
+    let applied = applied(shared);
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    let store = &state.store;
+    match pki::subject_of(cert) {
+        Some(pki::Subject::Node(name, key, born)) => match store.get(&node_key(&name)) {
+            None => !behind(store, &cluster.me.name, applied, &name, born),
+            Some(node) => {
+                let named = node.status.as_ref().and_then(|status| status["certificate"].as_str());
+                named.is_some_and(|named| named != pki::key_print(&key))
+            }
+        },
+        Some(pki::Subject::User(name, key)) => store.get(&format!("Identity/{name}")).is_some_and(|identity| {
+            !identity.spec["publicKey"]
+                .as_str()
+                .is_some_and(|pem| pki::same_key(pem, &key))
+        }),
+        _ => false,
+    }
+}
+
 /// [`admitted`], asked of a store, for the key whose print is `print`.
-fn stands(store: &kith_api::store::Store, name: &str, print: &str) -> bool {
+pub(crate) fn stands(store: &kith_api::store::Store, name: &str, print: &str) -> bool {
     let node = store.get(&node_key(name));
     let Some(status) = node.and_then(|node| node.status.as_ref()) else {
         return false;
@@ -761,6 +803,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
         .route("/v1/run-hop", post(api::run::hop))
         .route(POD_HOP, post(crate::pod_exec::hop))
         .route("/v1/raft/stands", get(standing))
+        .route("/v1/renew-certificate", post(crate::renew::issue))
         .route("/v1/clock", get(crate::clock::serve))
         .route("/v1/view", get(crate::view::serve))
         .route("/v1/node-metrics", get(crate::metrics::node))
@@ -1656,10 +1699,11 @@ pub(crate) mod pinned_peer {
 
     /// [`shared_with`] of a cluster already made.
     pub async fn shared_of(tag: &str, cluster: Cluster, nodes: &[Upstream]) -> Arc<Shared> {
-        let dir = std::env::temp_dir().join(format!("kithd-pinned-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::scratch::Scratch::new(&format!("kithd-pinned-{tag}"));
         let shared = crate::replica(Some(cluster), &dir, Duration::from_secs(300)).await;
         let shared = shared.unwrap();
+        // The directory goes when the last hold of the state does.
+        assert!(shared.scratch.set(dir).is_ok());
         for node in nodes {
             let text = format!(
                 "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: {}}}\nspec: {{}}\n",
@@ -2098,7 +2142,7 @@ pub(crate) mod pinned_peer {
         who: &Identity,
         request: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> (u16, String) {
-        let client = client_for(&who.ca, Some(who), None).unwrap();
+        let client = client_for(&who.ca, Some(pki::Live::new(who).unwrap()), None).unwrap();
         let answer = request(&client).send().await.unwrap();
         (answer.status().as_u16(), answer.text().await.unwrap())
     }
@@ -2218,6 +2262,53 @@ pub(crate) mod pinned_peer {
         assert_eq!(asked_now(), 16);
         let (status, _) = send(born("f"), "vote").await;
         assert_eq!((status, asked_now()), (403, 16));
+    }
+
+    /// What the handshake refuses ([`revoked`]): a node whose Node is gone or names another key,
+    /// an Identity whose `publicKey` is another now; and not what this node cannot tell (a node it
+    /// has not caught up to, an Identity it has not heard of) nor what stands.
+    #[tokio::test]
+    async fn revoked_is_what_the_store_shows_gone_or_replaced() {
+        let ca = pki::Ca::create().unwrap();
+        let (alpha, beta, rejoined) = (node(&ca, "alpha"), node(&ca, "beta"), node(&ca, "beta"));
+        let print = |who: &Identity| Some(pki::print_of(&who.cert).unwrap());
+        let nodes = [
+            at("alpha", "127.0.0.1:1", print(&alpha)),
+            at("beta", "127.0.0.1:2", print(&rejoined)),
+        ];
+        let shared = shared_with("revoked", alpha.clone(), &nodes).await;
+        use rustls::pki_types::pem::PemObject;
+        let cert = |pem: &str| rustls::pki_types::CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        // alpha stands; beta joined again with another key, so the first is replaced.
+        assert!(!revoked(&shared, &cert(&alpha.cert)));
+        assert!(!revoked(&shared, &cert(&rejoined.cert)));
+        assert!(revoked(&shared, &cert(&beta.cert)));
+        // A node with no Node: deleted, but one born past what this node has applied is not
+        // known to be (it may be a joiner this node has not heard of yet).
+        let gone = ca.issue("gone").unwrap().0;
+        assert!(revoked(&shared, &cert(&gone)));
+        let joiner = ca.issue_born("joiner", 1_000_000).unwrap().0;
+        assert!(!revoked(&shared, &cert(&joiner)));
+        // An Identity: not heard of, standing, then given another key.
+        let (alice, _, key) = ca.issue_user("alice").unwrap();
+        assert!(!revoked(&shared, &cert(&alice)));
+        let identity = |key: &str| {
+            let spec = serde_json::json!({ "publicKey": key });
+            let text = format!("apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{name: alice}}\nspec: {spec}\n");
+            kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap()
+        };
+        shared.store.lock().unwrap().store.apply(identity(&key)).unwrap();
+        assert!(!revoked(&shared, &cert(&alice)));
+        let other = ca.issue_user("alice").unwrap().2;
+        shared.store.lock().unwrap().store.apply(identity(&other)).unwrap();
+        assert!(revoked(&shared, &cert(&alice)));
+        // A Workload's pod certificate is checked per request, not here.
+        let public = rcgen::PublicKeyData::subject_public_key_info(&rcgen::KeyPair::generate().unwrap());
+        let now = kith_api::store::now();
+        let pod = ca
+            .issue_workload("gateway", ("web", "proxy"), "alpha", &public, now)
+            .unwrap();
+        assert!(!revoked(&shared, &cert(&pod)));
     }
 
     /// The forge route (a leader that appends what it was not asked for, forge.rs) is in a build

@@ -1569,7 +1569,7 @@ spec: {role: peers, subjects: [bob]}
 
     /// The private key is in no store, revision, audit line or file under the data directory
     /// (the raft log, the units' logs, the audit file), in text or as bytes.
-    fn nowhere(shared: &Shared, tag: &str, private: &kith_mesh::Key) {
+    fn nowhere(shared: &Shared, private: &kith_mesh::Key) {
         let needles = [b64(private).into_bytes(), hex(private).into_bytes(), private.to_vec()];
         let mut hay: Vec<Vec<u8>> = Vec::new();
         {
@@ -1580,7 +1580,7 @@ spec: {role: peers, subjects: [bob]}
             }
         }
         hay.push(serde_json::to_vec(&shared.audit.tail(1000).unwrap()).unwrap());
-        let mut dirs = vec![std::env::temp_dir().join(format!("kithd-pinned-{tag}-{}", std::process::id()))];
+        let mut dirs = vec![shared.scratch.get().unwrap().to_path_buf()];
         while let Some(dir) = dirs.pop() {
             for entry in std::fs::read_dir(&dir).unwrap().flatten() {
                 match entry.path() {
@@ -1638,7 +1638,7 @@ spec: {role: peers, subjects: [bob]}
             .iter()
             .find(|line| line["what"].to_string().contains("RemotePeer/phone"));
         assert_eq!(line.expect("an audit line")["verb"], json!("apply"));
-        nowhere(&shared, "peers-route", &private);
+        nowhere(&shared, &private);
     }
 
     /// An Identity with no right to apply RemotePeers gets a 403 (kept by no cache) and nothing
@@ -1701,8 +1701,8 @@ spec: {role: peers, subjects: [bob]}
             assert_eq!(stored.spec["level"], json!("friends"));
         }
         // (The first key is in the history as a public key only: its private half is nowhere.)
-        nowhere(&shared, "peers-route-again", &old);
-        nowhere(&shared, "peers-route-again", &new);
+        nowhere(&shared, &old);
+        nowhere(&shared, &new);
     }
 
     /// Keys come at 5 a minute, with a burst of 5: the sixth is a 429 that no cache keeps, and
