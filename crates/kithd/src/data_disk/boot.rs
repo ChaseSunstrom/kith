@@ -230,6 +230,15 @@ pub fn is_open(name: &str) -> bool {
         .any(|(kept, _)| kept == name)
 }
 
+/// Whether a disk is mounted by this kithd at `at`.
+pub fn is_mounted_at(at: &Path) -> bool {
+    OPEN_NOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(_, kept)| kept == at)
+}
+
 /// The disks this machine could use for data: every one besides the one it runs from (and the one
 /// the state is on), and a stick. What the scan at start and `list` look at.
 pub fn offered(verity: bool, ours: Option<&str>, state_disk: Option<&str>) -> Vec<Disk> {

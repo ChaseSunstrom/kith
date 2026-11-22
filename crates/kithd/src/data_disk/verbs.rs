@@ -22,6 +22,7 @@ use crate::Shared;
 use crate::access::Caller;
 use crate::cluster::refuse;
 use crate::install::Disk;
+use axum::body::Bytes;
 use axum::extract::{Path as Named, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -128,11 +129,14 @@ pub fn add<'a, D: Dev, M: Mapper>(
 /// serial the state kept, among `disks` (this machine's, a stick and the system's own left out by
 /// the caller), and the core's checks follow ([`super::remove`]). Returns the id and the disk. A
 /// disk that is not among `disks` (unplugged, dead) cannot be zeroed, and it is not kept for ever
-/// in the state: its entry and key are forgotten, and no disk comes back (`take` is not called).
+/// in the state: its entry and key are forgotten, and no disk comes back (`take` is not called),
+/// unless `mounted` says kithd has the disk's data mounted at the path it is asked about: a disk
+/// mounted but not among `disks` is not taken for gone, and its key is not forgotten under a mount.
 pub fn remove<'a, D: Dev, M: Mapper>(
     state: &Path,
     disks: &'a [Disk],
     id: &str,
+    mounted: impl Fn(&Path) -> bool,
     take: impl FnOnce(&Disk, &Id) -> Result<(D, M), String>,
 ) -> Result<(Id, Option<&'a Disk>), String> {
     let id = hex_id(id).ok_or("a disk's id is 32 lower-case hex digits: kith node disk list shows them")?;
@@ -140,6 +144,9 @@ pub fn remove<'a, D: Dev, M: Mapper>(
     let found = || disks.iter().filter(|disk| disk.serial == entry.serial);
     let disk = match (found().next(), found().nth(1)) {
         (Some(disk), None) => disk,
+        (None, _) if mounted(&dir_of(state, &id).join("data")) => {
+            return Err("this node has that disk mounted, but the machine does not show it among its disks: it is not taken for gone, and its key is kept. Restart the node, then remove it again".into());
+        }
         (None, _) => {
             // (A disk unplugged while mounted leaves its mount point busy: that stops the forget
             // before any key is erased, and the next start, with no mount, lets a second remove end it.)
@@ -278,8 +285,7 @@ impl Added {
 
 /// The add on this machine: what [`add`] does, then the mapping the add left is let go of and the
 /// disk opened the way the start opens it (its key from the state, mounted at `disks/<id>/data`).
-fn real_add(state: &Path, given: &Given) -> Result<Added, String> {
-    let _one = one()?;
+fn real_add(state: &Path, given: &Given, _turn: Turn) -> Result<Added, String> {
     let machine = Machine::find();
     let disks = machine.all();
     let (id, disk, mut mapper) = add(
@@ -324,11 +330,10 @@ fn open_now(state: &Path, id: &Id, disk: &Disk, mapper: &mut Real) -> Result<(),
 
 /// The remove on this machine: [`remove`], with the mount let go of first, then forgotten here.
 /// The answer is the id and whether the disk was not there (only its entry and key were forgotten).
-fn real_remove(state: &Path, id: &str) -> Result<(Id, bool), String> {
-    let _one = one()?;
+fn real_remove(state: &Path, id: &str, _turn: Turn) -> Result<(Id, bool), String> {
     let machine = Machine::find();
     let disks = machine.offered();
-    let (id, disk) = remove(state, &disks, id, |disk, id| {
+    let (id, disk) = remove(state, &disks, id, boot::is_mounted_at, |disk, id| {
         real(disk, Some(dir_of(state, id).join("data")))
     })?;
     if let Some(disk) = disk {
@@ -403,17 +408,36 @@ pub async fn add_one(
     State(shared): State<Arc<Shared>>,
     Extension(caller): Extension<Caller>,
     Named(node): Named<String>,
-    Json(given): Json<Given>,
+    body: Bytes,
 ) -> Response {
     let state = match gate(&shared, &caller, &node, (Verb::Apply, "disk add")) {
         Ok(state) => state,
         Err(refused) => return refused,
     };
+    // (The body is read after the gate: someone with no right is told so, whatever they sent.)
+    let given: Given = match serde_json::from_slice(&body) {
+        Ok(given) => given,
+        Err(e) => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                format!("the body is {{\"serial\": \"...\", \"wipe\": false, \"quick\": false}}: {e}"),
+            )
+            .into_response();
+        }
+    };
+    let flags = (given.wipe, given.quick);
+    let serial = given.serial.clone();
+    // (The turn is taken before anything is written: a verb that is told to wait leaves no "started".)
+    let turn = match one() {
+        Ok(turn) => turn,
+        Err(why) => {
+            audit::add(&shared.audit, &caller, &serial, flags, Err(why.clone()));
+            return refuse(StatusCode::CONFLICT, why).into_response();
+        }
+    };
     let task = tokio::spawn(async move {
-        let flags = (given.wipe, given.quick);
-        let serial = given.serial.clone();
         audit::adding(&shared.audit, &caller, &serial, flags);
-        let done = tokio::task::spawn_blocking(move || real_add(&state, &given))
+        let done = tokio::task::spawn_blocking(move || real_add(&state, &given, turn))
             .await
             .unwrap_or_else(|e| Err(format!("the add stopped: {e}")));
         audit::add(
@@ -442,11 +466,18 @@ pub async fn remove_one(
         Ok(state) => state,
         Err(refused) => return refused,
     };
+    let typed = id.clone();
+    let serial = serial_of(&state, &typed);
+    let turn = match one() {
+        Ok(turn) => turn,
+        Err(why) => {
+            audit::remove(&shared.audit, &caller, &typed, serial.as_deref(), Err(why.clone()));
+            return refuse(StatusCode::CONFLICT, why).into_response();
+        }
+    };
     let task = tokio::spawn(async move {
-        let typed = id.clone();
-        let serial = serial_of(&state, &typed);
         audit::removing(&shared.audit, &caller, &typed, serial.as_deref());
-        let done = tokio::task::spawn_blocking(move || real_remove(&state, &id))
+        let done = tokio::task::spawn_blocking(move || real_remove(&state, &id, turn))
             .await
             .unwrap_or_else(|e| Err(format!("the remove stopped: {e}")));
         audit::remove(
@@ -539,7 +570,7 @@ mod tests {
         assert_eq!(shown["known"][0]["state"], "mounted");
         assert_eq!(shown["unknown"], json!([]));
 
-        let (gone, at) = remove(&state, &disks, &crate::pki::hex(&id), |_, _| Ok(again(&file))).unwrap();
+        let (gone, at) = remove(&state, &disks, &crate::pki::hex(&id), |_| false, |_, _| Ok(again(&file))).unwrap();
         assert_eq!((gone, at.unwrap().name.as_str()), (id, "sdb"));
         assert!(room(&file).iter().all(|&byte| byte == 0), "its header is zeroed");
         assert!(ids(&state).is_empty(), "its key and entry are forgotten");
@@ -714,7 +745,7 @@ mod tests {
         .0;
         let hex = crate::pki::hex(&id);
         let refused = |disks: &[Disk], typed: &str, fail: Option<&'static str>| {
-            remove(&state, disks, typed, |_, _| {
+            remove(&state, disks, typed, |_| false, |_, _| {
                 let (disk, mut map) = again(&file);
                 map.fail = fail;
                 Ok((disk, map))
@@ -742,12 +773,67 @@ mod tests {
         .unwrap()
         .0;
         let took = |_: &Disk, _: &Id| -> Result<(Fake, Map), String> { panic!("a disk that is not there was taken") };
-        let (gone, at) = remove(&state, &disks[..1], &crate::pki::hex(&id), took).unwrap();
+        // (Mounted by this kithd, though the machine does not show it: not gone, nothing forgotten.)
+        let why = remove(&state, &disks[..1], &crate::pki::hex(&id), |_| true, took).unwrap_err();
+        assert!(why.contains("key is kept"), "{why}");
+        assert_eq!(ids(&state), vec![crate::pki::hex(&id)], "a disk kithd has mounted keeps its entry and key");
+        let (gone, at) = remove(&state, &disks[..1], &crate::pki::hex(&id), |_| false, took).unwrap();
         assert_eq!((gone, at.is_none()), (id, true));
         assert!(ids(&state).is_empty(), "its key and entry are forgotten");
         // (A second remove finds nothing: it is done.)
-        let again_ = remove(&state, &disks[..1], &crate::pki::hex(&id), took).unwrap_err();
+        let again_ = remove(&state, &disks[..1], &crate::pki::hex(&id), |_| false, took).unwrap_err();
         assert!(again_.contains("no such disk"), "{again_}");
+    }
+
+    /// The mount point `is_mounted_at` is asked about is the one `keep` was given.
+    #[test]
+    fn a_mount_kept_is_found_by_its_path() {
+        let at = Path::new("/var/lib/kith/disks/aa/data");
+        assert!(!boot::is_mounted_at(at));
+        boot::keep("sdzz", at);
+        assert!(boot::is_mounted_at(at) && !boot::is_mounted_at(Path::new("/var/lib/kith/disks/bb/data")));
+        boot::forget_open("sdzz");
+        assert!(!boot::is_mounted_at(at));
+    }
+
+    /// A node with no cluster, through the handlers (`gate` and all): the local socket's admin is
+    /// let through to the machine (here, refused only as a kithd that is not init), with no cluster
+    /// to ask; someone with no right is refused 403 whatever body they send, and a good body is not
+    /// read before that.
+    #[tokio::test]
+    async fn the_handlers_of_a_node_with_no_cluster_let_its_admin_in_and_nobody_else() {
+        let dir = std::env::temp_dir().join(format!("kithd-disk-verbs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert!(shared.cluster.is_none());
+        let said = |answer: Response| async move {
+            let status = answer.status();
+            let body = axum::body::to_bytes(answer.into_body(), 1 << 16).await.unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+        let admin = || Extension(Caller::Admin);
+        let nobody = || Extension(Caller::Identity("nobody".into()));
+        let body = || Bytes::from_static(br#"{"serial":"S1"}"#);
+        let state = State(shared.clone());
+        let me = || Named("n1".to_string());
+        for (what, (status, text)) in [
+            ("add", said(add_one(state.clone(), admin(), me(), body()).await).await),
+            ("remove", said(remove_one(state.clone(), admin(), Named(("n1".into(), "ab".into()))).await).await),
+            ("list", said(list_all(state.clone(), admin(), me()).await).await),
+        ] {
+            assert_eq!(status, StatusCode::CONFLICT, "{what}: {text}");
+            assert!(text.contains("running as the machine's init"), "{what}: {text}");
+        }
+        for (what, (status, _)) in [
+            ("add, a body that is no JSON", said(add_one(state.clone(), nobody(), me(), Bytes::from_static(b"{")).await).await),
+            ("add", said(add_one(state.clone(), nobody(), me(), body()).await).await),
+            ("remove", said(remove_one(state.clone(), nobody(), Named(("n1".into(), "ab".into()))).await).await),
+            ("list", said(list_all(state.clone(), nobody(), me()).await).await),
+        ] {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{what}");
+        }
     }
 
     /// A disk this node has added, added again: told so before the disk is touched (taken it
