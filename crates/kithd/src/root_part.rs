@@ -4869,15 +4869,15 @@ mod tests {
         let root = Direct::with(Nobody, &book);
         over_socket(&root, &Limits::default(), |mut socket| {
             socket.deadline = Duration::from_millis(600);
-            socket.floor = Duration::from_millis(400);
-            // The call in flight ends at 300 ms: 300 ms are left of 600, less than the floor.
+            socket.floor = Duration::from_millis(300);
+            // The call in flight ends at 500 ms: about 100 ms are left of 600, well under the floor.
             let why = std::thread::scope(|s| {
                 let (taken, wait) = std::sync::mpsc::channel();
                 let held = &socket;
                 s.spawn(move || {
                     let _held = held.stuck();
                     taken.send(()).unwrap();
-                    std::thread::sleep(Duration::from_millis(300));
+                    std::thread::sleep(Duration::from_millis(500));
                 });
                 wait.recv().unwrap();
                 socket.request(ask("127.0.0.1", 0, Proto::Tcp)).unwrap_err()

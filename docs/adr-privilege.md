@@ -286,7 +286,7 @@ the serving part makes (non-blocking, close-on-exec, bytes waiting, `TCGETS` and
 `EPERM`: the list is read off the code and the VM run, and widened by a line when a run shows one
 (`msync`, `fadvise64`, `signalfd4`, `rt_sigtimedwait`, `epoll_pwait2` and `getcpu` are in it because a
 real serving part, a tokio server over a store file, makes them; `execve` is not, and `fork` and
-`vfork` are, as the allow-list this one is made from has them: a child keeps the filter, the
+`vfork` are on x86_64 (aarch64 has neither syscall), as the allow-list this one is made from has them: a child keeps the filter, the
 empty capability sets and the mount namespace, and it can run no program, so it is no more than a
 thread that is a process).
 `Plan::filter` off leaves the filter out and nothing else (the filter is the

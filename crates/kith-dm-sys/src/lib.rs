@@ -2193,6 +2193,7 @@ mod tests {
         }
         // Nothing in the serving part's root can run, so nothing is made to run.
         assert_eq!(ours(libc::SYS_execve, [0; 2]), refused(libc::EPERM));
+        assert_eq!(ours(libc::SYS_execveat, [0; 2]), refused(libc::EPERM));
     }
 
     extern "C" fn nothing(_: libc::c_int) {}
