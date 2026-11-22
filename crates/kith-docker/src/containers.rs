@@ -274,9 +274,14 @@ impl Containers {
             // (A finished Job runs again: its status goes with it, so it is taken away first.)
             // (A kept status cannot be cleared by an apply, so delete comes first: if the new Job
             // is refused, the container goes back as a stopped one rather than being lost.)
+            // The parked Workload must be ours to write, so that is checked before anything goes.
+            let parked_key = key("Workload", &name);
+            self.not_foreign(&parked_key)?;
             self.store.delete(&key("Job", &name)).map_err(store_failed)?;
             if let Err(e) = self.put(doc.clone()) {
-                let _ = self.put(parked(&doc));
+                if self.not_foreign(&parked_key).is_ok() {
+                    let _ = self.put(parked(&doc));
+                }
                 return Err(store_failed(e));
             }
         } else if is_job(annotation(&doc, ANN_RESTART)) {
@@ -312,18 +317,25 @@ impl Containers {
         Ok(true)
     }
 
+    /// 409 when a resource that is not this front's is at `key`; absent or ours is fine. Every write
+    /// that may land on a key the caller did not just read goes through this.
+    fn not_foreign(&self, key: &str) -> Result<(), Reply> {
+        if self.get(key)?.is_some_and(|there| ours(&there).is_none()) {
+            return Err(message(
+                409,
+                format!("Conflict. {key} is not a container of this front: it is left as it is"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Make `new` (a container of the other kind than the one at `old_kind`) and then take the old
     /// one away, so a failure in between leaves a container, not none. A resource at the new key that
     /// is not this front's is never written over (409).
     fn convert(&self, old_kind: &str, new: Value) -> Result<(), Reply> {
         let name = name_of(&new).to_string();
         let new_key = key(new["kind"].as_str().unwrap_or(""), &name);
-        if self.get(&new_key)?.is_some_and(|there| ours(&there).is_none()) {
-            return Err(message(
-                409,
-                format!("Conflict. {new_key} is not a container of this front: it is left as it is"),
-            ));
-        }
+        self.not_foreign(&new_key)?;
         self.put(new).map_err(store_failed)?;
         if let Err(e) = self.store.delete(&key(old_kind, &name)) {
             let _ = self.store.delete(&new_key);
@@ -1164,6 +1176,51 @@ mod tests {
             call(&c, "GET", "/containers/once/json", "").1["State"]["Status"],
             "exited",
             "the container is kept"
+        );
+    }
+
+    #[test]
+    fn a_foreign_workload_survives_a_failing_job_restart_untouched() {
+        struct Refusing(MemStore);
+        impl Store for Refusing {
+            fn get(&self, key: &str) -> Result<Option<Value>, String> {
+                self.0.get(key)
+            }
+            fn list(&self, kind: &str, namespace: &str) -> Result<Vec<Value>, String> {
+                self.0.list(kind, namespace)
+            }
+            fn apply(&self, doc: Value) -> Result<(), String> {
+                if doc["kind"] == "Job" {
+                    return Err("refused".into());
+                }
+                self.0.apply(doc)
+            }
+            fn delete(&self, key: &str) -> Result<(), String> {
+                self.0.delete(key)
+            }
+        }
+        let mem = MemStore::default();
+        let c = Containers::new(Box::new(Refusing(mem.clone())));
+        let job = json!({"apiVersion": "kith.dev/v1", "kind": "Job",
+            "metadata": {"name": "once", "namespace": "docker", "labels": {LABEL: "once"}},
+            "spec": {"template": {"containers": [{"name": "once", "image": "alpine"}], "restartPolicy": "never"}},
+            "status": {"state": "succeeded", "containers": [{"name": "once", "exitCode": 0}]}});
+        mem.apply(job.clone()).unwrap();
+        let theirs = json!({"apiVersion": "kith.dev/v1", "kind": "Workload",
+            "metadata": {"name": "once", "namespace": "docker"},
+            "spec": {"template": {"containers": [{"name": "once", "image": "nginx"}]}}});
+        mem.apply(theirs.clone()).unwrap();
+        let (status, reply) = call(&c, "POST", "/containers/once/start", "");
+        assert_eq!(status, 409, "{reply}");
+        assert_eq!(
+            mem.get("Workload/docker/once").unwrap(),
+            Some(theirs),
+            "their Workload is as it was"
+        );
+        assert_eq!(
+            mem.get("Job/docker/once").unwrap(),
+            Some(job),
+            "the store was left alone"
         );
     }
 
