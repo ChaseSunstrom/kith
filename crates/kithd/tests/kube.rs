@@ -955,18 +955,21 @@ fn workflows_helm_test_runs_the_chart_test_pod_and_delete_pod_deletes_it() {
     }
 }
 
-/// The Deployment `web` of one replica whose image is `kith.test/box:1`, made and applied. Its
-/// container is `box`: a unit's id holds it, and the containers of the tests that run at once
-/// (each in a kithd of its own, in one cgroup tree) must not share an id, or one's delete ends the other's.
-fn apply_box(cluster: &Cluster) {
+/// A Deployment of one replica whose image is `kith.test/box:1`, made and applied; its run-unique name is returned
+/// (its pod is NAME-0). A unit's id holds the name, and the containers of the tests that run at once (each in a kithd
+/// of its own, in one cgroup tree) must not share an id, or one's delete ends the other's.
+fn apply_box(cluster: &Cluster) -> String {
     cluster.fill_box();
+    let name = unique("web");
     let web = WEB
+        .replace("  name: web\n", &format!("  name: {name}\n"))
         .replace("- name: web\n", "- name: box\n")
         .replace("mirror.gcr.io/library/busybox:1.36", "kith.test/box:1")
         .replace("replicas: 2", "replicas: 1")
         .replace("[sleep,", "[/bin/sleep,");
     cluster.write("box.yaml", &web);
     cluster.ok(&["apply", "-f", "box.yaml"]);
+    name
 }
 
 /// `kubectl exec` and `kubectl cp` (a tar run by exec, both ways) run in the replica's own mount and
@@ -981,47 +984,44 @@ fn workflows_kubectl_exec_and_cp_run_in_the_replica() {
     let may = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: execer }\nspec:\n  rules:\n    - kinds: [Workload]\n      verbs: [exec]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: alice-execer }\nspec:\n  role: execer\n  subjects: [alice]\n";
     cluster.write("execer.yaml", may);
     cluster.kith(&["apply", "-f", "execer.yaml"]);
-    apply_box(&cluster);
+    let web = apply_box(&cluster);
+    let web0 = format!("{web}-0");
     // The replica is up when a process can be run in it (a unit starts a moment after its pod is listed).
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        let (ok, _, err) = cluster.kubectl(&["exec", "web-0", "--", "sh", "-c", ":"]);
+        let (ok, _, err) = cluster.kubectl(&["exec", &web0, "--", "sh", "-c", ":"]);
         if ok {
             break;
         }
-        let status = cluster.kith(&["get", "workload/web", "-o", "json"]);
+        let status = cluster.kith(&["get", &format!("workload/{web}"), "-o", "json"]);
         if status.contains("cgroup error") {
             eprintln!("::warning title=SKIP::SKIP (not a pass): this host's cgroup takes no container");
             return;
         }
-        assert!(Instant::now() < deadline, "web-0 never took a process: {err}\n{status}");
+        assert!(
+            Instant::now() < deadline,
+            "{web0} never took a process: {err}\n{status}"
+        );
         std::thread::sleep(Duration::from_millis(250));
     }
     // In the container's pid namespace, its init is pid 1 and the shell has a small pid; its files are the image's.
     says(
-        &cluster.ok(&["exec", "web-0", "--", "cat", "/proc/1/cmdline"]),
+        &cluster.ok(&["exec", &web0, "--", "cat", "/proc/1/cmdline"]),
         &["/bin/sleep"],
     );
-    let pid = cluster.ok(&["exec", "web-0", "--", "sh", "-c", "echo $$"]);
+    let pid = cluster.ok(&["exec", &web0, "--", "sh", "-c", "echo $$"]);
     assert!(pid.trim().parse::<u32>().unwrap() < 1000, "{pid}");
     // (The host has /home, and the image does not.)
-    cluster.refused(&["exec", "web-0", "--", "sh", "-c", "test -e /home"], &["exit code 1"]);
+    cluster.refused(&["exec", &web0, "--", "sh", "-c", "test -e /home"], &["exit code 1"]);
     // stdout and stderr each on their channel, and the exit status.
-    let (ok, out, err) = cluster.kubectl(&[
-        "exec",
-        "web-0",
-        "--",
-        "sh",
-        "-c",
-        "echo to-out; echo to-err >&2; exit 3",
-    ]);
+    let (ok, out, err) = cluster.kubectl(&["exec", &web0, "--", "sh", "-c", "echo to-out; echo to-err >&2; exit 3"]);
     assert!(!ok && out == "to-out\n", "{ok} {out:?} {err}");
     says(&err, &["to-err", "exit code 3"]);
     // stdin, to its end, and more of it than one frame holds.
-    let (ok, out, err) = cluster.kubectl_in(&["exec", "-i", "web-0", "--", "cat"], b"hello\n");
+    let (ok, out, err) = cluster.kubectl_in(&["exec", "-i", &web0, "--", "cat"], b"hello\n");
     assert!(ok && out == b"hello\n", "{ok} {out:?} {err}");
     let big: Vec<u8> = (0..3u32 << 20).map(|n| (n % 251) as u8).collect();
-    let (ok, out, err) = cluster.kubectl_in(&["exec", "-i", "web-0", "--", "cat"], &big);
+    let (ok, out, err) = cluster.kubectl_in(&["exec", "-i", &web0, "--", "cat"], &big);
     assert!(
         ok && out == big,
         "{ok} {} bytes back of {}: {err}",
@@ -1030,16 +1030,16 @@ fn workflows_kubectl_exec_and_cp_run_in_the_replica() {
     );
     // cp up, then down.
     cluster.write("up.txt", "uploaded\n");
-    cluster.ok(&["cp", "up.txt", "web-0:/tmp/up.txt"]);
-    assert_eq!(cluster.ok(&["exec", "web-0", "--", "cat", "/tmp/up.txt"]), "uploaded\n");
-    cluster.ok(&["cp", "web-0:/tmp/up.txt", "down.txt"]);
+    cluster.ok(&["cp", "up.txt", &format!("{web0}:/tmp/up.txt")]);
+    assert_eq!(cluster.ok(&["exec", &web0, "--", "cat", "/tmp/up.txt"]), "uploaded\n");
+    cluster.ok(&["cp", &format!("{web0}:/tmp/up.txt"), "down.txt"]);
     assert_eq!(
         std::fs::read_to_string(cluster.dir.join("down.txt")).unwrap(),
         "uploaded\n"
     );
     // A program the image lacks is an error, and attach and a TTY are refused by name.
-    cluster.refused(&["exec", "web-0", "--", "nothing-here"], &[]);
-    cluster.refused(&["attach", "web-0"], &["attach to the main process is not carried"]);
+    cluster.refused(&["exec", &web0, "--", "nothing-here"], &[]);
+    cluster.refused(&["attach", &web0], &["attach to the main process is not carried"]);
 }
 
 #[test]
@@ -1810,15 +1810,16 @@ fn access_kubectl_exec_and_cp_are_refused_without_the_right_to_exec() {
     let roles = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: reader }\nspec:\n  rules:\n    - kinds: [Workload]\n      verbs: [get, list, watch]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob-reader }\nspec:\n  role: reader\n  subjects: [bob]\n";
     cluster.write("roles.yaml", roles);
     cluster.kith(&["apply", "-f", "roles.yaml"]);
-    apply_box(&cluster);
-    eventually("web-0 is a pod", 30, || cluster.kubectl(&["get", "pod", "web-0"]).0);
+    let web = apply_box(&cluster);
+    let web0 = format!("{web}-0");
+    eventually("the pod is made", 30, || cluster.kubectl(&["get", "pod", &web0]).0);
     let bob = cluster.as_("bob");
-    assert!(bob.kubectl(&["get", "pod", "web-0"]).0, "bob may get it");
+    assert!(bob.kubectl(&["get", "pod", &web0]).0, "bob may get it");
     cluster.write("up.txt", "uploaded\n");
     for args in [
-        &["exec", "web-0", "--", "true"][..],
-        &["cp", "up.txt", "web-0:/tmp/up.txt"],
-        &["cp", "web-0:/tmp/up.txt", "down.txt"],
+        &["exec", &web0, "--", "true"][..],
+        &["cp", "up.txt", &format!("{web0}:/tmp/up.txt")],
+        &["cp", &format!("{web0}:/tmp/up.txt"), "down.txt"],
     ] {
         let (ok, _, err) = bob.kubectl(args);
         assert!(!ok && err.contains("bob may not exec Workload"), "{args:?}: {ok} {err}");
@@ -1827,7 +1828,7 @@ fn access_kubectl_exec_and_cp_are_refused_without_the_right_to_exec() {
     let audit = cluster.kith(&["audit"]);
     let refused = audit
         .lines()
-        .filter(|line| line.contains("pod default/web-0") && line.split_whitespace().nth(1) == Some("bob"))
+        .filter(|line| line.contains(&format!("pod default/{web0}")) && line.split_whitespace().nth(1) == Some("bob"))
         .filter(|line| !line.ends_with(" ok"))
         .count();
     assert!(refused >= 1, "bob's refusals are in the audit log: {audit}");
@@ -1926,7 +1927,7 @@ fn access_an_upgrade_that_carries_an_origin_is_refused() {
 /// node (here this node's own certificate), and an Identity is refused (403) at both, for the hop is the cluster's nodes'.
 #[test]
 fn access_one_hop_route_for_a_pod_and_no_identity_uses_it() {
-    let cluster = with_team("kube-one-hop");
+    let (cluster, _web) = with_team("kube-one-hop");
     for who in ["bob", "carol"] {
         for path in ["/v1/exec-hop", "/v1/pod-hop"] {
             assert_eq!(cluster.reply(who, "POST", path, &[], None), "403", "{who} {path}");
