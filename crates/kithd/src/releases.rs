@@ -1547,8 +1547,15 @@ mod tests {
     #[test]
     fn a_step_making_any_kind_a_node_never_signs_proposes_nothing_and_says_so_once() {
         let kinds = [
-            "Role", "RoleBinding", "Identity", "KindDefinition", "Cluster", "AccessLevel", "RemotePeer",
-            "NetworkPolicy", "Exit",
+            "Role",
+            "RoleBinding",
+            "Identity",
+            "KindDefinition",
+            "Cluster",
+            "AccessLevel",
+            "RemotePeer",
+            "NetworkPolicy",
+            "Exit",
         ];
         for kind in kinds {
             // (A store for each kind: the status a refusal leaves must not hide the next one's.)
@@ -1577,18 +1584,27 @@ mod tests {
             };
             let mut made = make();
             assert!(refuse_access(&store, &mut made), "{kind}: a step making one is refused");
-            assert!(made.apply.is_empty() && made.delete.is_empty(), "{kind}: nothing proposed");
+            assert!(
+                made.apply.is_empty() && made.delete.is_empty(),
+                "{kind}: nothing proposed"
+            );
             let mut pruned = Step {
                 apply: Vec::new(),
                 delete: vec![format!("{kind}/x")],
                 ..make()
             };
-            assert!(refuse_access(&store, &mut pruned), "{kind}: a step pruning one is refused");
+            assert!(
+                refuse_access(&store, &mut pruned),
+                "{kind}: a step pruning one is refused"
+            );
             assert!(pruned.delete.is_empty(), "{kind}: no delete proposed");
             let status = made.status.clone().expect("says why");
             assert_eq!(status["state"], "error", "{kind}");
             let message = status["message"].as_str().unwrap();
-            assert!(message.contains(&format!(" {kind},")), "{kind}: the status names it: {message}");
+            assert!(
+                message.contains(&format!(" {kind},")),
+                "{kind}: the status names it: {message}"
+            );
             kith_store::run(
                 &mut store,
                 kith_store::Command::Patch {
