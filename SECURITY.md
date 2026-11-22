@@ -312,8 +312,8 @@ Only the newest version is fixed. There are no security releases of older ones.
   is held so two asks cannot both get a key. A level is held on the node by an nftables
   table, `inet kith-people`, written whole in one batch and judged on every packet both
   ways, with no accept on a connection's state alone: a level narrowed or a peer deleted is
-  cut within about 10 seconds (every store change wakes it), the connections open
-  included, which are flushed by the peer's mark. A peer's allowed addresses on the device
+  cut within 5 seconds (every store change wakes it at once; a rule undone by hand is put
+  back within 10), the connections open included, which are flushed by the peer's mark. A peer's allowed addresses on the device
   are its own /32 and /128, so WireGuard drops a packet sent as another's, and a people
   address that comes in by another link is dropped before any rule. A peer cannot reach the
   mesh, another peer, or the node's own ports (kithd's API only with `api`, its `--dns`,
@@ -762,7 +762,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   of the bounds ran in virtual machines on a kernel's own WireGuard (`sh ci/vm.sh --test
   access`: two phones, a Service reached and one not, a level narrowed, an Exit's level
   left by it, an Exit deleted and a peer removed with a connection open, each cut within
-  seconds); none ran with a real phone, a real router or the app, and not the IPv6 peer.
+  5 seconds, the Services reached over the phones' IPv6 addresses); none ran with a real
+  phone, a real router or the app, and not an IPv6 range a level names.
 - **A NetworkPolicy's egress rules hold a pod's packets, on kith OS as root and for pod Workloads
   and Jobs only.** The pods of the Workloads and Jobs a policy selects, an exit's pod included,
   pass only what a rule allows, DNS included. Each pod is matched per pod link: its rules are the

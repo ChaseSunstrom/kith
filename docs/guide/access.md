@@ -242,7 +242,7 @@ What bounds a peer is on the node that ends its tunnel, in the kernel's own tabl
   resolver, the internet or the Exit. Not the mesh, not another peer, not the node's own ports
   (the API's only with `api`), not a Service of another level.
 - Its address is its own: WireGuard drops a packet whose source is another's.
-- **A level narrowed, or a peer deleted, holds within seconds**, a connection it has open
+- **A level narrowed, or a peer deleted, holds within 5 seconds**, a connection it has open
   included: no rule lets a reply through on the strength of the connection alone.
 - Past the node, a peer is that node: a host or a NetworkPolicy sees the node's address.
 - A peer holds 8 of the Service proxy's places and 2 of 16 API handshakes; keys kithd makes are

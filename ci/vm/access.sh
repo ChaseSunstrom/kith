@@ -241,7 +241,7 @@ sys.exit(0 if any(r["kind"] == "Node" and r["metadata"]["name"] == "n1" and ((r.
             # A phone: its LAN address (N), then its link as its configuration makes it (what
             # the WireGuard app does), then what it watches: NAME HOST PORT each.
             phone() { # N NAME PEER WATCH...
-                n=$1 name=$2 peer=$3
+                local n=$1 name=$2 peer=$3
                 shift 3
                 cp -a "$work/vmroot" "$work/$name"
                 python3 -I - "$work/$peer.conf" "$work/$name" "$n" "$@" <<'PY'

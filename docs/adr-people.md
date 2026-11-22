@@ -154,8 +154,9 @@ each matching an exit pod's link or a tunnel's own address, so none meets a peer
 | 9011 | IPv4 | in by `kwg0`, from a peer of a level with `internet: true` | main |
 | 9012 | both | in by `kwg0` | unreachable |
 
-**A narrowed level or a removed peer holds within seconds, open connections too.** The loop
-wakes on every store change (as `exits.rs`'s `run`, on the generation) and every 10 s. Every
+**A narrowed level or a removed peer holds within 5 seconds, open connections too.** The loop
+wakes at once on every store change (as `exits.rs`'s `run`, on the generation) and every 10 s
+besides, which only puts back what was undone by hand. Every
 packet, both ways, is checked against the level as it is now; connection state only tells a
 reply from a request, never lets one through alone. Flushed: the connections carrying the
 peer's mark (`0x6b79` and 16 bits of the peer), by `exit.rs`'s `forget` with the mark as an
@@ -303,10 +304,10 @@ is "anyone who reaches a node's port" (SECURITY.md).
 
 | Threat | What holds | What does not |
 |---|---|---|
-| A stolen unlocked phone | What its level reaches, no more; deleting the peer holds within seconds, open connections too | Until deleted it is the peer: the app asks no unlock to turn on, and kith has no expiry |
+| A stolen unlocked phone | What its level reaches, no more; deleting the peer holds within 5 seconds, open connections too | Until deleted it is the peer: the app asks no unlock to turn on, and kith has no expiry |
 | A guest screenshots or re-shares the QR | The copy reaches only the guest's level, and one delete ends both; two devices on one key take turns (the last handshake wins), which shows in the handshake age | kith cannot tell a copy from the phone; a photo in a cloud backup is a copy |
 | A peer sets another's address | WireGuard drops it (allowed addresses per key); the table jumps by source after that; a people source in by any other link is dropped in `pre` | Nothing known |
-| A peer floods | It reaches only its level; the Service proxy holds each peer to 8 of 4096 places by its own address (`services.rs`, `People`, built in slice E2b), and the API's handshakes have 16 slots for the people, 8 to a peer, apart from the mesh's 64 | No rate in the table: a peer can fill the uplink |
+| A peer floods | It reaches only its level; the Service proxy holds each peer to 8 of 4096 places by its own address (`services.rs`, `People`, built in slice E2b), and the API's handshakes have 16 slots for the people, 2 to a peer, apart from the mesh's 64 | No rate in the table: a peer can fill the uplink |
 | The node that ends tunnels is taken | Peers' private keys are not there; the API still asks peers for certificates | Beyond what it has today (a control node is the cluster, a worker what its view holds): the people key, so it can be the server to every phone; peers' traffic in clear where not TLS; any rule. Choose a node you trust with your phones' traffic |
 | Whoever may write a level widens their own | Cluster-scoped kinds: only a Role with no namespace grants them; every write is audited by Identity and decided again where the log is kept | Roles go by kind, not name: who may write one level or peer may write all, and put any peer at admin |
 | An Exit provider sees traffic | Only the internet traffic of levels that name it, as the tunnel's address; not the LAN, not the phones' addresses | Destinations and whatever is not TLS. Names asked of the home's filter leave by its upstream instead |
@@ -544,7 +545,7 @@ A level that names an `exit` leaves by that Exit, on the node that holds it:
   of each rule, and a rule counts as held only with the table wanted. A pass takes away a rule
   9011 whose table is not the wanted one before it makes the right one (a peer never has two, and
   between them falls to 9012), and the steps say `rule 9011 + ADDRESS to table 0x6b780007`. An
-  Exit that goes (or stops listing the level) loses the rule within 10 s: the peer is held, with
+  Exit that goes (or stops listing the level) loses the rule within 5 s: the peer is held, with
   no internet.
 - `inet kith-pods`, with its guard (policy drop), passes what comes in by `kwg0` and what goes
   out by it, by the whole name; the people table's own chains still decide what a peer may
@@ -610,8 +611,8 @@ test reads those from the console.
 | the Exit deleted | phone-b's connections to the provider stop |
 | the RemotePeer phone-a deleted | its open connection and new ones stop |
 
-Not driven, and said: IPv6 people (the IPv6 half of a configuration is set on the phone and not
-exercised), a real phone, the stock app, a real router, UDP, the forged-source, resolver and "no
+Not driven, and said: an IPv6 range a level names, two IPv6 peers of one /64 (the phones' IPv6
+/128 is driven: the Services' addresses are IPv6, so every case above passes over it), a real phone, the stock app, a real router, UDP, the forged-source, resolver and "no
 new way in" cases of the table under "Tests" (those that need a second LAN machine or a capture:
 the unit tests and `kith-mesh`'s namespace tests hold them). The "Tests" plan above is the
 design; this is what was built.

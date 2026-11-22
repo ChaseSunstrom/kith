@@ -151,7 +151,7 @@ You say what should exist, in files. `kithd` makes each node match:
   what runs on one node reaches what runs on another.
 - Started also with `--people`, a node ends WireGuard tunnels for people's phones and laptops
   (`kith peer add`, with the stock app): each device gets an AccessLevel's Services, ranges,
-  resolver and internet (or an Exit's), held on that node by the kernel and cut within seconds
+  resolver and internet (or an Exit's), held on that node by the kernel and cut within 5 seconds
   when the level narrows or the peer goes. It is not on the mesh and holds nothing else;
   [what it does not hold](SECURITY.md) is stated.
 
