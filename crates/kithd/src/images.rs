@@ -199,7 +199,7 @@ async fn forget(shared: &Shared, job: &Job, kept: &Value) {
             let made = state
                 .store
                 .get(&key)
-                .is_some_and(|blob| blob.metadata.annotations.contains_key(MADE));
+                .is_some_and(|blob| crate::blobs::made_by(blob, "image"));
             made && !crate::backups::listed(&state.store, &job.namespace, &job.key, blob)
         };
         if ours && let Err(e) = shared.submit(Command::Delete { key: key.clone() }).await {

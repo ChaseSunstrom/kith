@@ -619,6 +619,12 @@ pub async fn copy(
     }
 }
 
+/// Whether `blob` says `who` ("backup" or "image") made it: the annotation's value, not
+/// just that the key is there (a person can put a Blob with the key set to anything).
+pub fn made_by(blob: &kith_api::Resource, who: &str) -> bool {
+    blob.metadata.annotations.get("kith.dev/made-by").is_some_and(|by| by == who)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,6 +677,23 @@ mod tests {
             0,
             "x was asked, and its bytes could have been passed on"
         );
+    }
+
+    #[test]
+    fn a_blob_is_made_by_only_its_own_maker() {
+        let blob = |notes: &str| {
+            let source = format!(
+                "apiVersion: kith.dev/v1\nkind: Blob\nmetadata: {{ name: x, annotations: {{ {notes} }} }}\nspec: {{ size: 2 }}\n"
+            );
+            kith_api::Resource::from_source(&source).unwrap().remove(0).unwrap()
+        };
+        let by = |who: &str| blob(&format!("kith.dev/made-by: {who}"));
+        assert!(made_by(&by("backup"), "backup"));
+        assert!(made_by(&by("image"), "image"));
+        assert!(!made_by(&by("image"), "backup"), "an image's Blob is not a backup's");
+        assert!(!made_by(&by("backup"), "image"));
+        assert!(!made_by(&by("mine"), "backup"), "a user's value is no maker's");
+        assert!(!made_by(&blob("other: backup"), "backup"), "no key, no maker");
     }
 
     #[test]

@@ -822,7 +822,7 @@ async fn forget(shared: &Shared, job: &Job, old: &Value) -> Result<(), String> {
             let made = state
                 .store
                 .get(&key)
-                .is_some_and(|blob| blob.metadata.annotations.contains_key(MADE));
+                .is_some_and(|blob| crate::blobs::made_by(blob, "backup"));
             made && !listed(&state.store, &job.namespace, &job.key, blob)
         };
         if !ours {
