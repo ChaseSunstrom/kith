@@ -467,7 +467,8 @@ skip() { echo "skipped: $1"; exit 0; }
 # ends a line with CR LF, the kernel's and the guest's alike, so the newline may follow a CR.)
 said_in() {
     grep -aq "$2" "$1" 2>/dev/null && return 0
-    sed -z -E 's/\[ *[0-9]+\.[0-9]+\] [^ ()]+ \([0-9]+\) used greatest stack depth: [0-9]+ bytes left\r?\n//g' "$1" | grep -aq "$2"
+    # (Any kernel record, not only the stack-depth one: an EXT4-fs mount line split the state's lines too, T-0098.)
+    sed -z -E 's/\[ *[0-9]+\.[0-9]+\] [^\r\n]*\r?\n//g' "$1" | grep -aq "$2"
 }
 
 # --selftest-said: said_in on fixture logs. A kernel stack-depth record can land in the middle of a
@@ -483,7 +484,9 @@ if [ "$selftest" = said ]; then
     printf 'kithd: init: restarting\n' >"$st/other"
     printf 'kithd: init: the state'"'"'s file system grown to 40[    2.926586] kithd (90) used greatest stack depth: 13224 bytes left\n709 MB\n' >"$st/grown"
     printf 'kithd: init: sta[    1.208476] kithd (90) used greatest stack depth: 13224 bytes left\r\nte on /dev/vda7\r\n' >"$st/crlf"
+    printf 'kithd: init: the state partition now ends where its disk does: 4[    2.009341] EXT4-fs (vda7): mounted filesystem with ordered data mode\r\n07 MB\r\n' >"$st/ext4"
     bad=0
+    said_in "$st/ext4" 'does: 407 MB' || { echo "vm.sh: selftest: FAIL: a line split by a file system record does not match" >&2; bad=1; }
     said_in "$st/grown" 'grown to 40709 MB' || { echo "vm.sh: selftest: FAIL: a line split by a record does not match" >&2; bad=1; }
     said_in "$st/crlf" 'kithd: init: state on /dev/vda7' || { echo "vm.sh: selftest: FAIL: a line split by a record on a CR LF console does not match" >&2; bad=1; }
     said_in "$st/split" 'reboot: Restarting system' || { echo "vm.sh: selftest: FAIL: an interleaved line does not match" >&2; bad=1; }

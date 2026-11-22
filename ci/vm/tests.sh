@@ -111,9 +111,11 @@
     want=$(sfdisk -l -o Start,Name "$work/disk.raw" 2>/dev/null | awk '$2 == "state" { print int((40959 - $1 / 2048) / 100) }')
     [ -n "$want" ] || fail "no state partition in the image's table"
     began=$(date +%s%N)
-    boot
+    # (T-0098: a guest with QEMU's i6300esb watchdog, which kithd opens and sets to 60 s.)
+    boot -device i6300esb
     up
     took=$((($(date +%s%N) - began) / 1000000))
+    said 'kithd: init: watchdog /dev/watchdog: reset after 60 s unless petted' || fail "kithd did not open the guest's watchdog"
     said 'Mounted root (squashfs filesystem) readonly on device 25[0-9]:0' || fail "the root is not the verity device"
     said 'kithd: init: state on /dev/vda7' || fail "the state partition was not mounted"
     # (T-0095: the kernel locks itself down at integrity from its config, with no command line to ask for it.)

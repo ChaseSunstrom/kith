@@ -138,6 +138,15 @@ pub fn set_rtc(secs: i64) -> Result<()> {
 
 const RTC_SET_TIME: u32 = 0x4024_700a; // _IOW('p', 0x0a, struct rtc_time)
 
+/// Sets how long the watchdog `file` (/dev/watchdog) waits for a write before it resets the
+/// machine (WDIOC_SETTIMEOUT); the driver may round it, and the time it set is returned.
+pub fn watchdog_timeout(file: &File, secs: i32) -> Result<i32> {
+    const WDIOC_SETTIMEOUT: u32 = 0xc004_5706; // _IOWR('W', 6, int)
+    let mut bytes = secs.to_ne_bytes();
+    ioctl(file, WDIOC_SETTIMEOUT, &mut bytes)?;
+    Ok(i32::from_ne_bytes(bytes))
+}
+
 /// `struct rtc_time` for `secs`: nine native-endian ints, 36 bytes.
 fn rtc_bytes(secs: i64) -> Vec<u8> {
     rtc_time_of(secs).iter().flat_map(|field| field.to_ne_bytes()).collect()
