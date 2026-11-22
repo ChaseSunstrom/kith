@@ -1020,9 +1020,11 @@ impl Proxy {
 
 /// Bytes both ways between a client and a backend, until either ends or `idle` goes by
 /// with no byte moved on one of them.
+///
 /// The bytes move in the kernel, by splice(2) through a pipe each way, not through a buffer
-/// here; a way that splice refuses goes on by the copy. (Plain TCP only: a TLS stream is
-/// bytes to be decrypted, so the ingress's, which end in TLS, keep `copy_bidirectional`.)
+/// here; a way that splice or a pipe is refused for (or that is past [`PIPES_MAX`]) goes on by
+/// the copy. (Plain TCP only: a TLS stream is bytes to be decrypted, so the ingress's, which
+/// end in TLS, keep `copy_bidirectional`.)
 async fn pass(client: TcpStream, backend: TcpStream, idle: Duration) -> std::io::Result<(u64, u64)> {
     let (begun, moved) = (tokio::time::Instant::now(), AtomicU64::new(0));
     let ((from_client, to_client), (from_backend, to_backend)) = (client.into_split(), backend.into_split());
@@ -1045,22 +1047,52 @@ async fn pass(client: TcpStream, backend: TcpStream, idle: Duration) -> std::io:
     tokio::select! { out = both => out, out = quiet => out }
 }
 
-/// A pipe: what splice moves bytes through. (Made once for a way of a connection.)
+/// A pipe: what splice moves bytes through, of the kernel's default 64 KiB. (Made once for a
+/// way of a connection.)
 struct Pipe(std::os::fd::OwnedFd, std::os::fd::OwnedFd);
 
-/// What a splice may move at once (the pipe's size, when it can be that).
-const PIPE: usize = 256 << 10;
+/// What a splice may move at once: the pipe's size.
+const PIPE: usize = 64 << 10;
+
+/// The most pipes open at once, all connections' ways: two files each, so 4096 of the 65536
+/// kithd has (`NOFILE_WANTED`); a way past it goes by the copy, as one a pipe is refused for.
+const PIPES_MAX: usize = 2048;
+
+/// Pipes open now, to keep within [`PIPES_MAX`].
+static PIPES_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Takes a place of `max` in `open`, if there is one.
+fn take_place(open: &std::sync::atomic::AtomicUsize, max: usize) -> bool {
+    open.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
+        .is_ok()
+}
 
 impl Pipe {
+    /// None when there is no room for one, or no pipe (out of files, say): the copy then.
     fn new() -> Option<Pipe> {
-        use nix::fcntl::{FcntlArg, OFlag, fcntl};
-        use std::os::fd::AsRawFd;
-        let (read, write) = nix::unistd::pipe2(OFlag::O_NONBLOCK | OFlag::O_CLOEXEC).ok()?;
-        // (Past the limit of what a user may have in pipes it stays the 64 KiB it is.)
-        let _ = fcntl(write.as_raw_fd(), FcntlArg::F_SETPIPE_SZ(PIPE as i32));
+        #[cfg(test)]
+        if NO_PIPE.get() {
+            return None;
+        }
+        if !take_place(&PIPES_OPEN, PIPES_MAX) {
+            return None;
+        }
+        let made = nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_CLOEXEC);
+        let Ok((read, write)) = made else {
+            PIPES_OPEN.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        };
         #[cfg(test)]
         PIPES.set(PIPES.get() + 1);
         Some(Pipe(read, write))
+    }
+}
+
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        PIPES_OPEN.fetch_sub(1, Ordering::AcqRel);
+        #[cfg(test)]
+        PIPES.set(PIPES.get() - 1);
     }
 }
 
@@ -1071,18 +1103,13 @@ pub(crate) fn splices() -> u64 {
 }
 
 #[cfg(test)]
-impl Drop for Pipe {
-    fn drop(&mut self) {
-        PIPES.set(PIPES.get() - 1);
-    }
-}
-
-#[cfg(test)]
 thread_local! {
-    /// For the tests of the thread: splices that moved bytes, pipes open, and splice refused.
+    /// For the tests of the thread: splices that moved bytes, pipes open, splice refused, and
+    /// no pipe to be had.
     static SPLICES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static PIPES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static REFUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NO_PIPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Splices that a filter or an old kernel gives these for do not come again: the copy.
@@ -3807,6 +3834,40 @@ spec:
         assert_eq!(passing.await.unwrap().unwrap(), (8, 6));
         assert_eq!(spliced().0, before);
         REFUSE.set(false);
+    }
+
+    /// No pipe to be had (out of files, or past the cap): the connection is not refused, the
+    /// bytes go by the copy.
+    #[tokio::test]
+    async fn splice_without_a_pipe_falls_back_to_the_copy() {
+        use tokio::io::AsyncReadExt;
+        NO_PIPE.set(true);
+        let before = spliced().0;
+        let ((mut client, held), (backend, mut replica)) = (pair().await, pair().await);
+        let passing = tokio::spawn(pass(held, backend, Duration::from_secs(60)));
+        client.write_all(b"question").await.unwrap();
+        let mut got = [0; 8];
+        replica.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"question");
+        replica.write_all(b"answer").await.unwrap();
+        let mut got = [0; 6];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"answer");
+        drop((client, replica));
+        assert_eq!(passing.await.unwrap().unwrap(), (8, 6));
+        assert_eq!((spliced().0, spliced().1), (before, 0));
+        NO_PIPE.set(false);
+    }
+
+    /// The count of pipes holds at its cap, and a place freed can be taken again.
+    #[test]
+    fn pipes_stop_at_the_cap() {
+        let open = std::sync::atomic::AtomicUsize::new(0);
+        assert!(take_place(&open, 2) && take_place(&open, 2));
+        assert!(!take_place(&open, 2));
+        open.fetch_sub(1, Ordering::AcqRel);
+        assert!(take_place(&open, 2));
+        assert_eq!(open.load(Ordering::Acquire), 2);
     }
 
     /// Not a check: the same proxy path by splice and by the copy, on loopback, for what the

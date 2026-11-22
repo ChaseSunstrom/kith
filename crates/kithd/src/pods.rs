@@ -1090,7 +1090,8 @@ const OWN: usize = 2;
 /// hard one, 65536 at most (`raise_nofile`), and its listeners, these relays, its API
 /// and ingress (1024 connections, two files each) all take of it, and so do the API's
 /// handshakes: 64 slots and 256 in line for the others, 16 and 64 for the people (about 400
-/// sockets, `cluster::LINE`).
+/// sockets, `cluster::LINE`), and the Service proxy's splice pipes, 4096 files at most
+/// (`services::PIPES_MAX`).
 static RELAYED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 
 /// A connection's or a sender's room: of its port's own, or of the node's.
