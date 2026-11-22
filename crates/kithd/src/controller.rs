@@ -1030,6 +1030,20 @@ fn pulling(
     unit: &Value,
     pull: Option<kith_runtime::Progress>,
 ) -> Option<Value> {
+    pulling_from(live, node, job, unit, pull, false)
+}
+
+/// `pulling`, with `sure` for a clear that is made even where `live` shows no `pull` to take off:
+/// a report that was cut off may still land, and `live` does not have it yet. The status then holds
+/// the units of this node as they are, `unit` among them (never none: that would say it runs none).
+fn pulling_from(
+    live: Option<&Value>,
+    node: &str,
+    job: bool,
+    unit: &Value,
+    pull: Option<kith_runtime::Progress>,
+    sure: bool,
+) -> Option<Value> {
     // (What `worker::report` takes of a Job, and of the rest.)
     const JOB: [&str; 7] = [
         "state",
@@ -1062,7 +1076,10 @@ fn pulling(
         }
     }
     let Some(pull) = pull else {
-        return stale.then(|| {
+        return (stale || sure).then(|| {
+            if ours.is_empty() {
+                ours.push(unit.clone());
+            }
             status["containers"] = json!(ours);
             status
         });
@@ -2401,7 +2418,12 @@ impl Controller {
                         tokio::select! {
                             started = &mut starting => break started,
                             // A pull can take minutes; shutting down does not wait for it.
-                            _ = stop_now.changed() => return TICK,
+                            _ = stop_now.changed() => {
+                                if let Some(r) = reported.take() {
+                                    r.abort();
+                                }
+                                return TICK;
+                            }
                             _ = ticks.tick() => {
                                 // (By the reference the image is asked with, so another asker of the same
                                 // reference, an API pull, is read as this unit's: both pull the same layers.)
@@ -2438,24 +2460,39 @@ impl Controller {
                     // A report still on its way must not land after the one that takes the pull off:
                     // waited for a little, then dropped. (The pass's own report comes only at its end,
                     // and until then the next unit may be pulling for minutes: the last count would stay.)
+                    let mut cut_off = false;
                     if let Some(mut r) = reported.take()
                         && tokio::time::timeout(PULL_SAID * 5, &mut r).await.is_err()
                     {
                         r.abort();
+                        cut_off = true;
                     }
                     if last.is_some() {
                         let node = shared.members.me().to_string();
                         let cleared = {
                             let held = shared.store.lock().expect("a handler panicked holding the store");
-                            held.store
-                                .get(&owner)
-                                .and_then(|live| pulling(live.status.as_ref(), &node, live.kind == "Job", &unit, None))
+                            held.store.get(&owner).and_then(|live| {
+                                // (A report cut off may have reached the leader without being applied yet.)
+                                pulling_from(live.status.as_ref(), &node, live.kind == "Job", &unit, None, cut_off)
+                            })
                         };
                         if let Some(status) = cleared {
-                            for report in crate::raft::in_parts(&node, vec![(owner.clone(), Some(status))]) {
-                                if let Err(e) = shared.submit(report).await {
-                                    eprintln!("kithd: saving status: {e}");
+                            // Bounded, and shutting down does not wait for it: with no majority a submit
+                            // retries for ten seconds, and the pass starts nothing meanwhile.
+                            let say = async {
+                                for report in crate::raft::in_parts(&node, vec![(owner.clone(), Some(status))]) {
+                                    if let Err(e) = shared.submit(report).await {
+                                        eprintln!("kithd: saving status: {e}");
+                                    }
                                 }
+                            };
+                            tokio::select! {
+                                said = tokio::time::timeout(PULL_SAID * 5, say) => {
+                                    if said.is_err() {
+                                        eprintln!("kithd: {id}: the end of its pull was not saved in time");
+                                    }
+                                }
+                                _ = stop_now.changed() => return TICK,
                             }
                         }
                     }
@@ -3933,6 +3970,13 @@ mod tests {
         let clean = json!({ "replicas": 1, "containers": [{ "name": "web", "replica": 0, "node": "a" }] });
         assert!(pulling(Some(&clean), "a", false, &unit, None).is_none());
         assert!(pulling(None, "a", false, &unit, None).is_none());
+        // A report cut off may still land: the clear is made though the store shows no count yet,
+        // with the unit in it where the store has none of this node's (never a report of no units).
+        let sure = pulling_from(Some(&clean), "a", false, &unit, None, true).unwrap();
+        assert_eq!(sure["containers"].as_array().unwrap().len(), 1, "{sure}");
+        assert!(sure["containers"][0].get("pull").is_none(), "{sure}");
+        let bare = pulling_from(None, "a", false, &unit, None, true).unwrap();
+        assert_eq!(bare["containers"][0]["name"], "web", "{bare}");
         // A count past what a report may hold is held there, not refused every tick.
         let vast = kith_runtime::Progress {
             layers: usize::MAX,

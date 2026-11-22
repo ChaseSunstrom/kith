@@ -72,7 +72,7 @@ no other image has.
 
 - **Pulling.** The layers of one image are fetched side by side, four at a time; one that fails
   stops the rest and leaves no half-written file. While a unit pulls, its Workload's status says
-  how far, once a second: `containers[].pull` holds `layers`, `layersTotal`, `bytes` and
+  how far, at most once a second, when it moved: `containers[].pull` holds `layers`, `layersTotal`, `bytes` and
   `bytesTotal` (a layer already on the node counts as done), and `kith get` and the UI show it in
   the status, `0/1 ready: pulling 3 of 7 layers, 12 of 40 MB`. The field is gone once the pull ends.
 - **When.** After `--image-grace` seconds unused; or, while the state disk is under
