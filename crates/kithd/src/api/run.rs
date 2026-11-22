@@ -1276,19 +1276,21 @@ spec: {role: other-jobber, subjects: [carol]}
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Where `cgroup.kill` cannot be written (before Linux 5.14: here a directory stands for it),
-    /// each pid in `cgroup.procs` is killed.
     /// A run's names carry its kithd's owner id, so the sweep of one state directory can tell
     /// them from another's.
     #[test]
     fn owners_differ_by_state_directory_and_a_runs_dir_carries_its_owner() {
         let (a, b) = (owner_of(Path::new("/var/a")), owner_of(Path::new("/var/b")));
         assert!(a != b && a.len() == 8 && a == owner_of(Path::new("/var/a")), "{a} {b}");
+        // (No other test sets the owner: `sweep_stale` is only called by kithd's start.)
+        assert_eq!(OWNER.get_or_init(|| a.clone()), &a);
         let dir = Dir::make().unwrap();
         let name = dir.0.file_name().unwrap().to_str().unwrap().to_string();
-        assert!(name.starts_with(&format!("{DIR_PREFIX}{}-", owner())), "{name}");
+        assert!(name.starts_with(&format!("{DIR_PREFIX}{a}-")), "{name}");
     }
 
+    /// Where `cgroup.kill` cannot be written (before Linux 5.14: here a directory stands for it),
+    /// each pid in `cgroup.procs` is killed.
     #[tokio::test]
     async fn kill_cgroup_kills_the_pids_listed_where_cgroup_kill_cannot_be_written() {
         let dir = std::env::temp_dir().join(format!("kithd-kill-{}", std::process::id()));

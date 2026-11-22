@@ -34,7 +34,11 @@ impl Sandbox {
     /// A sandbox under the temp dir, not CARGO_TARGET_TMPDIR (a merge train's is long): a path
     /// that is to hold a Unix socket must stay under the 107 bytes `sun_path` takes.
     fn short(name: &str) -> Sandbox {
-        let dir = std::env::temp_dir().join(format!("kr-{}-{name}", std::process::id()));
+        let mut dir = std::env::temp_dir().join(format!("kr-{}-{name}", std::process::id()));
+        // (A long temp dir, a train's scratch, is passed over for /tmp, as kithd's run dir does.)
+        if dir.join("kithd.sock").as_os_str().len() > 107 {
+            dir = Path::new("/tmp").join(format!("kr-{}-{name}", std::process::id()));
+        }
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Sandbox(dir, true)
