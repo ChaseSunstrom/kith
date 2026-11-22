@@ -3,7 +3,7 @@
 Status: the engine is built (T-1136, `crates/kithd/src/in_place.rs`, tested on files with every
 cut), and init runs it at boot (T-1137: a marker 64 KiB into the config partition, a lock record
 with the key, the pass before the state is mounted; `ci/vm/encrypt.sh` cuts it mid-pass), and
-`kith node encrypt` writes the marker. The user's side (time, a power cut, the SSD caveat) is in
+`kith node encrypt` writes the marker (T-1138). The user's side (time, a power cut, the SSD caveat) is in
 [the cluster guide](guide/cluster.md#encrypting-a-node-that-was-installed-plain). This record is the part of T-1106 that the cuts depend on. Where the code differs
 from a line here, the code is the word. It builds on [adr-unlock.md](adr-unlock.md) (the lock
 record, at 512 KiB into the config partition) and on the order of writes of

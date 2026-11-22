@@ -626,7 +626,7 @@ the node plain again.
 in chunks of 256 KiB with a journal beside each, so the pass runs at a fraction of the disk's
 copy speed: minutes for a small partition, hours for a large one or a slow disk. n1 is down for
 all of it. Its console (and the installer's panel, if the machine has a screen) shows a line a
-second: `37% of 61000 MB, 48.2 MB/s, about 11 min left`. The estimate is the rate so far, rounded
+second: `37% of 61000 MB, 48.2 MB/s, about 11 min left (chunk 37 of 233)`. The estimate is the rate so far, rounded
 up. Start it when n1 can be away for that long, with its replicas and Volumes elsewhere.
 
 **A power cut during the pass is not a failure.** The journal says where the pass was. The next
@@ -651,7 +651,10 @@ out of the cluster, erase the whole drive with the drive's own command (`nvme sa
 `blkdiscard --secure` or `hdparm --security-erase` where the drive supports it; a plain `dd` of
 zeros is no remedy on flash), reinstall with `encrypt: true`, and join it again: the state is then
 encrypted from its first write. A drive that encrypts itself (an SED) erased by changing its key is
-the same remedy. Whatever the node held in plain before the pass (a Secret, a Volume's key, the
+the same remedy. On a rented or virtual disk (a VPS installed by kexec) there is no drive of yours
+to erase: ask the provider to destroy the volume and its snapshots, or reinstall on a new volume
+and have the old one destroyed. An SD card or eMMC with no secure erase cannot be cleaned: replace
+the medium. Whatever the node held in plain before the pass (a Secret, a Volume's key, the
 CA key if it started the cluster) may be on the flash still: treat it as read by whoever has the
 chips, and make it again if that matters.
 
