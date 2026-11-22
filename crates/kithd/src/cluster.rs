@@ -2607,6 +2607,8 @@ pub(crate) mod pinned_peer {
             ("src/acme.rs", 3),
             ("src/update.rs", 1),
             ("src/install.rs", 1),
+            // The vulnerability scan's OSV query: package names and versions only, no proxy, no redirect.
+            ("src/scan.rs", 1),
         ];
         let mut files = Vec::new();
         sources(
