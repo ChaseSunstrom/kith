@@ -29,6 +29,13 @@ jobs:
       # steps, so a failure of those does not skip it.
       - name: The guide's pages are what its markdown makes
         run: python3 ci/site_docs.py --self-test && python3 ci/site_docs.py --check
+      # ci/vm.sh's own selftests: sh, mktemp and python3 only, no KVM (the VM tests themselves run elsewhere).
+      - name: ci/vm.sh selftests
+        run: |
+          sh ci/vm.sh --selftest-said
+          sh ci/vm.sh --selftest-sweep
+          sh ci/vm.sh --selftest-web
+          sh ci/vm.sh --selftest-kill
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       # kith's remote feature (--server, TLS to a node) is off in the workspace build: its code is built and tested here.
