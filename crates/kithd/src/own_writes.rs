@@ -70,6 +70,26 @@ fn class(kind: &str) -> Result<(), String> {
     }
 }
 
+/// Whether `command` applies or deletes one of who joins the mesh and at what level, or of what
+/// traffic flows (an AccessLevel, RemotePeer, NetworkPolicy or Exit): a node never signs one.
+pub(crate) fn reaches_network(command: &Command) -> bool {
+    let network = |kind: &str| {
+        ["AccessLevel", "RemotePeer", "NetworkPolicy", "Exit"]
+            .iter()
+            .any(|of| of.eq_ignore_ascii_case(kind))
+    };
+    match command {
+        Command::Apply { resources, .. } => resources.iter().any(|resource| network(&resource.kind)),
+        Command::Delete { key } => network(kind_of(key)),
+        _ => false,
+    }
+}
+
+/// What a node never signs, whatever the owner: a write that changes access or reaches the network.
+pub(crate) fn never_signed(command: &Command) -> bool {
+    crate::raft::changes_access(command) || reaches_network(command)
+}
+
 /// The kind of a store key (`Kind/namespace/name`, or `Kind/name`).
 fn kind_of(key: &str) -> &str {
     key.split('/').next().unwrap_or(key)
@@ -385,17 +405,7 @@ fn signed(store: &Store, prefix: Ipv6Addr, by: (&str, bool), command: &Command) 
     }
     // Nor one of who joins the mesh and at what level, or of what traffic flows: no Release's or
     // Source's chart needs one signed by a node that a person cannot apply (T-1084).
-    let network = |kind: &str| {
-        ["AccessLevel", "RemotePeer", "NetworkPolicy", "Exit"]
-            .iter()
-            .any(|of| of.eq_ignore_ascii_case(kind))
-    };
-    let reaches = match command {
-        Command::Apply { resources, .. } => resources.iter().any(|resource| network(&resource.kind)),
-        Command::Delete { key } => network(kind_of(key)),
-        _ => false,
-    };
-    if reaches {
+    if reaches_network(command) {
         return Err(not_made(
             "a node's own write",
             "it reaches the mesh or the network policy, and only a person signs that",
