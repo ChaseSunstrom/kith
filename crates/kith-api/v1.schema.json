@@ -3694,6 +3694,24 @@
         "secret"
       ]
     },
+    "ScaleToZero": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "idle": {
+          "type": "string",
+          "description": "How long without a connection before it sleeps, from `30s` to `30d`: `90s`, `30m`,\n`24h`. Nodes' clocks are taken to agree within a minute, and it is counted to\nwithin about ten seconds."
+        },
+        "start": {
+          "type": "string",
+          "description": "How long a first connection is held for a replica to start (at most `10m`),\nbefore it is closed with the reason."
+        }
+      },
+      "required": [
+        "idle",
+        "start"
+      ]
+    },
     "SeatSpec": {
       "type": "object",
       "additionalProperties": false,
@@ -3842,6 +3860,17 @@
             "null"
           ],
           "description": "No address of its own: its name (`<service>.<namespace>.kith`, and under\n`svc.cluster.local`) answers the addresses of its ready replicas, as a headless\nKubernetes Service does. Off unless true."
+        },
+        "scaleToZero": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScaleToZero"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Sleep the Workloads behind this Service (their `replicas` stay) after no\nconnection to it for `idle`; kithd holds the first TCP connection to a sleeping\none while a replica starts. Off unless set. TCP only: a datagram wakes nothing."
         }
       },
       "required": [

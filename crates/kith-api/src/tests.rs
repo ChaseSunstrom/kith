@@ -819,6 +819,43 @@ fn a_headless_service_has_no_expose() {
     assert!(said.contains("headless") && said.contains("expose"), "{said}");
 }
 
+/// `scaleToZero` is two durations, on a Service that has an address and only TCP ports: the rest
+/// is refused at apply, not left to sleep a Workload nothing can wake.
+#[test]
+fn scale_to_zero_is_checked_at_apply() {
+    let read = |spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: web }}\n{spec}");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    let with = |s2z: &str, rest: &str| {
+        read(&format!(
+            "spec: {{ selector: {{ app: web }}, ports: [{{ port: 80 }}], scaleToZero: {s2z}{rest} }}\n"
+        ))
+    };
+    with("{ idle: 5m, start: 30s }", "").unwrap();
+    // The ends of what is allowed: `idle` 30 s to 30 days, `start` up to 10 minutes.
+    with("{ idle: 30s, start: 10m }", "").unwrap();
+    with("{ idle: 30d, start: 1s }", "").unwrap();
+    for bad in [
+        "{ idle: 29s, start: 30s }",
+        "{ idle: 31d, start: 30s }",
+        "{ idle: 213503982334601d, start: 30s }",
+        "{ idle: 0s, start: 30s }",
+        "{ idle: soon, start: 30s }",
+        "{ idle: 5m, start: 0s }",
+        "{ idle: 5m, start: 2h }",
+    ] {
+        let said = with(bad, "").unwrap_err();
+        assert!(said.contains("scaleToZero"), "{bad}: {said}");
+    }
+    let said = with("{ idle: 5m, start: 30s }", ", headless: true").unwrap_err();
+    assert!(said.contains("scaleToZero") && said.contains("headless"), "{said}");
+    let said = read("spec: { selector: { app: web }, ports: [{ port: 80, protocol: udp }], scaleToZero: { idle: 5m, start: 30s } }\n")
+        .unwrap_err();
+    assert!(said.contains("scaleToZero") && said.contains("udp"), "{said}");
+}
+
 #[test]
 fn expose_host_is_one_a_certificate_authority_issues_for() {
     for bad in [
