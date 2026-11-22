@@ -61,7 +61,27 @@ spec:
 - A container gets its Devices' nodes in its own `/dev`, beside `null`, `zero`, `full`,
   `random`, `urandom`, `tty`; a GPU brings its render node (`/dev/dri/renderD*`). A missing
   Device or claim stops the unit and says which. `/dev/mem`, `/dev/kmem`, `/dev/port` and
-  `/dev/tpm*` are given to no pod, whatever a Device says.
+  `/dev/tpm*` are given to no pod, whatever a Device says. Nor is `/dev/kmsg`, a disk's or
+  flash's raw node (`/dev/sg*`, `/dev/nvme0`, `/dev/ng*`, `/dev/mtd*`, `/dev/mapper/control`),
+  any block device (`/dev/sda`, `/dev/block/8:0`), a link or a plain file: a Device grants a
+  node only if it is a character device that is there, whoever wrote the Device. One path that
+  is not (or is missing, an unplugged camera or a driver not yet loaded) stops the unit, and
+  its status says which Device and path.
+  The kernel subsystems refused are `scsi_generic`, `bsg`, `nvme`, `nvme-generic`, `mtd`,
+  `tpm`, `tpmrm`, `msr`, `dax`, `ubi`, `ublk-char`, `vfio`, `i2c-dev`, `nvram`, `cpuid`, `mei`, `watchdog`,
+  `vfio-dev`, `uio`, `spidev`, `ipmi`, `usbmon`, `drm_dp_aux` and `drm_dp_aux_dev` (read from
+  `/sys/dev/char`), and so are char major 21 (sg) and the misc nodes the kernel reports only as
+  `misc`: nvram (10:144), watchdog (10:130), vfio (10:196), mcelog (10:227), snapshot (10:231),
+  cpu/microcode (10:184) and hpet (10:228). Where `/sys/dev/char` is there
+  and a node's subsystem cannot be read, the node is refused too. This is a list of what to
+  refuse, not of what to allow: a Device is set by the admin for hardware no list could name,
+  and an allowlist would break it. Other raw nodes may exist; a Device is the admin's grant.
+  Given on purpose:
+  - `/dev/kvm` (10:232) is given: VM workloads need it.
+  - `hidraw` nodes are given: security keys and gamepads are such devices.
+  - `/dev/loop-control` (10:237) is given: it does nothing without a block device, which is never granted.
+  - `userfaultfd` is given: it is a syscall, not a node a Device grants.
+  - `/dev/hwrng` (10:183) is given: it only reads random bytes.
 - **On kith OS** a device filter on each container's cgroup checks every open and `mknod`: it
   lets through the usual few, the terminals of the container's own `/dev/pts` and each device it
   was given, and refuses the rest, even to a root pod. A pod that made its own node

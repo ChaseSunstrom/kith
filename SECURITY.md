@@ -24,6 +24,7 @@ Only the newest version is fixed. There are no security releases of older ones.
 | A workload | Nothing: it is a process on a node | What its container, machine or sandbox lets it reach (see "What is not defended") |
 | A Workload that runs as an Identity | A certificate for `IDENTITY.runs.kith`, `NAME.NAMESPACE.workload.kith` and `NODE.on.kith`, for two hours, while the store says that Workload, placed on that node, runs as that Identity and the Identity names it | What the Identity's Roles say (see "A Workload that runs as an Identity") |
 | Anyone who reaches a node's port | Nothing | Fetch the CA certificate, spend a join token, ask for a locked disk's key by its id |
+| A device that trusts the LAN CA (`kith ca export`) | Nothing: it holds a public certificate | Takes the host certificates the LAN CA signs for the cluster's LAN names, and no others: the certificate is name-constrained to `spec.lanDomains` (default `home.arpa`, `lan`, `internal`, `local`, never `cluster.local` or `kith`) |
 | Whoever writes what kith fetches | Nothing by itself | What follows from it: a Source's repository is applied, a package is rendered, an image is run, an archive is restored |
 
 ## The boundaries, as they are in the code
@@ -184,6 +185,22 @@ Only the newest version is fixed. There are no security releases of older ones.
   and kithd can hand the dmem controller down: the kernel then keeps the container's use
   of that GPU's memory under the share (`dmem.max`). Elsewhere it is a count the scheduler
   keeps, and a container that takes more is not stopped.
+  A Device cannot grant raw memory or a block device, whoever wrote it: when kithd hands nodes
+  to a container it stats each path (links not followed) and gives the Device's nodes only if
+  all are character devices that are there and not mem, kmem, port, kmsg, oldmem, the
+  device-mapper's control, a TPM, sg (major 21), the misc nodes nvram, watchdog, vfio and
+  mcelog, snapshot, cpu/microcode and hpet (10:144, 10:130, 10:196, 10:227, 10:231, 10:184,
+  10:228: the kernel reports them only as `misc`), or of the
+  kernel subsystems `scsi_generic`,
+  `bsg`, `nvme`, `nvme-generic`, `mtd`, `tpm`, `tpmrm`, `msr`, `dax`, `ubi`, `ublk-char`, `vfio`, `i2c-dev`,
+  `nvram`, `cpuid`, `mei`, `watchdog`, `vfio-dev`, `uio`, `spidev`, `ipmi`, `usbmon` or
+  `drm_dp_aux` or `drm_dp_aux_dev` (read from `/sys/dev/char`; where that is there and a
+  node's subsystem cannot be read the node is refused, and with no `/sys/dev/char` at all only
+  the fixed numbers are known). This is a denylist, not an allowlist, because a Device is set
+  by the admin for hardware no list could name. A block device, a file, a link or a missing node grants nothing, and the
+  workload is not run, its status saying which Device and path. Other character devices that
+  reach hardware (a USB or PCI node, `/dev/input`, `/dev/dri`) are what a Device is for and are
+  given.
   A device node a unit was given (an exclusive Device's, most of all) is not given to another
   unit while the unit that had it still runs: a unit whose stop failed with processes left
   keeps its devices and its name, its stop is retried at a later pass and no more often than
@@ -543,7 +560,17 @@ The nested kithd shares the node's network, so its registry port meets the node'
 Design in `docs/adr-privilege.md` (T-0334). Built today: the node's own policy and the
 typed request list's seam (`crates/kithd/src/root_part.rs`, for listeners, pods and the mesh), in one
 process. There is no second process yet, so everything below is what the split is for,
-not what a node has.
+not what a node has. **No part of a live node is confined today.** The confinement the serving part
+will take is built (T-0811, `crates/kithd/src/confine.rs`: its own mount namespace holding only its
+state directory, no exec, with a `/proc` that shows its own process alone; a user and group that are
+not 0, no capability in any set, `no_new_privs`, a seccomp allow-list last) and held to what it says
+by a probe, `kithd confine-probe`, in a test build that no release has (`sh ci/vm.sh --test privilege`),
+and not applied to the serving part, which is a thread of the root part's process; `--split` is off by
+default, and until the two are processes a node has none of it. What stays open when it is applied: the
+serving part shares the node's network namespace, so it reaches the host's loopback and every abstract
+`AF_UNIX` socket (a `CLONE_NEWNET` after its listeners are open would close that if it makes no outbound
+connection; not done). The filter can be left out alone (`--no-filter`, on the probe only today, for
+a call the list lacks); without it a hole in the serving part has every system call its user may make.
 
 **What the split does not change.** The part that reads the network still reads the
 store: every Secret of every namespace, and on a node that holds it the cluster's CA key.
@@ -876,6 +903,22 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   is each node's own word (`status.serves`, and the address it joined from): an ingress worker (its
   Node says `ingress`, below) or a worker that is sent the whole store can say it serves ingress and is
   then answered beside the others; any other worker cannot.
+- **`expose.issuer: cluster` has a LAN CA sign a host's certificate, and a device that trusts it takes
+  what it signs.** The LAN CA is apart from the cluster's root: its own key, kept beside the CA key on
+  the CA node and never leaving it, and a self-signed certificate with X.509 name constraints that
+  permit only the cluster's LAN domains (`spec.lanDomains` of a Cluster: the admin's list, by the
+  lowest key's if several name one; `home.arpa`, `lan`, `internal` and `local` where none does) and
+  exclude `kith` and `cluster.local`. `kith ca export` hands out that certificate alone, from the
+  node that holds it, over the local socket. A device that trusts it is bound by those constraints
+  whatever the CA signs; the workloads' `ca.crt` and the mesh never trust it, and a host certificate
+  does not verify against the cluster's root. Within the domains, whoever may write a Service may
+  name a host (key those in a Namespace's `spec.hosts`), and there is no revocation: a certificate
+  lasts 30 days and is made again in its last third. The LAN CA's own certificate lasts ten years;
+  changing the domains makes a new certificate with the same key and another serial, and a device
+  keeps trusting the old, broader one until its owner removes it and imports the new. The name
+  constraints also exclude every IP address, and the LAN CA's key is only read, never made again over
+  a file that is there but unreadable. `kith ca export` only works on the CA node. A
+  refused or failed issuance waits an hour, as ACME's, and the same error is written to the status once.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and
   PipeWire sockets are, and connects as any program the session started would: it can

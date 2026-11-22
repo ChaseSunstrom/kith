@@ -186,6 +186,11 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    /// The cluster's certificate authority: its public certificate, for a phone or laptop to trust
+    Ca {
+        #[command(subcommand)]
+        command: CaCommand,
+    },
     /// The admin's key: what signs the cluster's writes under `spec.signing: required`
     Admin {
         #[command(subcommand)]
@@ -328,6 +333,15 @@ enum IdentityCommand {
         #[arg(long, default_value = ".")]
         out: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum CaCommand {
+    /// Write the LAN CA's certificate (public: never a key) to FILE, or print it; run it on the
+    /// node that holds the CA. It vouches only for the cluster's LAN names (`spec.lanDomains`), so
+    /// trust it once on a device and the hosts that say `expose.issuer: cluster` open there
+    /// without a warning, and no other name does
+    Export { file: Option<PathBuf> },
 }
 
 #[derive(Subcommand)]
@@ -1470,6 +1484,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("remote apps go through kithd: leave out --store");
             };
+            remote::watch();
             return remote::run(&kithd, &on, via.as_deref(), &argv);
         }
         Command::Logs {
@@ -1962,6 +1977,33 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 "Identity/{name} can call the API with {out}/{name}.crt and {out}/{name}.key (nodes show {out}/ca.crt, as `kith`)"
             );
             println!("It may do what Roles bound to it allow: nothing, until a RoleBinding names it.");
+        }
+        Command::Ca {
+            command: CaCommand::Export { file },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("the CA is kithd's: leave out --store");
+            };
+            let on_the_node = "kith ca export runs on the node that holds the CA (kithd's admin socket serves the certificate, no remote context does)";
+            if matches!(kithd.route, Route::Node { .. }) {
+                return fail(format!("error: {on_the_node}"));
+            }
+            let reply = raw(&kithd, "GET", "/v1/ca/lan", b"").map_err(|e| format!("{e}\n(note: {on_the_node})"))?;
+            let pem = String::from_utf8(reply).map_err(|_| "error: kithd's reply is not text".to_string())?;
+            // (A certificate and nothing else: what is written for the world to trust holds no key.)
+            if pem.contains("PRIVATE KEY") || !pem.contains("BEGIN CERTIFICATE") {
+                return fail("kithd's reply is not a certificate alone (a private key is never exported)");
+            }
+            match file {
+                Some(file) => {
+                    std::fs::write(&file, &pem).map_err(|e| format!("error: writing {}: {e}", file.display()))?;
+                    println!(
+                        "The LAN CA's certificate is in {}: trust it once on each device (it vouches only for the cluster's LAN names)",
+                        file.display()
+                    );
+                }
+                None => print!("{pem}"),
+            }
         }
         Command::Controller {
             command:
