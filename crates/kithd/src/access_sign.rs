@@ -405,10 +405,32 @@ pub(crate) fn bare(store: &Store, command: &Command) -> Result<(), String> {
                 .iter()
                 .any(|field| fields.contains_key(*field))
     };
+    // A Status replaces a status whole and a Report merges one (`kith_store::reported`): either
+    // changes a Node's certificate or raft id if the status it leaves differs in them from today's.
+    let ids = |status: Option<&serde_json::Value>| {
+        ["certificate", "raftId"].map(|field| status.and_then(|s| s.get(field)).cloned())
+    };
+    let moves = |key: &str, new: Option<serde_json::Value>| {
+        let Some(live) = store.get(key).filter(|_| key.starts_with("Node/")) else {
+            return false;
+        };
+        ids(live.status.as_ref()) != ids(new.as_ref())
+    };
     let what = match command {
         Command::Apply { .. } | Command::Delete { .. } | Command::Rollback { .. } => "writes a spec",
         Command::Import { .. } => "imports a store",
         Command::Patch { statuses } if statuses.iter().any(node) => "sets a Node's certificate or raft id",
+        Command::Status { statuses } if statuses.iter().any(|(key, said)| moves(key, said.clone())) => {
+            "sets a Node's certificate or raft id"
+        }
+        Command::Report { node, statuses }
+            if statuses.iter().any(|(key, said)| {
+                let old = store.get(key).and_then(|live| live.status.clone());
+                moves(key, Some(kith_store::reported(old, node, said.clone())))
+            }) =>
+        {
+            "sets a Node's certificate or raft id"
+        }
         _ => return Ok(()),
     };
     // (The command first: the scan of the store for `required` only runs for such a write.)
@@ -1665,6 +1687,83 @@ mod tests {
             let status = Command::Status { statuses: Vec::new() };
             assert!(admit(store, CLUSTER, &status, leader).is_ok());
         }
+    }
+
+    /// A Node's status is what its signature is checked by (`own_writes::admit` reads `certificate`
+    /// from it), and `Command::Status` replaces the whole status and `Report` merges what is said:
+    /// no HTTP route builds either (only the leader's own pipeline, a worker's after
+    /// `worker::checked`, which refuses a Node), but a taken leader could append one. Under
+    /// `required` every node refuses a bare Status or Report on a Node that changes its
+    /// certificate or raft id, and takes one that leaves them (a normal report); `open` keeps both.
+    #[test]
+    fn signed_required_refuses_a_bare_status_or_report_that_changes_a_nodes_certificate() {
+        use serde_json::json;
+        let leader = kith_store::node_id(LEADER);
+        let node = |status: serde_json::Value| {
+            let mut store = required_store();
+            let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: n1}\nspec: {}\n";
+            store.apply(resource(text)).unwrap();
+            store.set_status("Node/n1", Some(status)).unwrap();
+            store
+        };
+        let was = json!({ "certificate": "AA", "raftId": "7", "os": "1" });
+        let status = |said: serde_json::Value| Command::Status {
+            statuses: vec![("Node/n1".into(), Some(said))],
+        };
+        let report = |said: serde_json::Value| Command::Report {
+            node: "n1".into(),
+            statuses: vec![("Node/n1".into(), Some(said))],
+        };
+        let forged = [
+            status(json!({ "certificate": "BB", "raftId": "7" })),
+            status(json!({ "certificate": "AA", "raftId": "8" })),
+            status(json!({ "raftId": "7" })),
+            report(json!({ "certificate": "BB", "raftId": "7", "os": "1" })),
+            report(json!({ "raftId": "9" })),
+            // (A report replaces the status: one that leaves the certificate out takes it away.)
+            report(json!({ "os": "2" })),
+        ];
+        let required = node(was.clone());
+        let open_store = {
+            let mut store = store_with(admin().public_key().as_ref(), "");
+            kith_store::run(&mut store, Command::MarkChecked).unwrap();
+            store
+                .apply(resource(
+                    "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: n1}\nspec: {}\n",
+                ))
+                .unwrap();
+            store.set_status("Node/n1", Some(was.clone())).unwrap();
+            store
+        };
+        for write in &forged {
+            let said = admit(&required, CLUSTER, write, leader).unwrap_err();
+            assert!(said.contains("certificate"), "{write:?}: {said}");
+            assert!(
+                admit(&open_store, CLUSTER, write, leader).is_ok(),
+                "open keeps {write:?}"
+            );
+        }
+        // A normal report keeps them, and another kind's status is as before.
+        let kept = [
+            status(json!({ "certificate": "AA", "raftId": "7", "os": "2" })),
+            report(json!({ "certificate": "AA", "raftId": "7", "os": "2" })),
+        ];
+        for write in &kept {
+            assert!(admit(&required, CLUSTER, write, leader).is_ok(), "{write:?}");
+        }
+        let elsewhere = Command::Status {
+            statuses: vec![("ConfigMap/a".into(), Some(json!({ "certificate": "BB" })))],
+        };
+        assert!(admit(&required, CLUSTER, &elsewhere, leader).is_ok());
+        // Run in a log: the forgeries leave the store as it was.
+        let mut one = node(was.clone());
+        let log: Vec<Command> = forged.into_iter().chain(kept.iter().cloned()).collect();
+        let taken = feed(&mut one, &log);
+        assert_eq!(taken, [vec![false; 6], vec![true; 2]].concat());
+        assert_eq!(
+            one.get("Node/n1").unwrap().status.as_ref().unwrap()["certificate"],
+            "AA"
+        );
     }
 
     /// The entry the certificate route writes for `name`: the admin's signature over `POST

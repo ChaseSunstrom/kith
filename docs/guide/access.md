@@ -185,7 +185,8 @@ and is T-1014.
 admin did not sign is kept, as it always was: a `curl`, a `kubectl apply`, a registry push,
 `kith node claim`, a restore. Under `required` every such write that changes a spec is
 refused on every node, when it is applied: an `Apply`, a `Delete`, a rollback or an import
-with no signature. A change of status is not one, and is kept. A refused write changes
+with no signature. A change of status is not one, and is kept, but for one that changes a
+Node's certificate or raft id: that is refused too. A refused write changes
 nothing and is audited. To make a change under `required`, sign it as a change with the
 admin's key; or set `spec.signing: open` first, and back after.
 

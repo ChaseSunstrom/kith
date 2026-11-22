@@ -477,9 +477,15 @@ nodes too, and a replay decides alike.
   is a pure function of the store and the entry. A follower forwards its signed entry to the
   leader, which accepts it only from the control node named in `who`. Callers use
   `raft::submit_node`. A bare Patch of a Node's `certificate` or `raftId` is refused at apply
-  (`access_sign::bare`), so a taken node cannot take another's identity. Without `required`
-  the writes stay bare, as before.
-- **What stays bare:** a status `Patch`, a `Status`, a `Report`, a snapshot and a
+  (`access_sign::bare`), so a taken node cannot take another's identity; so is a bare
+  `Status` or `Report` on a Node that leaves either different from what the store holds
+  (both replace the status, and `own_writes` reads a node's signing key from
+  `status.certificate`), where one that leaves them as they are is a normal status and is
+  kept. No HTTP route builds a Status or Report for a Node (a worker's is checked by
+  `worker::checked`, which refuses one); the guard is for a taken leader's append. Without
+  `required` the writes stay bare, as before.
+- **What stays bare:** a status `Patch`, a `Status`, a `Report` (but for a Node's
+  certificate or raft id, above), a snapshot and a
   membership entry, as before. The forge VM test is slice 4; slice 5 adds a bare
   Node-certificate Patch and a signed scheduler Volume to it.
 - **Slice 6 (T-0850): the rest of the spec writes.** Under `required` the node's own
@@ -531,7 +537,9 @@ nodes too, and a replay decides alike.
   `required` does cost: a Source that brings a KindDefinition (`sources`) and the prune that
   takes one away, the reaper's delete of an orphaned access kind, and a NetworkPolicy a
   Release renders (the only namespaced kind of these). A person applies those, signed,
-  not a Release; the Release's status says "changes access" or "reaches the mesh". What
+  not a Release; a step that would make or prune an access kind proposes nothing and the Release's
+  status says so, once (`releases::refuse_access`), instead of every node refusing and
+  auditing the same entry each round. What
   remains: a taken
   leader can still write, as the writer of an owner that is there, any other kind that
   writer may write, owned by it, and the owner's prune takes it away. The table test

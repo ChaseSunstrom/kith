@@ -1256,10 +1256,68 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     }
 }
 
+/// Under `spec.signing: required` a node never signs a write that changes access (a Role, a
+/// RoleBinding, an Identity, a KindDefinition, the Cluster: `own_writes`), so every node would
+/// refuse it at apply and audit the refusal again every round. A step that makes or prunes one
+/// proposes nothing: it says so in the Release's (or Source's) status, once. Returns whether it did.
+fn refuse_access(store: &Store, step: &mut Step) -> bool {
+    use kith_store::Command;
+    if !(store.checking() && crate::access_sign::required(store)) {
+        return false;
+    }
+    let apply = Command::Apply {
+        resources: std::mem::take(&mut step.apply),
+        at: 0,
+    };
+    let mut reaches = crate::raft::changes_access(&apply);
+    if let Command::Apply { resources, .. } = apply {
+        step.apply = resources;
+    }
+    reaches = reaches
+        || step
+            .delete
+            .iter()
+            .any(|key| crate::raft::changes_access(&Command::Delete { key: key.clone() }));
+    if !reaches {
+        return false;
+    }
+    let message = format!(
+        "{} makes or removes a Role, RoleBinding, Identity or KindDefinition, which only a person signs \
+         under spec.signing: required; apply it signed, or set signing open",
+        step.release
+    );
+    let Value::Object(status) = failed(&message, None) else {
+        unreachable!("an object")
+    };
+    let status: Map<String, Value> = status
+        .into_iter()
+        .filter(|(field, _)| field != "observedRevision")
+        .collect();
+    let live = store.get(&step.release).and_then(|release| release.status.as_ref());
+    let said = live.is_some_and(|live| status.iter().all(|(field, value)| &live[field] == value));
+    (step.apply, step.delete) = (Vec::new(), Vec::new());
+    step.status = (!said).then_some(status);
+    true
+}
+
 /// Each Release for itself: one that cannot be applied says so and stops no other.
 pub async fn carry_out(shared: &Shared, steps: Vec<Step>, orphans: Vec<String>) {
     use kith_api::store::Error;
     use kith_store::Command;
+    // (Decided once, from the store as it stands; every node decides alike again at apply.)
+    let (steps, orphans) = {
+        let state = shared.store.lock().expect("nothing panics holding the store");
+        let mut steps = steps;
+        for step in &mut steps {
+            refuse_access(&state.store, step);
+        }
+        let blocked = state.store.checking() && crate::access_sign::required(&state.store);
+        let orphans: Vec<String> = orphans
+            .into_iter()
+            .filter(|key| !(blocked && crate::raft::changes_access(&Command::Delete { key: key.clone() })))
+            .collect();
+        (steps, orphans)
+    };
     // (Signed by this node under `spec.signing: required`: every node holds each to what its owner's
     // writer may, `own_writes`.)
     let delete = async |key: String| match shared.submit_node(Command::Delete { key }).await {
@@ -1431,6 +1489,56 @@ mod tests {
         let mut store = Store::default();
         store.apply(map(None)).unwrap();
         assert!(reconcile(&store, "Release/shop/one", &recorded, &wanted, true).is_ok());
+    }
+
+    /// Under `spec.signing: required` a node never signs a write that changes access
+    /// (`own_writes`), so every node would refuse, and audit, a Release's or Source's Role every
+    /// round: a step that makes or prunes one proposes nothing and says why in the status, once.
+    #[test]
+    fn a_step_making_a_role_under_required_proposes_nothing_and_says_so() {
+        const ROLE: &str = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: shop }\nspec: { rules: [] }\n";
+        let mut store = Store::default();
+        apply(&mut store, RELEASE);
+        let step = |apply: Vec<Resource>, delete: Vec<String>| Step {
+            release: "Release/shop/mine".into(),
+            apply,
+            delete,
+            status: Some(Map::new()),
+        };
+        let role = || Resource::from_source(ROLE).unwrap().remove(0).unwrap();
+        apply(
+            &mut store,
+            &format!(
+                "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: c }}\nspec: {{ adminKey: {}, signing: required }}\n",
+                "11".repeat(32)
+            ),
+        );
+        // Open, or below format 4: the step stands.
+        let mut made = step(vec![role()], Vec::new());
+        assert!(!refuse_access(&store, &mut made));
+        assert_eq!(made.apply.len(), 1);
+        kith_store::run(&mut store, kith_store::Command::MarkChecked).unwrap();
+        // What is not access stands; a Role made, or a RoleBinding pruned, does not.
+        let mut plain = step(Vec::new(), vec!["ConfigMap/shop/a".into()]);
+        assert!(!refuse_access(&store, &mut plain));
+        let mut pruned = step(Vec::new(), vec!["RoleBinding/bob-shop".into()]);
+        assert!(refuse_access(&store, &mut pruned));
+        assert!(refuse_access(&store, &mut made));
+        assert!(made.apply.is_empty() && made.delete.is_empty());
+        let status = made.status.clone().expect("a status that says why");
+        assert_eq!(status["state"], "error");
+        assert!(status["message"].as_str().unwrap().contains("spec.signing: required"));
+        // Once it says so, the next round writes nothing at all.
+        kith_store::run(
+            &mut store,
+            kith_store::Command::Patch {
+                statuses: vec![("Release/shop/mine".into(), status)],
+            },
+        )
+        .unwrap();
+        let mut again = step(vec![role()], Vec::new());
+        assert!(refuse_access(&store, &mut again));
+        assert_eq!(again.status, None);
     }
 
     #[test]
