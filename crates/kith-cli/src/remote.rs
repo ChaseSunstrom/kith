@@ -13,12 +13,49 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// A directory only this user can enter, with a name nobody can guess, gone when dropped.
-// ponytail: an interrupt (Ctrl-C) ends the process without running this, and leaves the empty
-// directory in the temp dir; handling signals needs a dependency or unsafe.
+/// What an interrupt cleans up: this process's run directories and carrier pids.
+static LIVE: Mutex<(Vec<PathBuf>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
+
+fn live() -> std::sync::MutexGuard<'static, (Vec<PathBuf>, Vec<u32>)> {
+    LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Makes an interrupt (Ctrl-C), a hangup or a termination end the run as the end of the tunnel
+/// does: the carrier is killed, the directory removed, and the exit status is 128 plus the
+/// signal's number, as a shell gives one. Called before `run` starts a thread (kith has none
+/// before): the signals are blocked in all of them, and one thread takes them (`sigwait`), so
+/// there is no handler, and no unsafe.
+pub fn watch() {
+    use nix::sys::signal::{SigSet, Signal};
+    let mut signals = SigSet::empty();
+    for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
+        signals.add(signal);
+    }
+    if signals.thread_block().is_err() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let Ok(signal) = signals.wait() else { return };
+        let (dirs, pids) = std::mem::take(&mut *live());
+        for pid in pids {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGKILL);
+        }
+        for dir in dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        std::process::exit(128 + signal as i32);
+    });
+}
+
+/// A directory only this user can enter, with a name nobody can guess, gone when dropped (or
+/// when [`watch`] has been told to stop).
 struct Dir(PathBuf);
+
+/// What a Unix socket's path can hold: `sun_path` is 108 bytes, the last for the NUL.
+const SOCKET_PATH_MAX: usize = 107;
 
 impl Dir {
     fn make() -> Result<Dir, String> {
@@ -26,15 +63,33 @@ impl Dir {
         let read = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut random));
         read.or_else(|e| fail(format!("no random numbers: {e}")))?;
         let name: String = random.iter().map(|b| format!("{b:02x}")).collect();
-        let path = std::env::temp_dir().join(format!("kith-run-{name}"));
+        // The carrier binds a socket in here (`t` is the longest name it gets): a path past
+        // `sun_path` fails there, and the tunnel never opens. So the first of the temp dir, the
+        // runtime dir and /tmp where it fits (a long TMPDIR, as a build's, is passed over).
+        let bases = [
+            std::env::temp_dir(),
+            std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            "/tmp".into(),
+        ];
+        let fits = |base: &PathBuf| {
+            !base.as_os_str().is_empty() && base.join(format!("kith-run-{name}/t")).as_os_str().len() <= SOCKET_PATH_MAX
+        };
+        let Some(base) = bases.iter().find(|base| fits(base)) else {
+            return fail("no directory short enough for the run's Unix socket (set TMPDIR to a shorter one)");
+        };
+        let path = base.join(format!("kith-run-{name}"));
         let made = std::fs::DirBuilder::new().mode(0o700).create(&path);
         made.or_else(|e| fail(format!("cannot make {}: {e}", path.display())))?;
+        live().0.push(path.clone());
         Ok(Dir(path))
     }
 }
 
 impl Drop for Dir {
     fn drop(&mut self) {
+        live().0.retain(|path| *path != self.0);
         drop(std::fs::remove_dir_all(&self.0));
     }
 }
@@ -42,8 +97,23 @@ impl Drop for Dir {
 /// The local VIA, killed and waited for when dropped.
 struct Client(Child);
 
+impl Client {
+    /// How the tunnel's end left it: a moment for it to go by itself (its status is the run's),
+    /// then killed. `None` for a status that is not its own (killed by this).
+    fn status(&mut self) -> Option<std::process::ExitStatus> {
+        for _ in 0..50 {
+            if let Ok(Some(status)) = self.0.try_wait() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
+        live().1.retain(|pid| *pid != self.0.id());
         drop(self.0.kill());
         drop(self.0.wait());
     }
@@ -130,6 +200,7 @@ fn carried(program: &str, dir: &Path) -> Result<(Client, UnixStream, Option<Stri
             std::io::ErrorKind::NotFound => fail(format!("{program} is not installed here (kith does not ship it)")),
             _ => fail(format!("cannot start {program}: {e}")),
         })?);
+        live().1.push(client.0.id());
         // The client listens on its socket a moment after it starts.
         let started = Instant::now();
         loop {
@@ -153,6 +224,11 @@ fn carried(program: &str, dir: &Path) -> Result<(Client, UnixStream, Option<Stri
     }
 }
 
+/// Runs the app and returns the exit status of the local carrier (`VIA client`), which is what
+/// `kith run` ends with (see [`exit_code`]): the carrier's exit status, not the app's.
+// ponytail: the app's own status does not cross the tunnel (kith adds no protocol of its own
+// over the carrier's bytes). Real waypipe has not been run against this: which side listens,
+// and what its client exits with, are as its manual says (the guide says so too).
 pub fn run(kithd: &Kithd, on: &str, via: Option<&str>, argv: &[String]) -> Result<ExitCode, String> {
     let program = via.unwrap_or("waypipe");
     let dir = Dir::make()?;
@@ -165,7 +241,7 @@ pub fn run(kithd: &Kithd, on: &str, via: Option<&str>, argv: &[String]) -> Resul
     let body = serde_json::json!({ "on": on, "via": via, "argv": argv });
     let tunnel = open(kithd, &body)?;
     let local = Wire::Socket(local);
-    // Either end done ends both. (The app's own exit status does not come back.)
+    // Either end done ends both.
     let dup = |wire: &Wire| wire.dup().map_err(|e| e.to_string());
     let (mut tunnel_in, mut local_out) = (dup(&tunnel)?, dup(&local)?);
     let (mut local_in, mut tunnel_out) = (dup(&local)?, dup(&tunnel)?);
@@ -179,9 +255,24 @@ pub fn run(kithd: &Kithd, on: &str, via: Option<&str>, argv: &[String]) -> Resul
     local.end();
     tunnel.end();
     drop(up.join());
+    let mut client = client;
+    let status = client.status();
     drop(client);
     drop(dir);
-    Ok(ExitCode::SUCCESS)
+    Ok(exit_code(status))
+}
+
+/// The carrier's exit status as `kith run` ends with it: its code; 128 and the signal's number
+/// for a carrier a signal ended (a shell's way); 0 where it had to be killed here (`None`: the
+/// tunnel was done and it did not follow, which is a run that ended, not one that failed).
+fn exit_code(status: Option<std::process::ExitStatus>) -> ExitCode {
+    use std::os::unix::process::ExitStatusExt;
+    let Some(status) = status else { return ExitCode::SUCCESS };
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1);
+    ExitCode::from(code as u8)
 }
 
 #[cfg(test)]

@@ -46,7 +46,8 @@ pub struct Key {
 
 enum Kind {
     Public(&'static dyn VerificationAlgorithm, Vec<u8>),
-    Identity(crate::keyless::Identity),
+    /// (Shared: a verify runs off the async thread, and takes the identity with it.)
+    Identity(std::sync::Arc<crate::keyless::Identity>),
 }
 
 /// Reads a public key: a PEM file's text (`-----BEGIN PUBLIC KEY-----` …), or its base64
@@ -57,7 +58,7 @@ pub fn key(said: &str) -> Result<Key> {
         let identity = crate::keyless::identity(said)?;
         return Ok(Key {
             id: identity.id.clone(),
-            kind: Kind::Identity(identity),
+            kind: Kind::Identity(std::sync::Arc::new(identity)),
         });
     }
     let lines = said.lines().filter(|line| !line.trim_start().starts_with("-----"));
@@ -112,22 +113,44 @@ pub(crate) async fn signer(
     ))
 }
 
+type Identities<'a> = [(&'a Key, &'a std::sync::Arc<crate::keyless::Identity>)];
+
 /// Whether `signed` is by one of `identities`: the first that it is by, or why not (in `found`).
-fn by_identity(
-    signed: &mut crate::keyless::Signed,
+/// The checks (certificate chains, signatures: CPU work) run on a blocking thread, not this one.
+async fn by_identity(
+    signed: crate::keyless::Signed,
     digest: &str,
-    identities: &[(&Key, &crate::keyless::Identity)],
+    identities: &Identities<'_>,
     found: &mut Vec<String>,
     kept: &str,
 ) -> Option<String> {
-    for (key, identity) in identities {
-        // (Each identity's own `tsa` times the bundle, if it names one.)
-        match crate::keyless::verify(signed, digest, identity) {
-            Ok(()) => return Some(key.id.clone()),
-            Err(why) => found.push(format!("{kept}: {why}")),
+    let owned: Vec<_> = identities
+        .iter()
+        .map(|(key, identity)| (key.id.clone(), std::sync::Arc::clone(identity)))
+        .collect();
+    let (digest, kept_text) = (digest.to_string(), kept.to_string());
+    let ran = tokio::task::spawn_blocking(move || {
+        let (mut signed, mut found) = (signed, Vec::new());
+        for (id, identity) in owned {
+            // (Each identity's own `tsa` times the bundle, if it names one.)
+            match crate::keyless::verify(&mut signed, &digest, &identity) {
+                Ok(()) => return (Some(id), found),
+                Err(why) => found.push(format!("{kept_text}: {why}")),
+            }
+        }
+        (None, found)
+    })
+    .await;
+    match ran {
+        Ok((by, said)) => {
+            found.extend(said);
+            by
+        }
+        Err(e) => {
+            found.push(format!("{kept}: its check did not finish ({e})"));
+            None
         }
     }
-    None
 }
 
 /// cosign 3's bundles among `digest`'s referrers: the identity one is by.
@@ -135,7 +158,7 @@ async fn referred(
     remote: &Remote,
     reference: &Reference,
     digest: &str,
-    identities: &[(&Key, &crate::keyless::Identity)],
+    identities: &Identities<'_>,
     found: &mut Vec<String>,
 ) -> Option<String> {
     let (registry, repository) = (reference.registry().to_string(), reference.repository().to_string());
@@ -179,8 +202,9 @@ async fn referred(
         }
         let bytes = &into.get_ref()[..into.position() as usize];
         match crate::keyless::bundle(bytes) {
-            Ok(mut signed) => {
-                if let Some(by) = by_identity(&mut signed, digest, identities, found, "a bundle among its referrers") {
+            Ok(signed) => {
+                let kept = "a bundle among its referrers";
+                if let Some(by) = by_identity(signed, digest, identities, found, kept).await {
                     return Some(by);
                 }
             }
@@ -248,8 +272,8 @@ async fn look(
                 }
                 let kept = "a signature there made without a kept key";
                 match crate::keyless::tagged(text, signature, cert, note(PROMISE).map(String::as_str)) {
-                    Ok(mut signed) => {
-                        if let Some(by) = by_identity(&mut signed, digest, &identities, found, kept) {
+                    Ok(signed) => {
+                        if let Some(by) = by_identity(signed, digest, &identities, found, kept).await {
                             return Ok(Some(by));
                         }
                     }

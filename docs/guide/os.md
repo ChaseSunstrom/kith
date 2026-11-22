@@ -161,7 +161,7 @@ would refuse with `gpu-amd-phoenix` or `gpu-nvidia-pascal` and whose modules cov
 KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
 KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
 sh ci/vm.sh --test modules   # the same image: drivers load at start, on a device added, and a bad signature is refused
-sh ci/vm.sh --test disk      # a disk file made a data disk (a build with the feature disk-test) and mounted; another file left alone, unchanged
+sh ci/vm.sh --test disk      # kith node disk add on a disk file, mounted after a restart and listed, removed; a file with a signature refused, another file left alone
 ```
 
 For a node whose hardware is not known when the image is built, `features: [all]` turns on
@@ -227,6 +227,50 @@ the image has a driver for needs no restart. Modules in `modules.builtin` or alr
 missing file) is one console line, never an end. Not supported: module parameters,
 `modprobe.d` (blacklists, options), soft dependencies. Compressed modules (`.ko.xz`,
 `.zst`) are loaded by the kernel itself, from 5.17, if it was built to.
+
+#### Modules on the state partition: `# modules: state`
+
+```sh
+sh ci/vm.sh --test modules-state   # the image loads virtio-input from it; ten tampered disks load nothing
+```
+
+A feature whose first line is `# modules: state` (`os/features/modules-state-test.config` is the
+test's) keeps its modules and the firmware they name out of the root. `build.sh` packs them into
+`kith-modules.img` (squashfs, zstd) with a dm-verity tree (`kith-modules.img.verity`), and the
+raw image's state partition carries both as `os/modules-a.img(.verity)`. The root, which the
+UKI's verity hash covers, pins the tree's root hash, its salt and both sizes in
+`/usr/share/kith/modules`, so the chain is the same as the root's: nothing on the state
+partition is trusted for what it says, only for its bytes, and those are checked against a hash
+the root holds. After the state mounts, kithd takes the slot's image (`kith.slot` on the command
+line), opens it without following a link and with the pinned size, attaches it read-only to
+loop devices, maps dm-verity with the pinned hash, mounts the squashfs at `/run/kith/modules`
+(read-only, nosuid, nodev), points `firmware_class.path` at its `lib/firmware`, and runs the
+loader above over its `lib/modules`. A missing, altered, longer, linked or other build's image
+loads nothing: one console line (`kithd: init: modules: ...`) and the Node's status (`modules`)
+say why, and the node serves as before. The disk and the network come up before the state, so
+`build.sh` refuses a block or network driver as a module in such a spec, at the config and
+again over the modules built, and a `.ko` in the root fails the build. Not here: the update path
+(an update's slot-b image), NVIDIA's modules.
+### Secure Boot: an image signed with your own key
+
+```sh
+mkdir -m 700 ~/kith-sb && openssl req -new -x509 -newkey rsa:3072 -nodes -days 3650 -subj '/CN=my kith db/' -keyout ~/kith-sb/db.key -out ~/kith-sb/db.crt
+sh os/build.sh --secure-boot ~/kith-sb   # needs sbsign and sbverify (sbsigntools)
+```
+
+`--secure-boot KEYDIR` signs systemd-boot (the `BOOTX64.EFI` of both disks) and every kernel
+image (slot a and b, so the update's too, and the installer's) with `KEYDIR/db.key` and
+`KEYDIR/db.crt`, then checks each against the certificate before it goes into an ESP or the
+update (`sh ci/secure-boot-check.sh` does this with a throwaway key, and builds twice to show the same bytes; it needs sbsign, sbverify, mcopy and openssl, and exits 3 without them). The certificate is part of the update's kernel digest, so an update that only signs, or changes the key, is a full one, not a kithd-only one. A firmware that has that certificate as a `db` entry then checks the one file that
+carries the root's hash. Without sbsign the build stops with exit 3 (this machine cannot build
+it), and a directory without both files is refused (exit 2). The key is only read: it is
+never copied into an image, and keep it outside the repo. The signature is not part of what the
+TPM measures into PCR 4 (the Authenticode hash leaves it out), so sealing to PCR 4 is as before.
+
+Not done yet: enrolling the certificate. The installer does not write it into the firmware, so
+until it does you enroll it by hand (your firmware's setup, or `sbctl`/`virt-fw-vars` on the
+variable store); and the netboot image is not signed. Until then an image built with
+`--secure-boot` is the same as one without on a firmware with Secure Boot off.
 
 ### Updating a node: two slots
 
@@ -813,6 +857,34 @@ What is and is not protected:
 Not yet: a passphrase and the TPM both asked for, the cluster's key and the TPM both asked for,
 a keyboard layout at the console, the disk's secret
 kept in the TPM, a duress code that opens a decoy.
+
+### A second disk for a node's data
+
+A machine with a second disk can keep data on it, encrypted as a whole under a key kept in the
+node's own state (so a node whose state is not encrypted adds none). Run these where kithd runs
+(its own socket, as root): `NODE` is the node that kithd is.
+
+```
+kith node disk list NODE                   # the disks it has, and the ones it left alone
+kith node disk add NODE SERIAL [--wipe] [--quick]
+kith node disk remove NODE ID
+```
+
+- `list` shows each disk by its serial (and its id once it is a data disk). Nothing is taken
+  that has not been added: a stick, a backup disk or the disk the system runs from is left alone.
+- `add` names a disk by its **serial** (as `list` shows it), overwrites it through the
+  encryption (a large disk takes hours; `--quick` discards its blocks instead, which is fast
+  and shows which regions held data) and mounts it. The node mounts it again at every start. It
+  refuses a disk that holds a partition table, a filesystem or any data unless given `--wipe`,
+  and always the disk the system runs from.
+- `remove` takes the disk's id: its header is zeroed and its key forgotten, so what it holds can
+  no longer be read (the disk is not erased). A disk that is not in the machine any more has its
+  entry and key forgotten. One in use is refused.
+- Who may ask: whoever may apply (`add`), delete (`remove`) or get (`list`) a NodeKey. Each add and
+  remove, done or refused, is written to the audit log with who asked and the serial; an add
+  and a remove are written again when they begin, since they take long. Never a key.
+
+The design is in [adr-second-disk.md](../adr-second-disk.md).
 
 ### Not in kith OS yet
 

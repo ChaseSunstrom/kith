@@ -1256,32 +1256,36 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     }
 }
 
-/// Under `spec.signing: required` every node refuses, at apply, a bare write that changes access
-/// ([`crate::access_sign::refuses_render`]) and a Release's or a Source's is bare until slice 6
-/// (T-0850). So a step that makes or prunes a Role, RoleBinding, Identity or KindDefinition
-/// proposes nothing: it says so in the Release's (or Source's) status, once, not in an entry
-/// every node audits again every round. Returns whether it did.
+/// Under `spec.signing: required` a node never signs a write that changes access (a Role, a
+/// RoleBinding, an Identity, a KindDefinition, the Cluster: `own_writes`), so every node would
+/// refuse it at apply and audit the refusal again every round. A step that makes or prunes one
+/// proposes nothing: it says so in the Release's (or Source's) status, once. Returns whether it did.
 fn refuse_access(store: &Store, step: &mut Step) -> bool {
     use kith_store::Command;
+    if !(store.checking() && crate::access_sign::required(store)) {
+        return false;
+    }
     let apply = Command::Apply {
         resources: std::mem::take(&mut step.apply),
         at: 0,
     };
-    let mut why = crate::access_sign::refuses_render(store, &apply);
+    let mut reaches = crate::own_writes::never_signed(&apply);
     if let Command::Apply { resources, .. } = apply {
         step.apply = resources;
     }
-    why = why.or_else(|| {
-        let delete = |key: &String| Command::Delete { key: key.clone() };
-        step.delete
+    reaches = reaches
+        || step
+            .delete
             .iter()
-            .find_map(|key| crate::access_sign::refuses_render(store, &delete(key)))
-    });
-    let Some(why) = why else { return false };
+            .any(|key| crate::own_writes::never_signed(&Command::Delete { key: key.clone() }));
+    if !reaches {
+        return false;
+    }
     let message = format!(
-        "{} makes or removes a Role, RoleBinding, Identity or KindDefinition, which a Release or Source \
-         may not yet under spec.signing: required ({why}); apply it signed, or set signing open",
-        step.release
+        "{} makes or removes one of {}, which only a person signs under spec.signing: required; \
+         apply it signed, or set signing open",
+        step.release,
+        crate::own_writes::never_signed_kinds()
     );
     let Value::Object(status) = failed(&message, None) else {
         unreachable!("an object")
@@ -1308,15 +1312,16 @@ pub async fn carry_out(shared: &Shared, steps: Vec<Step>, orphans: Vec<String>) 
         for step in &mut steps {
             refuse_access(&state.store, step);
         }
+        let blocked = state.store.checking() && crate::access_sign::required(&state.store);
         let orphans: Vec<String> = orphans
             .into_iter()
-            .filter(|key| {
-                crate::access_sign::refuses_render(&state.store, &Command::Delete { key: key.clone() }).is_none()
-            })
+            .filter(|key| !(blocked && crate::own_writes::never_signed(&Command::Delete { key: key.clone() })))
             .collect();
         (steps, orphans)
     };
-    let delete = async |key: String| match shared.submit(Command::Delete { key }).await {
+    // (Signed by this node under `spec.signing: required`: every node holds each to what its owner's
+    // writer may, `own_writes`.)
+    let delete = async |key: String| match shared.submit_node(Command::Delete { key }).await {
         Ok(_) | Err(Error::NotFound(_)) => Ok(()),
         Err(e) => Err(e),
     };
@@ -1329,7 +1334,7 @@ pub async fn carry_out(shared: &Shared, steps: Vec<Step>, orphans: Vec<String>) 
         if !step.apply.is_empty() {
             let at = kith_api::store::now();
             let applied = shared
-                .submit(Command::Apply {
+                .submit_node(Command::Apply {
                     resources: step.apply,
                     at,
                 })
@@ -1487,9 +1492,9 @@ mod tests {
         assert!(reconcile(&store, "Release/shop/one", &recorded, &wanted, true).is_ok());
     }
 
-    /// Under `spec.signing: required` a step that makes a Role (a Source's: a Release's render
-    /// may not hold one, but a Source's may) or prunes one proposes nothing and says why, once:
-    /// every node would refuse the bare write at apply, and audit it, every round.
+    /// Under `spec.signing: required` a node never signs a write that changes access
+    /// (`own_writes`), so every node would refuse, and audit, a Release's or Source's Role every
+    /// round: a step that makes or prunes one proposes nothing and says why in the status, once.
     #[test]
     fn a_step_making_a_role_under_required_proposes_nothing_and_says_so() {
         const ROLE: &str = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: shop }\nspec: { rules: [] }\n";
@@ -1535,6 +1540,82 @@ mod tests {
         let mut again = step(vec![role()], Vec::new());
         assert!(refuse_access(&store, &mut again));
         assert_eq!(again.status, None);
+    }
+
+    /// Every kind a node never signs (`own_writes::signed`: access and network kinds) is held back
+    /// the same way: a step making or pruning one is emptied, and says why once.
+    #[test]
+    fn a_step_making_any_kind_a_node_never_signs_proposes_nothing_and_says_so_once() {
+        let kinds = [
+            "Role",
+            "RoleBinding",
+            "Identity",
+            "KindDefinition",
+            "Cluster",
+            "AccessLevel",
+            "RemotePeer",
+            "NetworkPolicy",
+            "Exit",
+        ];
+        for kind in kinds {
+            // (A store for each kind: the status a refusal leaves must not hide the next one's.)
+            let mut store = Store::default();
+            apply(&mut store, RELEASE);
+            apply(
+                &mut store,
+                &format!(
+                    "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: c }}\nspec: {{ adminKey: {}, signing: required }}\n",
+                    "11".repeat(32)
+                ),
+            );
+            kith_store::run(&mut store, kith_store::Command::MarkChecked).unwrap();
+            // (Built unvalidated: the spec is not what is under test, only the kind.)
+            let resource = || -> Resource {
+                serde_json::from_value(serde_json::json!({
+                    "apiVersion": "kith.dev/v1", "kind": kind, "metadata": { "name": "x" }, "spec": {}
+                }))
+                .unwrap()
+            };
+            let make = || Step {
+                release: "Release/shop/mine".into(),
+                apply: vec![resource()],
+                delete: Vec::new(),
+                status: Some(Map::new()),
+            };
+            let mut made = make();
+            assert!(refuse_access(&store, &mut made), "{kind}: a step making one is refused");
+            assert!(
+                made.apply.is_empty() && made.delete.is_empty(),
+                "{kind}: nothing proposed"
+            );
+            let mut pruned = Step {
+                apply: Vec::new(),
+                delete: vec![format!("{kind}/x")],
+                ..make()
+            };
+            assert!(
+                refuse_access(&store, &mut pruned),
+                "{kind}: a step pruning one is refused"
+            );
+            assert!(pruned.delete.is_empty(), "{kind}: no delete proposed");
+            let status = made.status.clone().expect("says why");
+            assert_eq!(status["state"], "error", "{kind}");
+            let message = status["message"].as_str().unwrap();
+            assert!(
+                message.contains(&format!(" {kind},")),
+                "{kind}: the status names it: {message}"
+            );
+            kith_store::run(
+                &mut store,
+                kith_store::Command::Patch {
+                    statuses: vec![("Release/shop/mine".into(), status)],
+                },
+            )
+            .unwrap();
+            let mut again = make();
+            assert!(refuse_access(&store, &mut again));
+            assert_eq!(again.status, None, "{kind}: said once, then silent");
+        }
     }
 
     #[test]
