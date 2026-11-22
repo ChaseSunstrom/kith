@@ -232,7 +232,22 @@ fn beyond(store: &Store, resources: &[Resource]) -> Vec<Right> {
         .iter()
         .filter(|resource| unconfined(resource))
         .map(|_| (Verb::Apply, "Unconfined".to_string(), None, None));
-    made.chain(reached(&written)).chain(loose).collect()
+    // A Repository that names a Secret for a registry login has it read by kithd as its writer:
+    // whoever writes one must be allowed to get that Secret (credentials() asks again when it reads).
+    let logins = resources
+        .iter()
+        .filter(|resource| resource.kind == "Repository")
+        .filter_map(|resource| serde_json::from_value::<kith_api::kinds::RepositorySpec>(resource.spec.clone()).ok())
+        .filter_map(|spec| spec.credentials)
+        .map(|login| {
+            (
+                Verb::Get,
+                "Secret".to_string(),
+                Some(login.namespace),
+                Some(login.secret),
+            )
+        });
+    made.chain(reached(&written)).chain(loose).chain(logins).collect()
 }
 
 /// Whether applying `resource` sets a container's seccomp unconfined, or names calls its filter
@@ -1168,6 +1183,15 @@ spec: {}
         let bob = Caller::Identity("bob".into());
         assert!(reach(&shared, &bob, &share).is_err(), "bob may not write Volumes");
         assert!(reach(&shared, &bob, &backup).is_err(), "bob may not read Secrets");
+        // A Repository that names a Secret for its login reads it as its writer may: leave to get it.
+        let repo = |more: &str| {
+            let head = "apiVersion: kith.dev/v1\nkind: Repository\nmetadata: {name: r}\n";
+            one(&format!("{head}spec: {{url: 'oci://127.0.0.1:1/kith'{more}}}\n"))
+        };
+        let login = ", credentials: {namespace: default, secret: s}";
+        assert!(reach(&shared, &bob, &repo("")).is_ok());
+        assert!(reach(&shared, &bob, &repo(login)).is_err(), "bob may not read Secrets");
+        assert!(reach(&shared, &Caller::Admin, &repo(login)).is_ok());
         assert!(reach(&shared, &Caller::Admin, &share).is_ok());
         assert!(reach(&shared, &Caller::Admin, &backup).is_ok());
         // An Image gives a Volume's files to every process of every node: leave to read it.

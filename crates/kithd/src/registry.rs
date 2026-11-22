@@ -2,8 +2,9 @@
 //! as the repository `PATH/NAME`, each version an artifact tagged with it. The artifact
 //! is what [`kith_packages::artifact`] says: one blob, the signature an annotation.
 //
-// ponytail: no credentials (public registries, or ones that trust the network they are
-// on); plain HTTP only to this machine. Logins when a private registry is first wanted.
+// ponytail: a login only from a Repository's Secret (read as its writer may read it), sent
+// as Basic to the registry or to its token realm, never to a Source's registry or a push;
+// plain HTTP only to this machine.
 // A registry is one an admin named, but not trusted to drown us or to send us inward:
 // the blob is capped (and pulled by oci-client), the manifest, the list of tags and the
 // token's answer are our own capped requests, a token is asked for only at the registry's
@@ -198,7 +199,7 @@ fn at(web: &Web, reference: &Reference, path: &str) -> String {
 
 /// What the registry answers `url` with (see [`at`]), at most `limit` bytes of it, and the
 /// next page it names in a `Link` header, if it does: only on the registry's own scheme,
-/// host and port, else an error. A token is fetched when the registry asks for one, only
+/// host, port and path (the same list), else an error. A token is fetched when the registry asks for one, only
 /// from the registry's own host (and handed to `oci`, as the blob is pulled by it); one
 /// that was is used again.
 async fn capped(
@@ -234,6 +235,7 @@ async fn capped(
                     url.scheme().to_string(),
                     url.host_str().map(str::to_string),
                     url.port_or_known_default(),
+                    url.path().to_string(),
                 )
             };
             match key(&next) == key(&own) {
@@ -266,12 +268,9 @@ async fn answer(oci: &Client, web: &Web, reference: &Reference, challenge: &str)
     let Some(login) = web.login.as_ref().filter(|_| basically) else {
         return bearer(oci, web, reference, challenge).await;
     };
+    // (Never through oci-client's `auth`: it probes `/v2/` unvetted and sends the login to the
+    // realm that names. The blob is then fetched by `pull_as` itself, see there.)
     let header = basic(login);
-    // (As the token is: what oci-client sends with the blob's request.)
-    let auth = oci_client::secrets::RegistryAuth::Basic(login.0.clone(), login.1.clone());
-    oci.auth(reference, &auth, RegistryOperation::Pull)
-        .await
-        .map_err(|e| e.to_string())?;
     *web.token.lock().expect("nothing panics holding it") = Some(header.clone());
     Ok(header)
 }
@@ -475,8 +474,16 @@ pub async fn pull_as(
     // (Room for what the manifest says and no more: a registry that sends more fails.)
     let size = usize::try_from(layer.size).unwrap_or_default();
     let mut blob = vec![0; size];
-    if web.outward {
-        // (Not by oci-client, which goes wherever a name or a redirect leads.)
+    let basically = web
+        .token
+        .lock()
+        .expect("nothing panics holding it")
+        .as_deref()
+        .is_some_and(|token| token.starts_with("Basic "));
+    // ponytail: a Basic login stays on the registry's own origin, so a registry that
+    // redirects its blobs to a CDN fails with one; follow it there only if that is asked for.
+    if web.outward || basically {
+        // (Not by oci-client, which goes wherever a name or a redirect leads, with the login.)
         let at = format!(
             "{}://{}/v2/{}/blobs/{}",
             web.scheme,
@@ -519,21 +526,27 @@ pub async fn versions(url: &str, name: &str, login: Option<&Login>) -> Fallible<
     web.login = login.cloned();
     let mut page = at(&web, &reference, "tags/list?n=1000");
     let mut tags: Vec<String> = Vec::new();
-    for _ in 0..MAX_PAGES {
-        let (listed, next) = capped(&client, &web, &reference, &page, "application/json", MANIFEST_LIMIT).await?;
-        let listed: Value = serde_json::from_slice(&listed).map_err(|e| format!("{reference}: {e}"))?;
-        let more: Option<Vec<String>> =
-            serde_json::from_value(listed["tags"].clone()).map_err(|e| format!("{reference}: tags: {e}"))?;
-        tags.extend(more.unwrap_or_default());
-        if tags.len() > MAX_TAGS {
-            return Err(format!("{reference}: more than {MAX_TAGS} tags"));
+    let all = async {
+        for _ in 0..MAX_PAGES {
+            let (listed, next) = capped(&client, &web, &reference, &page, "application/json", MANIFEST_LIMIT).await?;
+            let listed: Value = serde_json::from_slice(&listed).map_err(|e| format!("{reference}: {e}"))?;
+            let more: Option<Vec<String>> =
+                serde_json::from_value(listed["tags"].clone()).map_err(|e| format!("{reference}: tags: {e}"))?;
+            tags.extend(more.unwrap_or_default());
+            if tags.len() > MAX_TAGS {
+                return Err(format!("{reference}: more than {MAX_TAGS} tags"));
+            }
+            match next {
+                Some(next) => page = next,
+                None => return Ok(std::mem::take(&mut tags)),
+            }
         }
-        match next {
-            Some(next) => page = next,
-            None => return Ok(tags),
-        }
-    }
-    Err(format!("{reference}: more than {MAX_PAGES} pages of tags"))
+        Err(format!("{reference}: more than {MAX_PAGES} pages of tags"))
+    };
+    // (Every page has its own patience; the whole list gets twice one's, not fifty.)
+    tokio::time::timeout(PATIENCE * 2, all)
+        .await
+        .unwrap_or_else(|_| Err(format!("{url}/{name}: the tags took more than {:?}", PATIENCE * 2)))
 }
 
 /// The package in a pulled `blob`: signed by `public` when there is one, and the
@@ -673,6 +686,10 @@ const PASSED_OVER: usize = 5;
 async fn fetch(shared: &Shared, wanted: &Wanted) -> Fallible<(Option<Resource>, Vec<String>)> {
     let login = {
         let state = shared.store.lock().expect("nothing panics holding the store");
+        // (Asked of the Repository as it was: one applied since, by another, is asked again.)
+        if crate::releases::origin(&state.store, &wanted.repository).as_ref() != Some(&wanted.origin) {
+            return Err(format!("Repository/{} changed, and is asked again", wanted.repository));
+        }
         credentials(&state.store, &wanted.repository)?
     };
     let mut versions = versions(&wanted.url, &wanted.name, login.as_ref()).await?;
@@ -1183,6 +1200,30 @@ mod tests {
         assert_eq!(asked.lock().unwrap().len(), MAX_PAGES);
     }
 
+    #[tokio::test]
+    async fn registry_tags_follow_no_more_than_a_cap_of_tags() {
+        let tags: Vec<String> = (0..=MAX_TAGS).map(|n| format!("1.0.{n}")).collect();
+        let body = json!({ "tags": tags }).to_string().into_bytes();
+        let (port, _) = fake(move |_, _, _| (200, vec![], body.clone())).await;
+        let e = versions(&url(port), "pkg", None).await.unwrap_err();
+        assert!(e.contains("tags") && e.contains(&MAX_TAGS.to_string()), "{e}");
+    }
+
+    #[tokio::test]
+    async fn registry_tags_follow_a_link_only_to_the_same_list() {
+        let (port, asked) = fake(|_, path, _| match path.contains("/manifests/") {
+            true => (200, vec![], br#"{"tags":["9.9.9"]}"#.to_vec()),
+            false => {
+                let link = "link: </v2/kith/other/manifests/latest>; rel=\"next\"".to_string();
+                (200, vec![link], br#"{"tags":["1.0.0"]}"#.to_vec())
+            }
+        })
+        .await;
+        let e = versions(&url(port), "pkg", None).await.unwrap_err();
+        assert!(e.contains("not the registry's own"), "{e}");
+        assert_eq!(asked.lock().unwrap().len(), 1, "{:?}", asked.lock().unwrap());
+    }
+
     fn ann() -> Login {
         ("ann".into(), "s3cret".into()) // pragma: allowlist secret
     }
@@ -1232,6 +1273,29 @@ mod tests {
             assert!(versions(&url(port), "pkg", Some(&wrong)).await.is_err(), "{bare}");
             assert!(!asked.lock().unwrap().is_empty());
         }
+    }
+
+    /// A registry that wants Basic, whose `/v2/` points at a token realm on another port: the
+    /// login is asked for by us, so only the registry (never what oci-client would probe) gets it.
+    #[tokio::test]
+    async fn registry_credentials_a_basic_login_is_never_sent_to_a_realm_found_on_v2() {
+        let (elsewhere, reached) = fake(|_, _, _| (200, vec![], br#"{"token":"tok"}"#.to_vec())).await;
+        let manifest = manifest(0);
+        let (port, _) = headed(move |_, path, authorization| match path {
+            "/v2/" => {
+                let challenge = format!("www-authenticate: Bearer realm=\"http://127.0.0.1:{elsewhere}/token\"");
+                (401, vec![challenge], vec![])
+            }
+            _ if authorization != basic(&ann()) => (401, vec!["www-authenticate: Basic realm=\"fake\"".into()], vec![]),
+            _ if path.contains("/manifests/") => (200, vec![], manifest.clone()),
+            _ if path.contains("/blobs/") => (200, vec![], BLOB.to_vec()),
+            _ => (404, vec![], vec![]),
+        })
+        .await;
+        let (blob, _) = pull_as(&url(port), "pkg", "1.0.0", false, Some(&ann())).await.unwrap();
+        assert_eq!(blob.as_slice(), BLOB);
+        let reached = reached.lock().unwrap().clone();
+        assert!(reached.is_empty(), "the login was sent to another realm: {reached:?}");
     }
 
     /// The Secret behind a Repository is read as the Repository's writer may read it.
