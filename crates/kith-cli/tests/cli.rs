@@ -941,10 +941,26 @@ fn cluster_fields_nothing_reads_are_said() {
 
 /// A kithd on a unix socket that answers each request with `answer(method, path, body)`, a JSON
 /// text, and keeps what it was asked as `METHOD PATH BODY`. (The cluster's signing is open.)
+/// The socket [`fake_kithd`] binds: removed when the test is done with it.
+struct Socket(PathBuf);
+
+impl std::ops::Deref for Socket {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn fake_kithd(
     sb: &Sandbox,
     answer: impl Fn(&str, &str, &str) -> String + Send + 'static,
-) -> (PathBuf, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+) -> (Socket, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{Read, Write};
     // A unix socket path is cut at about 100 bytes, and a lane's target dir is longer: bind in
     // the short temp dir, named by the sandbox.
@@ -989,7 +1005,7 @@ fn fake_kithd(
             );
         }
     });
-    (socket, seen)
+    (Socket(socket), seen)
 }
 
 fn kith_at(socket: &Path, args: &[&str]) -> (i32, String, String) {
@@ -1017,7 +1033,7 @@ fn bare(
     })
 }
 
-/// `kith ca export FILE` writes the cluster CA's certificate, the public half, for a phone or a
+/// `kith ca export FILE` writes the LAN CA's certificate, the public half, for a phone or a
 /// laptop to trust once; without a FILE it prints it. A reply that carries a key is refused and
 /// nothing is written: the CA key stays where it is.
 #[test]
@@ -1029,7 +1045,8 @@ fn ca_export_writes_the_cluster_ca_certificate_only() {
     let (code, _, said) = kith_at(&socket, &["ca", "export", file.to_str().unwrap()]);
     assert_eq!(code, 0, "{said}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), pem);
-    assert_eq!(seen.lock().unwrap().as_slice(), ["GET /v1/ca "]);
+    // (The LAN CA's certificate, the one the name constraints bind; never the cluster root.)
+    assert_eq!(seen.lock().unwrap().as_slice(), ["GET /v1/ca/lan "]);
     // Without a file: on stdout, for a pipe.
     let (code, out, said) = kith_at(&socket, &["ca", "export"]);
     assert!(code == 0 && out == pem, "{code}: {out} {said}");

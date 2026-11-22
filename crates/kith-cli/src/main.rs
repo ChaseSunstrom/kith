@@ -337,8 +337,10 @@ enum IdentityCommand {
 
 #[derive(Subcommand)]
 enum CaCommand {
-    /// Write the CA's certificate (public: never the key) to FILE, or print it. Trust it once
-    /// on a device and the hosts that say `expose.issuer: cluster` open there without a warning
+    /// Write the LAN CA's certificate (public: never a key) to FILE, or print it; run it on the
+    /// node that holds the CA. It vouches only for the cluster's LAN names (`spec.lanDomains`), so
+    /// trust it once on a device and the hosts that say `expose.issuer: cluster` open there
+    /// without a warning, and no other name does
     Export { file: Option<PathBuf> },
 }
 
@@ -1981,7 +1983,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("the CA is kithd's: leave out --store");
             };
-            let pem = String::from_utf8(raw(&kithd, "GET", "/v1/ca", b"")?)
+            let pem = String::from_utf8(raw(&kithd, "GET", "/v1/ca/lan", b"")?)
                 .map_err(|_| "error: kithd's reply is not text".to_string())?;
             // (A certificate and nothing else: what is written for the world to trust holds no key.)
             if pem.contains("PRIVATE KEY") || !pem.contains("BEGIN CERTIFICATE") {
@@ -1991,7 +1993,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 Some(file) => {
                     std::fs::write(&file, &pem).map_err(|e| format!("error: writing {}: {e}", file.display()))?;
                     println!(
-                        "The cluster CA's certificate is in {}: trust it once on each device",
+                        "The LAN CA's certificate is in {}: trust it once on each device (it vouches only for the cluster's LAN names)",
                         file.display()
                     );
                 }

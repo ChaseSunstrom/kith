@@ -371,17 +371,21 @@ port 80 redirects. The ports need CAP_NET_BIND_SERVICE.
   accepts its terms) to get and renew one from Let's Encrypt. Point the host's DNS at the
   ingress nodes first, and give `--acme` to every control node that may lead (the leader orders
   for ingress workers; under `spec.signing: required` a control node that does not lead orders only once the admin has set `spec.ingress: true` on its Node). `kith get service/NAME -o yaml` shows `tls`; a failure is retried an
-  hour later. Keys, and the ACME account's (`Secret/kith-system/acme-account`), are Secrets in
+  hour later, for either issuer, and the same failure is not written to the status twice. Keys, and the ACME account's (`Secret/kith-system/acme-account`), are Secrets in
   the store.
-- **A name only the LAN knows:** `expose.issuer: cluster` (the default is `acme`) has the
-  cluster's own CA sign the host's certificate, with no authority asked: the node that holds
+- **A name only the LAN knows:** `expose.issuer: cluster` (the default is `acme`) has a CA of
+  the cluster's own sign the host's certificate, with no authority asked: the node that holds
   the CA key makes it for 30 days, keeps it in `tls-<host>`, says `tls.source: cluster` in the
-  Service's status, and makes a new one in the last third of its life. `kith ca export [FILE]`
-  writes the CA's public certificate (never the key) for a phone or laptop to trust once. The
-  CA then vouches for any name a Service says with `issuer: cluster`, so trust it only on
-  devices you own, and keep `spec.hosts` on Namespaces that others may apply Services to.
-  The cluster's own names (`kith`, `*.kith`), wildcards and addresses are not signed, and there
-  is no revocation: the short life is it. The CA key never leaves its node.
+  Service's status, and makes a new one in the last third of its life. The signer is a LAN CA,
+  apart from the cluster's root: its own key (which never leaves that node) and a certificate
+  with X.509 name constraints for the cluster's LAN domains, `home.arpa`, `lan`, `internal` and
+  `local` unless a Cluster's `spec.lanDomains` names others. `kith ca export [FILE]`, run on the
+  CA's node, writes that certificate (never a key) for a phone or laptop to trust once; a device
+  that trusts it takes nothing outside those domains from it. A host outside them, under
+  `cluster.local` or `kith`, a single label, a wildcard or an address is refused when applied
+  (the domains are checked too once a Cluster names them) and again when signed, and a
+  Namespace's `spec.hosts` still keeps the hosts it names. The workloads' `ca.crt` and the mesh
+  do not trust the LAN CA. There is no revocation: the short life is it.
 - **Bytes as they are:** TLS ends at the ingress and nothing is added; NetworkPolicy sees the
   ingress node. `expose.proxyProtocol: true` sends a PROXY v1 line (`PROXY TCP4 <client>
   <ingress> <client port> <ingress port>`) first; clients inside the mesh send none, so the

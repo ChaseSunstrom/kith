@@ -15,7 +15,8 @@
 // dependency of rcgen's, and the walk to them is a few lines.
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, NameConstraints,
 };
 use ring::rand::SecureRandom;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -160,13 +161,84 @@ fn host_name(host: &str) -> Fallible<()> {
 pub struct Ca {
     key: KeyPair,
     pub cert: String,
+    /// Where the LAN CA's files go (`keep_in`).
+    dir: Option<std::path::PathBuf>,
+    lan: Mutex<Option<Arc<LanCa>>>,
+}
+
+/// The certificate authority for names only a LAN knows (`issuer: cluster`): a key of its own,
+/// that signs no node, Identity or Workload and that no mesh or Workload trusts, and a certificate
+/// that holds it to the cluster's LAN domains (X.509 name constraints). That certificate, and not
+/// the cluster's, is the one a phone or laptop is given (`kith ca export`).
+pub struct LanCa {
+    key: KeyPair,
+    pub cert: String,
+    domains: Vec<String>,
+}
+
+/// The LAN CA's certificate: constrained to `domains` and, whatever they are, kept out of the
+/// zones the cluster answers for itself (`cluster.local` is under `local`).
+fn lan_ca_params(domains: &[String]) -> CertificateParams {
+    let dns = |names: Vec<&str>| {
+        names
+            .into_iter()
+            .map(|d| GeneralSubtree::DnsName(d.to_string()))
+            .collect()
+    };
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, "kith LAN CA");
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    params.not_after = rcgen::date_time_ymd(year_in(10), 1, 1);
+    params.name_constraints = Some(NameConstraints {
+        permitted_subtrees: dns(domains.iter().map(String::as_str).collect()),
+        excluded_subtrees: dns(kith_api::kinds::RESERVED_ZONES.to_vec()),
+    });
+    params
+}
+
+impl LanCa {
+    /// A server certificate for the LAN name `host` and a new key, as (certificate, key): good
+    /// from a minute before `now` (seconds since 1970) for `life`, and for serving TLS only. It
+    /// names no node, Identity or Workload. A short life is the only revocation there is. Not
+    /// for a name `cluster_host_refused` refuses (the one rule the apply of a Service reads too).
+    pub fn issue_host(&self, host: &str, now: u64, life: Duration) -> Fallible<(String, String)> {
+        host_name(host)?;
+        if let Some(refused) = kith_api::kinds::cluster_host_refused(host, Some(&self.domains)) {
+            return Err(refused);
+        }
+        self.sign_host(host, now, life)
+    }
+
+    fn sign_host(&self, host: &str, now: u64, life: Duration) -> Fallible<(String, String)> {
+        if life.is_zero() || life > HOST_LIFE_MAX {
+            return Err("a host certificate lasts more than 0 and at most 90 days".into());
+        }
+        let mut params = tls("naming the certificate", CertificateParams::new(vec![host.to_string()]))?;
+        params.distinguished_name.push(DnType::CommonName, host);
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.use_authority_key_identifier_extension = true;
+        // A minute before, for a clock behind the CA holder's.
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now.saturating_sub(60));
+        params.not_after = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now) + life;
+        let key = tls("making the key", KeyPair::generate())?;
+        let issuer = Issuer::new(lan_ca_params(&self.domains), &self.key);
+        let cert = tls("signing the certificate", params.signed_by(&key, &issuer))?;
+        Ok((cert.pem(), key.serialize_pem()))
+    }
 }
 
 impl Ca {
     pub fn create() -> Fallible<Ca> {
         let key = tls("making the CA key", KeyPair::generate())?;
         let cert = tls("making the CA certificate", ca_params().self_signed(&key))?.pem();
-        Ok(Ca { key, cert })
+        Ok(Ca {
+            key,
+            cert,
+            dir: None,
+            lan: Mutex::new(None),
+        })
     }
 
     /// A key pair and certificate for the node `name`, as (certificate, key).
@@ -223,27 +295,64 @@ impl Ca {
         Ok(tls("signing the certificate", params.signed_by(&NodeKey(point), &issuer))?.pem())
     }
 
-    /// A server certificate for the LAN name `host` (no wildcard, no address, nothing under
-    /// `kith`: those names are the cluster's own) and a new key, as (certificate, key): good from a
-    /// minute before `now` (seconds since 1970) for `life`, and for serving TLS only. It names no
-    /// node, Identity or Workload. A short life is the only revocation there is.
-    pub fn issue_host(&self, host: &str, now: u64, life: Duration) -> Fallible<(String, String)> {
-        host_name(host)?;
-        if life.is_zero() || life > HOST_LIFE_MAX {
-            return Err("a host certificate lasts more than 0 and at most 90 days".into());
+    /// Where the LAN CA's files are kept (beside the CA key). Without it the LAN CA lives as long
+    /// as this `Ca` does.
+    pub fn keep_in(mut self, dir: &Path) -> Ca {
+        self.dir = Some(dir.to_path_buf());
+        self
+    }
+
+    /// The LAN CA for the domains `named` (a Cluster's `spec.lanDomains`; none is the defaults):
+    /// made on first use with a key of its own, which is kept like this CA's and goes nowhere,
+    /// and a certificate that holds it to those domains. Asked for other domains, it is made
+    /// again for them, with the same key.
+    pub fn lan(&self, named: &[String]) -> Fallible<Arc<LanCa>> {
+        let mut domains = kith_api::kinds::lan_domains(named);
+        domains.sort();
+        domains.dedup();
+        let mut held = self.lan.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lan) = held.as_ref().filter(|lan| lan.domains == domains) {
+            return Ok(lan.clone());
         }
-        let mut params = tls("naming the certificate", CertificateParams::new(vec![host.to_string()]))?;
-        params.distinguished_name.push(DnType::CommonName, host);
-        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.use_authority_key_identifier_extension = true;
-        // A minute before, for a clock behind the CA holder's.
-        params.not_before = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now.saturating_sub(60));
-        params.not_after = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now) + life;
-        let key = tls("making the key", KeyPair::generate())?;
-        let issuer = Issuer::new(ca_params(), &self.key);
-        let cert = tls("signing the certificate", params.signed_by(&key, &issuer))?;
-        Ok((cert.pem(), key.serialize_pem()))
+        let read = |file: &str| {
+            let dir = self.dir.as_ref()?;
+            std::fs::read_to_string(dir.join(file)).ok()
+        };
+        let key_pem = held
+            .as_ref()
+            .map(|lan| lan.key.serialize_pem())
+            .or_else(|| read("lan-ca.key"));
+        let key = match &key_pem {
+            Some(pem) => tls("reading the LAN CA key", KeyPair::from_pem(pem))?,
+            None => tls("making the LAN CA key", KeyPair::generate())?,
+        };
+        // The certificate kept, if it was made for these domains: what was exported stays what it was.
+        let kept = read("lan-ca.domains")
+            .filter(|kept| kept.trim() == domains.join(","))
+            .and_then(|_| read("lan-ca.crt"))
+            .filter(|_| key_pem.is_some());
+        let cert = match kept {
+            Some(cert) => cert,
+            None => {
+                let cert = tls(
+                    "making the LAN CA certificate",
+                    lan_ca_params(&domains).self_signed(&key),
+                )?
+                .pem();
+                if let Some(dir) = &self.dir {
+                    let made = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+                    tls(&format!("creating {}", dir.display()), made)?;
+                    write_private(&dir.join("lan-ca.key"), &key.serialize_pem())?;
+                    write_private(&dir.join("lan-ca.crt"), &cert)?;
+                    // Last: it says the certificate is for these domains.
+                    write_private(&dir.join("lan-ca.domains"), &domains.join(","))?;
+                }
+                cert
+            }
+        };
+        let lan = Arc::new(LanCa { key, cert, domains });
+        *held = Some(lan.clone());
+        Ok(lan)
     }
 
     /// The certificate of the node `name` (born by the index `born`, if its certificate says) made
@@ -354,6 +463,8 @@ pub fn load(dir: &Path) -> Fallible<Option<(Identity, Option<Ca>)>> {
         true => Some(Ca {
             key: tls("reading the CA key", KeyPair::from_pem(&read("ca.key")?))?,
             cert: identity.ca.clone(),
+            dir: Some(dir.to_path_buf()),
+            lan: Mutex::new(None),
         }),
         false => None,
     };
@@ -1253,53 +1364,159 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The CA signs a server certificate for a LAN name, for the life asked and no longer: a client
-    /// that trusts the CA takes it for that name only, in that time only. It is no node's, no
-    /// Identity's, and the names a CA must not vouch for here (the cluster's own, a wildcard, an
-    /// address) are not signed.
+    /// Does `der`, shown for `host` at `at` (seconds since 1970), verify against the trusted `root`?
+    fn verifies(root: &str, der: &CertificateDer<'_>, host: &str, at: u64) -> bool {
+        let verifier = WebPkiServerVerifier::builder_with_provider(roots(root).unwrap(), provider());
+        let name = ServerName::try_from(host.to_string()).unwrap();
+        let at = UnixTime::since_unix_epoch(Duration::from_secs(at));
+        verifier
+            .build()
+            .unwrap()
+            .verify_server_cert(der, &[], &name, &[], at)
+            .is_ok()
+    }
+
+    /// The LAN CA signs a server certificate for a LAN name, for the life asked and no longer: a
+    /// client that trusts the LAN CA takes it for that name only, in that time only, and the
+    /// cluster's own root, which the mesh and every Workload trust, does not vouch for it. It is no
+    /// node's, no Identity's, and the names the LAN CA must not vouch for (the cluster's own, a
+    /// wildcard, an address, a name outside the LAN domains) are not signed.
     #[test]
     fn pki_issue_host_signs_a_server_certificate_for_the_name_for_the_life_asked() {
         let ca = Ca::create().unwrap();
+        let lan = ca.lan(&[]).unwrap();
         let (now, life) = (1_900_000_000, Duration::from_secs(600));
-        let (cert, key) = ca.issue_host("nas.home.lan", now, life).unwrap();
+        let (cert, key) = lan.issue_host("nas.home.lan", now, life).unwrap();
         certified(&cert, &key, "nas.home.lan").unwrap();
         let der = certs(&cert).unwrap().remove(0);
         assert!(
             subject_of(&der).is_none(),
             "a host's certificate names no node, Identity or Workload"
         );
-        let verify = |trusted: &str, host: &str, at: u64| {
-            let verifier = WebPkiServerVerifier::builder_with_provider(roots(trusted).unwrap(), provider());
-            let name = ServerName::try_from(host.to_string()).unwrap();
-            let at = UnixTime::since_unix_epoch(Duration::from_secs(at));
-            verifier.build().unwrap().verify_server_cert(&der, &[], &name, &[], at)
-        };
         // Good for its name, from a minute before it was made until the life is out.
-        assert!(verify(&ca.cert, "nas.home.lan", now).is_ok());
-        assert!(verify(&ca.cert, "nas.home.lan", now - 30).is_ok());
-        assert!(verify(&ca.cert, "nas.home.lan", now + 599).is_ok());
-        assert!(verify(&ca.cert, "nas.home.lan", now + 601).is_err());
-        assert!(verify(&ca.cert, "nas.home.lan", now - 3600).is_err());
-        // For no other name, and by no other CA.
-        assert!(verify(&ca.cert, "other.home.lan", now).is_err());
-        assert!(verify(&Ca::create().unwrap().cert, "nas.home.lan", now).is_err());
+        assert!(verifies(&lan.cert, &der, "nas.home.lan", now));
+        assert!(verifies(&lan.cert, &der, "nas.home.lan", now - 30));
+        assert!(verifies(&lan.cert, &der, "nas.home.lan", now + 599));
+        assert!(!verifies(&lan.cert, &der, "nas.home.lan", now + 601));
+        assert!(!verifies(&lan.cert, &der, "nas.home.lan", now - 3600));
+        // For no other name, and by no other CA: not the cluster's root either.
+        assert!(!verifies(&lan.cert, &der, "other.home.lan", now));
+        assert!(!verifies(&ca.cert, &der, "nas.home.lan", now));
+        assert!(!verifies(&Ca::create().unwrap().cert, &der, "nas.home.lan", now));
+        assert_ne!(lan.cert, ca.cert);
         // Never as a client or as a CA of its own: a server certificate and nothing more.
-        let as_client = WebPkiClientVerifier::builder_with_provider(roots(&ca.cert).unwrap(), provider());
+        let as_client = WebPkiClientVerifier::builder_with_provider(roots(&lan.cert).unwrap(), provider());
         let at = UnixTime::since_unix_epoch(Duration::from_secs(now));
         assert!(as_client.build().unwrap().verify_client_cert(&der, &[], at).is_err());
         for refused in [
             "*.home.lan",
             "kith",
             "x.node.kith",
+            "a.kith",
             "10.0.0.7",
             "Nas.home.lan",
             "a_b.lan",
             "-a.lan",
             "a..lan",
             "",
+            "nas",
+            "nas.example.com",
+            "a.cluster.local",
+            "cluster.local",
         ] {
-            assert!(ca.issue_host(refused, now, life).is_err(), "{refused:?} is signed");
+            assert!(lan.issue_host(refused, now, life).is_err(), "{refused:?} is signed");
         }
+        assert!(lan.issue_host("nas.home.arpa", now, life).is_ok());
+        assert!(lan.issue_host("a.b.internal", now, life).is_ok());
+        assert!(lan.issue_host("printer.local", now, life).is_ok());
+        assert!(
+            lan.issue_host("nas.lan", now, Duration::from_secs(91 * 86_400))
+                .is_err()
+        );
+    }
+
+    /// What a phone is given is the LAN CA's certificate, and it holds the CA to the cluster's LAN
+    /// domains by X.509 name constraints: a certificate the LAN CA's own key signed for another
+    /// name does not verify, whoever signed it, and neither does one for the cluster's own zones.
+    #[test]
+    fn the_lan_ca_certificate_carries_the_name_constraints_of_the_lan_domains() {
+        let ca = Ca::create().unwrap();
+        let (now, life) = (1_900_000_000, Duration::from_secs(600));
+        let lan = ca.lan(&[]).unwrap();
+        assert!(!lan.cert.contains("PRIVATE KEY"));
+        let signed = |lan: &LanCa, host: &str| {
+            let (cert, _) = lan.sign_host(host, now, life).unwrap();
+            certs(&cert).unwrap().remove(0)
+        };
+        for host in ["nas.home.arpa", "nas.lan", "a.b.internal", "printer.local", "lan"] {
+            assert!(verifies(&lan.cert, &signed(&lan, host), host, now), "{host}");
+        }
+        for host in [
+            "www.example.com",
+            "nas.lan.example.com",
+            "nas.kith",
+            "x.node.kith",
+            "kith",
+            "nas.cluster.local",
+            "cluster.local",
+            "xlan",
+        ] {
+            assert!(!verifies(&lan.cert, &signed(&lan, host), host, now), "{host}");
+        }
+        // The domains are the Cluster's: asked for others, the same key signs under those.
+        let home = ca.lan(&["Home.Arpa".to_string()]).unwrap();
+        assert_ne!(home.cert, lan.cert);
+        assert!(verifies(
+            &home.cert,
+            &signed(&home, "nas.home.arpa"),
+            "nas.home.arpa",
+            now
+        ));
+        assert!(!verifies(&home.cert, &signed(&home, "nas.lan"), "nas.lan", now));
+        assert!(home.issue_host("nas.lan", now, life).is_err());
+        assert!(home.issue_host("nas.home.arpa", now, life).is_ok());
+        // The same domains in any order or case are the same CA.
+        let again = ca.lan(&["home.arpa".to_string()]).unwrap();
+        assert!(Arc::ptr_eq(&home, &again));
+    }
+
+    /// The LAN CA is made once, with a key that stays in the node's PKI directory (read by the
+    /// owner only) and a certificate that is what it was when the node starts again: what was
+    /// exported keeps being the CA.
+    #[test]
+    fn the_lan_ca_is_kept_beside_the_cluster_ca_key_and_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("kith-lan-ca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let made = Ca::create().unwrap().keep_in(&dir);
+        let first = made.lan(&[]).unwrap();
+        let mode = |file: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(dir.join(file)).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!((mode("lan-ca.key"), mode("lan-ca.crt")), (0o600, 0o600));
+        let restarted = Ca::create().unwrap().keep_in(&dir);
+        let second = restarted.lan(&[]).unwrap();
+        assert_eq!(first.cert, second.cert);
+        let (now, life) = (1_900_000_000, Duration::from_secs(600));
+        let (cert, _) = first.issue_host("nas.lan", now, life).unwrap();
+        let der = certs(&cert).unwrap().remove(0);
+        assert!(verifies(&second.cert, &der, "nas.lan", now));
+        // Other domains: the certificate is made again, for the same key.
+        let other = restarted.lan(&["home.arpa".to_string()]).unwrap();
+        assert_ne!(other.cert, first.cert);
+        let (cert, _) = other.issue_host("nas.home.arpa", now, life).unwrap();
+        let der = certs(&cert).unwrap().remove(0);
+        assert!(verifies(&other.cert, &der, "nas.home.arpa", now));
+        // (Same key: what the first made for `lan` is no longer vouched for by the new certificate.)
+        let (cert, _) = first.issue_host("nas.lan", now, life).unwrap();
+        assert!(!verifies(&other.cert, &certs(&cert).unwrap().remove(0), "nas.lan", now));
+        let again = Ca::create()
+            .unwrap()
+            .keep_in(&dir)
+            .lan(&["home.arpa".to_string()])
+            .unwrap();
+        assert_eq!(again.cert, other.cert);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn secs() -> u64 {

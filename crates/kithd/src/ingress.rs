@@ -178,10 +178,21 @@ pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, B
     exposed_in(store, prefix, false)
 }
 
+/// The LAN domains the Clusters name (`spec.lanDomains`): the lowest key's that names any, so that
+/// every node takes the same; none where no Cluster does (the LAN CA's own defaults then).
+pub(crate) fn lan_domains(store: &Store) -> Vec<String> {
+    let said = store.list(Some("Cluster")).filter_map(|cluster| {
+        let domains = serde_json::from_value::<Vec<String>>(cluster.spec["lanDomains"].clone()).ok()?;
+        (!domains.is_empty()).then(|| (cluster.key(), domains))
+    });
+    said.min().map(|(_, domains)| domains).unwrap_or_default()
+}
+
 /// [`exposed`], of a worker's view (`view`) or of the store.
 fn exposed_in(store: &Store, prefix: Ipv6Addr, view: bool) -> (BTreeMap<String, Exposed>, BTreeMap<String, String>) {
     let mut hosts: BTreeMap<String, Exposed> = BTreeMap::new();
     let mut refused = BTreeMap::new();
+    let domains = lan_domains(store);
     let born = |service: &Resource| {
         let key = service.key();
         let oldest = || {
@@ -241,6 +252,15 @@ fn exposed_in(store: &Store, prefix: Ipv6Addr, view: bool) -> (BTreeMap<String, 
             refused.insert(key, message);
             continue;
         }
+        // (What the LAN CA would refuse to sign for: not exposed, rather than served with no certificate.)
+        let cluster = matches!(expose.issuer, Some(kith_api::kinds::ExposeIssuer::Cluster));
+        if let Some(message) = cluster
+            .then(|| kith_api::kinds::cluster_host_refused(&host, Some(&domains)))
+            .flatten()
+        {
+            refused.insert(key, message);
+            continue;
+        }
         let kept_for = match kept.get(namespace) {
             Some(own) if own.keeps(&host) => None,
             Some(own) => Some(format!(
@@ -263,7 +283,6 @@ fn exposed_in(store: &Store, prefix: Ipv6Addr, view: bool) -> (BTreeMap<String, 
         }
         let to = SocketAddr::new(address.into(), port.port);
         let proxy = expose.proxy_protocol == Some(true);
-        let cluster = matches!(expose.issuer, Some(kith_api::kinds::ExposeIssuer::Cluster));
         // (Only ever a Service of the exposing one's namespace: the name is all a path says.)
         let routes: Vec<Route> = expose
             .paths
@@ -1075,15 +1094,15 @@ async fn order(
     say(shared, &of.service, tls).await;
 }
 
-/// How long a certificate the cluster CA signs for a host lasts: short, because there is no
+/// How long a certificate the LAN CA signs for a host lasts: short, because there is no
 /// revocation (one is made again in its last third, ten days before it ends).
 const CLUSTER_LIFE: Duration = Duration::from_secs(30 * 86_400);
-/// A host the cluster CA signed for, or failed to, is not tried again for this many seconds.
-const CLUSTER_RETRY: u64 = 60;
 
-/// Sign a certificate for `host` (`expose.issuer: cluster`) with the cluster CA this node holds,
-/// good for `life` from `at`, keep it in the host's Secret and say so in the Service's status.
-/// A host tried within [`CLUSTER_RETRY`] seconds (by this process: `retry`) is left alone.
+/// Sign a certificate for `host` (`expose.issuer: cluster`) with the LAN CA of the cluster CA this
+/// node holds, good for `life` from `at`, keep it in the host's Secret and say so in the Service's
+/// status. A host tried within [`BETWEEN_ORDERS`] seconds (by this process: `retry`) is left alone,
+/// as is one whose status says an error that long ago or less (across a restart or a new leader),
+/// as ACME's are; and an error the status already says is not written again.
 async fn issue_cluster(
     shared: &Shared,
     ca: &crate::pki::Ca,
@@ -1093,10 +1112,15 @@ async fn issue_cluster(
     at: u64,
     retry: &mut BTreeMap<String, u64>,
 ) {
-    if retry
-        .get(host)
-        .is_some_and(|tried| at.saturating_sub(*tried) < CLUSTER_RETRY)
-    {
+    let (domains, failed) = {
+        let state = shared.store.lock().expect("nothing panics holding the store");
+        let status = state.store.get(&of.service).and_then(|service| service.status.clone());
+        let tls = status.map(|status| status["tls"].clone()).unwrap_or_default();
+        let failed = (tls["state"] == "error").then(|| (tls["at"].as_u64(), tls["message"].as_str().map(String::from)));
+        (lan_domains(&state.store), failed)
+    };
+    let (failed_at, failed_with) = failed.unwrap_or_default();
+    if asked_lately(retry.get(host).copied(), failed_at, at, BETWEEN_ORDERS) {
         return;
     }
     retry.insert(host.to_string(), at);
@@ -1104,10 +1128,11 @@ async fn issue_cluster(
     let secret = tls_secret(host, of);
     let made = a_secret(&secret, json!({}))
         .map_err(|e| format!("the host's Secret cannot be named: {e}"))
-        .and_then(|_| ca.issue_host(host, at, life).map_err(|e| e.to_string()))
+        .and_then(|_| ca.lan(&domains))
+        .and_then(|lan| lan.issue_host(host, at, life))
         .and_then(|(chain, key)| match fresh(&chain, &key, host, at) {
             true => Ok((chain, key)),
-            false => Err("the cluster CA's certificate is not good now".into()),
+            false => Err("the LAN CA's certificate is not good now".into()),
         });
     let kept = match made {
         Ok((chain, key)) => put(shared, &secret, json!({ "tls.crt": chain, "tls.key": key })).await,
@@ -1117,7 +1142,12 @@ async fn issue_cluster(
         Ok(()) => json!({ "state": "ready", "secret": secret, "source": "cluster", "by": me, "at": at }),
         Err(e) => {
             let e: String = e.chars().take(500).collect();
-            eprintln!("kithd: ingress: no certificate from the cluster CA for {host}: {e}");
+            eprintln!("kithd: ingress: no certificate from the LAN CA for {host}: {e}");
+            // (The same error again is no news: the status keeps the first one's time, and the
+            // store is not written once an hour for it.)
+            if failed_with.as_deref() == Some(e.as_str()) {
+                return;
+            }
             json!({ "state": "error", "message": e, "by": me, "at": at })
         }
     };
@@ -2973,5 +3003,144 @@ spec: {{ selector: {{ app: web }}, ports: [{{ port: 80 }}], expose: {{ host: {ho
         assert_ne!(renewed["tls.crt"], first["tls.crt"]);
         assert_eq!(until(&renewed), late + 600);
         assert_eq!(wanting(late), [("web.example.org".to_string(), false)]);
+    }
+
+    /// The LAN CA refuses a host outside the cluster's LAN domains: the error is said once (a
+    /// second round, an hour on, with the same error makes no write to the store), and a
+    /// different error is said.
+    #[tokio::test]
+    async fn ingress_cluster_issuer_refusal_is_said_once_and_waits_an_hour() {
+        use crate::cluster::{Cluster, pinned_peer};
+        let ca = crate::pki::Ca::create().unwrap();
+        let control = Cluster::new(pinned_peer::node(&ca, "a"), Some(ca)).unwrap();
+        let shared = pinned_peer::shared_of("cluster-issuer-refused", control, &[]).await;
+        let id = shared.raft.metrics().borrow().id;
+        shared
+            .raft
+            .wait(Some(Duration::from_secs(30)))
+            .current_leader(id, "leads")
+            .await
+            .unwrap();
+        let source = "apiVersion: kith.dev/v1\nkind: Service\nmetadata: { name: nas, namespace: shop }\n\
+                      spec: { selector: { app: nas }, ports: [{ port: 80 }], expose: { host: nas.home.lan, via: edge, issuer: cluster } }\n";
+        let resources = Resource::from_source(source).unwrap().into_iter().map(Result::unwrap);
+        let apply = kith_store::Command::Apply {
+            resources: resources.collect(),
+            at: now(),
+        };
+        shared.submit(apply).await.unwrap();
+        let of = {
+            let state = shared.store.lock().unwrap();
+            let (hosts, _) = exposed(&state.store, kith_mesh::prefix(b"ca"));
+            hosts["nas.home.lan"].clone()
+        };
+        let held = shared.cluster.as_ref().unwrap().ca.as_ref().unwrap();
+        let life = Duration::from_secs(600);
+        let applied = || format!("{:?}", shared.raft.metrics().borrow().last_applied);
+        let tls = || {
+            let state = shared.store.lock().unwrap();
+            let status = state.store.get(&of.service).and_then(|s| s.status.clone());
+            status.unwrap()["tls"].clone()
+        };
+        let t0 = now();
+        // (Not a LAN name: the signer refuses it, however it came to be asked.)
+        issue_cluster(&shared, held, "nas.example.com", &of, life, t0, &mut BTreeMap::new()).await;
+        let first = tls();
+        assert_eq!(first["state"], "error");
+        assert!(first["message"].as_str().unwrap().contains("LAN domains"), "{first}");
+        assert_eq!(first["at"], t0);
+        let written = applied();
+        // An hour on, by a node that remembers nothing (a restart, a new leader): the same
+        // error, and nothing written. (A minute on, it waits: no attempt at all.)
+        issue_cluster(
+            &shared,
+            held,
+            "nas.example.com",
+            &of,
+            life,
+            t0 + 60,
+            &mut BTreeMap::new(),
+        )
+        .await;
+        issue_cluster(
+            &shared,
+            held,
+            "nas.example.com",
+            &of,
+            life,
+            t0 + 3_601,
+            &mut BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(applied(), written);
+        assert_eq!(tls(), first);
+        // Another error is news.
+        issue_cluster(
+            &shared,
+            held,
+            "nas.example.net",
+            &of,
+            life,
+            t0 + 7_300,
+            &mut BTreeMap::new(),
+        )
+        .await;
+        assert_ne!(applied(), written);
+        assert_eq!(tls()["at"], t0 + 7_300);
+    }
+
+    /// `issuer: cluster` is refused for a host outside the Cluster's `lanDomains` (the defaults
+    /// where it names none), under cluster.local or kith, and for one its Namespace does not keep.
+    #[test]
+    fn a_host_the_lan_ca_would_refuse_is_not_exposed() {
+        let store = std::cell::RefCell::new(Store::default());
+        let apply = |source: String| {
+            let resource = Resource::from_source(&source).unwrap().remove(0);
+            resource
+                .map_err(|e| e.msg)
+                .and_then(|resource| store.borrow_mut().apply(resource).map_err(|e| e.to_string()))
+        };
+        let service = |namespace: &str, name: &str, host: &str, issuer: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: {name}, namespace: {namespace} }}\nspec:\n  \
+                 selector: {{ app: {name} }}\n  ports: [{{ port: 80 }}]\n  expose: {{ host: {host}, via: edge, issuer: {issuer} }}\n"
+            )
+        };
+        apply(service("a", "ok", "nas.home.arpa", "cluster")).unwrap();
+        apply(service("a", "public", "shop.example.org", "cluster")).unwrap();
+        apply(service("a", "acme", "shop.example.net", "acme")).unwrap();
+        // Refused when applied: no LAN name there can be.
+        for host in ["nas", "x.cluster.local", "cluster.local", "x.kith"] {
+            let said = apply(service("a", "bad", host, "cluster")).unwrap_err();
+            assert!(said.contains("expose.issuer"), "{host}: {said}");
+        }
+        apply(
+            "apiVersion: kith.dev/v1\nkind: Namespace\nmetadata: { name: b }\nspec: { hosts: ['*.home.arpa'] }\n"
+                .into(),
+        )
+        .unwrap();
+        apply(service("b", "kept", "nas.home.lan", "cluster")).unwrap();
+        apply(service("b", "within", "tv.home.arpa", "cluster")).unwrap();
+        let prefix = kith_mesh::prefix(b"ca");
+        let (hosts, refused) = exposed(&store.borrow(), prefix);
+        assert_eq!(hosts.keys().collect::<Vec<_>>(), ["shop.example.net", "tv.home.arpa"]);
+        assert!(refused["Service/a/public"].contains("LAN domains"), "{refused:?}");
+        assert!(refused["Service/b/kept"].contains("exposes only"), "{refused:?}");
+        // (The Namespace b keeps *.home.arpa, so a's nas.home.arpa is b's now.)
+        assert!(
+            refused["Service/a/ok"].contains("kept for the namespace b"),
+            "{refused:?}"
+        );
+        assert_eq!(refused.len(), 3);
+
+        // The cluster's own list replaces the defaults.
+        apply(
+            "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: { name: main }\nspec: { lanDomains: [corp.example] }\n"
+                .into(),
+        )
+        .unwrap();
+        let (hosts, refused) = exposed(&store.borrow(), prefix);
+        assert_eq!(hosts.keys().collect::<Vec<_>>(), ["shop.example.net"]);
+        assert!(refused["Service/a/ok"].contains("LAN domains"), "{refused:?}");
     }
 }

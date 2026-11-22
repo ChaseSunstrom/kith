@@ -136,9 +136,13 @@ The whole table is [From a docker-compose file](docs/guide/kubernetes.md#from-a-
 
 ## A name only your LAN knows
 
-ACME (Let's Encrypt) will not sign `nas.home.lan`. The cluster's own CA will: say
+ACME (Let's Encrypt) will not sign `nas.home.lan`. A CA of the cluster's own will: say
 `issuer: cluster` and the node that holds the CA key signs a server certificate for the host,
 keeps it in the Secret `tls-<host>`, and makes a new one before it ends (it lasts 30 days).
+That is a separate LAN CA, with a key of its own that stays on that node, and it is
+name-constrained to the cluster's LAN domains: `home.arpa`, `lan`, `internal` and `local`, or the
+list a Cluster's `spec.lanDomains` names. A host outside them (or one its Namespace's
+`spec.hosts` does not keep) is refused when applied or when signed.
 
 ```yaml
 apiVersion: kith.dev/v1
@@ -151,15 +155,16 @@ spec:
 ```
 
 ```sh
-kith ca export kith-ca.crt     # the CA's public certificate, never its key
+kith ca export kith-ca.crt     # on the CA's node: the LAN CA's public certificate, never a key
 ```
 
-Trust `kith-ca.crt` once on each phone or laptop. Do that only for a CA you keep safe: a device
-that trusts it takes whatever the CA signs, and the CA will vouch for any name a Service in the
-cluster says with `issuer: cluster`, not only your own. Whoever may apply Services may name a
-host, so name the hosts in a Namespace (`spec.hosts`) where that matters. There is no
-revocation: a short life is the revocation. The names of the cluster itself (`kith`, `*.kith`),
-wildcards and addresses are never signed.
+Trust `kith-ca.crt` once on each phone or laptop. A device that trusts it takes what the LAN CA
+signs, but the certificate itself carries the limit (X.509 name constraints), so it cannot
+vouch for any name outside the LAN domains, and a name of the cluster (`cluster.local`, `kith`)
+is never one. Whoever may apply Services may still name a host inside them, so name the hosts in
+a Namespace (`spec.hosts`) where that matters. There is no revocation: a short life is the
+revocation. Wildcards and addresses are never signed. The workloads' `ca.crt` and the mesh
+never trust the LAN CA: a host certificate does not verify against the cluster's own root.
 
 ## How it works
 
