@@ -791,9 +791,9 @@ and other names the same answer as before.
 - **It answers this machine only:** `127.0.0.0/8` is not reachable from any other machine. An
   unknown name under `.kith` is answered `NXDOMAIN` by kithd, not forwarded.
 - **How it goes:** kithd takes the entry back (`resolvectl revert`) before it takes the interface
-  down, and the entry is in resolved's memory, so a machine that loses power loses it too (a kithd killed outright leaves it while the link
-  stays, and the next one sets it again). It is
-  looked at every half minute and set again if resolved forgot it (a restart of resolved). Without
+  down, and the entry lives in resolved's memory only, so a reboot loses it too (a kithd killed
+  outright leaves it while the link stays, and the next one sets it again). It is looked at every
+  half minute and set again if resolved forgot it (a restart of resolved). Without
   `/run/systemd/resolve`, kithd says so once and does nothing else. If `127.0.0.87:53` is taken,
   kithd says so and registers nothing.
 
