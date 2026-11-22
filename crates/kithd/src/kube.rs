@@ -942,11 +942,40 @@ pub(crate) fn pod_owner(pod: &str) -> Option<(&'static str, &str, u32)> {
 /// What a pod named `pod` in `namespace` is, as [`pod_owner`] says it, but a bare Pod's name first: it is
 /// its own Job's or Workload's run 0, held under the name sent. The one resolver of every verb that
 /// reaches a pod (logs, exec, port-forward and the hop to the node that runs it).
+/// A name that both a bare Pod and a replica of an existing Job or Workload have is no pod: it is told
+/// as one not found, to every caller and every verb, so that neither can take the other's calls (the
+/// mark `kith.dev/pod` is on a resource whoever may apply one can write).
 pub(crate) fn resolve_pod<'a>(store: &Store, namespace: &str, pod: &'a str) -> Option<(&'static str, &'a str, u32)> {
+    let named = pod_owner(pod);
     match held_bare(store, Some(namespace), pod) {
-        Some(row) => Some((holder(row), pod, 0)),
-        None => pod_owner(pod),
+        Some(row) => {
+            let both = named.is_some_and(|(of, owner, _)| store.get(&format!("{of}/{namespace}/{owner}")).is_some());
+            (!both).then(|| (holder(row), pod, 0))
+        }
+        None => named,
     }
+}
+
+/// The native apply's own `taken`: a resource marked `kith.dev/pod` (a bare Pod, made by `kith apply` of one)
+/// whose name is a pod of an existing Job or Workload, or of one in the same body, is refused. The Kubernetes
+/// API's create has refused it by `taken` already; a native apply did not, and so could take a pod's calls.
+pub(crate) fn hijacks(store: &Store, resources: &[Resource]) -> Result<(), String> {
+    let namespace = |r: &Resource| r.metadata.namespace.clone().unwrap_or_else(|| kith_api::DEFAULT_NAMESPACE.into());
+    for bare in resources.iter().filter(|r| {
+        matches!(r.kind.as_str(), "Job" | "Workload") && r.metadata.annotations.get("kith.dev/pod").is_some_and(|m| m == "true")
+    }) {
+        let Some((of, owner, _)) = pod_owner(&bare.metadata.name) else {
+            continue;
+        };
+        let space = namespace(bare);
+        let there = store.get(&format!("{of}/{space}/{owner}")).is_some()
+            || resources.iter().any(|r| r.kind == of && r.metadata.name == owner && namespace(r) == space);
+        if there {
+            let name = &bare.metadata.name;
+            return Err(format!("{name}: a bare Pod's name is not one that a pod of a Job or Workload has"));
+        }
+    }
+    Ok(())
 }
 
 /// The pods of what `owner` runs: one for each replica its status tells of, named by
@@ -4882,6 +4911,51 @@ spec: {role: writer, subjects: [carol]}
             }
             assert!(answers.windows(2).all(|two| two[0] == two[1]), "{verb}: {answers:?}");
         }
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resource marked `kith.dev/pod` that has the name of a Workload's replica takes nobody's calls: the
+    /// name is no pod to any verb while both stand (resolve_pod), and a native apply of the mark on such a
+    /// name is refused (hijacks), in the body's own Workload's case too; a bare Pod with a name of its own
+    /// is found, and `once-0` is one while no Workload `once` is there.
+    #[tokio::test]
+    async fn a_marked_native_apply_cannot_take_a_pods_name() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-hijack-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let held = |name: &str| {
+            let sent = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name, "namespace": "default"}});
+            let text = format!(
+                "apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: {name}\n  namespace: default\n  annotations:\n    kith.dev/pod: 'true'\n    {SENT}: '{sent}'\nspec: {{replicas: 1, template: {{exec: [{{name: m, command: [sleep, '1']}}]}}}}\n"
+            );
+            Resource::from_source(&text).unwrap().remove(0).unwrap()
+        };
+        let web: Resource = Resource::from_source(
+            "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {name: web, namespace: default}\nspec: {replicas: 1, template: {exec: [{name: m, command: [sleep, '1']}]}}\n",
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        // A bare Pod named `once-0` with no Workload `once` is the bare Pod's.
+        let refused = crate::api::applied(&shared, &Caller::Admin, vec![held("once-0"), held("solo")]).await;
+        assert!(refused.is_ok(), "{:?}", refused.err().map(|e| e.into_response().status()));
+        // With Workload `web` there, the same mark on `web-0` is refused, native apply or not in the body.
+        for body in [vec![web.clone(), held("web-0")], vec![held("web-0"), web.clone()]] {
+            let refused = crate::api::applied(&shared, &Caller::Admin, body).await;
+            assert!(refused.is_err(), "web-0 marked was let in");
+        }
+        let state = shared.store.lock().unwrap();
+        assert!(state.store.get("Workload/default/web-0").is_none());
+        drop(state);
+        // Both held anyway (the store was written another way): neither takes the calls.
+        let mut state = shared.store.lock().unwrap();
+        state.store.apply(web).unwrap();
+        state.store.apply(held("web-0")).unwrap();
+        assert_eq!(resolve_pod(&state.store, "default", "web-0"), None);
+        assert_eq!(resolve_pod(&state.store, "default", "once-0").map(|(of, _, n)| (of, n)), Some(("Workload", 0)));
+        assert_eq!(resolve_pod(&state.store, "default", "solo").map(|(of, _, n)| (of, n)), Some(("Workload", 0)));
+        assert_eq!(resolve_pod(&state.store, "default", "web-1"), Some(("Workload", "web", 1)));
+        drop(state);
         drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
     }
