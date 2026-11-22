@@ -1701,12 +1701,15 @@ mod tests {
         assert_eq!(status, 501, "filters are not answered yet");
     }
 
+    /// What each exec was asked: the container, the command, and its stdin and tty flags.
+    type Ran = Arc<Mutex<Vec<(String, Vec<String>, bool, bool)>>>;
+
     /// A store with logs and exec: what each of the two outputs holds, and the session the next exec gets.
     struct Live {
         mem: MemStore,
         out: Arc<Mutex<[Vec<u8>; 2]>>,
         session: Mutex<Option<Session>>,
-        ran: Arc<Mutex<Vec<(String, Vec<String>, bool, bool)>>>,
+        ran: Ran,
     }
 
     impl Store for Live {
@@ -1758,7 +1761,7 @@ mod tests {
         mem: MemStore,
         c: Containers,
         out: Arc<Mutex<[Vec<u8>; 2]>>,
-        ran: Arc<Mutex<Vec<(String, Vec<String>, bool, bool)>>>,
+        ran: Ran,
     }
 
     /// Containers over a `Live` store; `session` is what the first exec is given.
