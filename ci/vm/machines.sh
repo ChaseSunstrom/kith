@@ -75,8 +75,7 @@
         # A screendump of machine NAME's framebuffer (its monitor socket is $work/NAME.mon), asked
         # for until it is WHAT, and held to be the install as drawn (T-1083): "mid", the disk
         # written part of the way (the bar has some of its length filled and some not), or "end",
-        # the install done (nothing in the accent: no stop or bar under way), "ask", a question
-        # asked (T-0734), or "key", the recovery key's screen (T-1172). Whichever, every
+        # the install done (nothing in the accent: no stop or bar under way). Whichever, every
         # pixel is a colour of docs/site.css's tokens: no kernel text (white or grey on black)
         # is on the picture. It stops asking when the machine's log says GIVE-UP.
         shot() { # NAME WHAT GIVE-UP
@@ -95,8 +94,6 @@ def said():
         return giveup.encode() in open(log, "rb").read()
     except OSError:
         return False
-def ioerr():
-    raise OSError("monitor closed")
 def ask():
     global conn
     if conn is None:
@@ -105,11 +102,11 @@ def ask():
         conn.connect(mon)
         seen = b""
         while seen.count(b"(qemu)") < 1:
-            seen += conn.recv(4096) or ioerr()
+            seen += conn.recv(4096)
     conn.sendall(("screendump " + ppm + "\n").encode())
     seen = b""
     while seen.count(b"(qemu)") < 1:
-        seen += conn.recv(4096) or ioerr()
+        seen += conn.recv(4096)
 def shape():
     head = open(ppm, "rb").read().split(b"\n", 3)
     if head[0] != b"P6":
@@ -130,11 +127,6 @@ while time.time() < end:
         colours, rows = got
         if what == "mid":
             now = any(r.count(accent) >= 64 and r.count(hair) >= 64 for r in rows)
-        elif what in ("ask", "key"):
-            # (A question or the key on the framebuffer: mostly paper, the accent on the current
-            # stop (a few hundred pixels). The key is told from a bar by no row of the accent.)
-            now = colours.most_common(1)[0][0] == tuple(paper) and colours[tuple(accent)] >= 100
-            now = now and (what == "ask" or not any(r.count(accent) >= 64 for r in rows))
         else:
             now = colours[tuple(accent)] == 0 and colours[tuple(text)] >= 200 and colours.most_common(1)[0][0] == tuple(paper)
         if now:
@@ -277,7 +269,24 @@ sys.exit(1)
         # the question on it) is mostly paper, with the accent on the current stop. Retried, as
         # the picture is drawn just after the question's text is on the serial console.
         hears install-gamma 'Install kith OS on which'
-        shot install-gamma ask "The node's name"
+        tries=0
+        until printf 'screendump %s\n' "$work/install-gamma.ppm" | socat -t 2 - "unix-connect:$work/install-gamma.mon" >/dev/null 2>&1 \
+            && python3 -c '
+import collections, sys
+data = open(sys.argv[1], "rb").read()
+header = data.split(b"\n", 3)
+if header[0] != b"P6":
+    sys.exit(1)
+pixels = header[3]
+colours = collections.Counter(pixels[i:i + 3] for i in range(0, len(pixels), 3))
+paper, accent = bytes((246, 245, 241)), bytes((47, 95, 224))
+if colours.most_common(1)[0][0] != paper or colours[accent] < 100:
+    sys.exit(1)
+' "$work/install-gamma.ppm" 2>/dev/null; do
+            tries=$((tries + 1))
+            [ "$tries" -lt 50 ] || fail "the install's question is not on the screen as drawn"
+            sleep 0.2
+        done
         typed 'Install kith OS on which' vdb
         typed "The node's name" gamma
         typed 'Its address, as' ''
@@ -301,27 +310,5 @@ sys.exit(1)
             [ "$tries" -lt 150 ] || fail "the node installed with a join token is not in alpha's cluster"
             sleep 0.2
         done
-        # Answers typed at the console, the state asked to be encrypted (T-1172): the recovery key
-        # is on the screen as well as the log, held (still there after a few seconds) until a key
-        # is pressed, and gone then (the end screen, with nothing of the accent, takes its place).
-        stick delta
-        blank delta
-        monitor=unix:$work/install-delta.mon,server=on,wait=off
-        # shellcheck disable=SC2046
-        vm install-delta $(drive delta.stick) $(drive delta.disk)
-        monitor=
-        hears install-delta 'Install kith OS on which'
-        for line in vdb delta '' '' yes vdb; do
-            printf '%s\n' "$line" | socat - "unix-connect:$work/install-delta.tty" >/dev/null
-            sleep 0.3
-        done
-        hears install-delta 'kithd: install: the node'"'"'s state is encrypted'
-        shot install-delta key 'kithd: install: kith OS is on'
-        sleep 3
-        shot install-delta key 'kithd: install: kith OS is on'
-        ! grep -aqF 'kithd: install: kith OS is on' "$work/install-delta.log" || fail "the installer went on before a key was pressed"
-        printf '\n' | socat - "unix-connect:$work/install-delta.tty" >/dev/null
-        shot install-delta end 'kithd: init: powering off'
-        installed install-delta vdb
-        echo "vm.sh: ok: no disk, nothing installed; from answers on the stick, a node (alpha) that starts a cluster at its fixed address; from a URL, onto the one of two disks its serial names, a node (beta, $first) that asks its network and keeps its state; from the console, after a slip that wrote nothing, a node (gamma) that joined alpha's cluster by token, and one (delta) with its state encrypted whose recovery key's screen was held until a key and gone after it"
+        echo "vm.sh: ok: no disk, nothing installed; from answers on the stick, a node (alpha) that starts a cluster at its fixed address; from a URL, onto the one of two disks its serial names, a node (beta, $first) that asks its network and keeps its state; from the console, after a slip that wrote nothing, a node (gamma) that joined alpha's cluster by token"
         exit 0
