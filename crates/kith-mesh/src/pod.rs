@@ -466,8 +466,18 @@ pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>, exit: Option<u16>) 
 /// `services` is the Services' (address, port) pairs this node listens on, IPv4 and IPv6: any
 /// pod reaches TCP at those and nothing else of the node's own (a listener bound to every
 /// address, the Service's address being one of the node's, is not reachable on another port).
-pub fn node(range: Range, services: &[(IpAddr, u16)], guarded: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
-    node_with(range, services, guarded, true, mesh, pods)
+///
+/// `people` is whether the people's table (`inet kith-people`) is there: the guard passes kwg0 only
+/// then (T-0987), so the caller reads it and says it again (`people::table_present`) when it changes.
+pub fn node(
+    range: Range,
+    services: &[(IpAddr, u16)],
+    guarded: bool,
+    mesh: &str,
+    pods: &[Served],
+    people: bool,
+) -> Result<bool> {
+    node_with(range, services, guarded, true, mesh, pods, people)
 }
 
 /// A pod this node serves: its number, whether it leaves by an exit (its link is then
@@ -500,12 +510,11 @@ fn node_with(
     masquerade: bool,
     mesh: &str,
     pods: &[Served],
+    people: bool,
 ) -> Result<bool> {
     crate::gateway4(1, range.gateway())?;
     let passes = "/proc/sys/net/ipv6/conf/all/forwarding";
     let guard = guard_wanted(guarded, std::fs::read_to_string(passes).ok().as_deref());
-    // (Only while the people's table is there to filter kwg0: see `people_passed`.)
-    let people = crate::people::table_present().unwrap_or(false);
     nat(range, services, guard, masquerade, mesh, pods, people)?;
     // A machine that passes packets on stops listening to its router's advertisements,
     // unless told to go on (2): the node's own way out must not be lost to this.
@@ -913,10 +922,10 @@ fn nat(
 /// link name (`is` compares a prefix, so the name ends with its NUL). None unless the people's table
 /// (`present`) is there: it is what filters kwg0, and kwg0 passes only behind it (T-0987).
 fn people_passed(present: bool) -> Vec<Vec<Vec<u8>>> {
-    let device = [crate::people::DEVICE.as_bytes(), &[0]].concat();
     if !present {
         return Vec::new();
     }
+    let device = [crate::people::DEVICE.as_bytes(), &[0]].concat();
     [6, 7].map(|link| vec![link_name(link), is(&device), verdict(1)]).into()
 }
 
@@ -1595,7 +1604,7 @@ mod tests {
         };
         let served = [served(12, Some(egress)), served(13, None), served(14, None)];
         // (Without masquerade: a kernel may have none in a namespace.)
-        assert!(node_with(range, &[], true, false, "kith0", &served).unwrap());
+        assert!(node_with(range, &[], true, false, "kith0", &served, false).unwrap());
         let connect = |from: usize, to: IpAddr, port: u16| {
             let to = SocketAddr::from((to, port));
             within(&pods[from].0, || {
@@ -1614,7 +1623,7 @@ mod tests {
         // Others are not held, and the held pod answers what comes to it.
         assert!(connect(1, host(pods[0].3), 80) && connect(1, third, 81));
         // A second time changes nothing.
-        assert!(node_with(range, &[], true, false, "kith0", &served).unwrap());
+        assert!(node_with(range, &[], true, false, "kith0", &served, false).unwrap());
         assert!(connect(0, second, 80) && !connect(0, third, 81));
     }
 
@@ -1633,13 +1642,13 @@ mod tests {
         // (A range that is not the default, and not whole bytes: the masquerade matches its bits.)
         let range = range("198.18.16.0/20").unwrap();
         // (A kernel whose masquerade is a module nobody loaded has none in a namespace.)
-        let masquerade = match node(range, &[], false, "kith0", &[]) {
+        let masquerade = match node(range, &[], false, "kith0", &[], false) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             guarded => guarded.unwrap(),
         };
         if !masquerade {
             eprintln!("this kernel has no masquerade here: without");
-            assert!(node_with(range, &[], false, false, "kith0", &[]).unwrap());
+            assert!(node_with(range, &[], false, false, "kith0", &[], false).unwrap());
         }
         let net = crate::node_net(crate::prefix(b"test"), "alpha");
         let pods: Vec<_> = [2, 3]
@@ -1661,7 +1670,7 @@ mod tests {
             .into();
         let service = crate::service_address(crate::prefix(b"test"), "default", "web");
         let services = [(IpAddr::from(service), 80)];
-        assert!(node_with(range, &services, true, masquerade, "kith0", &served).unwrap());
+        assert!(node_with(range, &services, true, masquerade, "kith0", &served, false).unwrap());
         // Each says who it is to whoever connects, and who that was.
         let serve = |listener: &TcpListener, says: &str| {
             let (mut stream, from) = listener.accept().unwrap();
@@ -1759,8 +1768,36 @@ mod tests {
             "a Service's address, a port that is no Service's: dropped"
         );
         // A second time changes nothing (what the first left is taken away and made again).
-        assert!(node_with(range, &services, true, masquerade, "kith0", &served).unwrap());
+        assert!(node_with(range, &services, true, masquerade, "kith0", &served, false).unwrap());
         assert!(tables().unwrap());
+    }
+
+    /// With the guard, `inet kith-pods`'s `passed` chain gains the two kwg0 rules when the people's
+    /// table is said to be there and loses them when it is not (`KITH_E2E=1 unshare -Urn cargo test
+    /// -p kith-mesh kwg0_rules`, T-0987).
+    #[test]
+    fn the_passed_chain_has_the_kwg0_rules_only_with_the_people_table() {
+        if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
+            return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh kwg0_rules");
+        }
+        use crate::people::tests::{dump, name_of};
+        let _lo = crate::netlink::LO.lock().unwrap_or_else(|e| e.into_inner());
+        up(1).unwrap();
+        let range = range("198.18.16.0/20").unwrap();
+        let passed = || {
+            let rules = dump(0xa07).unwrap();
+            let there = |m: &&Vec<(u16, Vec<u8>)>| {
+                name_of(m, 1).as_deref() == Some("kith-pods") && name_of(m, 2).as_deref() == Some("passed")
+            };
+            rules.iter().filter(there).count()
+        };
+        // (Without masquerade: a kernel may have none in a namespace.)
+        assert!(node_with(range, &[], true, false, "kith0", &[], false).unwrap());
+        let without = passed();
+        assert!(node_with(range, &[], true, false, "kith0", &[], true).unwrap());
+        assert_eq!(passed(), without + 2, "kwg0's two rules, with the people's table");
+        assert!(node_with(range, &[], true, false, "kith0", &[], false).unwrap());
+        assert_eq!(passed(), without, "and not without it");
     }
 
     /// A pod whose namespace has IPv6 off (no inet6 address at all) asks its node's resolver at
@@ -1801,7 +1838,7 @@ mod tests {
             v6,
             ..served_with(20, None)
         }];
-        assert!(node_with(range, &services, true, false, "kith0", &served).is_ok());
+        assert!(node_with(range, &services, true, false, "kith0", &served, false).is_ok());
         let within_pod = |f: fn(Ipv4Addr, Ipv4Addr) -> std::io::Result<String>, to: Ipv4Addr| {
             within(&namespace, move || f(v4, to)).unwrap()
         };

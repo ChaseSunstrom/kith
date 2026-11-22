@@ -105,6 +105,9 @@ pub struct Pods {
     unsent: bool,
     /// The (address, port) pairs of the Services, the only ones of the node's own a pod reaches by TCP.
     services: Vec<(IpAddr, u16)>,
+    /// Whether the people's table was there when the tables were last made (the guard passes kwg0
+    /// then): [`guard_again`] makes them again when that changes.
+    people: std::sync::atomic::AtomicBool,
 }
 
 /// Where each pod made is written down (its number, its exit's tunnel, its address) for a
@@ -483,12 +486,15 @@ impl Pods {
                 egress: pod.egress.clone(),
             })
             .collect();
+        let people = kith_mesh::people::table_present().unwrap_or(false);
+        self.people.store(people, std::sync::atomic::Ordering::Relaxed);
         kith_mesh::pod::node(
             range(),
             &self.services,
             Path::new(GUARDED).exists(),
             &self.mesh,
             &served,
+            people,
         )
     }
 }
@@ -683,15 +689,30 @@ pub async fn keep_held(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>)
 
 /// Make the node's tables for its pods again where they are gone while pods run (`nft flush
 /// ruleset`, say): else an exit's pods would reach the node itself, kithd's API among it.
+///
+/// Also when the people's table is there and the tables were made without it, or the other way
+/// (`flush ruleset` and the levels making it again, or someone deleting it): else kwg0 stays
+/// dropped, or passed with nothing filtering it.
 pub fn guard_again(shared: &Shared) {
     let pods = shared.pods.lock().expect("nothing panics holding the pods");
-    if pods.made.is_empty() || kith_mesh::pod::tables().unwrap_or(true) {
+    if pods.made.is_empty() {
         return;
     }
-    eprintln!("kithd: the tables of this node's pods are gone: made again");
+    let served = pods.people.load(std::sync::atomic::Ordering::Relaxed);
+    let people = kith_mesh::people::table_present().ok();
+    if kith_mesh::pod::tables().unwrap_or(true) && !people_changed(served, people) {
+        return;
+    }
+    eprintln!("kithd: the tables of this node's pods are gone, or the people's table with them: made again");
     if let Err(e) = pods.serve() {
         eprintln!("kithd: making the tables of this node's pods again: {e}");
     }
+}
+
+/// Whether the people's table (`present`, `None` if unread) is not as it was when the tables were
+/// made (`served`): they are made again.
+fn people_changed(served: bool, present: Option<bool>) -> bool {
+    present.is_some_and(|present| present != served)
 }
 
 /// Make the node's tables for its pods again, for the people's table made or taken away (the guard
@@ -1319,6 +1340,17 @@ mod tests {
             owner: owner.into(),
             egress,
         }
+    }
+
+    /// The pods' tables are made again when the people's table is not as it was at the last make
+    /// (`flush ruleset` then the levels' own, or a delete by hand), and not when it is unread.
+    #[test]
+    fn the_tables_are_made_again_when_the_people_table_changed_since() {
+        assert!(people_changed(false, Some(true)));
+        assert!(people_changed(true, Some(false)));
+        assert!(!people_changed(true, Some(true)));
+        assert!(!people_changed(false, Some(false)));
+        assert!(!people_changed(true, None) && !people_changed(false, None));
     }
 
     /// Only the IPv4 address of a pod made here is a pod's: another address of the range is not.

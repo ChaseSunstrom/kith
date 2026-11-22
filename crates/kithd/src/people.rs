@@ -412,7 +412,8 @@ pub async fn device(
         Ok(public) => public,
         Err(e) => {
             eprintln!("kithd: no people: {e} (it takes root)");
-            // (No device, so what an earlier start said of one is taken back.)
+            // (No device, so what an earlier start said of one is taken back; no table either.)
+            crate::pods::serve_again(&shared);
             return crate::mesh::left(shared, "people", stopping).await;
         }
     };
