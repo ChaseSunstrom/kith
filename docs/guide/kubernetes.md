@@ -179,10 +179,12 @@ Today it answers `docker version`, `docker info` and these container calls, each
   `start`, `restart`, `kill`, `rm -f` and `wait`.
 
 A container is a kith resource in the namespace `docker`, labelled `kith.dev/docker=NAME`, with the
-labels its create body gave kept as they are. `kith get workload NAME -n docker` shows what docker
-made, and `kith delete` removes it. A container with `--restart always` or `unless-stopped` is a
-Workload (`replicas: 0` while created or stopped, 1 while running); one with `no` (the default) or
-`on-failure` is a Job. Its ID is the SHA-256 of its namespace and name, the same on every run.
+labels its create body gave kept as they are. `kith delete` removes it. A container with
+`--restart always` or `unless-stopped` is a Workload (`replicas: 0` while created or stopped, 1
+while running): `kith get workload NAME -n docker` shows it. One with `no` (the default, so a plain
+`docker run -d`) or `on-failure` is a Job while it runs: `kith get job NAME -n docker` shows it, and
+once stopped it is a Workload at `replicas: 0` again, until `docker start` makes the Job anew. A
+name is at most 61 characters. Its ID is the SHA-256 of its namespace and name, the same on every run.
 
 Refused with a 400 and a JSON `message` in Docker's shape: a name Docker or kith would not take; a
 security-changing HostConfig field (`privileged`, `capAdd`, `securityOpt`, devices, binds and
@@ -191,5 +193,6 @@ name another resource in the store already has (a 409).
 
 Answered 501 with a JSON `message`, never left waiting: `docker run` without `-d`, which attaches
 to the container's output and waits for step 3; `ps` with filters; port bindings; ulimits;
-`--rm`; memory and CPU limits; other network modes; images; and any other call not listed above.
+`--rm`; memory and CPU limits; volumes, `--tmpfs`, `--volumes-from`, a read-only root and
+`--runtime`; other network modes; images; and any other call not listed above.
 A request body sent chunked is 501 too.

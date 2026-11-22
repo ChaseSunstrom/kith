@@ -41,13 +41,21 @@ impl Containers {
     }
 
     /// The reply to a container call, or None when the call is not one (the caller says 501).
-    pub(crate) fn route(&self, method: &str, path: &str, query: &str, body: &[u8]) -> Option<Reply> {
+    /// `gone` says whether the client has hung up: a `wait` stops looking when it has.
+    pub(crate) fn route(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        gone: &mut dyn FnMut() -> bool,
+    ) -> Option<Reply> {
         let parts: Vec<&str> = path.split('/').collect();
         let answer = match (method, parts.as_slice()) {
             ("POST", ["", "containers", "create"]) => self.create(query, body),
             ("GET", ["", "containers", "json"]) => self.list(query),
             ("GET", ["", "containers", id, "json"]) => self.inspect(id),
-            ("POST", ["", "containers", id, "wait"]) => self.wait(id),
+            ("POST", ["", "containers", id, "wait"]) => self.wait(id, gone),
             ("POST", ["", "containers", id, action @ ("start" | "stop" | "restart" | "kill")]) => {
                 self.act(id, action, query)
             }
@@ -89,8 +97,14 @@ impl Containers {
         Ok(found)
     }
 
-    /// The container named `id`, or whose ID starts with `id` (hex, and only one of them).
+    /// The container named `id`, or whose ID starts with `id` (hex, and only one of them). A name
+    /// is two single-key reads; only an ID prefix lists.
     fn find(&self, id: &str) -> Result<Value, Reply> {
+        for kind in ["Workload", "Job"] {
+            if let Some(doc) = self.get(&key(kind, id))?.filter(|doc| ours(doc) == Some(id)) {
+                return Ok(doc);
+            }
+        }
         let all = self.records()?;
         if let Some(doc) = all.iter().find(|doc| ours(doc) == Some(id)) {
             return Ok(doc.clone());
@@ -127,6 +141,9 @@ impl Containers {
         let host = &config["HostConfig"];
         refuse_host(host)?;
         refuse_streams(&config)?;
+        if set(&config["Volumes"]) {
+            return Err(message(501, "kith: volumes are not supported yet"));
+        }
         let restart = restart_of(host)?;
         let retries = host["RestartPolicy"]["MaximumRetryCount"].as_u64().unwrap_or(0);
         let container = container_of(&config, &name)?;
@@ -181,9 +198,12 @@ impl Containers {
     }
 
     /// `POST /containers/{id}/wait`: blocks until the container is not running, as Docker's does.
-    fn wait(&self, id: &str) -> Out {
+    fn wait(&self, id: &str, gone: &mut dyn FnMut() -> bool) -> Out {
         let name = name_of(&self.find(id)?).to_string();
         loop {
+            if gone() {
+                return Err(message(499, "kith: the client hung up"));
+            }
             let doc = self.find(&name)?;
             let st = state(&doc);
             if !st.running {
@@ -249,19 +269,18 @@ impl Containers {
             return Ok(false);
         }
         let name = name_of(&doc).to_string();
-        let next = if doc["kind"] == "Job" {
+        if doc["kind"] == "Job" {
+            // (A finished Job runs again: its status goes with it, so it is taken away first.)
             self.store.delete(&key("Job", &name)).map_err(store_failed)?;
-            doc
+            self.put(doc).map_err(store_failed)?;
         } else if is_job(annotation(&doc, ANN_RESTART)) {
-            self.store.delete(&key("Workload", &name)).map_err(store_failed)?;
-            job_from(&doc)
+            self.convert("Workload", job_from(&doc))?;
         } else {
             let mut doc = doc;
             doc["spec"]["replicas"] = json!(1);
             unset_annotation(&mut doc, ANN_STATE);
-            doc
-        };
-        self.put(next).map_err(store_failed)?;
+            self.put(doc).map_err(store_failed)?;
+        }
         Ok(true)
     }
 
@@ -274,14 +293,38 @@ impl Containers {
         }
         let name = name_of(doc).to_string();
         let mut doc = doc.clone();
-        if doc["kind"] == "Job" {
-            self.store.delete(&key("Job", &name)).map_err(store_failed)?;
+        let job = doc["kind"] == "Job";
+        if job {
             doc = parked(&doc);
         }
         doc["spec"]["replicas"] = json!(0);
         set_annotation(&mut doc, ANN_EXIT, &exit.to_string());
-        self.put(doc).map_err(store_failed)?;
+        if job {
+            self.convert("Job", doc)?;
+        } else {
+            self.put(doc).map_err(store_failed)?;
+        }
         Ok(true)
+    }
+
+    /// Make `new` (a container of the other kind than the one at `old_kind`) and then take the old
+    /// one away, so a failure in between leaves a container, not none. A resource at the new key that
+    /// is not this front's is never written over (409).
+    fn convert(&self, old_kind: &str, new: Value) -> Result<(), Reply> {
+        let name = name_of(&new).to_string();
+        let new_key = key(new["kind"].as_str().unwrap_or(""), &name);
+        if self.get(&new_key)?.is_some_and(|there| ours(&there).is_none()) {
+            return Err(message(
+                409,
+                format!("Conflict. {new_key} is not a container of this front: it is left as it is"),
+            ));
+        }
+        self.put(new).map_err(store_failed)?;
+        if let Err(e) = self.store.delete(&key(old_kind, &name)) {
+            let _ = self.store.delete(&new_key);
+            return Err(store_failed(e));
+        }
+        Ok(())
     }
 }
 
@@ -460,8 +503,15 @@ fn state(doc: &Value) -> State {
         };
     }
     if doc["spec"]["replicas"].as_u64().unwrap_or(1) > 0 {
+        // The status says what the units are doing: every one waiting to start again or exited is
+        // a restart in progress, which Docker counts as running too. (No status yet: just started.)
+        let units = doc["status"]["containers"].as_array().filter(|u| !u.is_empty());
+        let restarting = units.is_some_and(|u| {
+            u.iter()
+                .all(|u| matches!(u["state"].as_str(), Some("waiting" | "exited")))
+        });
         return State {
-            status: "running",
+            status: if restarting { "restarting" } else { "running" },
             running: true,
             exit: 0,
         };
@@ -501,6 +551,7 @@ fn list_item(doc: &Value) -> Value {
     let c = &doc["spec"]["template"]["containers"][0];
     let status = match st.status {
         "running" => "Up".to_string(),
+        "restarting" => "Restarting".to_string(),
         "exited" => format!("Exited ({})", st.exit),
         _ => "Created".to_string(),
     };
@@ -557,7 +608,7 @@ fn inspect_json(doc: &Value) -> Value {
             "Status": st.status,
             "Running": st.running,
             "Paused": false,
-            "Restarting": false,
+            "Restarting": st.status == "restarting",
             "OOMKilled": false,
             "Dead": false,
             "Pid": 0,
@@ -662,11 +713,14 @@ fn env_of(v: &Value) -> Result<Vec<Value>, Reply> {
         .collect()
 }
 
+/// The longest container name: a Workload's units are NAME-0, and a kith name is at most 63.
+const MAX_NAME: usize = 61;
+
 /// A container's name is a kith name: lowercase letters, digits, `-` and `.` (Docker's names, made
-/// stricter: no capitals or `_`), at most 63 characters, starting and ending with a letter or digit.
+/// stricter: no capitals or `_`), at most MAX_NAME characters, starting and ending with a letter or digit.
 fn check_name(name: &str) -> Result<(), Reply> {
     let ok = !name.is_empty()
-        && name.len() <= 63
+        && name.len() <= MAX_NAME
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
@@ -678,7 +732,7 @@ fn check_name(name: &str) -> Result<(), Reply> {
         Err(message(
             400,
             format!(
-                "kith: invalid container name ({name}): use lowercase letters, digits, - and ., starting and ending with a letter or digit, at most 63 characters"
+                "kith: invalid container name ({name}): use lowercase letters, digits, - and ., starting and ending with a letter or digit, at most {MAX_NAME} characters"
             ),
         ))
     }
@@ -746,7 +800,16 @@ fn refuse_host(host: &Value) -> Result<(), Reply> {
             format!("kith: NetworkMode {network} is not supported yet: the default bridge is"),
         ));
     }
-    let not_yet = ["PortBindings", "Ulimits"].iter().any(|f| set(&host[*f]))
+    let not_yet = [
+        "PortBindings",
+        "Ulimits",
+        "Tmpfs",
+        "VolumesFrom",
+        "ReadonlyRootfs",
+        "Runtime",
+    ]
+    .iter()
+    .any(|f| set(&host[*f]))
         || host["AutoRemove"].as_bool() == Some(true)
         || ["Memory", "NanoCpus", "CpuShares", "CpuQuota"]
             .iter()
@@ -754,7 +817,7 @@ fn refuse_host(host: &Value) -> Result<(), Reply> {
     if not_yet {
         return Err(message(
             501,
-            "kith: published ports, ulimits, --rm and resource limits are not supported yet",
+            "kith: published ports, ulimits, --rm, resource limits, volumes, tmpfs, read-only roots and runtimes are not supported yet",
         ));
     }
     Ok(())
@@ -860,7 +923,7 @@ mod tests {
     fn call(c: &Containers, method: &str, target: &str, body: &str) -> (u16, Value) {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         let reply = c
-            .route(method, path, query, body.as_bytes())
+            .route(method, path, query, body.as_bytes(), &mut || false)
             .expect("the front answers this call");
         let json = if reply.body.is_empty() {
             Value::Null
@@ -934,6 +997,92 @@ mod tests {
         let (_, inspect) = call(&c, "GET", "/containers/retry/json", "");
         assert_eq!(inspect["State"]["Status"], "exited");
         assert_eq!(inspect["State"]["ExitCode"], 143);
+    }
+
+    #[test]
+    fn a_kind_change_never_writes_over_a_resource_that_is_not_ours() {
+        let (mem, c) = fixture();
+        call(
+            &c,
+            "POST",
+            "/containers/create?name=once",
+            r#"{"Image":"alpine","HostConfig":{"RestartPolicy":{"Name":"no"}}}"#,
+        );
+        // Someone else's Job of that name (no kith.dev/docker label).
+        let theirs = json!({"kind":"Job","metadata":{"name":"once","namespace":"docker"},"spec":{}});
+        mem.apply(theirs.clone()).unwrap();
+        let (status, reply) = call(&c, "POST", "/containers/once/start", "");
+        assert_eq!(status, 409, "{reply}");
+        assert_eq!(
+            mem.get("Job/docker/once").unwrap(),
+            Some(theirs),
+            "their Job is as it was"
+        );
+        assert!(
+            mem.get("Workload/docker/once").unwrap().is_some(),
+            "the container is kept, not lost"
+        );
+    }
+
+    #[test]
+    fn a_name_fits_a_workloads_unit_names() {
+        let (_mem, c) = fixture();
+        let ok = "a".repeat(MAX_NAME);
+        let (status, _) = call(&c, "POST", &format!("/containers/create?name={ok}"), WEB);
+        assert_eq!(status, 201);
+        let long = "a".repeat(MAX_NAME + 1);
+        let (status, reply) = call(&c, "POST", &format!("/containers/create?name={long}"), WEB);
+        assert_eq!(status, 400, "{reply}");
+        assert!(reply["message"].as_str().unwrap().contains("at most 61"), "{reply}");
+    }
+
+    #[test]
+    fn volumes_tmpfs_read_only_roots_and_runtimes_are_refused_not_dropped() {
+        let (mem, c) = fixture();
+        for body in [
+            r#"{"Image":"alpine","Volumes":{"/data":{}},"HostConfig":{}}"#,
+            r#"{"Image":"alpine","HostConfig":{"Tmpfs":{"/tmp":""}}}"#,
+            r#"{"Image":"alpine","HostConfig":{"VolumesFrom":["other"]}}"#,
+            r#"{"Image":"alpine","HostConfig":{"ReadonlyRootfs":true}}"#,
+            r#"{"Image":"alpine","HostConfig":{"Runtime":"runsc"}}"#,
+        ] {
+            let (status, reply) = call(&c, "POST", "/containers/create?name=x", body);
+            assert_eq!(status, 501, "{body}: {reply}");
+        }
+        assert!(mem.0.lock().unwrap().is_empty(), "nothing was made");
+    }
+
+    #[test]
+    fn a_wait_stops_when_the_client_has_hung_up() {
+        let (_mem, c) = fixture();
+        call(&c, "POST", "/containers/create?name=web", WEB);
+        call(&c, "POST", "/containers/web/start", "");
+        let mut polls = 0;
+        let reply = c
+            .route("POST", "/containers/web/wait", "", b"", &mut || {
+                polls += 1;
+                polls > 2
+            })
+            .expect("answered");
+        assert_eq!(reply.status, 499);
+        assert!(polls > 2, "it asked the client again and again");
+    }
+
+    #[test]
+    fn a_workload_whose_units_are_all_waiting_or_exited_is_restarting() {
+        let (mem, c) = fixture();
+        call(&c, "POST", "/containers/create?name=web", WEB);
+        call(&c, "POST", "/containers/web/start", "");
+        let mut w = mem.get("Workload/docker/web").unwrap().unwrap();
+        w["status"] = json!({"replicas":1,"containers":[{"name":"web-0","state":"running"}]});
+        mem.apply(w.clone()).unwrap();
+        let (_, inspect) = call(&c, "GET", "/containers/web/json", "");
+        assert_eq!(inspect["State"]["Status"], "running");
+        w["status"] = json!({"replicas":1,"containers":[{"name":"web-0","state":"waiting"}]});
+        mem.apply(w).unwrap();
+        let (_, inspect) = call(&c, "GET", "/containers/web/json", "");
+        assert_eq!(inspect["State"]["Status"], "restarting");
+        assert_eq!(inspect["State"]["Restarting"], true);
     }
 
     #[test]
@@ -1118,9 +1267,12 @@ mod tests {
     #[test]
     fn calls_and_options_that_are_not_here_are_not_answered_here() {
         let (_mem, c) = fixture();
-        assert!(c.route("GET", "/containers/web/logs", "", b"").is_none());
-        assert!(c.route("POST", "/containers/web/attach", "", b"").is_none());
-        assert!(c.route("GET", "/images/json", "", b"").is_none());
+        assert!(c.route("GET", "/containers/web/logs", "", b"", &mut || false).is_none());
+        assert!(
+            c.route("POST", "/containers/web/attach", "", b"", &mut || false)
+                .is_none()
+        );
+        assert!(c.route("GET", "/images/json", "", b"", &mut || false).is_none());
         let attached = r#"{"Image":"alpine","AttachStdout":true,"HostConfig":{}}"#;
         let (status, reply) = call_refusal(&c, "POST", "/containers/create?name=web", attached);
         assert_eq!(status, 501, "docker run without -d needs attach: not yet");

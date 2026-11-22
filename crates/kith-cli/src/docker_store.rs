@@ -11,11 +11,12 @@ pub struct DockerStore(pub Backend);
 
 impl Store for DockerStore {
     fn get(&self, key: &str) -> Result<Option<Value>, String> {
-        let Some((kind, _)) = key.split_once('/') else {
-            return Ok(None);
-        };
-        let found = self.0.list(Some(kind))?.into_iter().find(|r| r.key() == key);
-        found.map(|r| to_value(&r)).transpose()
+        // One read of the one key; "not found" (local or kithd's refusal) is no resource, not a failure.
+        match self.0.get(key) {
+            Ok(resource) => to_value(&resource).map(Some),
+            Err(e) if e.ends_with(" not found") => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn list(&self, kind: &str, namespace: &str) -> Result<Vec<Value>, String> {

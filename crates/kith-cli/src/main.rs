@@ -1265,13 +1265,15 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 Some(path) => path,
                 None => return fail("no place for the socket: set --listen PATH"),
             };
+            // (The backend first: one that cannot be reached makes no socket.)
+            let store = docker_store::DockerStore(backend()?);
             let listener = kith_docker::listen(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             eprintln!(
                 "kith: the Docker API is on {}: DOCKER_HOST=unix://{} docker version",
                 path.display(),
                 path.display()
             );
-            kith_docker::serve_with(listener, Some(Box::new(docker_store::DockerStore(backend()?))));
+            kith_docker::serve_with(listener, Some(Box::new(store)));
             return Ok(ExitCode::SUCCESS);
         }
         Command::Lint { files } => {

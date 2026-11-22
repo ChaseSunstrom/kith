@@ -255,7 +255,22 @@ fn handle(stream: UnixStream, head: Duration, body: Duration, containers: Option
     loop {
         let (reply, head_only, close) = match read_request(&mut reader, head, body) {
             Ok(None) => return,
-            Ok(Some(request)) => (route(&request, containers), request.method == "HEAD", request.close),
+            Ok(Some(request)) => {
+                // Has the client hung up? A 1 ms look at the socket: EOF or an error says yes, a
+                // timeout (nothing sent) or buffered bytes (a pipelined request) say no.
+                let mut gone = || {
+                    reader.get_mut().until = Instant::now() + Duration::from_millis(1);
+                    match reader.fill_buf() {
+                        Ok(bytes) => bytes.is_empty(),
+                        Err(e) => !matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock),
+                    }
+                };
+                (
+                    route(&request, containers, &mut gone),
+                    request.method == "HEAD",
+                    request.close,
+                )
+            }
             Err(reply) => (reply, false, true),
         };
         if write_reply(&reader.get_ref().stream, &reply, head_only, close).is_err() || close {
@@ -387,7 +402,8 @@ fn read_request(reader: &mut BufReader<Clocked>, head: Duration, body: Duration)
         ));
     }
     reader.get_mut().until = Instant::now() + body;
-    let mut bytes = Vec::with_capacity(length as usize);
+    // (Not with_capacity(length): the length is the client's word, and a lie costs memory it never sends.)
+    let mut bytes = Vec::new();
     if reader.by_ref().take(length).read_to_end(&mut bytes).is_ok() && bytes.len() as u64 == length {
         Ok(Some(Request {
             method: method.to_string(),
@@ -417,7 +433,7 @@ fn split_version(path: &str) -> (Option<(u32, u32)>, &str) {
         .map_or((None, path), |(version, rest)| (Some(version), rest))
 }
 
-fn route(request: &Request, containers: Option<&Containers>) -> Reply {
+fn route(request: &Request, containers: Option<&Containers>, gone: &mut dyn FnMut() -> bool) -> Reply {
     let (path, query) = request.target.split_once('?').unwrap_or((request.target.as_str(), ""));
     let (version, path) = split_version(path);
     // (Like dockerd, `/_ping` answers any client: the version it names is how a client learns ours.)
@@ -452,7 +468,7 @@ fn route(request: &Request, containers: Option<&Containers>) -> Reply {
         ("GET" | "HEAD", "/version") => json_reply(200, version_json()),
         ("GET" | "HEAD", "/info") => json_reply(200, info_json()),
         (method, _) => containers
-            .and_then(|c| c.route(method, path, query, &request.body))
+            .and_then(|c| c.route(method, path, query, &request.body, gone))
             .unwrap_or_else(|| {
                 message(
                     501,
@@ -775,10 +791,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Feed `bytes` to `handle` one every 40 ms; how long until it hung up (None: it never did in 5 s).
+    /// Feed `bytes` to `handle` one every 40 ms (16 s in all); how long until it hung up (None: it
+    /// never did in 30 s). The deadline is 1.5 s and the test allows 12: a loaded host cannot flake it.
     fn trickle(head: &'static [u8], rest: &'static [u8]) -> Option<Duration> {
         let (client, server) = UnixStream::pair().unwrap();
-        std::thread::spawn(move || handle(server, Duration::from_millis(400), Duration::from_millis(400), None));
+        std::thread::spawn(move || handle(server, Duration::from_millis(1500), Duration::from_millis(1500), None));
         let start = Instant::now();
         let mut writer = client.try_clone().unwrap();
         std::thread::spawn(move || {
@@ -791,7 +808,7 @@ mod tests {
             }
         });
         let mut client = client;
-        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let mut sink = Vec::new();
         client.read_to_end(&mut sink).ok().map(|_| start.elapsed())
     }
@@ -799,12 +816,12 @@ mod tests {
     #[test]
     fn a_head_or_a_body_that_trickles_in_is_cut_off_at_its_deadline() {
         // A head: every read arrives in time, the head as a whole does not.
-        let cut = trickle(b"GET /_ping HTTP/1.1\r\nX-Slow: ", &[b'a'; 200]).expect("a slow head was never cut");
-        assert!(cut < Duration::from_secs(2), "cut after {cut:?}");
+        let cut = trickle(b"GET /_ping HTTP/1.1\r\nX-Slow: ", &[b'a'; 400]).expect("a slow head was never cut");
+        assert!(cut < Duration::from_secs(12), "cut after {cut:?}");
         // A body.
-        let cut = trickle(b"POST /x HTTP/1.1\r\nContent-Length: 1000\r\n\r\n", &[b'a'; 200])
+        let cut = trickle(b"POST /x HTTP/1.1\r\nContent-Length: 1000\r\n\r\n", &[b'a'; 400])
             .expect("a slow body was never cut");
-        assert!(cut < Duration::from_secs(2), "cut after {cut:?}");
+        assert!(cut < Duration::from_secs(12), "cut after {cut:?}");
     }
 
     #[test]

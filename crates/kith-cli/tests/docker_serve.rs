@@ -64,12 +64,18 @@ fn wait_for_socket(socket: &Path) {
 }
 
 /// The real `docker` CLI, pointed at `kith --store FILE docker serve`: the containers it runs are
-/// kith resources in that store, and `kith get` shows them. Skipped where there is no docker CLI.
+/// kith resources in that store, and `kith get` shows them. Where there is no docker CLI the test
+/// fails (a green run must not mean nothing ran) unless KITH_SKIP_DOCKER_CLI=1 says to skip it.
 #[test]
 fn the_docker_cli_runs_containers_through_kith_against_a_store() {
     let docker = Path::new("/usr/bin/docker");
     if !docker.exists() {
-        eprintln!("skipped: no docker CLI at {}", docker.display());
+        assert!(
+            std::env::var_os("KITH_SKIP_DOCKER_CLI").is_some_and(|v| v == "1"),
+            "no docker CLI at {}: install it, or set KITH_SKIP_DOCKER_CLI=1 to skip this test",
+            docker.display()
+        );
+        eprintln!("SKIPPED: no docker CLI at {}", docker.display());
         return;
     }
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("docker-cli-{}", std::process::id()));
@@ -147,6 +153,19 @@ fn the_docker_cli_runs_containers_through_kith_against_a_store() {
     assert!(
         inspected.contains("\"Name\": \"/web\"") && inspected.contains("\"Running\": true"),
         "{inspected}"
+    );
+
+    // A default `docker run -d` (restart no) is a Job while it runs; `--restart always` is a Workload.
+    let (ok, job) = kith(&["get", "job", "web", "-n", "docker", "-o", "json"]);
+    assert!(ok, "kith get job: {job}");
+    assert!(
+        job.contains("\"kith.dev/docker\": \"web\"") && job.contains("\"team\": \"a\""),
+        "{job}"
+    );
+    let (ok, api) = kith(&["get", "workload", "api", "-n", "docker", "-o", "json"]);
+    assert!(
+        ok && api.contains("\"kith.dev/docker\": \"api\""),
+        "kith get workload: {api}"
     );
 
     must("stop", cli(&["stop", "web"]));
