@@ -15,8 +15,8 @@
             three() {
                 cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"$1","labels":{"app":"$1"}},"spec":{"replicas":3,"template":{"pod":true,"containers":[
-  {"name":"web",$2,"ports":[{"port":80}],"readiness":{"tcp":{"port":80}}}]}}},
- {"apiVersion":"kith.dev/v1","kind":"Service","metadata":{"name":"$1"},"spec":{"selector":{"app":"$1"},"ports":[{"port":80}]}}]
+  {"name":"web",$2,"ports":[{"port":${cport:-80}}],"readiness":{"tcp":{"port":${cport:-80}}}}]}}},
+ {"apiVersion":"kith.dev/v1","kind":"Service","metadata":{"name":"$1"},"spec":{"selector":{"app":"$1"},"ports":[{"port":80,"targetPort":${cport:-80}}]}}${extra:-}]
 EOF
                 any POST /v1/apply "$work/apply.json" >/dev/null || fail "the pods of $1 were not applied"
                 waited=0
@@ -168,6 +168,16 @@ EOF
                     grep -q 'GET / HTTP/1.0' "$work/stock.out" || fail "the Service did not pass a request to nginx $replica, or it could not say so on /dev/stdout: $(cat "$work/stock.out")"
                 done
                 stock='three pods of nginx as it is shipped (mirror.gcr.io/library/nginx:1.27-alpine) started the same way, and each said on /dev/stdout that it was asked through their Service'
+                # What packages/web renders (T-1040): the unprivileged build, which runs as
+                # kith runs every container (non-root, read-only root) and listens on 8080,
+                # with its page, a ConfigMap, mounted at its web root.
+                cport=8080
+                extra=',{"apiVersion":"kith.dev/v1","kind":"ConfigMap","metadata":{"name":"webpage"},"spec":{"data":{"index.html":"<h1>Hello from kith</h1>"}}}'
+                three webpage '"image":"docker.io/nginxinc/nginx-unprivileged:1.27-alpine","volumeMounts":[{"configMap":"webpage","path":"/usr/share/nginx/html"}]'
+                unset cport extra
+                asks ask-webpage webpage 80
+                grep -q 'Hello from kith' "$work/ask-webpage.out" || fail "the web package's server did not serve its page: $(cat "$work/ask-webpage.out")"
+                stock="$stock; the web package's image (nginx-unprivileged on 8080, its page mounted) served its page"
             fi
 
             # A Job of one container: NAME, more of its template, its container, and what the

@@ -37,7 +37,7 @@ fn a_package_renders_to_resources() {
     assert_eq!(workload.spec["replicas"], 1);
     assert_eq!(
         workload.spec["template"]["containers"][0]["image"],
-        "docker.io/library/nginx:1.27-alpine"
+        "docker.io/nginxinc/nginx-unprivileged:1.27-alpine"
     );
     assert!(rendered.resources[0].spec.get("expose").is_none());
     assert!(rendered.notes.unwrap().contains("curl http://shop-web.store.kith/"));
@@ -58,6 +58,34 @@ fn a_package_renders_to_resources() {
         (Some("MODE"), Some("a: b"))
     );
     assert!(rendered.notes.unwrap().contains("2 copies"));
+}
+
+/// kith runs a container with a read-only root, as 65534: the web package's server must
+/// start so (the unprivileged nginx build: port 8080, writes only /tmp), serve the page the
+/// package makes (mounted at the web root) and say when it listens.
+#[test]
+fn web_package_runs_read_only_as_non_root() {
+    for package in [example(), twin()] {
+        let rendered = package.render(SHOP, &[]).unwrap();
+        let container = &rendered.resources[2].spec["template"]["containers"][0];
+        assert_eq!(container["image"], "docker.io/nginxinc/nginx-unprivileged:1.27-alpine");
+        assert_eq!(container["ports"][0]["port"], 8080);
+        assert_eq!(
+            container["volumeMounts"],
+            json!([{ "configMap": "shop-web-page", "path": "/usr/share/nginx/html" }])
+        );
+        assert_eq!(container["readiness"], json!({ "tcp": { "port": "http" } }));
+        // It asks for nothing that defaults take away: no root, no writable root.
+        for key in ["runAsUser", "readOnlyRoot", "runAsNonRoot"] {
+            assert!(container.get(key).is_none(), "{key}");
+        }
+        // The Service answers on 80 and reaches the container's named port.
+        assert_eq!(rendered.resources[0].spec["ports"][0]["targetPort"], "http");
+        // No page, no mount of a ConfigMap that is not there.
+        let bare = package.render(SHOP, &[json!({ "page": "" })]).unwrap();
+        let container = &bare.resources[1].spec["template"]["containers"][0];
+        assert!(container.get("volumeMounts").is_none(), "{container}");
+    }
 }
 
 #[test]
@@ -392,7 +420,7 @@ fn kith_templates_give_what_the_yaml_templates_give() {
     let values = [
         json!({}),
         json!({ "replicas": 3, "expose": { "host": "shop.example.org" }, "env": { "MODE": "fast", "B": "2" } }),
-        json!({ "page": "", "image": "example.org/web:2", "port": 8080 }),
+        json!({ "page": "", "image": "example.org/web:2", "port": 9090 }),
     ];
     for values in values {
         let layers = [values];
