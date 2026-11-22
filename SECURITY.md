@@ -39,7 +39,12 @@ Only the newest version is fixed. There are no security releases of older ones.
   browser holds.)
   A connection holds one of 64 slots until it has shown a certificate, and one that
   shows none for at most 15 seconds; one address (an IPv4 address, an IPv6 /64) holds
-  at most 8 of them. The node's own loopback is not counted.
+  at most 8 of them. The node's own loopback is not counted. On a node started with
+  `--people` the people's addresses (`100.89.0.0/16` and their /64) have 16 slots of their
+  own, 2 to an address (an IPv6 peer counted whole, not by its /64), so a crowd of them
+  leaves the 64 free, and a crowd of strangers filling the 64 does not keep them from being
+  picked up. A NetworkPolicy sees a person as the node that serves it (a Service on this node
+  asks it with the node's address), so a person's reach is its level's Services alone.
 - **The API** is behind a layer that works out who calls (the socket, a node, an
   Identity) and refuses what their Roles do not allow. A token is shown once, kept only
   as a hash, good for an hour, and spent by its first use.
@@ -313,6 +318,33 @@ Only the newest version is fixed. There are no security releases of older ones.
   namespaces ask for a port the node has kept for neither (a first start, a file that
   cannot be read, a node whose state is new), none of them has it. Whoever can write the
   node's state can write that file, as they can everything else of the node's.
+- **A person's device** (a phone, a laptop: a `RemotePeer` of one node, with an
+  `AccessLevel`) gets in only by a node its owner started with `--people` (as root; no
+  store write opens a port or makes the device), over a second WireGuard device `kwg0`
+  that is not the mesh's, and holds what its level names and nothing else.
+  `kith peer add` (`POST /v1/peers`, for whoever may apply a RemotePeer) has kithd make
+  the key and answer once, `Cache-Control: no-store`, with the configuration: the private
+  key is in that answer and nowhere else, not the store, the history, the audit line or
+  the log (a test looks in each), and is wiped where kithd holds it (not the copies the
+  kernel's netlink buffers and hyper's keep). Keys are made at 5 a minute for each node
+  asked, a name that has a key is refused unless asked with `replace`, and a name being added
+  is held so two asks cannot both get a key. A level is held on the node by an nftables
+  table, `inet kith-people`, written whole in one batch and judged on every packet both
+  ways, with no accept on a connection's state alone: a level narrowed or a peer deleted is
+  cut within 5 seconds (every store change wakes it at once; a rule undone by hand is put
+  back within 10), the connections open included, which are flushed by the peer's mark. A peer's allowed addresses on the device
+  are its own /32 and /128, so WireGuard drops a packet sent as another's, and a people
+  address that comes in by another link is dropped before any rule. A peer cannot reach the
+  mesh, another peer, or the node's own ports (kithd's API only with `api`, its `--dns`,
+  ingress, NFS and published ports never), and the table drops between start and the
+  rules. The ranges a level may name are the node's `--people-networks` (the store narrows
+  within them, never widens), cut of the mesh, the people's and the pods' ranges, the
+  link-local ranges and the node's own links; a level's internet is IPv4, out by the
+  home's connection or by the Exit that lists the level and no other, and a named range
+  never leaves by an Exit's link. Kithd's Service proxy serves a person only the
+  Services its level names, 8 places of 4096 each by its own address, and the API's
+  handshakes give the people 16 slots of their own (2 to an address) so neither keeps the
+  others out. The resolver does not forward for the people's ranges.
 - **The Kubernetes API** (`/api`, `/apis`) is behind the same layer as `/v1`. A request
   is checked as the kith kind and namespace it comes to, by the Roles of the
   certificate's Identity; a write is asked for before anything is said of what is
@@ -757,6 +789,29 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   starting a pod and making its rules (the rules come first; nothing shows the order
   holds under a kill), and names a pod's own resolver library cached before its exit
   changed.
+- **A person's device is its level's, and what a level does not hold is this.** (The
+  bounds are under "A person's device" above.)
+  A level that has the internet can go round the home's resolver: DNS over HTTPS, a resolver
+  on another port, a tunnel inside the tunnel. Past the node a peer is the node: a LAN host,
+  a router or a share that trusts addresses, and every NetworkPolicy, sees the node that
+  ends its tunnel. There is no limit on bandwidth, so a peer can fill the uplink. A copied
+  configuration is the peer until the peer is deleted: nothing expires, an unlocked phone
+  needs no unlock to turn the tunnel on, a QR code photographed into a cloud backup is a
+  copy, and two devices on one key take turns. Rolling a RemotePeer back to a revision with
+  an older key lets that key in again: delete, do not edit back. Who may apply an
+  AccessLevel or a RemotePeer may put any peer on any level (rights go by kind, not name),
+  so a level that holds `api` or the internet is the admin's to write. The node that ends
+  the tunnels holds the people key and sees what is not TLS, and a taken one is the server
+  to every phone: choose a node you trust with their traffic. After kithd crashes the
+  last rules stand until it is back (a peer deleted meanwhile still passes); a connection
+  kithd's proxy holds for a peer that lost its Service stays open, passing nothing, up to
+  an hour. IPv6 to the internet is not carried. People do not reach a Service on the
+  ingress node's ports 80 and 443. A name the resolver answers is not access. Every case
+  of the bounds ran in virtual machines on a kernel's own WireGuard (`sh ci/vm.sh --test
+  access`: two phones, a Service reached and one not, a level narrowed, an Exit's level
+  left by it, an Exit deleted and a peer removed with a connection open, each cut within
+  5 seconds, the Services reached over the phones' IPv6 addresses); none ran with a real
+  phone, a real router or the app, and not an IPv6 range a level names.
 - **A NetworkPolicy's egress rules hold a pod's packets, on kith OS as root and for pod Workloads
   and Jobs only.** The pods of the Workloads and Jobs a policy selects, an exit's pod included,
   pass only what a rule allows, DNS included. Each pod is matched per pod link: its rules are the

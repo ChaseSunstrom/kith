@@ -79,6 +79,33 @@ pub struct Wanted {
     notes: Vec<String>,
 }
 
+/// What each peer reaches: its Services' addresses and TCP ports (none is all of them).
+pub type Reach = BTreeMap<IpAddr, Arc<Vec<(Ipv6Addr, Vec<u16>)>>>;
+
+/// The Services each of this node's peers reaches, by the peer's address (both of them): what the
+/// Service listener lets a person's connection through to (docs/adr-people.md, slice E2b).
+pub fn reach(store: &Store, prefixes: (Ipv6Addr, Ipv6Addr), node: &str) -> Reach {
+    // (No networks: only the levels' Services are asked of it.)
+    let config = Config {
+        interface: String::new(),
+        networks: Vec::new(),
+        api: 0,
+        pods: (Ipv4Addr::UNSPECIFIED, 32),
+    };
+    // (No Exits either: a level's internet is not what a Service listener asks.)
+    let asked = wanted(store, prefixes, node, &config, Vec::new(), &Held::new());
+    let mut reach = BTreeMap::new();
+    for (person, _) in &asked.people {
+        let Some((_, level)) = asked.levels.iter().find(|(name, _)| *name == person.level) else {
+            continue;
+        };
+        let services = Arc::new(level.services.clone());
+        reach.extend(person.v4.map(|v4| (IpAddr::V4(v4), services.clone())));
+        reach.extend(person.v6.map(|v6| (IpAddr::V6(v6), services.clone())));
+    }
+    reach
+}
+
 fn status_text(resource: &Resource, field: &str) -> Option<String> {
     let said = resource.status.as_ref()?.get(field)?.as_str()?;
     (!said.is_empty()).then(|| said.to_string())
