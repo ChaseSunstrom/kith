@@ -257,6 +257,16 @@ pub fn from_docker(inspected: Vec<Value>) -> Result<(Value, Vec<(String, String)
         if name.is_empty() || !c.is_object() {
             return Err("a container of the input has no Name: is it `docker inspect` of containers?".into());
         }
+        // A saved inspect is not trusted: the name goes into paths and lines on a terminal, and
+        // docker's own container names are these characters.
+        if !name.starts_with(|c: char| c.is_ascii_alphanumeric())
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+        {
+            return Err(format!(
+                "a container's Name ({}) has characters a docker container's does not",
+                name.escape_default()
+            ));
+        }
         // What is there, and not the empty or false it stands for.
         let on = |v: &Value| (!is_empty(v) && *v != json!(false)).then(|| v.clone());
         let secs = |ns: &Value| {
@@ -298,7 +308,8 @@ pub fn from_docker(inspected: Vec<Value>) -> Result<(Value, Vec<(String, String)
             let (port, proto) = key.split_once('/').unwrap_or((key, "tcp"));
             match host["PortBindings"][key.as_str()].as_array().filter(|b| !b.is_empty()) {
                 Some(bound) => ports.extend(bound.iter().map(|b| {
-                    json!(format!("{}:{port}/{proto}", b["HostPort"].as_str().unwrap_or(""))) // (the address a port is bound to is not carried)
+                    json!(format!("{}:{port}/{proto}", b["HostPort"].as_str().unwrap_or("")))
+                    // (the address a port is bound to is not carried)
                 })),
                 None => ports.push(json!(key)),
             }

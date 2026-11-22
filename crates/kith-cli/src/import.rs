@@ -76,6 +76,7 @@ pub fn run(what: Import) -> Result<ExitCode, String> {
     // The docker volumes a container mounts, and the Volumes kith names them.
     let mut named = Vec::new();
     let mut copy_into = "default".to_string();
+    let mut has_node = false;
     let (resources, report) = match what {
         Import::Docker {
             containers,
@@ -95,6 +96,7 @@ pub fn run(what: Import) -> Result<ExitCode, String> {
             let (doc, volumes) =
                 kith_kube::compose::from_docker(documents(&name, &src)?).map_err(|e| format!("error: {name}: {e}"))?;
             named = volumes;
+            has_node = node.is_some();
             copy_into = namespace.clone().unwrap_or(copy_into);
             kith_kube::compose::translate(doc, namespace.as_deref(), node.as_deref())
         }
@@ -137,6 +139,18 @@ pub fn run(what: Import) -> Result<ExitCode, String> {
         }
     }
     for line in &report {
+        // The input is not trusted: a key with a newline in it would forge a line below, and an
+        // escape would reach the terminal.
+        let line: String = line
+            .chars()
+            .flat_map(|c| {
+                if c.is_control() {
+                    c.escape_default().collect()
+                } else {
+                    vec![c]
+                }
+            })
+            .collect();
         eprintln!("not translated: {line}");
     }
     // A volume that no Workload made here mounts (a refused mount, or a name two things make)
@@ -150,19 +164,34 @@ pub fn run(what: Import) -> Result<ExitCode, String> {
             })
         })
     };
-    for (docker, kith) in named.iter().filter(|(_, kith)| mounted(kith)) {
-        // The line is one to paste into a shell, and a saved inspect is not trusted: docker's
-        // own volume names are these characters, and a name of others gets no line.
-        let plain = docker.starts_with(|c: char| c.is_ascii_alphanumeric())
-            && docker.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c));
-        if !plain {
-            eprintln!("volume {kith}: its docker name has characters a docker volume's does not: copy it in by hand");
-            continue;
+    // Without --node no Volume is made: there is nothing to copy into.
+    // The docker volumes by the kith name they make: two of one name (`web_data`, `web-data`) are
+    // one Volume that a copy of each would mix.
+    let mut by_kith: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> = Default::default();
+    for (docker, kith) in named.iter().filter(|(_, kith)| has_node && mounted(kith)) {
+        by_kith.entry(kith).or_default().insert(docker);
+    }
+    // The line is one to paste into a shell, and a saved inspect is not trusted: docker's own
+    // volume names are these characters, a namespace's are these, and others get no line.
+    let plain = |s: &str, more: &str| {
+        s.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || more.contains(c))
+    };
+    for (kith, dockers) in by_kith {
+        let escaped: Vec<String> = dockers.iter().map(|d| d.escape_default().to_string()).collect();
+        if dockers.len() > 1 {
+            eprintln!("volume {kith}: copy by hand: {} all map to it", escaped.join(", "));
+        } else if !dockers.iter().all(|d| plain(d, "_.-")) || !plain(&copy_into, "-.") {
+            eprintln!(
+                "volume {kith}: its docker name or namespace has characters a name's does not: copy it in by hand"
+            );
+        } else {
+            let docker = escaped[0].as_str();
+            eprintln!(
+                "volume {kith}: once applied, copy the docker volume's files in: \
+                 docker run --rm -v {docker}:/v:ro busybox tar -C /v -c . | kith volume put {kith} - -n {copy_into}"
+            );
         }
-        eprintln!(
-            "volume {kith}: once applied, copy the docker volume's files in: \
-             docker run --rm -v {docker}:/v:ro busybox tar -C /v -c . | kith volume put {kith} - -n {copy_into}"
-        );
     }
     eprintln!("{} resources, {} things not translated", resources.len(), report.len());
     Ok(ExitCode::from(u8::from(!report.is_empty())))

