@@ -4,9 +4,9 @@
 //! is an apply of a Job (or, with `-d`, a Workload of one replica), and `ps` reads the
 //! `status.containers` that kithd writes for every Workload, NodeWorkload and Job.
 
-use kith_api::store::Action;
 use super::{Backend, DEFAULT_NAMESPACE, Resource, escape, fail, print_table, stream_logs};
 use clap::Args;
+use kith_api::store::Action;
 use serde_json::{Value, json};
 use std::process::ExitCode;
 
@@ -139,7 +139,10 @@ fn apply_new(backend: &Backend, kind: &str, l: &Launch) -> Result<Resource, Stri
         match changes.into_iter().next() {
             Some(c) if c.action == Action::Created => return Ok(c.after),
             _ if l.name.is_some() || lost.len() >= 20 => {
-                return fail(format!("{kind}/{}/{name} was taken meanwhile: pick another --name", l.namespace));
+                return fail(format!(
+                    "{kind}/{}/{name} was taken meanwhile: pick another --name",
+                    l.namespace
+                ));
             }
             _ => lost.push(name),
         }

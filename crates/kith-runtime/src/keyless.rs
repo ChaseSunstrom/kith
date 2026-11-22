@@ -239,7 +239,10 @@ pub fn bundle(bytes: &[u8]) -> std::result::Result<Signed, String> {
         .map(Vec::as_slice)
         .unwrap_or_default();
     if listed.len() > STAMPS {
-        return Err(format!("a bundle with {} timestamps, not more than {STAMPS}", listed.len()));
+        return Err(format!(
+            "a bundle with {} timestamps, not more than {STAMPS}",
+            listed.len()
+        ));
     }
     let stamps = listed
         .iter()
@@ -1772,7 +1775,12 @@ pub(crate) mod tests {
         let said = refused_under(&v2(&made, &cert, &key, None, 3_600, ""), &rule);
         assert!(said.contains("outside its authority's certificate's time"), "{said}");
         // A certificate that starts at START + 7,200: a timestamp at 60 is before it.
-        let (late, late_key) = tsa.leaf(START + 7_200, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let (late, late_key) = tsa.leaf(
+            START + 7_200,
+            "tsa@example.test",
+            ISSUED,
+            ExtendedKeyUsagePurpose::TimeStamping,
+        );
         let said = refused_under(&v2(&made, &late, &late_key, None, 60, ""), &rule);
         assert!(said.contains("outside its authority's certificate's time"), "{said}");
     }
@@ -1795,7 +1803,12 @@ pub(crate) mod tests {
         // The signer's certificate runs START to START + 600; a timestamp at 700, by a TSA
         // certificate that runs past it, is after it.
         let made = Making::new(&authority, &log, DIGEST);
-        let (later, later_key) = tsa.leaf(START + 300, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let (later, later_key) = tsa.leaf(
+            START + 300,
+            "tsa@example.test",
+            ISSUED,
+            ExtendedKeyUsagePurpose::TimeStamping,
+        );
         let said = refused_under(&v2(&made, &later, &later_key, None, 700, ""), &rule);
         assert!(said.contains("outside its certificate's time"), "{said}");
     }
@@ -1862,7 +1875,9 @@ pub(crate) mod tests {
         let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
         let good = v2(&made, &cert, &key, None, 60, "");
         let bad = v2(&made, &cert, &key, Some(b"another signature"), 60, "");
-        let entry = |bundle: &Value| bundle["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"][0].clone();
+        let entry = |bundle: &Value| {
+            bundle["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"][0].clone()
+        };
         for (first, second) in [(&good, &bad), (&bad, &good)] {
             let mut two = good.clone();
             two["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"] =
