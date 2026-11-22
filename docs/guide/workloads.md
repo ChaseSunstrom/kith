@@ -530,8 +530,10 @@ kith machine rm dev              # its Jobs and the Workload; the home Volume st
   other kith command does, and the right it asks is `exec` on the machine's Workload.
 - **`--root`** is root of the machine's own user namespace and nothing more: it is refused, with
   the reason, where uid 0 there would be the node's root or the user kithd runs as (a container
-  with no user namespace of its own, or a rootless kithd's). A machine is made without
-  `userNamespaces` today, so `--root` says why not until it is one; it is not `sudo`.
+  with no user namespace of its own, or a rootless kithd's). `--root` needs a machine with a user
+  namespace of its own (`userNamespaces: true`), and `kith machine create` does not make one
+  (that setting lets the calls a container is refused back), so today `--root` is refused with
+  that reason on every machine; it is not `sudo`.
 - **A command in a Job** is `kith machine run`, which runs a Job of its own with the machine's
   container and mount; read it with `kith logs job NAME-run-N -f`. The machine's own container
   only sleeps.

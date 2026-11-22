@@ -28,55 +28,31 @@ const REFUSAL_MAX: usize = 64 << 10;
 /// What `shell` runs when it is given no command: bash where the image has it.
 const SHELL: &str = "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi";
 
+// kithd's own frame code (one file, no dependency), so both ends of the wire read and write alike.
+#[path = "../../../kithd/src/websocket/frame.rs"]
+#[allow(dead_code, reason = "kithd's file: what it holds for the server's side is not used here")]
+mod frame;
+use frame::{Frame, Op};
+
 /// One frame to kithd, masked as a client's are.
-fn encode(op: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
-    let mut out = vec![0x80 | op];
-    match payload.len() {
-        n if n < 126 => out.push(0x80 | n as u8),
-        n if n <= 0xffff => {
-            out.push(0x80 | 126);
-            out.extend((n as u16).to_be_bytes());
-        }
-        n => {
-            out.push(0x80 | 127);
-            out.extend((n as u64).to_be_bytes());
-        }
-    }
+fn encode(op: Op, payload: &[u8]) -> Result<Vec<u8>, String> {
     let mut mask = [0u8; 4];
     SystemRandom::new()
         .fill(&mut mask)
         .or_else(|_| fail("no randomness for a frame's mask"))?;
-    out.extend(mask);
-    out.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
-    Ok(out)
+    Ok(frame::encode(op, payload, Some(mask)))
 }
 
-/// The first whole frame in `buf` from kithd: its opcode, payload and how many bytes it took.
-/// None when more is to come.
-fn decode(buf: &[u8]) -> Result<Option<(u8, Vec<u8>, usize)>, String> {
-    let [first, second, ..] = buf else { return Ok(None) };
-    if first & 0x80 == 0 || first & 15 == 0 {
+/// The first whole frame in `buf` from kithd and how many bytes it took. None when more is to come.
+fn decode(buf: &[u8]) -> Result<Option<(Frame, usize)>, String> {
+    if buf.first().is_some_and(|first| first & 0x80 == 0) {
         return fail("kithd sent a frame in parts, which this kith cannot read");
     }
-    if second & 0x80 != 0 {
-        return fail("kithd sent a masked frame");
+    match frame::decode(buf, false, FRAME_MAX) {
+        Ok(Some((frame, _))) if frame.op == Op::Continue => fail("kithd sent a frame in parts, which this kith cannot read"),
+        Ok(found) => Ok(found),
+        Err(e) => fail(format!("kithd sent a frame this kith refuses: {e:?}")),
     }
-    let (len, at) = match second & 127 {
-        126 if buf.len() >= 4 => (usize::from(u16::from_be_bytes([buf[2], buf[3]])), 4),
-        127 if buf.len() >= 10 => {
-            let long = u64::from_be_bytes(buf[2..10].try_into().unwrap_or_default());
-            (usize::try_from(long).unwrap_or(usize::MAX), 10)
-        }
-        126 | 127 => return Ok(None),
-        n => (usize::from(n), 2),
-    };
-    if len > FRAME_MAX {
-        return fail("kithd sent a frame longer than this kith reads");
-    }
-    if buf.len() < at + len {
-        return Ok(None);
-    }
-    Ok(Some((first & 15, buf[at..at + len].to_vec(), at + len)))
 }
 
 /// The terminal as it was, put back when this is dropped.
@@ -189,7 +165,7 @@ fn send(to: &Mutex<crate::wire::Wire>, bytes: Vec<u8>) -> Result<(), String> {
 }
 
 fn channel(number: u8, data: &[u8]) -> Result<Vec<u8>, String> {
-    encode(2, &[&[number][..], data].concat())
+    encode(Op::Binary, &[&[number][..], data].concat())
 }
 
 /// This terminal's size as channel 4 says it (none while it says 0 by 0, or cannot say).
@@ -297,18 +273,18 @@ fn pump(wire: &mut crate::wire::Wire, to: &Mutex<crate::wire::Wire>, buf: &mut V
     let (mut stdout, mut stderr, mut chunk) = (std::io::stdout(), std::io::stderr(), [0u8; 8192]);
     let mut ended = None;
     'read: loop {
-        while let Some((op, payload, used)) = decode(buf)? {
+        while let Some((Frame { op, payload }, used)) = decode(buf)? {
             buf.drain(..used);
             match (op, payload.split_first()) {
-                (8, _) => break 'read,
-                (9, _) => send(to, encode(10, &payload)?)?,
-                (1 | 2, Some((1, data))) => {
+                (Op::Close, _) => break 'read,
+                (Op::Ping, _) => send(to, encode(Op::Pong, &payload)?)?,
+                (Op::Text | Op::Binary, Some((1, data))) => {
                     stdout.write_all(data).and_then(|()| stdout.flush()).or_else(|e| fail(format!("stdout: {e}")))?;
                 }
-                (1 | 2, Some((2, data))) => {
+                (Op::Text | Op::Binary, Some((2, data))) => {
                     stderr.write_all(data).or_else(|e| fail(format!("stderr: {e}")))?;
                 }
-                (1 | 2, Some((3, status))) => {
+                (Op::Text | Op::Binary, Some((3, status))) => {
                     ended = Some(outcome(status));
                     break 'read;
                 }
@@ -322,7 +298,7 @@ fn pump(wire: &mut crate::wire::Wire, to: &Mutex<crate::wire::Wire>, buf: &mut V
         }
     }
     // Say goodbye (kithd waits for it before it shuts the connection) and be done.
-    let _ = encode(8, &[3, 232]).and_then(|frame| send(to, frame));
+    let _ = encode(Op::Close, &frame::close_body(1000, "")).and_then(|frame| send(to, frame));
     wire.end();
     ended.unwrap_or_else(|| fail("kithd ended the session before the command did"))
 }
@@ -333,14 +309,17 @@ mod tests {
 
     #[test]
     fn frames_round_trip_and_stay_masked_and_bounded() {
-        let sent = encode(2, b"\x00hello").unwrap();
+        let sent = encode(Op::Binary, b"\x00hello").unwrap();
         assert_eq!(sent[0], 0x82);
         assert_eq!(sent[1], 0x80 | 6, "a client's frame is masked");
         let unmasked: Vec<u8> = sent[6..].iter().enumerate().map(|(i, b)| b ^ sent[2 + i % 4]).collect();
         assert_eq!(unmasked, b"\x00hello");
         // What kithd sends is not masked; a half frame waits, a long one is refused.
         let from_server = [&[0x82, 3][..], b"\x01ab"].concat();
-        assert_eq!(decode(&from_server).unwrap(), Some((2, b"\x01ab".to_vec(), 5)));
+        assert_eq!(
+            decode(&from_server).unwrap(),
+            Some((Frame { op: Op::Binary, payload: b"\x01ab".to_vec() }, 5))
+        );
         assert_eq!(decode(&from_server[..4]).unwrap(), None);
         assert!(decode(&[0x82, 127, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff]).is_err());
         assert!(decode(&[0x02, 1, 0]).is_err(), "a part of a message");

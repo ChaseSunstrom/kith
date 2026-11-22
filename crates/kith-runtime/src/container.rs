@@ -5962,6 +5962,37 @@ mod tests {
         assert_eq!(made.root().as_ref().unwrap().path(), Path::new("/images/x/rootfs"));
     }
 
+    /// `--root` is refused where the container's uid 0 is the node's root, kithd's own user, or
+    /// a rootless container's one user (`BECOMES` set), and given where it is another user's.
+    #[test]
+    fn own_root_refuses_the_nodes_root_and_kithds_user() {
+        let spec = |host: Option<u32>, rootless: bool| {
+            let mut spec = Spec::default();
+            let mut linux = spec.linux().clone().unwrap_or_default();
+            let maps = host.map(|host| {
+                let map = oci_spec::runtime::LinuxIdMappingBuilder::default()
+                    .container_id(0u32)
+                    .host_id(host)
+                    .size(65536u32)
+                    .build()
+                    .unwrap();
+                vec![map]
+            });
+            linux.set_uid_mappings(maps);
+            spec.set_linux(Some(linux));
+            let notes = rootless.then(|| std::collections::HashMap::from([(BECOMES.to_string(), "1:1".to_string())]));
+            spec.set_annotations(notes);
+            spec
+        };
+        let me = nix::unistd::geteuid().as_raw();
+        let other = if me == 4_000_000 { 4_000_001 } else { 4_000_000 };
+        assert!(own_root(&spec(None, false)).unwrap_err().contains("no user namespace"));
+        assert!(own_root(&spec(Some(0), false)).unwrap_err().contains("node's user 0"));
+        assert!(own_root(&spec(Some(me), false)).unwrap_err().contains("the one kithd runs as"));
+        assert!(own_root(&spec(Some(other), true)).is_err(), "rootless: its 0 is kithd's user");
+        assert_eq!(own_root(&spec(Some(other), false)), Ok(other));
+    }
+
     /// Two containers never share a range: one being made holds its own until its bundle names
     /// it, a bundle's names it until the bundle goes (also over a restart), and a freed one is
     /// taken again.
