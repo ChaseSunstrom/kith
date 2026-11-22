@@ -115,6 +115,8 @@ pub struct Exposed {
     routes: Vec<Route>,
     /// Set on each request (`expose.headers`).
     headers: Vec<(HeaderName, HeaderValue)>,
+    /// Is its certificate the cluster CA's (`expose.issuer: cluster`), not an ACME authority's?
+    cluster: bool,
 }
 
 /// Where requests under one path go.
@@ -261,6 +263,7 @@ fn exposed_in(store: &Store, prefix: Ipv6Addr, view: bool) -> (BTreeMap<String, 
         }
         let to = SocketAddr::new(address.into(), port.port);
         let proxy = expose.proxy_protocol == Some(true);
+        let cluster = matches!(expose.issuer, Some(kith_api::kinds::ExposeIssuer::Cluster));
         // (Only ever a Service of the exposing one's namespace: the name is all a path says.)
         let routes: Vec<Route> = expose
             .paths
@@ -294,6 +297,7 @@ fn exposed_in(store: &Store, prefix: Ipv6Addr, view: bool) -> (BTreeMap<String, 
                 proxy,
                 routes,
                 headers: headers.collect(),
+                cluster,
             },
         );
     }
@@ -923,18 +927,18 @@ fn looks(serves: bool, worker: bool, leading: bool) -> bool {
     serves || (!worker && leading)
 }
 
-#[allow(clippy::type_complexity)]
-fn look(
-    store: &Store,
-    prefix: Ipv6Addr,
-    web: &Web,
-    view: bool,
-) -> (Vec<(String, Exposed)>, Option<acme::Account>, Vec<(String, Value)>) {
+type Looked = (Vec<(String, Exposed)>, Option<acme::Account>, Vec<(String, Value)>);
+
+fn look(store: &Store, prefix: Ipv6Addr, web: &Web, view: bool) -> Looked {
+    look_at(store, prefix, web, view, now())
+}
+
+/// [`look`] as of `at` (seconds since 1970).
+fn look_at(store: &Store, prefix: Ipv6Addr, web: &Web, view: bool, at: u64) -> Looked {
     let hosts = exposed_in(store, prefix, view).0;
     let mut certificates = BTreeMap::new();
     let mut wanting = Vec::new();
     let mut naming = Vec::new();
-    let at = now();
     for (host, exposed) in &hosts {
         let key = tls_secret(host, exposed);
         let held = secret(store, &key);
@@ -1071,6 +1075,55 @@ async fn order(
     say(shared, &of.service, tls).await;
 }
 
+/// How long a certificate the cluster CA signs for a host lasts: short, because there is no
+/// revocation (one is made again in its last third, ten days before it ends).
+const CLUSTER_LIFE: Duration = Duration::from_secs(30 * 86_400);
+/// A host the cluster CA signed for, or failed to, is not tried again for this many seconds.
+const CLUSTER_RETRY: u64 = 60;
+
+/// Sign a certificate for `host` (`expose.issuer: cluster`) with the cluster CA this node holds,
+/// good for `life` from `at`, keep it in the host's Secret and say so in the Service's status.
+/// A host tried within [`CLUSTER_RETRY`] seconds (by this process: `retry`) is left alone.
+async fn issue_cluster(
+    shared: &Shared,
+    ca: &crate::pki::Ca,
+    host: &str,
+    of: &Exposed,
+    life: Duration,
+    at: u64,
+    retry: &mut BTreeMap<String, u64>,
+) {
+    if retry
+        .get(host)
+        .is_some_and(|tried| at.saturating_sub(*tried) < CLUSTER_RETRY)
+    {
+        return;
+    }
+    retry.insert(host.to_string(), at);
+    let me = shared.members.me();
+    let secret = tls_secret(host, of);
+    let made = a_secret(&secret, json!({}))
+        .map_err(|e| format!("the host's Secret cannot be named: {e}"))
+        .and_then(|_| ca.issue_host(host, at, life).map_err(|e| e.to_string()))
+        .and_then(|(chain, key)| match fresh(&chain, &key, host, at) {
+            true => Ok((chain, key)),
+            false => Err("the cluster CA's certificate is not good now".into()),
+        });
+    let kept = match made {
+        Ok((chain, key)) => put(shared, &secret, json!({ "tls.crt": chain, "tls.key": key })).await,
+        Err(e) => Err(e),
+    };
+    let tls = match kept {
+        Ok(()) => json!({ "state": "ready", "secret": secret, "source": "cluster", "by": me, "at": at }),
+        Err(e) => {
+            let e: String = e.chars().take(500).collect();
+            eprintln!("kithd: ingress: no certificate from the cluster CA for {host}: {e}");
+            json!({ "state": "error", "message": e, "by": me, "at": at })
+        }
+    };
+    say(shared, &of.service, tls).await;
+}
+
 /// Write down the account's thumbprint for the workers that serve ingress (they answer the
 /// authority's challenges with it, and have nothing else of the account), unless the store
 /// has it already.
@@ -1152,6 +1205,7 @@ pub async fn run(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut generation = shared.generation.subscribe();
     let mut tried = BTreeMap::new();
+    let mut issued = BTreeMap::new();
     // (The term whose first order followed a linearizable read: a new leader's store may lag the old leader's.)
     let mut read_term: Option<u64> = None;
     // (Since when orders wait on a worker; the hosts last ordered without waiting on one.)
@@ -1170,13 +1224,21 @@ pub async fn run(
             let worker = crate::access::is_worker(&state.store, &me);
             let mut nodes = state.store.list(Some("Node"));
             let wanted = nodes.any(|node| node.status.as_ref().is_some_and(|s| s["serves"]["ingress"] == true));
-            let looked = match looks(served.is_some(), worker, leading) {
+            // (The node that holds the CA key signs for the hosts that say `issuer: cluster`, leader or not.)
+            let looked = match looks(served.is_some(), worker, leading || (!worker && cluster.ca.is_some())) {
                 true => look(&state.store, prefix, &web, worker),
                 false => Default::default(),
             };
             (worker, wanted, looked)
         };
         let leads = !worker && leading;
+        // The hosts the cluster CA signs for are not the authority's to be asked.
+        let (own, wanting): (Vec<_>, Vec<_>) = wanting.into_iter().partition(|(_, of)| of.cluster);
+        if let Some(ca) = cluster.ca.as_ref().filter(|_| !worker) {
+            for (host, of) in &own {
+                issue_cluster(&shared, ca, host, of, CLUSTER_LIFE, now(), &mut issued).await;
+            }
+        }
         if worker && acme.is_some() && !said {
             said = true;
             eprintln!(
@@ -2159,6 +2221,7 @@ spec: { selector: { app: web }, ports: [{ port: 80 }] }
             proxy,
             routes,
             headers,
+            cluster: false,
         }
     }
 
@@ -2811,5 +2874,104 @@ spec: {{ selector: {{ app: web }}, ports: [{{ port: 80 }}], expose: {{ host: {ho
             json!({ "view": true, "serves": { "ingress": true }, "thumbprint": "print" }),
         );
         assert!(unanswered(&store, "print").is_empty());
+    }
+
+    /// A host that says `issuer: cluster` gets its certificate from the cluster CA, by the node
+    /// that holds it, with no authority asked: the Secret, a status that says where it came from,
+    /// and a new one made once the old is in its last third, before it ends. A host that does not
+    /// say it is left to ACME; one just made is not made again at once.
+    #[tokio::test]
+    async fn ingress_cluster_issuer_host_is_issued_and_renewed_before_it_ends() {
+        use crate::cluster::{Cluster, pinned_peer};
+        let ca = crate::pki::Ca::create().unwrap();
+        let control = Cluster::new(pinned_peer::node(&ca, "a"), Some(ca)).unwrap();
+        let shared = pinned_peer::shared_of("cluster-issuer", control, &[]).await;
+        let id = shared.raft.metrics().borrow().id;
+        shared
+            .raft
+            .wait(Some(Duration::from_secs(30)))
+            .current_leader(id, "leads")
+            .await
+            .unwrap();
+        let service = |name: &str, expose: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: {name}, namespace: shop }}\n\
+                 spec: {{ selector: {{ app: {name} }}, ports: [{{ port: 80 }}], expose: {expose} }}\n---\n"
+            )
+        };
+        let source = service("nas", "{ host: nas.home.lan, via: edge, issuer: cluster }")
+            + &service("web", "{ host: web.example.org, via: edge }");
+        let resources = Resource::from_source(&source).unwrap().into_iter().map(Result::unwrap);
+        let apply = kith_store::Command::Apply {
+            resources: resources.collect(),
+            at: now(),
+        };
+        shared.submit(apply).await.unwrap();
+
+        let prefix = kith_mesh::prefix(b"ca");
+        let wanting = |at: u64| {
+            let state = shared.store.lock().unwrap();
+            let (wanting, _, _) = look_at(&state.store, prefix, &Web::default(), false, at);
+            wanting
+                .into_iter()
+                .map(|(host, of)| (host, of.cluster))
+                .collect::<Vec<_>>()
+        };
+        let secret_of = |host: &str| {
+            let state = shared.store.lock().unwrap();
+            secret(&state.store, &format!("Secret/shop/tls-{host}"))
+        };
+        let t0 = now();
+        let both = [
+            ("nas.home.lan".to_string(), true),
+            ("web.example.org".to_string(), false),
+        ];
+        assert_eq!(wanting(t0), both);
+
+        let held = shared.cluster.as_ref().unwrap().ca.as_ref().unwrap();
+        let life = Duration::from_secs(600);
+        let (host, of) = {
+            let state = shared.store.lock().unwrap();
+            let (hosts, _) = exposed(&state.store, prefix);
+            ("nas.home.lan".to_string(), hosts["nas.home.lan"].clone())
+        };
+        let mut retry = BTreeMap::new();
+        issue_cluster(&shared, held, &host, &of, life, t0, &mut retry).await;
+        let first = secret_of(&host);
+        let until = |held: &BTreeMap<String, String>| {
+            let chain = crate::pki::certified(&held["tls.crt"], &held["tls.key"], "nas.home.lan").unwrap();
+            validity(chain.cert.first().unwrap()).unwrap().1
+        };
+        assert_eq!(until(&first), t0 + 600);
+        // The CA signed it: trusted by it, for this name.
+        let status = {
+            let state = shared.store.lock().unwrap();
+            state
+                .store
+                .get(&of.service)
+                .and_then(|service| service.status.clone())
+                .unwrap()
+        };
+        assert_eq!(status["tls"]["state"], "ready");
+        assert_eq!(status["tls"]["source"], "cluster");
+        assert_eq!(status["tls"]["secret"], "Secret/shop/tls-nas.home.lan");
+        // The other host is for ACME: nothing of its own was made, and it is still wanted.
+        assert!(secret_of("web.example.org").is_empty());
+        assert_eq!(wanting(t0 + 1), [("web.example.org".to_string(), false)]);
+        // Held at once again: not made twice.
+        issue_cluster(&shared, held, &host, &of, life, t0 + 1, &mut retry).await;
+        assert_eq!(secret_of(&host), first);
+
+        // In the last third of its time (a minute back and 600 s on: 220 s) it is wanted, and the
+        // next is made before this one ends.
+        assert_eq!(wanting(t0 + 300), [("web.example.org".to_string(), false)]);
+        let late = t0 + 450;
+        assert!(late < until(&first));
+        assert_eq!(wanting(late), both);
+        issue_cluster(&shared, held, &host, &of, life, late, &mut BTreeMap::new()).await;
+        let renewed = secret_of(&host);
+        assert_ne!(renewed["tls.crt"], first["tls.crt"]);
+        assert_eq!(until(&renewed), late + 600);
+        assert_eq!(wanting(late), [("web.example.org".to_string(), false)]);
     }
 }

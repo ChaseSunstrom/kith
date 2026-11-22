@@ -108,6 +108,35 @@ fn ca_params() -> CertificateParams {
     params
 }
 
+/// The longest a host certificate may last.
+const HOST_LIFE_MAX: Duration = Duration::from_secs(90 * 86_400);
+
+/// `host` is a name the cluster CA will sign a server certificate for: two or more labels of
+/// lowercase letters, digits and `-` (so no wildcard, `_` or space), the last not all digits (an
+/// address), and not `kith` or under it (a node's or an Identity's name must not be had by a host).
+fn host_name(host: &str) -> Fallible<()> {
+    let label = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    let last = host.rsplit('.').next().unwrap_or_default();
+    let fine = host.len() <= 253
+        && host.contains('.')
+        && host.split('.').all(label)
+        && !last.bytes().all(|b| b.is_ascii_digit())
+        && last != "kith";
+    match fine {
+        true => Ok(()),
+        false => Err(format!(
+            "`{host}` is not a name for a host certificate: lowercase labels of a-z, 0-9 and `-`, two or more, not an address, not under `kith`"
+        )
+        .into()),
+    }
+}
+
 /// The cluster's certificate authority: only a node that holds its key can admit nodes.
 pub struct Ca {
     key: KeyPair,
@@ -176,6 +205,29 @@ impl Ca {
         params.not_after = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now) + WORKLOAD_LIFE;
         let issuer = Issuer::new(ca_params(), &self.key);
         Ok(tls("signing the certificate", params.signed_by(&NodeKey(point), &issuer))?.pem())
+    }
+
+    /// A server certificate for the LAN name `host` (no wildcard, no address, nothing under
+    /// `kith`: those names are the cluster's own) and a new key, as (certificate, key): good from a
+    /// minute before `now` (seconds since 1970) for `life`, and for serving TLS only. It names no
+    /// node, Identity or Workload. A short life is the only revocation there is.
+    pub fn issue_host(&self, host: &str, now: u64, life: Duration) -> Fallible<(String, String)> {
+        host_name(host)?;
+        if life.is_zero() || life > HOST_LIFE_MAX {
+            return Err("a host certificate lasts more than 0 and at most 90 days".into());
+        }
+        let mut params = tls("naming the certificate", CertificateParams::new(vec![host.to_string()]))?;
+        params.distinguished_name.push(DnType::CommonName, host);
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.use_authority_key_identifier_extension = true;
+        // A minute before, for a clock behind the CA holder's.
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now.saturating_sub(60));
+        params.not_after = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now) + life;
+        let key = tls("making the key", KeyPair::generate())?;
+        let issuer = Issuer::new(ca_params(), &self.key);
+        let cert = tls("signing the certificate", params.signed_by(&key, &issuer))?;
+        Ok((cert.pem(), key.serialize_pem()))
     }
 
     fn params(
@@ -944,5 +996,54 @@ mod tests {
         // Into a directory that is not there: an error, and nothing made.
         assert!(write_whole(&dir.join("gone/marker.json"), b"x").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The CA signs a server certificate for a LAN name, for the life asked and no longer: a client
+    /// that trusts the CA takes it for that name only, in that time only. It is no node's, no
+    /// Identity's, and the names a CA must not vouch for here (the cluster's own, a wildcard, an
+    /// address) are not signed.
+    #[test]
+    fn pki_issue_host_signs_a_server_certificate_for_the_name_for_the_life_asked() {
+        let ca = Ca::create().unwrap();
+        let (now, life) = (1_900_000_000, Duration::from_secs(600));
+        let (cert, key) = ca.issue_host("nas.home.lan", now, life).unwrap();
+        certified(&cert, &key, "nas.home.lan").unwrap();
+        let der = certs(&cert).unwrap().remove(0);
+        assert!(
+            subject_of(&der).is_none(),
+            "a host's certificate names no node, Identity or Workload"
+        );
+        let verify = |trusted: &str, host: &str, at: u64| {
+            let verifier = WebPkiServerVerifier::builder_with_provider(roots(trusted).unwrap(), provider());
+            let name = ServerName::try_from(host.to_string()).unwrap();
+            let at = UnixTime::since_unix_epoch(Duration::from_secs(at));
+            verifier.build().unwrap().verify_server_cert(&der, &[], &name, &[], at)
+        };
+        // Good for its name, from a minute before it was made until the life is out.
+        assert!(verify(&ca.cert, "nas.home.lan", now).is_ok());
+        assert!(verify(&ca.cert, "nas.home.lan", now - 30).is_ok());
+        assert!(verify(&ca.cert, "nas.home.lan", now + 599).is_ok());
+        assert!(verify(&ca.cert, "nas.home.lan", now + 601).is_err());
+        assert!(verify(&ca.cert, "nas.home.lan", now - 3600).is_err());
+        // For no other name, and by no other CA.
+        assert!(verify(&ca.cert, "other.home.lan", now).is_err());
+        assert!(verify(&Ca::create().unwrap().cert, "nas.home.lan", now).is_err());
+        // Never as a client or as a CA of its own: a server certificate and nothing more.
+        let as_client = WebPkiClientVerifier::builder_with_provider(roots(&ca.cert).unwrap(), provider());
+        let at = UnixTime::since_unix_epoch(Duration::from_secs(now));
+        assert!(as_client.build().unwrap().verify_client_cert(&der, &[], at).is_err());
+        for refused in [
+            "*.home.lan",
+            "kith",
+            "x.node.kith",
+            "10.0.0.7",
+            "Nas.home.lan",
+            "a_b.lan",
+            "-a.lan",
+            "a..lan",
+            "",
+        ] {
+            assert!(ca.issue_host(refused, now, life).is_err(), "{refused:?} is signed");
+        }
     }
 }

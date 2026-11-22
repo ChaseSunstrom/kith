@@ -99,6 +99,7 @@ is still there when it starts again.
 | Run containers, plain processes and jobs, and change them safely | [What kithd does today](docs/guide/workloads.md#what-kithd-does-today) |
 | Make several machines one cluster | [More than one node](docs/guide/cluster.md#more-than-one-node) |
 | Give what runs a name, inside and outside | [DNS](docs/guide/cluster.md#dns); a host of its own with a certificate: [More than one node](docs/guide/cluster.md#more-than-one-node) |
+| Give a name only your LAN knows a certificate, and trust it on a phone or laptop | [A name only your LAN knows](#a-name-only-your-lan-knows) |
 | Say a thing once: names, functions and imports instead of YAML repeated | [kith's own language](docs/guide/api.md#kiths-own-language) |
 | Install an app with its settings, and upgrade it (a Job annotated `kith.dev/hook` runs before or after: `pre-install`, `post-install`, `pre-upgrade`, `post-upgrade`; delete hooks are not built) | [Packages](docs/guide/packages.md#packages) |
 | Keep a cluster in step with a git repository | [Sources (GitOps)](docs/guide/packages.md#sources-gitops) |
@@ -132,6 +133,33 @@ kith refuses by path and name what it cannot carry: `cap_add` (kith only drops c
 `sysctls`, `devices` (a DeviceClaim hands hardware in), `privileged`, `env_file` (write the
 variables under `environment`), `build`, `security_opt` and `tmpfs`; the guide lists the rest.
 The whole table is [From a docker-compose file](docs/guide/kubernetes.md#from-a-docker-compose-file).
+
+## A name only your LAN knows
+
+ACME (Let's Encrypt) will not sign `nas.home.lan`. The cluster's own CA will: say
+`issuer: cluster` and the node that holds the CA key signs a server certificate for the host,
+keeps it in the Secret `tls-<host>`, and makes a new one before it ends (it lasts 30 days).
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: nas, namespace: home }
+spec:
+  selector: { app: nas }
+  ports: [{ port: 80 }]
+  expose: { host: nas.home.lan, via: edge, issuer: cluster }
+```
+
+```sh
+kith ca export kith-ca.crt     # the CA's public certificate, never its key
+```
+
+Trust `kith-ca.crt` once on each phone or laptop. Do that only for a CA you keep safe: a device
+that trusts it takes whatever the CA signs, and the CA will vouch for any name a Service in the
+cluster says with `issuer: cluster`, not only your own. Whoever may apply Services may name a
+host, so name the hosts in a Namespace (`spec.hosts`) where that matters. There is no
+revocation: a short life is the revocation. The names of the cluster itself (`kith`, `*.kith`),
+wildcards and addresses are never signed.
 
 ## How it works
 

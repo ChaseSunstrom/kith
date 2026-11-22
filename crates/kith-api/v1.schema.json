@@ -2353,6 +2353,17 @@
             "type": "string"
           },
           "description": "Headers set on each request on its way to the backend, in place of any of the\nsame name the client sent."
+        },
+        "issuer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExposeIssuer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Who vouches for the host's certificate: `acme` (the default) asks the ACME\nauthority, which needs a name the world can reach; `cluster` has the cluster's own\nCA sign it, for a name only the LAN knows (a phone or laptop trusts `kith ca export`\nonce). The cluster CA then vouches for any name that says so: keep its key safe."
         }
       },
       "required": [
@@ -2360,6 +2371,13 @@
         "via"
       ],
       "description": "Public HTTPS through an edge node."
+    },
+    "ExposeIssuer": {
+      "type": "string",
+      "enum": [
+        "acme",
+        "cluster"
+      ]
     },
     "ExposePath": {
       "type": "object",

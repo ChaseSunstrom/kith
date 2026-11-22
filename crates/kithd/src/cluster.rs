@@ -2,7 +2,7 @@
 //! certificate from the cluster CA, and how a new node gets one.
 //!
 //! ```text
-//! GET  /v1/ca                          -> the CA certificate (PEM)     no certificate needed
+//! GET  /v1/ca                          -> the CA certificate (PEM)     no certificate needed; also on the local socket (`kith ca export`)
 //! POST /v1/join {token, name, port}    -> {ca, cert, key}              no certificate needed
 //! POST /v1/claim {token, name}         -> {ca, cert, key}              no certificate needed
 //! POST /v1/tokens                      -> {token}                      local socket, or an Identity that may apply Nodes, Roles and RoleBindings
@@ -785,6 +785,8 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
 /// What only the local socket serves.
 pub fn admin_router(shared: Arc<Shared>) -> Router {
     let admin = Router::new().route("/v1/identities/{name}/certificate", post(certificate));
+    // (The CA's certificate is public; `kith ca export` reads it here, on this node's own socket.)
+    let admin = admin.route("/v1/ca", get(ca));
     admin.route("/v1/cluster", get(status)).with_state(shared)
 }
 

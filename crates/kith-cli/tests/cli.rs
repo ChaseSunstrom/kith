@@ -946,7 +946,11 @@ fn fake_kithd(
     answer: impl Fn(&str, &str, &str) -> String + Send + 'static,
 ) -> (PathBuf, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{Read, Write};
-    let socket = sb.0.join("kithd.sock");
+    // A unix socket path is cut at about 100 bytes, and a lane's target dir is longer: bind in
+    // the short temp dir, named by the sandbox.
+    let name = sb.0.file_name().unwrap().to_string_lossy().to_string();
+    let socket = std::env::temp_dir().join(format!("kfk-{}-{name}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let kept = seen.clone();
@@ -1011,6 +1015,36 @@ fn bare(
         "metadata": { "name": name, "namespace": namespace },
         "spec": spec, "status": status,
     })
+}
+
+/// `kith ca export FILE` writes the cluster CA's certificate, the public half, for a phone or a
+/// laptop to trust once; without a FILE it prints it. A reply that carries a key is refused and
+/// nothing is written: the CA key stays where it is.
+#[test]
+fn ca_export_writes_the_cluster_ca_certificate_only() {
+    let pem = "-----BEGIN CERTIFICATE-----\nMIIBcluster\n-----END CERTIFICATE-----\n";
+    let sb = Sandbox::new("ca-export");
+    let (socket, seen) = fake_kithd(&sb, move |_, _, _| pem.to_string());
+    let file = sb.0.join("kith-ca.crt");
+    let (code, _, said) = kith_at(&socket, &["ca", "export", file.to_str().unwrap()]);
+    assert_eq!(code, 0, "{said}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), pem);
+    assert_eq!(seen.lock().unwrap().as_slice(), ["GET /v1/ca "]);
+    // Without a file: on stdout, for a pipe.
+    let (code, out, said) = kith_at(&socket, &["ca", "export"]);
+    assert!(code == 0 && out == pem, "{code}: {out} {said}");
+
+    let leaky = format!("{pem}-----BEGIN PRIVATE KEY-----\nMIIsecret\n-----END PRIVATE KEY-----\n");
+    let sb = Sandbox::new("ca-export-leak");
+    let (socket, _) = fake_kithd(&sb, move |_, _, _| leaky.clone());
+    let other = sb.0.join("never.crt");
+    let (code, out, said) = kith_at(&socket, &["ca", "export", other.to_str().unwrap()]);
+    assert!(
+        code != 0 && !out.contains("secret") && !said.contains("secret"),
+        "{code}: {out} {said}"
+    );
+    assert!(said.contains("private key"), "{said}");
+    assert!(!other.exists(), "a refused export wrote a file");
 }
 
 /// `kith launch IMAGE -- CMD` applies a Job that never retries, prints the unit's output as it

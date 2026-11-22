@@ -821,6 +821,12 @@ spec! {
         /// same name the client sent.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pub headers: BTreeMap<String, String>,
+        /// Who vouches for the host's certificate: `acme` (the default) asks the ACME
+        /// authority, which needs a name the world can reach; `cluster` has the cluster's own
+        /// CA sign it, for a name only the LAN knows (a phone or laptop trusts `kith ca export`
+        /// once). The cluster CA then vouches for any name that says so: keep its key safe.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub issuer: Option<ExposeIssuer>,
     }
 
     /// Where requests under one path go.
@@ -837,6 +843,8 @@ spec! {
     }
 
     pub enum ExposeVia { Edge }
+
+    pub enum ExposeIssuer { Acme, Cluster }
 
     // ---- DNS ----
 

@@ -855,6 +855,25 @@ fn expose_asks_for_the_proxy_protocol() {
     let off = service("{ host: a.example.org, via: edge }").unwrap();
     assert_eq!(off.expose.unwrap().proxy_protocol, None);
     assert!(service("{ host: a.example.org, via: edge, proxyProtocol: yes please }").is_err());
+    // Who vouches for the certificate: ACME unless it says `cluster`; nobody else.
+    let issued = |issuer: &str| service(&format!("{{ host: a.home.lan, via: edge, issuer: {issuer} }}"));
+    assert_eq!(
+        issued("cluster").unwrap().expose.unwrap().issuer,
+        Some(kinds::ExposeIssuer::Cluster)
+    );
+    assert_eq!(
+        issued("acme").unwrap().expose.unwrap().issuer,
+        Some(kinds::ExposeIssuer::Acme)
+    );
+    assert_eq!(
+        service("{ host: a.home.lan, via: edge }")
+            .unwrap()
+            .expose
+            .unwrap()
+            .issuer,
+        None
+    );
+    assert!(issued("letsencrypt").is_err());
 }
 
 #[test]

@@ -373,6 +373,15 @@ port 80 redirects. The ports need CAP_NET_BIND_SERVICE.
   for ingress workers; under `spec.signing: required` a control node that does not lead orders only once the admin has set `spec.ingress: true` on its Node). `kith get service/NAME -o yaml` shows `tls`; a failure is retried an
   hour later. Keys, and the ACME account's (`Secret/kith-system/acme-account`), are Secrets in
   the store.
+- **A name only the LAN knows:** `expose.issuer: cluster` (the default is `acme`) has the
+  cluster's own CA sign the host's certificate, with no authority asked: the node that holds
+  the CA key makes it for 30 days, keeps it in `tls-<host>`, says `tls.source: cluster` in the
+  Service's status, and makes a new one in the last third of its life. `kith ca export [FILE]`
+  writes the CA's public certificate (never the key) for a phone or laptop to trust once. The
+  CA then vouches for any name a Service says with `issuer: cluster`, so trust it only on
+  devices you own, and keep `spec.hosts` on Namespaces that others may apply Services to.
+  The cluster's own names (`kith`, `*.kith`), wildcards and addresses are not signed, and there
+  is no revocation: the short life is it. The CA key never leaves its node.
 - **Bytes as they are:** TLS ends at the ingress and nothing is added; NetworkPolicy sees the
   ingress node. `expose.proxyProtocol: true` sends a PROXY v1 line (`PROXY TCP4 <client>
   <ingress> <client port> <ingress port>`) first; clients inside the mesh send none, so the
