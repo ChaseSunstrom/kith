@@ -543,7 +543,10 @@ kith machine rm dev              # its Jobs and the Workload; the home Volume st
   command's exit code is kith's. With a pipe on either end it runs on pipes, with the standard
   error apart. It is the same call as `kubectl exec -it`, so `--server` reaches a node as every
   other kith command does, and the right it asks is `exec` on the machine's Workload.
-- **`--root`** is root of the machine's own user namespace and nothing more: it is refused, with
+- **`--root`** needs `apply` on the machine's Workload as well as `exec`: a caller with `exec` alone is
+  refused (403, in the audit log) and still gets a plain shell. Every route that takes it asks the same,
+  the Kubernetes exec route and the node that runs the machine (where `/v1/pod-hop` arrives) alike.
+  It is root of the machine's own user namespace and nothing more: it is refused, with
   the reason, where uid 0 there would be the node's root or the user kithd runs as (a container
   with no user namespace of its own, or a rootless kithd's). `--root` needs a machine with a user
   namespace of its own (`userNamespaces: true`), and `kith machine create` does not make one
