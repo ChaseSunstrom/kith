@@ -5,7 +5,9 @@
 //! - answers those machines when they ask the network what to start (PXE). It gives no
 //!   addresses: the network's own DHCP server does, and this is the second answer the
 //!   firmware waits for, "proxy DHCP": on port 67 to a broadcast, on 4011 when asked there;
-//! - serves each of them one file over TFTP: the network boot file os/build.sh makes
+//! - serves each of them one file over TFTP, or over HTTP to firmware that boots from a URL
+//!   (UEFI HTTP boot: its question says "HTTPClient" and it is answered with the URL, on
+//!   port 8069): the network boot file os/build.sh makes
 //!   (kernel, installer and image), with that machine's answers written into the place
 //!   the file keeps for them: install on the only disk, and join this cluster with a
 //!   token made for that machine;
@@ -14,11 +16,11 @@
 //!
 //! Only machines that start by UEFI on x86-64 are answered: kith OS starts no other way.
 //!
-//! TFTP hides nothing: whoever can listen on that network during the hour reads the
+//! Neither hides anything: whoever can listen on that network during the hour reads the
 //! token, and could join one node in the machine's place. It is good once.
 //
 // ponytail: the file (38 MB) is held in memory while this is on, and TFTP sends one block
-// per answer: a minute on a slow network. UEFI HTTP boot would be faster (T-0114).
+// per answer: a minute on a slow network (HTTP is the fast way, but only for firmware that has it).
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -120,15 +122,17 @@ pub struct Asks {
     kind: u8,
     /// The machine's own id (option 97), to be said back.
     id: Option<Vec<u8>>,
+    /// UEFI HTTP boot ("HTTPClient"): it is told a URL, not a TFTP name.
+    http: bool,
 }
 
-/// Read `packet` as a PXE client's question, from a machine that starts by UEFI on x86-64.
+/// Read `packet` as a PXE or UEFI HTTP boot client's question, from a machine that starts by UEFI on x86-64.
 pub fn asks(packet: &[u8]) -> Option<Asks> {
     if packet.len() < 240 || packet[0] != 1 || packet[1] != 1 || packet[2] != 6 || packet[236..240] != [99, 130, 83, 99]
     {
         return None;
     }
-    let (mut kind, mut pxe, mut arch, mut id) = (0, false, None, None);
+    let (mut kind, mut pxe, mut http, mut arch, mut id) = (0, false, false, None, None);
     let mut options = &packet[240..];
     while let [code, rest @ ..] = options {
         match (*code, rest) {
@@ -138,7 +142,7 @@ pub fn asks(packet: &[u8]) -> Option<Asks> {
                 let (value, rest) = rest.split_at(*len as usize);
                 match (code, value) {
                     (53, [said]) => kind = *said,
-                    (60, class) => pxe = class.starts_with(b"PXEClient"),
+                    (60, class) => (pxe, http) = (class.starts_with(b"PXEClient"), class.starts_with(b"HTTPClient")),
                     (93, [high, low, ..]) => arch = Some(u16::from_be_bytes([*high, *low])),
                     (97, own) => id = Some(own.to_vec()),
                     _ => {}
@@ -148,13 +152,19 @@ pub fn asks(packet: &[u8]) -> Option<Asks> {
             _ => return None,
         }
     }
-    // (7 and 9: x86-64 UEFI, as the firmware's makers and the RFC number it.)
-    (pxe && matches!(kind, 1 | 3) && matches!(arch, Some(7 | 9))).then(|| Asks {
+    // (7 and 9: x86-64 UEFI, as the firmware's makers and the RFC number it; 16: the same by HTTP.)
+    let arch_ok = match arch {
+        Some(7 | 9) => pxe || http,
+        Some(16) => http,
+        _ => false,
+    };
+    (arch_ok && matches!(kind, 1 | 3)).then(|| Asks {
         mac: packet[28..34].try_into().expect("six bytes"),
         xid: packet[4..8].try_into().expect("four bytes"),
         ciaddr: packet[12..16].try_into().expect("four bytes"),
         kind,
         id,
+        http,
     })
 }
 
@@ -169,21 +179,33 @@ pub fn answer(asked: &Asks, us: Ipv4Addr) -> Vec<u8> {
     packet[12..16].copy_from_slice(&asked.ciaddr);
     packet[20..24].copy_from_slice(&us.octets());
     packet[28..34].copy_from_slice(&asked.mac);
-    let name = file(&asked.mac);
+    // (A URL is at most 58 bytes here: it fits the 128 of the file field.)
+    let name = if asked.http {
+        format!("http://{us}:{HTTP_PORT}/{}", file(&asked.mac))
+    } else {
+        file(&asked.mac)
+    };
     packet[108..108 + name.len()].copy_from_slice(name.as_bytes());
     packet[236..240].copy_from_slice(&[99, 130, 83, 99]);
     // OFFER to a DISCOVER, ACK to a REQUEST.
     packet.extend([53, 1, if asked.kind == 1 { 2 } else { 5 }]);
     packet.extend([54, 4]);
     packet.extend(us.octets());
-    packet.extend([60, 9]);
-    packet.extend(b"PXEClient");
+    // (The class said back is the one asked: HTTP boot firmware ignores an offer without it.)
+    let class: &[u8] = if asked.http { b"HTTPClient" } else { b"PXEClient" };
+    packet.extend([60, class.len() as u8]);
+    packet.extend(class);
     if let Some(id) = asked.id.as_ref().filter(|id| id.len() < 256) {
         packet.extend([97, id.len() as u8]);
         packet.extend(id);
     }
-    // (Option 43, PXE's own: 6 = 8, "take the file named, ask no boot server, show no menu".)
-    packet.extend([43, 4, 6, 1, 8, 255]);
+    if asked.http {
+        packet.extend([67, name.len() as u8]);
+        packet.extend(name.as_bytes());
+    } else {
+        // (Option 43, PXE's own: 6 = 8, "take the file named, ask no boot server, show no menu".)
+        packet.extend([43, 4, 6, 1, 8, 255]);
+    }
     packet.push(255);
     packet
 }
@@ -346,6 +368,61 @@ async fn send(
     Ok(())
 }
 
+/// What one machine that is named, and has not had the file, is sent (by TFTP or HTTP alike).
+struct Wanted {
+    mac: Mac,
+    image: Arc<Vec<u8>>,
+    at: usize,
+    disk: String,
+    encrypt: bool,
+    releases: (Vec<String>, bool),
+    mesh: bool,
+    token: String,
+}
+
+fn wanted(mac: Mac) -> Option<Wanted> {
+    let active = active();
+    let active = active.as_ref()?;
+    let machine = active.machines.get(&mac).filter(|machine| !machine.served)?;
+    Some(Wanted {
+        mac,
+        image: active.image.clone(),
+        at: active.at,
+        disk: active.disk.clone(),
+        encrypt: active.encrypt,
+        releases: active.releases.clone(),
+        mesh: active.mesh,
+        token: machine.token.clone(),
+    })
+}
+
+impl Wanted {
+    /// Its answers, for a node joined at `us`, the address the machine reaches this node by.
+    fn answers(&self, us: std::net::IpAddr) -> Option<Vec<u8>> {
+        let join = SocketAddr::new(us, *PORT.get()?);
+        let (keys, lan) = &self.releases;
+        let made = answers(&self.disk, self.encrypt, join, &self.token, keys, *lan, self.mesh);
+        if made.is_none() {
+            eprintln!(
+                "kithd: netboot: the answers for {} do not fit in {ROOM} bytes (or hold a key that is none): it is sent nothing",
+                written(&self.mac)
+            );
+        }
+        made
+    }
+}
+
+/// The machine has the whole file: it is not answered again.
+fn served(mac: &Mac) {
+    if let Some(machine) = active().as_mut().and_then(|active| active.machines.get_mut(mac)) {
+        machine.served = true;
+    }
+    eprintln!(
+        "kithd: netboot: {} has the installer: it is not answered again",
+        written(mac)
+    );
+}
+
 /// Answer read requests on `socket` (port 69) for as long as netboot is on.
 async fn tftp(socket: UdpSocket) {
     let mut packet = [0; 1024];
@@ -356,24 +433,8 @@ async fn tftp(socket: UdpSocket) {
         let Some((name, options)) = request(&packet[..len]) else {
             continue;
         };
-        let wanted = of(&name).and_then(|mac| {
-            let active = active();
-            let active = active.as_ref()?;
-            let machine = active.machines.get(&mac).filter(|machine| !machine.served)?;
-            Some((
-                mac,
-                active.image.clone(),
-                active.at,
-                (
-                    active.disk.clone(),
-                    active.encrypt,
-                    active.releases.clone(),
-                    active.mesh,
-                ),
-                machine.token.clone(),
-            ))
-        });
-        let named = wanted.as_ref().map(|wanted| wanted.0);
+        let wanted = of(&name).and_then(wanted);
+        let named = wanted.as_ref().map(|wanted| wanted.mac);
         let transfer = tokio::spawn(async move {
             // Each transfer from a port of its own, as TFTP has it.
             let Ok(transfer) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await else {
@@ -382,38 +443,22 @@ async fn tftp(socket: UdpSocket) {
             if transfer.connect(peer).await.is_err() {
                 return;
             }
-            let Some((mac, image, at, disk, token)) = wanted else {
+            let Some(wanted) = wanted else {
                 let _ = transfer.send(&refusal(1, "no such file here")).await;
                 return;
             };
             // The node is joined at the address this machine reaches it by.
-            let (Ok(us), Some(port)) = (transfer.local_addr(), PORT.get()) else {
+            let Some(answers) = transfer.local_addr().ok().and_then(|us| wanted.answers(us.ip())) else {
                 return;
             };
-            let join = SocketAddr::new(us.ip(), *port);
-            let Some(answers) = answers(&disk.0, disk.1, join, &token, &disk.2.0, disk.2.1, disk.3) else {
-                eprintln!(
-                    "kithd: netboot: the answers for {} do not fit in {ROOM} bytes (or hold a key that is none): it is sent nothing",
-                    written(&mac)
-                );
-                return;
-            };
-            let sent = send(&transfer, image.len(), &options, |from, len| {
-                read(&image, at, &answers, from, len)
+            let sent = send(&transfer, wanted.image.len(), &options, |from, len| {
+                read(&wanted.image, wanted.at, &answers, from, len)
             });
             // (Firmware asks once for the size and gives up, then asks again: only a
             // transfer that ended is a machine that has the file.)
             match sent.await {
-                Ok(()) => {
-                    if let Some(machine) = active().as_mut().and_then(|active| active.machines.get_mut(&mac)) {
-                        machine.served = true;
-                    }
-                    eprintln!(
-                        "kithd: netboot: {} has the installer: it is not answered again",
-                        written(&mac)
-                    );
-                }
-                Err(why) => eprintln!("kithd: netboot: sending to {} ended: {why}", written(&mac)),
+                Ok(()) => served(&wanted.mac),
+                Err(why) => eprintln!("kithd: netboot: sending to {} ended: {why}", written(&wanted.mac)),
             }
         });
         // One at a time to a machine: firmware that asks again has given up on what it asked
@@ -458,6 +503,138 @@ async fn dhcp(socket: UdpSocket, us: Option<Ipv4Addr>) {
         };
         let _ = socket.send_to(&answer(&asked, us), to).await;
     }
+}
+
+/// The port the boot file is served on over HTTP, for firmware that boots from a URL.
+const HTTP_PORT: u16 = 8069;
+
+/// Connections served at once: the file is a few dozen MB, and one machine needs one.
+const HTTP_CONNECTIONS: usize = 16;
+
+/// Of those, the most that one address may hold: a machine needs one, and firmware may keep a second.
+const HTTP_PER_PEER: usize = 2;
+
+/// The whole of the request's head must arrive in this long, however it is cut up.
+const HTTP_HEAD_SECS: u64 = 10;
+
+/// Serve the boot file to the machines named, over HTTP, on `listener` for as long as netboot is
+/// on. Each connection is a task of this one, so they all end with it.
+///
+// ponytail: a hand-read GET and HEAD of one path, no Range (firmware that sends one gets the
+// whole file, as HTTP/1.1 allows), no keep-alive; a second GET of one machine's file may run
+// beside the first, as a second TFTP read could not. The limits (16 connections, 2 of them from
+// one address) are those of one listener: one task per card address, so a host with several
+// cards allows that much on each.
+async fn http(listener: tokio::net::TcpListener) {
+    let mut connections = tokio::task::JoinSet::new();
+    // (The peers of the connections that are open: a task gives its peer back when it ends.)
+    let mut open: BTreeMap<std::net::IpAddr, usize> = BTreeMap::new();
+    loop {
+        let Ok((stream, peer)) = listener.accept().await else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        while let Some(done) = connections.try_join_next() {
+            if let Ok(ip) = done
+                && let Some(count) = open.get_mut(&ip)
+            {
+                *count -= 1;
+                if *count == 0 {
+                    open.remove(&ip);
+                }
+            }
+        }
+        let ip = peer.ip();
+        // (Closed at once, when it is dropped: one peer cannot hold every place.)
+        if connections.len() < HTTP_CONNECTIONS && open.get(&ip).copied().unwrap_or(0) < HTTP_PER_PEER {
+            *open.entry(ip).or_default() += 1;
+            connections.spawn(async move {
+                let _ = http_connection(stream).await;
+                ip
+            });
+        }
+    }
+}
+
+/// The longest a machine may take to read a file of `len` bytes: 30 seconds and a megabyte a
+/// second. A transfer slower than that ends.
+fn transfer_time(len: usize) -> Duration {
+    Duration::from_secs(30 + len as u64 / 1_000_000)
+}
+
+/// `what` for at most `secs`: a peer that stops reading or writing is let go.
+async fn within<T>(secs: u64, what: impl std::future::Future<Output = std::io::Result<T>>) -> std::io::Result<T> {
+    tokio::time::timeout(Duration::from_secs(secs), what)
+        .await
+        .map_err(|_| std::io::Error::other("the machine is too slow"))?
+}
+
+async fn http_connection(mut stream: tokio::net::TcpStream) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let head = |status: &str, len: usize| {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    // The request's head (its first line is all that is read of it), at most 8 KiB of it.
+    let mut heard = Vec::new();
+    let hear = async {
+        let mut chunk = [0; 1024];
+        while !heard.windows(4).any(|window| window == b"\r\n\r\n") && heard.len() < 8192 {
+            match stream.read(&mut chunk).await? {
+                0 => return Ok(false),
+                len => heard.extend(&chunk[..len]),
+            }
+        }
+        Ok(true)
+    };
+    // (One limit on all of it, not one per read: a byte every few seconds is no faster.)
+    if !within(HTTP_HEAD_SECS, hear).await? {
+        return Ok(());
+    }
+    let line = String::from_utf8_lossy(heard.split(|byte| *byte == b'\r').next().unwrap_or_default()).into_owned();
+    let mut words = line.split(' ');
+    let (method, path) = (words.next().unwrap_or_default(), words.next().unwrap_or_default());
+    let us = stream.local_addr()?.ip();
+    let found = matches!(method, "GET" | "HEAD")
+        .then(|| of(path))
+        .flatten()
+        .and_then(wanted)
+        .and_then(|wanted| Some((wanted.answers(us)?, wanted)));
+    let Some((answers, wanted)) = found else {
+        return within(10, stream.write_all(head("404 Not Found", 0).as_bytes())).await;
+    };
+    let len = wanted.image.len();
+    within(10, stream.write_all(head("200 OK", len).as_bytes())).await?;
+    if method == "GET" {
+        let send = async {
+            for from in (0..len).step_by(64 << 10) {
+                stream
+                    .write_all(&read(&wanted.image, wanted.at, &answers, from, 64 << 10))
+                    .await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        let limit = transfer_time(len);
+        tokio::time::timeout(limit, send)
+            .await
+            .map_err(|_| std::io::Error::other("the machine is too slow"))??;
+    }
+    stream.shutdown().await?;
+    if method == "GET" {
+        // (The machine closes when it has it all; a reset says it did not. One that closes
+        // late has the file all the same.)
+        if let Ok(Err(e)) = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::copy(&mut stream, &mut tokio::io::sink()),
+        )
+        .await
+        {
+            return Err(e);
+        }
+        served(&wanted.mac);
+    }
+    Ok(())
 }
 
 /// This machine's cards that have an IPv4 address, and it.
@@ -509,11 +686,26 @@ pub async fn on(
         socket.set_nonblocking(true)?;
         UdpSocket::from_std(socket)
     };
-    // (Both before either is served: what fails here has started nothing to stop.)
+    // (All before any is served: what fails here has started nothing to stop.)
     let (files, asked) = (
         bound(69).map_err(failed("port 69 (TFTP)"))?,
         bound(4011).map_err(failed("port 4011"))?,
     );
+    // HTTP is on the cards' own addresses, the ones the answers name in the URL, not on every one.
+    let cards = cards();
+    let mut webs = Vec::new();
+    for (_, address) in &cards {
+        let web = std::net::TcpListener::bind((*address, HTTP_PORT))
+            .and_then(|listener| {
+                listener.set_nonblocking(true)?;
+                tokio::net::TcpListener::from_std(listener)
+            })
+            .map_err(failed("port 8069 (HTTP)"))?;
+        webs.push(web);
+    }
+    if webs.is_empty() {
+        return Err("netboot found no card with an IPv4 address to serve HTTP on".into());
+    }
     let mut held = BTreeMap::new();
     for mac in machines {
         let (token, served, transfer) = (token()?, false, None);
@@ -527,7 +719,10 @@ pub async fn on(
         );
     }
     let mut tasks = vec![tokio::spawn(tftp(files)), tokio::spawn(dhcp(asked, None))];
-    for (card, address) in cards() {
+    tasks.extend(webs.into_iter().map(|web| tokio::spawn(http(web))));
+    // ponytail: the addresses are those the cards have now; one that changes while netboot is on
+    // is not followed (a machine on it is told a URL that does not answer). Turn netboot on again.
+    for (card, address) in cards {
         match crate::dhcp::socket(&card, 67) {
             Ok(socket) => tasks.push(tokio::spawn(dhcp(socket, Some(address)))),
             Err(e) => eprintln!("kithd: netboot: not answering on {card}: {e}"),
@@ -996,6 +1191,244 @@ mod tests {
             assert!(task.await.unwrap_err().is_cancelled());
         }
         assert_eq!(status()["on"], false);
+    }
+
+    /// The value of DHCP option `code` in `reply`.
+    fn option(reply: &[u8], code: u8) -> Option<&[u8]> {
+        let mut options = &reply[240..];
+        while let [this, rest @ ..] = options {
+            match (*this, rest) {
+                (255, _) => return None,
+                (0, _) => options = rest,
+                (_, [len, rest @ ..]) => {
+                    let (value, rest) = rest.split_at(*len as usize);
+                    if *this == code {
+                        return Some(value);
+                    }
+                    options = rest;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// A machine that boots by UEFI HTTP says "HTTPClient" and architecture 16: it is answered
+    /// with the URL of its file, in the file field and option 67, and not with a TFTP name.
+    #[test]
+    fn netboot_answers_http_boot_clients_with_a_url() {
+        let us = Ipv4Addr::new(10, 0, 2, 15);
+        let url = format!("http://10.0.2.15:{HTTP_PORT}/kith-netboot-525400aabbcc.efi");
+        for (class, kind) in [(&b"HTTPClient:Arch:00016:UNDI:003001"[..], 1), (b"HTTPClient", 3)] {
+            let asked = asks(&discover(class, 16, kind)).expect("an HTTP boot question is answered");
+            let reply = answer(&asked, us);
+            assert_eq!(reply[..4], [2, 1, 6, 0]);
+            assert_eq!(reply[4..8], [1, 2, 3, 4]);
+            assert_eq!(reply[16..20], [0; 4]);
+            assert_eq!(reply[28..34], CARD);
+            assert!(reply[108..].starts_with(format!("{url}\0").as_bytes()));
+            assert_eq!(option(&reply, 53), Some(&[if kind == 1 { 2 } else { 5 }][..]));
+            assert_eq!(option(&reply, 54), Some(&us.octets()[..]));
+            // The class said back is the one asked: firmware ignores an offer that is not.
+            assert_eq!(option(&reply, 60), Some(&b"HTTPClient"[..]));
+            assert_eq!(option(&reply, 67), Some(url.as_bytes()));
+            assert_eq!(option(&reply, 97), Some(&[0, 7, 7][..]));
+            // (PXE's own option 43 means nothing to it.)
+            assert_eq!(option(&reply, 43), None);
+        }
+        // Architecture 16 says HTTP: a PXE client of it, and an HTTP client of BIOS, are not answered.
+        assert_eq!(asks(&discover(b"PXEClient", 16, 1)), None);
+        assert_eq!(asks(&discover(b"HTTPClient", 0, 1)), None);
+        // PXE is as it was: a TFTP name and no option 67.
+        let pxe = answer(&asks(&discover(b"PXEClient", 7, 1)).unwrap(), us);
+        assert!(pxe[108..].starts_with(b"kith-netboot-525400aabbcc.efi\0"));
+        assert_eq!((option(&pxe, 60), option(&pxe, 67)), (Some(&b"PXEClient"[..]), None));
+    }
+
+    /// One HTTP/1.1 request to `server`, read to the end: the head and the body.
+    async fn get(server: SocketAddr, method: &str, path: &str) -> (String, Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(server).await.unwrap();
+        let ask = format!("{method} {path} HTTP/1.1\r\nHost: {server}\r\nUser-Agent: UefiHttpBoot\r\n\r\n");
+        stream.write_all(ask.as_bytes()).await.unwrap();
+        let mut heard = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut heard));
+        read.await.expect("the server closes when it is done").unwrap();
+        let end = heard.windows(4).position(|w| w == b"\r\n\r\n").expect("a head") + 4;
+        (
+            String::from_utf8_lossy(&heard[..end]).into_owned(),
+            heard[end..].to_vec(),
+        )
+    }
+
+    #[tokio::test]
+    async fn netboot_serves_the_file_over_http_to_the_machines_named_once() {
+        let _serial = SERIAL.lock().await;
+        let mut image: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+        image[1000..1000 + MARKER.len()].copy_from_slice(MARKER);
+        let _ = PORT.set(7443);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        *active() = Some(Active {
+            image: Arc::new(image.clone()),
+            at: 1000,
+            disk: "only".into(),
+            encrypt: false,
+            releases: (vec!["c".repeat(64)], true),
+            mesh: false,
+            machines: BTreeMap::from([(CARD, machine(false)), (SMALL, machine(false))]),
+            until: Instant::now() + Duration::from_secs(60),
+            tasks: vec![tokio::spawn(http(listener))],
+        });
+
+        // Another machine's file, any other file and any other way to ask are not here.
+        for (method, path) in [
+            ("GET", "/kith-netboot-525400000001.efi"),
+            ("GET", "/etc/passwd"),
+            ("GET", "/"),
+            ("GET", "/../kith-netboot-525400aabbcc.efi.sig"),
+            ("POST", "/kith-netboot-525400aabbcc.efi"),
+        ] {
+            let (head, body) = get(server, method, path).await;
+            assert!(head.starts_with("HTTP/1.1 404 "), "{method} {path}: {head}");
+            assert!(body.is_empty(), "{method} {path}");
+        }
+        assert_eq!(status()["machines"][0]["served"], false);
+
+        // Firmware asks for the length first: HEAD says it and sends no body, and is no download.
+        let name = format!("/{}", file(&CARD));
+        let (head, body) = get(server, "HEAD", &name).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert!(head.contains(&format!("Content-Length: {}\r\n", image.len())), "{head}");
+        assert!(body.is_empty());
+        assert_eq!(status()["machines"][0]["served"], false);
+
+        let (head, whole) = get(server, "GET", &name).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert!(head.contains(&format!("Content-Length: {}\r\n", image.len())), "{head}");
+        assert_eq!(whole.len(), image.len());
+        assert_eq!(whole[..1000], image[..1000]);
+        let held = format!(
+            "disk: only\nreleaseKey: '{}'\nlanReleases: true\njoin:\n  address: 127.0.0.1:7443\n  token: kith1.ab.cd\n\n",
+            "c".repeat(64)
+        );
+        assert!(whole[1000..].starts_with(held.as_bytes()));
+        assert_eq!(whole[1000 + ROOM..], image[1000 + ROOM..]);
+        // (The mark is made once the last byte is written.)
+        for _ in 0..50 {
+            if status()["machines"][0]["served"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status()["machines"][0]["served"], true);
+        assert_eq!(status()["machines"][1]["served"], false);
+
+        // It has the file: nobody is given that file, and its token, a second time, nor its length.
+        for method in ["GET", "HEAD"] {
+            assert!(get(server, method, &name).await.0.starts_with("HTTP/1.1 404 "));
+        }
+        // The other machine is still served, and by TFTP's rules: its own answers.
+        let (head, whole) = get(server, "GET", &format!("/{}", file(&SMALL))).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_eq!(whole[whole.len() - 100..], image[image.len() - 100..]);
+
+        for task in off() {
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(status()["on"], false);
+    }
+
+    /// A peer that dribbles its request, a byte now and then, is let go when the head's time is
+    /// up, not a read's time after each byte.
+    #[tokio::test]
+    async fn netboot_http_closes_a_slow_head_after_one_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let serving = tokio::spawn(http(listener));
+        let (mut reader, mut writer) = tokio::net::TcpStream::connect(server).await.unwrap().into_split();
+        let dribble = tokio::spawn(async move {
+            for _ in 0..20 {
+                if writer.write_all(b"G").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        let began = Instant::now();
+        let mut heard = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(15), reader.read_to_end(&mut heard));
+        let _ = read.await.expect("the server lets a slow head go");
+        let took = began.elapsed();
+        assert!(
+            took >= Duration::from_secs(9) && took < Duration::from_secs(12),
+            "{took:?}"
+        );
+        dribble.abort();
+        serving.abort();
+    }
+
+    /// One address holds two connections at most: a third is closed at once, and the places
+    /// are free again when they end. Others are as they were, and a time is set by the file.
+    #[tokio::test]
+    async fn netboot_http_refuses_a_third_connection_from_one_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let serving = tokio::spawn(http(listener));
+        let first = tokio::net::TcpStream::connect(server).await.unwrap();
+        let mut second = tokio::net::TcpStream::connect(server).await.unwrap();
+        let mut third = tokio::net::TcpStream::connect(server).await.unwrap();
+        let mut heard = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(2), third.read_to_end(&mut heard)).await;
+        assert!(matches!(closed, Ok(Ok(0))), "{closed:?}");
+        // (The two that are open are waiting for their request, not closed.)
+        let waiting = tokio::time::timeout(Duration::from_millis(300), second.read_u8()).await;
+        assert!(waiting.is_err(), "{waiting:?}");
+        // A place that is let go is given to the next one.
+        drop(first);
+        let mut served = None;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut next = tokio::net::TcpStream::connect(server).await.unwrap();
+            next.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+            let mut heard = Vec::new();
+            let _ = next.read_to_end(&mut heard).await;
+            if heard.starts_with(b"HTTP/1.1 404 ") {
+                served = Some(heard);
+                break;
+            }
+        }
+        assert!(served.is_some(), "a freed place is not given again");
+        serving.abort();
+
+        assert_eq!(transfer_time(0), Duration::from_secs(30));
+        assert_eq!(transfer_time(50_000_000), Duration::from_secs(80));
+    }
+
+    /// Turned off, the HTTP port is closed: nothing answers there, not even a refusal.
+    #[tokio::test]
+    async fn netboot_http_serves_nothing_after_it_is_off() {
+        let _serial = SERIAL.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        *active() = Some(Active {
+            image: Arc::new(vec![0; 64]),
+            at: 0,
+            disk: "only".into(),
+            encrypt: false,
+            releases: Default::default(),
+            mesh: false,
+            machines: BTreeMap::from([(CARD, machine(false))]),
+            until: Instant::now() + Duration::from_secs(60),
+            tasks: vec![tokio::spawn(http(listener))],
+        });
+        assert!(tokio::net::TcpStream::connect(server).await.is_ok());
+        for task in off() {
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert!(tokio::net::TcpStream::connect(server).await.is_err());
     }
 
     /// Netboot is on for an hour at most, and says how much of that is left: what is out of

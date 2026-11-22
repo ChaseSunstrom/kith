@@ -661,6 +661,15 @@ impl ImageStore {
         refuse_newer_json(&file, saved.as_ref())
     }
 
+    /// The image `reference` resolved to last time, if it is still unpacked here: what a pull would
+    /// find already stored, with no pull, no network and nothing written. (A note of a newer
+    /// format is none here: a pull says why, T-0219.)
+    pub fn here(&self, reference: &str) -> Option<Image> {
+        let reference = reference.parse().ok()?;
+        self.refuse_newer_note(&reference).ok()?;
+        self.cached(&reference)
+    }
+
     /// The image `reference` resolved to last time, if it is still unpacked here.
     fn cached(&self, reference: &Reference) -> Option<Image> {
         let saved = fs::read(self.ref_file(reference).ok()?).ok()?;

@@ -588,7 +588,12 @@ fn served(resource: &Resource) -> Option<(&'static Kind, Value)> {
         // Its address on the mesh; with none it is found by its name alone, which is what
         // Kubernetes calls a Service with `None` here. A headless one has no address, whatever
         // it had before it was made so. (Helm waits for this field to say something.)
-        "Service" if object.pointer("/spec/clusterIP").is_none() => {
+        // (Helm sends `clusterIP: ""` for "allocate": it is read as absent.)
+        "Service"
+            if object
+                .pointer("/spec/clusterIP")
+                .is_none_or(|ip| ip.as_str() == Some("")) =>
+        {
             let address = match crate::services::headless(resource) {
                 true => "None",
                 false => said("address").unwrap_or("None"),
@@ -2108,6 +2113,7 @@ fn updated(live: &Value, after: &mut Value) {
 type Asked = HashMap<String, String>;
 
 /// One request: who asks, and what its query says.
+#[derive(Clone)]
 struct Call {
     shared: Arc<Shared>,
     caller: Caller,
@@ -3254,15 +3260,17 @@ impl Watch {
             self.event("BOOKMARK", &mark, at);
         }
     }
+}
 
-    /// Does the caller's certificate still stand for it? (A watch is long: an Identity
-    /// deleted, or given another key, meanwhile is told no more.)
+impl Call {
+    /// Does the caller's certificate still stand for it? (A watch or a followed log is long: an
+    /// Identity deleted, or given another key, meanwhile is told no more.)
     fn stands(&self) -> bool {
-        match (&self.call.caller, &self.call.certificate) {
-            (Caller::Identity(_) | Caller::Node(_), Some(shown)) => shown.stands(&self.call.shared),
+        match (&self.caller, &self.certificate) {
+            (Caller::Identity(_) | Caller::Node(_), Some(shown)) => shown.stands(&self.shared),
             (Caller::Identity(_), None) => false,
             (Caller::Admin | Caller::Console(_), _) => true,
-            // (A node shows its certificate, and nothing is passed on to a watch.)
+            // (A node shows its certificate, and nothing is passed on to a stream.)
             (Caller::Node(_), None) | (Caller::Via(..) | Caller::Checked(..), _) => false,
         }
     }
@@ -3300,7 +3308,7 @@ fn watch(call: Call, kind: &'static Kind, namespace: Option<String>) -> Result<R
                 _ = stop.wait_for(|stop| *stop) => watch.over = true,
                 () = tokio::time::sleep_until(watch.until) => watch.over = true,
             }
-            if !watch.stands() {
+            if !watch.call.stands() {
                 return None;
             }
             drop(watch.generation.borrow_and_update());
@@ -3370,14 +3378,26 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
     };
     // (The first reading here, so that what cannot be read is said as an error.)
     let (first, _) = reading.more().await.map_err(refusal)?;
-    let chunks = futures_util::stream::unfold((reading, Some(first)), move |(mut reading, first)| async move {
+    let own = (call.clone(), format!("pod {namespace}/{pod}"));
+    let state = (reading, Some(first), own);
+    let chunks = futures_util::stream::unfold(state, move |(mut reading, first, own)| async move {
         if let Some(first) = first.filter(|first| !first.is_empty()) {
-            return Some((Ok::<_, std::io::Error>(Bytes::from(first)), (reading, None)));
+            return Some((Ok::<_, std::io::Error>(Bytes::from(first)), (reading, None, own)));
         }
         loop {
+            // A followed log is long: an Identity deleted, or given another key, meanwhile is read to
+            // no more, as a watch is told no more; unlike a watch's, this end is written in the audit log.
+            if follow && !own.0.stands() {
+                let why = "this certificate does not stand for its Identity any more".to_string();
+                own.0
+                    .shared
+                    .audit
+                    .record(&own.0.caller, "logs", vec![own.1.clone()], Err(why));
+                return None;
+            }
             let (text, more) = reading.more().await.ok()?;
             if !text.is_empty() {
-                return Some((Ok(Bytes::from(text)), (reading, None)));
+                return Some((Ok(Bytes::from(text)), (reading, None, own)));
             }
             if !follow || !more || *reading.shared.stop.borrow() {
                 return None;
@@ -3511,7 +3531,16 @@ async fn pod_decision(
         &parts.headers,
         parts.uri.query().unwrap_or_default(),
     );
-    pod_run(call, namespace, pod, Verb::Exec, ui)?;
+    let (key, _) = pod_run(call, namespace, pod, Verb::Exec, ui)?;
+    // Root of the container's user namespace (`root=true`, which only kith's own client sends) takes Apply on the
+    // holder as well as Exec; the node the pod runs on checks it again where the hop arrives. Attach has no root.
+    if verb == "exec" && crate::pod_exec::asks_root(query) {
+        let holder = vec![(
+            key.split('/').next().unwrap_or_default().to_string(),
+            Some(namespace.to_string()),
+        )];
+        api::permit(&call.shared, &call.caller, Verb::Apply, |_| holder).map_err(refusal)?;
+    }
     // kubectl sends no Origin: one is a browser's, and a browser is not let upgrade to a shell,
     // unless it is the UI's route and the page is the UI's own.
     if let Some(why) = foreign_origin(headers, ui) {
@@ -3611,6 +3640,95 @@ mod tests {
         assert!(!ask(&[own[0]], false));
     }
 
+    /// The Kubernetes route carries kith's `root=true` too: it takes Apply on the holder as well as Exec, refused
+    /// (403, before any upgrade) for a caller with Exec alone, who still gets a plain exec.
+    #[tokio::test]
+    async fn exec_root_needs_apply_on_the_kubernetes_route() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-exec-root-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let held = "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: {name: web, namespace: default}
+spec: {replicas: 1, template: {exec: [{name: sleep, command: [sleep, '3600']}]}}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: alice}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: dana}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: execer}
+spec:
+  rules:
+    - {kinds: [Workload], verbs: [exec], namespaces: [default]}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: rooter}
+spec:
+  rules:
+    - {kinds: [Workload], verbs: [exec, apply], namespaces: [default]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: alice-execer}
+spec: {role: execer, subjects: [alice]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: dana-rooter}
+spec: {role: rooter, subjects: [dana]}
+";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(held).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        let ask = |who: &str, query: &str| {
+            let call = Call {
+                shared: shared.clone(),
+                caller: Caller::Identity(who.into()),
+                certificate: None,
+                asked: Asked::new(),
+                table: false,
+            };
+            let request = axum::http::Request::builder()
+                .uri(format!("/exec?{query}"))
+                .body(())
+                .unwrap();
+            (call, request.into_parts().0)
+        };
+        // (A request that is no upgrade is 400 once past the gate: that is the plain exec's way here.)
+        for (who, query, want) in [
+            ("alice", "command=true", 400),
+            ("alice", "command=true&root=true", 403),
+            ("alice", "command=true&root=false", 400),
+            ("dana", "command=true&root=true", 400),
+            ("dana", "command=true", 400),
+        ] {
+            let (call, parts) = ask(who, query);
+            let no = pod_decision(&call, "exec", "default", "web-0", &parts, None, true)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(no.code.as_u16(), want, "{who} {query}: {}", no.why);
+            if want == 403 {
+                assert!(no.why.contains("alice may not apply Workload"), "{}", no.why);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A status is kithd's own word for what runs: a client's PUT or PATCH of it is refused
     /// in those words, not with the bare 405 of a path nothing is done to.
     #[tokio::test]
@@ -3638,31 +3756,52 @@ mod tests {
     /// not headless reads the address kithd gave it.
     #[test]
     fn a_headless_service_reads_none_whatever_its_stale_address() {
-        let service = |headless: &str| {
-            let sent = json!({
-                "apiVersion": "v1", "kind": "Service",
-                "metadata": { "name": "web", "namespace": "default" },
-                "spec": { "selector": { "app": "web" }, "ports": [{ "port": 80 }] },
-            });
-            let sent = serde_json::to_string(&sent.to_string()).unwrap();
-            let source = format!(
-                "apiVersion: kith.dev/v1\nkind: Service\n\
-                 metadata: {{name: web, namespace: default, annotations: {{{SENT}: {sent}}}}}\n\
-                 spec: {{{headless} selector: {{app: web}}, ports: [{{port: 80}}]}}\n"
-            );
-            let mut resource = kith_api::Resource::from_source(&source)
-                .unwrap()
-                .pop()
-                .unwrap()
-                .unwrap();
-            resource.status = Some(json!({"address": "fd00::7"}));
-            served(&resource).unwrap().1
-        };
+        let service = |headless: &str| service_served(headless, json!({}));
         let headless = service("headless: true,");
         assert_eq!(headless.pointer("/spec/clusterIP"), Some(&json!("None")));
         assert_eq!(headless.pointer("/spec/clusterIPs"), Some(&json!(["None"])));
         let mesh = service("");
         assert_eq!(mesh.pointer("/spec/clusterIP"), Some(&json!("fd00::7")));
+    }
+
+    /// Helm renders `clusterIP: ""` to mean "allocate"; it reads back with the address, or
+    /// `helm --wait` (a Service is ready once its ClusterIP is not "") never finishes.
+    #[test]
+    fn a_service_sent_with_an_empty_cluster_ip_reads_its_address() {
+        let empty = json!({ "clusterIP": "", "clusterIPs": [""] });
+        let mesh = service_served("", empty.clone());
+        assert_eq!(mesh.pointer("/spec/clusterIP"), Some(&json!("fd00::7")));
+        assert_eq!(mesh.pointer("/spec/clusterIPs"), Some(&json!(["fd00::7"])));
+        let headless = service_served("headless: true,", empty);
+        assert_eq!(headless.pointer("/spec/clusterIP"), Some(&json!("None")));
+        assert_eq!(headless.pointer("/spec/clusterIPs"), Some(&json!(["None"])));
+    }
+
+    /// A Service as the Kubernetes API serves it: what was sent (`extra` merged into its
+    /// spec), with the status address `fd00::7`.
+    fn service_served(headless: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut sent = json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": { "selector": { "app": "web" }, "ports": [{ "port": 80 }] },
+        });
+        sent["spec"]
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let sent = serde_json::to_string(&sent.to_string()).unwrap();
+        let source = format!(
+            "apiVersion: kith.dev/v1\nkind: Service\n\
+             metadata: {{name: web, namespace: default, annotations: {{{SENT}: {sent}}}}}\n\
+             spec: {{{headless} selector: {{app: web}}, ports: [{{port: 80}}]}}\n"
+        );
+        let mut resource = kith_api::Resource::from_source(&source)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap();
+        resource.status = Some(json!({"address": "fd00::7"}));
+        served(&resource).unwrap().1
     }
 
     /// Who may write a kind and not read it is not answered with what is there by a
@@ -4418,6 +4557,116 @@ spec: {role: writer, subjects: [carol]}
             }
             Err(no) => (no.code, no.why),
         }
+    }
+
+    type Chunks = std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, axum::Error>> + Send>>;
+
+    /// A followed log of the pod `x-0`, asked by Identity `alice` showing a certificate of `public`'s
+    /// key; `alice` may read what runs pods. The replica's output file is written with `first`.
+    async fn followed_log_of_alice(shared: &Arc<crate::Shared>, public: &str, first: &str) -> Chunks {
+        use rustls::pki_types::pem::PemObject;
+        let reader = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: reader}\nspec:\n  rules:\n    - {kinds: ['*'], verbs: [get, list]}\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: alice-reader}\nspec: {role: reader, subjects: [alice]}\n---\napiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: alice}\nspec: {publicKey: PUBLIC}\n";
+        let reader = reader.replace("PUBLIC", &serde_json::to_string(public).unwrap());
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(&reader).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        two_replicas_of_x(shared).await;
+        std::fs::create_dir_all(&shared.logs).unwrap();
+        std::fs::write(shared.logs.join("w_default_x_0_main.out"), first).unwrap();
+        let der = rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(public.as_bytes()).unwrap();
+        let mut request = axum::http::Request::builder().method("GET").body(()).unwrap();
+        request.extensions_mut().insert(Caller::Identity("alice".into()));
+        request.extensions_mut().insert(Certificate(crate::pki::Subject::User(
+            "alice".into(),
+            der.as_ref().to_vec(),
+        )));
+        let (parts, ()) = request.into_parts();
+        let asked = Asked::from([("follow".to_string(), "true".to_string())]);
+        let rest = "namespaces/default/pods/x-0/log";
+        let answer = serve(shared.clone(), parts, "", rest, asked, b"")
+            .await
+            .unwrap_or_else(|no| panic!("{}", no.why));
+        assert_eq!(answer.status(), StatusCode::OK);
+        Box::pin(answer.into_body().into_data_stream())
+    }
+
+    async fn next_of(chunks: &mut Chunks) -> Option<String> {
+        use futures_util::StreamExt;
+        let next = tokio::time::timeout(Duration::from_secs(10), chunks.next()).await;
+        next.expect("no chunk and no end in 10 s")
+            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+    }
+
+    /// A followed `kubectl logs` goes on reading while the Identity's certificate stands.
+    #[tokio::test]
+    async fn a_followed_log_goes_on_while_its_identity_stands() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-log-stands-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let (_, _, public) = crate::pki::Ca::create().unwrap().issue_user("alice").unwrap();
+        let mut chunks = followed_log_of_alice(&shared, &public, "one\n").await;
+        assert_eq!(next_of(&mut chunks).await.as_deref(), Some("one\n"));
+        std::fs::write(shared.logs.join("w_default_x_0_main.out"), "one\ntwo\n").unwrap();
+        assert_eq!(next_of(&mut chunks).await.as_deref(), Some("two\n"));
+        drop(chunks);
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A followed `kubectl logs` ends once its Identity is deleted, and its end is audited.
+    #[tokio::test]
+    async fn a_followed_log_ends_when_its_identity_no_longer_stands() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-log-ends-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let (_, _, public) = crate::pki::Ca::create().unwrap().issue_user("alice").unwrap();
+        let mut chunks = followed_log_of_alice(&shared, &public, "one\n").await;
+        assert_eq!(next_of(&mut chunks).await.as_deref(), Some("one\n"));
+        shared.store.lock().unwrap().store.delete("Identity/alice").unwrap();
+        std::fs::write(shared.logs.join("w_default_x_0_main.out"), "one\ntwo\n").unwrap();
+        assert_eq!(next_of(&mut chunks).await, None, "the stream went on");
+        let entries = shared.audit.tail(10).unwrap();
+        let said = entries
+            .iter()
+            .any(|e| e["verb"] == "logs" && e["who"] == "alice" && e["ok"] == false);
+        assert!(said, "{entries:?}");
+        drop(chunks);
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A followed `kubectl logs` ends once its Identity is given another key, and its end is audited.
+    #[tokio::test]
+    async fn a_followed_log_ends_when_its_identity_gets_another_key() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-log-rekey-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let ca = crate::pki::Ca::create().unwrap();
+        let (_, _, public) = ca.issue_user("alice").unwrap();
+        let (_, _, given) = ca.issue_user("alice").unwrap();
+        let mut chunks = followed_log_of_alice(&shared, &public, "one\n").await;
+        assert_eq!(next_of(&mut chunks).await.as_deref(), Some("one\n"));
+        let new = json!({
+            "apiVersion": kith_api::API_VERSION, "kind": "Identity",
+            "metadata": { "name": "alice" }, "spec": { "publicKey": given },
+        });
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .apply(serde_json::from_value(new).unwrap())
+            .unwrap();
+        std::fs::write(shared.logs.join("w_default_x_0_main.out"), "one\ntwo\n").unwrap();
+        assert_eq!(next_of(&mut chunks).await, None, "the stream went on");
+        let entries = shared.audit.tail(10).unwrap();
+        let said = entries
+            .iter()
+            .any(|e| e["verb"] == "logs" && e["who"] == "alice" && e["ok"] == false);
+        assert!(said, "{entries:?}");
+        drop(chunks);
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A Deployment `x` of two replicas, both running here, and the pods of it by name.

@@ -868,9 +868,16 @@ async fn members_only(
             let raft = path.starts_with("/v1/raft/");
             let mut answer = next.run(request).await;
             if raft {
+                // (The store is locked only on trial: off it the answer is this build's format.)
+                let trial = crate::os::on_trial();
+                let current = if trial {
+                    kith_store::format_of(&shared.store.lock().expect("nothing panics holding the store").store)
+                } else {
+                    kith_store::FORMAT
+                };
                 answer
                     .headers_mut()
-                    .insert(crate::raft::READS, kith_store::FORMAT.into());
+                    .insert(crate::raft::READS, crate::raft::reads(current, trial).into());
             }
             return answer;
         }
@@ -2600,6 +2607,8 @@ pub(crate) mod pinned_peer {
             ("src/acme.rs", 3),
             ("src/update.rs", 1),
             ("src/install.rs", 1),
+            // The vulnerability scan's OSV query: package names and versions only, no proxy, no redirect.
+            ("src/scan.rs", 1),
         ];
         let mut files = Vec::new();
         sources(

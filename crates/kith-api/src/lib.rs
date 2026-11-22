@@ -17,7 +17,7 @@ pub const API_VERSION: &str = "kith.dev/v1";
 pub const DEFAULT_NAMESPACE: &str = "default";
 
 /// Is `method` `path` a request one node passes on to another for whoever asked it: a unit's logs,
-/// a Volume's files, a node's passphrase, new recovery key or encryption, a backup's restore, a replica's
+/// a Volume's files, an image's scan on a node, a node's passphrase, new recovery key or encryption, a backup's restore, a replica's
 /// restart (a `kubectl delete pod`), and a change to
 /// the store a control node that is not the leader passes on as it came (an apply, a delete, a
 /// rollback). kithd reads the signer of such a request from the node that passed it on (`FOR`);
@@ -30,6 +30,7 @@ pub fn passed_on(method: &str, path: &str) -> bool {
     let parts: Vec<&str> = rest.split('/').collect();
     match parts[..] {
         ["logs", _, ..]
+        | ["scan", _]
         | ["volumes", _, _, "files"]
         | ["lock", _, "passphrase" | "recovery" | "encrypt"]
         | ["backups", _, _, "restore"] => true,

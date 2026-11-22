@@ -76,6 +76,7 @@ mod renew;
 mod replicas;
 mod resolver;
 mod root_part;
+mod scan;
 mod sched;
 #[cfg(test)]
 mod scratch;
@@ -444,6 +445,31 @@ fn main() -> ExitCode {
     // The same for the software security key (the VM test, T-0973, looks for the line).
     #[cfg(feature = "fido2-test")]
     let _ = std::io::Write::write_all(&mut std::io::stderr(), fido2_test::STARTUP_LINE);
+    // `kithd config-image IMAGE ANSWERS` (os/config.sh): the node's config written into a built
+    // image on the build host, by the installer's own code. Nothing else of kithd starts.
+    if let [_, verb, image, answers] = std::env::args().collect::<Vec<_>>().as_slice()
+        && verb == "config-image"
+    {
+        let done = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(image)
+            .map_err(|e| format!("{image}: {e}"))
+            .and_then(|image| {
+                let yaml = std::fs::read_to_string(answers).map_err(|e| format!("{answers}: {e}"))?;
+                install::config_image(&image, &yaml)
+            });
+        return match done {
+            Ok(config) => {
+                println!("{}", install::wrote(image, &config));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("kithd: config-image: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
     if std::process::id() == 1 {
         keeper::keep();

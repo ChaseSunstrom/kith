@@ -201,6 +201,26 @@ fn vetted(args: Vec<String>, image: Option<&[String]>) -> (Vec<String>, Vec<Stri
     (kept, said)
 }
 
+/// The keys `--release-key` gives in `args` (after `vetted`: the image's).
+fn given_keys(args: &[String]) -> Vec<String> {
+    let mut given = Vec::new();
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        let keys = match word.strip_prefix("--release-key") {
+            Some("") => words.next().map_or("", String::as_str),
+            Some(keys) if keys.starts_with('=') => &keys[1..],
+            _ => continue,
+        };
+        given.extend(
+            keys.split(',')
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string),
+        );
+    }
+    given
+}
+
 /// The slaves of dm-0, the verity device the root is: the one this system runs from.
 const ROOT_SLAVES: &str = "/sys/block/dm-0/slaves";
 
@@ -758,6 +778,7 @@ impl Boot {
             tokio::spawn(crate::dhcp::keep(card, self.name.clone(), got));
         }
         let Some(slot) = self.slot else { return };
+        crate::os::ON_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
         // ponytail: good means kithd started, has its state to use, and is still running a
         // little later (one that cannot start ends, and the machine restarts, well within
         // that). Whether the node is healthy in its cluster is the update plan's to judge
@@ -1042,7 +1063,12 @@ pub fn early(again: bool) -> Boot {
         std::process::abort();
     }));
     if let (Some(slot), Some(device), false) = (options.slot, &options.update, again) {
-        match crate::os::update(device, slot, &line) {
+        // (The keys a release is taken by, in its order, and its floor: a key a handover retired
+        // does not sign a stick, nor does a version under the floor. The state is open here
+        // unless it is sealed or this is the installer.)
+        let vouch = crate::update::keys(given_keys(&args), std::path::Path::new(STATE))
+            .for_stick(!installing && sealed.is_none());
+        match crate::os::update(device, slot, &line, vouch) {
             Ok(Some(version)) => {
                 eprintln!("kithd: init: kith OS {version} from {device} is in the other slot: starting it");
                 end(false)
@@ -1238,6 +1264,14 @@ mod tests {
 
     fn words(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn the_given_release_keys_are_those_of_both_forms() {
+        let given = |text| super::given_keys(&words(text));
+        assert_eq!(given("--claim t --release-key A,B --listen x"), ["A", "B"]);
+        assert_eq!(given("--release-key=A --release-key C"), ["A", "C"]);
+        assert!(given("--claim t --release-key").is_empty() && given("").is_empty());
     }
 
     #[test]

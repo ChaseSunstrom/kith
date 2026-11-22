@@ -736,6 +736,37 @@ fn logs_are_capped_and_removed() {
     });
 }
 
+/// `kith image scan` asks the node (here, the one this kithd is) and does not pull: an image it does not
+/// have is said not to be there, and a name that is no image is refused before any look.
+#[test]
+fn scan_of_an_image_the_node_does_not_have_says_so_and_pulls_nothing() {
+    if !e2e() {
+        return;
+    }
+    let daemon = Daemon::start("scan_not_here");
+    let (code, out, err) = daemon.kith(&["image", "scan", "registry.invalid/none:1", "--node", "alpha"]);
+    assert_eq!((code, out.as_str()), (2, ""), "{err}");
+    assert!(
+        err.contains("registry.invalid/none:1 is not on node alpha") && err.contains("nothing is pulled"),
+        "{err}"
+    );
+    // (No pull: the store has no such image, nor a ref note of one.)
+    for kept in ["images", "refs"] {
+        let names = std::fs::read_dir(daemon.dir.join("state/runtime").join(kept)).unwrap();
+        let names: Vec<_> = names
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| !n.to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(names.is_empty(), "{kept}: {names:?}");
+    }
+    let (code, _, err) = daemon.kith(&["image", "scan", "not an image", "--node", "alpha"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("not an image reference"), "{err}");
+    // A node that is not this one, in a kithd with no cluster... is this one (one node, whatever it is called).
+    let (_, _, err) = daemon.kith(&["image", "scan", "registry.invalid/none:1", "--node", "elsewhere"]);
+    assert!(err.contains("is not on node elsewhere"), "{err}");
+}
+
 #[test]
 fn node_workload_runs_one_copy_alone() {
     if !e2e() {
@@ -2472,8 +2503,9 @@ fn rbac_is_enforced_and_audited() {
 
     // A new certificate ends the old one's access; deleting the Identity ends it all.
     daemon.ok(&["identity", "cert", "alice", "--out", "second"]);
+    // (A replaced certificate is refused at the TLS handshake, so curl has no status: 0 here; T-1014.)
     let (status, reply) = call("first", "GET", "/v1/resources", "");
-    assert_eq!(status, 401, "{reply}");
+    assert_eq!(status, 0, "{reply}");
     assert_eq!(call("second", "GET", "/v1/resources/ConfigMap/web/site", "").0, 200);
     daemon.ok(&["delete", "identity/alice"]);
     assert_eq!(call("second", "GET", "/v1/resources/ConfigMap/web/site", "").0, 401);
@@ -3014,7 +3046,7 @@ spec: { role: reader, subjects: [reader] }
     let status = |who: &str, pod: &str, upgrading: bool, more: &[&str]| ask(Some(who), pod, upgrading, more).0;
 
     // Without the right: 403 before the request is read (a plain GET and an upgrade alike), for a pod that is
-    // there and one that is not; a NodeWorkload's pod takes the right on Node too, which the runner has not.
+    // there and one that is not.
     for who in ["reader", "nobody"] {
         for pod in ["web-0", "web-j0", "nosuch-0"] {
             for upgrading in [false, true] {
@@ -3027,19 +3059,17 @@ spec: { role: reader, subjects: [reader] }
             }
         }
     }
+    // Past that gate, a pod whose holder the caller has no right on is 404, as a name that is nothing (T-1005):
+    // the runner holds Exec on Workload, not on NodeWorkload, so `agent-n0` is not there for it.
     assert_eq!(
         status("runner", "agent-n0", true, &[]),
-        403,
-        "a NodeWorkload's pod takes Exec on Node"
+        404,
+        "a NodeWorkload's pod, to a caller without the right on NodeWorkload"
     );
     assert_eq!(ask(None, "web-0", true, &[]).0, 401, "no certificate");
     // With it: a pod the store does not hold is 404 (as it is for kubectl), a pod it holds is the upgrade.
-    assert_eq!(
-        status("runner", "nosuch-j0", true, &[]),
-        403,
-        "a Job's pod takes Exec on Job, which the runner has not"
-    );
-    for pod in ["nosuch-0", "web"] {
+    // (A Job's pod the runner has no right on is nothing to it, as is a pod that is not there: T-1005.)
+    for pod in ["nosuch-j0", "nosuch-0", "web"] {
         let (code, _, body) = ask(Some("runner"), pod, true, &[]);
         assert!(code == 404 && body.contains("NotFound"), "{pod}: {code} {body}");
     }

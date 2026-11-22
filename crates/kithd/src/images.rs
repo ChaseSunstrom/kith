@@ -12,9 +12,9 @@
 //
 // ponytail: one layer and no base image (the volume holds the whole root); made once for a
 // spec (a new tag is a new image: nodes keep a tag they have pulled); nothing is pushed
-// with the registry protocol; an Image that is deleted leaves its Blobs to be deleted by
-// hand; an Image that waits (no Volume, its Job not done) says nothing in its status.
-// Each is left for later.
+// with the registry protocol; the Blobs of an Image that is deleted are let go of by the leader
+// ten minutes after nothing lists them (see [`released`]); an Image that waits (no Volume, its
+// Job not done) says nothing in its status. Each is left for later.
 
 use crate::Shared;
 use crate::blobs::Incoming;
@@ -27,9 +27,10 @@ use kith_api::store::Store;
 use kith_store::Command;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 /// How often a node looks for an image to make.
@@ -71,7 +72,15 @@ fn due(store: &Store, me: &str, now: u64) -> Vec<Job> {
         let of = format!("{}/{}", image.spec, ran.unwrap_or(0));
         let of = blake3::hash(of.as_bytes()).to_hex()[..16].to_string();
         let status = image.status.clone().unwrap_or_default();
-        if status["of"] == of.as_str() || status["tried"].as_u64().is_some_and(|tried| now < tried + AGAIN) {
+        // (Made once, unless a Blob of it is gone: one let go of as unlisted in the instant between
+        // a make that reused it and the status that lists it. Made again, it is put back.)
+        let whole = status["blobs"].as_object().is_none_or(|blobs| {
+            blobs
+                .values()
+                .filter_map(Value::as_str)
+                .all(|blob| store.get(&format!("Blob/{namespace}/{blob}")).is_some())
+        });
+        if status["of"] == of.as_str() && whole || status["tried"].as_u64().is_some_and(|tried| now < tried + AGAIN) {
             return None;
         }
         let old = status["blobs"].as_object().into_iter().flatten();
@@ -184,8 +193,8 @@ async fn make(shared: &Shared, state: &Path, job: &Job) -> Result<Value, String>
 
 /// Lets go of the Blobs of the image `job` was before, but for those `kept`, those kith
 /// did not make and those another Image or a Backup of the namespace has too. (When the
-/// image's bytes are a backup's identical bytes, the Blob is the backup's, made by whichever
-/// came first: it is left behind when the image lets go of it, not deleted.)
+/// image's bytes are a backup's identical bytes, the Blob is made by whichever came first: one
+/// a Backup lists is not deleted here, and once nothing lists it [`released`] lets go of it.)
 async fn forget(shared: &Shared, job: &Job, kept: &Value) {
     let keeps = |blob: &str| {
         kept["blobs"]
@@ -208,14 +217,59 @@ async fn forget(shared: &Shared, job: &Job, kept: &Value) {
     }
 }
 
+/// How long a Blob an Image made may be listed by no Image and no Backup before it is let go of.
+/// (A running `make` puts its Blobs before it writes the status that lists them. If one is let
+/// go of in that instant anyway, `due` makes the Image again: see there.)
+const UNLISTED: Duration = Duration::from_secs(600);
+
+/// The keys of the Blobs an Image made that no Image or Backup has listed for `UNLISTED`:
+/// those of an Image that was deleted. `seen` is when each was first seen unlisted (a monotonic
+/// clock: a step of the wall clock neither lets one go early nor holds it).
+fn released(store: &Store, seen: &mut BTreeMap<String, Instant>, now: Instant) -> Vec<String> {
+    let mut made = BTreeSet::new();
+    let mut out = Vec::new();
+    for blob in store
+        .list(Some("Blob"))
+        .filter(|b| crate::blobs::made_by(b, crate::blobs::IMAGE))
+    {
+        let namespace = blob.metadata.namespace.as_deref().unwrap_or("default");
+        let key = blob.key();
+        if crate::backups::listed(store, namespace, "", &blob.metadata.name) {
+            seen.remove(&key);
+        } else if now.saturating_duration_since(*seen.entry(key.clone()).or_insert(now)) >= UNLISTED {
+            out.push(key.clone());
+        }
+        made.insert(key);
+    }
+    seen.retain(|key, _| made.contains(key));
+    out
+}
+
 /// Makes the images that are due of the volumes on this node.
 pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Receiver<bool>) {
+    // When the leader first saw each Blob of an Image unlisted (kept by the leader only).
+    let mut unlisted = BTreeMap::new();
     loop {
         tokio::select! {
             _ = stopping.changed() => return,
             () = tokio::time::sleep(ROUND) => {}
         }
         let now = kith_api::store::now();
+        // One node lets go of the Blobs of deleted Images: the leader (blob gc does the files).
+        if crate::dns::leads(&shared) {
+            let gone = {
+                let state = shared.store.lock().expect("a handler panicked holding the store");
+                released(&state.store, &mut unlisted, Instant::now())
+            };
+            for key in gone {
+                match shared.submit_node(Command::Delete { key: key.clone() }).await {
+                    Ok(_) | Err(kith_api::store::Error::NotFound(_)) => {}
+                    Err(e) => eprintln!("kithd: {key} of a deleted image was not removed: {e}"),
+                }
+            }
+        } else {
+            unlisted.clear();
+        }
         let jobs = {
             let state = shared.store.lock().expect("a handler panicked holding the store");
             due(&state.store, shared.members.me(), now)
@@ -672,8 +726,99 @@ mod tests {
     fn store(resources: Value) -> Store {
         let mut store = Store::default();
         let resources: Vec<Resource> = serde_json::from_value(resources).unwrap();
+        // (An apply drops the status: it is written apart, as the controllers do.)
+        let statuses: Vec<_> = resources.iter().map(|r| (r.key(), r.status.clone())).collect();
         store.apply_all(resources).unwrap();
+        for (key, status) in statuses.into_iter().filter(|(_, status)| status.is_some()) {
+            store.set_status(&key, status).unwrap();
+        }
         store
+    }
+
+    fn blob(name: &str, by: &str) -> Value {
+        json!({ "apiVersion": "kith.dev/v1", "kind": "Blob",
+            "metadata": { "name": name, "namespace": "team", "annotations": { crate::blobs::MADE_BY: by } },
+            "spec": { "size": 1 } })
+    }
+
+    fn lister(kind: &str, name: &str, status: Value) -> Value {
+        json!({ "apiVersion": "kith.dev/v1", "kind": kind,
+            "metadata": { "name": name, "namespace": "team" }, "spec": if kind == "Image" { json!({ "volume": "v" }) } else { json!({ "volume": "v", "every": "1h" }) },
+            "status": status })
+    }
+
+    /// An Image's Blobs are let go of ten minutes after nothing lists them (it was deleted), and
+    /// no sooner; a Blob another Image or a Backup lists, one a Backup made and one put by hand stay.
+    #[test]
+    fn images_released() {
+        let all = |image: bool| {
+            let mut all = vec![
+                blob("gone", "image"),
+                blob("shared", "image"),
+                blob("backups", "backup"),
+                blob("byhand", "other"),
+                blob("backed", "image"),
+                lister("Image", "other", json!({ "blobs": { "s": "shared" } })),
+                lister("Backup", "daily", json!({ "backups": [{ "blob": "backed" }] })),
+            ];
+            if image {
+                all.push(lister("Image", "app", json!({ "blobs": { "g": "gone" } })));
+            }
+            store(Value::Array(all))
+        };
+        let mut seen = BTreeMap::new();
+        let t = Instant::now();
+        let after = |secs: u64| t + Duration::from_secs(secs);
+        // (The Image is there: its Blob is listed, and nothing is let go of however long.)
+        assert!(released(&all(true), &mut seen, t).is_empty());
+        assert!(released(&all(true), &mut seen, after(100_000)).is_empty());
+        // (Deleted: the clock starts when it is first seen unlisted.)
+        let gone = all(false);
+        assert!(released(&gone, &mut seen, after(100_000)).is_empty());
+        assert!(released(&gone, &mut seen, after(100_000) + UNLISTED - Duration::from_secs(1)).is_empty());
+        assert_eq!(
+            released(&gone, &mut seen, after(100_000) + UNLISTED),
+            ["Blob/team/gone"]
+        );
+        // (Once it is gone from the store, nothing is remembered of it.)
+        let none = store(Value::Array(vec![
+            blob("shared", "image"),
+            lister("Image", "other", json!({ "blobs": { "s": "shared" } })),
+        ]));
+        assert!(released(&none, &mut seen, after(200_000)).is_empty());
+        assert!(seen.is_empty());
+    }
+
+    /// Listed again, a Blob's wait starts over: unlisted for 599 s, listed once, then unlisted
+    /// again is not yet ten minutes. A Blob is judged by the listers of its own namespace.
+    #[test]
+    fn images_released_wait_starts_over_when_listed_and_is_by_namespace() {
+        let listed = || {
+            store(json!([
+                blob("x", "image"),
+                lister("Image", "app", json!({ "blobs": { "x": "x" } }))
+            ]))
+        };
+        let unlisted = || store(json!([blob("x", "image")]));
+        let (mut seen, t) = (BTreeMap::new(), Instant::now());
+        let after = |secs: u64| t + Duration::from_secs(secs);
+        assert!(released(&unlisted(), &mut seen, t).is_empty());
+        assert!(released(&unlisted(), &mut seen, after(599)).is_empty());
+        assert!(released(&listed(), &mut seen, after(600)).is_empty());
+        assert!(released(&unlisted(), &mut seen, after(601)).is_empty());
+        assert!(
+            released(&unlisted(), &mut seen, after(1200)).is_empty(),
+            "599 s since it was unlisted again"
+        );
+        assert_eq!(released(&unlisted(), &mut seen, after(1201)), ["Blob/team/x"]);
+        // (The same name in another namespace: the lister of `team` does not keep `other`'s Blob.)
+        let mut other = blob("x", "image");
+        other["metadata"]["namespace"] = "other".into();
+        let lister = lister("Image", "app", json!({ "blobs": { "x": "x" } }));
+        let both = store(json!([blob("x", "image"), other, lister]));
+        let mut seen = BTreeMap::new();
+        assert!(released(&both, &mut seen, t).is_empty());
+        assert_eq!(released(&both, &mut seen, after(600)), ["Blob/other/x"]);
     }
 
     fn sha_of(path: &Path) -> String {
@@ -1507,7 +1652,12 @@ mod tests {
         changed.apply(job).unwrap();
         assert!(due(&changed, "n1", 100).is_empty());
         let of = jobs[0].of.clone();
-        let done = cluster(json!({ "of": of, "blobs": { "aa": "b1" } }), "succeeded");
+        let mut done = cluster(json!({ "of": of, "blobs": { "aa": "b1" } }), "succeeded");
+        // (A Blob that is missing, let go of as unlisted while the status was being written, is made again.)
+        assert_eq!(due(&done, "n1", 100).len(), 1, "a Blob of it is gone");
+        let kept =
+            json!({ "apiVersion": "kith.dev/v1", "kind": "Blob", "metadata": { "name": "b1" }, "spec": { "size": 1 } });
+        done.apply(serde_json::from_value(kept).unwrap()).unwrap();
         assert!(due(&done, "n1", 100).is_empty(), "made once");
         let stale = cluster(json!({ "of": "another spec", "blobs": { "aa": "b1" } }), "succeeded");
         assert_eq!(due(&stale, "n1", 100)[0].old, ["b1"]);

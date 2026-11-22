@@ -157,6 +157,10 @@ pub enum Request {
     /// The unpacked image `image` (a digest) removed, if it was last used no later than `before`
     /// (seconds since the epoch), no pull holds the store and no container's bundle names it.
     Drop { image: String, before: u64 },
+    /// The packages of the image `reference` names, if it is unpacked on this node (nothing is
+    /// pulled), as its own package list says: the root part opens that one file, from the
+    /// image's root, and answers what [`crate::scan::read`] makes of it.
+    Packages { reference: String },
     /// The unit `id` (one this part made) killed.
     Kill { id: String },
     /// The unit `id` killed if it runs, and its cgroup, state and bundle removed.
@@ -231,6 +235,8 @@ pub enum Reply {
     Usage(Option<(u64, u64, u64)>),
     /// The bytes an image's removal freed, or `None` when it stayed.
     Freed(Option<u64>),
+    /// An image's packages (`Packages`).
+    Packages(crate::scan::Found),
     Socket(OwnedFd),
     Sockets(Vec<OwnedFd>),
     Pod(Given),
@@ -333,6 +339,12 @@ pub fn check(request: &Request) -> Result<(), String> {
         | Request::MeshKey { .. } => Ok(()),
         // (Digests, and nothing else, become the names of files.)
         Request::Unpack { image, .. } | Request::Drop { image, .. } => digest(image),
+        // (A reference is looked up in the store's notes by its escaped form, which is one name
+        // whatever it holds: only its size and its characters are checked here.)
+        Request::Packages { reference } => match reference.len() <= 255 && !reference.chars().any(char::is_control) {
+            true => Ok(()),
+            false => Err("an image reference: at most 255 characters, none of them a control character".into()),
+        },
         // (Against the units made here and the claims: [`Book::known`].)
         Request::Kill { id } | Request::Delete { id } => label("unit id", id),
         Request::Usage { pod } => label("pod id", pod),
@@ -704,7 +716,7 @@ pub struct Book {
     mesh: Mutex<Option<MeshTold>>,
     /// Held by a mesh request from its check to its end: one at a time.
     meshing: Mutex<()>,
-    crossed: [AtomicUsize; 20],
+    crossed: [AtomicUsize; 21],
 }
 
 /// What a request is, for counting.
@@ -723,6 +735,8 @@ pub enum Kind {
     Unpack,
     /// An image removed (`Drop`): the pruning job's.
     Drop,
+    /// An image's package list read (`Packages`): a scan's.
+    Packages,
     /// A unit killed, deleted or tuned, a device plugged or unplugged, a pod's usage read: none
     /// of them is in a container's start, and a unit's stop is one `Delete`.
     Kill,
@@ -750,7 +764,7 @@ impl Book {
             units: Mutex::new(BTreeSet::new()),
             mesh: Mutex::new(None),
             meshing: Mutex::new(()),
-            crossed: [const { AtomicUsize::new(0) }; 20],
+            crossed: [const { AtomicUsize::new(0) }; 21],
         }
     }
 
@@ -1584,6 +1598,13 @@ impl<H: Hands> Direct<'_, H> {
                     .map(Reply::Freed)
                     .map_err(|e| e.to_string())
             }
+            Request::Packages { reference } => {
+                let image = store.here(&reference).ok_or_else(|| {
+                    format!("{reference} is not on this node (nothing is pulled for a scan: pull it first)")
+                })?;
+                // (The rootfs is the store's own path, derived from the image's digest.)
+                crate::scan::read(&image.rootfs).map(Reply::Packages)
+            }
             _ => Err("not a request of the images".into()),
         }
     }
@@ -1640,6 +1661,7 @@ impl<H: Hands> Direct<'_, H> {
             Request::MeshSeen { .. } => Kind::Seen,
             Request::Unpack { .. } => Kind::Unpack,
             Request::Drop { .. } => Kind::Drop,
+            Request::Packages { .. } => Kind::Packages,
             Request::Kill { .. } => Kind::Kill,
             Request::Delete { .. } => Kind::Delete,
             Request::Tune { .. } => Kind::Tune,
@@ -1676,7 +1698,9 @@ impl<H: Hands> Direct<'_, H> {
                 let state = self.book.state().ok_or("this root part has no state directory")?;
                 Ok(Reply::Usage(crate::controller::storage::Projects::usage(&state, pod)))
             }
-            images @ (Request::Unpack { .. } | Request::Drop { .. }) => self.images_request(images, files),
+            images @ (Request::Unpack { .. } | Request::Drop { .. } | Request::Packages { .. }) => {
+                self.images_request(images, files)
+            }
             volumes @ (Request::Volume { .. }
             | Request::Open { .. }
             | Request::Restore { .. }
@@ -1769,6 +1793,16 @@ pub fn drop_image(image: &str, before: std::time::SystemTime) -> Result<Option<u
     })? {
         Reply::Freed(freed) => Ok(freed),
         _ => Err("the root part answered a drop with another reply".into()),
+    }
+}
+
+/// The packages of the image `reference` (as a pull was asked it), if this node has it unpacked.
+pub fn packages_of(reference: &str) -> Result<crate::scan::Found, String> {
+    match Direct::new().request(Request::Packages {
+        reference: reference.into(),
+    })? {
+        Reply::Packages(found) => Ok(found),
+        _ => Err("the root part answered a package list with another reply".into()),
     }
 }
 
@@ -2297,6 +2331,68 @@ mod tests {
             no_node_root: false,
             ..Unit::default()
         }
+    }
+
+    /// A Unit as the serving part reads it off the --split socket: every field set to something
+    /// other than its default, so a field renamed, dropped, retyped or added without a line here
+    /// changes what the root part reads and fails the pin. (`Mount::held` is not serialized: it
+    /// crosses as a descriptor.)
+    fn full_unit_json() -> serde_json::Value {
+        serde_json::json!({
+            "command": ["/bin/app"],
+            "args": ["--serve"],
+            "env": [["K", "V"]],
+            "working_dir": "/srv",
+            "memory_bytes": 1048576,
+            "cpu_millis": 500,
+            "devices": ["/dev/dri/card0"],
+            "dmem": [["drm/0000:03:00.0/vram", 4096]],
+            "mounts": [{
+                "host": "/h", "container": "/c", "read_only": true, "give": true, "part": "data"
+            }],
+            "user": 1000,
+            "non_root": true,
+            "no_node_root": true,
+            "drop": ["NET_RAW"],
+            "unconfined": true,
+            "allow": ["mount"],
+            "nested": true,
+            "as_image": true,
+            "writable": true,
+            "netns": "/run/netns/p",
+            "hostname": "web",
+            "host_users": true,
+            "project": 7,
+            "namespace": "team-a",
+        })
+    }
+
+    #[test]
+    fn a_units_wire_form_is_pinned() {
+        let want = full_unit_json();
+        // Every field is read under the name the literal gives (`namespace` has a default, so
+        // a rename there shows as an empty one)...
+        let unit: Unit = serde_json::from_value(want.clone()).unwrap();
+        assert_eq!(unit.namespace, "team-a");
+        assert_eq!(unit.mounts[0].part.as_deref(), Some("data"));
+        // ... and what is written is exactly the literal: no field more or less, none renamed,
+        // and what the serving part writes reads back as the same unit.
+        let sent = serde_json::to_vec(&unit).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&sent).unwrap(), want);
+        let back: Unit = serde_json::from_slice(&sent).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), want);
+    }
+
+    #[test]
+    fn a_unit_from_before_a_field_still_reads() {
+        // Only `namespace` has been added with a default: a unit with every older field and no
+        // namespace reads, as one with none named.
+        let mut old = full_unit_json();
+        old.as_object_mut().unwrap().remove("namespace");
+        let unit: Unit = serde_json::from_value(old).unwrap();
+        assert_eq!(unit.namespace, "");
+        assert_eq!(unit.command, ["/bin/app"]);
+        assert_eq!(unit.project, Some(7));
     }
 
     /// A unit's namespace keys the give pool's shares: refused unless a name of the form every
@@ -3931,6 +4027,57 @@ mod tests {
         };
         assert!(root.request(drop).unwrap_err().contains("not the node's own"));
         assert!(!other.join("runtime/images").join(&image["sha256:".len()..]).exists());
+    }
+
+    #[test]
+    fn a_packages_request_reads_the_image_the_store_has_for_the_reference_and_pulls_nothing() {
+        let (book, state, store) = imaged("packages");
+        let root = Direct::with(Nobody, &book);
+        let ask = |reference: &str| Request::Packages {
+            reference: reference.into(),
+        };
+        // An image that is not here: said so, and nothing is made.
+        let why = root.request(ask("busybox:latest")).unwrap_err();
+        assert!(
+            why.contains("is not on this node") && why.contains("nothing is pulled"),
+            "{why}"
+        );
+        assert!(nothing_in(&store));
+        // One that is (its note, its config and its unpacked files): its source packages.
+        let hex = "a".repeat(64);
+        let rootfs = store.root().join("images").join(&hex).join("rootfs");
+        for (path, text) in [
+            ("etc/os-release", "ID=debian\nVERSION_ID=\"12\"\n"),
+            (
+                "var/lib/dpkg/status",
+                "Package: libssl3\nStatus: install ok installed\nSource: openssl\nVersion: 3.0.11-1\n",
+            ),
+        ] {
+            std::fs::create_dir_all(rootfs.join(path).parent().unwrap()).unwrap();
+            std::fs::write(rootfs.join(path), text).unwrap();
+        }
+        std::fs::write(store.root().join("images").join(&hex).join("config.json"), "{}").unwrap();
+        let note = serde_json::json!({
+            "digest": format!("sha256:{hex}"), "entrypoint": [], "cmd": [], "env": [], "user": "",
+        });
+        std::fs::write(
+            store.root().join("refs/docker.io%2flibrary%2fbusybox:latest"),
+            note.to_string(),
+        )
+        .unwrap();
+        let Reply::Packages(found) = root.request(ask("busybox:latest")).unwrap() else {
+            panic!("not a package list");
+        };
+        assert_eq!(found.ecosystem, "Debian:12");
+        assert_eq!(found.packages.len(), 1);
+        assert_eq!(found.packages[0].name, "openssl");
+        // A reference that is no reference, or too long, is refused before the store is looked in;
+        // and the call crossed each time, a read of the store with no file passed.
+        assert!(check(&ask(&"a".repeat(256))).is_err());
+        assert!(check(&ask("a\nb")).is_err());
+        assert!(root.request(ask("../../etc/passwd")).is_err());
+        assert_eq!(book.crossed(Kind::Packages), 3);
+        let _ = state;
     }
 
     #[test]

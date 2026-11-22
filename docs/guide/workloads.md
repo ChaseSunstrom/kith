@@ -82,6 +82,25 @@ no other image has.
 - **After removal** the image is pulled again when a unit needs it (`pullPolicy: never` fails).
   A node off its network (a laptop) wants `--image-grace 0`, which keeps every image.
 
+#### Is an image known to be vulnerable
+
+`kith image scan IMAGE --node NODE` checks the packages of an image that NODE has against
+[OSV](https://osv.dev), when you ask and not otherwise: it prints each package OSV has advisories
+for, its version and their ids, each with its osv.dev link. kithd reads the package list of the
+image as unpacked on the node (Debian, Ubuntu and Alpine: dpkg's `var/lib/dpkg/status`, apk's
+`lib/apk/db/installed`; the release from `etc/os-release`), and sends OSV (`api.osv.dev`, by https,
+from the node) the release's ecosystem (`Debian:12`, `Alpine:v3.19`) and the name and version of each
+package, and nothing else: not the image's name or registry, not the node's or the cluster's.
+OSV, and whoever can see that traffic, learns which packages and versions the node holds.
+
+- **Nothing is pulled.** An image the node does not have is said not to be there (`kith launch`
+  or a unit's start pulls it). Nothing is kept: no result is stored, and a scan runs at no pull.
+- **What it does not say.** Only the ids: no severity and no fixed version (the id's link has
+  them). It reads no RPM and no language package (a Python wheel, an npm module), and an image
+  of another distribution, or with no package list (a scratch or distroless image), is said so.
+- **Who may.** Whoever may get the Node (`Node/NODE`): the request is passed on to NODE as a
+  unit's logs are, for the caller.
+
 #### An image from a Nix closure
 
 A node has no Nix, and needs none: build the image elsewhere with one layer for each store
@@ -543,7 +562,10 @@ kith machine rm dev              # its Jobs and the Workload; the home Volume st
   command's exit code is kith's. With a pipe on either end it runs on pipes, with the standard
   error apart. It is the same call as `kubectl exec -it`, so `--server` reaches a node as every
   other kith command does, and the right it asks is `exec` on the machine's Workload.
-- **`--root`** is root of the machine's own user namespace and nothing more: it is refused, with
+- **`--root`** needs `apply` on the machine's Workload as well as `exec`: a caller with `exec` alone is
+  refused with a 403 (audited); the same caller without `--root` gets a plain shell. Every route that takes it asks the same,
+  the Kubernetes exec route and the node that runs the machine (where `/v1/pod-hop` arrives) alike.
+  It is root of the machine's own user namespace and nothing more: it is refused, with
   the reason, where uid 0 there would be the node's root or the user kithd runs as (a container
   with no user namespace of its own, or a rootless kithd's). `--root` needs a machine with a user
   namespace of its own (`userNamespaces: true`), and `kith machine create` does not make one

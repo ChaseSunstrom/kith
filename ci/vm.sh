@@ -98,7 +98,8 @@ usage: sh ci/vm.sh [--kernel FILE] [--initrd FILE] [--disk IMAGE] [--append ARGS
 Boots a kernel in QEMU (KVM), prints the serial console, and exits 0 once the guest
 has said something of kithd's (a line containing "kithd"), 1 if it did not.
 
-  --kernel FILE    any kernel image (default: the host's /boot/vmlinuz-*)
+  --kernel FILE    any kernel image (default: the host's /boot/vmlinuz-*; with none readable
+                   there, the image's own, built here, only if KITH_VM_BUILD_KERNEL=1)
   --initrd FILE    any initramfs, plain or compressed cpio
                    (default: one made here, whose /init is the static kithd)
   --disk IMAGE     any raw disk image, attached as a virtio disk (/dev/vda); the VM
@@ -667,12 +668,14 @@ if [ -z "$kernel" ]; then
     for k in "/boot/vmlinuz-$(uname -r)" "/lib/modules/$(uname -r)/vmlinuz" /boot/vmlinuz-* /boot/vmlinuz; do
         [ -r "$k" ] && { kernel=$k; break; }
     done
-    # (A machine with no kernel of its own, as a cluster Job's is, starts the image's: built here if need be.)
-    if [ -z "$kernel" ]; then
+    # (A machine with no kernel of its own, as a cluster Job's is, starts the image's: built here if need be, but only
+    # where the Job says so with KITH_VM_BUILD_KERNEL=1; a plain run would compile a kernel for minutes.)
+    if [ -z "$kernel" ] && [ -n "${KITH_VM_BUILD_KERNEL:-}" ]; then
         [ -r "$root/target/os/vmlinuz" ] || sh "$root/os/build.sh" --out "$root/target/os" >&2 || { [ $? -ne 3 ] || skip "no readable kernel in /boot (pass --kernel), and this machine cannot build the image's"; exit 1; }
         kernel=$root/target/os/vmlinuz
     fi
 fi
+[ -n "$kernel" ] || skip "no readable kernel in /boot (pass --kernel, or set KITH_VM_BUILD_KERNEL=1 to build the image's)"
 [ -r "$kernel" ] || skip "kernel $kernel is not readable"
 
 if [ -z "$initrd" ]; then
