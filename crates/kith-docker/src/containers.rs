@@ -1787,10 +1787,25 @@ mod tests {
 
     /// A stream call as `docker` makes it: what the server wrote until it let go of the connection.
     fn streamed(c: &Containers, method: &str, target: &str, body: &str, sent: &[u8]) -> (Result<(), Reply>, Vec<u8>) {
+        streamed_with(c, method, target, body, sent, false)
+    }
+
+    /// `streamed`; with `half_close` the client shuts its sending side at once and goes on reading (as `docker exec` without `-i` does).
+    fn streamed_with(
+        c: &Containers,
+        method: &str,
+        target: &str,
+        body: &str,
+        sent: &[u8],
+        half_close: bool,
+    ) -> (Result<(), Reply>, Vec<u8>) {
         use std::io::Write as _;
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(sent).unwrap();
+        if half_close {
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+        }
         let mut got = Vec::new();
         let result = std::thread::scope(|scope| {
             let call = scope.spawn(move || {
@@ -2015,6 +2030,35 @@ mod tests {
         // Started once.
         let (again, _) = streamed(&rig.c, "POST", &format!("/exec/{id}/start"), "{}", b"");
         assert_eq!(again.unwrap_err().status, 409);
+    }
+
+    #[test]
+    fn an_exec_without_stdin_keeps_running_when_the_client_half_closes_at_once() {
+        let (events, ev_in) = mpsc::channel();
+        let (input, sent) = mpsc::channel();
+        let rig = live(Some(Session { events: ev_in, input }));
+        running(&rig, "web", RUNNING);
+        let (_, reply) = call(
+            &rig.c,
+            "POST",
+            "/containers/web/exec",
+            r#"{"Cmd":["sh","-c","sleep 1; echo hi"],"AttachStdout":true}"#,
+        );
+        let id = reply["Id"].as_str().unwrap().to_string();
+        let feed = std::thread::spawn(move || {
+            // The command is still running: its end of input must not have been closed.
+            std::thread::sleep(Duration::from_millis(400));
+            let closed = sent.try_iter().any(|i| matches!(i, Input::Close));
+            events.send(Event::Out(b"hi\n".to_vec())).unwrap();
+            events.send(Event::Done(0)).unwrap();
+            closed
+        });
+        let (result, raw) = streamed_with(&rig.c, "POST", &format!("/exec/{id}/start"), "{}", b"", true);
+        assert!(!feed.join().unwrap(), "a half-close is not a hang-up: the command is not killed");
+        result.unwrap();
+        assert_eq!(unframe(after_head(&raw)), [(1, "hi\n".to_string())]);
+        let (_, after) = call(&rig.c, "GET", &format!("/exec/{id}/json"), "");
+        assert_eq!(after["ExitCode"], json!(0));
     }
 
     #[test]

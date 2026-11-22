@@ -422,14 +422,17 @@ impl Containers {
             reader.get_mut().until = Instant::now() + super::super::NEVER;
             std::thread::scope(|scope| {
                 // What the client sends is the command's input. Its end is the end of the command's
-                // input (a client half-closes and goes on reading); with no stdin wanted, the end of
-                // the connection is the client gone, and so is an error.
+                // input (a client half-closes and goes on reading); with no stdin wanted, the end is
+                // no hang-up either (`docker exec` without -i half-closes at once): the command ends
+                // on its own, or when a write to the gone client fails, or on a read error.
                 scope.spawn(|| {
                     let mut buf = [0u8; 8192];
                     loop {
                         match reader.read(&mut buf) {
                             Ok(0) => {
-                                let _ = input.send(if stdin { Input::End } else { Input::Close });
+                                if stdin {
+                                    let _ = input.send(Input::End);
+                                }
                                 break;
                             }
                             Ok(n) if stdin => {
