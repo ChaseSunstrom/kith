@@ -3510,6 +3510,22 @@
       "description": "An amount of CPU, memory or storage: `2`, `500m`, `2Gi`, `1.5G`.",
       "pattern": "^[0-9]+(\\.[0-9]+)?(m|k|M|G|T|Ki|Mi|Gi|Ti)?$"
     },
+    "RegistryCredentials": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "namespace": {
+          "type": "string"
+        },
+        "secret": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "namespace",
+        "secret"
+      ]
+    },
     "Relay": {
       "type": "string",
       "enum": [
@@ -3578,6 +3594,17 @@
             "null"
           ],
           "description": "Key the repository's packages must be signed with."
+        },
+        "credentials": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegistryCredentials"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Secret whose `username` and `password` the registry is asked with (Basic, or\nto its token service). Read as whoever applied the Repository may read it."
         }
       },
       "required": [

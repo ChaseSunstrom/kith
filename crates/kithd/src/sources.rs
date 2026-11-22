@@ -746,7 +746,7 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
             let makes = |resource: &Resource| {
                 matches!(
                     resource.kind.as_str(),
-                    "Release" | "Source" | "KindDefinition" | "Package"
+                    "Release" | "Source" | "KindDefinition" | "Package" | "Repository"
                 )
             };
             if resources.iter().any(makes) {

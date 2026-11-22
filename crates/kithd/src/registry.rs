@@ -2,8 +2,9 @@
 //! as the repository `PATH/NAME`, each version an artifact tagged with it. The artifact
 //! is what [`kith_packages::artifact`] says: one blob, the signature an annotation.
 //
-// ponytail: no credentials (public registries, or ones that trust the network they are
-// on); plain HTTP only to this machine. Logins when a private registry is first wanted.
+// ponytail: a login only from a Repository's Secret (read as its writer may read it), sent
+// as Basic to the registry or to its token realm, never to a Source's registry or a push;
+// plain HTTP only to this machine.
 // A registry is one an admin named, but not trusted to drown us or to send us inward:
 // the blob is capped (and pulled by oci-client), the manifest, the list of tags and the
 // token's answer are our own capped requests, a token is asked for only at the registry's
@@ -102,8 +103,21 @@ fn place(url: &str, name: &str, version: &str, outward: bool) -> Fallible<(Clien
         scheme,
         outward,
         token: Default::default(),
+        login: None,
     };
     Ok((Client::new(config), reference, web))
+}
+
+/// A user name and a password.
+pub type Login = (String, String);
+
+/// `Authorization: Basic …` for `login`.
+fn basic(login: &Login) -> String {
+    use base64::Engine;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", login.0, login.1))
+    )
 }
 
 /// The client for what [`capped`] asks, and the scheme the registry is reached by.
@@ -112,8 +126,12 @@ struct Web {
     scheme: &'static str,
     /// See the module's note.
     outward: bool,
-    /// The token the registry wanted, once one was fetched.
+    /// What the registry wanted to be sent (an `Authorization` header's value), once it was
+    /// known: a Bearer token fetched, or Basic.
     token: std::sync::Mutex<Option<String>>,
+    /// What a Repository's Secret says to ask with, to the registry's token service or, where
+    /// it challenges Basic, the registry. None: Anonymous.
+    login: Option<Login>,
 }
 
 /// A client that connects only where `url`'s host was just seen to be: outside this node
@@ -136,10 +154,11 @@ async fn held(url: &reqwest::Url) -> Fallible<reqwest::Client> {
 }
 
 /// GET `url` as `web` does: with its client, or, `outward`, hop by hop through [`held`]
-/// ones (five at most, never from https to less, the token only to the first host).
+/// ones (five at most, never from https to less, the `token`, an `Authorization` header's
+/// value (a Bearer or a Basic one), only to the first host).
 async fn get(web: &Web, url: &str, accept: &str, token: Option<&str>) -> Fallible<reqwest::Response> {
     let authorized = |request: reqwest::RequestBuilder, token: Option<&str>| match token {
-        Some(token) => request.header("accept", accept).bearer_auth(token),
+        Some(token) => request.header("accept", accept).header("authorization", token),
         None => request.header("accept", accept),
     };
     if !web.outward {
@@ -168,28 +187,37 @@ async fn get(web: &Web, url: &str, accept: &str, token: Option<&str>) -> Fallibl
     Err("more than five redirects".into())
 }
 
-/// `path` of the repository `reference` is in (`manifests/TAG`, `tags/list?n=1000`), as
-/// what the registry answers with, at most `limit` bytes of it. A token is fetched when
-/// the registry asks for one, only from the registry's own host (and handed to `oci`, as
-/// the blob is pulled by it).
+/// Where `path` of the repository `reference` is in (`manifests/TAG`, `tags/list?n=1000`).
+fn at(web: &Web, reference: &Reference, path: &str) -> String {
+    format!(
+        "{}://{}/v2/{}/{path}",
+        web.scheme,
+        reference.resolve_registry(),
+        reference.repository()
+    )
+}
+
+/// What the registry answers `url` with (see [`at`]), at most `limit` bytes of it, and the
+/// next page it names in a `Link` header, if it does: only on the registry's own scheme,
+/// host, port and path (the same list), else an error. A token is fetched when the registry asks for one, only
+/// from the registry's own host (and handed to `oci`, as the blob is pulled by it); one
+/// that was is used again.
 async fn capped(
     oci: &Client,
     web: &Web,
     reference: &Reference,
-    path: &str,
+    url: &str,
     accept: &str,
     limit: usize,
-) -> Fallible<Vec<u8>> {
+) -> Fallible<(Vec<u8>, Option<String>)> {
     let what = |e: &dyn std::fmt::Display| format!("{reference}: {e}");
-    let registry = reference.resolve_registry();
-    let url = format!("{}://{registry}/v2/{}/{path}", web.scheme, reference.repository());
-    let mut token: Option<String> = None;
+    let mut token = web.token.lock().expect("nothing panics holding it").clone();
     loop {
-        let reply = get(web, &url, accept, token.as_deref()).await.map_err(|e| what(&e))?;
+        let reply = get(web, url, accept, token.as_deref()).await.map_err(|e| what(&e))?;
         if reply.status() == 401 && token.is_none() {
             let challenge = reply.headers().get("www-authenticate").and_then(|h| h.to_str().ok());
             token = Some(
-                bearer(oci, web, reference, challenge.unwrap_or_default())
+                answer(oci, web, reference, challenge.unwrap_or_default())
                     .await
                     .map_err(|e| what(&e))?,
             );
@@ -198,8 +226,53 @@ async fn capped(
         if !reply.status().is_success() {
             return Err(what(&format!("{}: {}", reply.url(), reply.status())));
         }
-        return read(reply, limit).await.map_err(|e| what(&format!("{path}: {e}")));
+        let next = reply.headers().get("link").and_then(|link| link.to_str().ok());
+        let next = next.and_then(next_link).map(|next| {
+            let own = reqwest::Url::parse(url).map_err(|e| what(&e))?;
+            let next = own.join(next).map_err(|e| what(&format!("link {next}: {e}")))?;
+            let key = |url: &reqwest::Url| {
+                (
+                    url.scheme().to_string(),
+                    url.host_str().map(str::to_string),
+                    url.port_or_known_default(),
+                    url.path().to_string(),
+                )
+            };
+            match key(&next) == key(&own) {
+                true => Ok(next.to_string()),
+                false => Err(what(&format!("link {next} is not the registry's own ({own})"))),
+            }
+        });
+        let next = next.transpose()?;
+        let body = read(reply, limit).await.map_err(|e| what(&format!("{url}: {e}")))?;
+        return Ok((body, next));
     }
+}
+
+/// The target of the `rel="next"` link in a `Link` header's value.
+fn next_link(link: &str) -> Option<&str> {
+    let part = link.split(',').find(|part| {
+        let part = part.replace(' ', "").to_lowercase();
+        part.contains("rel=\"next\"") || part.contains("rel=next")
+    })?;
+    Some(part.split_once('<')?.1.split_once('>')?.0)
+}
+
+/// What to send a registry that answered 401 with `challenge` (its `WWW-Authenticate`): a
+/// token from the service it names, which a login is sent to as Basic, or, where the
+/// registry itself asks for Basic and there is a login, that. Kept in `web` for what follows.
+async fn answer(oci: &Client, web: &Web, reference: &Reference, challenge: &str) -> Fallible<String> {
+    let basically = challenge
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("Basic"));
+    let Some(login) = web.login.as_ref().filter(|_| basically) else {
+        return bearer(oci, web, reference, challenge).await;
+    };
+    // (Never through oci-client's `auth`: it probes `/v2/` unvetted and sends the login to the
+    // realm that names. The blob is then fetched by `pull_as` itself, see there.)
+    let header = basic(login);
+    *web.token.lock().expect("nothing panics holding it") = Some(header.clone());
+    Ok(header)
 }
 
 /// What `reply` says, at most `limit` bytes of it (kith-runtime reads the same way for its own).
@@ -207,8 +280,9 @@ async fn read(reply: reqwest::Response, limit: usize) -> Fallible<Vec<u8>> {
     kith_runtime::read_capped(reply, limit).await.map_err(|e| e.to_string())
 }
 
-/// A token for pulling `reference`, from the realm a `challenge` (the registry's
-/// `WWW-Authenticate`) names, if that is the registry's own: same scheme, host and port.
+/// A token for pulling `reference` (as the `Authorization` value `Bearer …`), from the realm
+/// a `challenge` (the registry's `WWW-Authenticate`) names, if that is the registry's own
+/// (same scheme, host and port) or one that is https and outside this node's networks.
 async fn bearer(oci: &Client, web: &Web, reference: &Reference, challenge: &str) -> Fallible<String> {
     let param = |key: &str| {
         let rest = challenge.split(&format!("{key}=\"")).nth(1)?;
@@ -245,12 +319,20 @@ async fn bearer(oci: &Client, web: &Web, reference: &Reference, challenge: &str)
             query.append_pair("service", &service);
         }
     }
+    // (A login goes to the token service as Basic, as a container tool's does: where the
+    // registry points, which is no more than its own word for whom to trust with it.)
+    let login = web.login.as_ref().map(basic);
     let reply = match elsewhere {
         true => {
             let client = held(&realm).await.map_err(|e| format!("token realm {realm}: {e}"))?;
-            client.get(realm).send().await.map_err(|e| e.to_string())?
+            let asked = client.get(realm);
+            let asked = match &login {
+                Some(login) => asked.header("authorization", login),
+                None => asked,
+            };
+            asked.send().await.map_err(|e| e.to_string())?
         }
-        false => get(web, realm.as_str(), "application/json", None).await?,
+        false => get(web, realm.as_str(), "application/json", login.as_deref()).await?,
     };
     if !reply.status().is_success() {
         return Err(format!("token: {}", reply.status()));
@@ -269,8 +351,9 @@ async fn bearer(oci: &Client, web: &Web, reference: &Reference, challenge: &str)
     )
     .await
     .map_err(|e| e.to_string())?;
-    *web.token.lock().expect("nothing panics holding it") = Some(token.to_string());
-    Ok(token.to_string())
+    let header = format!("Bearer {token}");
+    *web.token.lock().expect("nothing panics holding it") = Some(header.clone());
+    Ok(header)
 }
 
 async fn patiently<T>(what: &Reference, asked: impl Future<Output = oci_client::errors::Result<T>>) -> Fallible<T> {
@@ -364,9 +447,21 @@ pub async fn push(
 ///
 /// `outward`: see the module's note.
 pub async fn pull(url: &str, name: &str, version: &str, outward: bool) -> Fallible<(Vec<u8>, Option<String>)> {
-    let (client, reference, web) = place(url, name, version, outward)?;
-    let tag = format!("manifests/{version}");
-    let manifest = capped(&client, &web, &reference, &tag, MANIFEST_TYPE, MANIFEST_LIMIT).await?;
+    pull_as(url, name, version, outward, None).await
+}
+
+/// [`pull`], asking as `login` where the registry wants one (Anonymous when none).
+pub async fn pull_as(
+    url: &str,
+    name: &str,
+    version: &str,
+    outward: bool,
+    login: Option<&Login>,
+) -> Fallible<(Vec<u8>, Option<String>)> {
+    let (client, reference, mut web) = place(url, name, version, outward)?;
+    web.login = login.cloned();
+    let tag = at(&web, &reference, &format!("manifests/{version}"));
+    let (manifest, _) = capped(&client, &web, &reference, &tag, MANIFEST_TYPE, MANIFEST_LIMIT).await?;
     let manifest: OciImageManifest = serde_json::from_slice(&manifest).map_err(|e| format!("{reference}: {e}"))?;
     let [layer] = manifest.layers.as_slice() else {
         return Err(format!("{reference}: not a kith package (not one layer)"));
@@ -379,8 +474,16 @@ pub async fn pull(url: &str, name: &str, version: &str, outward: bool) -> Fallib
     // (Room for what the manifest says and no more: a registry that sends more fails.)
     let size = usize::try_from(layer.size).unwrap_or_default();
     let mut blob = vec![0; size];
-    if web.outward {
-        // (Not by oci-client, which goes wherever a name or a redirect leads.)
+    let basically = web
+        .token
+        .lock()
+        .expect("nothing panics holding it")
+        .as_deref()
+        .is_some_and(|token| token.starts_with("Basic "));
+    // ponytail: a Basic login stays on the registry's own origin, so a registry that
+    // redirects its blobs to a CDN fails with one; follow it there only if that is asked for.
+    if web.outward || basically {
+        // (Not by oci-client, which goes wherever a name or a redirect leads, with the login.)
         let at = format!(
             "{}://{}/v2/{}/blobs/{}",
             web.scheme,
@@ -412,23 +515,38 @@ pub async fn pull(url: &str, name: &str, version: &str, outward: bool) -> Fallib
     Ok((blob, signature))
 }
 
-/// The versions of `name` in the repository `url`.
-pub async fn versions(url: &str, name: &str) -> Fallible<Vec<String>> {
-    let (client, reference, web) = place(url, name, "latest", false)?;
-    // ponytail: the first 1000 tags; a package with more versions gets pages.
-    let listed = capped(
-        &client,
-        &web,
-        &reference,
-        "tags/list?n=1000",
-        "application/json",
-        MANIFEST_LIMIT,
-    )
-    .await?;
-    let listed: Value = serde_json::from_slice(&listed).map_err(|e| format!("{reference}: {e}"))?;
-    let tags: Option<Vec<String>> =
-        serde_json::from_value(listed["tags"].clone()).map_err(|e| format!("{reference}: tags: {e}"))?;
-    Ok(tags.unwrap_or_default())
+/// The most pages of tags, and the most tags, a registry gets to send of one package.
+const MAX_PAGES: usize = 50;
+const MAX_TAGS: usize = 50_000;
+
+/// The versions of `name` in the repository `url`, asking as `login` where the registry
+/// wants one: every page of its tag list, as far as the `Link` headers go.
+pub async fn versions(url: &str, name: &str, login: Option<&Login>) -> Fallible<Vec<String>> {
+    let (client, reference, mut web) = place(url, name, "latest", false)?;
+    web.login = login.cloned();
+    let mut page = at(&web, &reference, "tags/list?n=1000");
+    let mut tags: Vec<String> = Vec::new();
+    let all = async {
+        for _ in 0..MAX_PAGES {
+            let (listed, next) = capped(&client, &web, &reference, &page, "application/json", MANIFEST_LIMIT).await?;
+            let listed: Value = serde_json::from_slice(&listed).map_err(|e| format!("{reference}: {e}"))?;
+            let more: Option<Vec<String>> =
+                serde_json::from_value(listed["tags"].clone()).map_err(|e| format!("{reference}: tags: {e}"))?;
+            tags.extend(more.unwrap_or_default());
+            if tags.len() > MAX_TAGS {
+                return Err(format!("{reference}: more than {MAX_TAGS} tags"));
+            }
+            match next {
+                Some(next) => page = next,
+                None => return Ok(std::mem::take(&mut tags)),
+            }
+        }
+        Err(format!("{reference}: more than {MAX_PAGES} pages of tags"))
+    };
+    // (Every page has its own patience; the whole list gets twice one's, not fifty.)
+    tokio::time::timeout(PATIENCE * 2, all)
+        .await
+        .unwrap_or_else(|_| Err(format!("{url}/{name}: the tags took more than {:?}", PATIENCE * 2)))
 }
 
 /// The package in a pulled `blob`: signed by `public` when there is one, and the
@@ -510,6 +628,54 @@ fn wanted(store: &Store) -> BTreeSet<Wanted> {
     all
 }
 
+/// The login the Repository `name` names a Secret for, if it does: read as whoever applied
+/// the Repository may read that Secret (never more than that one's rights), so a Repository
+/// is no way to a Secret its writer could not `get`. One with nobody written down, or a
+/// Secret that is not there or has no `username` and `password`, is an error.
+fn credentials(store: &Store, name: &str) -> Fallible<Option<Login>> {
+    use crate::access::{Caller, Grants};
+    use crate::releases::WRITER;
+    use kith_api::kinds::{RegistryCredentials, SecretSpec, Verb};
+    let Some(repository) = store.get(&format!("Repository/{name}")) else {
+        return Ok(None);
+    };
+    let Ok(spec) = serde_json::from_value::<RepositorySpec>(repository.spec.clone()) else {
+        return Ok(None);
+    };
+    let Some(RegistryCredentials { namespace, secret }) = spec.credentials else {
+        return Ok(None);
+    };
+    let Some(writer) = repository.metadata.annotations.get(WRITER) else {
+        return Err(format!(
+            "nobody is written down as having applied Repository/{name} (it was applied before kithd wrote \
+             that down), so its credentials are not read: apply it again"
+        ));
+    };
+    let Some(caller) = Caller::named(writer) else {
+        return Err(format!(
+            "Repository/{name} was applied by {writer}, as whom kithd reads no Secret"
+        ));
+    };
+    crate::releases::same_writer(store, repository, &caller)?;
+    if !Grants::of(&caller, store).may(&Verb::Get, "Secret", Some(&namespace), Some(&secret)) {
+        return Err(format!(
+            "Repository/{name} was applied by {writer}, and {writer} may not get Secret in namespace {namespace}"
+        ));
+    }
+    let Some(found) = store.get(&format!("Secret/{namespace}/{secret}")) else {
+        return Err(format!("Secret {secret} in namespace {namespace} is not there"));
+    };
+    let data = serde_json::from_value::<SecretSpec>(found.spec.clone())
+        .map_err(|e| format!("Secret {secret} in namespace {namespace}: {e}"))?
+        .data;
+    let field = |key: &str| {
+        data.get(key)
+            .cloned()
+            .ok_or_else(|| format!("Secret {secret} in namespace {namespace} has no {key}"))
+    };
+    Ok(Some((field("username")?, field("password")?)))
+}
+
 /// How many versions that do not check out are passed over for an older one that does.
 const PASSED_OVER: usize = 5;
 
@@ -518,7 +684,15 @@ const PASSED_OVER: usize = 5;
 /// the way to it (a newer version that is not signed as it must be stops no one from
 /// installing an older one that is).
 async fn fetch(shared: &Shared, wanted: &Wanted) -> Fallible<(Option<Resource>, Vec<String>)> {
-    let mut versions = versions(&wanted.url, &wanted.name).await?;
+    let login = {
+        let state = shared.store.lock().expect("nothing panics holding the store");
+        // (Asked of the Repository as it was: one applied since, by another, is asked again.)
+        if crate::releases::origin(&state.store, &wanted.repository).as_ref() != Some(&wanted.origin) {
+            return Err(format!("Repository/{} changed, and is asked again", wanted.repository));
+        }
+        credentials(&state.store, &wanted.repository)?
+    };
+    let mut versions = versions(&wanted.url, &wanted.name, login.as_ref()).await?;
     versions.retain(|version| crate::releases::fits(wanted.asked.as_deref(), version));
     versions.sort_by_cached_key(|version| std::cmp::Reverse(semver::Version::parse(version).ok()));
     let asked = wanted.asked.as_deref().unwrap_or("*");
@@ -539,7 +713,7 @@ async fn fetch(shared: &Shared, wanted: &Wanted) -> Fallible<(Option<Resource>, 
             Some(_) => return Err(format!("{key} is there already, and not from this repository")),
             None => {}
         }
-        let pulled = pull(&wanted.url, &wanted.name, version, false).await?;
+        let pulled = pull_as(&wanted.url, &wanted.name, version, false, login.as_ref()).await?;
         let (blob, signature) = pulled;
         match checked(
             &blob,
@@ -711,6 +885,13 @@ mod tests {
     /// A registry answering each request (its port, its path, whether it came with the
     /// token `tok`) with `answer`. Says its port and the paths it was asked for.
     async fn fake(answer: impl Fn(u16, &str, bool) -> Reply + Send + Sync + 'static) -> (u16, Arc<Mutex<Vec<String>>>) {
+        headed(move |port, path, authorization| answer(port, path, authorization == "Bearer tok")).await
+    }
+
+    /// [`fake`], told the request's `Authorization` header as it came (empty: none).
+    async fn headed(
+        answer: impl Fn(u16, &str, &str) -> Reply + Send + Sync + 'static,
+    ) -> (u16, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (answer, asked) = (Arc::new(answer), Arc::new(Mutex::new(Vec::new())));
@@ -727,7 +908,16 @@ mod tests {
                         }
                     }
                     let sent = head.len() - head.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0) - 4;
-                    let head = String::from_utf8_lossy(&head).to_lowercase();
+                    let head = String::from_utf8_lossy(&head).to_string();
+                    let authorization = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_lowercase()
+                                .starts_with("authorization: ")
+                                .then(|| line[15..].to_string())
+                        })
+                        .unwrap_or_default();
+                    let head = head.to_lowercase();
                     // (What is sent with it is read to its end, and thrown away.)
                     let length = head.lines().find_map(|line| line.strip_prefix("content-length: "));
                     let mut left = length
@@ -741,9 +931,8 @@ mod tests {
                         }
                     }
                     let path = head.split(' ').nth(1).unwrap_or_default().to_string();
-                    let authed = head.lines().any(|line| line == "authorization: bearer tok");
                     log.lock().unwrap().push(path.clone());
-                    let (status, headers, body) = answer(port, &path, authed);
+                    let (status, headers, body) = answer(port, &path, &authorization);
                     let mut reply = format!(
                         "HTTP/1.1 {status} x\r\ncontent-length: {}\r\nconnection: close\r\n",
                         body.len()
@@ -804,7 +993,7 @@ mod tests {
         let (port, _) = fake(registry(manifest(0), tags)).await;
         let (blob, signature) = pull(&url(port), "pkg", "1.0.0", false).await.unwrap();
         assert_eq!((blob.as_slice(), signature.as_deref()), (BLOB, Some("sig")));
-        assert_eq!(versions(&url(port), "pkg").await.unwrap(), ["1.0.0", "1.1.0"]);
+        assert_eq!(versions(&url(port), "pkg", None).await.unwrap(), ["1.0.0", "1.1.0"]);
     }
 
     /// For a Source that is not the cluster's own: nothing is asked of an address that is
@@ -848,7 +1037,7 @@ mod tests {
     async fn registry_refuses_an_oversized_tag_list() {
         let tags = json!({ "name": "kith/pkg", "tags": ["1.0.0".repeat(300_000)] }).to_string();
         let (port, _) = fake(registry(vec![], tags.into_bytes())).await;
-        let e = versions(&url(port), "pkg").await.unwrap_err();
+        let e = versions(&url(port), "pkg", None).await.unwrap_err();
         assert!(e.contains("more than"), "{e}");
     }
 
@@ -876,7 +1065,7 @@ mod tests {
         let location = format!("location: http://localhost:{elsewhere}/v2/kith/pkg/manifests/1.0.0");
         let (port, _) = fake(move |_, _, _| (302, vec![location.clone()], vec![])).await;
         assert!(pull(&url(port), "pkg", "1.0.0", false).await.is_err());
-        assert!(versions(&url(port), "pkg").await.is_err());
+        assert!(versions(&url(port), "pkg", None).await.is_err());
         assert!(reached.lock().unwrap().is_empty(), "the other host was asked");
     }
 
@@ -935,5 +1124,234 @@ mod tests {
             reached.lock().unwrap().is_empty(),
             "this node's own side was sent the blob"
         );
+    }
+
+    /// A registry (behind its token) that lists `tags` 1000 at a time, each page with a
+    /// `Link` to the next as registries send it.
+    fn paged(tags: Vec<String>) -> impl Fn(u16, &str, bool) -> Reply + Send + Sync + 'static {
+        move |port, path, authed| {
+            if path.starts_with("/token") {
+                return (200, vec![], br#"{"token":"tok"}"#.to_vec());
+            }
+            if !authed {
+                let challenge = format!("www-authenticate: Bearer realm=\"http://127.0.0.1:{port}/token\"");
+                return (401, vec![challenge], vec![]);
+            }
+            let last = path.split("last=").nth(1).and_then(|rest| rest.split('&').next());
+            let start = last.map_or(0, |last| {
+                tags.iter().position(|tag| tag == last).map_or(tags.len(), |at| at + 1)
+            });
+            let page = &tags[start..(start + 1000).min(tags.len())];
+            let link = (start + 1000 < tags.len()).then(|| {
+                format!(
+                    "link: </v2/kith/pkg/tags/list?last={}&n=1000>; rel=\"next\"",
+                    page.last().unwrap()
+                )
+            });
+            let body = json!({ "name": "kith/pkg", "tags": page }).to_string();
+            (200, link.into_iter().collect(), body.into_bytes())
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_tags_follow_the_link_header_until_it_ends() {
+        let tags: Vec<String> = (0..2500).map(|n| format!("1.0.{n}")).collect();
+        let (port, asked) = fake(paged(tags.clone())).await;
+        assert_eq!(versions(&url(port), "pkg", None).await.unwrap(), tags);
+        let asked = asked.lock().unwrap().clone();
+        // (A token once, for the three pages.)
+        assert_eq!(
+            asked.iter().filter(|path| path.starts_with("/token")).count(),
+            1,
+            "{asked:?}"
+        );
+        assert_eq!(
+            asked.iter().filter(|path| path.contains("/tags/list")).count(),
+            4,
+            "{asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_tags_follow_a_link_only_on_the_registrys_own_host() {
+        let (elsewhere, reached) = fake(|_, _, _| (200, vec![], br#"{"tags":["9.9.9"]}"#.to_vec())).await;
+        for next in [
+            format!("http://localhost:{elsewhere}/v2/kith/pkg/tags/list?last=a"),
+            format!("http://127.0.0.1:{elsewhere}/v2/kith/pkg/tags/list?last=a"),
+            "https://127.0.0.1/v2/kith/pkg/tags/list?last=a".to_string(),
+        ] {
+            let link = format!("link: <{next}>; rel=\"next\"");
+            let (port, _) = fake(move |_, _, _| (200, vec![link.clone()], br#"{"tags":["1.0.0"]}"#.to_vec())).await;
+            let e = versions(&url(port), "pkg", None).await.unwrap_err();
+            assert!(e.contains("not the registry's own"), "{next}: {e}");
+        }
+        assert!(reached.lock().unwrap().is_empty(), "the other host was asked");
+    }
+
+    #[tokio::test]
+    async fn registry_tags_follow_no_more_than_a_page_cap_of_links() {
+        let (port, asked) = fake(|_, path, _| {
+            let link = format!("link: <{path}>; rel=\"next\"");
+            (200, vec![link], br#"{"tags":["1.0.0"]}"#.to_vec())
+        })
+        .await;
+        let e = versions(&url(port), "pkg", None).await.unwrap_err();
+        assert!(e.contains("pages"), "{e}");
+        assert_eq!(asked.lock().unwrap().len(), MAX_PAGES);
+    }
+
+    #[tokio::test]
+    async fn registry_tags_follow_no_more_than_a_cap_of_tags() {
+        let tags: Vec<String> = (0..=MAX_TAGS).map(|n| format!("1.0.{n}")).collect();
+        let body = json!({ "tags": tags }).to_string().into_bytes();
+        let (port, _) = fake(move |_, _, _| (200, vec![], body.clone())).await;
+        let e = versions(&url(port), "pkg", None).await.unwrap_err();
+        assert!(e.contains("tags") && e.contains(&MAX_TAGS.to_string()), "{e}");
+    }
+
+    #[tokio::test]
+    async fn registry_tags_follow_a_link_only_to_the_same_list() {
+        let (port, asked) = fake(|_, path, _| match path.contains("/manifests/") {
+            true => (200, vec![], br#"{"tags":["9.9.9"]}"#.to_vec()),
+            false => {
+                let link = "link: </v2/kith/other/manifests/latest>; rel=\"next\"".to_string();
+                (200, vec![link], br#"{"tags":["1.0.0"]}"#.to_vec())
+            }
+        })
+        .await;
+        let e = versions(&url(port), "pkg", None).await.unwrap_err();
+        assert!(e.contains("not the registry's own"), "{e}");
+        assert_eq!(asked.lock().unwrap().len(), 1, "{:?}", asked.lock().unwrap());
+    }
+
+    fn ann() -> Login {
+        ("ann".into(), "s3cret".into()) // pragma: allowlist secret
+    }
+
+    fn basic(login: &Login) -> String {
+        use base64::Engine;
+        let both = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", login.0, login.1));
+        format!("Basic {both}")
+    }
+
+    /// A registry whose token service, or the registry itself (`bare`), wants ann's login as Basic.
+    fn guarded(bare: bool) -> impl Fn(u16, &str, &str) -> Reply + Send + Sync + 'static {
+        let (manifest, tags) = (manifest(0), br#"{"tags":["1.0.0"]}"#.to_vec());
+        move |port, path, authorization| {
+            let (token, ours) = (path.starts_with("/token"), authorization == basic(&ann()));
+            match (bare, token, ours) {
+                (false, true, true) => (200, vec![], br#"{"token":"tok"}"#.to_vec()),
+                (false, true, false) => (401, vec![], vec![]),
+                (false, false, _) if authorization != "Bearer tok" => {
+                    let challenge = format!("www-authenticate: Bearer realm=\"http://127.0.0.1:{port}/token\"");
+                    (401, vec![challenge], vec![])
+                }
+                (true, false, false) => (401, vec!["www-authenticate: Basic realm=\"fake\"".into()], vec![]),
+                _ if path.contains("/manifests/") => (200, vec![], manifest.clone()),
+                _ if path.contains("/blobs/") => (200, vec![], BLOB.to_vec()),
+                _ if path.contains("/tags/list") => (200, vec![], tags.clone()),
+                _ => (404, vec![], vec![]),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_credentials_are_sent_as_basic_to_the_token_realm_or_to_the_registry() {
+        for bare in [false, true] {
+            let (port, asked) = headed(guarded(bare)).await;
+            let login = ann();
+            assert_eq!(
+                versions(&url(port), "pkg", Some(&login)).await.unwrap(),
+                ["1.0.0"],
+                "{bare}"
+            );
+            let (blob, _) = pull_as(&url(port), "pkg", "1.0.0", false, Some(&login)).await.unwrap();
+            assert_eq!(blob.as_slice(), BLOB, "{bare}");
+            // (Without them: refused, as an anonymous pull always was.)
+            assert!(versions(&url(port), "pkg", None).await.is_err(), "{bare}");
+            let wrong = ("ann".to_string(), "other".to_string()); // pragma: allowlist secret
+            assert!(versions(&url(port), "pkg", Some(&wrong)).await.is_err(), "{bare}");
+            assert!(!asked.lock().unwrap().is_empty());
+        }
+    }
+
+    /// A registry that wants Basic, whose `/v2/` points at a token realm on another port: the
+    /// login is asked for by us, so only the registry (never what oci-client would probe) gets it.
+    #[tokio::test]
+    async fn registry_credentials_a_basic_login_is_never_sent_to_a_realm_found_on_v2() {
+        let (elsewhere, reached) = fake(|_, _, _| (200, vec![], br#"{"token":"tok"}"#.to_vec())).await;
+        let manifest = manifest(0);
+        let (port, _) = headed(move |_, path, authorization| match path {
+            "/v2/" => {
+                let challenge = format!("www-authenticate: Bearer realm=\"http://127.0.0.1:{elsewhere}/token\"");
+                (401, vec![challenge], vec![])
+            }
+            _ if authorization != basic(&ann()) => (401, vec!["www-authenticate: Basic realm=\"fake\"".into()], vec![]),
+            _ if path.contains("/manifests/") => (200, vec![], manifest.clone()),
+            _ if path.contains("/blobs/") => (200, vec![], BLOB.to_vec()),
+            _ => (404, vec![], vec![]),
+        })
+        .await;
+        let (blob, _) = pull_as(&url(port), "pkg", "1.0.0", false, Some(&ann())).await.unwrap();
+        assert_eq!(blob.as_slice(), BLOB);
+        let reached = reached.lock().unwrap().clone();
+        assert!(reached.is_empty(), "the login was sent to another realm: {reached:?}");
+    }
+
+    /// The Secret behind a Repository is read as the Repository's writer may read it.
+    #[test]
+    fn registry_credentials_a_secret_is_read_only_as_the_repository_writer_may_read_it() {
+        let repository = |name: &str, writer: &str, namespace: &str, secret: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Repository\n\
+                 metadata: {{ name: {name}, {writer} }}\n\
+                 spec: {{ url: 'oci://127.0.0.1:1/kith', credentials: {{ namespace: {namespace}, secret: {secret} }} }}\n---\n"
+            )
+        };
+        let admin = "annotations: { 'kith.dev/written-by': 'local socket' }";
+        let source = format!(
+            "apiVersion: kith.dev/v1\nkind: Secret\nmetadata: {{ name: login, namespace: ops }}\n\
+             spec: {{ data: {{ username: ann, password: s3cret }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Secret\nmetadata: {{ name: login, namespace: locked }}\n\
+             spec: {{ data: {{ username: ann, password: s3cret }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Secret\nmetadata: {{ name: half, namespace: ops }}\n\
+             spec: {{ data: {{ username: ann }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: reads }}\n\
+             spec: {{ rules: [{{ kinds: [Secret], verbs: [get], namespaces: [ops] }}] }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: reads }}\nspec: {{ role: reads, subjects: [bob] }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Repository\nmetadata: {{ name: plain, {admin} }}\n\
+             spec: {{ url: 'oci://127.0.0.1:1/kith' }}\n---\n\
+             {}{}{}{}{}{}",
+            repository("byadmin", admin, "locked", "login"),
+            repository("bybob", &crate::releases::bobs_note(0), "ops", "login"),
+            repository("bobsnot", &crate::releases::bobs_note(0), "locked", "login"),
+            repository("unwritten", "labels: {}", "ops", "login"),
+            repository("halved", admin, "ops", "half"),
+            repository("gone", admin, "ops", "nothere"),
+        );
+        let mut store = Store::default();
+        for resource in Resource::from_source(&source).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        crate::releases::bob_is(&mut store, 0);
+        assert_eq!(credentials(&store, "plain"), Ok(None));
+        // (The local socket may read any Secret.)
+        assert_eq!(credentials(&store, "byadmin"), Ok(Some(ann())));
+        assert_eq!(credentials(&store, "bybob"), Ok(Some(ann())));
+        let refused = credentials(&store, "bobsnot").unwrap_err();
+        assert!(
+            refused.contains("bob may not get Secret in namespace locked"),
+            "{refused}"
+        );
+        // (Not read for a Repository nobody is written down for: it was applied before kithd wrote that down.)
+        let refused = credentials(&store, "unwritten").unwrap_err();
+        assert!(refused.contains("nobody is written down"), "{refused}");
+        let refused = credentials(&store, "halved").unwrap_err();
+        assert!(refused.contains("password"), "{refused}");
+        let refused = credentials(&store, "gone").unwrap_err();
+        assert!(refused.contains("is not there"), "{refused}");
+        // (Bob made again under his name, with another key: no longer who applied it.)
+        crate::releases::bob_is(&mut store, 1);
+        assert!(credentials(&store, "bybob").is_err());
     }
 }

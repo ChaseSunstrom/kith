@@ -107,9 +107,11 @@ spec:
 | Pushed by hand | A Release renders it with its pusher's rights as well as its writer's: what the Package makes and no longer makes is asked of the pusher too. Where the pusher may not, nothing new is made, what was installed stays, and the status says whose right fell short (a Package pushed before kithd wrote the pusher down renders nothing new until pushed again). |
 | Fetched | It has no pusher: the Repository's key is its trust, so whoever may apply a Repository gives the rights of every Release that names it. Only kithd's fetcher sets `kith.dev/repository`: an apply or a Source's file that carries it is refused. |
 | Reaching a registry | `kith` goes through kithd. Plain HTTP only to a registry on the same machine. |
+| Many versions | A package's tags are read page by page, as far as the registry's `Link: <…>; rel="next"` headers go (up to 50 pages and 50 000 tags; more is an error). A next page on another host or port than the registry's is refused. |
+| Credentials | `spec: { url: …, credentials: { namespace: ops, secret: registry } }` names a Secret whose `username` and `password` kithd sends as Basic auth to the registry, or to the token service it names. The Secret is read with the rights of whoever applied the Repository (it must be allowed to `get` it; a Repository applied before kithd wrote that down reads none until applied again). Fetching uses them; `kith package push` stays anonymous, and so do `oci://` Sources. |
 
 Not yet: `dependencies` are read and nothing more; no delete hooks, no `lookup` outside the release's
-namespace or in `.kith` files, no registry credentials.
+namespace or in `.kith` files, no registry credentials for pushing or for Sources.
 
 ### A desktop is a package
 
