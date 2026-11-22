@@ -9,7 +9,9 @@
 //! An update is one file: a 4096-byte header (a line of JSON, padded: os/update.sh) and
 //! then the pieces it names, in order. An update the cluster hands out (an OSRelease, see
 //! `update`) must have its header signed by the release's key ([`signed`]); one given
-//! with `kith.update=` is taken on the word of whoever is at the machine's boot menu.
+//! with `kith.update=` must carry a signature by one of the image's release keys after its last
+//! piece ([`stick_signed`]) when the image holds any, else it is taken on the word of whoever
+//! is at the machine's boot menu.
 
 use serde::Deserialize;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -376,9 +378,57 @@ fn mounted<T>(
     Ok(with())
 }
 
+/// A stick's update is vouched for by a signature of its header, as hex, after its last piece
+/// (`sh os/update.sh --sign KEY UPDATE`, appended to the file): by one of `keys`. The header is
+/// not the place for it, as it is what is signed. Leaves `from` at its start.
+pub fn stick_signed(from: &mut (impl Read + Seek), keys: &[String]) -> Result<(), String> {
+    let mut block = [0; HEADER];
+    from.read_exact(&mut block)
+        .map_err(|e| format!("this is not a kith OS update: {e}"))?;
+    let size = header(&block)?
+        .pieces
+        .iter()
+        .try_fold(HEADER as u64, |at, piece| at.checked_add(piece.size))
+        .ok_or("this update's pieces are larger than any disk")?;
+    let mut trailer = Vec::new();
+    // (Room for the hex and a newline or two; whatever else is there is no signature.)
+    let read = from
+        .seek(SeekFrom::Start(size))
+        .and_then(|_| Read::take(&mut *from, 256).read_to_end(&mut trailer));
+    from.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("reading the update again: {e}"))?;
+    let signature = String::from_utf8_lossy(&trailer).trim().to_string();
+    if read.is_err() || signature.is_empty() {
+        return Err("the update is not signed: the image holds release keys (/etc/kith/release-keys), so an update from a stick carries a signature of its header after its last piece".into());
+    }
+    let by = |key: &String| signed(Some(&signature), Some(key))(&block).is_ok();
+    if keys.iter().any(by) {
+        return Ok(());
+    }
+    Err("the update's signature is by none of this system's release keys (/etc/kith/release-keys)".into())
+}
+
+/// The check [`update`] makes of a stick: nothing when the image holds no release key (whoever
+/// is at the boot menu has the machine), else [`stick_signed`]; and no keys that could not be read
+/// is a refusal, not a node that takes anything.
+fn stick_vouched(from: &mut (impl Read + Seek), keys: &Result<Vec<String>, String>) -> Result<(), String> {
+    match keys {
+        Ok(keys) if keys.is_empty() => Ok(()),
+        Ok(keys) => stick_signed(from, keys),
+        Err(e) => Err(e.clone()),
+    }
+}
+
 /// `kith.update=DEVICE`: the update on that disk (a stick, a second disk) goes into the
-/// slot this node does not run from. Nobody vouches for it but whoever plugged it in.
-pub fn update(device: &str, slot: char, running: &str) -> Result<Option<String>, String> {
+/// slot this node does not run from. When the image holds release keys (`keys`, from
+/// /etc/kith/release-keys) the stick must carry a signature by one of them ([`stick_signed`]);
+/// with none, nobody vouches for it but whoever plugged it in.
+pub fn update(
+    device: &str,
+    slot: char,
+    running: &str,
+    keys: &Result<Vec<String>, String>,
+) -> Result<Option<String>, String> {
     let device = Path::new("/dev").join(device);
     // ponytail: a stick takes a moment to be there; ten seconds of looking, not an event.
     for _ in 0..100 {
@@ -388,6 +438,7 @@ pub fn update(device: &str, slot: char, running: &str) -> Result<Option<String>,
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let mut from = std::fs::File::open(&device).map_err(|e| format!("{}: {e}", device.display()))?;
+    stick_vouched(&mut from, keys)?;
     into_other_slot(&mut from, slot, running, |_| Ok(()))
 }
 
@@ -776,6 +827,67 @@ mod tests {
             run(&packed(&other, HASH), Some(&signature), Some(&public), "altered"),
             "not the release's key's",
         );
+    }
+
+    /// `update` with `signature` (hex, or none) on its end, as `sh os/update.sh --sign` prints it.
+    fn stick(update: &[u8], signature: Option<&str>) -> Vec<u8> {
+        let mut stick = update.to_vec();
+        stick.extend(signature.map(|s| format!("{s}\n")).unwrap_or_default().bytes());
+        stick
+    }
+
+    fn sign(secret: &str, update: &[u8]) -> String {
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&unhex(secret)).unwrap();
+        crate::pki::hex(pair.sign(&update[..HEADER]).as_ref())
+    }
+
+    #[test]
+    fn a_stick_update_is_taken_on_a_trailer_signed_by_an_image_key() {
+        let (secret, public) = kith_packages::artifact::keygen().unwrap();
+        let (_, another) = kith_packages::artifact::keygen().unwrap();
+        let update = packed(&PIECES, HASH);
+        let stick = stick(&update, Some(&sign(&secret, &update)));
+        let keys = vec![another, public];
+        assert_eq!(stick_signed(&mut std::io::Cursor::new(&stick), &keys), Ok(()));
+        // The vouching leaves the stick where it was: the install reads it from the start.
+        let places = places("stick-signed");
+        let mut from = std::io::Cursor::new(&stick);
+        stick_signed(&mut from, &keys).unwrap();
+        assert_eq!(
+            install(&mut from, "kith.slot=a", 'b', &places, |_| Ok(())),
+            Ok(Some("9.9".into()))
+        );
+    }
+
+    #[test]
+    fn a_stick_update_with_no_trailer_or_another_key_is_refused_untouched() {
+        let (secret, public) = kith_packages::artifact::keygen().unwrap();
+        let (other_secret, _) = kith_packages::artifact::keygen().unwrap();
+        let update = packed(&PIECES, HASH);
+        let keys = vec![public];
+        let refused = |stick: &[u8]| stick_signed(&mut std::io::Cursor::new(stick), &keys).unwrap_err();
+        assert!(refused(&stick(&update, None)).contains("not signed"));
+        assert!(refused(&stick(&update, Some(&sign(&other_secret, &update)))).contains("none of"));
+        assert!(refused(&stick(&update, Some("zz"))).contains("none of"));
+        // A signature over another header than the one on the stick.
+        let other: [(&str, &[u8]); 4] = [("root", b"b root"), PIECES[1], PIECES[2], PIECES[3]];
+        let altered = stick(&packed(&other, HASH), Some(&sign(&secret, &update)));
+        assert!(refused(&altered).contains("none of"));
+        // A stick that is no update is refused too; and so is a node whose keys cannot be read.
+        assert!(refused(b"not an update").contains("not a kith OS update"));
+        let mut from = std::io::Cursor::new(stick(&update, Some(&sign(&secret, &update))));
+        assert!(
+            stick_vouched(&mut from, &Err("unreadable".into()))
+                .unwrap_err()
+                .contains("unreadable")
+        );
+    }
+
+    #[test]
+    fn a_stick_update_is_unchecked_when_the_image_has_no_key() {
+        let update = packed(&PIECES, HASH);
+        let mut from = std::io::Cursor::new(update);
+        assert_eq!(stick_vouched(&mut from, &Ok(vec![])), Ok(()));
     }
 
     fn unhex(text: &str) -> Vec<u8> {

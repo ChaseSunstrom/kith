@@ -1040,7 +1040,7 @@ pub fn early(again: bool) -> Boot {
         std::process::abort();
     }));
     if let (Some(slot), Some(device), false) = (options.slot, &options.update, again) {
-        match crate::os::update(device, slot, &line) {
+        match crate::os::update(device, slot, &line, &image) {
             Ok(Some(version)) => {
                 eprintln!("kithd: init: kith OS {version} from {device} is in the other slot: starting it");
                 end(false)

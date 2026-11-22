@@ -441,7 +441,8 @@ What a system the release key did not sign gets:
 
 - Never a `tpm-next:`. Only the signed update path makes one, after `os::signed` has checked
   the header and the piece's hash has been checked against it. An update from a stick
-  (`kith.update=`) is not signed and is never sealed for.
+  (`kith.update=`) is never sealed for: init checks its trailer signature against the image's
+  release keys when there are any (`os::stick_signed`), but takes it before the state is opened.
 - At its start PCR 4 differs from both seals: the TPM refuses, and the node asks the cluster
   or the console as today.
 - Once open by another way, it does not seal itself (step 5's checks).

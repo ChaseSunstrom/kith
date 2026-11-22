@@ -4,7 +4,7 @@ On a kith OS machine there is the kernel and kithd, nothing else: no systemd, no
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../../docs/assets/diagrams/os-dark.svg">
-  <img src="../../docs/assets/diagrams/os-light.svg" alt="kith OS from power-on: the firmware starts systemd-boot, which starts the newest kernel image that has tries left; the image names the hash of its 6 MB read-only root, of which a changed block is refused; kithd is the first process, reads the config partition and mounts the state partition, the two that no update replaces. An update, one node at a time: an OSRelease signed by the release's key (an update from a stick is not signed) is written into the other slot, the node restarts into it, and it is marked good or the node is back on the old slot after three tries" width="100%">
+  <img src="../../docs/assets/diagrams/os-light.svg" alt="kith OS from power-on: the firmware starts systemd-boot, which starts the newest kernel image that has tries left; the image names the hash of its 6 MB read-only root, of which a changed block is refused; kithd is the first process, reads the config partition and mounts the state partition, the two that no update replaces. An update, one node at a time: an OSRelease signed by the release's key (an update from a stick carries its signature after its last piece, when the image holds release keys) is written into the other slot, the node restarts into it, and it is marked good or the node is back on the old slot after three tries" width="100%">
 </picture>
 
 As process 1, kithd:
@@ -272,7 +272,13 @@ slot. The state partition is in no slot: the node is the same node after an upda
 going back. An update can also reach one node from a stick: `dd if=kith-os.update of=/dev/sdX`,
 then start the node once with `kith.update=sdX` on its command line. It writes the other slot and
 restarts into it, newer or older; one given while its own slot is not yet good is refused.
-Nothing checks who made it: whoever can change the command line has the machine anyway.
+An image with no release keys (`/etc/kith/release-keys`) checks nothing about who made it:
+whoever can change the command line has the machine anyway. An image that holds keys takes a
+stick's update only with a signature by one of them: before `dd`, append what
+`sh os/update.sh --sign KEYFILE kith-os.update` prints to the file
+(`sh os/update.sh --sign KEYFILE kith-os.update >sig && cat sig >>kith-os.update`). It sits
+right after the last piece, which an older kithd never reads. An update with none, with another
+key's, or when the key file cannot be read is refused with the other slot untouched.
 
 ### What an update keeps: the format of the store
 
