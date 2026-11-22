@@ -2706,6 +2706,26 @@ spec: { selector: { app: web }, ports: [{ port: 80 }] }
         assert_eq!(got, b"GET /x HTTP/1.1\nX: a\0b\n\n");
     }
 
+    /// A client of port 443 is TLS, bytes to be decrypted: they never go by splice, only by the copy.
+    #[tokio::test]
+    async fn a_tls_client_never_reaches_splice() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut connect, _web) = shop(routed(listener.local_addr().unwrap(), Vec::new(), &[])).await;
+        let mut client = connect().await;
+        client.write_all(b"question").await.unwrap();
+        let (mut service, _) = listener.accept().await.unwrap();
+        let mut got = [0; 8];
+        service.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"question");
+        service.write_all(b"answer").await.unwrap();
+        let mut got = [0; 6];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"answer");
+        // (The server of 443 runs on this thread, which counts what splice moved.)
+        assert_eq!(crate::services::splices(), 0);
+    }
+
     /// The leading control node orders the certificate of a host only a worker serves, from
     /// an authority on 127.0.0.1; the worker's view has the certificate and the thumbprint
     /// (and no account key), it answers the challenge from them and serves the certificate

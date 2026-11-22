@@ -1020,9 +1020,145 @@ impl Proxy {
 
 /// Bytes both ways between a client and a backend, until either ends or `idle` goes by
 /// with no byte moved on one of them.
+/// The bytes move in the kernel, by splice(2) through a pipe each way, not through a buffer
+/// here; a way that splice refuses goes on by the copy. (Plain TCP only: a TLS stream is
+/// bytes to be decrypted, so the ingress's, which end in TLS, keep `copy_bidirectional`.)
 async fn pass(client: TcpStream, backend: TcpStream, idle: Duration) -> std::io::Result<(u64, u64)> {
-    let (mut client, mut backend) = (Idle::new(client, idle, None), Idle::new(backend, idle, None));
-    tokio::io::copy_bidirectional(&mut client, &mut backend).await
+    let (begun, moved) = (tokio::time::Instant::now(), AtomicU64::new(0));
+    let ((from_client, to_client), (from_backend, to_backend)) = (client.into_split(), backend.into_split());
+    let both = async {
+        tokio::try_join!(
+            pump(from_client, to_backend, begun, &moved),
+            pump(from_backend, to_client, begun, &moved)
+        )
+    };
+    // (The time since a byte last moved either way, asked when it may be up.)
+    let quiet = async {
+        loop {
+            let until = begun + Duration::from_millis(moved.load(Ordering::Relaxed)) + idle;
+            if tokio::time::Instant::now() >= until {
+                return Err::<(u64, u64), _>(std::io::ErrorKind::TimedOut.into());
+            }
+            tokio::time::sleep_until(until).await;
+        }
+    };
+    tokio::select! { out = both => out, out = quiet => out }
+}
+
+/// A pipe: what splice moves bytes through. (Made once for a way of a connection.)
+struct Pipe(std::os::fd::OwnedFd, std::os::fd::OwnedFd);
+
+/// What a splice may move at once (the pipe's size, when it can be that).
+const PIPE: usize = 256 << 10;
+
+impl Pipe {
+    fn new() -> Option<Pipe> {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        use std::os::fd::AsRawFd;
+        let (read, write) = nix::unistd::pipe2(OFlag::O_NONBLOCK | OFlag::O_CLOEXEC).ok()?;
+        // (Past the limit of what a user may have in pipes it stays the 64 KiB it is.)
+        let _ = fcntl(write.as_raw_fd(), FcntlArg::F_SETPIPE_SZ(PIPE as i32));
+        #[cfg(test)]
+        PIPES.set(PIPES.get() + 1);
+        Some(Pipe(read, write))
+    }
+}
+
+/// Splices that moved bytes on this thread (for another module's test).
+#[cfg(test)]
+pub(crate) fn splices() -> u64 {
+    SPLICES.get()
+}
+
+#[cfg(test)]
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        PIPES.set(PIPES.get() - 1);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For the tests of the thread: splices that moved bytes, pipes open, and splice refused.
+    static SPLICES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PIPES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    static REFUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Splices that a filter or an old kernel gives these for do not come again: the copy.
+fn refused(error: &std::io::Error) -> bool {
+    use nix::errno::Errno::{EACCES, EINVAL, ENOSYS, EOPNOTSUPP, EPERM};
+    let errno = error.raw_os_error();
+    [EINVAL, ENOSYS, EPERM, EACCES, EOPNOTSUPP]
+        .iter()
+        .any(|e| errno == Some(*e as i32))
+}
+
+/// One way of [`pass`]: what `from` reads goes to `to`, until `from` ends (then `to` is
+/// shut for writing: it is dropped), counting the bytes, and each that moves is noted in
+/// `moved` for the idle cut.
+async fn pump(
+    mut from: OwnedReadHalf,
+    mut to: OwnedWriteHalf,
+    begun: tokio::time::Instant,
+    moved: &AtomicU64,
+) -> std::io::Result<u64> {
+    use nix::fcntl::{SpliceFFlags, splice};
+    use std::io::{Error, ErrorKind::WouldBlock};
+    use tokio::io::Interest;
+    let note = || moved.store(begun.elapsed().as_millis() as u64, Ordering::Relaxed);
+    let mut total = 0u64;
+    if let Some(pipe) = Pipe::new() {
+        let (src, dst) = (from.as_ref(), to.as_ref());
+        let flags = SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK;
+        loop {
+            src.readable().await?;
+            let pulled = src.try_io(Interest::READABLE, || {
+                #[cfg(test)]
+                if REFUSE.get() {
+                    return Err(Error::from_raw_os_error(nix::errno::Errno::EINVAL as i32));
+                }
+                splice(src, None, &pipe.1, None, PIPE, flags).map_err(Error::from)
+            });
+            let mut left = match pulled {
+                Ok(0) => return Ok(total),
+                Ok(n) => n,
+                Err(e) if e.kind() == WouldBlock => continue,
+                // (Nothing is in the pipe when it is asked: the copy has all of it still.)
+                Err(e) if refused(&e) => break,
+                Err(e) => return Err(e),
+            };
+            #[cfg(test)]
+            SPLICES.set(SPLICES.get() + 1);
+            note();
+            total += left as u64;
+            while left > 0 {
+                dst.writable().await?;
+                match dst.try_io(Interest::WRITABLE, || {
+                    splice(&pipe.0, None, dst, None, left, flags).map_err(Error::from)
+                }) {
+                    Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                    Ok(n) => {
+                        left -= n;
+                        note();
+                    }
+                    Err(e) if e.kind() == WouldBlock => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    let mut chunk = vec![0; 16 << 10];
+    loop {
+        let read = from.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(total);
+        }
+        note();
+        to.write_all(&chunk[..read]).await?;
+        note();
+        total += read as u64;
+    }
 }
 
 /// What an asking that got no answer means for its client.
@@ -3541,6 +3677,231 @@ spec:
         }
         let each = (20 * TURNS) as f64 / begun.elapsed().as_secs_f64();
         eprintln!("pass: {each:.0} questions answered a second");
+    }
+
+    /// What [`pass`] did on this thread: (splices that moved bytes, pipes still open).
+    fn spliced() -> (u64, i64) {
+        (SPLICES.get(), PIPES.get())
+    }
+
+    #[tokio::test]
+    async fn splice_moves_bytes_both_ways_and_ends_each_way_on_eof() {
+        use tokio::io::AsyncReadExt;
+        let ((mut client, held), (backend, mut replica)) = (pair().await, pair().await);
+        let passing = tokio::spawn(pass(held, backend, Duration::from_secs(60)));
+        client.write_all(b"question").await.unwrap();
+        let mut got = [0; 8];
+        replica.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"question");
+        replica.write_all(b"answer").await.unwrap();
+        let mut got = [0; 6];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"answer");
+        // The client ends its way: the replica sees the end, and can still be heard.
+        client.shutdown().await.unwrap();
+        assert_eq!(replica.read(&mut got).await.unwrap(), 0);
+        replica.write_all(b"late").await.unwrap();
+        replica.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"late");
+        assert_eq!(passing.await.unwrap().unwrap(), (8, 10));
+        // (The thread of this test did the splicing, none of it on the copy.)
+        assert!(spliced().0 >= 3);
+    }
+
+    /// A transfer far past a pipe's size, the replica slow to take it: all of it arrives, in order.
+    #[tokio::test]
+    async fn splice_moves_a_large_transfer_whole_against_a_slow_reader() {
+        use tokio::io::AsyncReadExt;
+        const SIZE: usize = 8 << 20;
+        let ((mut client, held), (backend, mut replica)) = (pair().await, pair().await);
+        let passing = tokio::spawn(pass(held, backend, Duration::from_secs(60)));
+        let sending = tokio::spawn(async move {
+            let block: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+            for _ in 0..SIZE / block.len() {
+                client.write_all(&block).await.unwrap();
+            }
+            client
+        });
+        let mut got = vec![0; SIZE];
+        for part in got.chunks_mut(1 << 20) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            replica.read_exact(part).await.unwrap();
+        }
+        assert!(
+            got.chunks(65536)
+                .all(|c| c.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8))
+        );
+        drop((sending.await.unwrap(), replica));
+        assert_eq!(passing.await.unwrap().unwrap().0, SIZE as u64);
+    }
+
+    #[tokio::test]
+    async fn splice_leaks_no_pipe_when_a_connection_ends_either_way() {
+        use tokio::io::AsyncReadExt;
+        let before = spliced().1;
+        for round in 0..20 {
+            let ((mut client, held), (backend, mut replica)) = (pair().await, pair().await);
+            let passing = tokio::spawn(pass(held, backend, Duration::from_secs(60)));
+            client.write_all(b"x").await.unwrap();
+            assert_eq!(replica.read_u8().await.unwrap(), b'x');
+            // Some end by the client going, some by the replica, some in a reset.
+            // (A way that ends leaves the other to end by itself: both go, one first.)
+            match round % 3 {
+                0 => drop((client, replica)),
+                1 => drop((replica, client)),
+                _ => {
+                    client.set_zero_linger().unwrap();
+                    drop(client);
+                }
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(10), passing).await.unwrap();
+        }
+        assert_eq!(spliced().1, before);
+        assert!(before >= 0 && SPLICES.get() > 0);
+    }
+
+    #[tokio::test]
+    async fn splice_keeps_the_idle_cut() {
+        use tokio::io::AsyncReadExt;
+        let ((mut client, held), (backend, mut replica)) = (pair().await, pair().await);
+        let passing = tokio::spawn(pass(held, backend, Duration::from_secs(2)));
+        // Bytes one way only keep it going past the idle time, too...
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            client.write_all(b"q").await.unwrap();
+            assert_eq!(replica.read_u8().await.unwrap(), b'q');
+            assert!(!passing.is_finished());
+        }
+        // ...and then silence ends it, and both ends see the hang-up.
+        let ended = tokio::time::timeout(Duration::from_secs(10), passing).await;
+        assert_eq!(
+            ended.unwrap().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(client.read_u8().await.is_err());
+        assert!(replica.read_u8().await.is_err());
+        assert!(spliced().0 > 0);
+    }
+
+    /// A kernel (or a filter) that refuses splice: the bytes go on by the copy, both ways.
+    #[tokio::test]
+    async fn splice_refused_falls_back_to_the_copy() {
+        use tokio::io::AsyncReadExt;
+        REFUSE.set(true);
+        let before = spliced().0;
+        let ((mut client, held), (backend, mut replica)) = (pair().await, pair().await);
+        let passing = tokio::spawn(pass(held, backend, Duration::from_secs(60)));
+        client.write_all(b"question").await.unwrap();
+        let mut got = [0; 8];
+        replica.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"question");
+        replica.write_all(b"answer").await.unwrap();
+        let mut got = [0; 6];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"answer");
+        drop(client);
+        assert_eq!(replica.read(&mut got).await.unwrap(), 0);
+        drop(replica);
+        assert_eq!(passing.await.unwrap().unwrap(), (8, 6));
+        assert_eq!(spliced().0, before);
+        REFUSE.set(false);
+    }
+
+    /// Not a check: the same proxy path by splice and by the copy, on loopback, for what the
+    /// kept-connection rows (small questions and answers) and a bulk transfer ask of it
+    /// (`cargo test --release -p kithd --bin kithd splice_not_slower_than_copy -- --ignored
+    /// --nocapture`). Splice may not be slower than 0.9 of the copy on either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "a measurement, for whoever changes pass"]
+    async fn splice_not_slower_than_copy() {
+        use tokio::io::AsyncReadExt;
+        async fn copy(client: TcpStream, backend: TcpStream, idle: Duration) -> std::io::Result<(u64, u64)> {
+            let (mut client, mut backend) = (Idle::new(client, idle, None), Idle::new(backend, idle, None));
+            tokio::io::copy_bidirectional(&mut client, &mut backend).await
+        }
+        type Way = fn(
+            TcpStream,
+            TcpStream,
+            Duration,
+        ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<(u64, u64)>> + Send>>;
+        // Small: 20 kept connections of 1000 question and answer pairs each, 20000 in all.
+        async fn small(way: Way) -> f64 {
+            let mut clients = Vec::new();
+            for _ in 0..20 {
+                let ((mut client, held), (backend, mut replica)) = (pair().await, pair().await);
+                tokio::spawn(way(held, backend, Duration::from_secs(60)));
+                tokio::spawn(async move {
+                    let mut asked = [0; 80];
+                    while replica.read_exact(&mut asked).await.is_ok() && replica.write_all(&[7; 200]).await.is_ok() {}
+                });
+                clients.push(tokio::spawn(async move {
+                    let mut answer = [0; 200];
+                    for _ in 0..1000 {
+                        client.write_all(&[1; 80]).await.unwrap();
+                        client.read_exact(&mut answer).await.unwrap();
+                    }
+                }));
+            }
+            let begun = std::time::Instant::now();
+            for client in clients {
+                client.await.unwrap();
+            }
+            20_000.0 / begun.elapsed().as_secs_f64()
+        }
+        // Bulk: 1 GiB over 4 connections, in MiB a second.
+        async fn bulk(way: Way) -> f64 {
+            let mut clients = Vec::new();
+            for _ in 0..4 {
+                let ((mut client, held), (backend, mut replica)) = (pair().await, pair().await);
+                tokio::spawn(way(held, backend, Duration::from_secs(60)));
+                tokio::spawn(async move {
+                    let mut sink = vec![0; 1 << 20];
+                    while replica.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+                });
+                clients.push(tokio::spawn(async move {
+                    let block = vec![5u8; 1 << 20];
+                    for _ in 0..256 {
+                        client.write_all(&block).await.unwrap();
+                    }
+                    client.shutdown().await.unwrap();
+                    let mut end = [0; 1];
+                    let _ = client.read(&mut end).await;
+                }));
+            }
+            let begun = std::time::Instant::now();
+            for client in clients {
+                client.await.unwrap();
+            }
+            1024.0 / begun.elapsed().as_secs_f64()
+        }
+        let (spliced, copied): (Way, Way) = (|a, b, i| Box::pin(pass(a, b, i)), |a, b, i| Box::pin(copy(a, b, i)));
+        // (Each way twice, alternating, the better of the two: a loaded host swings.)
+        let (mut small_rates, mut bulk_rates) = ([0f64; 2], [0f64; 2]);
+        for _ in 0..2 {
+            for (i, way) in [spliced, copied].into_iter().enumerate() {
+                small_rates[i] = small_rates[i].max(small(way).await);
+                bulk_rates[i] = bulk_rates[i].max(bulk(way).await);
+            }
+        }
+        eprintln!(
+            "small: splice {:.0}/s, copy {:.0}/s ({:.2})",
+            small_rates[0],
+            small_rates[1],
+            small_rates[0] / small_rates[1]
+        );
+        eprintln!(
+            "bulk: splice {:.0} MiB/s, copy {:.0} MiB/s ({:.2})",
+            bulk_rates[0],
+            bulk_rates[1],
+            bulk_rates[0] / bulk_rates[1]
+        );
+        assert!(
+            small_rates[0] >= 0.9 * small_rates[1],
+            "small requests slower by splice"
+        );
+        assert!(bulk_rates[0] >= 0.9 * bulk_rates[1], "bulk slower by splice");
     }
 
     #[tokio::test]
