@@ -59,7 +59,11 @@ RUNS = 5  # each time is the median of this many runs
 # RAISE, kithd 13.79 to 14.20 (T-1265 for trains E and F): main 81fe0db4 with train D's lanes builds
 # kithd at 13.81 to 13.83 MB with T-1216 or T-1218 merged, and train E (kith docker, machines, VM
 # migration, mDNS names, image pull progress) adds more; T-0269 brings it back down.
-KITHD_SIZE = 14.20
+# RAISE, kithd 14.20 to 14.35, kith 3.10 to 3.20 and kith-remote 3.75 to 3.95 (T-1378 for trains G
+# and H): CI on 4d9b2d79 (train 2 merged: the OSV scan, store formats, tlog, machines) built kithd at
+# 14.25 MB, kith at 3.17 MB and kith-remote at 3.91 MB, and the late-card, watchdog and splice lanes
+# still come; T-0269 brings them back down.
+KITHD_SIZE = 14.35
 KITHD_IDLE_RSS = 9 * MB
 # binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
 # 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.
@@ -92,7 +96,7 @@ KITHD_IDLE_RSS = 9 * MB
 # RAISE, kith 3.05 to 3.10 and kith-remote 3.68 to 3.75 (T-1265 for trains E and F): kith-remote
 # built 3.68 MB with T-1218 merged on main 81fe0db4, and train E adds kith verbs (machine, launch,
 # pull progress); T-0269 brings them back down.
-SIZE_BUDGETS = {"kith": int(3.10 * MB), "kith-remote": int(3.75 * MB), "kithd": int(KITHD_SIZE * MB)}
+SIZE_BUDGETS = {"kith": int(3.20 * MB), "kith-remote": int(3.95 * MB), "kithd": int(KITHD_SIZE * MB)}
 # (T-1209: kith machine create|list|run|rm costs about 24 KB on the merged tree: kith 3,196,248 B on main 32840235
 # to 3,220,856 B, and kith-remote 3,888,504 B to 3,921,304 B, each from `cargo build --release -p kith-cli` for musl;
 # built with kithd as ci/musl.sh does, kith is 3,249,528 B, 1 KB under the 3.10 above.)
