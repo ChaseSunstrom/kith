@@ -355,12 +355,14 @@ Only the newest version is fixed. There are no security releases of older ones.
   give nothing; a pod is given no token and no API to ask. `privileged`, the host's
   namespaces, `hostPath` and added capabilities have no field in kith, and an object
   that asks for one is refused by its name. Of a body in protobuf 50,000 fields are read.
-- **A terminal and `--root` in an exec add no right.** `kubectl exec -it` and `kith machine shell`
+- **A terminal in an exec adds no right; `--root` adds `apply`.** `kubectl exec -it` and `kith machine shell`
   are the same `exec` right as without a terminal; the process gets a pseudo-terminal of its own
   (kithd keeps the master end), and kith puts its own terminal back when it ends. `--root`
-  (`root=true` in the request, which any client may send) runs as uid 0 of the pod's own user
-  namespace only: it is refused, with the reason, when that uid 0 would be the node's root or the
-  user kithd runs as, so a pod with no user namespace of its own is never entered as root of the node.
+  (`root=true` in the request, which any client may send) needs `apply` on the Workload, Job or NodeWorkload
+  that owns the pod as well as `exec`, asked on the Kubernetes exec route and again by the node the hop
+  arrives at (a caller with `exec` alone is refused with a 403, audited; the same caller without `--root` gets a plain exec). It runs as
+  uid 0 of the pod's own user namespace only: it is refused, with the reason, when that uid 0 would be the node's
+  root or the user kithd runs as, so a pod with no user namespace of its own is never entered as root of the node.
 - **`kubectl exec`, `cp` and `port-forward` are one right, `exec`, on the Workload or Job that
   owns the pod.** `get` alone reads a pod and is refused all three. A `port-forward` reaches
   any port of the pod, whatever listens there and whatever a NetworkPolicy says: a policy holds
@@ -513,7 +515,9 @@ Only the newest version is fixed. There are no security releases of older ones.
   the volume from it and never names the path again, so swapping the directory for a link
   after it is opened gets no bind or chown of what the link points at; the chown does not
   follow a link and leaves a file with another hard link alone (the start logs how many
-  files it left, as it is not given them). A kithd that is not root has no clone to bind
+  files it left, as it is not given them). That chown walk, and the wait on the root part's
+  helper, run on the blocking pool: a start with a huge volume does not stop the API or the
+  other units meanwhile (T-1274). A kithd that is not root has no clone to bind
   from: it refuses the start when the path is no longer the directory held (device and
   inode, checked just before the container's init binds it), but a tenant that swaps the
   directory for a link in the short time after that check is bound what the link names,
@@ -1115,7 +1119,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     worker's own, with the labels discovery writes and no other, the node and the
     class among them its own), the status of an Image or a Backup of
     a Volume that is on it, a Blob it made, its own name among a Blob's holders, and
-    when it synced as a Volume's replica, the notes of a Job placed on it, and the delete of
+    when it synced as a Volume's replica, why an encrypted Volume of it is not open (`reason`: a text of
+    at most 1 KiB without control characters), which encrypted Volumes' files it holds (its own Node's
+    `encrypted`: up to 1024 names), the notes of a Job placed on it, and the delete of
     a Volume that is on it whose data it was told to wipe (its claim gone, not retained, not
     encrypted, and no unit placed on it mounts it). Everything else is refused and written to
     the audit log under the worker's name: a template, a Secret, a Role, a Node's
@@ -1129,7 +1135,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     Volume's whole copy is sent only to a node the store names among its replicas
     (any node, not workers alone). The key of an encrypted Volume is given to control
     nodes to keep and to no worker, and a node made a worker deletes the keys it
-    kept. Of a worker's word about which nodes are there, only what it says of itself
+    kept. **A Volume gone from the store for a day has its key copies and its file erased,
+    and that cannot be undone:** the Volume's own node closes it if it is open (unmounts it and
+    removes its mapping; one still in use is left and tried again), then unlinks the file; a
+    node that keeps a key copy waits until that node says (its Node's `encrypted`, `[]` for
+    none) it holds no file of it, and a day more, so an owner that still mounts the file, or
+    that restarted, keeps its keys; a node that has said nothing of its files keeps them too.
+    A node's word that it holds a file can keep a key copy longer, and never erase one. Of a worker's word about which nodes are there, only what it says of itself
     is taken. A worker's replica takes over a lost Volume only when no control node
     has one, whatever time it says it synced. A worker's `status.serves` (the DNS port
     it says it answers, and ingress) is its own word and nothing more: a control node
@@ -1770,6 +1782,17 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   says so once on its error output and goes on, as a node that cannot protect itself
   still has to boot. `python3 ci/budgets.py` runs both shipped programs and fails when
   any byte of the part is still writable in `/proc/PID/maps`.
+- **`kith image scan` sends an image's package names and versions to api.osv.dev, and trusts its answer
+  only as text.** Whoever may Get the node reads, from an image already on it, the package list (kithd's
+  root part opens only that file, from inside the unpacked root, never following a link out of it) and
+  node-side kithd asks OSV over HTTPS with them (no proxy, no redirect, a capped reply, ids kept only
+  when they look like advisory ids). Nothing else leaves the node, nothing is pulled or stored, and a
+  scan says nothing of a package the list does not name (a language package, a binary put there by hand).
+  The three files the root part opens are `/etc/os-release` (or `/usr/lib/os-release`), `/var/lib/dpkg/status`
+  and `/lib/apk/db/installed`, each a regular file at most so large. Anyone who may Get the Node can have a
+  scan run on it (one request to OSV for each thousand packages and each page more; each scan is in the
+  audit log with the image), OSV sees the node's own IP address, and no proxy is used, so an operator who
+  does not want either leaves Get on Nodes to those they trust, or blocks api.osv.dev.
 
 ## The review before 1.0
 

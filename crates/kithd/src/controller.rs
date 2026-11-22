@@ -228,7 +228,8 @@ struct Controller {
     /// theirs remain), by id. They have no slot: they are leaving with no owner (see `leaving_of`),
     /// so their ids and devices go to no other unit, and each is deleted once its processes are gone.
     left: BTreeMap<String, Left>,
-    runtime: Runtime,
+    /// (An `Arc`: a container's create runs on the blocking pool, see `blocking_create`.)
+    runtime: std::sync::Arc<Runtime>,
     logs: PathBuf,
     log_cap: u64,
     slots: BTreeMap<String, Slot>,
@@ -544,7 +545,7 @@ pub async fn run(
     eprintln!("kithd: pods' storage limits are held {}", storage::how(held));
     let projects = held.then(|| storage::Projects::read(state));
     let mut controller = Controller {
-        runtime,
+        runtime: std::sync::Arc::new(runtime),
         logs: shared.logs.clone(),
         log_cap,
         slots: BTreeMap::new(),
@@ -3477,10 +3478,38 @@ fn held_volume(volume: crate::volumes::VolumeDir) -> (PathBuf, Option<kith_runti
     (real, Some(kith_runtime::Held::new(fd)))
 }
 
+/// A container's create on the blocking pool: it chowns the volumes it is given, a walk as long
+/// as they are big, and waits on the root part's helper for up to a minute; on kithd's one async
+/// thread either would stop the API and every other unit (T-1274). A panic in `create` is an
+/// error, as for `Direct::create` a failure is.
+///
+/// A stop drops the start's future while the create runs, and the create goes on to its end: a
+/// task of its own takes the result, and when no one is left to take it hands it to `undo`
+/// (a delete of the container, which the root part's book holds as made) instead of dropping it.
+async fn blocking_create<T: Send + 'static>(
+    create: impl FnOnce() -> Result<T, String> + Send + 'static,
+    undo: impl FnOnce(T) + Send + 'static,
+) -> Result<T, String> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let made = tokio::task::spawn_blocking(create)
+            .await
+            .map_err(|e| format!("making the container failed: {e}"))
+            .and_then(|made| made);
+        if let Err(Ok(orphan)) = send.send(made) {
+            // (Off this thread too: a delete waits on the helper as a create does.)
+            let _ = tokio::task::spawn_blocking(move || undo(orphan)).await;
+        }
+    });
+    receive
+        .await
+        .map_err(|_| "making the container was cut short".to_string())?
+}
+
 /// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
 async fn start(
-    shared: &Shared,
-    runtime: &Runtime,
+    shared: &std::sync::Arc<Shared>,
+    runtime: &std::sync::Arc<Runtime>,
     logs: &Path,
     mesh: Option<(std::net::Ipv6Addr, &str)>,
     id: &str,
@@ -3492,7 +3521,7 @@ async fn start(
         Run::Exec(e) => &e.resources,
     };
     // What this node's root part does for the units it starts (docs/adr-privilege.md).
-    let root = crate::root_part::Direct::today(&shared.pods, Some(runtime));
+    let root = crate::root_part::Direct::today(&shared.pods, Some(&**runtime));
     let mut unit = Unit {
         env: slot.env.clone()?,
         // (An exec unit is given none: it sees all of `/dev`. A PCI device held for a VM is
@@ -3748,13 +3777,29 @@ async fn start(
                 .map_err(|e| e.to_string())?;
             kith_runtime::timeline::mark("image");
             let (out, err) = (log("out")?, log("err")?);
-            let created = root.create(crate::root_part::Create {
-                id,
-                image: &image,
-                unit: &unit,
-                out,
-                err,
-            });
+            let (shared, runtime, id, unit) = (shared.clone(), runtime.clone(), id.to_string(), unit.clone());
+            let (undo_shared, undo_runtime, undo_id) = (shared.clone(), runtime.clone(), id.clone());
+            let created = blocking_create(
+                move || {
+                    let root = crate::root_part::Direct::today(&shared.pods, Some(&*runtime));
+                    root.create(crate::root_part::Create {
+                        id: &id,
+                        image: &image,
+                        unit: &unit,
+                        out,
+                        err,
+                    })
+                },
+                // Made, and no start left to take it (a stop dropped it): deleted, as a start
+                // that fails is, so no container is left that no slot knows.
+                move |handle| {
+                    let root = crate::root_part::Direct::today(&undo_shared.pods, Some(&*undo_runtime));
+                    if let Err((_, e)) = root.delete(handle, &undo_id) {
+                        eprintln!("kithd: {undo_id}: made as kithd stopped, and not deleted: {e}");
+                    }
+                },
+            )
+            .await;
             // The runtime says what the container would be; here whose word refused it.
             created.map_err(node_root_refusal)
         }
@@ -5081,6 +5126,88 @@ mod tests {
         let left = wait_for_storage(jobs, Duration::from_millis(50)).await;
         assert_eq!(left, ["the removal of pod b"]);
         assert!(wait_for_storage(Vec::new(), Duration::from_millis(50)).await.is_empty());
+    }
+
+    /// A container's create (a chown walk over a big volume) goes through `blocking_create`: the
+    /// thread kithd's tasks run on, a current-thread runtime's only one, keeps ticking meanwhile
+    /// (T-1274).
+    #[test]
+    fn a_create_off_the_async_thread_leaves_it_running() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ticks = rt.block_on(async {
+            let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let ticking = ticks.clone();
+            let ticker = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    ticking.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let made = blocking_create(
+                || {
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok::<_, String>(7)
+                },
+                |_| {},
+            )
+            .await;
+            ticker.abort();
+            assert_eq!(made, Ok(7));
+            ticks.load(Ordering::SeqCst)
+        });
+        assert!(
+            ticks >= 10,
+            "the async thread ticked {ticks} times during a 400 ms create"
+        );
+    }
+
+    /// A create that panics is an error the start returns, not a panic of kithd's.
+    #[tokio::test]
+    async fn a_create_that_panics_is_an_error() {
+        let made: Result<(), String> = blocking_create(|| panic!("the chown walk broke"), |_| {}).await;
+        let why = made.unwrap_err();
+        assert!(
+            why.contains("panicked") && why.contains("the chown walk broke"),
+            "{why}"
+        );
+    }
+
+    /// A stop drops the start while the create runs: what the create makes is deleted, not left
+    /// made with no slot to know it (T-1274).
+    #[tokio::test]
+    async fn a_create_whose_start_was_dropped_is_deleted() {
+        let (made, deleted) = (
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicBool::new(false)),
+        );
+        let (made_in, deleted_in) = (made.clone(), deleted.clone());
+        let start = tokio::spawn(blocking_create(
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                made_in.store(true, Ordering::SeqCst);
+                Ok::<_, String>(7)
+            },
+            move |handle| {
+                assert_eq!(handle, 7);
+                deleted_in.store(true, Ordering::SeqCst);
+            },
+        ));
+        // (Mid-create: the closure is running, its result not yet made.)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!made.load(Ordering::SeqCst));
+        start.abort();
+        let _ = start.await;
+        for _ in 0..100 {
+            if deleted.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(made.load(Ordering::SeqCst), "the create ran to its end");
+        assert!(deleted.load(Ordering::SeqCst), "what it made was deleted");
     }
 
     /// The runtime is handed the descriptor a volume directory is held by, and the path it was

@@ -106,6 +106,7 @@ enum Answer {
     Dir(PathBuf),
     Usage(Option<(u64, u64, u64)>),
     Freed(Option<u64>),
+    Packages(crate::scan::Found),
     /// One descriptor beside the message.
     Socket,
     /// This many descriptors beside the message.
@@ -267,6 +268,7 @@ fn reply(answer: Answer, fds: Vec<OwnedFd>) -> Result<Reply, String> {
         Answer::Done => Reply::Done,
         Answer::Usage(usage) => Reply::Usage(usage),
         Answer::Freed(freed) => Reply::Freed(freed),
+        Answer::Packages(found) => Reply::Packages(found),
         Answer::Pod(given) => Reply::Pod(given),
         Answer::Key(key) => Reply::Key(key),
         Answer::Seen(seen) => Reply::Seen(seen),
@@ -777,6 +779,7 @@ fn unit_or_request<H: Hands>(
         }
         Ok(Reply::Usage(usage)) => Out::ok(Answer::Usage(usage)),
         Ok(Reply::Freed(freed)) => Out::ok(Answer::Freed(freed)),
+        Ok(Reply::Packages(found)) => Out::ok(Answer::Packages(found)),
         Ok(Reply::Pod(given)) => Out::ok(Answer::Pod(given)),
         Ok(Reply::Key(key)) => Out::ok(Answer::Key(key)),
         Ok(Reply::Seen(seen)) => Out::ok(Answer::Seen(seen)),

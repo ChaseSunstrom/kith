@@ -18,6 +18,7 @@ mod outside;
 mod seccomp;
 pub mod signed;
 pub mod timeline;
+mod tlog;
 
 pub use container::*;
 pub use image::{

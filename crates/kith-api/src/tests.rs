@@ -28,7 +28,10 @@ fn passed_on_is_one_list_for_the_nodes_and_the_cli() {
     assert!(passed_on("POST", "/v1/rollback/ConfigMap/default/gone?to=1"));
     // A node's lock record, written for whoever asked it (T-1138: its encryption).
     assert!(passed_on("POST", "/v1/lock/n1/encrypt"));
+    // A scan of an image, asked of the node that has it (T-1256).
+    assert!(passed_on("GET", "/v1/scan/n1?image=docker.io%2Flibrary%2Fdebian%3A12"));
     // Not these: a node's own reads, and the same routes by another method.
+    assert!(!passed_on("GET", "/v1/scan"));
     assert!(!passed_on("GET", "/v1/cluster"));
     assert!(!passed_on("GET", "/v1/resources?namespace=default"));
     assert!(!passed_on("GET", "/v1/apply"));

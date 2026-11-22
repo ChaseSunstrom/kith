@@ -939,6 +939,30 @@ impl Keys {
         }
     }
 
+    /// What a stick's update (`kith.update=`, taken by init) must show: the keys one of which
+    /// signed it, in the order a release is taken (`mine`: given, then kept by a handover, then
+    /// the image's), and the floor it must clear. With no key in the image, nothing is asked
+    /// (whoever can change the command line has the machine). `state_open`: the state is
+    /// mounted; if it is not (encrypted and not yet opened) a handover in it cannot be seen,
+    /// and the image's keys may be retired there: a node that holds keys takes no stick then.
+    pub(crate) fn for_stick(&self, state_open: bool) -> Result<crate::os::Vouch, String> {
+        let image = match &self.image {
+            Some(image) => keys_in(image)?,
+            None => Vec::new(),
+        };
+        let nothing = crate::os::Vouch {
+            keys: Vec::new(),
+            floor: None,
+        };
+        match (image.is_empty(), state_open) {
+            (true, _) => Ok(nothing),
+            (false, false) => Err("this system holds release keys, and the state, where a release may have handed over \
+                                   others, is not open yet: an update from a stick is not taken until it is (use the cluster's)"
+                .into()),
+            (false, true) => Ok(crate::os::Vouch { keys: self.mine()?.0, floor: Some(self.floor.clone()) }),
+        }
+    }
+
     /// Whose keys this node takes releases from, for its status (`os.releaseKeys`). One
     /// it cannot read says `unread`: it takes nothing then.
     fn whose(&self) -> &'static str {
@@ -1166,7 +1190,7 @@ fn floor(file: &Path) -> Result<Option<String>, String> {
 }
 
 /// Refuses a release under the floor.
-fn above(file: &Path, version: &str) -> Result<(), String> {
+pub(crate) fn above(file: &Path, version: &str) -> Result<(), String> {
     match floor(file)? {
         Some(floor) if before(version, &floor) => Err(format!(
             "kith OS {version} is older than {floor}, the newest this node has run well: it takes nothing under \
@@ -1872,6 +1896,39 @@ mod tests {
         let unread = Keys::new(Vec::new(), &dir.join("unread"));
         std::fs::create_dir_all(&unread.kept).unwrap();
         assert!(unread.refused(Some(theirs)).is_err());
+    }
+
+    /// A stick's update (`kith.update=`) is checked by the keys a release is: a key a handover
+    /// retired signs nothing, and the floor is the node's.
+    #[test]
+    fn a_stick_is_vouched_by_the_keys_a_release_is_and_the_floor() {
+        let dir = scratch("stick");
+        let image = dir.join("image-keys");
+        std::fs::write(&image, "# the image's\naa11\nbb22\n").unwrap();
+        let with = |given: Vec<String>| Keys {
+            image: Some(image.clone()),
+            ..Keys::new(given, &dir)
+        };
+        let keys = |keys: &Keys, open| keys.for_stick(open).map(|vouch| vouch.keys);
+        // The image's, and the floor the state keeps.
+        let plain = with(Vec::new());
+        assert_eq!(keys(&plain, true), Ok(vec!["aa11".into(), "bb22".into()]));
+        assert_eq!(plain.for_stick(true).unwrap().floor, Some(dir.join("os-release-floor")));
+        // Keys the config gave (the image's, as vetted) are the ones.
+        assert_eq!(keys(&with(vec!["bb22".into()]), true), Ok(vec!["bb22".into()]));
+        // A handover kept others: the image's key it retired is not taken.
+        crate::pki::write_whole(&plain.kept, b"cc33\n").unwrap();
+        assert_eq!(keys(&plain, true), Ok(vec!["cc33".into()]));
+        // A state that is not open may hold a handover: nothing is taken from a stick then.
+        let why = keys(&plain, false).unwrap_err();
+        assert!(why.contains("not open yet"), "{why}");
+        // An image with no key asks nothing, open or not; and one that cannot be read is no key.
+        std::fs::write(&image, "# none\n").unwrap();
+        assert_eq!(keys(&plain, false), Ok(Vec::new()));
+        assert_eq!(keys(&Keys::new(Vec::new(), &dir), true), Ok(Vec::new()));
+        std::fs::remove_file(&image).unwrap();
+        std::fs::create_dir(&image).unwrap();
+        assert!(keys(&plain, true).is_err());
     }
 
     #[test]
@@ -3363,6 +3420,44 @@ mod tests {
         // 60 seconds from the first wait, though only 10 from the last time the seat was busy.
         let up = vec![busy[0].clone(), voter(node("b", "1", true))];
         assert_eq!(told(&go(Some(&again), &up, 1060)), ["a"]);
+    }
+
+    /// Time a busy seat spends while its node does not fit (another voter is down) counts toward
+    /// `idleWaitSeconds`: the node is let go at once when it fits, the seat still busy. A seat that
+    /// was idle all that time has no count: busy only when the node fits, it waits the whole time.
+    #[test]
+    fn update_idle_wait_counts_a_busy_seat_while_the_node_does_not_fit() {
+        let go = |last: Option<&Decided>, nodes: &[Node], at: u64| {
+            let spec = json!({ "waitForIdleSeats": true, "idleWaitSeconds": 60 });
+            step(&plan(spec, last), Some(("2", "next@1")), nodes, at)
+        };
+        let voter = |a: Node| Node { voter: true, ..a };
+        let down = Node {
+            up: false,
+            ..voter(node("b", "1", true))
+        };
+        let up = voter(node("b", "1", true));
+        // Busy for 100 s with the node held back by `b` being down: its count is 100 s when `b` is back.
+        let held = go(None, &[voter(seated("a", "active")), down.clone()], 1000);
+        assert!(told(&held).is_empty());
+        let held = go(Some(&held), &[voter(seated("a", "active")), down.clone()], 1100);
+        assert_eq!(held.status["idleSince"], json!({ "a": 1000 }));
+        let freed = go(Some(&held), &[voter(seated("a", "active")), up.clone()], 1101);
+        assert_eq!(told(&freed), ["a"]);
+        assert!(
+            freed.status["gaveUp"]["a"]
+                .as_str()
+                .unwrap()
+                .contains("still said active")
+        );
+        // Idle for 100 s while it did not fit, then busy once it does: the count starts there.
+        let idle = go(None, &[voter(node("a", "1", true)), down.clone()], 1000);
+        let idle = go(Some(&idle), &[voter(node("a", "1", true)), down], 1100);
+        assert_eq!(idle.status["idleSince"], json!({}));
+        let busy = go(Some(&idle), &[voter(seated("a", "active")), up.clone()], 1101);
+        // (`a` waits for its seat, so `b`, the other voter, goes first.)
+        assert_eq!(told(&busy), ["b"]);
+        assert_eq!(busy.status["idleSince"], json!({ "a": 1101 }));
     }
 
     /// The wait for a seat counts continuous picking: a pause or a closed window restarts it.

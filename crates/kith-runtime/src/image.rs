@@ -611,6 +611,12 @@ impl ImageStore {
         Ok(self.root.join("refs").join(name))
     }
 
+    /// The image `reference` resolved to last time, if it is still unpacked here: what a pull would
+    /// find already stored, with no pull, no network and nothing written.
+    pub fn here(&self, reference: &str) -> Option<Image> {
+        self.cached(&reference.parse().ok()?)
+    }
+
     /// The image `reference` resolved to last time, if it is still unpacked here.
     fn cached(&self, reference: &Reference) -> Option<Image> {
         let saved = fs::read(self.ref_file(reference).ok()?).ok()?;

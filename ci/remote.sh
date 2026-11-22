@@ -38,6 +38,8 @@ cache_mb=${KITH_REMOTE_CACHE_MB:-30000}
 pending=${KITH_REMOTE_PENDING:-600}
 # (Both are used in arithmetic and in a Job's env: digits, or the run is refused.)
 case $cache_mb$pending in '' | *[!0-9]*) echo "remote.sh: KITH_REMOTE_CACHE_MB and KITH_REMOTE_PENDING are whole numbers" >&2; exit 64 ;; esac
+# (0 would give up on every --vm Job before its first poll.)
+[ "$pending" -ge 1 ] || { echo "remote.sh: KITH_REMOTE_PENDING is at least 1" >&2; exit 64; }
 # (CI's namespace: its Volumes, Jobs and claims, and the one /dev/kvm is granted to.)
 ns=ci
 

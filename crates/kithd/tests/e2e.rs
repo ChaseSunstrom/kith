@@ -736,6 +736,37 @@ fn logs_are_capped_and_removed() {
     });
 }
 
+/// `kith image scan` asks the node (here, the one this kithd is) and does not pull: an image it does not
+/// have is said not to be there, and a name that is no image is refused before any look.
+#[test]
+fn scan_of_an_image_the_node_does_not_have_says_so_and_pulls_nothing() {
+    if !e2e() {
+        return;
+    }
+    let daemon = Daemon::start("scan_not_here");
+    let (code, out, err) = daemon.kith(&["image", "scan", "registry.invalid/none:1", "--node", "alpha"]);
+    assert_eq!((code, out.as_str()), (2, ""), "{err}");
+    assert!(
+        err.contains("registry.invalid/none:1 is not on node alpha") && err.contains("nothing is pulled"),
+        "{err}"
+    );
+    // (No pull: the store has no such image, nor a ref note of one.)
+    for kept in ["images", "refs"] {
+        let names = std::fs::read_dir(daemon.dir.join("state/runtime").join(kept)).unwrap();
+        let names: Vec<_> = names
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| !n.to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(names.is_empty(), "{kept}: {names:?}");
+    }
+    let (code, _, err) = daemon.kith(&["image", "scan", "not an image", "--node", "alpha"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("not an image reference"), "{err}");
+    // A node that is not this one, in a kithd with no cluster... is this one (one node, whatever it is called).
+    let (_, _, err) = daemon.kith(&["image", "scan", "registry.invalid/none:1", "--node", "elsewhere"]);
+    assert!(err.contains("is not on node elsewhere"), "{err}");
+}
+
 #[test]
 fn node_workload_runs_one_copy_alone() {
     if !e2e() {

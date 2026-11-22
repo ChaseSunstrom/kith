@@ -9,7 +9,9 @@
 //! An update is one file: a 4096-byte header (a line of JSON, padded: os/update.sh) and
 //! then the pieces it names, in order. An update the cluster hands out (an OSRelease, see
 //! `update`) must have its header signed by the release's key ([`signed`]); one given
-//! with `kith.update=` is taken on the word of whoever is at the machine's boot menu.
+//! with `kith.update=` must carry a signature by one of the image's release keys after its last
+//! piece ([`stick_trailer`], [`Vouch`]) when the image holds any, and a version over the node's
+//! floor; with none it is taken on the word of whoever is at the machine's boot menu.
 
 use serde::Deserialize;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -296,6 +298,16 @@ pub fn wait(failures: u32) -> std::time::Duration {
 /// Whether the slot this node runs from is marked good: `settle` has found it so, or made it so.
 pub static GOOD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether this node runs from a kith OS slot (set at start, where the command line names one).
+pub static ON_SLOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this node runs from a slot not yet marked good: if it fails before that the node falls
+/// back to its other slot, which may not read a store format this one moves on to (T-0222). False
+/// on any host that is not a kith OS.
+pub fn on_trial() -> bool {
+    ON_SLOT.load(std::sync::atomic::Ordering::Relaxed) && !GOOD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// This node came up from `slot`: mark it good (the boot loader stops counting its
 /// tries), and say what became of a slot that did not come up. What to say is returned.
 /// The count of failed starts is cleared too: this start came up.
@@ -376,9 +388,71 @@ fn mounted<T>(
     Ok(with())
 }
 
+/// What a stick's update must show (see `update::Keys::for_stick`): a signature of its header
+/// by one of `keys` (none: nothing is asked), and a version at or over `floor`'s.
+pub struct Vouch {
+    pub keys: Vec<String>,
+    pub floor: Option<PathBuf>,
+}
+
+/// The signature after a stick update's last piece (`sh os/update.sh --sign KEY UPDATE`,
+/// appended to the file): 128 hex digits, the first on the stick after the pieces and any white
+/// space, and whatever follows is not read (a stick written with `dd` has the device's old
+/// bytes after it). Not checked here: the header it is of is the one `install` reads, see
+/// [`Vouch::vouches`]. Leaves `from` at its start.
+pub fn stick_trailer(from: &mut (impl Read + Seek)) -> Result<String, String> {
+    let mut block = [0; HEADER];
+    from.read_exact(&mut block)
+        .map_err(|e| format!("this is not a kith OS update: {e}"))?;
+    let size = header(&block)?
+        .pieces
+        .iter()
+        .try_fold(HEADER as u64, |at, piece| at.checked_add(piece.size))
+        .ok_or("this update's pieces are larger than any disk")?;
+    let mut trailer = Vec::new();
+    let read = from
+        .seek(SeekFrom::Start(size))
+        .and_then(|_| Read::take(&mut *from, 256).read_to_end(&mut trailer));
+    from.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("reading the update again: {e}"))?;
+    let hex = trailer
+        .trim_ascii_start()
+        .get(..128)
+        .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit));
+    match (read, hex) {
+        (Ok(_), Some(hex)) => Ok(String::from_utf8_lossy(hex).into_owned()),
+        _ => Err("the update is not signed: this node holds release keys, so an update from a stick carries a signature of its header after its last piece".into()),
+    }
+}
+
+impl Vouch {
+    /// For [`install`]: the header it parses (the very bytes, not a second reading of the
+    /// stick) is signed by one of the keys, with `signature` from [`stick_trailer`], and is
+    /// not of a version under the floor.
+    pub fn vouches<'a>(&'a self, signature: &'a str) -> impl FnOnce(&[u8]) -> Result<(), String> + 'a {
+        move |block| {
+            if self.keys.is_empty() {
+                return Ok(());
+            }
+            let by = |key: &String| signed(Some(signature), Some(key))(block).is_ok();
+            if !self.keys.iter().any(by) {
+                return Err("the update's signature is by none of this node's release keys".into());
+            }
+            match &self.floor {
+                Some(floor) => crate::update::above(floor, &header(block)?.version),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
 /// `kith.update=DEVICE`: the update on that disk (a stick, a second disk) goes into the
-/// slot this node does not run from. Nobody vouches for it but whoever plugged it in.
-pub fn update(device: &str, slot: char, running: &str) -> Result<Option<String>, String> {
+/// slot this node does not run from. When the node holds release keys (`vouch`, see
+/// `update::Keys::for_stick`) the stick must carry a signature by one of them
+/// ([`stick_trailer`]) and a version over the floor; with none, nobody vouches for it but
+/// whoever plugged it in. A `vouch` that is an error (keys that cannot be read) refuses.
+pub fn update(device: &str, slot: char, running: &str, vouch: Result<Vouch, String>) -> Result<Option<String>, String> {
+    let vouch = vouch?;
     let device = Path::new("/dev").join(device);
     // ponytail: a stick takes a moment to be there; ten seconds of looking, not an event.
     for _ in 0..100 {
@@ -388,7 +462,12 @@ pub fn update(device: &str, slot: char, running: &str) -> Result<Option<String>,
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let mut from = std::fs::File::open(&device).map_err(|e| format!("{}: {e}", device.display()))?;
-    into_other_slot(&mut from, slot, running, |_| Ok(()))
+    let signature = if vouch.keys.is_empty() {
+        String::new()
+    } else {
+        stick_trailer(&mut from)?
+    };
+    into_other_slot(&mut from, slot, running, vouch.vouches(&signature))
 }
 
 /// The update read from `from` goes into the slot this node (running from `slot`) does not
@@ -775,6 +854,177 @@ mod tests {
         not(
             run(&packed(&other, HASH), Some(&signature), Some(&public), "altered"),
             "not the release's key's",
+        );
+    }
+
+    /// `update` with `signature` (hex, or none) on its end, as `sh os/update.sh --sign` prints it.
+    fn stick(update: &[u8], signature: Option<&str>) -> Vec<u8> {
+        let mut stick = update.to_vec();
+        stick.extend(signature.map(|s| format!("{s}\n")).unwrap_or_default().bytes());
+        stick
+    }
+
+    fn sign(secret: &str, update: &[u8]) -> String {
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&unhex(secret)).unwrap();
+        crate::pki::hex(pair.sign(&update[..HEADER]).as_ref())
+    }
+
+    /// What `update` does with a stick, less the device: the trailer, then `install` with the
+    /// check over the block it parses.
+    fn from_stick(
+        from: &mut (impl Read + Seek),
+        keys: &[String],
+        floor: Option<PathBuf>,
+        test: &str,
+    ) -> Result<Option<String>, String> {
+        let vouch = Vouch {
+            keys: keys.to_vec(),
+            floor,
+        };
+        let signature = if keys.is_empty() {
+            String::new()
+        } else {
+            stick_trailer(from)?
+        };
+        install(from, "kith.slot=a", 'b', &places(test), vouch.vouches(&signature))
+    }
+
+    #[test]
+    fn a_stick_update_is_taken_on_a_trailer_signed_by_an_image_key() {
+        let (secret, public) = kith_packages::artifact::keygen().unwrap();
+        let (_, another) = kith_packages::artifact::keygen().unwrap();
+        let update = packed(&PIECES, HASH);
+        let stick = stick(&update, Some(&sign(&secret, &update)));
+        let keys = [another, public];
+        let mut from = std::io::Cursor::new(&stick);
+        assert_eq!(
+            from_stick(&mut from, &keys, None, "stick-signed"),
+            Ok(Some("9.9".into()))
+        );
+    }
+
+    #[test]
+    fn a_stick_update_is_taken_with_what_a_dd_leaves_after_the_trailer() {
+        let (secret, public) = kith_packages::artifact::keygen().unwrap();
+        let update = packed(&PIECES, HASH);
+        for (left, test) in [(0u8, "dd-zeros"), (0xff, "dd-ones")] {
+            let mut stick = stick(&update, Some(&sign(&secret, &update)));
+            stick.extend([left; 300]);
+            let mut from = std::io::Cursor::new(&stick);
+            assert_eq!(
+                from_stick(&mut from, std::slice::from_ref(&public), None, test),
+                Ok(Some("9.9".into())),
+                "{test}"
+            );
+        }
+        // (White space before the signature is the same: a newline, say, after the last piece.)
+        let mut stick = update.clone();
+        stick.extend(*b"\n\n");
+        stick.extend(sign(&secret, &update).bytes());
+        let mut from = std::io::Cursor::new(&stick);
+        assert_eq!(
+            from_stick(&mut from, &[public], None, "dd-newlines"),
+            Ok(Some("9.9".into()))
+        );
+    }
+
+    #[test]
+    fn a_stick_update_with_no_trailer_or_another_key_is_refused_untouched() {
+        let (secret, public) = kith_packages::artifact::keygen().unwrap();
+        let (other_secret, _) = kith_packages::artifact::keygen().unwrap();
+        let update = packed(&PIECES, HASH);
+        let keys = [public];
+        let mut n = 0;
+        let mut refused = |stick: &[u8]| {
+            n += 1;
+            let mut from = std::io::Cursor::new(stick.to_vec());
+            from_stick(&mut from, &keys, None, &format!("stick-refused-{n}")).unwrap_err()
+        };
+        assert!(refused(&stick(&update, None)).contains("not signed"));
+        assert!(refused(&stick(&update, Some(&sign(&other_secret, &update)))).contains("none of"));
+        assert!(refused(&stick(&update, Some("zz"))).contains("not signed"));
+        let mut short = stick(&update, Some(&sign(&secret, &update)));
+        short.truncate(short.len() - 20);
+        assert!(refused(&short).contains("not signed"));
+        // A signature over another header than the one on the stick.
+        let other: [(&str, &[u8]); 4] = [("root", b"b root"), PIECES[1], PIECES[2], PIECES[3]];
+        let altered = stick(&packed(&other, HASH), Some(&sign(&secret, &update)));
+        assert!(refused(&altered).contains("none of"));
+        // A stick that is no update is refused too; and so is a node whose keys cannot be read.
+        assert!(refused(b"not an update").contains("not a kith OS update"));
+        let unread = update_of(Err("unreadable".into()));
+        assert!(unread.contains("unreadable"));
+    }
+
+    /// `update` with a vouch that is an error: it is refused before any device is looked at.
+    fn update_of(vouch: Result<Vouch, String>) -> String {
+        update("/nonexistent", 'b', "kith.slot=a", vouch).unwrap_err()
+    }
+
+    #[test]
+    fn a_stick_update_is_unchecked_when_the_image_has_no_key() {
+        let update = packed(&PIECES, HASH);
+        let mut from = std::io::Cursor::new(update);
+        assert_eq!(
+            from_stick(&mut from, &[], None, "stick-keyless"),
+            Ok(Some("9.9".into()))
+        );
+    }
+
+    /// A stick that answers with one header the first time it is read and another after it is
+    /// read again from its start: what a device that is changed under the node does.
+    struct Lying {
+        now: std::io::Cursor<Vec<u8>>,
+        then: Vec<u8>,
+    }
+
+    impl Read for Lying {
+        fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+            self.now.read(into)
+        }
+    }
+
+    impl Seek for Lying {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            if to == SeekFrom::Start(0) {
+                self.now = std::io::Cursor::new(self.then.clone());
+            }
+            self.now.seek(to)
+        }
+    }
+
+    #[test]
+    fn a_stick_update_is_vouched_on_the_header_install_reads() {
+        let (secret, public) = kith_packages::artifact::keygen().unwrap();
+        let update = packed(&PIECES, HASH);
+        let signed = stick(&update, Some(&sign(&secret, &update)));
+        // The same pieces and trailer, under a header of another hash: the one install would parse.
+        let mut swapped = signed.clone();
+        swapped[..HEADER].copy_from_slice(&packed(&PIECES, &HASH.replace('0', "1"))[..HEADER]);
+        let mut from = Lying {
+            now: std::io::Cursor::new(signed),
+            then: swapped,
+        };
+        let why = from_stick(&mut from, &[public], None, "stick-lying").unwrap_err();
+        assert!(why.contains("none of"), "{why}");
+    }
+
+    #[test]
+    fn a_stick_update_under_the_floor_is_refused() {
+        let (secret, public) = kith_packages::artifact::keygen().unwrap();
+        let update = packed(&PIECES, HASH);
+        let stick = stick(&update, Some(&sign(&secret, &update)));
+        let floor = places("stick-floor").root.with_file_name("floor");
+        std::fs::write(&floor, "10.0\n").unwrap();
+        let keys = [public];
+        let mut from = std::io::Cursor::new(&stick);
+        let why = from_stick(&mut from, &keys, Some(floor.clone()), "stick-floor-old").unwrap_err();
+        assert!(why.contains("older than 10.0"), "{why}");
+        std::fs::write(&floor, "9.0\n").unwrap();
+        let mut from = std::io::Cursor::new(&stick);
+        assert_eq!(
+            from_stick(&mut from, &keys, Some(floor), "stick-floor-new"),
+            Ok(Some("9.9".into()))
         );
     }
 

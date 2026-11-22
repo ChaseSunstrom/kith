@@ -20,7 +20,7 @@ self_test() {
     # skips, and fails the rest)
     mkdir "$t/w/ci"
     # shellcheck disable=SC2016 # (the stub's)
-    printf '%s\n' '[ "$1" = --test ] || exit 9' 'case $2 in alone) [ "${TAR_OPTIONS-}" = --no-same-owner ] || { echo "vm.sh: FAIL: tar keeps owners"; exit 1; }; [ "${KITH_VM_NO_TPM_LOG-}" = 1 ] || { echo "vm.sh: FAIL: the Job does not say its firmware has no TPM log"; exit 1; }; echo "vm.sh: ok: alone" ;; skipme) echo "skipped: no KVM"; exit 0 ;; *) echo "vm.sh: FAIL: $2"; exit 1 ;; esac' >"$t/w/ci/vm.sh"
+    printf '%s\n' '[ "$1" = --test ] || exit 9' 'case $2 in alone) [ "${TAR_OPTIONS-}" = --no-same-owner ] || { echo "vm.sh: FAIL: tar keeps owners"; exit 1; }; [ "${KITH_VM_NO_TPM_LOG-}" = 1 ] || { echo "vm.sh: FAIL: the Job does not say its firmware has no TPM log"; exit 1; }; [ "${KITH_VM_BUILD_KERNEL-}" = 1 ] || { echo "vm.sh: FAIL: the Job does not allow building the image kernel"; exit 1; }; echo "vm.sh: ok: alone" ;; skipme) echo "skipped: no KVM"; exit 0 ;; *) echo "vm.sh: FAIL: $2"; exit 1 ;; esac' >"$t/w/ci/vm.sh"
     # shellcheck disable=SC2016 # (the stub's)
     printf '%s\n' 'echo "kube.sh $*" >>"$FAKE_RAN"' 'echo "kube.sh: skipped: could not fetch kubectl" >&2' >"$t/w/ci/kube.sh"
     echo three >"$t/w/f" && echo x >"$t/w/g" && git -C "$t/w" add g ci && git -C "$t/w" commit -qam three
@@ -190,7 +190,10 @@ EOF
         env "$v=1;x" sh "$self" --vm alone HEAD >/dev/null 2>&1 || code=$?
         [ "$code" = 64 ] || die "$v=1;x was not refused (exit $code)"
     done
-    ok "a fan Job is held to its timeout, not the pending time; a setting that is not a whole number is refused"
+    code=0
+    env KITH_REMOTE_PENDING=0 sh "$self" --vm alone HEAD >/dev/null 2>&1 || code=$?
+    [ "$code" = 64 ] || die "KITH_REMOTE_PENDING=0 was not refused (exit $code)"
+    ok "a fan Job is held to its timeout, not the pending time; a setting that is not a whole number, or a pending time of 0, is refused"
     # one test per node at a time, each test once: the cluster's answers stubbed, one as it is (a
     # Job named ci-NODE-COMMIT-TEST-TIME starts at its apply and ends at its log)
     : >"$t/sched"

@@ -312,10 +312,21 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
                     "peopleNotes",
                     "alone",
                     "shares",
+                    "encrypted",
                     "seen",
                     "wake",
                 ],
             )?;
+            // (The volume files it holds, by `NAMESPACE/NAME` (a name is at most 63 characters): its keepers
+            // keep their copies of the key while it holds one.)
+            if let Some(files) = fields.get("encrypted") {
+                let names = files.as_array().filter(|names| names.len() <= crate::encrypted::HELD);
+                if !files.is_null()
+                    && !names.is_some_and(|names| names.iter().all(|n| n.as_str().is_some_and(|n| n.len() <= 127)))
+                {
+                    return Err(refused(key, "`encrypted` is null or up to 1024 names"));
+                }
+            }
             // (Which Services it met a connection to, and holds one for: the leader sleeps and wakes by them.)
             for field in ["seen", "wake"] {
                 if let Some(said) = fields.get(field) {
@@ -428,6 +439,20 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
             {
                 Some(blob) => Err(refused(key, format!("the blob {blob} is not one this node made"))),
                 None => Ok(()),
+            }
+        }
+        // Why its encrypted Volume is not open ([`crate::encrypted`]): the node it is on says it,
+        // as text of up to 1 KiB or null, and nothing beside it in that write.
+        "Volume" if fields.contains_key("reason") => {
+            let mine = crate::volumes::encrypted(store, node)
+                .iter()
+                .any(|(dir, _)| key == format!("Volume/{}/{}", dir.namespace, dir.name));
+            // (Text a terminal shows: `kith get` prints it, so no control character.)
+            let text = |why: &str| why.len() <= 1024 && !why.chars().any(char::is_control);
+            let shaped = fields.len() == 1 && fields["reason"].as_str().is_none_or(text);
+            match mine && shaped && (fields["reason"].is_null() || fields["reason"].is_string()) {
+                true => Ok(()),
+                false => Err(refused(key, "`reason` is the text a Volume's node says, written alone")),
             }
         }
         "Volume" => {
