@@ -748,12 +748,19 @@ impl Boot {
     /// Ask for as long as kithd runs (it serves meanwhile). Call inside the runtime.
     pub fn network(self) {
         power_button();
+        let mut asking = std::collections::HashMap::new();
         for card in self.asking {
-            tokio::spawn(crate::dhcp::keep(card, self.name.clone(), got(self.dns, false), || {
-                true
-            }));
+            let index = card.index;
+            let keep = crate::dhcp::keep(
+                card,
+                self.name.clone(),
+                got(self.dns, false, index),
+                || true,
+                |_| Ok(()),
+            );
+            asking.insert(index, tokio::spawn(keep).abort_handle());
         }
-        tokio::spawn(rescan(self.seen, self.fixed, self.name.clone(), self.dns));
+        tokio::spawn(rescan(asking, self.seen, self.fixed, self.name.clone(), self.dns));
         let Some(slot) = self.slot else { return };
         // ponytail: good means kithd started, has its state to use, and is still running a
         // little later (one that cannot start ends, and the machine restarts, well within
@@ -780,13 +787,42 @@ struct Has {
     ntp: bool,
 }
 
-static HAS: std::sync::Mutex<Has> = std::sync::Mutex::new(Has {
-    way: false,
-    dns: false,
-    ntp: false,
-});
+/// What each card (by link index) gave the node: what the node has is what the cards that
+/// are there gave, so a card unplugged takes its part with it.
+#[derive(Default)]
+struct Held(Vec<(u32, Has)>);
 
-fn held() -> std::sync::MutexGuard<'static, Has> {
+impl Held {
+    /// What the node has.
+    fn all(&self) -> Has {
+        self.0.iter().fold(Has::default(), |all, (_, has)| Has {
+            way: all.way || has.way,
+            dns: all.dns || has.dns,
+            ntp: all.ntp || has.ntp,
+        })
+    }
+
+    /// The card `index` gave `more` as well.
+    fn add(&mut self, index: u32, more: Has) {
+        match self.0.iter_mut().find(|(card, _)| *card == index) {
+            Some((_, has)) => {
+                has.way |= more.way;
+                has.dns |= more.dns;
+                has.ntp |= more.ntp;
+            }
+            None => self.0.push((index, more)),
+        }
+    }
+
+    /// The card `index` is gone, and what it gave.
+    fn forget(&mut self, index: u32) {
+        self.0.retain(|(card, _)| *card != index);
+    }
+}
+
+static HAS: std::sync::Mutex<Held> = std::sync::Mutex::new(Held(Vec::new()));
+
+fn held() -> std::sync::MutexGuard<'static, Held> {
     HAS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -813,9 +849,12 @@ fn took(has: Has, may: Has, gave: Has) -> Has {
 
 /// What a lease changes on this node. (A name server on the command line is one the
 /// network's own may not replace.) A card that came `late` changes only what [`may`] allows.
-fn got(told: Option<IpAddr>, late: bool) -> impl Fn(&crate::dhcp::Lease) + Send + 'static {
+/// `index` is the card's: what it gave is kept under it, for when it is unplugged.
+fn got(told: Option<IpAddr>, late: bool, index: u32) -> impl Fn(&crate::dhcp::Lease) + Send + 'static {
     move |lease| {
-        let _ = ADDRESS.set(lease.address);
+        if sets_address(late, ADDRESS.get().is_some()) {
+            let _ = ADDRESS.set(lease.address);
+        }
         let servers: Vec<IpAddr> = match told {
             Some(server) => vec![server],
             None => lease.dns.iter().copied().map(IpAddr::from).collect(),
@@ -825,8 +864,9 @@ fn got(told: Option<IpAddr>, late: bool) -> impl Fn(&crate::dhcp::Lease) + Send 
             dns: !servers.is_empty(),
             ntp: !lease.ntp.is_empty() || lease.router.is_some(),
         };
-        let mut has = held();
-        let may = may(late, *has);
+        let mut held = held();
+        let has = held.all();
+        let may = may(late, has);
         if may.ntp {
             crate::clock::learn(&lease.ntp, lease.router.filter(|_| may.way));
         }
@@ -834,13 +874,63 @@ fn got(told: Option<IpAddr>, late: bool) -> impl Fn(&crate::dhcp::Lease) + Send 
             eprintln!("kithd: init: name servers from the lease: {servers:?}");
             resolvers(&servers);
         }
-        *has = took(*has, may, gave);
+        held.add(index, took(Has::default(), may, gave));
     }
+}
+
+/// Whether a lease sets the address the node tells the cluster it has ([`ADDRESS`], once):
+/// any card of the boot does, a card that came after it only when none has yet.
+fn sets_address(late: bool, set: bool) -> bool {
+    !late || !set
 }
 
 /// May a lease of a card that came after the boot set the default route?
 fn way_for_late() -> bool {
-    may(true, *held()).way
+    may(true, held().all()).way
+}
+
+/// A reason to refuse a lease of `address`/`bits` for the late card `own`, or none: the
+/// kernel gives a card a route to its whole network, so a rogue server's `1.2.3.4/1` would
+/// send half of IPv4 out of the card, and a `/25` of the node's own network, the node's
+/// peers. A late card's network is one in a private block (whole), and no other card's
+/// route (`routes`: link, network, prefix length) covers or is covered by it.
+fn refuse(address: Ipv4Addr, bits: u8, routes: &[(u32, Ipv4Addr, u8)], own: u32) -> Option<&'static str> {
+    let mask = |bits: u8| u32::MAX.checked_shl(32 - u32::from(bits.min(32))).unwrap_or(0);
+    let private = [
+        (Ipv4Addr::new(10, 0, 0, 0), 8),
+        (Ipv4Addr::new(172, 16, 0, 0), 12),
+        (Ipv4Addr::new(192, 168, 0, 0), 16),
+        (Ipv4Addr::new(100, 64, 0, 0), 10),
+        (Ipv4Addr::new(169, 254, 0, 0), 16),
+    ];
+    let inside = |(block, block_bits): &(Ipv4Addr, u8)| {
+        bits >= *block_bits && u32::from(address) & mask(*block_bits) == u32::from(*block)
+    };
+    if !private.iter().any(inside) {
+        return Some("its network is not one of a private block, or is wider than the block");
+    }
+    let overlaps = |(link, network, network_bits): &(u32, Ipv4Addr, u8)| {
+        let both = mask(bits.min(*network_bits));
+        *link != own && u32::from(address) & both == u32::from(*network) & both
+    };
+    routes
+        .iter()
+        .any(overlaps)
+        .then_some("its network overlaps a route the node has")
+}
+
+/// What a late card's lease must pass before it is taken ([`refuse`]).
+fn admit_late(index: u32) -> impl Fn(&crate::dhcp::Lease) -> std::io::Result<()> {
+    move |lease| {
+        let routes = kith_mesh::routes4()?;
+        match refuse(lease.address, lease.bits, &routes, index) {
+            Some(why) => Err(std::io::Error::other(format!(
+                "lease {}/{} refused: {why}",
+                lease.address, lease.bits
+            ))),
+            None => Ok(()),
+        }
+    }
 }
 
 /// The command line's address, and the card it was given to.
@@ -888,28 +978,53 @@ fn physical(card: &kith_mesh::Card) -> bool {
 }
 
 /// Every few seconds look for cards that came after boot: bring each up and ask its network
-/// for an address as the others do, and end the asking of one that is unplugged.
+/// for an address as the others do, and end the asking of one that is unplugged (what it
+/// gave the node is no longer the node's: a card plugged in again may give it anew).
+/// `asking` holds the tasks of the cards of the boot, too.
 //
 // ponytail: a dump of a few links every 5 s, not the kernel's link messages (a netlink
 // multicast socket in kith-mesh): that is for a machine that needs it sooner.
-async fn rescan(mut seen: Vec<u32>, fixed: Option<Fixed>, name: String, dns: Option<IpAddr>) {
-    let mut asking = std::collections::HashMap::<u32, tokio::task::AbortHandle>::new();
+async fn rescan(
+    mut asking: std::collections::HashMap<u32, tokio::task::AbortHandle>,
+    mut seen: Vec<u32>,
+    fixed: Option<Fixed>,
+    name: String,
+    dns: Option<IpAddr>,
+) {
+    // (Said once each: a card that cannot come up, or a listing that fails, is tried every scan.)
+    let (mut cannot, mut listing) = (std::collections::HashSet::<u32>::new(), false);
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let Ok(Ok((found, _))) = tokio::task::spawn_blocking(kith_mesh::cards).await else {
-            continue;
+        let found = match tokio::task::spawn_blocking(kith_mesh::cards).await {
+            Ok(Ok((found, _))) => found,
+            other => {
+                if !std::mem::replace(&mut listing, true) {
+                    let why = other.map_or_else(
+                        |e| e.to_string(),
+                        |e| e.err().map(|e| e.to_string()).unwrap_or_default(),
+                    );
+                    eprintln!("kithd: init: listing the network cards again: {why}");
+                }
+                continue;
+            }
         };
+        listing = false;
         for index in gone(&seen, &found) {
             seen.retain(|seen| *seen != index);
+            held().forget(index);
             if let Some(task) = asking.remove(&index) {
                 task.abort();
             }
         }
+        cannot.retain(|index| found.iter().any(|card| card.index == *index));
         for card in late(&seen, &found, physical) {
             if let Err(e) = kith_mesh::up(card.index) {
-                eprintln!("kithd: init: bringing {} up: {e}", card.name);
+                if cannot.insert(card.index) {
+                    eprintln!("kithd: init: bringing {} up: {e} (tried every 5 s)", card.name);
+                }
                 continue;
             }
+            cannot.remove(&card.index);
             seen.push(card.index);
             if let Some((address, bits, gateway)) = fixed_for(&card, &found, fixed) {
                 match kith_mesh::address4(card.index, address, bits, gateway) {
@@ -929,8 +1044,9 @@ async fn rescan(mut seen: Vec<u32>, fixed: Option<Fixed>, name: String, dns: Opt
                 "kithd: init: {} came after boot: asking its network for an address",
                 card.name
             );
-            let keep = crate::dhcp::keep(card.clone(), name.clone(), got(dns, true), way_for_late);
-            asking.insert(card.index, tokio::spawn(keep).abort_handle());
+            let (index, admit) = (card.index, admit_late(card.index));
+            let keep = crate::dhcp::keep(card, name.clone(), got(dns, true, index), way_for_late, admit);
+            asking.insert(index, tokio::spawn(keep).abort_handle());
         }
     }
 }
@@ -963,11 +1079,12 @@ fn links(options: &Options) -> (Vec<kith_mesh::Card>, Vec<u32>, Option<Fixed>) {
             Err(e) => eprintln!("kithd: init: giving {} {address}/{bits}: {e}", card.name),
         }
         resolvers(&options.dns.into_iter().collect::<Vec<_>>());
-        *held() = Has {
+        let gave = Has {
             way: gateway.is_some(),
             dns: options.dns.is_some(),
             ntp: gateway.is_some(),
         };
+        held().add(card.index, gave);
         let fixed = Fixed {
             mac: card.mac,
             ip: (address, bits, gateway),
@@ -1444,6 +1561,71 @@ mod tests {
             took(none, may(false, none), Has { dns: true, ..none }),
             Has { dns: true, ..none }
         );
+    }
+
+    #[test]
+    fn init_a_card_that_went_supplies_no_more_of_what_it_gave() {
+        let way = Has {
+            way: true,
+            ..Has::default()
+        };
+        let dns = Has {
+            dns: true,
+            ..Has::default()
+        };
+        let mut held = Held::default();
+        held.add(2, way);
+        held.add(3, dns);
+        // With a way out from card 2, a late card may not set another.
+        assert!(!may(true, held.all()).way);
+        // Card 2 is unplugged and comes back as card 4 (late): it may be the way out again,
+        // and what card 3 gave is still the node's.
+        held.forget(2);
+        assert_eq!(held.all(), dns);
+        assert!(may(true, held.all()).way);
+        // A card that gave one thing and then another keeps both until it goes.
+        held.add(3, way);
+        assert_eq!(
+            held.all(),
+            Has {
+                way: true,
+                dns: true,
+                ntp: false
+            }
+        );
+        held.forget(3);
+        assert_eq!(held.all(), Has::default());
+    }
+
+    #[test]
+    fn init_a_late_card_may_not_name_the_node_before_a_boot_card_does() {
+        assert!(sets_address(false, true));
+        assert!(sets_address(false, false));
+        assert!(sets_address(true, false));
+        assert!(!sets_address(true, true));
+    }
+
+    #[test]
+    fn init_late_lease_of_a_network_that_covers_the_nodes_is_refused() {
+        let ip = |a, b, c, d| Ipv4Addr::new(a, b, c, d);
+        // The node: eth0 (index 1) on 10.0.2.0/24.
+        let routes = [(1, ip(10, 0, 2, 0), 24)];
+        let own = 5;
+        // A network of its own in a private block: taken.
+        assert_eq!(refuse(ip(10, 0, 3, 15), 24, &routes, own), None);
+        assert_eq!(refuse(ip(192, 168, 1, 5), 24, &routes, own), None);
+        // Half of IPv4, or a network of a public name server's: not.
+        assert!(refuse(ip(1, 2, 3, 4), 1, &routes, own).is_some());
+        assert!(refuse(ip(8, 8, 8, 8), 24, &routes, own).is_some());
+        // A private address with a mask wider than its block's.
+        assert!(refuse(ip(10, 0, 3, 15), 4, &routes, own).is_some());
+        assert!(refuse(ip(192, 168, 1, 5), 8, &routes, own).is_some());
+        // The node's own network, or a part of it, or one that holds it.
+        assert!(refuse(ip(10, 0, 2, 77), 24, &routes, own).is_some());
+        assert!(refuse(ip(10, 0, 2, 130), 25, &routes, own).is_some());
+        assert!(refuse(ip(10, 1, 2, 3), 8, &routes, own).is_some());
+        // The card's own route (a renewal of the same lease) is not another's.
+        assert_eq!(refuse(ip(10, 0, 3, 15), 24, &[(own, ip(10, 0, 3, 0), 24)], own), None);
     }
 
     #[test]

@@ -610,6 +610,33 @@ pub fn address4(index: u32, address: std::net::Ipv4Addr, bits: u8, gateway: Opti
     ask_route(RouteNetlinkMessage::NewRoute(route), flags).map(drop)
 }
 
+/// The IPv4 routes of the main table that are not the default one: the link each goes out
+/// by, its network and its prefix length.
+pub fn routes4() -> Result<Vec<(u32, Ipv4Addr, u8)>> {
+    use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
+    let mut asked = RouteMessage::default();
+    asked.header.address_family = AddressFamily::Inet;
+    let found = ask_route(RouteNetlinkMessage::GetRoute(asked), NLM_F_DUMP)?;
+    Ok(found
+        .into_iter()
+        .filter_map(|found| {
+            let RouteNetlinkMessage::NewRoute(route) = found else {
+                return None;
+            };
+            let (mut to, mut by) = (None, 0);
+            for attribute in route.attributes {
+                match attribute {
+                    RouteAttribute::Destination(RouteAddress::Inet(a)) => to = Some(a),
+                    RouteAttribute::Oif(index) => by = index,
+                    _ => {}
+                }
+            }
+            let bits = route.header.destination_prefix_length;
+            (route.header.table == 254 && bits > 0).then_some((by, to?, bits))
+        })
+        .collect())
+}
+
 /// The label kith puts on the gateway it holds on the loopback (a label of the loopback's
 /// must begin with its name).
 const GATEWAY_LABEL: &str = "lo:kith";

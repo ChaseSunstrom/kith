@@ -11,6 +11,7 @@
         [ "$test" != kube ] || [ -x "$kubectl" ] || skip "no kubectl (KITH_KUBECTL names one; sh ci/kube.sh --vm fetches one)"
         [ "$test" != quota ] || command -v socat >/dev/null 2>&1 || skip "no socat to restart a node with"
         [ "$test" != home ] || command -v socat >/dev/null 2>&1 || skip "no socat to reset and stop a node with"
+        [ "$test" != latecard ] || command -v socat >/dev/null 2>&1 || skip "no socat to plug a card in with"
         if [ "$test" = pods ]; then
             command -v socat >/dev/null 2>&1 || skip "no socat to plug a keyboard in with"
         fi

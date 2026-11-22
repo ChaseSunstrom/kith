@@ -41,7 +41,8 @@
 //!   pod tick [N]               say which process it is and when it started, then `tick N`
 //!                              each second, for as long as it runs (or N times, then end)
 //!   pod net                    run on a node: its global IPv6 addresses (SLAAC), its cards
-//!                              ("link: NAME") and the name servers in /run/resolv.conf, a line each
+//!                              ("link: NAME"), its default routes ("default: IFACE GATEWAY") and
+//!                              the name servers in /run/resolv.conf, a line each
 //!   pod memory                 run on a node: process 1's and kithd's resident memory
 //!                              ("memory: PID COMM VmRSS RssAnon", kB)
 //!   pod kill N SECONDS         run on a node (an exec unit): N times, SECONDS apart, kill
@@ -927,6 +928,15 @@ fn main() {
             let dev = std::fs::read_to_string("/proc/net/dev").unwrap_or_default();
             for name in dev.lines().filter_map(|l| l.split_once(':')).map(|(n, _)| n.trim()) {
                 println!("link: {name}");
+            }
+            // ("default: IFACE GATEWAY" for each default route: the gateway as /proc/net/route's
+            // hex, the bytes of the address from the first, so 10.0.2.2 is 0202000A.)
+            let routes = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+            for line in routes.lines().skip(1) {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() > 7 && f[1] == "00000000" && f[7] == "00000000" {
+                    println!("default: {} {}", f[0], f[2]);
+                }
             }
             let resolv = std::fs::read_to_string("/run/resolv.conf");
             println!("file: /run/resolv.conf {resolv:?}");
