@@ -396,6 +396,15 @@ else
     grep -qxF '# CONFIG_UHID is not set' "$built" ||
         die "a shipped kernel's .config must say '# CONFIG_UHID is not set' (only --spec with the feature uhid-test has /dev/uhid): $(grep 'CONFIG_UHID' "$built" || echo 'no CONFIG_UHID line')"
 fi
+# No kexec (a privileged workload could load an unsigned kernel past verity and the slots), and
+# the kernel locked down at integrity: a missing line (an option the tree does not know) fails too.
+grep -qxF '# CONFIG_KEXEC is not set' "$built" ||
+    die "the kernel's .config must say '# CONFIG_KEXEC is not set': $(grep '^CONFIG_KEXEC=' "$built" || echo 'no CONFIG_KEXEC line')"
+grep -qxF '# CONFIG_KEXEC_FILE is not set' "$built" ||
+    die "the kernel's .config must say '# CONFIG_KEXEC_FILE is not set': $(grep '^CONFIG_KEXEC_FILE=' "$built" || echo 'no CONFIG_KEXEC_FILE line')"
+for want_on in CONFIG_SECURITY_LOCKDOWN_LSM=y CONFIG_LOCK_DOWN_KERNEL_FORCE_INTEGRITY=y; do
+    grep -qxF "$want_on" "$built" || die "the kernel's .config has no $want_on (kernel lockdown at integrity)"
+done
 if [ -n "$modules" ]; then
     # What the modules ask for, from linux-firmware: the whole of it for `all`, and the files
     # named in the spec. The list is kept; the tarball (640 MB) is read once, into a tree.
