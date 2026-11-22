@@ -569,7 +569,16 @@ Write `kith-os-installer.raw` to a USB stick (`dd if=kith-os-installer.raw of=/d
 attach it to a VM as its first disk, and start the machine from it (UEFI). It is kith OS started
 with `kith.install`: it serves nothing, and asks on the screen and the serial line alike. Its
 root and verity tree are labelled `install-root` and `install-verity`, not `root-a`, so it starts
-from the stick on a machine whose disk already has kith OS, and installs over it:
+from the stick on a machine whose disk already has kith OS, and installs over it.
+
+A machine or hypervisor that only takes a CD image (UEFI only, 1 GB of memory) takes
+`kith-installer.iso`, which `sh os/build.sh` writes beside it (needs xorriso): an El Torito entry
+for EFI whose boot file is the in-memory one `kith node netboot` serves (`kith-netboot.efi`, with
+the kernel and the installer in it). It asks at the console as from a stick; a CD holds no
+answers and is no disk to install on, so for an unattended install use the stick, netboot or
+`os/vps.sh`. It is not a USB image (no BIOS boot, no hybrid table); the stick is `kith-os-installer.raw`.
+
+The questions, as the stick asks them:
 
 ```
 This machine's disks:

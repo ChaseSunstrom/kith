@@ -173,6 +173,19 @@ sys.exit(1)
         hears nodisk 'kithd: install: nothing was installed: this machine has no disk to install on'
         kill "$vm"
 
+        # The CD image (T-0105): started as a CD from OVMF it asks its question as from a stick, and
+        # lists the one empty disk but not the CD it started from. (1 GB: the kernel and the installer are in memory.)
+        iso=$root/target/os/kith-installer.iso
+        [ -r "$iso" ] || fail "no $iso: sh os/build.sh makes it"
+        blank iso
+        # shellcheck disable=SC2046
+        vm iso -m 1024 -drive "file=$iso,format=raw,media=cdrom,readonly=on" $(drive iso.disk)
+        hears iso 'Install kith OS on which'
+        sed -n "/This machine's disks:/,/Install kith OS on which/p" "$work/iso.log" >"$work/iso.disks"
+        grep -aq '^  vda ' "$work/iso.disks" || fail "the installer started from the CD does not list the empty disk"
+        [ "$(grep -ac '^  [a-z]' "$work/iso.disks")" -eq 1 ] || fail "the installer started from the CD lists a disk besides the empty one: $(cat "$work/iso.disks")"
+        kill "$vm"
+
         # Answers on the stick: the only disk, a name, a fixed address, a new cluster.
         blank alpha
         # (The picture is drawn whatever the answers' source: the disk written part of the way,
@@ -310,5 +323,5 @@ if colours.most_common(1)[0][0] != paper or colours[accent] < 100:
             [ "$tries" -lt 150 ] || fail "the node installed with a join token is not in alpha's cluster"
             sleep 0.2
         done
-        echo "vm.sh: ok: no disk, nothing installed; from answers on the stick, a node (alpha) that starts a cluster at its fixed address; from a URL, onto the one of two disks its serial names, a node (beta, $first) that asks its network and keeps its state; from the console, after a slip that wrote nothing, a node (gamma) that joined alpha's cluster by token"
+        echo "vm.sh: ok: no disk, nothing installed; from the CD image, the question with the disk but not the CD listed; from answers on the stick, a node (alpha) that starts a cluster at its fixed address; from a URL, onto the one of two disks its serial names, a node (beta, $first) that asks its network and keeps its state; from the console, after a slip that wrote nothing, a node (gamma) that joined alpha's cluster by token"
         exit 0

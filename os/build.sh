@@ -16,7 +16,7 @@
 #     carries the first one whole, to copy to a machine's disk.
 #
 # Nothing needs root, nothing outside --out and the cache is written, and no disk is
-# touched: the result is files, kith-os.raw, kith-os.qcow2 and kith-os-installer.raw.
+# touched: the result is files, kith-os.raw, kith-os.qcow2, kith-os-installer.raw and kith-installer.iso.
 set -eu
 
 kernel_version=6.18.63
@@ -52,7 +52,9 @@ Builds DIR/kith-os.raw, DIR/kith-os.qcow2 and the installer, DIR/kith-os-install
 (default DIR: target/os).
 For a machine that is only reached through the system it runs: DIR/vmlinuz,
 DIR/kith-install.cpio.zst and DIR/vps.sh (see os/vps.sh). For machines started from
-the network by a node (`kith node netboot`): DIR/kith-netboot.efi.
+the network by a node (`kith node netboot`): DIR/kith-netboot.efi. For a machine or a
+hypervisor that only takes a CD image (UEFI, 1 GB of memory): DIR/kith-installer.iso, that
+file as the El Torito EFI boot image; the installer asks its questions at the console.
 Beside them, DIR/kith-os.update: what a running node is given to become this version
 (it writes it into its other slot). KITH_OS_VERSION names the version built (default:
 the workspace's). KITH_RELEASE_KEY (hex keys, commas between) are the keys its nodes take
@@ -85,7 +87,7 @@ The first build compiles the kernel (ten minutes or so) and keeps it in
 $KITH_OS_CACHE (default ~/.cache/kith-os), keyed by its version, its config and the
 compiler; later builds take seconds. Needs: gcc, make, flex, bison, bc, cargo, a musl C
 compiler or zig, mksquashfs, veritysetup, objcopy, systemd-repart with systemd's EFI
-stub and systemd-boot, mkfs.vfat, mcopy (mtools), mkfs.ext4, qemu-img, curl, cpio, zstd. Where bc
+stub and systemd-boot, mkfs.vfat, mcopy and mmd (mtools), xorriso, mkfs.ext4, qemu-img, curl, cpio, zstd. Where bc
 or mcopy is missing and nix is there, they come from nix.
 EOF
 }
@@ -164,7 +166,7 @@ if ! command -v bc >/dev/null 2>&1 || ! command -v mcopy >/dev/null 2>&1; then
     fi
     lacks "bc and mcopy (mtools)"
 fi
-for tool in gcc make flex bison cargo flock objdump sfdisk mksquashfs veritysetup objcopy systemd-repart mkfs.vfat mkfs.ext4 qemu-img curl cpio zstd; do
+for tool in gcc make flex bison cargo flock objdump sfdisk mksquashfs veritysetup objcopy systemd-repart mkfs.vfat xorriso mkfs.ext4 qemu-img curl cpio zstd; do
     command -v "$tool" >/dev/null 2>&1 || lacks "$tool"
 done
 if [ -n "$sbdir" ]; then
@@ -855,6 +857,21 @@ assemble() { # DIR
         --add-section .initrd="$w/netboot.initrd" --change-section-vma .initrd="$initrd_at" \
         "$efi/linuxx64.efi.stub" "$w/kith-netboot.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-netboot.efi"
+
+    # For a machine or hypervisor that takes only a CD image (T-0105): the same file as the
+    # one boot image of an El Torito entry for UEFI, a FAT image the size of the file and 4 MB.
+    # The installer asks at the console, as from a stick: a CD cannot hold answers.
+    cd_dir=$w/iso
+    mkdir "$cd_dir"
+    cd_size=$((($(stat -c %s "$w/kith-netboot.efi") + 4 * 1024 * 1024 + 1024 * 1024 - 1) / 1024 / 1024 * 1024 * 1024))
+    truncate -s "$cd_size" "$cd_dir/efi.img"
+    mkfs.vfat --invariant -i 6B697461 -n KITH-ISO "$cd_dir/efi.img" >/dev/null
+    mmd -i "$cd_dir/efi.img" ::EFI ::EFI/BOOT
+    mcopy -m -i "$cd_dir/efi.img" "$w/kith-netboot.efi" ::EFI/BOOT/BOOTX64.EFI
+    touch -d "@$SOURCE_DATE_EPOCH" "$cd_dir/efi.img" "$cd_dir"
+    xorriso -as mkisofs -iso-level 3 -V KITH-INST -e efi.img -no-emul-boot -o "$w/kith-installer.iso" "$cd_dir" >"$w/xorriso.log" 2>&1 \
+        || { cat "$w/xorriso.log" >&2; die "xorriso failed"; }
+    find "$cd_dir" -delete
     # (With the firmware the root dir is a GB the image has: kept only where it is small.)
     [ -z "$rootmods" ] || find "$r" -delete
 }
@@ -871,7 +888,7 @@ if [ -n "$check" ]; then
 fi
 if [ -n "$twice" ]; then
     assemble "$out/again"
-    for piece in root.squashfs root.verity kith-a.efi kith-b.efi kith-install.efi kith-os.update esp.img kith-os.raw kith-os-installer.raw kith-install.cpio.zst kith-netboot.efi; do
+    for piece in root.squashfs root.verity kith-a.efi kith-b.efi kith-install.efi kith-os.update esp.img kith-os.raw kith-os-installer.raw kith-install.cpio.zst kith-netboot.efi kith-installer.iso; do
         cmp "$out/$piece" "$out/again/$piece" || die "$piece differs between two builds"
     done
     [ -z "$mstate" ] || for piece in kith-modules.img kith-modules.img.verity; do
