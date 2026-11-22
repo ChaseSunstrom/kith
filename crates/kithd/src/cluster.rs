@@ -868,9 +868,12 @@ async fn members_only(
             let raft = path.starts_with("/v1/raft/");
             let mut answer = next.run(request).await;
             if raft {
-                answer
-                    .headers_mut()
-                    .insert(crate::raft::READS, kith_store::FORMAT.into());
+                let current =
+                    kith_store::format_of(&shared.store.lock().expect("nothing panics holding the store").store);
+                answer.headers_mut().insert(
+                    crate::raft::READS,
+                    crate::raft::reads(current, crate::os::on_trial()).into(),
+                );
             }
             return answer;
         }

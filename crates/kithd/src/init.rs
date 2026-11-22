@@ -758,6 +758,7 @@ impl Boot {
             tokio::spawn(crate::dhcp::keep(card, self.name.clone(), got));
         }
         let Some(slot) = self.slot else { return };
+        crate::os::ON_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
         // ponytail: good means kithd started, has its state to use, and is still running a
         // little later (one that cannot start ends, and the machine restarts, well within
         // that). Whether the node is healthy in its cluster is the update plan's to judge
