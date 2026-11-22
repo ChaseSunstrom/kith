@@ -140,9 +140,22 @@ fn machine_create_never_overwrites_what_is_not_its_own() {
     assert!(err.contains("other settings"), "{err}");
     assert!(sb.kith(&args("dev", "alpine")).1.contains("unchanged"));
     // Another home, the Volume kept: named, and what changes it says it deletes.
-    let (code, _, err) = sb.kith(&["machine", "create", "dev", "--node", "alpha", "--distro", "alpine", "--replicas", "3"]);
+    let (code, _, err) = sb.kith(&[
+        "machine",
+        "create",
+        "dev",
+        "--node",
+        "alpha",
+        "--distro",
+        "alpine",
+        "--replicas",
+        "3",
+    ]);
     assert_eq!(code, 2);
-    assert!(err.contains("dev-home") && err.contains("rm dev --purge") && err.contains("data"), "{err}");
+    assert!(
+        err.contains("dev-home") && err.contains("rm dev --purge") && err.contains("data"),
+        "{err}"
+    );
     // A home that is copied nowhere is not what a machine is.
     let (code, _, err) = sb.kith(&["machine", "create", "one", "--replicas", "1", "--node", "alpha"]);
     assert_eq!(code, 2);
@@ -332,7 +345,7 @@ fn fake_kithd(dir: &Path, workload: String) -> (PathBuf, mpsc::Receiver<Seen>, m
             if !path.contains("/exec") {
                 let (code, body) = match path.as_str() {
                     "/v1/resources/Workload/default/dev" => ("200 OK", workload.clone()),
-                    _ => ("404 Not Found", r#"{"error":"nothing here"}"#.to_string()),
+                    _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
                 };
                 let reply = format!(
                     "HTTP/1.1 {code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -622,5 +635,8 @@ fn machine_get_error_is_not_absent() {
         assert!(!String::from_utf8_lossy(&out.stdout).contains("deleted"));
     }
     let seen = seen.lock().unwrap();
-    assert!(seen.iter().all(|l| l.starts_with("GET ")), "only reads were sent: {seen:?}");
+    assert!(
+        seen.iter().all(|l| l.starts_with("GET ")),
+        "only reads were sent: {seen:?}"
+    );
 }

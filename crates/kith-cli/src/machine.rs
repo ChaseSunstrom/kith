@@ -285,7 +285,9 @@ pub fn run(command: Machine, backend: &dyn Fn() -> Result<Backend, String>) -> R
                 if purge {
                     String::new()
                 } else {
-                    format!(" (its home Volume {volume} stays; `kith machine rm {name} --purge` deletes it, data and all)")
+                    format!(
+                        " (its home Volume {volume} stays; `kith machine rm {name} --purge` deletes it, data and all)"
+                    )
                 }
             );
         }
