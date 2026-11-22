@@ -57,6 +57,33 @@ fn every_guide_is_read() {
     );
 }
 
+/// The guide's docker section says what streams (T-1261): logs, run in front and exec work, and stdin
+/// to a container's main process is refused, with the reason and the way round it.
+#[test]
+fn the_docker_section_says_what_streams_and_what_stdin_is_refused() {
+    let guide = DOCS.iter().find(|(path, _)| path.ends_with("kubernetes.md")).unwrap().1;
+    let section = guide
+        .split("\n## ")
+        .find(|s| s.starts_with("The docker command"))
+        .expect("kubernetes.md has no section on the docker command");
+    for said in [
+        "docker logs",
+        "docker run IMAGE CMD",
+        "docker exec",
+        "exit code",
+        "`docker run -i`",
+        "`docker attach` with stdin",
+        "no input",
+        "`docker exec -i`",
+    ] {
+        assert!(section.contains(said), "the docker section does not say: {said}");
+    }
+    assert!(
+        !section.contains("waits for step 3"),
+        "the docker section still says run without -d waits"
+    );
+}
+
 /// The front page says how a compose stack becomes kith's and names each key the reader
 /// refuses: the names are read from compose.rs's REFUSED, so the list cannot drift from it.
 #[test]

@@ -30,7 +30,10 @@ const SHELL: &str = "if command -v bash >/dev/null 2>&1; then exec bash; else ex
 
 // kithd's own frame code (one file, no dependency), so both ends of the wire read and write alike.
 #[path = "../../../kithd/src/websocket/frame.rs"]
-#[allow(dead_code, reason = "kithd's file: what it holds for the server's side is not used here")]
+#[allow(
+    dead_code,
+    reason = "kithd's file: what it holds for the server's side is not used here"
+)]
 mod frame;
 use frame::{Frame, Op};
 
@@ -49,7 +52,9 @@ fn decode(buf: &[u8]) -> Result<Option<(Frame, usize)>, String> {
         return fail("kithd sent a frame in parts, which this kith cannot read");
     }
     match frame::decode(buf, false, FRAME_MAX) {
-        Ok(Some((frame, _))) if frame.op == Op::Continue => fail("kithd sent a frame in parts, which this kith cannot read"),
+        Ok(Some((frame, _))) if frame.op == Op::Continue => {
+            fail("kithd sent a frame in parts, which this kith cannot read")
+        }
         Ok(found) => Ok(found),
         Err(e) => fail(format!("kithd sent a frame this kith refuses: {e:?}")),
     }
@@ -81,19 +86,23 @@ impl Drop for Raw {
 
 /// What kithd's Status on channel 3 says: the shell's exit code, or why there is none.
 fn outcome(status: &[u8]) -> Result<ExitCode, String> {
+    exit_code(status).map(|code| u8::try_from(code).map_or(ExitCode::FAILURE, ExitCode::from))
+}
+
+/// The same as a number (a code outside a process's own range is returned as it is).
+fn exit_code(status: &[u8]) -> Result<i64, String> {
     let status: Value = serde_json::from_slice(status).or_else(|e| fail(format!("kithd's status: {e}")))?;
     if status["status"] == "Success" {
-        return Ok(ExitCode::SUCCESS);
+        return Ok(0);
     }
     let code = status["details"]["causes"]
         .as_array()
         .into_iter()
         .flatten()
         .find(|cause| cause["reason"] == "ExitCode")
-        .and_then(|cause| cause["message"].as_str()?.parse::<i32>().ok());
+        .and_then(|cause| cause["message"].as_str()?.parse::<i64>().ok());
     match code {
-        // (A code outside a process's own range is a failure, never a success.)
-        Some(code) => Ok(ExitCode::from(u8::try_from(code).unwrap_or(1))),
+        Some(code) => Ok(code),
         None => fail(status["message"].as_str().unwrap_or("the command did not run")),
     }
 }
@@ -101,7 +110,9 @@ fn outcome(status: &[u8]) -> Result<ExitCode, String> {
 /// What a reply that is not an upgrade says: a Status's message, or `{"error": …}`, or the text.
 fn why(body: &[u8]) -> String {
     let said = serde_json::from_slice::<Value>(body).ok();
-    let said = said.as_ref().and_then(|v| v["message"].as_str().or(v["error"].as_str()));
+    let said = said
+        .as_ref()
+        .and_then(|v| v["message"].as_str().or(v["error"].as_str()));
     said.map_or_else(|| String::from_utf8_lossy(body).trim().to_string(), String::from)
 }
 
@@ -117,7 +128,8 @@ fn upgrade(wire: &mut crate::wire::Wire, path: &str) -> Result<Vec<u8>, String> 
          Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Protocol: {PROTOCOL}\r\n\r\n",
         base64(&key)
     );
-    wire.write_all(head.as_bytes()).or_else(|e| fail(format!("talking to kithd: {e}")))?;
+    wire.write_all(head.as_bytes())
+        .or_else(|e| fail(format!("talking to kithd: {e}")))?;
     let (mut reply, mut chunk) = (Vec::new(), [0u8; 4096]);
     let split = loop {
         if let Some(at) = reply.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -208,14 +220,23 @@ fn run(kithd: &Kithd, name: &str, root: bool, argv: Vec<String>) -> Result<ExitC
     let mut wire = connect(kithd)?;
     let mut buf = upgrade(&mut wire, &path)?;
     // A shell is idle as long as its user is: there is no timeout on it (the terminal's hangup ends it).
-    wire.set_patience(None).or_else(|e| fail(format!("talking to kithd: {e}")))?;
-    let to = Arc::new(Mutex::new(wire.dup().or_else(|e| fail(format!("talking to kithd: {e}")))?));
+    wire.set_patience(None)
+        .or_else(|e| fail(format!("talking to kithd: {e}")))?;
+    let to = Arc::new(Mutex::new(
+        wire.dup().or_else(|e| fail(format!("talking to kithd: {e}")))?,
+    ));
 
     // Signals are taken by a thread of their own (blocked here, before any other thread is made):
     // the window follows, and a hangup or a kill puts the terminal back before it ends this.
     let guard = if tty {
         let mut set = SigSet::empty();
-        for signal in [Signal::SIGWINCH, Signal::SIGHUP, Signal::SIGTERM, Signal::SIGINT, Signal::SIGQUIT] {
+        for signal in [
+            Signal::SIGWINCH,
+            Signal::SIGHUP,
+            Signal::SIGTERM,
+            Signal::SIGINT,
+            Signal::SIGQUIT,
+        ] {
             set.add(signal);
         }
         set.thread_block().or_else(|e| fail(format!("signals: {e}")))?;
@@ -279,7 +300,10 @@ fn pump(wire: &mut crate::wire::Wire, to: &Mutex<crate::wire::Wire>, buf: &mut V
                 (Op::Close, _) => break 'read,
                 (Op::Ping, _) => send(to, encode(Op::Pong, &payload)?)?,
                 (Op::Text | Op::Binary, Some((1, data))) => {
-                    stdout.write_all(data).and_then(|()| stdout.flush()).or_else(|e| fail(format!("stdout: {e}")))?;
+                    stdout
+                        .write_all(data)
+                        .and_then(|()| stdout.flush())
+                        .or_else(|e| fail(format!("stdout: {e}")))?;
                 }
                 (Op::Text | Op::Binary, Some((2, data))) => {
                     stderr.write_all(data).or_else(|e| fail(format!("stderr: {e}")))?;
@@ -303,6 +327,107 @@ fn pump(wire: &mut crate::wire::Wire, to: &Mutex<crate::wire::Wire>, buf: &mut V
     ended.unwrap_or_else(|| fail("kithd ended the session before the command did"))
 }
 
+/// `command` in the pod `pod` of the docker front's namespace (T-1261): what `docker exec` runs.
+/// The session's events are what kithd's frames say (output, then the Status as the code), and
+/// what is sent to its input goes to kithd as stdin, the end of stdin, the window, or the end.
+#[cfg(feature = "docker")]
+pub fn session(
+    kithd: &Kithd,
+    pod: &str,
+    command: &[String],
+    tty: bool,
+    stdin: bool,
+) -> Result<kith_docker::Session, String> {
+    use kith_docker::{Event, Input};
+    let mut query = vec![format!("tty={tty}"), format!("stdin={stdin}"), "stdout=true".into()];
+    if !tty {
+        query.push("stderr=true".into());
+    }
+    query.extend(command.iter().map(|word| format!("command={}", escape(word))));
+    let path = format!(
+        "/api/v1/namespaces/{}/pods/{}/exec?{}",
+        kith_docker::NAMESPACE,
+        escape(pod),
+        query.join("&")
+    );
+    let mut wire = connect(kithd)?;
+    let mut buf = upgrade(&mut wire, &path)?;
+    // (An exec is idle as long as its command is quiet: the client hanging up ends it.)
+    wire.set_patience(None)
+        .or_else(|e| fail(format!("talking to kithd: {e}")))?;
+    let to = Arc::new(Mutex::new(
+        wire.dup().or_else(|e| fail(format!("talking to kithd: {e}")))?,
+    ));
+    let (events, seen) = std::sync::mpsc::channel();
+    let (input, typed) = std::sync::mpsc::channel();
+
+    let (reply, hangup) = (to.clone(), events.clone());
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        let ended = 'read: loop {
+            loop {
+                let (Frame { op, payload }, used) = match decode(&buf) {
+                    Ok(Some(found)) => found,
+                    Ok(None) => break,
+                    Err(e) => break 'read Event::Failed(e),
+                };
+                buf.drain(..used);
+                match (op, payload.split_first()) {
+                    (Op::Close, _) => {
+                        break 'read Event::Failed("kithd ended the session before the command did".into());
+                    }
+                    (Op::Ping, _) => {
+                        if let Err(e) = encode(Op::Pong, &payload).and_then(|frame| send(&reply, frame)) {
+                            break 'read Event::Failed(e);
+                        }
+                    }
+                    (Op::Text | Op::Binary, Some((1, data))) => {
+                        if events.send(Event::Out(data.to_vec())).is_err() {
+                            break 'read Event::Failed(String::new());
+                        }
+                    }
+                    (Op::Text | Op::Binary, Some((2, data))) => {
+                        if events.send(Event::Err(data.to_vec())).is_err() {
+                            break 'read Event::Failed(String::new());
+                        }
+                    }
+                    (Op::Text | Op::Binary, Some((3, status))) => {
+                        break 'read exit_code(status).map_or_else(Event::Failed, Event::Done);
+                    }
+                    _ => {}
+                }
+            }
+            match wire.read(&mut chunk) {
+                Ok(0) => break Event::Failed("kithd ended the session before the command did".into()),
+                Ok(n) => buf.extend(&chunk[..n]),
+                Err(e) => break Event::Failed(format!("talking to kithd: {e}")),
+            }
+        };
+        let _ = hangup.send(ended);
+        let _ = encode(Op::Close, &frame::close_body(1000, "")).and_then(|frame| send(&reply, frame));
+        wire.end();
+    });
+
+    let out = to.clone();
+    std::thread::spawn(move || {
+        while let Ok(next) = typed.recv() {
+            let frame = match next {
+                Input::Data(data) => channel(0, &data),
+                Input::End => channel(255, &[0]),
+                Input::Resize(width, height) => {
+                    channel(4, json!({"Width": width, "Height": height}).to_string().as_bytes())
+                }
+                Input::Close => break,
+            };
+            if frame.and_then(|frame| send(&out, frame)).is_err() {
+                return;
+            }
+        }
+        let _ = encode(Op::Close, &frame::close_body(1000, "")).and_then(|frame| send(&out, frame));
+    });
+    Ok(kith_docker::Session { events: seen, input })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,12 +443,21 @@ mod tests {
         let from_server = [&[0x82, 3][..], b"\x01ab"].concat();
         assert_eq!(
             decode(&from_server).unwrap(),
-            Some((Frame { op: Op::Binary, payload: b"\x01ab".to_vec() }, 5))
+            Some((
+                Frame {
+                    op: Op::Binary,
+                    payload: b"\x01ab".to_vec()
+                },
+                5
+            ))
         );
         assert_eq!(decode(&from_server[..4]).unwrap(), None);
         assert!(decode(&[0x82, 127, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff]).is_err());
         assert!(decode(&[0x02, 1, 0]).is_err(), "a part of a message");
-        assert!(decode(&[0x82, 0x81, 0, 0, 0, 0, 1]).is_err(), "a masked frame from the server");
+        assert!(
+            decode(&[0x82, 0x81, 0, 0, 0, 0, 1]).is_err(),
+            "a masked frame from the server"
+        );
     }
 
     #[test]

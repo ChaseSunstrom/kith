@@ -179,6 +179,20 @@ Today it answers `docker version`, `docker info` and these container calls, each
 
 - `docker run -d --name NAME IMAGE CMD` (create, then start), `ps`, `ps -a`, `inspect`, `stop`,
   `start`, `restart`, `kill`, `rm -f` and `wait`.
+- `docker logs [-f] [--tail N] NAME`: what the container wrote, its two outputs kept apart, and
+  with `-f` what it writes after, until it stops. kithd keeps no times, so `--timestamps`,
+  `--since` and `--until` are 501, and a container that is a stopped Workload (`replicas: 0`) has
+  no logs for kithd to read (one that never started has none to show).
+- `docker run IMAGE CMD` without `-d` (and with `-t`): it prints the output as it comes and
+  exits with the container's exit code. With `-t` the output is raw, as it is on a terminal.
+- `docker exec [-i] [-t] NAME CMD`, and `docker exec -it NAME sh` on a terminal: the command runs in
+  the container's unit through kithd's exec connection, its input is what you type (with `-i`), the
+  window size follows your terminal, and its exit code is the command's. Not carried: `exec -d`,
+  `--env`, `--workdir`, `--user` and `--privileged` (each is 501, with the reason).
+
+Stdin to a container's main process (`docker run -i`, `docker attach` with stdin) is refused with a
+501 that says why: kithd starts the main process with no input and has no way to attach to it.
+Give a command its input with `docker exec -i`.
 
 A container is a kith resource in the namespace `docker`, labelled `kith.dev/docker=NAME`, with the
 labels its create body gave kept as they are. `kith delete` removes it. A container with
@@ -193,8 +207,7 @@ security-changing HostConfig field (`privileged`, `capAdd`, `securityOpt`, devic
 mounts, host PID, IPC, UTS, user or cgroup namespaces, `networkMode` host or `container:`); and a
 name another resource in the store already has (a 409).
 
-Answered 501 with a JSON `message`, never left waiting: `docker run` without `-d`, which attaches
-to the container's output and waits for step 3; `ps` with filters; port bindings; ulimits;
+Answered 501 with a JSON `message`, never left waiting: `ps` with filters; port bindings; ulimits;
 `--rm`; memory, CPU and PID limits; DNS, extra hosts and links; a hostname, exposed ports, a
 health check and a stop signal; volumes, `--tmpfs`, `--volumes-from`, a read-only root and
 `--runtime`; other network modes; images; and any other call not listed above.
