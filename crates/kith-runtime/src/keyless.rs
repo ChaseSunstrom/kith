@@ -1901,7 +1901,7 @@ pub(crate) mod tests {
         for cut in [0, 1, 5, response.len() / 2, response.len() - 1] {
             let mut cuts = super::bundle(good.to_string().as_bytes()).unwrap();
             cuts.stamps = vec![response[..cut].to_vec()];
-            let said = timestamp(&mut cuts, &[tsa.root.clone()]).unwrap_err();
+            let said = timestamp(&mut cuts, std::slice::from_ref(&tsa.root)).unwrap_err();
             assert!(said.contains("cannot be read"), "{cut}: {said}");
         }
     }
@@ -1981,7 +1981,10 @@ pub(crate) mod tests {
         assert_eq!(stamp(&token).map(|read| read.time), Some((START + 60) as i64));
         let mut bundle = super::bundle(good.to_string().as_bytes()).unwrap();
         bundle.stamps = vec![token];
-        assert_eq!(timestamp(&mut bundle, &[tsa.root.clone()]), Ok((START + 60) as i64));
+        assert_eq!(
+            timestamp(&mut bundle, std::slice::from_ref(&tsa.root)),
+            Ok((START + 60) as i64)
+        );
     }
 
     /// Over 16 KiB, nesting past the limit, a fifth certificate and BER are each refused, saying why.
@@ -1995,7 +1998,7 @@ pub(crate) mod tests {
             assert!(stamp(&der).is_none(), "{why}");
             let mut bundle = super::bundle(good.to_string().as_bytes()).unwrap();
             bundle.stamps = vec![der];
-            let said = timestamp(&mut bundle, &[tsa.root.clone()]).unwrap_err();
+            let said = timestamp(&mut bundle, std::slice::from_ref(&tsa.root)).unwrap_err();
             assert!(said.contains(why), "expected `{why}`, got `{said}`");
         };
         let imprint = super::bundle(good.to_string().as_bytes()).unwrap().signature;
@@ -2045,7 +2048,7 @@ pub(crate) mod tests {
             read += usize::from(stamp(&input).is_some());
             let mut damaged = super::bundle(good.to_string().as_bytes()).unwrap();
             damaged.stamps = vec![input];
-            let _ = timestamp(&mut damaged, &[tsa.root.clone()]);
+            let _ = timestamp(&mut damaged, std::slice::from_ref(&tsa.root));
         }
         // (Some alterations leave it readable, say a byte of the certificate's name: they
         // are refused by the checks, not the reader. None of the cuts is readable.)
