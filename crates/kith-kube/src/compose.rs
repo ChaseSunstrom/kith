@@ -244,8 +244,9 @@ pub fn translate(root: Value, namespace: Option<&str>, node: Option<&str>) -> (V
 /// [`translate`] to refuse and carry by its own rules, so a container made with `docker run` is
 /// read as a compose service of its name. Also each named volume mounted: its docker name and
 /// the name kith gives the Volume.
-/// ponytail: the fields compose has a key for; limits (Memory, NanoCpus, Ulimits), Dns, ExtraHosts
-/// and the like are not read: add a key here, and the translator says it by path.
+/// ponytail: the fields compose has a key for, and the HostConfig settings kith does not carry
+/// (Memory, NanoCpus, host modes, DeviceRequests...) under compose's names, so the translator
+/// says each by path; Ulimits, Dns, ExtraHosts and the like are not read: add a key here.
 pub fn from_docker(inspected: Vec<Value>) -> Result<(Value, Vec<(String, String)>), String> {
     let (mut services, mut volumes, mut named) = (Map::new(), Map::new(), Vec::new());
     for c in inspected
@@ -334,6 +335,10 @@ pub fn from_docker(inspected: Vec<Value>) -> Result<(Value, Vec<(String, String)
                 }
             }
         }
+        // `docker run --tmpfs` is in HostConfig, not Mounts.
+        tmpfs.extend(host["Tmpfs"].as_object().into_iter().flatten().map(|(d, _)| json!(d)));
+        // A mode other than the container's own, said by compose's key for it.
+        let mode = |k: &str, own: &[&str]| on(&host[k]).filter(|v| !v.as_str().is_some_and(|s| own.contains(&s)));
         let logging = host["LogConfig"]["Type"]
             .as_str()
             .filter(|t| !["", "json-file", "local"].contains(t));
@@ -389,6 +394,15 @@ pub fn from_docker(inspected: Vec<Value>) -> Result<(Value, Vec<(String, String)
             ("init", on(&host["Init"])),
             ("logging", logging.map(|driver| json!({ "driver": driver }))),
             ("tmpfs", nonempty(json!(tmpfs))),
+            ("mem_limit", on(&host["Memory"]).filter(|v| *v != 0)),
+            ("cpus", on(&host["NanoCpus"]).filter(|v| *v != 0)),
+            ("pid", mode("PidMode", &["private"])),
+            ("ipc", mode("IpcMode", &["private", "shareable"])),
+            ("uts", mode("UTSMode", &["private"])),
+            ("userns_mode", mode("UsernsMode", &["private"])),
+            ("group_add", on(&host["GroupAdd"])),
+            ("volumes_from", on(&host["VolumesFrom"])),
+            ("gpus", on(&host["DeviceRequests"])),
             ("volumes", nonempty(json!(vols))),
         ]);
         if services.insert(name.to_string(), service).is_some() {
@@ -731,7 +745,15 @@ fn slug(s: &str) -> String {
             out.push(c);
         }
     }
-    out.trim_matches('-').to_string()
+    let out = out.trim_matches('-');
+    if out.len() <= 63 {
+        return out.to_string();
+    }
+    // Too long for a name: its start, and a hash of all of `s` so that two long ones stay two.
+    let hash = s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    });
+    format!("{}-{:012x}", out[..50].trim_end_matches('-'), hash & 0xffff_ffff_ffff)
 }
 
 /// The Volume of a directory: its name, or none, the reason said at `at`.
@@ -754,6 +776,10 @@ fn claim(cx: &mut Cx, env: &mut Env, at: &str, path: &str, named: Option<&str>) 
                 );
                 return None;
             }
+            cx.hint(
+                at,
+                "is a host path of the node, held as it is: check it is the one meant",
+            );
             path.to_string()
         }
         (true, true) => {

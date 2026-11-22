@@ -181,6 +181,65 @@ fn docker_inspect_a_namespace_that_is_not_plain_or_no_node_gets_no_line_to_paste
 }
 
 #[test]
+fn docker_inspect_an_anonymous_volume_of_64_hex_gets_a_name_within_63() {
+    let sb = Sandbox::new("docker-inspect-anon");
+    let hex = "0123456789abcdef".repeat(4);
+    let one = format!(
+        r#"{{"Name": "/app", "Config": {{"Image": "example/app:1"}}, "HostConfig": {{}}, "Mounts": [{{"Type": "volume", "Name": "{hex}", "Destination": "/data", "RW": true}}]}}"#
+    );
+    let (_, out, err) = sb.kith("", &one, &["import", "docker", "-f", "-", "--node", "n1"]);
+    let docs = kith_kube::documents("out.yml", &out).unwrap();
+    let vol = docs
+        .iter()
+        .find(|d| d["kind"] == "Volume")
+        .unwrap_or_else(|| panic!("no Volume: {out}{err}"));
+    let name = vol["metadata"]["name"].as_str().unwrap();
+    assert!(name.len() <= 63 && !name.ends_with('-'), "{name}");
+    assert!(err.contains(&format!("kith volume put {name} -")), "{err}");
+}
+
+#[test]
+fn docker_inspect_a_host_setting_kith_does_not_read_is_said() {
+    let sb = Sandbox::new("docker-inspect-host");
+    let one = r#"{"Name": "/app", "Config": {"Image": "example/app:1"}, "Mounts": [], "HostConfig": {"Memory": 536870912, "NanoCpus": 500000000,
+        "PidMode": "host", "IpcMode": "host", "UTSMode": "host", "UsernsMode": "host", "GroupAdd": ["video"], "VolumesFrom": ["db"],
+        "DeviceRequests": [{"Count": -1}], "Tmpfs": {"/run": "rw"}}}"#;
+    let (code, _, err) = sb.kith("", one, &["import", "docker", "-f", "-"]);
+    assert_eq!(code, 1, "{err}");
+    for at in [
+        "mem_limit",
+        "cpus",
+        "pid",
+        "ipc",
+        "uts",
+        "userns_mode",
+        "group_add",
+        "volumes_from",
+        "gpus",
+        "tmpfs",
+    ] {
+        said(&err, &format!("services.app.{at}"), "");
+    }
+    // The values docker fills in for nothing are not a setting.
+    let none = r#"{"Name": "/app", "Config": {"Image": "example/app:1"}, "Mounts": [], "HostConfig": {"Memory": 0, "NanoCpus": 0,
+        "PidMode": "", "IpcMode": "private", "UTSMode": "", "UsernsMode": "", "GroupAdd": null, "VolumesFrom": null, "DeviceRequests": null, "Tmpfs": null}}"#;
+    let (code, _, err) = sb.kith("", none, &["import", "docker", "-f", "-"]);
+    assert_eq!(code, 0, "{err}");
+}
+
+#[test]
+fn docker_inspect_a_bind_mount_in_kith_system_says_it_is_a_host_path() {
+    let sb = Sandbox::new("docker-inspect-hostpath");
+    let one = r#"{"Name": "/app", "Config": {"Image": "example/app:1"}, "HostConfig": {}, "Mounts": [{"Type": "bind", "Source": "/srv/data", "Destination": "/data", "RW": true}]}"#;
+    let (_, _, err) = sb.kith(
+        "",
+        one,
+        &["import", "docker", "-f", "-", "--node", "n1", "-n", "kith-system"],
+    );
+    said(&err, "services.app.volumes[0]", "host path");
+}
+
+#[test]
 fn docker_inspect_unreadable_input_exits_two() {
     let sb = Sandbox::new("docker-inspect-bad");
     for bad in ["not json at all: [", "[{\"Config\": {}}]", "[]"] {
