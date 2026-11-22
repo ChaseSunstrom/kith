@@ -91,6 +91,7 @@
 {"u":"guide/kubernetes.html#kubectl-and-helm-as-they-are","t":"Coming from Kubernetes, Helm, Proxmox or compose","h":"kubectl and Helm, as they are"},
 {"u":"guide/kubernetes.html#importing-from-kubernetes-and-helm","t":"Coming from Kubernetes, Helm, Proxmox or compose","h":"Importing from Kubernetes and Helm"},
 {"u":"guide/kubernetes.html#from-a-docker-compose-file","t":"Coming from Kubernetes, Helm, Proxmox or compose","h":"From a docker-compose file"},
+{"u":"guide/kubernetes.html#from-docker-containers","t":"Coming from Kubernetes, Helm, Proxmox or compose","h":"From Docker containers"},
 {"u":"guide/kubernetes.html#coming-from-proxmox-or-docker-compose","t":"Coming from Kubernetes, Helm, Proxmox or compose","h":"Coming from Proxmox or docker compose"},
 {"u":"guide/kubernetes.html#the-docker-command-against-kith","t":"Coming from Kubernetes, Helm, Proxmox or compose","h":"The docker command, against kith"},
 {"u":"guide/ui.html","t":"Web UI","h":""},

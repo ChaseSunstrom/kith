@@ -1,0 +1,56 @@
+[
+  {
+    "Id": "3f1c0a9d7b2e4c5d8a6b9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+    "Name": "/web",
+    "Image": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "Config": {
+      "Hostname": "3f1c0a9d7b2e",
+      "Image": "nginx:1.27",
+      "Env": ["TZ=Etc/UTC", "NGINX_PORT=80"],
+      "Cmd": ["nginx", "-g", "daemon off;"],
+      "Entrypoint": ["/docker-entrypoint.sh"],
+      "WorkingDir": "/usr/share/nginx",
+      "User": "101",
+      "ExposedPorts": {"80/tcp": {}, "443/tcp": {}},
+      "Healthcheck": {
+        "Test": ["CMD-SHELL", "curl -f http://localhost:80/ping"],
+        "Interval": 30000000000,
+        "Timeout": 5000000000,
+        "Retries": 3
+      },
+      "Labels": {"maintainer": "someone"}
+    },
+    "HostConfig": {
+      "NetworkMode": "bridge",
+      "PortBindings": {"80/tcp": [{"HostIp": "", "HostPort": "8080"}]},
+      "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
+      "Privileged": false,
+      "CapAdd": null,
+      "CapDrop": ["ALL"],
+      "ReadonlyRootfs": true
+    },
+    "Mounts": [
+      {"Type": "volume", "Name": "web_data", "Source": "/var/lib/docker/volumes/web_data/_data", "Destination": "/data", "Driver": "local", "Mode": "z", "RW": true}
+    ]
+  },
+  {
+    "Id": "9a8b7c6d5e4f30211203f4e5d6c7b8a99a8b7c6d5e4f30211203f4e5d6c7b8a9",
+    "Name": "/vpn",
+    "Image": "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+    "Config": {
+      "Hostname": "9a8b7c6d5e4f",
+      "Image": "example/vpn:2",
+      "Env": ["MODE=client"],
+      "Cmd": ["--client"]
+    },
+    "HostConfig": {
+      "NetworkMode": "default",
+      "RestartPolicy": {"Name": "always", "MaximumRetryCount": 0},
+      "Privileged": true,
+      "CapAdd": ["NET_ADMIN"]
+    },
+    "Mounts": [
+      {"Type": "bind", "Source": "/home/user/vpn", "Destination": "/etc/vpn", "Mode": "", "RW": false}
+    ]
+  }
+]
