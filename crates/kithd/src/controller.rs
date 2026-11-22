@@ -1477,7 +1477,7 @@ impl Controller {
                 crate::devices::scan(Path::new("/sys"), me)
             })
         });
-        let (resources, granted, mounted, tunes, found): (Vec<Resource>, _, _, _, _) = {
+        let (sizes, resources, granted, mounted, tunes, found): (_, Vec<Resource>, _, _, _, _) = {
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
             let store = &file_store.store;
             let found = found.map(|found| crate::devices::as_found(store, found));
@@ -1491,7 +1491,9 @@ impl Controller {
             let granted = me.map(|me| crate::claims::granted(store, me, Path::new("/sys")));
             let mounted = me.map(|me| crate::volumes::mounts(store, me));
             let tunes = me.map(|me| crate::seats::tunes(store, me));
+            let sizes = crate::volumes::sizes(store);
             (
+                sizes,
                 resources,
                 granted.unwrap_or_default(),
                 mounted.unwrap_or_default(),
@@ -1591,7 +1593,9 @@ impl Controller {
             // here: one that cannot be had is no machine of this node's (and says why).
             let (mut vms, mut images, mut resolved) = (Vec::new(), BTreeMap::new(), true);
             for vm in template.vms.iter().filter(|_| may) {
-                match crate::vm::resolve(vm, &state, me.unwrap_or_default(), &volumes) {
+                match crate::vm::resolve(vm, &state, me.unwrap_or_default(), &volumes, |dir| {
+                    sizes.get(&(dir.namespace.clone(), dir.name.clone())).copied()
+                }) {
                     Ok((vm, made)) => {
                         images.insert(vm.name.clone(), made);
                         vms.push(vm);
