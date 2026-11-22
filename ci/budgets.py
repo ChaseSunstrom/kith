@@ -93,7 +93,9 @@ KITHD_IDLE_RSS = 9 * MB
 # built 3.68 MB with T-1218 merged on main 81fe0db4, and train E adds kith verbs (machine, launch,
 # pull progress); T-0269 brings them back down.
 SIZE_BUDGETS = {"kith": int(3.10 * MB), "kith-remote": int(3.75 * MB), "kithd": int(KITHD_SIZE * MB)}
-# (T-1209: kith machine create|list|run|rm costs about 20 KB alone, 3,159,384 B to 3,179,896 B; the 3.10 above covers it.)
+# (T-1209: kith machine create|list|run|rm costs about 24 KB on the merged tree: kith 3,196,248 B on main 32840235
+# to 3,220,856 B, and kith-remote 3,888,504 B to 3,921,304 B, each from `cargo build --release -p kith-cli` for musl;
+# built with kithd as ci/musl.sh does, kith is 3,249,528 B, 1 KB under the 3.10 above.)
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
