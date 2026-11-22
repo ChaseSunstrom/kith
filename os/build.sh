@@ -17,7 +17,6 @@
 #
 # Nothing needs root, nothing outside --out and the cache is written, and no disk is
 # touched: the result is files, kith-os.raw, kith-os.qcow2 and kith-os-installer.raw.
-# shellcheck disable=SC2015,SC2012,SC2017 # (A && B || C where C only reports; ls of a fixed directory; MB sizes)
 set -eu
 
 kernel_version=6.18.63
@@ -98,9 +97,11 @@ while [ $# -gt 0 ]; do
     --check) check=1; shift ;;
     --twice) twice=1; shift ;;
     --spec)
+        # shellcheck disable=SC2015 # (C only reports and exits)
         [ $# -ge 2 ] && [ -f "$2" ] && [ -r "$2" ] || { echo "build.sh: --spec needs a file it can read" >&2; exit 2; }
         spec=$(realpath "$2"); shift 2 ;;
     --secure-boot)
+        # shellcheck disable=SC2015
         [ $# -ge 2 ] && [ -f "$2/db.key" ] && [ -r "$2/db.key" ] && [ -f "$2/db.crt" ] && [ -r "$2/db.crt" ] \
             || { echo "build.sh: --secure-boot needs a directory with a db.key and db.crt it can read" >&2; exit 2; }
         sbdir=$(realpath "$2"); shift 2 ;;
@@ -228,6 +229,7 @@ if [ -n "$spec" ]; then
     globs=$(spec_list firmware)
     for f in $(spec_list features); do
         case $f in *[!a-z0-9-]*) die "--spec: '$f' is not a feature's name" ;; esac
+        # shellcheck disable=SC2012 # (ls of a fixed directory, for a message)
         [ -r "$root/os/features/$f.config" ] ||
             die "--spec: no feature '$f' (os/features has: $(cd "$root/os/features" && ls | sed 's/\.config$//' | tr '\n' ' '))"
         # (uhid-test puts /dev/uhid in the kernel: only for the image of the fido2 test, which
@@ -380,6 +382,7 @@ if ! [ -r "$kernel" ]; then
             have=$(modinfo -F sig_key "$sample" | hexid)
             serial=$(openssl x509 -inform DER -in certs/signing_key.x509 -noout -serial | sed 's/^serial=//' | hexid)
             ski=$(openssl x509 -inform DER -in certs/signing_key.x509 -noout -ext subjectKeyIdentifier | sed -n 2p | hexid)
+            # shellcheck disable=SC2015
             [ -n "$have" ] && [ -n "$(modinfo -F signer "$sample")" ] || { echo "build.sh: amdgpu.ko has no signer: $(modinfo "$sample" | tail -n 5)" >&2; exit 1; }
             [ "$have" = "$serial" ] || [ "$have" = "$ski" ] ||
                 { echo "build.sh: amdgpu.ko is signed by $have, which is not the kernel's key (serial $serial, id $ski)" >&2; exit 1; }
@@ -649,7 +652,9 @@ assemble() { # DIR
     # in it); and of the root but for kithd (/sbin/init) and its os-release, which names the
     # version (sorted, owner and time fixed, as the squashfs is).
     kithd_sum=$(sha256sum "$bin/kithd" | cut -d ' ' -f 1)
-    kernel_sum=$({ cmdline a 0 0; cat "$kernel" "$efi/linuxx64.efi.stub" "$w/osrel"; } | sha256sum | cut -d ' ' -f 1)
+    # (--secure-boot: the certificate is in the digest, so an update that only signs, or changes the
+    # key, is not taken for a kithd-only one; without it the digest is what it was.)
+    kernel_sum=$({ cmdline a 0 0; cat "$kernel" "$efi/linuxx64.efi.stub" "$w/osrel"; [ -z "$sbdir" ] || cat "$sbdir/db.crt"; } | sha256sum | cut -d ' ' -f 1)
     rest_sum=$(tar -C "$r" --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
         --exclude=./sbin/init --exclude=./etc/os-release -cf - . | sha256sum | cut -d ' ' -f 1)
     # What a node of an older version is given to become this one (os/update.sh).
@@ -691,7 +696,9 @@ assemble() { # DIR
     rootsz=88M veritysz=4M
     if [ -n "$modules" ]; then
         s=$(stat -c %s "$w/root.squashfs")
+        # shellcheck disable=SC2017 # (whole MB: the 5/4 is room, not precision)
         rootsz=$((s / 1048576 * 5 / 4 + 64))M
+        # shellcheck disable=SC2017
         veritysz=$(($(stat -c %s "$w/root.verity") / 1048576 * 5 / 4 + 4))M
     fi
     part 10-esp esp esp 64M "CopyBlocks=$w/esp.img"

@@ -230,14 +230,14 @@ missing file) is one console line, never an end. Not supported: module parameter
 ### Secure Boot: an image signed with your own key
 
 ```sh
-mkdir sb && openssl req -new -x509 -newkey rsa:3072 -nodes -days 3650 -subj '/CN=my kith db/' -keyout sb/db.key -out sb/db.crt
-sh os/build.sh --secure-boot sb        # needs sbsign and sbverify (sbsigntools)
+mkdir -m 700 ~/kith-sb && openssl req -new -x509 -newkey rsa:3072 -nodes -days 3650 -subj '/CN=my kith db/' -keyout ~/kith-sb/db.key -out ~/kith-sb/db.crt
+sh os/build.sh --secure-boot ~/kith-sb   # needs sbsign and sbverify (sbsigntools)
 ```
 
 `--secure-boot KEYDIR` signs systemd-boot (the `BOOTX64.EFI` of both disks) and every kernel
 image (slot a and b, so the update's too, and the installer's) with `KEYDIR/db.key` and
 `KEYDIR/db.crt`, then checks each against the certificate before it goes into an ESP or the
-update. A firmware that has that certificate as a `db` entry then checks the one file that
+update (`sh ci/secure-boot-check.sh` does this with a throwaway key, and builds twice to show the same bytes; it needs sbsign, sbverify and mcopy, and exits 3 without them). The certificate is part of the update's kernel digest, so an update that only signs, or changes the key, is a full one, not a kithd-only one. A firmware that has that certificate as a `db` entry then checks the one file that
 carries the root's hash. Without sbsign the build stops with exit 3 (this machine cannot build
 it), and a directory without both files is refused (exit 2). The key is only read: it is
 never copied into an image, and keep it outside the repo. The signature is not part of what the
