@@ -11,9 +11,11 @@
 //!                          \-- replica there: POST /v1/pod-hop --> node B (checks it again in
 //!                                             its own store, enters, speaks the channels)
 //! ```
-//! `/v1/pod-hop` is the one route between nodes for a pod: `kubectl port-forward` (kube/portforward.rs) asks
-//! it for a byte stream to a port instead ([`Spec::Connect`]). It has one gate ([`hop`]) and one sender
-//! ([`send`]); what the gate lets through is run by what the body asks.
+//! `/v1/pod-hop` is the one route between nodes for a pod, of three kinds: exec (above), `kubectl port-forward`
+//! (kube/portforward.rs), which asks it for a byte stream to a port ([`Spec::Connect`]), and a VM's live
+//! migration (vm_migrate.rs), the stream to the QEMU waiting for it ([`Spec::Migrate`]: answered at once, by
+//! the node's certificate, with no caller to check). It has one gate ([`hop`]) and one sender ([`send`]); what
+//! the gate lets through is run by what the body asks.
 //! Node A passes the client's bytes on without reading them (the WebSocket is the client's, to
 //! node B, which is the one that answers it). A failure after the upgrade is a Status on channel
 //! 3 and a close: a client that was refused an upgrade would fall back to another protocol.
@@ -385,7 +387,11 @@ struct Hop {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Spec {
     Exec(Ask),
-    Connect { port: u16 },
+    Connect {
+        port: u16,
+    },
+    /// The migration stream of a VM replica waiting for one (nodes only: `vm_migrate`).
+    Migrate,
 }
 
 /// `POST /v1/pod-hop`: the node that runs the replica, asked by the node the client reached
@@ -418,6 +424,10 @@ pub async fn hop(
         Ok(hop) => hop,
         Err(e) => return say(StatusCode::BAD_REQUEST, e.to_string()),
     };
+    // A migration is a node's own business (no user asked), so it is answered here: the node's certificate is the gate.
+    if matches!(hop.spec, Spec::Migrate) {
+        return crate::vm_migrate::hop(&shared, &from, &hop.namespace, &hop.pod, upgrade).await;
+    }
     // The first node checked the caller, and so does this one, in its own store: it takes a
     // node's word for who asked, not for what they may do.
     let Some(who) = Caller::named(&hop.caller) else {
@@ -436,6 +446,7 @@ pub async fn hop(
     let verb = match hop.spec {
         Spec::Exec(_) => "exec",
         Spec::Connect { .. } => "portforward",
+        Spec::Migrate => "migrate",
     };
     let audit = |outcome| {
         let what = vec![format!("pod {}/{}", hop.namespace, hop.pod)];
@@ -474,12 +485,19 @@ pub async fn hop(
             let key = format!("{holder}/{}/{owner}", hop.namespace);
             crate::kube::portforward::tunnel(&shared, &key, replica, port, upgrade).await
         }
+        // (Answered above, by the node's certificate alone: a user's hop never gets here.)
+        Spec::Migrate => Err((StatusCode::FORBIDDEN, "a migration is a node's".to_string())),
     };
     if let Err((status, why)) = done {
         audit(Err(why.clone()));
         return say(status, why);
     }
     audit(Ok(()));
+    switching()
+}
+
+/// The `101` that hands the connection over to what the hop set up.
+pub(crate) fn switching() -> Response {
     let mut reply = Response::new(Body::empty());
     *reply.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
     let headers = reply.headers_mut();

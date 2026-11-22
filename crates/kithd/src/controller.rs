@@ -1392,7 +1392,11 @@ fn bound(resource: &Resource) -> Vec<u32> {
 pub(crate) fn template_of(resource: &Resource) -> Result<(Template, u32), String> {
     let spec = resource.spec.clone();
     match resource.kind.as_str() {
-        "Workload" => serde_json::from_value::<WorkloadSpec>(spec).map(|s| (s.template, s.replicas.unwrap_or(1))),
+        // (A sleeping Workload, T-1210, keeps its `spec.replicas` and runs none.)
+        "Workload" => serde_json::from_value::<WorkloadSpec>(spec).map(|s| {
+            let asleep = resource.status.as_ref().is_some_and(|status| status["asleep"] == true);
+            (s.template, if asleep { 0 } else { s.replicas.unwrap_or(1) })
+        }),
         "Job" => serde_json::from_value::<JobSpec>(spec).map(|s| (s.template, s.completions.unwrap_or(1))),
         // One copy for each node the scheduler has given a number to.
         "NodeWorkload" => {
@@ -1537,6 +1541,7 @@ impl Controller {
                 seat,
                 classes,
                 dmem,
+                refused: unusable,
             } = granted.get(&key).cloned().unwrap_or_default();
             let allowed = !claimed || (resource.kind != "NodeWorkload" && granted.contains_key(&key));
             // What this node's own policy refuses of it is not run here, whoever wrote it and
@@ -1547,6 +1552,8 @@ impl Controller {
                 !crate::vm::pci(&devices).is_empty(),
                 resource.kind == "NodeWorkload",
             );
+            // A Device node that is not there or may not be given: not run without it, and said.
+            refused.extend(unusable);
             let kept = |(name, class): &&(String, kith_api::kinds::DeviceClass)| {
                 !node_policy.device(class) || found.as_ref().is_some_and(|found| !found.contains(name))
             };
@@ -3060,7 +3067,10 @@ impl Controller {
         self.wiping = Some(tokio::spawn(async move {
             let removed = tokio::task::spawn_blocking(move || wipe_all(&state, dirs)).await;
             for key in removed.unwrap_or_default() {
-                if let Err(e) = shared.submit(kith_store::Command::Delete { key: key.clone() }).await {
+                if let Err(e) = shared
+                    .submit_node(kith_store::Command::Delete { key: key.clone() })
+                    .await
+                {
                     eprintln!("kithd: deleting {key} after its data was removed: {e}");
                 }
             }
