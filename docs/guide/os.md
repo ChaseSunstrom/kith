@@ -632,7 +632,7 @@ kith node netboot --off
 sh ci/vm.sh --test netboot             # the same, in QEMU, on a disk that is a file
 ```
 
-Then set each machine to start from the network (PXE, IPv4) once, or first in its boot order: a
+Then set each machine to start from the network (PXE, or UEFI HTTP boot, IPv4) once, or first in its boot order: a
 machine that has the installer is not answered again and goes on to its disk. **Everything on
 that disk is lost**, and nobody is asked at the machine: name only cards of machines you mean to
 erase. `--disk only` (the default) installs on a machine's one disk and refuses a machine with
@@ -655,11 +655,15 @@ curl --cacert ca.pem --cert cert.pem --key key.pem --data-binary @target/os/kith
     -X PUT 'https://NODE:7443/v1/netboot?macs=52:54:00:12:34:56,52:54:00:12:34:57&minutes=30&disk=only'
 ```
 
-The boot file goes over TFTP, unencrypted and unsigned, with the machine's join token in it.
+The boot file goes over TFTP, or over plain HTTP (TCP port 8069 on the node) to firmware that
+does UEFI HTTP boot, which is faster: such a machine's DHCP question says `HTTPClient`, and the
+node answers it with the URL of its file (`http://NODE:8069/kith-netboot-525400123456.efi`).
+Either way it is unencrypted and unsigned, with the machine's join token in it, and it goes once,
+to a named machine only; any other request gets a 404, and the port is closed when netboot is off.
 Anyone on that network segment who claims a named card's address while netboot is on gets that
 token (it lets one node join, for an hour), and can answer network boots faster than the node:
 use it on a network you trust, for as short as it takes. Machines must start by UEFI on x86-64
-and have 1 GB of memory. UEFI HTTP boot is not answered yet.
+and have 1 GB of memory. HTTPS boot, and HTTP boot over IPv6, are not answered.
 
 ### Installing on a rented machine
 
