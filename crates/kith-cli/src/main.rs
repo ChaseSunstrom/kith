@@ -2444,6 +2444,10 @@ fn status_summary(resource: &Resource) -> String {
                 format!("{state} at {}{mesh}{serves}", clean(address))
             }
             (Some(state), _, Some(address)) => format!("{state} at {}", clean(address)),
+            // An encrypted Volume that is not open says why (T-1030).
+            (Some(state), ..) if resource.kind == "Volume" && status["reason"].is_string() => {
+                format!("{state}: {}", clean(status["reason"].as_str().unwrap_or_default()))
+            }
             (Some(state), ..) | (None, _, Some(state)) => clean(state),
             _ => String::new(),
         },
@@ -2880,6 +2884,23 @@ mod drain_tests {
             workload(json!({ "ready": 1, "replicas": 1, "containers": [{ "name": "a" }] })),
             "1/1 ready"
         );
+    }
+
+    #[test]
+    fn a_volume_not_open_says_why_in_the_status_column() {
+        use kith_api::Resource;
+        let volume = |status: serde_json::Value| {
+            let volume = json!({
+                "apiVersion": "kith.dev/v1", "kind": "Volume", "metadata": { "name": "data" },
+                "spec": {}, "status": status,
+            });
+            super::status_summary(&serde_json::from_value::<Resource>(volume).unwrap())
+        };
+        assert_eq!(
+            volume(json!({ "state": "pending", "reason": "no seed\u{1b}[2J" })),
+            "pending: no seed[2J"
+        );
+        assert_eq!(volume(json!({ "state": "bound" })), "bound");
     }
 
     #[test]

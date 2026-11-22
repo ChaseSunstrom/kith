@@ -313,8 +313,18 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
                     "peopleNotes",
                     "alone",
                     "shares",
+                    "encrypted",
                 ],
             )?;
+            // (The volume files it holds, by `NAMESPACE/NAME`: its keepers keep their copies of the key while it holds one.)
+            if let Some(files) = fields.get("encrypted") {
+                let names = files.as_array().filter(|names| names.len() <= crate::encrypted::HELD);
+                if !files.is_null()
+                    && !names.is_some_and(|names| names.iter().all(|n| n.as_str().is_some_and(|n| n.len() <= 320)))
+                {
+                    return Err(refused(key, "`encrypted` is null or up to 4096 names"));
+                }
+            }
             // (The Shares it serves over NFS, by name: for the leader to say a Share is served.)
             if let Some(shares) = fields.get("shares") {
                 let names = shares.as_array().filter(|names| names.len() <= 256);
@@ -429,7 +439,9 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
             let mine = crate::volumes::encrypted(store, node)
                 .iter()
                 .any(|(dir, _)| key == format!("Volume/{}/{}", dir.namespace, dir.name));
-            let shaped = fields.len() == 1 && fields["reason"].as_str().is_none_or(|why| why.len() <= 1024);
+            // (Text a terminal shows: `kith get` prints it, so no control character.)
+            let text = |why: &str| why.len() <= 1024 && !why.chars().any(char::is_control);
+            let shaped = fields.len() == 1 && fields["reason"].as_str().is_none_or(text);
             match mine && shaped && (fields["reason"].is_null() || fields["reason"].is_string()) {
                 true => Ok(()),
                 false => Err(refused(key, "`reason` is the text a Volume's node says, written alone")),

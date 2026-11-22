@@ -24,7 +24,9 @@
 // from the store for a day (`GONE`, seen by each node on its own, only while it sees a leader,
 // and counted again after a restart) has its key copies erased where they are held (zeros,
 // then unlinked) and its file unlinked (not shredded: the blocks are the disk's) if it is not
-// open; a Volume of the name in the store keeps both, whatever it says. While a volume is open its key is in kithd's memory on its node (as it is
+// open; a Volume of the name in the store keeps both, whatever it says. A node keeps the copy it
+// holds for another's volume until that node's Node says (`status.encrypted`) it holds no file of it,
+// and a day more. While a volume is open its key is in kithd's memory on its node (as it is
 // in the kernel's), for the nodes that join later. Each is left for later; the first to
 // come is a key sealed to each holder's TPM.
 
@@ -488,46 +490,114 @@ fn reason_write(
 /// of it is erased: the window in which applying it again brings back its file and its key.
 const GONE: u64 = 86_400;
 
+/// What is in `path` as (name, path), but for what starts with a `.`: the file of a start that
+/// got no further (`keep` and a volume's file are each made under such a name first).
+fn inside(path: &Path) -> Vec<(String, PathBuf)> {
+    let found = std::fs::read_dir(path).into_iter().flatten().flatten();
+    let named = found.filter_map(|entry| Some((entry.file_name().into_string().ok()?, entry.path())));
+    named.filter(|(name, _)| !name.starts_with('.')).collect()
+}
+
+/// The regular files in `path` (a link is none).
+fn files(path: &Path) -> Vec<(String, PathBuf)> {
+    let regular = |(_, path): &(String, PathBuf)| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
+    inside(path).into_iter().filter(regular).collect()
+}
+
+/// The folders in `path` (a link is none).
+fn folders(path: &Path) -> Vec<(String, PathBuf)> {
+    let real = |(_, path): &(String, PathBuf)| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    inside(path).into_iter().filter(real).collect()
+}
+
+/// How many files a node says it holds: what its Node's write of them is refused above.
+pub(crate) const HELD: usize = 4096;
+
+/// The Volumes (`NAMESPACE/NAME`) whose files this node holds, in order: a Volume that is gone
+/// from the store and not open has its file erased after [`GONE`], and the node's keepers keep
+/// their copies of its key until it says it does not hold the file.
+fn files_held(state: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    for (namespace, folder) in folders(&state.join("encrypted")) {
+        names.extend(
+            files(&folder)
+                .into_iter()
+                .map(|(name, _)| format!("{namespace}/{name}")),
+        );
+    }
+    names.sort();
+    // (A node with more says no more: the copies of the rest are erased as they would be.)
+    names.truncate(HELD);
+    names
+}
+
+/// What to write in `me`'s own Node so that it says which files it holds (`status.encrypted`,
+/// null for none), if it does not say that already.
+fn held_write(
+    store: &Store,
+    me: &str,
+    files: &[String],
+) -> Option<(String, serde_json::Map<String, serde_json::Value>)> {
+    let key = format!("Node/{me}");
+    let said = store
+        .get(&key)?
+        .status
+        .as_ref()
+        .map_or(serde_json::Value::Null, |s| s["encrypted"].clone());
+    let want = match files.is_empty() {
+        true => serde_json::Value::Null,
+        false => files.into(),
+    };
+    (said != want).then(|| (key, [("encrypted".to_string(), want)].into_iter().collect()))
+}
+
+/// Whether `what` (what went wrong with `at`) is news: it is not what was said of `at` last.
+/// `None` (it went right) is not, and what goes wrong after it is.
+fn news(said: &mut BTreeMap<String, String>, at: &str, what: Option<&str>) -> bool {
+    let Some(what) = what else {
+        said.remove(at);
+        return false;
+    };
+    let new = said.get(at).is_none_or(|last| last != what);
+    if new {
+        said.insert(at.to_string(), what.to_string());
+    }
+    new
+}
+
 /// The files this node keeps for Volumes that have been gone from `store` for [`GONE`] seconds
 /// (`now` and `seen` are in seconds: when each was first seen gone): the keys it holds for other
 /// nodes' volumes (`volume-keys/NODE/NS/NAME`) and the files of its own (`encrypted/NS/NAME`)
 /// that are not open. A Volume of the name that is in the store, whatever it says or where it
 /// is, keeps both: this is only for what nothing names any more.
 fn forgotten(store: &Store, state: &Path, seen: &mut BTreeMap<PathBuf, u64>, now: u64) -> Vec<PathBuf> {
-    let inside = |path: &Path| -> Vec<(String, PathBuf)> {
-        let found = std::fs::read_dir(path).into_iter().flatten().flatten();
-        let named = found.filter_map(|entry| Some((entry.file_name().into_string().ok()?, entry.path())));
-        named.filter(|(name, _)| !name.starts_with('.')).collect()
-    };
-    let files = |path: &Path| -> Vec<(String, PathBuf)> {
-        let regular = |(_, path): &(String, PathBuf)| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
-        inside(path).into_iter().filter(regular).collect()
-    };
-    let folders = |path: &Path| -> Vec<(String, PathBuf)> {
-        let real = |(_, path): &(String, PathBuf)| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
-        inside(path).into_iter().filter(real).collect()
-    };
+    // (Each with the node a key copy is for: none for a volume's own file.)
     let mut named = Vec::new();
-    for (_, node) in folders(&state.join("volume-keys")) {
+    for (owner, node) in folders(&state.join("volume-keys")) {
         for (namespace, folder) in folders(&node) {
-            named.extend(
-                files(&folder)
-                    .into_iter()
-                    .map(|(name, path)| (namespace.clone(), name, path, false)),
-            );
+            let found = files(&folder).into_iter();
+            named.extend(found.map(|(name, path)| (namespace.clone(), name, path, Some(owner.clone()))));
         }
     }
     for (namespace, folder) in folders(&state.join("encrypted")) {
-        named.extend(
-            files(&folder)
-                .into_iter()
-                .map(|(name, path)| (namespace.clone(), name, path, true)),
-        );
+        let found = files(&folder).into_iter();
+        named.extend(found.map(|(name, path)| (namespace.clone(), name, path, None)));
     }
+    // Whether the node a key copy is for says it holds the Volume's file: it may be running it.
+    let held = |owner: &str, volume: &str| {
+        let listed = store
+            .get(&format!("Node/{owner}"))
+            .and_then(|node| node.status.as_ref()?["encrypted"].as_array());
+        listed.is_some_and(|files| files.iter().any(|file| file == volume))
+    };
     let mut gone = Vec::new();
-    for (namespace, name, path, file) in named {
+    for (namespace, name, path, owner) in named {
         let there = store.get(&format!("Volume/{namespace}/{name}")).is_some();
-        if !there && !(file && open(&root(state, &namespace, &name))) {
+        let kept = match &owner {
+            Some(owner) => held(owner, &format!("{namespace}/{name}")),
+            None => open(&root(state, &namespace, &name)),
+        };
+        if !there && !kept {
             gone.push(path);
         }
     }
@@ -553,6 +623,18 @@ fn erase(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Erase what [`forgotten`] listed: a key kept under `keys` is written over and unlinked, a
+/// volume's file (as big as the volume) is only unlinked. One that is not there is erased.
+fn forget(keys: &Path, path: &Path) -> std::io::Result<()> {
+    match path.starts_with(keys) {
+        true => erase(path),
+        false => match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            done => done,
+        },
+    }
+}
+
 /// Keeps this node's encrypted volumes open.
 pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Receiver<bool>) {
     let me = shared.members.me().to_string();
@@ -560,6 +642,8 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
     // last said of each that is not, so that it is said once.
     let mut keys: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     let mut said: BTreeMap<String, String> = BTreeMap::new();
+    // What failed to be erased or written, by path or key, said once like `said`.
+    let mut unsaid: BTreeMap<String, String> = BTreeMap::new();
     let mut round = 0u32;
     // When each file of a Volume that is not in the store was first seen so, in seconds since
     // kithd started: a start again counts from nothing, and so does a time with no leader (a
@@ -596,23 +680,42 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
         if !forgot.is_empty() {
             let keys = state.join("volume-keys");
             let erased = tokio::task::spawn_blocking(move || {
-                for path in forgot {
-                    // (A key is written over; a volume's file, as big as the volume, is only unlinked.)
-                    let done = if path.starts_with(&keys) {
-                        erase(&path)
-                    } else {
-                        std::fs::remove_file(&path)
-                    };
-                    match done {
-                        Ok(()) => eprintln!(
-                            "kithd: {} is erased: its Volume has been gone for a day",
-                            path.display()
-                        ),
-                        Err(e) => eprintln!("kithd: {} is not erased (tried again later): {e}", path.display()),
+                forgot
+                    .into_iter()
+                    .map(|path| (forget(&keys, &path), path))
+                    .collect::<Vec<_>>()
+            });
+            for (done, path) in erased.await.unwrap_or_default() {
+                let at = path.display().to_string();
+                match done {
+                    Ok(()) => {
+                        news(&mut unsaid, &at, None);
+                        eprintln!("kithd: {at} is erased: its Volume has been gone for a day");
+                    }
+                    Err(e) => {
+                        if news(&mut unsaid, &at, Some(&e.to_string())) {
+                            eprintln!("kithd: {at} is not erased (tried again later): {e}");
+                        }
                     }
                 }
-            });
-            drop(erased.await);
+            }
+        }
+        // Which files it holds, in its own Node: its keepers erase their copies of a key only when it lets go.
+        let files = files_held(&state);
+        let write = {
+            let held = shared.store.lock().expect("a handler panicked holding the store");
+            held_write(&held.store, &me, &files)
+        };
+        if let Some((key, fields)) = write {
+            let statuses = vec![(key.clone(), fields)];
+            let done = shared.submit(kith_store::Command::Patch { statuses }).await;
+            let failed = done.err().map(|e| e.to_string());
+            if news(&mut unsaid, &key, failed.as_deref()) {
+                eprintln!(
+                    "kithd: {key} did not say which volume files it holds (tried again later): {}",
+                    failed.unwrap_or_default()
+                );
+            }
         }
         round += 1;
         let cluster = shared.cluster.as_ref();
@@ -634,15 +737,20 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
                 }
                 Err(_) => {}
             }
-            // In the Volume's status too, where `kith get` shows it: what the log says, until it is open.
+            // In the Volume's status too, where `kith get volumes` shows it: what the log says, until it is open.
             let write = {
                 let held = shared.store.lock().expect("a handler panicked holding the store");
                 reason_write(&held.store, &dir, outcome.as_ref().err().map(String::as_str))
             };
             if let Some((key, fields)) = write {
                 let statuses = vec![(key.clone(), fields)];
-                if let Err(e) = shared.submit(kith_store::Command::Patch { statuses }).await {
-                    eprintln!("kithd: the status of {key} was not written (tried again later): {e}");
+                let done = shared.submit(kith_store::Command::Patch { statuses }).await;
+                let failed = done.err().map(|e| e.to_string());
+                if news(&mut unsaid, &key, failed.as_deref()) {
+                    eprintln!(
+                        "kithd: the status of {key} was not written (tried again later): {}",
+                        failed.unwrap_or_default()
+                    );
                 }
             }
         }
@@ -902,6 +1010,138 @@ spec: { node: a, path: /srv/data, size: 1Gi, encrypted: true }
         assert!(patch("a", serde_json::json!({ "reason": "x".repeat(1025) })).is_err());
         assert!(patch("a", serde_json::json!({ "reason": "x", "primary": "a" })).is_err());
         assert!(patch("b", serde_json::json!({ "reason": "no seed" })).is_err());
+        // Text, not a terminal's: no control character (it is shown where `kith get` prints it).
+        assert!(patch("a", serde_json::json!({ "reason": "no\nseed" })).is_err());
+        assert!(patch("a", serde_json::json!({ "reason": "no\u{1b}[2Jseed" })).is_err());
+    }
+
+    /// A node says which volume files it holds (`status.encrypted` of its own Node): the shape of
+    /// a short list of names, from that node only.
+    #[test]
+    fn encrypted_node_says_which_files_it_holds() {
+        let state = state("held");
+        assert!(files_held(&state).is_empty());
+        for (namespace, name) in [("default", "vault"), ("kith-system", "anywhere")] {
+            let path = backing(&state, namespace, name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"sealed").unwrap();
+        }
+        // (A partial file of a start that got no further is no volume's.)
+        std::fs::write(state.join("encrypted/default/.vault.new"), b"half").unwrap();
+        let files = files_held(&state);
+        assert_eq!(files, ["default/vault", "kith-system/anywhere"]);
+        let mut store = store("");
+        // Said once: nothing more to write when the Node says it.
+        let (at, fields) = held_write(&store, "a", &files).expect("said");
+        assert_eq!(
+            (at.as_str(), &fields["encrypted"]),
+            ("Node/a", &serde_json::json!(files))
+        );
+        store
+            .set_status("Node/a", Some(serde_json::json!({ "encrypted": files })))
+            .unwrap();
+        assert_eq!(held_write(&store, "a", &files), None);
+        // None held: null, not a list.
+        let (_, fields) = held_write(&store, "a", &[]).unwrap();
+        assert!(fields["encrypted"].is_null());
+        assert_eq!(held_write(&store, "nobody", &files), None);
+        let nothing = |_: &str| false;
+        let patch = |node: &str, fields: serde_json::Value| {
+            let who = crate::worker::Worker {
+                name: node,
+                prefix: None,
+                held: &nothing,
+            };
+            crate::worker::patch(&store, &who, "Node/a", fields.as_object().unwrap())
+        };
+        assert!(patch("a", serde_json::json!({ "encrypted": ["default/vault"] })).is_ok());
+        assert!(patch("a", serde_json::json!({ "encrypted": null })).is_ok());
+        assert!(patch("a", serde_json::json!({ "encrypted": "default/vault" })).is_err());
+        assert!(patch("a", serde_json::json!({ "encrypted": [7] })).is_err());
+        assert!(patch("a", serde_json::json!({ "encrypted": ["x".repeat(321)] })).is_err());
+        assert!(patch("a", serde_json::json!({ "encrypted": vec!["x"; 4097] })).is_err());
+        assert!(patch("b", serde_json::json!({ "encrypted": ["default/vault"] })).is_err());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A key copy is kept while the node it is for says it holds the Volume's file: that node
+    /// may be running it still, and a Volume applied again then finds its file and its key.
+    #[test]
+    fn encrypted_forgotten_key_is_kept_while_its_owner_holds_the_file() {
+        let state = state("forgotten-owner");
+        let dir = asked(&store(""), "default", "vault", "a").unwrap();
+        let dir = Dir {
+            name: "ghost".into(),
+            ..dir
+        };
+        keep(&state, &dir, &[8u8; KEY]).unwrap();
+        let key = kept(&state, &dir);
+        let said = |files: serde_json::Value| {
+            let mut store = store("");
+            store
+                .set_status("Node/a", Some(serde_json::json!({ "encrypted": files })))
+                .unwrap();
+            store
+        };
+        let mut seen = BTreeMap::new();
+        let holds = said(serde_json::json!(["default/ghost"]));
+        // Days on, the owner still has it: kept.
+        let _ = forgotten(&holds, &state, &mut seen, 0);
+        assert!(forgotten(&holds, &state, &mut seen, 3 * GONE).is_empty());
+        // Another volume of its is no reason to keep this one.
+        let other = said(serde_json::json!(["default/else"]));
+        assert!(forgotten(&other, &state, &mut seen, 3 * GONE).is_empty());
+        // It lets go of the file (erased on its node): a day more, and the copy goes.
+        assert!(forgotten(&other, &state, &mut seen, 4 * GONE - 1).is_empty());
+        assert_eq!(forgotten(&other, &state, &mut seen, 4 * GONE), [key.clone()]);
+        // It holds the file again: the clock starts over when it lets go.
+        assert!(forgotten(&holds, &state, &mut seen, 5 * GONE).is_empty());
+        assert!(seen.is_empty());
+        // A node that is not in the store holds nothing.
+        let gone = Store::default();
+        let _ = forgotten(&gone, &state, &mut seen, 6 * GONE);
+        assert_eq!(forgotten(&gone, &state, &mut seen, 7 * GONE), [key]);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// What is erased is told by where it is: a key is written over and unlinked, a volume's file
+    /// is only unlinked; neither is an error when it is gone already.
+    #[test]
+    fn encrypted_forgotten_is_erased_by_what_it_is() {
+        let state = state("forgotten-by-what");
+        let dir = asked(&store(""), "default", "vault", "a").unwrap();
+        let dir = Dir {
+            name: "ghost".into(),
+            ..dir
+        };
+        keep(&state, &dir, &[8u8; KEY]).unwrap();
+        let (key, file) = (kept(&state, &dir), backing(&state, "default", "ghost"));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"sealed").unwrap();
+        let (key_copy, file_copy) = (state.join("key-copy"), state.join("file-copy"));
+        std::fs::hard_link(&key, &key_copy).unwrap();
+        std::fs::hard_link(&file, &file_copy).unwrap();
+        let keys = state.join("volume-keys");
+        forget(&keys, &key).unwrap();
+        forget(&keys, &file).unwrap();
+        assert!(!key.exists() && !file.exists());
+        assert_eq!(std::fs::read(&key_copy).unwrap(), vec![0u8; KEY]);
+        assert_eq!(std::fs::read(&file_copy).unwrap(), b"sealed");
+        assert!(forget(&keys, &key).is_ok() && forget(&keys, &file).is_ok());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// What goes wrong is said once for each thing, until it goes right or is another thing.
+    #[test]
+    fn encrypted_news_is_said_once() {
+        let mut said = BTreeMap::new();
+        assert!(news(&mut said, "a", Some("no")));
+        assert!(!news(&mut said, "a", Some("no")));
+        assert!(news(&mut said, "b", Some("no")));
+        assert!(news(&mut said, "a", Some("still no")));
+        // It went right: nothing to say, and a fault after is news again.
+        assert!(!news(&mut said, "a", None));
+        assert!(news(&mut said, "a", Some("still no")));
     }
 
     /// A key file or a volume's file under `state`: a Volume that is gone from the store for a
