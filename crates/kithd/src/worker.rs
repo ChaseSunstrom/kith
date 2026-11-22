@@ -423,6 +423,18 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
                 None => Ok(()),
             }
         }
+        // Why its encrypted Volume is not open ([`crate::encrypted`]): the node it is on says it,
+        // as text of up to 1 KiB or null, and nothing beside it in that write.
+        "Volume" if fields.contains_key("reason") => {
+            let mine = crate::volumes::encrypted(store, node)
+                .iter()
+                .any(|(dir, _)| key == format!("Volume/{}/{}", dir.namespace, dir.name));
+            let shaped = fields.len() == 1 && fields["reason"].as_str().is_none_or(|why| why.len() <= 1024);
+            match mine && shaped && (fields["reason"].is_null() || fields["reason"].is_string()) {
+                true => Ok(()),
+                false => Err(refused(key, "`reason` is the text a Volume's node says, written alone")),
+            }
+        }
         "Volume" => {
             // (`synced-NODE` is the node's own time, written alone so two replicas never overwrite
             // each other's; `synced` is the whole object an older kithd wrote.)

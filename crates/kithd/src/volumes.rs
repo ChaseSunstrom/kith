@@ -587,6 +587,13 @@ pub fn resolve(store: &Store) -> Volumes {
         if vol.replicas < 2 {
             copies.retain(|field, node| field == "primary" && node.as_str() != home);
         }
+        // (An encrypted Volume's node says why it is not open: kept while it is encrypted.)
+        let why = was
+            .and_then(|status| status.get("reason"))
+            .filter(|why| why.is_string());
+        if let Some(why) = why.filter(|_| vol.dir.encrypted) {
+            copies.insert("reason".into(), why.clone());
+        }
         let status = match (status, copies.is_empty()) {
             (status, true) => status,
             (status, false) => {
