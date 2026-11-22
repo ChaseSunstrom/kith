@@ -664,18 +664,24 @@ fn erase(path: &Path) -> std::io::Result<()> {
 }
 
 /// Erase what [`due`] listed: a key kept under `state`'s `volume-keys` is written over and
-/// unlinked; a volume's file (as big as the volume) is only unlinked, after it is closed if it
-/// is open (unmounted, and its mapping removed: one still in use stays open and is an error, to
-/// be tried again at the next round). One that is not there is erased.
+/// unlinked; a volume's file (as big as the volume) is only unlinked, after it is closed: its
+/// root unmounted if that is mounted, and its mapping removed if there is one (whether or not
+/// the root is mounted: an unmount that went through and a removal that did not leave a mapping
+/// over the file). One still in use stays open and is an error, to be tried again at the next
+/// round, and the file stays. One that is not there is erased.
 fn forget(state: &Path, path: &Path) -> std::io::Result<()> {
-    forget_with(state, path, &|at, name| {
-        nix::mount::umount(at).map_err(std::io::Error::from)?;
-        kith_dm_sys::remove(name)
-    })
+    let umount = |at: &Path| nix::mount::umount(at).map_err(std::io::Error::from);
+    forget_with(state, path, &umount, &kith_dm_sys::remove)
 }
 
-/// [`forget`], with `close` (the volume's root and its mapping's name) to close a volume that is open.
-fn forget_with(state: &Path, path: &Path, close: &dyn Fn(&Path, &str) -> std::io::Result<()>) -> std::io::Result<()> {
+/// [`forget`], with `umount` (a volume's root) and `unmap` (its mapping's name) to close it. A
+/// mapping that is not there (no such device, or no device mapper at all) is closed.
+fn forget_with(
+    state: &Path,
+    path: &Path,
+    umount: &dyn Fn(&Path) -> std::io::Result<()>,
+    unmap: &dyn Fn(&str) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     if path.starts_with(state.join("volume-keys")) {
         return erase(path);
     }
@@ -683,7 +689,15 @@ fn forget_with(state: &Path, path: &Path, close: &dyn Fn(&Path, &str) -> std::io
     if let (Some(name), Some(namespace)) = (named(path), path.parent().and_then(named)) {
         let at = root(state, &namespace, &name);
         if open(&at) {
-            close(&at, &mapping(&namespace, &name))?;
+            umount(&at)?;
+        }
+        match unmap(&mapping(&namespace, &name)) {
+            Err(e)
+                if matches!(
+                    e.raw_os_error().map(nix::errno::Errno::from_raw),
+                    Some(nix::errno::Errno::ENXIO | nix::errno::Errno::ENOENT)
+                ) => {}
+            done => done?,
         }
     }
     match std::fs::remove_file(path) {
@@ -758,6 +772,13 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
                     Ok(()) => {
                         news(&mut unsaid, &at, None);
                         eprintln!("kithd: {at} is erased: its Volume has been gone for a day");
+                        // (Its key goes from memory too: that is for a volume's own file.)
+                        if let (Some(name), Some(namespace)) =
+                            (path.file_name(), path.parent().and_then(Path::file_name))
+                            && !path.starts_with(state.join("volume-keys"))
+                        {
+                            keys.remove(&format!("{}/{}", namespace.to_string_lossy(), name.to_string_lossy()));
+                        }
                     }
                     Err(e) => {
                         if news(&mut unsaid, &at, Some(&e.to_string())) {
@@ -1225,17 +1246,20 @@ spec: { node: a, path: /srv/data, size: 1Gi, encrypted: true }
         std::fs::hard_link(&key, &key_copy).unwrap();
         std::fs::hard_link(&file, &file_copy).unwrap();
         forget(&state, &key).unwrap();
-        forget(&state, &file).unwrap();
+        let closed = |_: &Path| Ok(());
+        let ok = |_: &str| Ok(());
+        forget_with(&state, &file, &closed, &ok).unwrap();
         assert!(!key.exists() && !file.exists());
         assert_eq!(std::fs::read(&key_copy).unwrap(), vec![0u8; KEY]);
         assert_eq!(std::fs::read(&file_copy).unwrap(), b"sealed");
-        assert!(forget(&state, &key).is_ok() && forget(&state, &file).is_ok());
+        assert!(forget(&state, &key).is_ok() && forget_with(&state, &file, &closed, &ok).is_ok());
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// A volume's file that is open (mounted) is closed first: its root unmounted and its mapping
-    /// removed, then unlinked. Busy (the close fails) leaves it, an error, to be tried again; one
-    /// that is not open is not closed.
+    /// A volume's file is closed before it is erased: its root unmounted if that is mounted, and
+    /// its mapping removed if there is one, mounted or not (an unmount that went through and a
+    /// removal that did not must not leave the file unlinked under a mapping). Busy leaves the
+    /// file, an error, to be tried again; a mapping that is not there is closed already.
     #[test]
     fn encrypted_forgotten_open_file_is_closed_before_it_is_erased() {
         let state = state("forgotten-open");
@@ -1245,31 +1269,56 @@ spec: { node: a, path: /srv/data, size: 1Gi, encrypted: true }
             std::fs::write(&path, b"sealed").unwrap();
             path
         };
-        let (open, shut) = (file("open"), file("shut"));
+        let (open, half, shut) = (file("open"), file("half"), file("shut"));
         // `open` is mounted over: a different device from the folder above it.
         std::fs::create_dir_all(state.join("volumes/default")).unwrap();
         std::os::unix::fs::symlink("/proc", state.join("volumes/default/open")).unwrap();
-        let closed = std::cell::RefCell::new(Vec::new());
-        let busy = |_: &Path, _: &str| Err(std::io::Error::from_raw_os_error(16));
-        let close = |at: &Path, name: &str| {
-            closed.borrow_mut().push((at.to_path_buf(), name.to_string()));
-            Ok(())
+        let called = std::cell::RefCell::new(Vec::<String>::new());
+        let (busy, no_device) = (16, 6);
+        let umount = |fails: Option<i32>| {
+            let called = &called;
+            move |at: &Path| {
+                called.borrow_mut().push(format!("umount {}", at.display()));
+                fails.map_or(Ok(()), |e| Err(std::io::Error::from_raw_os_error(e)))
+            }
         };
-        // Busy: an error, and the file stays for the next round.
-        assert!(forget_with(&state, &open, &busy).is_err());
+        let unmap = |fails: Option<i32>| {
+            let called = &called;
+            move |name: &str| {
+                called.borrow_mut().push(format!("unmap {name}"));
+                fails.map_or(Ok(()), |e| Err(std::io::Error::from_raw_os_error(e)))
+            }
+        };
+        let (ok, stuck) = (umount(None), umount(Some(busy)));
+        let at = root(&state, "default", "open").display().to_string();
+        // The root is busy: an error, the mapping is not touched, the file stays.
+        assert!(forget_with(&state, &open, &stuck, &unmap(None)).is_err());
         assert!(open.exists());
-        assert!(closed.borrow().is_empty());
-        // Closed, then erased; given the root and the mapping it was opened under.
-        forget_with(&state, &open, &close).unwrap();
+        assert_eq!(*called.borrow(), [format!("umount {at}")]);
+        called.borrow_mut().clear();
+        // Unmounted, but the mapping is in use: an error, the file stays.
+        assert!(forget_with(&state, &open, &ok, &unmap(Some(busy))).is_err());
+        assert!(open.exists());
+        called.borrow_mut().clear();
+        // The next pass: the root is not mounted (`half`'s is not) and the mapping is still
+        // there: it is removed again, not skipped, and the file is not unlinked while that fails.
+        assert!(forget_with(&state, &half, &stuck, &unmap(Some(busy))).is_err());
+        assert!(half.exists());
+        assert_eq!(*called.borrow(), [format!("unmap {}", mapping("default", "half"))]);
+        // It goes through: then the file is unlinked.
+        forget_with(&state, &half, &stuck, &unmap(None)).unwrap();
+        assert!(!half.exists());
+        // Both close, the root and then the mapping it was opened under; then it is erased.
+        called.borrow_mut().clear();
+        forget_with(&state, &open, &ok, &unmap(None)).unwrap();
         assert!(!open.exists());
         assert_eq!(
-            *closed.borrow(),
-            [(root(&state, "default", "open"), mapping("default", "open"))]
+            *called.borrow(),
+            [format!("umount {at}"), format!("unmap {}", mapping("default", "open"))]
         );
-        // Not open: nothing to close.
-        forget_with(&state, &shut, &busy).unwrap();
+        // A mapping that is not there (no such device, or no device mapper) is closed: erased.
+        forget_with(&state, &shut, &stuck, &unmap(Some(no_device))).unwrap();
         assert!(!shut.exists());
-        assert_eq!(closed.borrow().len(), 1);
         let _ = std::fs::remove_dir_all(&state);
     }
 
