@@ -492,6 +492,8 @@ sys.exit(subprocess.run(args[4:], stdin=s, stdout=s).returncode)
         pub(crate) a_port: u16,
         pub(crate) b_port: u16,
         ca: Ca,
+        /// Removed with the world.
+        _dir: crate::scratch::Scratch,
     }
 
     const ROLES: &str = "
@@ -523,7 +525,7 @@ spec: {role: other-jobber, subjects: [carol]}
 
     impl World {
         pub(crate) async fn new(tag: &str) -> World {
-            let dir = std::env::temp_dir().join(format!("kithd-run-on-{tag}-{}", std::process::id()));
+            let dir = crate::scratch::Scratch::new(&format!("kithd-run-on-{tag}"));
             let ca = Ca::create().unwrap();
             let mut nodes = Vec::new();
             for name in ["a", "b"] {
@@ -555,6 +557,7 @@ spec: {role: other-jobber, subjects: [carol]}
                 a_port,
                 b_port,
                 ca,
+                _dir: dir,
             };
             world.node("a", "", Some(a_port));
             world.node("b", "role: display", Some(b_port));
@@ -606,7 +609,7 @@ spec: {role: other-jobber, subjects: [carol]}
                 cert,
                 key,
             };
-            Self::client(pki::client_config(&me.ca, Some(&me), None).unwrap())
+            Self::client(pki::client_config(&me.ca, Some(pki::Live::new(&me).unwrap()), None).unwrap())
         }
 
         fn client(config: rustls::ClientConfig) -> reqwest::Client {
