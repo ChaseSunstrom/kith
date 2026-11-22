@@ -692,7 +692,7 @@ fn stamped(der: &[u8], signed: &Signed, tsa: &[CertificateDer]) -> std::result::
             refused.push("the timestamp authority's root is no certificate".into());
             continue;
         };
-        match leaf.verify_for_usage(&chain, &[anchor], &others, when, usage.clone(), None, None) {
+        match leaf.verify_for_usage(&chain, &[anchor], &others, when, usage, None, None) {
             Ok(_) => return Ok(read.time),
             Err(e) => refused.push(match e {
                 webpki::Error::CertNotValidYet { .. } | webpki::Error::CertExpired { .. } => {
@@ -1786,7 +1786,11 @@ pub(crate) mod tests {
         let before = searches();
         let mut signed = super::bundle(v2(&made, &cert, &key, None, 60, "").to_string().as_bytes()).unwrap();
         verify(&mut signed, DIGEST, &rule).unwrap();
-        assert_eq!(searches() - before, 1, "the signer was searched for once per stamp, not per root");
+        assert_eq!(
+            searches() - before,
+            1,
+            "the signer was searched for once per stamp, not per root"
+        );
     }
 
     /// A timestamp at a time the TSA's certificate is not valid at (after it, and before it) is

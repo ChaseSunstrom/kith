@@ -124,7 +124,10 @@ async fn by_identity(
     found: &mut Vec<String>,
     kept: &str,
 ) -> Option<String> {
-    let owned: Vec<_> = identities.iter().map(|(key, identity)| (key.id.clone(), std::sync::Arc::clone(identity))).collect();
+    let owned: Vec<_> = identities
+        .iter()
+        .map(|(key, identity)| (key.id.clone(), std::sync::Arc::clone(identity)))
+        .collect();
     let (digest, kept_text) = (digest.to_string(), kept.to_string());
     let ran = tokio::task::spawn_blocking(move || {
         let (mut signed, mut found) = (signed, Vec::new());
