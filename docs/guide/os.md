@@ -20,7 +20,8 @@ As process 1, kithd:
   default route, the name servers and the time servers it names are used only if the node has
   none yet, so a card put on another wire cannot take them over; the card that had `kith.ip`,
   plugged in again, gets that address, not a lease. A veth, bridge or tunnel that kithd makes
-  is never asked. IPv6 on a link is the
+  is never asked. (The kernel has PCIe hot-plug, so a card put in a slot of a running machine
+  appears.) IPv6 on a link is the
   kernel's (router advertisements); there is no DHCPv6;
 - keeps the time: a machine has no clock battery to trust, so after the network is up kithd asks
   an SNTP server for the time at start and every hour, and sets the clock when it is more than

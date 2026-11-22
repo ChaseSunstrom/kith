@@ -53,8 +53,10 @@
         # (access: three nodes on the mesh, pod's image in each; people on the first, below.)
         [ "$test" != access ] || others='2 3'
         [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != privilege ] && [ "$test" != nested ] && [ "$test" != nofile ] && [ "$test" != handover ] && [ "$test" != latecard ] || others=''
-        # (latecard: a PCIe root port to plug a card into after the boot: the q35 root bus takes none.)
-        [ "$test" != latecard ] || ports='-device pcie-root-port,id=rp1,chassis=1'
+        # (latecard: a PCIe root port to plug a card into after the boot: the q35 root bus takes none. Hot-plug is
+        # the kernel's own (pciehp): QEMU's ACPI says it supports none unless that is off, and with a power
+        # controller the kernel waits 5 s after the "button press" a plug makes, which a power-less slot spares.)
+        [ "$test" != latecard ] || ports='-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off -device pcie-root-port,id=rp1,chassis=1,power_controller_present=off'
         # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
         # as a node's state from before had none: kithd counts what their pods write.)
         [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
@@ -380,7 +382,8 @@ EOF
         # (access: the first node ends the people's tunnels, which phones on its LAN reach.)
         [ "$test" != access ] || first='--people --people-endpoint 10.9.0.1:51821'
         keep=${net_restrict-,restrict=on}
-        [ "$test" != pods ] || net_restrict=''
+        # (latecard: the same, for a lease with a name server: a restricted network gives none, as it gives no router.)
+        { [ "$test" != pods ] && [ "$test" != latecard ]; } || net_restrict=''
         # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
         # (home: every joined one serves DNS too; node 4 roams (--roaming, as a laptop joins): it is reset, and dials the house endpoint.)
         [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353'; }

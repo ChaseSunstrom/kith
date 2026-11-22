@@ -831,6 +831,7 @@ fn got(told: Option<IpAddr>, late: bool) -> impl Fn(&crate::dhcp::Lease) + Send 
             crate::clock::learn(&lease.ntp, lease.router.filter(|_| may.way));
         }
         if may.dns && (gave.dns || !late) {
+            eprintln!("kithd: init: name servers from the lease: {servers:?}");
             resolvers(&servers);
         }
         *has = took(*has, may, gave);
@@ -1458,7 +1459,7 @@ mod tests {
         assert_eq!(fixed_for(&back, &[back.clone(), other.clone()], fixed), Some(ip));
         // Another card, or no address on the command line: its network's.
         assert_eq!(fixed_for(&other, &[back.clone(), other.clone()], fixed), None);
-        assert_eq!(fixed_for(&back, &[back.clone()], None), None);
+        assert_eq!(fixed_for(&back, std::slice::from_ref(&back), None), None);
         // Two cards with that MAC: neither is given it.
         let twin = kith_mesh::Card { index: 8, ..first };
         assert_eq!(fixed_for(&back, &[back.clone(), twin], fixed), None);

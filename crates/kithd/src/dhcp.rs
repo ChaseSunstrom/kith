@@ -113,7 +113,7 @@ pub fn reply(packet: &[u8], xid: u32, mac: [u8; 6]) -> Option<(u8, Lease)> {
     (usable && (1..=32).contains(&lease.bits)).then_some((kind?, lease))
 }
 
-async fn hear(socket: &UdpSocket, xid: u32, mac: [u8; 6], wanted: u8) -> Result<Lease> {
+async fn hear(socket: &UdpSocket, xid: u32, mac: [u8; 6], wanted: u8, secs: u64) -> Result<Lease> {
     let answer = async {
         let mut packet = [0; 1500];
         loop {
@@ -126,7 +126,7 @@ async fn hear(socket: &UdpSocket, xid: u32, mac: [u8; 6], wanted: u8) -> Result<
         }
     };
     let none = |_| Error::new(ErrorKind::TimedOut, "no DHCP server answered");
-    tokio::time::timeout(Duration::from_secs(4), answer)
+    tokio::time::timeout(Duration::from_secs(secs), answer)
         .await
         .map_err(none)?
 }
@@ -155,10 +155,20 @@ pub async fn ask(card: &Card, hostname: &str) -> Result<Lease> {
     let mut xid = [0; 4];
     std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut xid)?;
     let xid = u32::from_be_bytes(xid);
-    broadcast(card, &message(DISCOVER, xid, card.mac, hostname, None))?;
-    let offer = hear(&socket, xid, card.mac, OFFER).await?;
+    // (The DISCOVER again each second, four times: a card just plugged in has no carrier for a
+    // moment, and a frame sent before it does is lost, which cost the 4 s of waiting for it.)
+    let discover = message(DISCOVER, xid, card.mac, hostname, None);
+    let mut tries = 0;
+    let offer = loop {
+        broadcast(card, &discover)?;
+        tries += 1;
+        match hear(&socket, xid, card.mac, OFFER, 1).await {
+            Err(e) if e.kind() == ErrorKind::TimedOut && tries < 4 => {}
+            heard => break heard?,
+        }
+    };
     broadcast(card, &message(REQUEST, xid, card.mac, hostname, Some(&offer)))?;
-    hear(&socket, xid, card.mac, ACK).await
+    hear(&socket, xid, card.mac, ACK, 4).await
 }
 
 /// Send `message` to every server on `card`'s network, from no address: as a frame of its
