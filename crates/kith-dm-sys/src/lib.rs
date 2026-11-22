@@ -450,8 +450,11 @@ const READONLY: u32 = 1;
 /// salt are what the system pinned, and what is on the disk can only match them or fail.
 fn verity_table(data: &Path, hash: &Path, data_blocks: u64, hash_start: u64, root: &str, salt: &str) -> Result<String> {
     let path = |device: &Path| {
-        let told = device.to_str().filter(|path| !path.is_empty() && !path.contains([' ', '\0']));
-        told.map(str::to_owned).ok_or_else(|| Error::other(format!("{}: cannot be told to the kernel", device.display())))
+        let told = device
+            .to_str()
+            .filter(|path| !path.is_empty() && !path.contains([' ', '\0']));
+        told.map(str::to_owned)
+            .ok_or_else(|| Error::other(format!("{}: cannot be told to the kernel", device.display())))
     };
     let hex = |text: &str| text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
     if data_blocks == 0 || data_blocks.checked_mul(8).is_none() {
@@ -461,12 +464,16 @@ fn verity_table(data: &Path, hash: &Path, data_blocks: u64, hash_start: u64, roo
         return Err(Error::other("the root hash is not 64 lowercase hex digits"));
     }
     // (The kernel takes up to 256 bytes of salt.)
-    if salt.len() % 2 != 0 || salt.len() > 512 || !hex(salt) {
-        return Err(Error::other("the salt is not whole bytes of lowercase hex, at most 256"));
+    if !salt.len().is_multiple_of(2) || salt.len() > 512 || !hex(salt) {
+        return Err(Error::other(
+            "the salt is not whole bytes of lowercase hex, at most 256",
+        ));
     }
     let salt = if salt.is_empty() { "-" } else { salt };
     let (data, hash) = (path(data)?, path(hash)?);
-    Ok(format!("1 {data} {hash} 4096 4096 {data_blocks} {hash_start} sha256 {root} {salt}"))
+    Ok(format!(
+        "1 {data} {hash} 4096 4096 {data_blocks} {hash_start} sha256 {root} {salt}"
+    ))
 }
 
 /// Make the mapping `name`: `data` (`data_blocks` of 4096 bytes) read through dm-verity,
@@ -497,7 +504,10 @@ mod verity_tests {
     #[test]
     fn verity_table_of_two_files() {
         let told = verity_table(Path::new("/dev/loop0"), Path::new("/dev/loop1"), 256, 1, ROOT, "00ff").unwrap();
-        assert_eq!(told, format!("1 /dev/loop0 /dev/loop1 4096 4096 256 1 sha256 {ROOT} 00ff"));
+        assert_eq!(
+            told,
+            format!("1 /dev/loop0 /dev/loop1 4096 4096 256 1 sha256 {ROOT} 00ff")
+        );
     }
 
     /// The tree after the data in one file (veritysetup --hash-offset): the superblock is the
@@ -505,7 +515,10 @@ mod verity_tests {
     #[test]
     fn verity_table_of_one_file() {
         let told = verity_table(Path::new("/dev/loop3"), Path::new("/dev/loop3"), 256, 257, ROOT, "").unwrap();
-        assert_eq!(told, format!("1 /dev/loop3 /dev/loop3 4096 4096 256 257 sha256 {ROOT} -"));
+        assert_eq!(
+            told,
+            format!("1 /dev/loop3 /dev/loop3 4096 4096 256 257 sha256 {ROOT} -")
+        );
     }
 
     #[test]
@@ -515,14 +528,26 @@ mod verity_tests {
         };
         assert!(table("/dev/loop0", 0, ROOT, "00").is_err(), "no data");
         assert!(table("/dev/loop0", 1, &ROOT[1..], "00").is_err(), "63 digits");
-        assert!(table("/dev/loop0", 1, &ROOT.to_uppercase(), "00").is_err(), "not as veritysetup writes it");
+        assert!(
+            table("/dev/loop0", 1, &ROOT.to_uppercase(), "00").is_err(),
+            "not as veritysetup writes it"
+        );
         assert!(table("/dev/loop0", 1, &format!("{}g", &ROOT[1..]), "00").is_err());
         assert!(table("/dev/loop0", 1, ROOT, "0").is_err(), "half a byte of salt");
         assert!(table("/dev/loop0", 1, ROOT, "zz").is_err());
-        assert!(table("/dev/loop0", 1, ROOT, &"00".repeat(257)).is_err(), "more salt than the kernel takes");
-        assert!(table("/dev/loop 0", 1, ROOT, "00").is_err(), "a space ends a path in a table");
+        assert!(
+            table("/dev/loop0", 1, ROOT, &"00".repeat(257)).is_err(),
+            "more salt than the kernel takes"
+        );
+        assert!(
+            table("/dev/loop 0", 1, ROOT, "00").is_err(),
+            "a space ends a path in a table"
+        );
         assert!(table("", 1, ROOT, "00").is_err());
-        assert!(table("/dev/loop0", u64::MAX / 4, ROOT, "00").is_err(), "more sectors than a u64");
+        assert!(
+            table("/dev/loop0", u64::MAX / 4, ROOT, "00").is_err(),
+            "more sectors than a u64"
+        );
     }
 
     /// The table is loaded read-only (dm-verity takes no other), with no options: a block

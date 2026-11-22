@@ -570,7 +570,14 @@ mod tests {
         assert_eq!(shown["known"][0]["state"], "mounted");
         assert_eq!(shown["unknown"], json!([]));
 
-        let (gone, at) = remove(&state, &disks, &crate::pki::hex(&id), |_| false, |_, _| Ok(again(&file))).unwrap();
+        let (gone, at) = remove(
+            &state,
+            &disks,
+            &crate::pki::hex(&id),
+            |_| false,
+            |_, _| Ok(again(&file)),
+        )
+        .unwrap();
         assert_eq!((gone, at.unwrap().name.as_str()), (id, "sdb"));
         assert!(room(&file).iter().all(|&byte| byte == 0), "its header is zeroed");
         assert!(ids(&state).is_empty(), "its key and entry are forgotten");
@@ -745,11 +752,17 @@ mod tests {
         .0;
         let hex = crate::pki::hex(&id);
         let refused = |disks: &[Disk], typed: &str, fail: Option<&'static str>| {
-            remove(&state, disks, typed, |_| false, |_, _| {
-                let (disk, mut map) = again(&file);
-                map.fail = fail;
-                Ok((disk, map))
-            })
+            remove(
+                &state,
+                disks,
+                typed,
+                |_| false,
+                |_, _| {
+                    let (disk, mut map) = again(&file);
+                    map.fail = fail;
+                    Ok((disk, map))
+                },
+            )
             .unwrap_err()
         };
         assert!(refused(&disks, "not an id", None).contains("32 lower-case hex"));
@@ -776,7 +789,11 @@ mod tests {
         // (Mounted by this kithd, though the machine does not show it: not gone, nothing forgotten.)
         let why = remove(&state, &disks[..1], &crate::pki::hex(&id), |_| true, took).unwrap_err();
         assert!(why.contains("key is kept"), "{why}");
-        assert_eq!(ids(&state), vec![crate::pki::hex(&id)], "a disk kithd has mounted keeps its entry and key");
+        assert_eq!(
+            ids(&state),
+            vec![crate::pki::hex(&id)],
+            "a disk kithd has mounted keeps its entry and key"
+        );
         let (gone, at) = remove(&state, &disks[..1], &crate::pki::hex(&id), |_| false, took).unwrap();
         assert_eq!((gone, at.is_none()), (id, true));
         assert!(ids(&state).is_empty(), "its key and entry are forgotten");
@@ -820,16 +837,25 @@ mod tests {
         let me = || Named("n1".to_string());
         for (what, (status, text)) in [
             ("add", said(add_one(state.clone(), admin(), me(), body()).await).await),
-            ("remove", said(remove_one(state.clone(), admin(), Named(("n1".into(), "ab".into()))).await).await),
+            (
+                "remove",
+                said(remove_one(state.clone(), admin(), Named(("n1".into(), "ab".into()))).await).await,
+            ),
             ("list", said(list_all(state.clone(), admin(), me()).await).await),
         ] {
             assert_eq!(status, StatusCode::CONFLICT, "{what}: {text}");
             assert!(text.contains("running as the machine's init"), "{what}: {text}");
         }
         for (what, (status, _)) in [
-            ("add, a body that is no JSON", said(add_one(state.clone(), nobody(), me(), Bytes::from_static(b"{")).await).await),
+            (
+                "add, a body that is no JSON",
+                said(add_one(state.clone(), nobody(), me(), Bytes::from_static(b"{")).await).await,
+            ),
             ("add", said(add_one(state.clone(), nobody(), me(), body()).await).await),
-            ("remove", said(remove_one(state.clone(), nobody(), Named(("n1".into(), "ab".into()))).await).await),
+            (
+                "remove",
+                said(remove_one(state.clone(), nobody(), Named(("n1".into(), "ab".into()))).await).await,
+            ),
             ("list", said(list_all(state.clone(), nobody(), me()).await).await),
         ] {
             assert_eq!(status, StatusCode::FORBIDDEN, "{what}");
