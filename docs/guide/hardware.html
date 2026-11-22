@@ -108,56 +108,71 @@ spec:
 </code></pre>
 <ul><li>A seat's <code>reserve</code> comes off its node for every workload that does not hold the seat, held or not. The holder fits only what it wants beyond it; its units are guaranteed the reserve's memory (<code>memory.min</code>) and go first for CPU and disk (<code>cpu.weight</code> and <code>io.weight</code> at 10000; all else 100). CPUs are not pinned; a GPU is not shared out (not yet).</li><li>kithd sets <code>status.activity</code> of a held seat itself, every few seconds: <code>fullscreen</code> while the seat's sound card plays (any playback counts, music too), <code>active</code> for three minutes after its keyboard, mouse or pad is touched (kithd notes only that something came, never what), <code>idle</code> otherwise. A seat nobody holds is idle, and one with no sound card or input is left as it is. A session may say better with <code>POST /v1/seats/desk-seat0/activity?state=active|idle|fullscreen</code> (it needs an Identity whose Role may apply <code>Seat</code>s): a POST wins for ten minutes, then kithd judges again. Posting the same value again does not extend the ten minutes (there is no heartbeat yet): a session that must stay <code>fullscreen</code> longer than that has a sound card or input that says so. (A POST of the value already there, or one made before the node first looks at the seat, is not seen as a POST.) A plan with <code>waitForIdleSeats</code> waits for a node whose seat is <code>active</code> or <code>fullscreen</code>.</li><li>A workload with <code>yieldTo</code> runs on a twentieth of a CPU on that seat's node while the seat is in a state it names, and gets its limit back when the state changes (about ten seconds).</li><li>A template that says <code>priority: idle</code> goes further down: <code>cpu.idle</code>, the lowest <code>io.weight</code> and a <code>memory.high</code>, on every node and whatever the seat does. Batch work beside a desktop takes only spare cycles (see <a href="workloads.html#idle-work">idle work</a>).</li></ul>
 <h3 id="a-tv-or-kiosk-seat">A TV or kiosk seat <a class="anchor" href="#a-tv-or-kiosk-seat" aria-label="Link to this section">#</a></h3>
-<p>A PC on a TV that shows one web page (a media server's TV page) is a seat held by one container: a Wayland compositor (cage) with a browser in it, on an image from a registry or on a stock Alpine that installs them into a Volume. The seat's sound goes out of the TV's HDMI. The node runs a kith OS image with the card's driver built in (<code>gpu-nvidia-pascal</code> for a GeForce GTX 10xx, <code>gpu-amd-phoenix</code> for a Ryzen's GPU: <a href="os.html#a-node-that-needs-more-a-spec">kith OS</a>).</p>
+<p>A PC on a TV that shows one web page (a media server's TV page) is a seat held by one container: a Wayland compositor (cage) with a browser in it. The seat's sound goes out of the TV's HDMI. The node runs a kith OS image with the card's driver built in (<code>gpu-nvidia-pascal</code> for a GeForce GTX 10xx, <code>gpu-amd-phoenix</code> for a Ryzen's GPU: <a href="os.html#a-node-that-needs-more-a-spec">kith OS</a>).</p>
+<p><strong>The image is yours to build.</strong> kith ships no kiosk image: this recipe starts from stock Alpine and you build and push one image of your own, with the packages in it, to a registry the nodes reach. Nothing is installed when the seat starts, so the session needs no root and no network but the page's:</p>
+<pre><code class="language-dockerfile">FROM docker.io/library/alpine:3.22@sha256:&lt;digest of the Alpine you checked&gt;
+RUN apk add --no-cache cage chromium mesa-dri-gallium mesa-gbm alsa-utils wlr-randr font-noto \
+ &amp;&amp; adduser -D -u 1000 kiosk &amp;&amp; addgroup kiosk video &amp;&amp; addgroup kiosk audio
+USER 1000
+</code></pre>
+<p>The page is trusted with the seat: a page that runs in the kiosk reads the seat's keyboards and pads and sets its sound, so point it only at a server you run, and keep the seat in a namespace of its own (<code>tv</code> below) that no one else's workloads share. The seat and each Device of it are given to that namespace by their label (<code>kith.dev/namespaces: tv</code>: add it under <code>metadata.labels</code> of <code>kith get seat tv-seat0 -o yaml</code> and of each of the seat's <code>kith get device</code>, and apply them), as under <a href="#claiming-hardware">who may claim what</a>; until then the claim is refused and says why.</p>
 <pre><code class="language-yaml">apiVersion: kith.dev/v1
 kind: Volume
-metadata: { name: tv, namespace: kith-system }
-spec: { node: tv, path: /var/lib/kith/tv, size: 4Gi }   # the packages and the browser's profile
+metadata: { name: tv, namespace: tv }
+spec: { node: tv, path: /var/lib/kith/tv, size: 1Gi }   # the browser's profile
 ---
 apiVersion: kith.dev/v1
 kind: DeviceClaim
-metadata: { name: tv, namespace: kith-system }
+metadata: { name: tv, namespace: tv }
 spec: { seat: tv-seat0, access: exclusive }
 ---
 apiVersion: kith.dev/v1
 kind: Workload
-metadata: { name: tv, namespace: kith-system }
+metadata: { name: tv, namespace: tv }
 spec:
   replicas: 1
   template:
     deviceClaims: [tv]
+    initContainers:
+      - name: own-profile        # the Volume is root's: give it to the browser's user, then end
+        image: registry.example/tv/kiosk@sha256:&lt;digest&gt;
+        runAsUser: 0
+        command: [chown, "1000:1000", /data]
+        volumeMounts: [{ volume: tv, path: /data }]
     containers:
       - name: session
-        image: docker.io/library/alpine:3.22
-        runAsUser: 0            # apk installs into the image's root
-        readOnlyRoot: false
+        image: registry.example/tv/kiosk@sha256:&lt;digest&gt;   # pinned by digest, built as above
+        runAsUser: 1000
+        runAsNonRoot: true
+        userNamespaces: true     # Chromium's own sandbox starts: no --no-sandbox
         resources: { memory: 3Gi }     # no cpu: see below
         volumeMounts: [{ volume: tv, path: /data }]
         env:
           - { name: URL, value: "https://media.example/tv" }
           - { name: CARD, value: NVidia }      # the sound card's id: the audio Device's `model` label
+          - { name: PCM, value: "3" }          # its output PCM: see Sound below
           - { name: XDG_RUNTIME_DIR, value: /tmp/run }
           - { name: LIBSEAT_BACKEND, value: noop }
         command:
           - sh
           - -c
           - |
-            mkdir -p /data/apk /data/profile /tmp/run &amp;&amp; chmod 700 /tmp/run
-            apk add -q --cache-dir /data/apk cage chromium mesa-dri-gallium mesa-gbm alsa-utils wlr-randr font-noto
+            mkdir -p /tmp/run &amp;&amp; chmod 700 /tmp/run
             for i in 0 1 2 3; do amixer -q -c "$CARD" sset "IEC958,$i" on; done
-            exec cage -- chromium --kiosk --no-sandbox --ozone-platform=wayland --ignore-gpu-blocklist \
-              --autoplay-policy=no-user-gesture-required --user-data-dir=/data/profile "$URL"
+            exec cage -- chromium --kiosk --ozone-platform=wayland --ignore-gpu-blocklist \
+              --autoplay-policy=no-user-gesture-required --user-data-dir=/data/profile \
+              --alsa-output-device="plughw:CARD=$CARD,DEV=$PCM" "$URL"
 ---
 apiVersion: kith.dev/v1
 kind: Workload
-metadata: { name: encode }
+metadata: { name: encode, namespace: tv }
 spec:
   template:
     priority: idle              # only spare cycles, and a twentieth of a CPU while the TV is full screen
     yieldTo: { seat: tv-seat0, when: [fullscreen] }
-    containers: [{ name: run, image: registry.example/batch/encode:1, resources: { memory: 2Gi } }]
+    containers: [{ name: run, image: "registry.example/batch/encode@sha256:&lt;digest&gt;", resources: { memory: 2Gi } }]
 </code></pre>
-<p>The seat's sound card is a Device with its playback PCM nodes (<code>/dev/snd/pcmC1D3p</code>, one per output), so the claim gives the container the sound as well as the screen. What this taught on a spare PC (a GTX 1060) and on a Ryzen's GPU:</p>
+<p>The seat's sound card is a Device with its playback PCM nodes (<code>/dev/snd/pcmC1D3p</code>, one per output), so the claim gives the container the sound as well as the screen. <code>userNamespaces: true</code> costs something (see <a href="workloads.html#what-a-container-is-given">workloads</a>): a browser's sandbox reaches kernel code a plain user never calls, which is why the seat has a namespace to itself. Not tried: this form, with a user that is not root; the first recipe on a spare PC (a GTX 1060) and on a Ryzen's GPU ran as root with <code>--no-sandbox</code>, and that is what these notes come from.</p>
 <ul><li><strong>Memory only.</strong> A container's <code>resources.cpu</code> is a hard <code>cpu.max</code>, and drawing in software uses every core. The seat's <code>reserve</code> is the browser's guarantee; a Workload beside it that must stay out of the way is <code>priority: idle</code> with <code>yieldTo</code> (the second Workload).</li><li><strong>The screen's mode.</strong> An LG TV prefers 3840x2160 at 30 Hz and offers 4K at 60 Hz only with HDMI Ultra HD Deep Colour on for that input. Pick 1080p at 60 Hz (<code>wlr-randr --output NAME --mode 1920x1080@60Hz</code> in cage) where drawing is in software.</li><li><strong>Sound.</strong> NVIDIA's HDMI sound starts with its IEC958 switches off (<code>amixer sset IEC958,0 on</code>, up to <code>,3</code>). The output PCM is the one whose ELD control (<code>iface=PCM,name=ELD,device=N</code>) is not empty, which shows once the compositor has set the mode (<code>amixer cget</code> splits the jack control's name at its comma, so ask for the ELD). A container does not see <code>/proc/asound</code> (masked): read <code>/dev/snd/pcmC*D*p</code> and ask <code>amixer</code>.</li><li><strong>nouveau.</strong> On Pascal it has no reclocking and no video decode: 4K and HEVC play better on a GPU with VAAPI (a Ryzen's Radeon 780M). With the firmware built in, cage needs no <code>WLR_RENDERER</code>; Chromium needs <code>--ignore-gpu-blocklist</code> on nouveau.</li><li><strong>The image.</strong> It comes from a registry (kith reaches a plain-HTTP registry only on the same machine), or from a stock Alpine as above, with <code>apk add</code> into the Volume so the next start has the packages.</li><li><strong><code>status.activity</code>.</strong> kithd sets it: <code>fullscreen</code> while the HDMI sound plays, so <code>encode</code> drops to a twentieth of a CPU as a film starts and returns about ten seconds after it stops (a session may say better with a POST, as above). A seat with no sound card is judged by its inputs only.</li></ul>
 <h3 id="virtual-machines">Virtual machines <a class="anchor" href="#virtual-machines" aria-label="Link to this section">#</a></h3>
 <p>A template's <code>vms</code> are virtual machines, beside or instead of its <code>containers</code> and <code>exec</code> units, in a Workload, a Job or anything with a template:</p>

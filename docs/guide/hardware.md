@@ -204,64 +204,93 @@ spec:
 ### A TV or kiosk seat
 
 A PC on a TV that shows one web page (a media server's TV page) is a seat held by one container:
-a Wayland compositor (cage) with a browser in it, on an image from a registry or on a stock
-Alpine that installs them into a Volume. The seat's sound goes out of the TV's HDMI. The node
-runs a kith OS image with the card's driver built in (`gpu-nvidia-pascal` for a GeForce GTX 10xx,
-`gpu-amd-phoenix` for a Ryzen's GPU: [kith OS](os.md#a-node-that-needs-more-a-spec)).
+a Wayland compositor (cage) with a browser in it. The seat's sound goes out of the TV's HDMI. The
+node runs a kith OS image with the card's driver built in (`gpu-nvidia-pascal` for a GeForce GTX
+10xx, `gpu-amd-phoenix` for a Ryzen's GPU: [kith OS](os.md#a-node-that-needs-more-a-spec)).
+
+**The image is yours to build.** kith ships no kiosk image: this recipe starts from stock Alpine
+and you build and push one image of your own, with the packages in it, to a registry the nodes
+reach. Nothing is installed when the seat starts, so the session needs no root and no network but
+the page's:
+
+```dockerfile
+FROM docker.io/library/alpine:3.22@sha256:<digest of the Alpine you checked>
+RUN apk add --no-cache cage chromium mesa-dri-gallium mesa-gbm alsa-utils wlr-randr font-noto \
+ && adduser -D -u 1000 kiosk && addgroup kiosk video && addgroup kiosk audio
+USER 1000
+```
+
+The page is trusted with the seat: a page that runs in the kiosk reads the seat's keyboards and
+pads and sets its sound, so point it only at a server you run, and keep the seat in a namespace of
+its own (`tv` below) that no one else's workloads share. The seat and each Device of it are given
+to that namespace by their label (`kith.dev/namespaces: tv`: add it under `metadata.labels` of
+`kith get seat tv-seat0 -o yaml` and of each of the seat's `kith get device`, and apply them), as
+under [who may claim what](#claiming-hardware); until then the claim is refused and says why.
 
 ```yaml
 apiVersion: kith.dev/v1
 kind: Volume
-metadata: { name: tv, namespace: kith-system }
-spec: { node: tv, path: /var/lib/kith/tv, size: 4Gi }   # the packages and the browser's profile
+metadata: { name: tv, namespace: tv }
+spec: { node: tv, path: /var/lib/kith/tv, size: 1Gi }   # the browser's profile
 ---
 apiVersion: kith.dev/v1
 kind: DeviceClaim
-metadata: { name: tv, namespace: kith-system }
+metadata: { name: tv, namespace: tv }
 spec: { seat: tv-seat0, access: exclusive }
 ---
 apiVersion: kith.dev/v1
 kind: Workload
-metadata: { name: tv, namespace: kith-system }
+metadata: { name: tv, namespace: tv }
 spec:
   replicas: 1
   template:
     deviceClaims: [tv]
+    initContainers:
+      - name: own-profile        # the Volume is root's: give it to the browser's user, then end
+        image: registry.example/tv/kiosk@sha256:<digest>
+        runAsUser: 0
+        command: [chown, "1000:1000", /data]
+        volumeMounts: [{ volume: tv, path: /data }]
     containers:
       - name: session
-        image: docker.io/library/alpine:3.22
-        runAsUser: 0            # apk installs into the image's root
-        readOnlyRoot: false
+        image: registry.example/tv/kiosk@sha256:<digest>   # pinned by digest, built as above
+        runAsUser: 1000
+        runAsNonRoot: true
+        userNamespaces: true     # Chromium's own sandbox starts: no --no-sandbox
         resources: { memory: 3Gi }     # no cpu: see below
         volumeMounts: [{ volume: tv, path: /data }]
         env:
           - { name: URL, value: "https://media.example/tv" }
           - { name: CARD, value: NVidia }      # the sound card's id: the audio Device's `model` label
+          - { name: PCM, value: "3" }          # its output PCM: see Sound below
           - { name: XDG_RUNTIME_DIR, value: /tmp/run }
           - { name: LIBSEAT_BACKEND, value: noop }
         command:
           - sh
           - -c
           - |
-            mkdir -p /data/apk /data/profile /tmp/run && chmod 700 /tmp/run
-            apk add -q --cache-dir /data/apk cage chromium mesa-dri-gallium mesa-gbm alsa-utils wlr-randr font-noto
+            mkdir -p /tmp/run && chmod 700 /tmp/run
             for i in 0 1 2 3; do amixer -q -c "$CARD" sset "IEC958,$i" on; done
-            exec cage -- chromium --kiosk --no-sandbox --ozone-platform=wayland --ignore-gpu-blocklist \
-              --autoplay-policy=no-user-gesture-required --user-data-dir=/data/profile "$URL"
+            exec cage -- chromium --kiosk --ozone-platform=wayland --ignore-gpu-blocklist \
+              --autoplay-policy=no-user-gesture-required --user-data-dir=/data/profile \
+              --alsa-output-device="plughw:CARD=$CARD,DEV=$PCM" "$URL"
 ---
 apiVersion: kith.dev/v1
 kind: Workload
-metadata: { name: encode }
+metadata: { name: encode, namespace: tv }
 spec:
   template:
     priority: idle              # only spare cycles, and a twentieth of a CPU while the TV is full screen
     yieldTo: { seat: tv-seat0, when: [fullscreen] }
-    containers: [{ name: run, image: registry.example/batch/encode:1, resources: { memory: 2Gi } }]
+    containers: [{ name: run, image: "registry.example/batch/encode@sha256:<digest>", resources: { memory: 2Gi } }]
 ```
 
 The seat's sound card is a Device with its playback PCM nodes (`/dev/snd/pcmC1D3p`, one per
-output), so the claim gives the container the sound as well as the screen. What this taught on a
-spare PC (a GTX 1060) and on a Ryzen's GPU:
+output), so the claim gives the container the sound as well as the screen. `userNamespaces: true`
+costs something (see [workloads](workloads.md#what-a-container-is-given)): a browser's sandbox
+reaches kernel code a plain user never calls, which is why the seat has a namespace to itself.
+Not tried: this form, with a user that is not root; the first recipe on a spare PC (a GTX 1060)
+and on a Ryzen's GPU ran as root with `--no-sandbox`, and that is what these notes come from.
 
 - **Memory only.** A container's `resources.cpu` is a hard `cpu.max`, and drawing in software
   uses every core. The seat's `reserve` is the browser's guarantee; a Workload beside it that must
