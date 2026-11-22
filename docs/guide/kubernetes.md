@@ -193,6 +193,7 @@ name another resource in the store already has (a 409).
 
 Answered 501 with a JSON `message`, never left waiting: `docker run` without `-d`, which attaches
 to the container's output and waits for step 3; `ps` with filters; port bindings; ulimits;
-`--rm`; memory and CPU limits; volumes, `--tmpfs`, `--volumes-from`, a read-only root and
+`--rm`; memory, CPU and PID limits; DNS, extra hosts and links; a hostname, exposed ports, a
+health check and a stop signal; volumes, `--tmpfs`, `--volumes-from`, a read-only root and
 `--runtime`; other network modes; images; and any other call not listed above.
 A request body sent chunked is 501 too.

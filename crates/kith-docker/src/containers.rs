@@ -141,6 +141,7 @@ impl Containers {
         let host = &config["HostConfig"];
         refuse_host(host)?;
         refuse_streams(&config)?;
+        refuse_config(&config)?;
         if set(&config["Volumes"]) {
             return Err(message(501, "kith: volumes are not supported yet"));
         }
@@ -271,8 +272,13 @@ impl Containers {
         let name = name_of(&doc).to_string();
         if doc["kind"] == "Job" {
             // (A finished Job runs again: its status goes with it, so it is taken away first.)
+            // (A kept status cannot be cleared by an apply, so delete comes first: if the new Job
+            // is refused, the container goes back as a stopped one rather than being lost.)
             self.store.delete(&key("Job", &name)).map_err(store_failed)?;
-            self.put(doc).map_err(store_failed)?;
+            if let Err(e) = self.put(doc.clone()) {
+                let _ = self.put(parked(&doc));
+                return Err(store_failed(e));
+            }
         } else if is_job(annotation(&doc, ANN_RESTART)) {
             self.convert("Workload", job_from(&doc))?;
         } else {
@@ -291,7 +297,6 @@ impl Containers {
         if !state(doc).running {
             return Ok(false);
         }
-        let name = name_of(doc).to_string();
         let mut doc = doc.clone();
         let job = doc["kind"] == "Job";
         if job {
@@ -807,17 +812,69 @@ fn refuse_host(host: &Value) -> Result<(), Reply> {
         "VolumesFrom",
         "ReadonlyRootfs",
         "Runtime",
+        // Fields the mapping would otherwise drop without a word.
+        "Dns",
+        "DnsSearch",
+        "DnsOptions",
+        "ExtraHosts",
+        "Links",
+        "PublishAllPorts",
+        "Init",
+        "OomKillDisable",
+        "CpusetCpus",
+        "CpusetMems",
+        "StorageOpt",
+        "Isolation",
+        "Cgroup",
     ]
     .iter()
     .any(|f| set(&host[*f]))
         || host["AutoRemove"].as_bool() == Some(true)
-        || ["Memory", "NanoCpus", "CpuShares", "CpuQuota"]
-            .iter()
-            .any(|f| host[*f].as_i64().is_some_and(|n| n != 0));
+        || host["LogConfig"]["Type"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty() && t != "json-file")
+        || [
+            "Memory",
+            "MemorySwap",
+            "MemoryReservation",
+            "NanoCpus",
+            "CpuShares",
+            "CpuQuota",
+            "CpuPeriod",
+            "PidsLimit",
+            "ShmSize",
+            "BlkioWeight",
+        ]
+        .iter()
+        .any(|f| host[*f].as_i64().is_some_and(|n| n > 0));
     if not_yet {
         return Err(message(
             501,
-            "kith: published ports, ulimits, --rm, resource limits, volumes, tmpfs, read-only roots and runtimes are not supported yet",
+            "kith: published ports, ulimits, --rm, resource limits, DNS settings, extra hosts, links, init, log drivers, volumes, tmpfs, read-only roots and runtimes are not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+/// Create-body fields outside HostConfig that the mapping has no place for: refused, not dropped.
+fn refuse_config(config: &Value) -> Result<(), Reply> {
+    let ignored = [
+        "Hostname",
+        "Domainname",
+        "ExposedPorts",
+        "Healthcheck",
+        "StopSignal",
+        "Shell",
+        "MacAddress",
+    ]
+    .iter()
+    .any(|f| set(&config[*f]))
+        || config["NetworkDisabled"].as_bool() == Some(true)
+        || config["StopTimeout"].as_i64().is_some_and(|n| n > 0);
+    if ignored {
+        return Err(message(
+            501,
+            "kith: a hostname, exposed ports, a health check, a stop signal or timeout and a MAC address are not supported yet",
         ));
     }
     Ok(())
@@ -1050,6 +1107,64 @@ mod tests {
             assert_eq!(status, 501, "{body}: {reply}");
         }
         assert!(mem.0.lock().unwrap().is_empty(), "nothing was made");
+    }
+
+    #[test]
+    fn fields_the_mapping_would_drop_are_refused_with_a_501() {
+        let (mem, c) = fixture();
+        for body in [
+            r#"{"Image":"alpine","HostConfig":{"Dns":["1.1.1.1"]}}"#,
+            r#"{"Image":"alpine","HostConfig":{"ExtraHosts":["a:1.2.3.4"]}}"#,
+            r#"{"Image":"alpine","HostConfig":{"PidsLimit":10}}"#,
+            r#"{"Image":"alpine","HostConfig":{"MemorySwap":1000}}"#,
+            r#"{"Image":"alpine","HostConfig":{"LogConfig":{"Type":"syslog"}}}"#,
+            r#"{"Image":"alpine","Hostname":"box"}"#,
+            r#"{"Image":"alpine","ExposedPorts":{"80/tcp":{}}}"#,
+            r#"{"Image":"alpine","Healthcheck":{"Test":["CMD","true"]}}"#,
+            r#"{"Image":"alpine","StopSignal":"SIGINT"}"#,
+        ] {
+            let (status, reply) = call(&c, "POST", "/containers/create?name=x", body);
+            assert_eq!(status, 501, "{body}: {reply}");
+        }
+        // What the docker CLI sends when nothing was asked for is not refused.
+        let plain = r#"{"Image":"alpine","Hostname":"","ExposedPorts":null,"HostConfig":{"Dns":[],"MemorySwap":0,"PidsLimit":null,"LogConfig":{"Type":"","Config":{}},"Init":null}}"#;
+        assert_eq!(call(&c, "POST", "/containers/create?name=x", plain).0, 201);
+        assert_eq!(mem.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_finished_job_that_cannot_be_made_again_stays_a_stopped_container() {
+        struct Refusing(MemStore);
+        impl Store for Refusing {
+            fn get(&self, key: &str) -> Result<Option<Value>, String> {
+                self.0.get(key)
+            }
+            fn list(&self, kind: &str, namespace: &str) -> Result<Vec<Value>, String> {
+                self.0.list(kind, namespace)
+            }
+            fn apply(&self, doc: Value) -> Result<(), String> {
+                if doc["kind"] == "Job" {
+                    return Err("refused".into());
+                }
+                self.0.apply(doc)
+            }
+            fn delete(&self, key: &str) -> Result<(), String> {
+                self.0.delete(key)
+            }
+        }
+        let mem = MemStore::default();
+        let c = Containers::new(Box::new(Refusing(mem.clone())));
+        mem.apply(json!({"apiVersion": "kith.dev/v1", "kind": "Job",
+            "metadata": {"name": "once", "namespace": "docker", "labels": {LABEL: "once"}},
+            "spec": {"template": {"containers": [{"name": "once", "image": "alpine"}], "restartPolicy": "never"}},
+            "status": {"state": "succeeded", "containers": [{"name": "once", "exitCode": 0}]}}))
+            .unwrap();
+        assert_eq!(call(&c, "POST", "/containers/once/start", "").0, 500);
+        assert_eq!(
+            call(&c, "GET", "/containers/once/json", "").1["State"]["Status"],
+            "exited",
+            "the container is kept"
+        );
     }
 
     #[test]
