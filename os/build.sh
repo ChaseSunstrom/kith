@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build kith OS's disk image: the whole operating system of a node.
 #
-#   sh os/build.sh [--out DIR] [--check] [--twice]
+#   sh os/build.sh [--out DIR] [--spec FILE] [--secure-boot KEYDIR] [--check] [--twice]
 #
 # What is in it:
 #   - a kernel built from kernel.org's source at a pinned version and checksum with
@@ -46,7 +46,7 @@ limit=$((300 * 1024 * 1024))
 
 usage() {
     cat <<'EOF'
-usage: sh os/build.sh [--out DIR] [--spec FILE] [--check] [--twice]
+usage: sh os/build.sh [--out DIR] [--spec FILE] [--secure-boot KEYDIR] [--check] [--twice]
 
 Builds DIR/kith-os.raw, DIR/kith-os.qcow2 and the installer, DIR/kith-os-installer.raw
 (default DIR: target/os).
@@ -69,6 +69,13 @@ KITH_OS_BIN is a folder with the kithd and kith to put in it (default: what ci/m
               modules with a key made for this build and deleted after, and puts the
               modules and the firmware they name (`firmware: [all]`: all of
               linux-firmware) in the root's /lib/modules and /lib/firmware
+  --secure-boot KEYDIR
+              sign systemd-boot and every kernel image (both slots', the update's and
+              the installer's) with KEYDIR/db.key and KEYDIR/db.crt, the owner's own
+              key, which is only read here and never goes into an image; an owner who
+              enrolls that certificate as db has the firmware check the file that
+              carries the root's hash. Enrolling it is not done by kith yet (docs/guide/os.md).
+              Needs sbsign and sbverify (sbsigntools)
   --check     fail unless the raw image is under 300 MB (4 GB with modules)
   --twice     build the root and the image a second time and fail unless both are
               byte for byte the same (the kernel comes from the cache both times)
@@ -83,15 +90,21 @@ or mcopy is missing and nix is there, they come from nix.
 EOF
 }
 
-out='' check='' twice='' spec=''
+out='' check='' twice='' spec='' sbdir=''
 while [ $# -gt 0 ]; do
     case $1 in
     --help | -h) usage; exit 0 ;;
     --check) check=1; shift ;;
     --twice) twice=1; shift ;;
     --spec)
+        # shellcheck disable=SC2015 # (C only reports and exits)
         [ $# -ge 2 ] && [ -f "$2" ] && [ -r "$2" ] || { echo "build.sh: --spec needs a file it can read" >&2; exit 2; }
         spec=$(realpath "$2"); shift 2 ;;
+    --secure-boot)
+        # shellcheck disable=SC2015 # (C only reports and exits)
+        [ $# -ge 2 ] && [ -f "$2/db.key" ] && [ -r "$2/db.key" ] && [ -f "$2/db.crt" ] && [ -r "$2/db.crt" ] \
+            || { echo "build.sh: --secure-boot needs a directory with a db.key and db.crt it can read" >&2; exit 2; }
+        sbdir=$(realpath "$2"); shift 2 ;;
     --out)
         [ $# -ge 2 ] || { echo "build.sh: --out needs a directory" >&2; exit 2; }
         out=$2; shift 2 ;;
@@ -146,6 +159,7 @@ if ! command -v bc >/dev/null 2>&1 || ! command -v mcopy >/dev/null 2>&1; then
         [ -z "$check" ] || set -- "$@" --check
         [ -z "$twice" ] || set -- "$@" --twice
         [ -z "$spec" ] || set -- "$@" --spec "$spec"
+        [ -z "$sbdir" ] || set -- "$@" --secure-boot "$sbdir"
         exec nix shell nixpkgs#bc nixpkgs#mtools -c sh "$0" --out "$out" "$@"
     fi
     lacks "bc and mcopy (mtools)"
@@ -153,6 +167,11 @@ fi
 for tool in gcc make flex bison cargo flock objdump sfdisk mksquashfs veritysetup objcopy systemd-repart mkfs.vfat mkfs.ext4 qemu-img curl cpio zstd; do
     command -v "$tool" >/dev/null 2>&1 || lacks "$tool"
 done
+if [ -n "$sbdir" ]; then
+    for tool in sbsign sbverify; do
+        command -v "$tool" >/dev/null 2>&1 || lacks "$tool (sbsigntools: --secure-boot signs the boot loader and the kernel images)"
+    done
+fi
 if ! [ -r "$efi/linuxx64.efi.stub" ] || ! [ -r "$efi/systemd-bootx64.efi" ]; then lacks "systemd's EFI stub and systemd-boot in $efi"; fi
 
 mkdir -p "$out" "$cache"
@@ -210,6 +229,7 @@ if [ -n "$spec" ]; then
     globs=$(spec_list firmware)
     for f in $(spec_list features); do
         case $f in *[!a-z0-9-]*) die "--spec: '$f' is not a feature's name" ;; esac
+        # shellcheck disable=SC2012 # (ls of a fixed directory, for a message)
         [ -r "$root/os/features/$f.config" ] ||
             die "--spec: no feature '$f' (os/features has: $(cd "$root/os/features" && ls | sed 's/\.config$//' | tr '\n' ' '))"
         # (uhid-test puts /dev/uhid in the kernel: only for the image of the fido2 test, which
@@ -226,7 +246,7 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
         die "--spec: 'all' and 'gpu-amd-phoenix' do not go together (the same driver, as modules and built in)"
     ! spec_list features | grep -qx all || ! spec_list features | grep -qx gpu-nvidia-pascal ||
         die "--spec: 'all' and 'gpu-nvidia-pascal' do not go together (nouveau, as modules and built in)"
-    # shellcheck disable=SC2086
+    # shellcheck disable=SC2086 # (a list of globs, split on purpose; globbing is off)
     globs=$(printf '%s\n' $globs | LC_ALL=C sort -u)
     for g in $globs; do
         case $g in /* | *..* | *[!A-Za-z0-9_./*+-]*) die "--spec: '$g' is not a path in linux-firmware" ;; esac
@@ -243,9 +263,11 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
         fwextra=$globs
         limit=$((4096 * 1024 * 1024))
     elif [ -n "$globs" ]; then
+        # shellcheck disable=SC2116,SC2086 # (the echo joins the lines of a list; globbing is off)
         case " $(echo $globs) " in *" all "*) die "--spec: firmware: [all] is for a kernel with modules (os/examples/all.yaml)" ;; esac
         # (The tarball is 640 MB, read once per new list of files: what it gave is kept.)
         if [ "$(cat "$fwdir/.kith-globs" 2>/dev/null)" != "$globs" ]; then
+            # shellcheck disable=SC2116,SC2086 # (as above: the echo joins the list)
             echo "build.sh: firmware from linux-firmware $firmware_date: $(echo $globs)" >&2
             fetch "$firmware_url" "$firmware_sha256" "$cache/linux-firmware-$firmware_date.tar.xz"
             [ ! -d "$fwdir" ] || find "$fwdir" -delete
@@ -253,7 +275,7 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
             # The files the globs name, and the links of linux-firmware's WHENCE that they name
             # (most of nvidia/gp106 is links) with what those point at: os/firmware.sh, which
             # dies, naming why, for a glob that names nothing, a link out of the tree or a cycle.
-            # shellcheck disable=SC2086
+            # shellcheck disable=SC2086 # (one argument for each glob; globbing is off)
             sh "$root/os/firmware.sh" "$cache/linux-firmware-$firmware_date.tar.xz" "$fwdir" $globs ||
                 die "--spec: os/firmware.sh's line above says what linux-firmware $firmware_date lacks or why a link is refused"
             echo "$globs" >"$fwdir/.kith-globs"
@@ -360,6 +382,7 @@ if ! [ -r "$kernel" ]; then
             have=$(modinfo -F sig_key "$sample" | hexid)
             serial=$(openssl x509 -inform DER -in certs/signing_key.x509 -noout -serial | sed 's/^serial=//' | hexid)
             ski=$(openssl x509 -inform DER -in certs/signing_key.x509 -noout -ext subjectKeyIdentifier | sed -n 2p | hexid)
+            # shellcheck disable=SC2015 # (C only reports and exits)
             [ -n "$have" ] && [ -n "$(modinfo -F signer "$sample")" ] || { echo "build.sh: amdgpu.ko has no signer: $(modinfo "$sample" | tail -n 5)" >&2; exit 1; }
             [ "$have" = "$serial" ] || [ "$have" = "$ski" ] ||
                 { echo "build.sh: amdgpu.ko is signed by $have, which is not the kernel's key (serial $serial, id $ski)" >&2; exit 1; }
@@ -445,6 +468,7 @@ if [ -n "$modules" ]; then
     fwlist=$cache/kernel-$key/firmware-$(printf 'links2\n%s\n%s\n' "$firmware_sha256" "$fwextra" | sha256sum | cut -c 1-16).list
     if ! [ -s "$fwlist" ]; then
         set -f
+        # shellcheck disable=SC2116,SC2086 # (the echo joins the lines of a list; globbing is off)
         case " $(echo $fwextra) " in
         # (Every file and every link, a link to a directory too: not what is under one.)
         *" all "*) (cd "$fwall" && find . \( -type f -o -type l \) ! -name '.kith-*' | sed 's|^\./||' | LC_ALL=C sort) >"$fwlist.part" ;;
@@ -457,7 +481,7 @@ if [ -n "$modules" ]; then
                 set +f
                 while read -r name; do
                     case $name in '' | /* | *..*) continue ;; esac
-                    # shellcheck disable=SC2086
+                    # shellcheck disable=SC2086 # (a list of names, split on purpose; globbing is off)
                     # (A link is kept with the file it points to.)
                     for f in $name; do
                         [ -f "$f" ] || continue
@@ -583,6 +607,16 @@ assemble() { # DIR
     # slots by it, and a node told to go to an older release would never start it. The
     # order is the N in the file's name, which the node gives it: crates/kithd/src/os.rs.)
     printf 'NAME="kith OS"\nID=kith\nPRETTY_NAME="kith OS"\n' >"$w/osrel"
+    # With --secure-boot: the owner's db key signs the file and the owner's certificate must
+    # verify it, so a file the firmware would refuse is never put in an ESP or an update.
+    # (The signature is added after the sections are, so the hashes above do not change.)
+    sign() { # FILE
+        [ -z "$sbdir" ] || {
+            sbsign --key "$sbdir/db.key" --cert "$sbdir/db.crt" --output "$1.signed" "$1" >/dev/null || die "sbsign could not sign $1"
+            mv "$1.signed" "$1"
+            sbverify --cert "$sbdir/db.crt" "$1" >/dev/null || die "$1 does not verify against $sbdir/db.crt"
+        }
+    }
     cmdline() { # SLOT BLOCKS HASH
         table="root,,,ro,0 $(($2 * 8)) verity 1 PARTLABEL=root-$1 PARTLABEL=verity-$1 4096 4096 $2 1 sha256 $3 $salt"
         printf '%s' "console=ttyS0 console=tty0 dm-mod.create=\"$table\" dm-mod.waitfor=PARTLABEL=root-$1,PARTLABEL=verity-$1 root=/dev/dm-0 ro rootwait kith.slot=$1"
@@ -594,6 +628,7 @@ assemble() { # DIR
             --add-section .cmdline="$w/cmdline-$slot" --change-section-vma .cmdline=0x14dfd0000 \
             --add-section .linux="$kernel" --change-section-vma .linux=0x14e000000 \
             "$efi/linuxx64.efi.stub" "$w/kith-$slot.efi"
+        sign "$w/kith-$slot.efi"
         touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-$slot.efi"
     done
     # The installer's: slot a's, told to install and not to serve (crates/kithd/src/install.rs),
@@ -609,6 +644,7 @@ assemble() { # DIR
         --add-section .cmdline="$w/cmdline-install" --change-section-vma .cmdline=0x14dfd0000 \
         --add-section .linux="$kernel" --change-section-vma .linux=0x14e000000 \
         "$efi/linuxx64.efi.stub" "$w/kith-install.efi"
+    sign "$w/kith-install.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-install.efi"
     # What tells a node a kithd-only update from a full one (the header's `kithd` object,
     # crates/kithd/src/os.rs): the digests of kithd; of the boot file but for the root's own
@@ -616,7 +652,9 @@ assemble() { # DIR
     # in it); and of the root but for kithd (/sbin/init) and its os-release, which names the
     # version (sorted, owner and time fixed, as the squashfs is).
     kithd_sum=$(sha256sum "$bin/kithd" | cut -d ' ' -f 1)
-    kernel_sum=$({ cmdline a 0 0; cat "$kernel" "$efi/linuxx64.efi.stub" "$w/osrel"; } | sha256sum | cut -d ' ' -f 1)
+    # (--secure-boot: the certificate is in the digest, so an update that only signs, or changes the
+    # key, is not taken for a kithd-only one; without it the digest is what it was.)
+    kernel_sum=$({ cmdline a 0 0; cat "$kernel" "$efi/linuxx64.efi.stub" "$w/osrel"; [ -z "$sbdir" ] || cat "$sbdir/db.crt"; } | sha256sum | cut -d ' ' -f 1)
     rest_sum=$(tar -C "$r" --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
         --exclude=./sbin/init --exclude=./etc/os-release -cf - . | sha256sum | cut -d ' ' -f 1)
     # What a node of an older version is given to become this one (os/update.sh).
@@ -630,6 +668,7 @@ assemble() { # DIR
     printf 'timeout 0\neditor no\n' >"$w/loader.conf"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/loader.conf"
     cp -p "$efi/systemd-bootx64.efi" "$w/boot.efi"
+    sign "$w/boot.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/boot.efi"
     mmd -i "$w/esp.img" ::EFI ::EFI/BOOT ::EFI/Linux ::loader
     mcopy -m -i "$w/esp.img" "$w/boot.efi" ::EFI/BOOT/BOOTX64.EFI
@@ -657,7 +696,9 @@ assemble() { # DIR
     rootsz=88M veritysz=4M
     if [ -n "$modules" ]; then
         s=$(stat -c %s "$w/root.squashfs")
+        # shellcheck disable=SC2017 # (whole MB: the 5/4 is room, not precision)
         rootsz=$((s / 1048576 * 5 / 4 + 64))M
+        # shellcheck disable=SC2017 # (as above)
         veritysz=$(($(stat -c %s "$w/root.verity") / 1048576 * 5 / 4 + 4))M
     fi
     part 10-esp esp esp 64M "CopyBlocks=$w/esp.img"
