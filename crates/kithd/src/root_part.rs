@@ -2814,6 +2814,7 @@ mod tests {
         };
         let why = refused(&unit, &ground(&state, "no-unconfined")).expect("delegation was made");
         assert!(why.contains("no system call filter"), "{why}");
+        assert!(why.contains("a writable cgroup subtree"), "{why}");
         assert_eq!(refused(&unit, &ground(&state, "")), None);
         assert_eq!(refused(&unit, &ground(&state, "no-root-containers")), None);
     }

@@ -813,6 +813,7 @@ impl Runtime {
             let cgroup = format!("{}/kith-{}", self.cgroup_parent, name.to_string_lossy());
             let path = sys.join(cgroup.trim_start_matches('/'));
             let swept = sweep(&state, &bundles.join(&name), &path, || {
+                prune_children(&path); // (a delegated one's tenant made some, which block its removal)
                 // State we cannot load (or none) is removed along with the bundle.
                 if let Ok(mut container) = Container::load(state.clone())
                     && let Err(e) = container.delete(true)
@@ -925,6 +926,7 @@ impl Runtime {
         let state = self.root.join("state").join(id);
         let cgroup_dir = Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/'));
         clear_kept(&state, &bundle, &cgroup_dir, || {
+            prune_cgroup(&cgroup);
             let _ = manager(&cgroup).remove();
         })
         .ctx(&what)?;
@@ -1099,6 +1101,7 @@ impl Runtime {
             // outlives its cgroup's kill: then, as with a delete, its state and bundle (its range)
             // stay until it is gone.
             sweep(&state, &bundle, &cgroup_dir, || {
+                prune_cgroup(&cgroup);
                 let _ = manager(&cgroup).remove();
             });
         }
@@ -1124,10 +1127,8 @@ impl Runtime {
         }
         // (Where kithd is not root the cgroup is already its own user's, which the container's
         // user is inside the namespace it made: nothing to hand.)
-        if unit.delegated_cgroup
-            && uid.is_root()
-            && let Some(user) = user
-            && let Err(e) = delegate(&handle.cgroup, shift.unwrap_or(0) + user.uid(), shift.unwrap_or(0) + user.gid())
+        if let Some((to_uid, to_gid)) = delegation(unit, uid.is_root(), user.map(|u| (u.uid(), u.gid())), shift)
+            && let Err(e) = delegate(&handle.cgroup, to_uid, to_gid)
         {
             handle.discard(&state);
             return Err(e).ctx(format!("{what}: delegating its cgroup"));
@@ -2030,6 +2031,7 @@ impl Handle {
     pub fn delete(mut self) -> std::result::Result<(), Undeleted> {
         // A helper still waiting for the word to go ends when its input does.
         drop(self.go.take());
+        prune_children(&self.cgroup); // (a delegated cgroup's tenant made some: they block its removal)
         let deleted = match &mut self.container {
             Some(container) => container.delete(true).ctx("deleting the container"),
             None => {
@@ -2145,6 +2147,38 @@ fn sweep(state: &Path, bundle: &Path, cgroup: &Path, kill: impl FnOnce()) -> boo
     true
 }
 
+/// Kills and removes the cgroups below `dir`, deepest first: what a tenant of a delegated cgroup
+/// (`cgroupDelegation`) made, which blocks the removal of `dir` (libcgroups' remove is one `rmdir`:
+/// EBUSY while a child is). Best effort: what cannot be removed stays, and `dir`'s removal says so.
+/// A link is not followed; `cgroup.kill` is written where it is, never made.
+// ponytail: a rmdir of a cgroup whose processes are still dying is retried for half a second at most.
+fn prune_children(dir: &Path) {
+    use std::io::Write;
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(mut kill) = fs::OpenOptions::new().write(true).open(path.join("cgroup.kill")) {
+            let _ = kill.write_all(b"1");
+        }
+        prune_children(&path);
+        for _ in 0..50 {
+            match fs::remove_dir(&path) {
+                Err(e) if e.raw_os_error() == Some(nix::libc::EBUSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                _ => break,
+            }
+        }
+    }
+}
+
+/// [`prune_children`] of the cgroup `cgroup` (as `/kith/kith-ID`, below the cgroup mount).
+fn prune_cgroup(cgroup: &str) {
+    prune_children(&Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')));
+}
+
 /// Whether a cgroup still has processes, its child cgroups' included (`populated` in `cgroup.events`,
 /// which a unit's `nested` cgroups set too). A cgroup that is gone has none; one whose events cannot be
 /// read may have some. Without `cgroup.events` its own `cgroup.procs` says.
@@ -2166,7 +2200,9 @@ fn cgroup_parent() -> Result<String> {
         return Ok("/kith".into());
     }
     let own = fs::read_to_string("/proc/self/cgroup").ctx("reading /proc/self/cgroup")?;
-    let parent = parent_of_own(&own)?;
+    // (Writable by us, not just mounted rw: a root cgroup of a namespace that was delegated to our user.)
+    let writable = nix::unistd::access("/sys/fs/cgroup/cgroup.subtree_control", nix::unistd::AccessFlags::W_OK).is_ok();
+    let parent = parent_of_own(&own, writable)?;
     #[cfg(test)]
     let parent = test_parent(Path::new("/sys/fs/cgroup"), &parent);
     Ok(parent)
@@ -2215,10 +2251,13 @@ pub fn units_cgroup_dir() -> Option<PathBuf> {
 }
 
 /// The delegated parent of the cgroup `/proc/self/cgroup` (`proc`) names: its parent, unless that is
-/// the root, which no user was given.
-fn parent_of_own(proc: &str) -> Result<String> {
+/// the root, which no user was given. In a cgroup namespace (a container with `cgroupDelegation`) the
+/// own cgroup reads `/`: that is the delegated one itself, if the mount is writable there
+/// (`root_writable`), and the parent is then `""` (so `{parent}/kith-ID` is `/kith-ID`).
+fn parent_of_own(proc: &str, root_writable: bool) -> Result<String> {
     let own = proc.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("/");
     match Path::new(own).parent() {
+        None if root_writable && proc.lines().any(|l| l == "0::/") => Ok(String::new()),
         Some(parent) if parent != Path::new("/") => Ok(parent.display().to_string()),
         _ => err("no delegated cgroup: run kith inside a systemd user session or scope"),
     }
@@ -2601,12 +2640,34 @@ fn give_slots() -> &'static GiveSlots {
     })
 }
 
+/// Who a `cgroupDelegation` unit's cgroup is handed to, as the node's ids (the container's user, shifted
+/// by its range): `None` where it is not asked for, where kithd is not root (the cgroup is its own
+/// user's already, the container's user being inside the namespace it made), or the unit has no user.
+fn delegation(unit: &Unit, root: bool, user: Option<(u32, u32)>, shift: Option<u32>) -> Option<(u32, u32)> {
+    let (uid, gid) = user.filter(|_| unit.delegated_cgroup && root)?;
+    Some((shift.unwrap_or(0) + uid, shift.unwrap_or(0) + gid))
+}
+
+/// What a tenant of a delegated cgroup may make below it: this many cgroups in all, this deep. The
+/// limits are the cgroup's own (`cgroup.max.descendants`, `cgroup.max.depth`) and stay root's.
+const DELEGATED_DESCENDANTS: u32 = 64;
+const DELEGATED_DEPTH: u32 = 8;
+
 /// Hands a container's cgroup directory, and the three files a user of it writes to make a child
 /// cgroup and move into it (`cgroup.procs`, `cgroup.subtree_control`, `cgroup.threads`), to the
 /// node's `uid` and `gid` of its user: the kernel lets a user who owns these move its own
-/// processes into a cgroup below, and never above. The limits (`memory.max`…) stay root's.
-/// A file that is not there is an error: the cgroup was not made as a cgroup 2 makes one.
+/// processes into a cgroup below, and never above. The limits (`memory.max`…) stay root's, and
+/// so do the caps on how many cgroups it may make and how deep ([`DELEGATED_DESCENDANTS`],
+/// [`DELEGATED_DEPTH`]), set first. A file that is not there is an error: the cgroup was not made
+/// as a cgroup 2 makes one.
 fn delegate(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    for (name, cap) in [
+        ("cgroup.max.descendants", DELEGATED_DESCENDANTS),
+        ("cgroup.max.depth", DELEGATED_DEPTH),
+    ] {
+        let path = dir.join(name);
+        fs::write(&path, cap.to_string()).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    }
     for name in ["", "cgroup.procs", "cgroup.subtree_control", "cgroup.threads"] {
         let path = dir.join(name);
         std::os::unix::fs::lchown(&path, Some(uid), Some(gid))
@@ -3128,7 +3189,10 @@ fn spec_shifted(
     }
     if unit.delegated_cgroup {
         // (Read-only by default; the user it is delegated to may then write what `delegate` gave.)
-        for mount in mounts.iter_mut().filter(|m| m.destination() == Path::new("/sys/fs/cgroup")) {
+        for mount in mounts
+            .iter_mut()
+            .filter(|m| m.destination() == Path::new("/sys/fs/cgroup"))
+        {
             let mut options = mount.options().clone().unwrap_or_default();
             options.retain(|option| option != "ro");
             options.push("rw".into());
@@ -3324,18 +3388,57 @@ mod tests {
     #[test]
     fn cgroup_parent_is_none_without_a_delegated_one() {
         assert_eq!(
-            parent_of_own("0::/user.slice/user-1000.slice/session-1.scope\n").unwrap(),
+            parent_of_own("0::/user.slice/user-1000.slice/session-1.scope\n", false).unwrap(),
             "/user.slice/user-1000.slice"
         );
         // (A hybrid host: v1 lines first, then the v2 one.)
         assert_eq!(
-            parent_of_own("1:name=x:/a/b\n0::/user.slice/a.slice/b.scope\n").unwrap(),
+            parent_of_own("1:name=x:/a/b\n0::/user.slice/a.slice/b.scope\n", false).unwrap(),
             "/user.slice/a.slice"
         );
         for no in ["0::/\n", "0::/kith-job\n", "", "1:name=x:/a/b\n"] {
-            let said = parent_of_own(no).unwrap_err().to_string();
+            let said = parent_of_own(no, false).unwrap_err().to_string();
             assert!(said.contains("no delegated cgroup"), "{no:?}: {said}");
         }
+    }
+
+    /// In a cgroup namespace of a container with `cgroupDelegation` the own cgroup is `0::/`: the
+    /// delegated one itself, its parent is it (`""`), provided the mount is writable there (T-1050).
+    #[test]
+    fn cgroup_parent_in_a_delegated_namespace_is_its_root() {
+        assert_eq!(parent_of_own("0::/\n", true).unwrap(), "");
+        assert_eq!(format!("{}/kith-x", parent_of_own("0::/\n", true).unwrap()), "/kith-x");
+        // (Not by what it reads alone: a read-only mount, a missing line or a cgroup below it is as before.)
+        assert!(parent_of_own("0::/\n", false).is_err());
+        assert!(parent_of_own("", true).is_err());
+        assert!(parent_of_own("1:name=x:/\n", true).is_err());
+        assert!(parent_of_own("0::/kith-job\n", true).is_err());
+    }
+
+    /// A cgroup under a delegated one that its tenant made does not block the removal: its children
+    /// go deepest first, and a file that is not a cgroup's (`cgroup.kill` is written only where
+    /// it is) is not made. A link is not followed.
+    #[test]
+    fn prune_children_removes_the_tenants_cgroups() {
+        let top = std::env::temp_dir().join(format!("kith-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&top);
+        fs::create_dir_all(top.join("a/b/c")).unwrap();
+        fs::create_dir_all(top.join("d")).unwrap();
+        let outside = std::env::temp_dir().join(format!("kith-prune-out-{}", std::process::id()));
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, top.join("link")).unwrap();
+        prune_children(&top);
+        for gone in ["a", "d"] {
+            assert!(!top.join(gone).exists(), "{gone}");
+        }
+        assert!(
+            top.exists() && outside.exists(),
+            "the cgroup itself, and what a link names, stay"
+        );
+        assert!(!top.join("cgroup.kill").exists(), "kill is written, never created");
+        prune_children(&top.join("none")); // (a cgroup that is gone has no children)
+        let _ = fs::remove_dir_all(&top);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -3518,6 +3621,24 @@ mod tests {
         assert!(delegated.iter().any(|o| o == "nosuid") && delegated.iter().any(|o| o == "nodev"));
     }
 
+    /// What `create` hands the cgroup to: the container's user shifted by its range, only for a
+    /// unit that asks, only where kithd is root (and so, with a range, never as a root of the node's).
+    #[test]
+    fn delegation_names_the_owners_create_hands_to() {
+        let asks = Unit {
+            delegated_cgroup: true,
+            ..Unit::default()
+        };
+        assert_eq!(
+            delegation(&asks, true, Some((1000, 100)), Some(65536)),
+            Some((66536, 65636))
+        );
+        assert_eq!(delegation(&asks, true, Some((1000, 100)), None), Some((1000, 100)));
+        assert_eq!(delegation(&asks, false, Some((1000, 100)), None), None);
+        assert_eq!(delegation(&asks, true, None, None), None);
+        assert_eq!(delegation(&Unit::default(), true, Some((1000, 100)), None), None);
+    }
+
     /// The directory of the container's cgroup and the three files that move a process into it,
     /// make a child of it and move threads, are the container's user's; nothing else of it is.
     #[test]
@@ -3529,7 +3650,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kith-delegate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        for file in ["cgroup.procs", "cgroup.subtree_control", "cgroup.threads", "memory.max"] {
+        let files = ["cgroup.procs", "cgroup.subtree_control", "cgroup.threads", "memory.max"];
+        for file in files.into_iter().chain(["cgroup.max.descendants", "cgroup.max.depth"]) {
             fs::write(dir.join(file), "").unwrap();
         }
         delegate(&dir, uid, other).unwrap();
@@ -3538,8 +3660,12 @@ mod tests {
         for file in ["cgroup.procs", "cgroup.subtree_control", "cgroup.threads"] {
             assert_eq!(group(file), other, "{file}");
         }
-        // Its limits stay the node's: the user may not raise them.
-        assert_eq!(group("memory.max"), gid);
+        // Its limits stay the node's: the user may not raise them, nor the caps on its cgroups.
+        for file in ["memory.max", "cgroup.max.descendants", "cgroup.max.depth"] {
+            assert_eq!(group(file), gid, "{file}");
+        }
+        assert_eq!(fs::read_to_string(dir.join("cgroup.max.descendants")).unwrap(), "64");
+        assert_eq!(fs::read_to_string(dir.join("cgroup.max.depth")).unwrap(), "8");
         // A cgroup that has no such file is not delegated, and says which.
         fs::remove_file(dir.join("cgroup.threads")).unwrap();
         let said = delegate(&dir, uid, other).unwrap_err().to_string();
@@ -3970,7 +4096,7 @@ mod tests {
             .map(|g| g.as_raw())
             .find(|g| *g != gid);
         if other.is_none() {
-            eprintln!("skipped: this user has one group, so nothing can be given");
+            report_skip("skipped: this user has one group, so nothing can be given");
         }
         other.map(|other| (uid, gid, other))
     }
@@ -6071,7 +6197,18 @@ mod tests {
             user: Some(0),
             ..Unit::default()
         };
-        assert!(spec_shifted("a", &image, &delegated, "/kith/a", Path::new("/b"), (uid, gid), Some(base)).is_ok());
+        assert!(
+            spec_shifted(
+                "a",
+                &image,
+                &delegated,
+                "/kith/a",
+                Path::new("/b"),
+                (uid, gid),
+                Some(base)
+            )
+            .is_ok()
+        );
         let said = spec_shifted("a", &image, &delegated, "/kith/a", Path::new("/b"), (uid, gid), None);
         assert!(said.unwrap_err().to_string().contains("cgroupDelegation"));
         // A user past the range has no id in it: refused, never the node's.

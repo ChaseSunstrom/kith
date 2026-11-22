@@ -2589,7 +2589,11 @@ fn cgroup_delegation_round_trips() {
     assert!(serde_json::to_value(&off).unwrap().get("cgroupDelegation").is_none());
     // The schema the CLI checks a file against knows it.
     assert!(
-        kind("Workload").unwrap().schema().to_string().contains("\"cgroupDelegation\""),
+        kind("Workload")
+            .unwrap()
+            .schema()
+            .to_string()
+            .contains("\"cgroupDelegation\""),
         "v1.schema.json has no cgroupDelegation"
     );
 }

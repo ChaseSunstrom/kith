@@ -164,7 +164,9 @@ Only the newest version is fixed. There are no security releases of older ones.
   A container whose template says `userNamespaces: true` (off unless said: a sandbox
   inside it, as Steam's runtime and Flatpak start) may make namespaces and mount in them,
   and nothing in its `/proc` is covered; it is refused to a container that is the node's
-  root.
+  root. One with `cgroupDelegation: true` (off unless said, the same ask) has its
+  cgroup handed to its user and `/sys/fs/cgroup` read-write: it can make cgroups on the
+  node below its own, at most 64 of them and 8 deep, and the limits stay the container's.
   On kith OS each container's cgroup has a device filter (a BPF program kithd loads; the
   kernel asks it at every open and `mknod` of a device node): the few nodes every
   container has, its own terminals, and the devices its claims gave it, to read and
@@ -614,7 +616,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   word: `exec` units (`no-exec-units`); containers that would be the node's root, which
   is root in one that keeps the node's users, not root in a pod's range of its own
   (`no-root-containers`); `seccomp` unconfined or with
-  refused calls allowed back, `nested` included (`no-unconfined`); containers that keep the
+  refused calls allowed back, `nested` and `cgroupDelegation` included (`no-unconfined`); containers that keep the
   node's own users with no range of ids of their own, as a NodeWorkload's do (`no-host-users`);
   containers on the node's own network
   (`no-node-network`); VMs (`no-vms`), a VM's kernel, firmware or disks as paths on the

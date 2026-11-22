@@ -27,7 +27,7 @@ pub const KEYS: [(&str, &str, &str); 11] = [
     (
         "unconfined",
         "unconfined",
-        "containers with no system call filter, or with refused calls allowed back",
+        "containers with no system call filter, or with refused calls allowed back, or a writable cgroup subtree",
     ),
     (
         "host-users",
@@ -596,7 +596,9 @@ mod tests {
         use serde_json::json;
         let of = |extra: &str| {
             let mut c = json!({ "name": "a", "image": "x" });
-            c.as_object_mut().unwrap().insert("cgroupDelegation".into(), json!(extra == "on"));
+            c.as_object_mut()
+                .unwrap()
+                .insert("cgroupDelegation".into(), json!(extra == "on"));
             template(json!({ "pod": true, "containers": [c] }))
         };
         assert!(needs(&of("on"), false, false).contains(&"unconfined"));
