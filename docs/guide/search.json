@@ -31,6 +31,7 @@
 {"u":"guide/cluster.html#a-node-away-from-its-cluster","t":"A cluster","h":"A node away from its cluster"},
 {"u":"guide/cluster.html#dns","t":"A cluster","h":"DNS"},
 {"u":"guide/cluster.html#forwarding-one-zone","t":"A cluster","h":"Forwarding one zone"},
+{"u":"guide/cluster.html#this-machines-own-programs---resolver","t":"A cluster","h":"This machine's own programs: --resolver"},
 {"u":"guide/workloads.html","t":"What kithd does today","h":""},
 {"u":"guide/workloads.html#images","t":"What kithd does today","h":"Images"},
 {"u":"guide/workloads.html#cronjobs","t":"What kithd does today","h":"CronJobs"},
