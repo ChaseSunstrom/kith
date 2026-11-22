@@ -522,8 +522,10 @@ fn in_dev(p: &str) -> bool {
 }
 
 /// The kernel subsystems (`/sys/dev/char/MAJ:MIN/subsystem`) whose character devices are raw
-/// access to a disk, flash, a TPM or the CPU's registers; their majors are not fixed.
-const RAW_SUBSYSTEMS: [&str; 8] = [
+/// access to a disk, flash, a TPM, persistent or physical memory, a bus or the CPU's registers;
+/// their majors are not fixed. (A list to deny, not one to allow: a Device is set by the admin
+/// for hardware no list could name, so an allowlist would break it.)
+const RAW_SUBSYSTEMS: [&str; 17] = [
     "scsi_generic",
     "bsg",
     "nvme",
@@ -532,20 +534,35 @@ const RAW_SUBSYSTEMS: [&str; 8] = [
     "tpm",
     "tpmrm",
     "msr",
+    "dax",
+    "ubi",
+    "ublk-char",
+    "vfio",
+    "i2c-dev",
+    "nvram",
+    "cpuid",
+    "mei",
+    "watchdog",
 ];
 
-/// Whether the character device `major:minor` is raw memory, the kernel's log, the device-mapper's
-/// control node, a TPM, or of a subsystem in `RAW_SUBSYSTEMS` (read from `sys`; with no `/sys`
-/// only the fixed numbers are known).
-fn denied(major: u64, minor: u64, sys: &Path) -> bool {
-    // 1:1 mem, 1:2 kmem, 1:4 port, 1:11 kmsg, 1:12 oldmem, 10:224 tpm0, 10:236 mapper/control
-    if matches!((major, minor), (1, 1 | 2 | 4 | 11 | 12) | (10, 224 | 236)) {
-        return true;
+/// Why the character device `major:minor` may not be given: it is raw memory, the kernel's log,
+/// the device-mapper's control node, sg, a TPM, or of a subsystem in `RAW_SUBSYSTEMS` (read from
+/// `sys`). Where `/sys/dev/char` is there and a node's subsystem cannot be read, it is refused;
+/// where it is not there at all only the fixed numbers are known and the rest pass.
+fn denied(major: u64, minor: u64, sys: &Path) -> Option<&'static str> {
+    const RAW: &str =
+        "is raw memory, the kernel's log, or raw access to a disk, flash, a TPM or a bus, which no Device gives";
+    // 1:1 mem, 1:2 kmem, 1:4 port, 1:11 kmsg, 1:12 oldmem, 10:224 tpm0, 10:236 mapper/control, 21 sg
+    if matches!((major, minor), (1, 1 | 2 | 4 | 11 | 12) | (10, 224 | 236) | (21, _)) {
+        return Some(RAW);
     }
     let link = sys.join(format!("dev/char/{major}:{minor}/subsystem"));
-    let link = std::fs::read_link(link).ok();
-    link.and_then(|l| l.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .is_some_and(|name| RAW_SUBSYSTEMS.contains(&name.as_str()))
+    match std::fs::read_link(link) {
+        Ok(link) if link.file_name().is_some_and(|n| RAW_SUBSYSTEMS.iter().any(|s| n == *s)) => Some(RAW),
+        Ok(_) => None,
+        Err(_) if !sys.join("dev/char").is_dir() => None,
+        Err(_) => Some("has no readable subsystem under /sys/dev/char, so it is refused"),
+    }
 }
 
 /// Why `p` may not be given, or `Ok`: it must be there and be, on this node, a character device
@@ -560,10 +577,8 @@ fn char_node(p: &Path, sys: &Path) -> Result<(), &'static str> {
     let rdev = meta.rdev();
     if !meta.file_type().is_char_device() {
         Err("is not a character device (a link, a block device or a file is never given)")
-    } else if denied(major(rdev), minor(rdev), sys) {
-        Err("is raw memory, the kernel's log, a disk's, flash's or a TPM's raw access, which no Device gives")
     } else {
-        Ok(())
+        denied(major(rdev), minor(rdev), sys).map_or(Ok(()), Err)
     }
 }
 
@@ -1358,30 +1373,54 @@ spec: { node: b, devices: [b-usb0] }
     #[test]
     fn the_denied_character_devices_are_raw_memory_and_raw_disk_access() {
         let root = sys("denied");
-        for (major, minor) in [(1, 1), (1, 2), (1, 4), (1, 11), (1, 12), (10, 224), (10, 236)] {
-            assert!(denied(major, minor, &root), "{major}:{minor}");
+        // 21 is sg whatever its minor.
+        let fixed = [
+            (1, 1),
+            (1, 2),
+            (1, 4),
+            (1, 11),
+            (1, 12),
+            (10, 224),
+            (10, 236),
+            (21, 0),
+            (21, 7),
+        ];
+        for (major, minor) in fixed {
+            assert!(denied(major, minor, &root).is_some(), "{major}:{minor}");
         }
         // null, zero, full, random, urandom; a GPU; a misc device that is not the mapper's.
+        // (No /sys/dev/char at all: the fixed numbers are all that is known, so these pass.)
         for (major, minor) in [(1, 3), (1, 5), (1, 7), (1, 8), (1, 9), (226, 0), (10, 237)] {
-            assert!(!denied(major, minor, &root), "{major}:{minor}");
+            assert!(denied(major, minor, &root).is_none(), "{major}:{minor}");
         }
-        for (n, subsystem) in [
-            ("21:0", "scsi_generic"),
-            ("240:0", "nvme"),
-            ("241:0", "nvme-generic"),
-            ("90:0", "mtd"),
-            ("242:0", "tpmrm"),
-            ("243:0", "drm"),
-        ] {
-            let dir = root.join("dev/char").join(n);
+        // With /sys/dev/char there, a node whose subsystem cannot be read is refused, a readable one
+        // by its subsystem: every one of RAW_SUBSYSTEMS, and not a GPU's.
+        let (links, mut minor) = (root.join("dev/char"), 0);
+        std::fs::create_dir_all(&links).unwrap();
+        assert!(denied(226, 0, &root).is_some(), "an unreadable subsystem is refused");
+        for subsystem in RAW_SUBSYSTEMS.iter().chain(&["drm", "input"]) {
+            minor += 1;
+            let dir = links.join(format!("240:{minor}"));
             std::fs::create_dir_all(&dir).unwrap();
             std::os::unix::fs::symlink(format!("../../../class/{subsystem}"), dir.join("subsystem")).unwrap();
-            let (major, minor) = n.split_once(':').unwrap();
             assert_eq!(
-                denied(major.parse().unwrap(), minor.parse().unwrap(), &root),
-                subsystem != "drm",
-                "{n}"
+                denied(240, minor, &root).is_some(),
+                RAW_SUBSYSTEMS.contains(subsystem),
+                "{subsystem}"
             );
+        }
+        for new in [
+            "dax",
+            "ubi",
+            "ublk-char",
+            "vfio",
+            "i2c-dev",
+            "nvram",
+            "cpuid",
+            "mei",
+            "watchdog",
+        ] {
+            assert!(RAW_SUBSYSTEMS.contains(&new), "{new}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }

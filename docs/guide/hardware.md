@@ -64,6 +64,12 @@ spec:
   node only if it is a character device that is there, whoever wrote the Device. One path that
   is not (or is missing, an unplugged camera or a driver not yet loaded) stops the unit, and
   its status says which Device and path.
+  The kernel subsystems refused, read from `/sys/dev/char`, are `scsi_generic`, `bsg`, `nvme`,
+  `nvme-generic`, `mtd`, `msr`, `dax`, `ubi`, `ublk-char`, `vfio`, `i2c-dev`, `nvram`, `cpuid`,
+  `mei` and `watchdog`, and so is char major 21 (sg). Where `/sys/dev/char` is there and a
+  node's subsystem cannot be read, the node is refused too. This is a list of what to refuse,
+  not of what to allow: a Device is set by the admin for hardware no list could name, and an
+  allowlist would break it.
 - **On kith OS** a device filter on each container's cgroup checks every open and `mknod`: it
   lets through the usual few, the terminals of the container's own `/dev/pts` and each device it
   was given, and refuses the rest, even to a root pod. A pod that made its own node

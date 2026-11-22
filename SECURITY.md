@@ -185,9 +185,12 @@ Only the newest version is fixed. There are no security releases of older ones.
   A Device cannot grant raw memory or a block device, whoever wrote it: when kithd hands nodes
   to a container it stats each path (links not followed) and gives the Device's nodes only if
   all are character devices that are there and not mem, kmem, port, kmsg, oldmem, the
-  device-mapper's control, a TPM, or of the kernel subsystems `scsi_generic`, `bsg`, `nvme`,
-  `nvme-generic`, `mtd` or `msr` (read from `/sys/dev/char`, so with no `/sys` only the fixed
-  numbers are known). A block device, a file, a link or a missing node grants nothing, and the
+  device-mapper's control, a TPM, sg (major 21), or of the kernel subsystems `scsi_generic`,
+  `bsg`, `nvme`, `nvme-generic`, `mtd`, `msr`, `dax`, `ubi`, `ublk-char`, `vfio`, `i2c-dev`,
+  `nvram`, `cpuid`, `mei` or `watchdog` (read from `/sys/dev/char`; where that is there and a
+  node's subsystem cannot be read the node is refused, and with no `/sys/dev/char` at all only
+  the fixed numbers are known). This is a denylist, not an allowlist, because a Device is set
+  by the admin for hardware no list could name. A block device, a file, a link or a missing node grants nothing, and the
   workload is not run, its status saying which Device and path. Other character devices that
   reach hardware (a USB or PCI node, `/dev/input`, `/dev/dri`) are what a Device is for and are
   given.
