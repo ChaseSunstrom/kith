@@ -504,7 +504,9 @@ fn node_with(
     crate::gateway4(1, range.gateway())?;
     let passes = "/proc/sys/net/ipv6/conf/all/forwarding";
     let guard = guard_wanted(guarded, std::fs::read_to_string(passes).ok().as_deref());
-    nat(range, services, guard, masquerade, mesh, pods)?;
+    // (Only while the people's table is there to filter kwg0: see `people_passed`.)
+    let people = crate::people::table_present().unwrap_or(false);
+    nat(range, services, guard, masquerade, mesh, pods, people)?;
     // A machine that passes packets on stops listening to its router's advertisements,
     // unless told to go on (2): the node's own way out must not be lost to this.
     for link in std::fs::read_dir("/proc/sys/net/ipv6/conf")?.flatten() {
@@ -839,6 +841,7 @@ fn nat(
     masquerade: bool,
     mesh: &str,
     pods: &[Served],
+    people: bool,
 ) -> Result<()> {
     let mut batch = Batch::new("kith-pods");
     batch.table(IP);
@@ -899,7 +902,7 @@ fn nat(
         }
         // The people's device, both ways: what its table (`inet kith-people`) lets through is
         // passed on here too (a level's exit, out by kx; the answers come back by the rule above).
-        for rule in people_passed() {
+        for rule in people_passed(people) {
             batch.rule(INET, "passed", &rule);
         }
     }
@@ -907,10 +910,14 @@ fn nat(
 }
 
 /// The `passed` rules for the people's device: what comes in by it and what goes out by it, whole
-/// link name (`is` compares a prefix, so the name ends with its NUL).
-fn people_passed() -> [Vec<Vec<u8>>; 2] {
+/// link name (`is` compares a prefix, so the name ends with its NUL). None unless the people's table
+/// (`present`) is there: it is what filters kwg0, and kwg0 passes only behind it (T-0987).
+fn people_passed(present: bool) -> Vec<Vec<Vec<u8>>> {
     let device = [crate::people::DEVICE.as_bytes(), &[0]].concat();
-    [6, 7].map(|link| vec![link_name(link), is(&device), verdict(1)])
+    if !present {
+        return Vec::new();
+    }
+    [6, 7].map(|link| vec![link_name(link), is(&device), verdict(1)]).into()
 }
 
 /// nftables' families of tables: IPv4's, and both IPv4's and IPv6's.
@@ -1093,9 +1100,16 @@ mod tests {
     /// the whole name (with its NUL: kwg0 and not a link that starts with it), both ways (T-0797).
     #[test]
     fn people_exit_the_guard_passes_kwg0_by_its_whole_name() {
-        let [came, went] = people_passed();
+        let [came, went] = people_passed(true).try_into().unwrap();
         assert_eq!(came, vec![link_name(6), is(b"kwg0\0"), verdict(1)]);
         assert_eq!(went, vec![link_name(7), is(b"kwg0\0"), verdict(1)]);
+    }
+
+    /// Without the people's table nothing passes kwg0 (T-0987): it is that table that filters it.
+    #[test]
+    fn people_exit_the_guard_passes_kwg0_only_with_the_people_table() {
+        assert!(people_passed(false).is_empty());
+        assert_eq!(people_passed(true).len(), 2);
     }
 
     #[test]

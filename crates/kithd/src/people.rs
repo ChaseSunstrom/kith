@@ -416,6 +416,8 @@ pub async fn device(
             return crate::mesh::left(shared, "people", stopping).await;
         }
     };
+    // (Pods made before the people's table get kwg0 passed now.)
+    crate::pods::serve_again(&shared);
     eprintln!("kithd: people on {}: UDP port {port}", kith_mesh::people::DEVICE);
     let status = said(Some(&public), port, endpoint.as_deref());
     let mut generation = shared.generation.subscribe();
@@ -436,6 +438,7 @@ pub async fn device(
         }
     }
     take_away();
+    crate::pods::serve_again(&shared);
     if let Err(e) = crate::mesh::say(&shared, &node, "people", Value::Null).await {
         eprintln!("kithd: people: taking back this node's people: {e}");
     }

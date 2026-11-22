@@ -694,6 +694,15 @@ pub fn guard_again(shared: &Shared) {
     }
 }
 
+/// Make the node's tables for its pods again, for the people's table made or taken away (the guard
+/// passes kwg0 only while it is there: T-0987).
+pub fn serve_again(shared: &Shared) {
+    let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
+    if !pods.made.is_empty() {
+        pods.remake();
+    }
+}
+
 /// A socket made in pod `id`'s namespace, and never the node's: a pod gone is an error.
 fn inside<T: Send>(shared: &Shared, id: &str, make: impl FnOnce() -> std::io::Result<T> + Send) -> std::io::Result<T> {
     let pods = shared.pods.lock().expect("nothing panics holding the pods");
