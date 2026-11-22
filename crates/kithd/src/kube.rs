@@ -3377,7 +3377,7 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
         }
         loop {
             // A followed log is long: an Identity deleted, or given another key, meanwhile is read to
-            // no more, as a watch is told no more, and that is written down.
+            // no more, as a watch is told no more; unlike a watch's, this end is written in the audit log.
             if follow && !own.0.stands() {
                 let why = "this certificate does not stand for its Identity any more".to_string();
                 own.0.shared.audit.record(&own.0.caller, "logs", vec![own.1.clone()], Err(why));
@@ -4505,8 +4505,7 @@ spec: {role: writer, subjects: [carol]}
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A followed `kubectl logs` ends once its Identity is deleted or given another key, and
-    /// what it ended for is written down (as a watch's end is).
+    /// A followed `kubectl logs` ends once its Identity is deleted, and its end is audited.
     #[tokio::test]
     async fn a_followed_log_ends_when_its_identity_no_longer_stands() {
         let dir = std::env::temp_dir().join(format!("kithd-kube-log-ends-{}", std::process::id()));
@@ -4515,6 +4514,31 @@ spec: {role: writer, subjects: [carol]}
         let mut chunks = followed_log_of_alice(&shared, &public, "one\n").await;
         assert_eq!(next_of(&mut chunks).await.as_deref(), Some("one\n"));
         shared.store.lock().unwrap().store.delete("Identity/alice").unwrap();
+        std::fs::write(shared.logs.join("w_default_x_0_main.out"), "one\ntwo\n").unwrap();
+        assert_eq!(next_of(&mut chunks).await, None, "the stream went on");
+        let entries = shared.audit.tail(10).unwrap();
+        let said = entries.iter().any(|e| e["verb"] == "logs" && e["who"] == "alice" && e["ok"] == false);
+        assert!(said, "{entries:?}");
+        drop(chunks);
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A followed `kubectl logs` ends once its Identity is given another key, and its end is audited.
+    #[tokio::test]
+    async fn a_followed_log_ends_when_its_identity_gets_another_key() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-log-rekey-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let ca = crate::pki::Ca::create().unwrap();
+        let (_, _, public) = ca.issue_user("alice").unwrap();
+        let (_, _, given) = ca.issue_user("alice").unwrap();
+        let mut chunks = followed_log_of_alice(&shared, &public, "one\n").await;
+        assert_eq!(next_of(&mut chunks).await.as_deref(), Some("one\n"));
+        let new = json!({
+            "apiVersion": kith_api::API_VERSION, "kind": "Identity",
+            "metadata": { "name": "alice" }, "spec": { "publicKey": given },
+        });
+        shared.store.lock().unwrap().store.apply(serde_json::from_value(new).unwrap()).unwrap();
         std::fs::write(shared.logs.join("w_default_x_0_main.out"), "one\ntwo\n").unwrap();
         assert_eq!(next_of(&mut chunks).await, None, "the stream went on");
         let entries = shared.audit.tail(10).unwrap();
