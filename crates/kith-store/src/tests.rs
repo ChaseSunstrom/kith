@@ -205,6 +205,23 @@ fn nodes_report_on_one_status() {
     );
 }
 
+/// `asleep` is the leader's word (T-1210): a node's report neither sets, clears nor flips it.
+#[test]
+fn a_report_leaves_asleep_as_the_store_has_it() {
+    use serde_json::json;
+    for was in [json!(true), json!(false)] {
+        let old = json!({ "nodes": { "0": "a" }, "asleep": was });
+        for said in [
+            json!({ "containers": [] }),
+            json!({ "containers": [], "asleep": !was.as_bool().unwrap() }),
+        ] {
+            assert_eq!(reported(Some(old.clone()), "a", Some(said))["asleep"], was);
+        }
+    }
+    let status = reported(None, "a", Some(json!({ "containers": [], "asleep": true })));
+    assert_eq!(status.get("asleep"), None);
+}
+
 /// A state as format 1's builds wrote it. Later formats get a directory of their own, and
 /// this one stays: a build that cannot read it has broken every node that updates to it.
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/format-1");

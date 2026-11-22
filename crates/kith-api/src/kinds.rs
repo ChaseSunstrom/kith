@@ -797,6 +797,21 @@ spec! {
         /// Kubernetes Service does. Off unless true.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub headless: Option<bool>,
+        /// Sleep the Workloads behind this Service (their `replicas` stay) after no
+        /// connection to it for `idle`; kithd holds the first TCP connection to a sleeping
+        /// one while a replica starts. Off unless set. TCP only: a datagram wakes nothing.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub scale_to_zero: Option<ScaleToZero>,
+    }
+
+    pub struct ScaleToZero {
+        /// How long without a connection before it sleeps, from `30s` to `30d`: `90s`, `30m`,
+        /// `24h`. Nodes' clocks are taken to agree within a minute, and it is counted to
+        /// within about ten seconds.
+        pub idle: String,
+        /// How long a first connection is held for a replica to start (at most `10m`),
+        /// before it is closed with the reason.
+        pub start: String,
     }
 
     pub struct ServicePort {
@@ -2734,6 +2749,22 @@ impl Spec for ServiceSpec {
             return Err(
                 "expose: a headless Service has no address to send a host to: its name answers its replicas".into(),
             );
+        }
+        if let Some(zero) = &self.scale_to_zero {
+            let (idle, start) = (every(&zero.idle), every(&zero.start));
+            // (A node says what it met every 10 s or so: less than 30 s would put to sleep what is in use.)
+            if idle.is_none_or(|s| !(30..=30 * 86400).contains(&s)) || start.is_none_or(|s| s > 600) {
+                return Err(
+                    "scaleToZero: `idle` and `start` are durations like `90s` or `30m`, `idle` from `30s` to `30d`, `start` at most `10m`"
+                        .into(),
+                );
+            }
+            if self.headless == Some(true) {
+                return Err("scaleToZero: a headless Service has no address a connection could wake it at".into());
+            }
+            if self.ports.iter().any(|p| p.protocol == Some(Protocol::Udp)) {
+                return Err("scaleToZero: a udp port wakes nothing: only a TCP connection does".into());
+            }
         }
         // (The host is asked for in TLS, named in a Secret and in DNS: a name, not a URL.)
         let Some(expose) = &self.expose else { return Ok(()) };

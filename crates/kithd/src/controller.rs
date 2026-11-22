@@ -1391,7 +1391,11 @@ fn bound(resource: &Resource) -> Vec<u32> {
 pub(crate) fn template_of(resource: &Resource) -> Result<(Template, u32), String> {
     let spec = resource.spec.clone();
     match resource.kind.as_str() {
-        "Workload" => serde_json::from_value::<WorkloadSpec>(spec).map(|s| (s.template, s.replicas.unwrap_or(1))),
+        // (A sleeping Workload, T-1210, keeps its `spec.replicas` and runs none.)
+        "Workload" => serde_json::from_value::<WorkloadSpec>(spec).map(|s| {
+            let asleep = resource.status.as_ref().is_some_and(|status| status["asleep"] == true);
+            (s.template, if asleep { 0 } else { s.replicas.unwrap_or(1) })
+        }),
         "Job" => serde_json::from_value::<JobSpec>(spec).map(|s| (s.template, s.completions.unwrap_or(1))),
         // One copy for each node the scheduler has given a number to.
         "NodeWorkload" => {
