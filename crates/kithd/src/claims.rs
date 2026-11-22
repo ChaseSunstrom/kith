@@ -24,7 +24,8 @@ pub struct Held {
     pub shares: BTreeMap<String, u64>,
 }
 
-/// What a workload is given on its node: device nodes, and a seat's directory.
+/// What a workload is given on its node: device nodes (character devices that are there, never
+/// a link, a disk or raw memory), and a seat's directory.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Granted {
     pub devices: Vec<PathBuf>,
@@ -35,6 +36,9 @@ pub struct Granted {
     pub classes: Vec<(String, DeviceClass)>,
     /// The dmem cgroup's regions its shares are a ceiling on, and the bytes of each.
     pub dmem: Vec<(String, u64)>,
+    /// Why a Device's nodes were refused (a node that is not there, not a character device, or
+    /// raw access): the workload is not run while there is one.
+    pub refused: Vec<String>,
 }
 
 /// The answer for every workload that names claims (its key), and every `DeviceClaim` (its key).
@@ -517,19 +521,50 @@ fn in_dev(p: &str) -> bool {
     rest.split('/').all(|c| !matches!(c, "" | "." | ".."))
 }
 
-/// Whether `p` is, on this node, a character device (not followed through a link: a link
-/// could be repointed) that is not raw memory or the kernel's log. The kernel's own type
-/// decides, so `/dev/block/8:0` and `/dev/disk/by-id/x` fare as `/dev/sda` does; a path
-/// that is not there grants nothing.
-fn char_node(p: &Path) -> bool {
+/// The kernel subsystems (`/sys/dev/char/MAJ:MIN/subsystem`) whose character devices are raw
+/// access to a disk, flash, a TPM or the CPU's registers; their majors are not fixed.
+const RAW_SUBSYSTEMS: [&str; 8] = [
+    "scsi_generic",
+    "bsg",
+    "nvme",
+    "nvme-generic",
+    "mtd",
+    "tpm",
+    "tpmrm",
+    "msr",
+];
+
+/// Whether the character device `major:minor` is raw memory, the kernel's log, the device-mapper's
+/// control node, a TPM, or of a subsystem in `RAW_SUBSYSTEMS` (read from `sys`; with no `/sys`
+/// only the fixed numbers are known).
+fn denied(major: u64, minor: u64, sys: &Path) -> bool {
+    // 1:1 mem, 1:2 kmem, 1:4 port, 1:11 kmsg, 1:12 oldmem, 10:224 tpm0, 10:236 mapper/control
+    if matches!((major, minor), (1, 1 | 2 | 4 | 11 | 12) | (10, 224 | 236)) {
+        return true;
+    }
+    let link = sys.join(format!("dev/char/{major}:{minor}/subsystem"));
+    let link = std::fs::read_link(link).ok();
+    link.and_then(|l| l.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .is_some_and(|name| RAW_SUBSYSTEMS.contains(&name.as_str()))
+}
+
+/// Why `p` may not be given, or `Ok`: it must be there and be, on this node, a character device
+/// (not followed through a link: a link could be repointed) that is not `denied`. The kernel's own
+/// type decides, so `/dev/block/8:0` and `/dev/disk/by-id/x` (links) fare as `/dev/sda` does.
+fn char_node(p: &Path, sys: &Path) -> Result<(), &'static str> {
     use nix::sys::stat::{major, minor};
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let Ok(meta) = std::fs::symlink_metadata(p) else {
-        return false;
+        return Err("is not there");
     };
     let rdev = meta.rdev();
-    // 1:1 mem, 1:2 kmem, 1:4 port, 1:11 kmsg, 1:12 oldmem
-    meta.file_type().is_char_device() && !(major(rdev) == 1 && matches!(minor(rdev), 1 | 2 | 4 | 11 | 12))
+    if !meta.file_type().is_char_device() {
+        Err("is not a character device (a link, a block device or a file is never given)")
+    } else if denied(major(rdev), minor(rdev), sys) {
+        Err("is raw memory, the kernel's log, a disk's, flash's or a TPM's raw access, which no Device gives")
+    } else {
+        Ok(())
+    }
 }
 
 /// What to give each workload that is placed on `me` with claims: its key, the paths of
@@ -539,11 +574,16 @@ fn char_node(p: &Path) -> bool {
 /// A plain host process (an exec unit) sees all of `/dev` already and needs none of this;
 /// only a container is given these.
 pub fn granted(store: &Store, me: &str, sys: &Path) -> BTreeMap<String, Granted> {
-    granted_with(store, me, sys, &|p| char_node(Path::new(p)))
+    granted_with(store, me, sys, &|p| char_node(Path::new(p), sys))
 }
 
 /// `granted`, with `node_ok` deciding whether a path under /dev may be given (tests stand in).
-fn granted_with(store: &Store, me: &str, sys: &Path, node_ok: &dyn Fn(&str) -> bool) -> BTreeMap<String, Granted> {
+fn granted_with(
+    store: &Store,
+    me: &str,
+    sys: &Path,
+    node_ok: &dyn Fn(&str) -> Result<(), &'static str>,
+) -> BTreeMap<String, Granted> {
     let mut granted = BTreeMap::new();
     for (key, outcome) in resolve(store).owners {
         let Ok(held) = outcome else { continue };
@@ -556,7 +596,7 @@ fn granted_with(store: &Store, me: &str, sys: &Path, node_ok: &dyn Fn(&str) -> b
         let drawn = drawn.and_then(|(seat, _)| store.get(&format!("Seat/{seat}")));
         let drawn = drawn.and_then(|seat| serde_json::from_value::<SeatSpec>(seat.spec.clone()).ok());
         let drawn = drawn.map(|seat| seat.devices).unwrap_or_default();
-        let (mut paths, mut classes) = (BTreeSet::new(), Vec::new());
+        let (mut paths, mut classes, mut refused) = (BTreeSet::new(), Vec::new(), Vec::new());
         let all = held.devices.iter().map(|name| (name, true));
         for (name, whole) in all.chain(drawn.iter().map(|name| (name, false))) {
             let Some(device) = store.get(&format!("Device/{name}")) else {
@@ -568,9 +608,19 @@ fn granted_with(store: &Store, me: &str, sys: &Path, node_ok: &dyn Fn(&str) -> b
             if spec.node != me || !(whole || spec.class == DeviceClass::Gpu) {
                 continue;
             }
-            // The store is not trusted for a path: one outside /dev, with a `..`, or that is not a
-            // character device here (a disk, a file, /dev/mem), grants nothing.
-            if !spec.path.iter().chain(&spec.nodes).all(|p| in_dev(p) && node_ok(p)) {
+            // The store is not trusted for a path: one outside /dev, with a `..`, not there, or that is
+            // not a character device here (a disk, a file, /dev/mem) grants nothing, and the
+            // workload is not run (said in its status) rather than run without its device.
+            let bad = spec.path.iter().chain(&spec.nodes).find_map(|p| {
+                let why = if in_dev(p) {
+                    node_ok(p).err()?
+                } else {
+                    "is not a plain path under /dev"
+                };
+                Some(format!("Device {name}: {p} {why}"))
+            });
+            if let Some(bad) = bad {
+                refused.push(bad);
                 continue;
             }
             classes.push((name.clone(), spec.class.clone()));
@@ -614,6 +664,7 @@ fn granted_with(store: &Store, me: &str, sys: &Path, node_ok: &dyn Fn(&str) -> b
                 seat,
                 classes,
                 dmem,
+                refused,
             },
         );
     }
@@ -1237,10 +1288,9 @@ spec: { node: b, devices: [b-usb0] }
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A made-up `/sys` with a render node for `card0`.
     /// `granted` with the device-type check off: these tests name /dev paths this host lacks.
     fn granted(store: &Store, me: &str, sys: &Path) -> BTreeMap<String, Granted> {
-        granted_with(store, me, sys, &|_| true)
+        granted_with(store, me, sys, &|_| Ok(()))
     }
 
     /// A Device naming raw memory, the kernel log, a directory or a missing node grants nothing;
@@ -1253,34 +1303,90 @@ spec: { node: b, devices: [b-usb0] }
             let device = format!(
                 "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: {{ name: a-gpu-card1 }}\nspec: {spec}\n"
             );
-            let source = [device, claim("cuda", "{ device: a-gpu-card1 }"), workload("train", "[cuda]")].concat();
-            super::granted(&self::store(&source), "a", &empty)["Workload/default/train"]
-                .devices
-                .clone()
+            let source = [
+                device,
+                claim("cuda", "{ device: a-gpu-card1 }"),
+                workload("train", "[cuda]"),
+            ]
+            .concat();
+            super::granted(&self::store(&source), "a", &empty)["Workload/default/train"].clone()
         };
-        assert_eq!(grant("{ node: a, class: gpu, path: /dev/null }"), [PathBuf::from("/dev/null")]);
+        let ok = grant("{ node: a, class: gpu, path: /dev/null }");
         assert_eq!(
-            grant("{ node: a, class: gpu, nodes: [/dev/null, /dev/zero] }"),
-            ["/dev/null", "/dev/zero"].map(PathBuf::from)
+            (ok.devices, ok.refused),
+            ([PathBuf::from("/dev/null")].to_vec(), Vec::<String>::new())
         );
-        for bad in ["/dev/mem", "/dev/kmem", "/dev/port", "/dev/kmsg", "/dev/sda", "/dev/shm", "/dev/nothing-here"] {
-            assert!(grant(&format!("{{ node: a, class: gpu, path: {bad} }}")).is_empty(), "path {bad}");
-            // One bad node takes the whole Device with it, as a path outside /dev does.
-            let nodes = format!("{{ node: a, class: gpu, nodes: [/dev/null, {bad}] }}");
-            assert!(grant(&nodes).is_empty(), "node {bad}");
+        let ok = grant("{ node: a, class: gpu, nodes: [/dev/null, /dev/zero] }");
+        assert_eq!(ok.devices, ["/dev/null", "/dev/zero"].map(PathBuf::from));
+        for bad in [
+            "/dev/mem",
+            "/dev/kmem",
+            "/dev/port",
+            "/dev/kmsg",
+            "/dev/sda",
+            "/dev/shm",
+            "/dev/nothing-here",
+        ] {
+            // One bad node takes the whole Device with it, and the workload is told why (it is not
+            // run without its device in silence).
+            for spec in [format!("path: {bad}"), format!("nodes: [/dev/null, {bad}]")] {
+                let got = grant(&format!("{{ node: a, class: gpu, {spec} }}"));
+                assert!(got.devices.is_empty() && got.classes.is_empty(), "{spec}");
+                assert_eq!(got.refused.len(), 1, "{spec}");
+                assert!(
+                    got.refused[0].starts_with(&format!("Device a-gpu-card1: {bad} ")),
+                    "{:?}",
+                    got.refused
+                );
+            }
         }
-        // The kernel's type decides: a plain file, a link to /dev/null and the low char numbers.
+        // The kernel's type decides: a plain file, a link to /dev/null and a directory are not given.
         let dir = empty.join("files");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("file"), "").unwrap();
         std::os::unix::fs::symlink("/dev/null", dir.join("link")).unwrap();
-        assert!(char_node(Path::new("/dev/null")));
-        assert!(!char_node(&dir.join("file")));
-        assert!(!char_node(&dir.join("link")));
-        assert!(!char_node(&dir));
+        assert_eq!(char_node(Path::new("/dev/null"), &empty), Ok(()));
+        for not in [dir.join("file"), dir.join("link"), dir.clone()] {
+            assert!(char_node(&not, &empty).is_err(), "{not:?}");
+        }
+        assert_eq!(char_node(&dir.join("missing"), &empty), Err("is not there"));
         let _ = std::fs::remove_dir_all(&empty);
     }
 
+    /// The denied numbers work where /dev/mem and the rest are absent, and so do the subsystems
+    /// whose majors are not fixed (a made-up `/sys/dev/char/21:0/subsystem` link).
+    #[test]
+    fn the_denied_character_devices_are_raw_memory_and_raw_disk_access() {
+        let root = sys("denied");
+        for (major, minor) in [(1, 1), (1, 2), (1, 4), (1, 11), (1, 12), (10, 224), (10, 236)] {
+            assert!(denied(major, minor, &root), "{major}:{minor}");
+        }
+        // null, zero, full, random, urandom; a GPU; a misc device that is not the mapper's.
+        for (major, minor) in [(1, 3), (1, 5), (1, 7), (1, 8), (1, 9), (226, 0), (10, 237)] {
+            assert!(!denied(major, minor, &root), "{major}:{minor}");
+        }
+        for (n, subsystem) in [
+            ("21:0", "scsi_generic"),
+            ("240:0", "nvme"),
+            ("241:0", "nvme-generic"),
+            ("90:0", "mtd"),
+            ("242:0", "tpmrm"),
+            ("243:0", "drm"),
+        ] {
+            let dir = root.join("dev/char").join(n);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::os::unix::fs::symlink(format!("../../../class/{subsystem}"), dir.join("subsystem")).unwrap();
+            let (major, minor) = n.split_once(':').unwrap();
+            assert_eq!(
+                denied(major.parse().unwrap(), minor.parse().unwrap(), &root),
+                subsystem != "drm",
+                "{n}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A made-up `/sys` with a render node for `card0`.
     fn sys(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("kith-claims-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);

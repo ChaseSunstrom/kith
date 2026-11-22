@@ -58,10 +58,12 @@ spec:
 - A container gets its Devices' nodes in its own `/dev`, beside `null`, `zero`, `full`,
   `random`, `urandom`, `tty`; a GPU brings its render node (`/dev/dri/renderD*`). A missing
   Device or claim stops the unit and says which. `/dev/mem`, `/dev/kmem`, `/dev/port` and
-  `/dev/tpm*` are given to no pod, whatever a Device says. Nor is `/dev/kmsg`, any block
-  device (`/dev/sda`, `/dev/block/8:0`), a link, a plain file or a node that is not there: a
-  Device grants a node only if it is a character device on its node, whoever wrote the Device,
-  and one such path makes it grant nothing.
+  `/dev/tpm*` are given to no pod, whatever a Device says. Nor is `/dev/kmsg`, a disk's or
+  flash's raw node (`/dev/sg*`, `/dev/nvme0`, `/dev/ng*`, `/dev/mtd*`, `/dev/mapper/control`),
+  any block device (`/dev/sda`, `/dev/block/8:0`), a link or a plain file: a Device grants a
+  node only if it is a character device that is there, whoever wrote the Device. One path that
+  is not (or is missing, an unplugged camera or a driver not yet loaded) stops the unit, and
+  its status says which Device and path.
 - **On kith OS** a device filter on each container's cgroup checks every open and `mknod`: it
   lets through the usual few, the terminals of the container's own `/dev/pts` and each device it
   was given, and refuses the rest, even to a root pod. A pod that made its own node
