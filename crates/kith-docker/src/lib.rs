@@ -763,7 +763,12 @@ mod tests {
         let mut client = client;
         client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut sink = Vec::new();
-        client.read_to_end(&mut sink).ok().map(|_| start.elapsed())
+        // A cut with the writer's last byte still unread reaches this end as a reset, not an EOF.
+        match client.read_to_end(&mut sink) {
+            Ok(_) => Some(start.elapsed()),
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => Some(start.elapsed()),
+            Err(_) => None,
+        }
     }
 
     #[test]
