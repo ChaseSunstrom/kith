@@ -202,13 +202,14 @@ struct Placed {
 /// runs it. The id is made from the stored resource, never from what the client sent.
 fn place(shared: &Shared, namespace: &str, pod: &str, container: Option<&str>) -> Result<Placed, Failed> {
     let missing = || Failed::new(404, "NotFound", format!("pod {namespace}/{pod} is not found"));
-    let (holder, owner, replica) = crate::kube::pod_owner(pod).ok_or_else(missing)?;
+    let me = shared.cluster.as_ref().map_or("local", |c| c.me.name.as_str());
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    // (A bare Pod's name too: it is held under the name it was sent as.)
+    let (holder, owner, replica) = crate::kube::resolve_pod(&state.store, namespace, pod).ok_or_else(missing)?;
     if holder == "NodeWorkload" {
         let why = "a NodeWorkload's pod runs on the host, not in a container: `kith run` runs a command there";
         return Err(Failed::new(501, "NotImplemented", why));
     }
-    let me = shared.cluster.as_ref().map_or("local", |c| c.me.name.as_str());
-    let state = shared.store.lock().expect("a handler panicked holding the store");
     let resource = state
         .store
         .get(&format!("{holder}/{namespace}/{owner}"))
@@ -445,7 +446,12 @@ pub async fn hop(
         return say(StatusCode::FORBIDDEN, why);
     }
     // (What the pod's name says is enough to ask: a caller without the right is refused whether or not the pod is there.)
-    let Some((holder, owner, replica)) = crate::kube::pod_owner(&hop.pod) else {
+    let named = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let named = crate::kube::resolve_pod(&state.store, &hop.namespace, &hop.pod);
+        named.map(|(holder, owner, replica)| (holder, owner.to_string(), replica))
+    };
+    let Some((holder, owner, replica)) = named else {
         let why = format!("pod {}/{} is not found", hop.namespace, hop.pod);
         audit(Err(why.clone()));
         return say(StatusCode::NOT_FOUND, why);
@@ -901,6 +907,16 @@ metadata: {name: far, namespace: default}
 spec: {replicas: 1, template: {exec: [{name: sleep, command: [sleep, '3600']}]}}
 ---
 apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: solo
+  namespace: default
+  annotations:
+    kith.dev/pod: 'true'
+    kube.kith.dev/sent: '{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"solo\",\"namespace\":\"default\"}}'
+spec: {replicas: 1, template: {exec: [{name: sleep, command: [sleep, '3600']}]}}
+---
+apiVersion: kith.dev/v1
 kind: NodeWorkload
 metadata: {name: agent, namespace: default}
 spec: {template: {exec: [{name: sleep, command: [sleep, '3600']}]}}
@@ -967,7 +983,11 @@ spec: {role: execer, subjects: [alice]}
                 state.store.apply(resource.unwrap()).unwrap();
             }
             // web runs on b, far and the host's agent elsewhere.
-            for (key, node) in [("Workload/default/web", "b"), ("Workload/default/far", "a")] {
+            for (key, node) in [
+                ("Workload/default/web", "b"),
+                ("Workload/default/far", "a"),
+                ("Workload/default/solo", "b"),
+            ] {
                 let unit = json!({"replica": 0, "node": node, "state": "running"});
                 let status = json!({"nodes": {"0": node}, "containers": [unit]});
                 state.store.set_status(key, Some(status)).unwrap();
@@ -1002,6 +1022,10 @@ spec: {role: execer, subjects: [alice]}
         let (status, why) = ask_hop(&a, world.b_port, "alice", "web-0", &exec).await;
         assert_eq!(status, 422, "{why}");
         assert!(why.contains("not a unit made here"), "{why}");
+        // A bare Pod's replica on that node is found by its own name, as web-0 is: the exec goes on to enter.
+        let (status, why) = ask_hop(&a, world.b_port, "alice", "solo", &exec).await;
+        assert_eq!(status, 422, "{why}");
+        assert_eq!(ask_hop(&a, world.b_port, "bob", "solo", &exec).await.0, 403);
         let (status, why) = ask_hop(&a, world.b_port, "alice", "web-0", &connect).await;
         assert_eq!(status, 502, "{why}");
         // Neither a spec that names nothing nor one that names both is a hop.
