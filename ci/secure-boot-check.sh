@@ -8,15 +8,17 @@
 set -eu
 here=$(dirname "$0")
 root=$(cd "$here/.." && pwd)
-for tool in sbsign sbverify mcopy openssl; do
+for tool in sbsign sbverify openssl; do
     command -v "$tool" >/dev/null 2>&1 || { echo "secure-boot-check: needs $tool" >&2; exit 3; }
 done
 w=$(mktemp -d)
-trap 'rm -rf "$w"' EXIT INT TERM
+trap 'rm -rf "$w"' EXIT
+trap 'exit 130' INT TERM
 mkdir "$w/keys"
 openssl req -new -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=kith secure-boot-check/' \
     -keyout "$w/keys/db.key" -out "$w/keys/db.crt" 2>/dev/null
-# (build.sh exits 3 itself for a tool of its own that is missing: that passes through.)
+# (build.sh exits 3 for a tool of its own that is missing, mcopy among them: with -e this script ends
+# with that 3, its own skip code. ci/vm.sh's skip is an exit 0, so nothing there maps it.)
 sh "$root/os/build.sh" --secure-boot "$w/keys" --twice --out "$w/signed"
 sh "$root/os/build.sh" --out "$w/plain"
 for f in kith-a.efi kith-b.efi kith-install.efi; do

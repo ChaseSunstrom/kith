@@ -237,7 +237,7 @@ sh os/build.sh --secure-boot ~/kith-sb   # needs sbsign and sbverify (sbsigntool
 `--secure-boot KEYDIR` signs systemd-boot (the `BOOTX64.EFI` of both disks) and every kernel
 image (slot a and b, so the update's too, and the installer's) with `KEYDIR/db.key` and
 `KEYDIR/db.crt`, then checks each against the certificate before it goes into an ESP or the
-update (`sh ci/secure-boot-check.sh` does this with a throwaway key, and builds twice to show the same bytes; it needs sbsign, sbverify and mcopy, and exits 3 without them). The certificate is part of the update's kernel digest, so an update that only signs, or changes the key, is a full one, not a kithd-only one. A firmware that has that certificate as a `db` entry then checks the one file that
+update (`sh ci/secure-boot-check.sh` does this with a throwaway key, and builds twice to show the same bytes; it needs sbsign, sbverify, mcopy and openssl, and exits 3 without them). The certificate is part of the update's kernel digest, so an update that only signs, or changes the key, is a full one, not a kithd-only one. A firmware that has that certificate as a `db` entry then checks the one file that
 carries the root's hash. Without sbsign the build stops with exit 3 (this machine cannot build
 it), and a directory without both files is refused (exit 2). The key is only read: it is
 never copied into an image, and keep it outside the repo. The signature is not part of what the

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build kith OS's disk image: the whole operating system of a node.
 #
-#   sh os/build.sh [--out DIR] [--check] [--twice]
+#   sh os/build.sh [--out DIR] [--spec FILE] [--secure-boot KEYDIR] [--check] [--twice]
 #
 # What is in it:
 #   - a kernel built from kernel.org's source at a pinned version and checksum with
@@ -101,7 +101,7 @@ while [ $# -gt 0 ]; do
         [ $# -ge 2 ] && [ -f "$2" ] && [ -r "$2" ] || { echo "build.sh: --spec needs a file it can read" >&2; exit 2; }
         spec=$(realpath "$2"); shift 2 ;;
     --secure-boot)
-        # shellcheck disable=SC2015
+        # shellcheck disable=SC2015 # (C only reports and exits)
         [ $# -ge 2 ] && [ -f "$2/db.key" ] && [ -r "$2/db.key" ] && [ -f "$2/db.crt" ] && [ -r "$2/db.crt" ] \
             || { echo "build.sh: --secure-boot needs a directory with a db.key and db.crt it can read" >&2; exit 2; }
         sbdir=$(realpath "$2"); shift 2 ;;
@@ -246,7 +246,7 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
         die "--spec: 'all' and 'gpu-amd-phoenix' do not go together (the same driver, as modules and built in)"
     ! spec_list features | grep -qx all || ! spec_list features | grep -qx gpu-nvidia-pascal ||
         die "--spec: 'all' and 'gpu-nvidia-pascal' do not go together (nouveau, as modules and built in)"
-    # shellcheck disable=SC2086
+    # shellcheck disable=SC2086 # (a list of globs, split on purpose; globbing is off)
     globs=$(printf '%s\n' $globs | LC_ALL=C sort -u)
     for g in $globs; do
         case $g in /* | *..* | *[!A-Za-z0-9_./*+-]*) die "--spec: '$g' is not a path in linux-firmware" ;; esac
@@ -267,7 +267,7 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
         case " $(echo $globs) " in *" all "*) die "--spec: firmware: [all] is for a kernel with modules (os/examples/all.yaml)" ;; esac
         # (The tarball is 640 MB, read once per new list of files: what it gave is kept.)
         if [ "$(cat "$fwdir/.kith-globs" 2>/dev/null)" != "$globs" ]; then
-            # shellcheck disable=SC2116,SC2086
+            # shellcheck disable=SC2116,SC2086 # (as above: the echo joins the list)
             echo "build.sh: firmware from linux-firmware $firmware_date: $(echo $globs)" >&2
             fetch "$firmware_url" "$firmware_sha256" "$cache/linux-firmware-$firmware_date.tar.xz"
             [ ! -d "$fwdir" ] || find "$fwdir" -delete
@@ -275,7 +275,7 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
             # The files the globs name, and the links of linux-firmware's WHENCE that they name
             # (most of nvidia/gp106 is links) with what those point at: os/firmware.sh, which
             # dies, naming why, for a glob that names nothing, a link out of the tree or a cycle.
-            # shellcheck disable=SC2086
+            # shellcheck disable=SC2086 # (one argument for each glob; globbing is off)
             sh "$root/os/firmware.sh" "$cache/linux-firmware-$firmware_date.tar.xz" "$fwdir" $globs ||
                 die "--spec: os/firmware.sh's line above says what linux-firmware $firmware_date lacks or why a link is refused"
             echo "$globs" >"$fwdir/.kith-globs"
@@ -382,7 +382,7 @@ if ! [ -r "$kernel" ]; then
             have=$(modinfo -F sig_key "$sample" | hexid)
             serial=$(openssl x509 -inform DER -in certs/signing_key.x509 -noout -serial | sed 's/^serial=//' | hexid)
             ski=$(openssl x509 -inform DER -in certs/signing_key.x509 -noout -ext subjectKeyIdentifier | sed -n 2p | hexid)
-            # shellcheck disable=SC2015
+            # shellcheck disable=SC2015 # (C only reports and exits)
             [ -n "$have" ] && [ -n "$(modinfo -F signer "$sample")" ] || { echo "build.sh: amdgpu.ko has no signer: $(modinfo "$sample" | tail -n 5)" >&2; exit 1; }
             [ "$have" = "$serial" ] || [ "$have" = "$ski" ] ||
                 { echo "build.sh: amdgpu.ko is signed by $have, which is not the kernel's key (serial $serial, id $ski)" >&2; exit 1; }
@@ -468,7 +468,7 @@ if [ -n "$modules" ]; then
     fwlist=$cache/kernel-$key/firmware-$(printf 'links2\n%s\n%s\n' "$firmware_sha256" "$fwextra" | sha256sum | cut -c 1-16).list
     if ! [ -s "$fwlist" ]; then
         set -f
-        # shellcheck disable=SC2116,SC2086
+        # shellcheck disable=SC2116,SC2086 # (the echo joins the lines of a list; globbing is off)
         case " $(echo $fwextra) " in
         # (Every file and every link, a link to a directory too: not what is under one.)
         *" all "*) (cd "$fwall" && find . \( -type f -o -type l \) ! -name '.kith-*' | sed 's|^\./||' | LC_ALL=C sort) >"$fwlist.part" ;;
@@ -481,7 +481,7 @@ if [ -n "$modules" ]; then
                 set +f
                 while read -r name; do
                     case $name in '' | /* | *..*) continue ;; esac
-                    # shellcheck disable=SC2086
+                    # shellcheck disable=SC2086 # (a list of names, split on purpose; globbing is off)
                     # (A link is kept with the file it points to.)
                     for f in $name; do
                         [ -f "$f" ] || continue
@@ -698,7 +698,7 @@ assemble() { # DIR
         s=$(stat -c %s "$w/root.squashfs")
         # shellcheck disable=SC2017 # (whole MB: the 5/4 is room, not precision)
         rootsz=$((s / 1048576 * 5 / 4 + 64))M
-        # shellcheck disable=SC2017
+        # shellcheck disable=SC2017 # (as above)
         veritysz=$(($(stat -c %s "$w/root.verity") / 1048576 * 5 / 4 + 4))M
     fi
     part 10-esp esp esp 64M "CopyBlocks=$w/esp.img"
