@@ -291,6 +291,16 @@ A node runs from one slot (`root-a` or `root-b`); an update is written into the 
    starts the slot that worked, and kithd says `slot a did not come up in 3 tries: this is slot
    b, which ran before it`. Each failed start in a row waits longer, up to ten minutes.
 
+A slot that hangs without a panic is restarted by the hardware watchdog (the kernel has iTCO,
+SP5100 and QEMU's i6300esb, with no way out once started): kithd opens `/dev/watchdog` in its
+first moments, sets 60 seconds (`kithd: init: watchdog /dev/watchdog: reset after 60 s unless
+petted`) and writes to it every ten seconds from a thread of its own, so slow work such as
+encrypting the state is no hang. The machine is reset when the kernel or kithd's first process
+stops running, and for a slot not yet good the boot loader counts that as a failed try. The
+writes stop, and the reset follows, when kithd's runtime has not run for five minutes, or when
+it has not begun to run an hour after kithd started. A machine with no watchdog says
+`kithd: init: no watchdog` and goes on.
+
 A damaged, cut-short or too-big update is refused, and no kernel image offers the half-written
 slot. The state partition is in no slot: the node is the same node after an update, and after
 going back. An update can also reach one node from a stick: `dd if=kith-os.update of=/dev/sdX`,
@@ -931,6 +941,6 @@ The design is in [adr-second-disk.md](../adr-second-disk.md).
 
 ### Not in kith OS yet
 
-A CD image, starting by BIOS, a watchdog for a slot that hangs without stopping, Secure Boot
+A CD image, starting by BIOS, a watchdog for a kithd that hangs while the kernel runs on, Secure Boot
 (the image is not signed), drivers for Wi-Fi and sound, graphics but by a [spec](#a-node-that-needs-more-a-spec), a card plugged in later, IPv6
 addresses from the network, arm64.

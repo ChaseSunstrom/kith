@@ -764,6 +764,7 @@ impl Boot {
     /// Ask for as long as kithd runs (it serves meanwhile). Call inside the runtime.
     pub fn network(self) {
         power_button();
+        heartbeat();
         for card in self.asking {
             // (A name server on the command line is one the network's own may not replace.)
             let told = self.dns;
@@ -980,11 +981,93 @@ pub fn first_things() {
     consoles();
 }
 
+/// The hardware watchdog (iTCO, SP5100 or QEMU's i6300esb: the kernel has them all).
+const WATCHDOG: &str = "/dev/watchdog";
+/// The machine is reset this long after the last write to it (the drivers' own defaults differ),
+/// and kithd writes every `PET_EVERY`.
+const WATCHDOG_SECS: i32 = 60;
+const PET_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+/// A kithd that has not served (no beat yet) this long after it started is not petted again: a
+/// first start encrypts a disk and installs, so it is long. (ponytail: a node that waits for its
+/// key longer than this is reset; the serving runtime beats while it waits, so it does not.)
+const BOOT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Once serving has begun, a beat older than this is a runtime that does not run any more.
+const STALE: std::time::Duration = std::time::Duration::from_secs(300);
+/// When kithd started, and the last beat of its runtime in ms after that, plus one (0: none yet).
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static BEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Is the watchdog to be petted, `since_start` after kithd began and `since_beat` after the last
+/// beat of its runtime (None: it has not beaten yet)?
+fn alive(since_start: std::time::Duration, since_beat: Option<std::time::Duration>) -> bool {
+    since_beat.map_or(since_start <= BOOT_DEADLINE, |beat| beat <= STALE)
+}
+
+/// Writes to `device` every `every` for as long as `alive` says so; the machine is reset
+/// soon after it stops.
+fn pet(device: &mut impl std::io::Write, every: std::time::Duration, mut alive: impl FnMut() -> bool) {
+    while alive() {
+        // (A refused write is no reason to stop: the reset is what a failed pet is for.)
+        let _ = device.write_all(b"k");
+        std::thread::sleep(every);
+    }
+}
+
+/// Opens the watchdog at `path`, sets its time and pets it from a thread of its own, one that
+/// no work of kithd's starves: a hung kernel, or a first process that no longer runs, resets the
+/// machine, and the loader counts that as a failed start of the slot (os.rs). Whether there is one:
+/// a machine with none is said so and goes on. A kithd started again finds the device open if
+/// the one before it still runs it (or the kernel, which never closes it, lets it be opened).
+fn watchdog(path: &std::path::Path) -> bool {
+    let started = *STARTED.get_or_init(std::time::Instant::now);
+    let mut device = match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(device) => device,
+        Err(e) => {
+            eprintln!("kithd: init: no watchdog {}: {e}", path.display());
+            return false;
+        }
+    };
+    match kith_dm_sys::watchdog_timeout(&device, WATCHDOG_SECS) {
+        Ok(secs) => eprintln!(
+            "kithd: init: watchdog {}: reset after {secs} s unless petted",
+            path.display()
+        ),
+        Err(e) => eprintln!("kithd: init: watchdog {}: its time is not set: {e}", path.display()),
+    }
+    let alive = move || {
+        let beat = BEAT
+            .load(Ordering::Relaxed)
+            .checked_sub(1)
+            .map(std::time::Duration::from_millis);
+        alive(started.elapsed(), beat.map(|at| started.elapsed().saturating_sub(at)))
+    };
+    let spawned = std::thread::Builder::new()
+        .stack_size(128 << 10)
+        .spawn(move || pet(&mut device, PET_EVERY, alive));
+    spawned.is_ok()
+}
+
+/// Beats for as long as the runtime it is spawned on runs (`Boot::network`), which the
+/// watchdog's pet watches: a runtime that stops for good is reset after a while.
+fn heartbeat() {
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(PET_EVERY);
+        loop {
+            tick.tick().await;
+            if let Some(started) = STARTED.get() {
+                BEAT.store(started.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
 /// kithd as the machine's first (under the keeper): what it learns of the machine, and, on
 /// the machine's first start of it (`again` false), what it does to it once. Started again
 /// (`again`), it reads the command line and the config as before and changes nothing: the
 /// state is mounted, the TPM measured, the disk grown already.
 pub fn early(again: bool) -> Boot {
+    // (Before anything that can hang: the disk checks and the encryption below.)
+    watchdog(std::path::Path::new(WATCHDOG));
     // Drivers first (a started-again kithd finds them loaded, and only listens again).
     crate::modules::start();
     // (Before anything is read from the root's disk: see `check_boot_disk`.)
@@ -1216,6 +1299,34 @@ pub fn end(failed: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_pet_writes_to_the_device_every_beat() {
+        let mut device = Vec::new();
+        let mut beats = 0;
+        pet(&mut device, std::time::Duration::ZERO, || {
+            beats += 1;
+            beats <= 3
+        });
+        assert_eq!(device, b"kkk");
+    }
+
+    #[test]
+    fn init_watchdog_without_a_device_is_not_an_error() {
+        // (Said on the console, and kithd goes on: a VM or a board may have none.)
+        assert!(!watchdog(std::path::Path::new("/nonexistent/watchdog")));
+    }
+
+    #[test]
+    fn init_pet_stops_when_the_heartbeat_is_stale() {
+        use std::time::Duration as D;
+        // Booting, and no beat yet: petted until the boot deadline.
+        assert!(alive(D::from_secs(60), None));
+        assert!(!alive(BOOT_DEADLINE + D::from_secs(1), None));
+        // Serving: petted while the beat is fresh, however long ago kithd started.
+        assert!(alive(BOOT_DEADLINE * 2, Some(D::from_secs(10))));
+        assert!(!alive(BOOT_DEADLINE * 2, Some(STALE + D::from_secs(1))));
+    }
 
     #[test]
     fn init_a_wait_ends_when_its_stop_flag_is_raised() {
