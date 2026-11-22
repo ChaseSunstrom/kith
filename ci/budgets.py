@@ -93,6 +93,7 @@ KITHD_IDLE_RSS = 9 * MB
 # built 3.68 MB with T-1218 merged on main 81fe0db4, and train E adds kith verbs (machine, launch,
 # pull progress); T-0269 brings them back down.
 SIZE_BUDGETS = {"kith": int(3.10 * MB), "kith-remote": int(3.75 * MB), "kithd": int(KITHD_SIZE * MB)}
+# (T-1209: kith machine create|list|run|rm costs about 20 KB alone, 3,159,384 B to 3,179,896 B; the 3.10 above covers it.)
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
