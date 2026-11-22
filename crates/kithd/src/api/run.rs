@@ -37,17 +37,18 @@ use std::future::Future;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
-/// How long the app has to connect to its socket, the second node to answer (and the caller to
-/// take the connection over), and the caller to send its ask: a few hundred bytes (the tests
-/// shorten two).
-const START: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 30 });
+/// How long the app has to connect to its socket (the tests shorten it, and [`BODY`]).
+const START: Duration = Duration::from_secs(if cfg!(test) { 8 } else { 30 });
+/// How long the second node has to answer, and the caller to take the connection over.
 const HOP: Duration = Duration::from_secs(15);
+/// How long the caller has to send its ask: a few hundred bytes.
 const BODY: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
 const PROTOCOL: &str = "kith-run";
 
@@ -373,7 +374,9 @@ impl Dir {
             .map_err(|_| "no random numbers".to_string())?;
         // The socket in here (`s`) must fit `sun_path` (107 bytes): a long temp dir, as a build's,
         // is passed over for /tmp.
-        let name = format!("kith-run-{}", pki::hex(&random));
+        // (Not `kith-run-`: the `kith` command makes those in the same temp dir, and the sweep
+        // at start must not take a live one of theirs.)
+        let name = format!("{DIR_PREFIX}{}", pki::hex(&random));
         let mut path = std::env::temp_dir().join(&name);
         if path.join("s").as_os_str().len() > 107 {
             path = Path::new("/tmp").join(&name);
@@ -390,6 +393,15 @@ impl Drop for Dir {
     }
 }
 
+/// The names a run's directory and its cgroup start with.
+const DIR_PREFIX: &str = "kithd-run-";
+const CGROUP_PREFIX: &str = "kith-run-";
+
+/// True the first time it is asked of `flag`: for a line every run would repeat.
+fn first(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
+}
+
 /// A cgroup of a run's own, in the subtree the node was delegated: what the run started is in it
 /// however it left the process group (a `setsid`), and is killed with it. Gone when dropped.
 struct Leaf(PathBuf);
@@ -397,34 +409,113 @@ struct Leaf(PathBuf);
 impl Leaf {
     /// `None` where none can be made (no cgroup v2, no delegation): the process group is all there is.
     fn make(name: &str) -> Option<Leaf> {
+        static SAID: AtomicBool = AtomicBool::new(false);
         match kith_runtime::leaf_cgroup(name) {
             Ok(leaf) => Some(Leaf(leaf)),
             Err(e) => {
-                eprintln!("kithd: run: no cgroup for this run, the process group is all that ends it: {e}");
+                if first(&SAID) {
+                    eprintln!(
+                        "kithd: run: no cgroup for runs, the process group is all that ends one (said once): {e}"
+                    );
+                }
                 None
             }
         }
     }
 
     fn kill(&self) {
-        let _ = std::fs::write(self.0.join("cgroup.kill"), "1");
+        kill_cgroup(&self.0);
     }
+}
+
+/// Kills everything in the cgroup `path`: `cgroup.kill` (Linux 5.14), and where that cannot be
+/// written, a SIGKILL to each pid in `cgroup.procs` (not atomic against a fork: a program that
+/// forks as fast as it is killed can leave a child, which the process group still catches).
+/// A cgroup that is gone is nothing to kill.
+fn kill_cgroup(path: &Path) {
+    // (No `create`: on a cgroup the file is there, and where it is not, there is no cgroup.)
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path.join("cgroup.kill"))
+        .and_then(|mut file| std::io::Write::write_all(&mut file, b"1"));
+    let Err(e) = written else { return };
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return;
+    }
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if first(&SAID) {
+        eprintln!(
+            "kithd: run: cannot write cgroup.kill ({e}): killing each process of a run's cgroup instead (said once)"
+        );
+    }
+    let procs = std::fs::read_to_string(path.join("cgroup.procs")).unwrap_or_default();
+    for pid in procs.lines().filter_map(|pid| pid.trim().parse::<i32>().ok()) {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+/// Removes the empty directory `path` once what was in it is gone (a cgroup is removed once what
+/// was in it is waited for, which is not by this thread): tries for ten seconds, off the
+/// runtime's threads, and leaves it after that.
+fn remove_when_empty(path: PathBuf) {
+    std::thread::spawn(move || {
+        for _ in 0..200 {
+            if std::fs::remove_dir(&path).is_ok() || !path.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+}
+
+/// At kithd's start, what a kithd before left of runs (it was killed, or crashed, with runs going:
+/// their cgroups are beside kithd's own, not in it, and live on): the `kith-run-*` cgroups in
+/// `cgroups` are killed and removed, and the `kithd-run-*` directories in `tmps` removed.
+/// Nothing of this kithd's is yet there, and what is not this user's is left.
+// ponytail: a second kithd of the same user on this machine (not a deployment) would lose its
+// live runs to this; a pid in the name would tell them apart.
+fn sweep(cgroups: Option<&Path>, tmps: &[&Path]) {
+    use std::os::unix::fs::MetadataExt;
+    let ours = |path: &Path, prefix: &str| {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(prefix));
+        let meta = std::fs::symlink_metadata(path);
+        name && meta.is_ok_and(|meta| meta.is_dir() && meta.uid() == nix::unistd::geteuid().as_raw())
+    };
+    for entry in cgroups
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if ours(&entry.path(), CGROUP_PREFIX) {
+            kill_cgroup(&entry.path());
+            remove_when_empty(entry.path());
+        }
+    }
+    for tmp in tmps {
+        for entry in std::fs::read_dir(tmp).ok().into_iter().flatten().flatten() {
+            if ours(&entry.path(), DIR_PREFIX) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
+/// [`sweep`] where runs go.
+pub(crate) fn sweep_stale() {
+    let cgroups = kith_runtime::units_cgroup_dir();
+    let temp = std::env::temp_dir();
+    // (`Dir::make` falls back to /tmp for a long temp dir.)
+    sweep(cgroups.as_deref(), &[&temp, Path::new("/tmp")]);
 }
 
 impl Drop for Leaf {
     fn drop(&mut self) {
         self.kill();
-        // A cgroup is removed once what was in it is waited for, which is not by this thread:
-        // try for ten seconds, off the runtime's threads, and leave it empty after that.
-        let path = std::mem::take(&mut self.0);
-        std::thread::spawn(move || {
-            for _ in 0..200 {
-                if std::fs::remove_dir(&path).is_ok() || !path.exists() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        });
+        remove_when_empty(std::mem::take(&mut self.0));
     }
 }
 
@@ -449,11 +540,13 @@ impl App {
     // forks is outside; without delegation only the group is.
     // ponytail: a tunnel whose far end vanishes without a word (a node powered off) is ended by
     // the keepalive on the nodes' connections (`cluster::listen` and reqwest's own), not at once:
-    // about a minute.
+    // about a minute (see "Remote apps" in docs/guide/storage.md).
     fn start(node: &str, spec: &Spec) -> Result<App, String> {
         let via = spec.via.as_deref().unwrap_or("waypipe");
         let dir = Dir::make()?;
-        let leaf = dir.0.file_name().and_then(|name| name.to_str()).and_then(Leaf::make);
+        let leaf = (dir.0.file_name().and_then(|name| name.to_str()))
+            .and_then(|name| name.strip_prefix(DIR_PREFIX))
+            .and_then(|id| Leaf::make(&format!("{CGROUP_PREFIX}{id}")));
         let socket = dir.0.join("s");
         let listener =
             UnixListener::bind(&socket).map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
@@ -475,9 +568,10 @@ impl App {
         };
         // In the cgroup before its exec (so nothing it forks is outside). If that fails the
         // program is not started, and it is started again without: the process group still ends it.
+        // (Not for a program that is not there: no cgroup is to blame, and a second try is the same.)
         let procs = leaf.as_ref().map(|leaf| leaf.0.join("cgroup.procs"));
         let spawned = match start(procs.as_deref()) {
-            Err(e) if procs.is_some() => {
+            Err(e) if procs.is_some() && e.kind() != std::io::ErrorKind::NotFound => {
                 eprintln!(
                     "kithd: run: could not start the app in its cgroup, the process group is all that ends it: {e}"
                 );
@@ -1116,6 +1210,62 @@ spec: {role: other-jobber, subjects: [carol]}
         let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
         assert!(ended, "the program that left its session stays");
         assert!(gone(&format!("/sys/fs/cgroup{cgroup}")).await, "{cgroup} stays");
+    }
+
+    /// At start, what an earlier kithd left (runs' cgroups and directories) goes; what is not
+    /// a run's, and what is a `kith` command's own directory, stays.
+    #[tokio::test]
+    async fn sweep_removes_the_runs_a_kithd_before_left_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!("kithd-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cgroups, tmp) = (root.join("cgroup"), root.join("tmp"));
+        for dir in [
+            "cgroup/kith-run-stale",
+            "cgroup/kith-unit-1",
+            "tmp/kithd-run-stale",
+            "tmp/kith-run-cli",
+            "tmp/other",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(tmp.join("kithd-run-stale/s"), "").unwrap();
+        std::fs::write(cgroups.join("kith-run-file"), "").unwrap();
+        sweep(Some(&cgroups), &[&tmp]);
+        assert!(
+            gone(cgroups.join("kith-run-stale").to_str().unwrap()).await,
+            "the stale cgroup stays"
+        );
+        assert!(
+            gone(tmp.join("kithd-run-stale").to_str().unwrap()).await,
+            "the stale directory stays"
+        );
+        for kept in [
+            "cgroup/kith-unit-1",
+            "cgroup/kith-run-file",
+            "tmp/kith-run-cli",
+            "tmp/other",
+        ] {
+            assert!(root.join(kept).exists(), "{kept} was removed");
+        }
+        sweep(None, &[&root.join("nowhere")]); // nothing to read is nothing to do
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Where `cgroup.kill` cannot be written (before Linux 5.14: here a directory stands for it),
+    /// each pid in `cgroup.procs` is killed.
+    #[tokio::test]
+    async fn kill_cgroup_kills_the_pids_listed_where_cgroup_kill_cannot_be_written() {
+        let dir = std::env::temp_dir().join(format!("kithd-kill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cgroup.kill")).unwrap();
+        let mut sleeper = Command::new("sleep").arg("300").spawn().unwrap();
+        std::fs::write(dir.join("cgroup.procs"), format!("{}\n", sleeper.id().unwrap())).unwrap();
+        kill_cgroup(&dir);
+        let status = tokio::time::timeout(Duration::from_secs(10), sleeper.wait()).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let status = status.expect("not killed").unwrap();
+        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(9));
+        kill_cgroup(&dir); // a cgroup that is gone is nothing to kill
     }
 
     /// Whatever is wrong with the ask, it is answered, not waited on.

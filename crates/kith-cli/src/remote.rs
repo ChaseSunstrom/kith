@@ -225,11 +225,10 @@ fn carried(program: &str, dir: &Path) -> Result<(Client, UnixStream, Option<Stri
 }
 
 /// Runs the app and returns the exit status of the local carrier (`VIA client`), which is what
-/// `kith run` ends with (0 where the carrier had to be killed): the app's status is the app's
-/// end of the carrier's to pass on, and the carrier's to give.
+/// `kith run` ends with (see [`exit_code`]): the carrier's exit status, not the app's.
 // ponytail: the app's own status does not cross the tunnel (kith adds no protocol of its own
 // over the carrier's bytes). Real waypipe has not been run against this: which side listens,
-// and what its client exits with, are as its manual says (the README says so too).
+// and what its client exits with, are as its manual says (the guide says so too).
 pub fn run(kithd: &Kithd, on: &str, via: Option<&str>, argv: &[String]) -> Result<ExitCode, String> {
     let program = via.unwrap_or("waypipe");
     let dir = Dir::make()?;
@@ -260,10 +259,20 @@ pub fn run(kithd: &Kithd, on: &str, via: Option<&str>, argv: &[String]) -> Resul
     let status = client.status();
     drop(client);
     drop(dir);
-    // (A carrier that was killed, or died of a signal, is a run that ended: not one that failed.)
-    Ok(status
-        .and_then(|status| status.code())
-        .map_or(ExitCode::SUCCESS, |code| ExitCode::from(code as u8)))
+    Ok(exit_code(status))
+}
+
+/// The carrier's exit status as `kith run` ends with it: its code; 128 and the signal's number
+/// for a carrier a signal ended (a shell's way); 0 where it had to be killed here (`None`: the
+/// tunnel was done and it did not follow, which is a run that ended, not one that failed).
+fn exit_code(status: Option<std::process::ExitStatus>) -> ExitCode {
+    use std::os::unix::process::ExitStatusExt;
+    let Some(status) = status else { return ExitCode::SUCCESS };
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1);
+    ExitCode::from(code as u8)
 }
 
 #[cfg(test)]

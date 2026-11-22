@@ -372,10 +372,13 @@ passed as written, never through a shell.
   kills the app and what it started: each run has its own cgroup on the node (where kithd has
   one delegated to it), so a program that left its session with `setsid()` is ended too. Node to
   node, the connection has TCP keepalive, so a node that vanishes without a word is noticed in
-  under a minute. The command line is in the audit log: pass no secret.
-- **Exit status:** `kith run` ends with the status of the local `waypipe client` (or `--via`
-  program), not the app's: the app's own status does not cross the tunnel. An interrupt
-  (Ctrl-C, SIGTERM) kills the carrier, removes its directory and ends with 128 plus the signal.
+  about a minute. If kithd is killed or restarted, the runs it had are left going until the next
+  kithd starts, which ends them and removes what they left. The command line is in the audit
+  log: pass no secret.
+- **Exit status:** `kith run` ends with the carrier's exit status (the local `waypipe client`,
+  or the `--via` program), not the app's: the app's own status does not cross the tunnel. A
+  carrier that a signal ended gives 128 plus the signal. An interrupt (Ctrl-C, SIGTERM) kills the
+  carrier, removes its directory and ends with 128 plus the signal.
 - **Not tested for real:** this was built and tested against stand-in programs. Real waypipe has
   not been run with it: which side of the pair listens, and what its client exits with, are as
   its manual says.

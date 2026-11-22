@@ -408,6 +408,16 @@ fn kith_run_returns_the_status_the_carrier_ends_with() {
     assert_eq!(run_dirs(&sb), 0, "the run's directory stays");
 }
 
+/// A carrier a signal ended has no code: `kith run` ends with the shell's 128 and the signal's
+/// number, not with 0 (a run that went well).
+#[test]
+fn kith_run_ends_with_128_and_the_signal_for_a_carrier_a_signal_ended() {
+    let sb = Sandbox::short("run-signalled");
+    let (mut kith, _, _) = kith_run(&sb, &sb.0, "os.kill(os.getpid(), 9)", false);
+    assert_eq!(kith.wait().unwrap().code(), Some(137));
+    assert_eq!(run_dirs(&sb), 0, "the run's directory stays");
+}
+
 /// A TMPDIR too long for the carrier's socket (past the 107 bytes of `sun_path`, as a build's
 /// is) is passed over: the carrier binds, the run goes, and no run directory is made there.
 #[test]
