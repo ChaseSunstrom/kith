@@ -741,6 +741,12 @@ tokio::task_local! {
     static OWN: ();
 }
 
+/// Run `work` (a `submit`, `write` or `write_at`) as this node's own write: signed by its key
+/// under `spec.signing: required`, where callers sign (`own_writes`).
+pub async fn as_node<F: std::future::Future>(work: F) -> F::Output {
+    OWN.scope((), work).await
+}
+
 fn unavailable(why: impl std::fmt::Display) -> Error {
     Error::Io(format!("the store cannot take changes now: {why}"))
 }
@@ -760,7 +766,7 @@ impl Shared {
     /// [`Shared::submit`] for this node's own write of what only it makes (a Volume it
     /// provisions, a cron Job, an ACME secret, its own Node): signed by its key, where callers sign.
     pub async fn submit_node(&self, command: Command) -> Result<Done, Error> {
-        OWN.scope((), self.submit(command)).await
+        as_node(self.submit(command)).await
     }
 
     /// [`Shared::submit`] for `who`: an Identity's write is decided again where it is put in
@@ -1121,7 +1127,7 @@ pub(crate) fn changes_access(command: &Command) -> bool {
     let access = |kind: &str| {
         // (A KindDefinition says whether a kind is namespaced: which rule matches it. A
         // Cluster holds the admin's key, asked of in the same turn: `access_sign::guard`.)
-        ["Role", "RoleBinding", "Identity", "KindDefinition", "Cluster"]
+        crate::own_writes::ACCESS_KINDS
             .iter()
             .any(|of| of.eq_ignore_ascii_case(kind))
     };

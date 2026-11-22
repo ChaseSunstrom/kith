@@ -45,13 +45,14 @@
         # learner, and the cluster says four nodes.)
         nodes=three four=''
         [ "$test" != home ] || { more='--mesh --ingress' others='2 3 4' nodes=four four=',[^,? ]+'; }
-        # (access: the nodes run the image tests.sh built with the forge feature.)
-        [ "$test" != access ] || base=$osdir
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ] || [ "$test" = access ]; then
+        # (access: the nodes run the image tests.sh built with the forge feature; privilege: with the
+        # confine-probe feature.)
+        { [ "$test" != access ] && [ "$test" != privilege ]; } || base=$osdir
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = privilege ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ] || [ "$test" = access ]; then
         others=2 more=--mesh project=''
         # (access: three nodes on the mesh, pod's image in each; people on the first, below.)
         [ "$test" != access ] || others='2 3'
-        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != nested ] && [ "$test" != nofile ] && [ "$test" != handover ] || others=''
+        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] && [ "$test" != privilege ] && [ "$test" != nested ] && [ "$test" != nofile ] && [ "$test" != handover ] || others=''
         # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
         # as a node's state from before had none: kithd counts what their pods write.)
         [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
@@ -79,6 +80,8 @@
         # (policy: no way left to be root with all of the kernel's capabilities, so kithd gives up the rest.
         # QEMU reads a comma in -smbios as the end of a value, so each one here is doubled.)
         [ "$test" != policy ] || more='--mesh --node-policy no-exec-units,,no-vm-paths,,no-run'
+        # (privilege: the root part and the serving part split, and the serving part's confinement held to what it says.)
+        [ "$test" != privilege ] || more='--mesh --split'
         # A container image the nodes have without asking anybody (they reach no registry
         # here): kith itself, put where a node keeps an image it has pulled, in a state
         # partition made again with that in it.
@@ -121,7 +124,7 @@
                     chmod 755 "$image/rootfs/bin/tar"
                 fi
                 # (outlive: pod on the node's own disk as well, for its exec units.)
-                [ "$test" != outlive ] || { mkdir -p "$work/seed/tools" && cp "$work/pod" "$work/seed/tools/pod"; }
+                { [ "$test" != outlive ] && [ "$test" != privilege ]; } || { mkdir -p "$work/seed/tools" && cp "$work/pod" "$work/seed/tools/pod"; }
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:user"
                 for tag in serve again; do
@@ -488,6 +491,9 @@ EOF
         fi
         if [ "$test" = outlive ]; then
             . "$root/ci/vm/outlive.sh"
+        fi
+        if [ "$test" = privilege ]; then
+            . "$root/ci/vm/privilege.sh"
         fi
         if [ "$test" = nested ]; then
             . "$root/ci/vm/nested.sh"

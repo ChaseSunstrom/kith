@@ -47,7 +47,7 @@ impl AsyncRead for Pty {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         loop {
             let mut ready = ready!(self.0.poll_read_ready(cx))?;
-            if let Ok(read) = ready.try_io(|fd| (&*fd.get_ref()).read(buf.initialize_unfilled())) {
+            if let Ok(read) = ready.try_io(|fd| fd.get_ref().read(buf.initialize_unfilled())) {
                 buf.advance(read?);
                 return Poll::Ready(Ok(()));
             }
@@ -59,7 +59,7 @@ impl AsyncWrite for Pty {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         loop {
             let mut ready = ready!(self.0.poll_write_ready(cx))?;
-            if let Ok(wrote) = ready.try_io(|fd| (&*fd.get_ref()).write(buf)) {
+            if let Ok(wrote) = ready.try_io(|fd| fd.get_ref().write(buf)) {
                 return Poll::Ready(wrote);
             }
         }
@@ -203,7 +203,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kith-tty-hup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let said = dir.join("said");
-        let script = format!("trap 'echo hup > {}; exit 0' HUP; echo ready; sleep 30 & wait", said.display());
+        let script = format!(
+            "trap 'echo hup > {}; exit 0' HUP; echo ready; sleep 30 & wait",
+            said.display()
+        );
         let (mut client, pid, serving) = session(&script);
         // (Ready: the trap is set, or the hangup would end the shell before it.)
         assert!(client.until("ready").await.is_none());
@@ -213,7 +216,11 @@ mod tests {
             .expect("the session ends when its client goes")
             .unwrap();
         assert!(gone(pid).await, "the process is gone");
-        assert_eq!(std::fs::read_to_string(&said).unwrap_or_default().trim(), "hup", "SIGHUP reached it");
+        assert_eq!(
+            std::fs::read_to_string(&said).unwrap_or_default().trim(),
+            "hup",
+            "SIGHUP reached it"
+        );
 
         let script = "trap '' HUP; echo ready; while :; do sleep 1; done";
         let (mut client, pid, serving) = session(script);

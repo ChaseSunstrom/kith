@@ -371,7 +371,8 @@ fn refused_at_handshake(address: &str, dir: &Path, method: &str, path: &str) -> 
 
 /// `refused_at_handshake` for the API and for a node route, the two a taken certificate would try.
 fn is_shut_out(address: &str, dir: &Path) -> bool {
-    refused_at_handshake(address, dir, "GET", "/v1/resources") && refused_at_handshake(address, dir, "POST", "/v1/raft/write")
+    refused_at_handshake(address, dir, "GET", "/v1/resources")
+        && refused_at_handshake(address, dir, "POST", "/v1/raft/write")
 }
 
 /// (Not behind KITH_E2E: it pulls nothing, and a test that is skipped proves nothing.)
@@ -407,7 +408,12 @@ fn an_evicted_nodes_certificate_is_refused_at_once_and_stays_refused() {
 
     // Deleted: refused at the next handshake, with alpha never restarted (T-1014).
     alpha.ok(&["delete", "node/beta"]);
-    assert!(is_shut_out(&address, &taken), "refused at the handshake: {:?} {:?}", curl_as_node(&address, &taken, "GET", "/v1/resources"), curl_as_node(&address, &taken, "POST", "/v1/raft/write"));
+    assert!(
+        is_shut_out(&address, &taken),
+        "refused at the handshake: {:?} {:?}",
+        curl_as_node(&address, &taken, "GET", "/v1/resources"),
+        curl_as_node(&address, &taken, "POST", "/v1/raft/write")
+    );
     beta.stop();
     // A Node of that name made by hand admits nobody: it never joined. (It names no key, so the
     // handshake cannot tell the certificate is revoked; the request is refused instead.)
@@ -425,10 +431,18 @@ fn an_evicted_nodes_certificate_is_refused_at_once_and_stays_refused() {
         status_as_node(&address, &beta.dir.join("state/pki"), "GET", "/v1/resources"),
         "403"
     );
-    assert!(is_shut_out(&address, &taken), "refused at the handshake: {:?} {:?}", curl_as_node(&address, &taken, "GET", "/v1/resources"), curl_as_node(&address, &taken, "POST", "/v1/raft/write"));
+    assert!(
+        is_shut_out(&address, &taken),
+        "refused at the handshake: {:?} {:?}",
+        curl_as_node(&address, &taken, "GET", "/v1/resources"),
+        curl_as_node(&address, &taken, "POST", "/v1/raft/write")
+    );
     assert!(beta.ok(&["get", "ConfigMap/shared"]).contains("shared"));
     // The new node refuses it too, by the store it was sent.
-    assert!(is_shut_out(&beta.address(), &taken), "the new beta takes the old certificate in");
+    assert!(
+        is_shut_out(&beta.address(), &taken),
+        "the new beta takes the old certificate in"
+    );
 
     // For a cluster locked out of itself: a node started with the switch takes it again.
     alpha.stop();

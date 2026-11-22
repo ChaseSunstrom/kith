@@ -616,12 +616,12 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>, dmem:
         }
         if !resources.is_empty() {
             let at = kith_api::store::now();
-            if let Err(e) = shared.submit(Command::Apply { resources, at }).await {
+            if let Err(e) = shared.submit_node(Command::Apply { resources, at }).await {
                 eprintln!("kithd: devices: listing this node's hardware: {e}");
             }
         }
         for key in gone {
-            if let Err(e) = shared.submit(Command::Delete { key: key.clone() }).await {
+            if let Err(e) = shared.submit_node(Command::Delete { key: key.clone() }).await {
                 // (The rest wait for the next round: each would wait out the same trouble.)
                 eprintln!("kithd: devices: taking {key} away: {e}");
                 break;
@@ -819,15 +819,32 @@ mod tests {
             put(&root, &format!("class/sound/controlC{card}/dev"), "116:2\n");
         }
         for pcm in [
-            "pcmC0D0p", "pcmC0D0c", "pcmC0D3p", "pcmC1D3p", "pcmC1D7p", "pcmC1D7c", "pcmC10D0p", "pcmC10D1p", "pcmC10D0c",
+            "pcmC0D0p",
+            "pcmC0D0c",
+            "pcmC0D3p",
+            "pcmC1D3p",
+            "pcmC1D7p",
+            "pcmC1D7c",
+            "pcmC10D0p",
+            "pcmC10D1p",
+            "pcmC10D0c",
         ] {
             put(&root, &format!("class/sound/{pcm}/dev"), "116:16\n");
         }
         let found = scan(&root, "n1");
         let nodes = |name: &str| get(&found, name).spec["nodes"].clone();
-        assert_eq!(nodes("n1-audio-card0"), json!(["/dev/snd/pcmC0D0p", "/dev/snd/pcmC0D3p"]));
-        assert_eq!(nodes("n1-audio-card1"), json!(["/dev/snd/pcmC1D3p", "/dev/snd/pcmC1D7p"]));
-        assert_eq!(nodes("n1-audio-card10"), json!(["/dev/snd/pcmC10D0p", "/dev/snd/pcmC10D1p"]));
+        assert_eq!(
+            nodes("n1-audio-card0"),
+            json!(["/dev/snd/pcmC0D0p", "/dev/snd/pcmC0D3p"])
+        );
+        assert_eq!(
+            nodes("n1-audio-card1"),
+            json!(["/dev/snd/pcmC1D3p", "/dev/snd/pcmC1D7p"])
+        );
+        assert_eq!(
+            nodes("n1-audio-card10"),
+            json!(["/dev/snd/pcmC10D0p", "/dev/snd/pcmC10D1p"])
+        );
         assert_eq!(get(&found, "n1-audio-card1").spec["path"], "/dev/snd/controlC1");
         // A card with no PCM (no sound to play) lists none.
         let root = tree("audio-no-pcm");

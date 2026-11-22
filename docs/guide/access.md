@@ -255,6 +255,30 @@ not hold (DNS over HTTPS around the filter, bandwidth, IPv6 to the internet, a c
 configuration until it is deleted) is in [SECURITY.md](../../SECURITY.md) ("A person's device").
 `sh ci/vm.sh --test access` drives it with two phones in virtual machines: a Service reached, a
 level narrowed and a peer removed with a connection open, and an Exit's level leaving by it.
+## Signed writes: `spec.signing: required` and `open`
+
+`spec.signing` on the Cluster is `open` (the default) or `required`. Under `open` a write the
+admin did not sign is kept, as it always was: a `curl`, a `kubectl apply`, a registry push,
+`kith node claim`, a restore. Under `required` every such write that changes a spec is
+refused on every node, when it is applied: an `Apply`, a `Delete`, a rollback or an import
+with no signature. A change of status is not one, and is kept, but for one that changes a
+Node's certificate or raft id: that is refused too. A refused write changes
+nothing and is audited. To make a change under `required`, sign it as a change with the
+admin's key; or set `spec.signing: open` first, and back after.
+
+What the cluster writes for itself is signed by the node's own key and held to what it comes
+from: a Release's or a Source's renders, a fetched package, a rolling update's cordon, a
+custom-kind controller's writes, cron's Jobs, the scheduler's Volumes. Each must have its
+owner in the store and stay within the rights of whoever wrote that owner and within what its render may make (its own
+namespace, nothing that is in no namespace, no Release, Source or KindDefinition from a Release
+or a controller; a Source in `kith-system` alone may make what is in no namespace), so a taken
+control node cannot write more than the owner could. A node never signs a change of access (a Role, a
+RoleBinding, an Identity, a KindDefinition, the Cluster) nor one of the mesh or the network
+policy (an AccessLevel, a RemotePeer, a NetworkPolicy, an Exit), so a Source that brings a KindDefinition
+or a Release that renders a NetworkPolicy is refused under `required`: apply those yourself,
+signed. Under `required` a Release step that renders a NetworkPolicy applies nothing, and the Release's status says so once. A worker node cannot sign, so the spec writes it
+makes for itself (its Devices, Images and Backups) are refused under `required`, and so is a
+Blob put through the API.
 
 ## What a node refuses, whatever the cluster says
 
@@ -279,6 +303,15 @@ firmware or disks as node paths, or a hypervisor other than qemu; `vms` alone ru
 with classes named, only Devices the node listed itself). `no-` before a word turns it off; they
 are read left to right. On kith OS they go at the end of what the config partition says (` --
 --node-policy hardened`); elsewhere `KITH_NODE_POLICY` does too.
+
+`kithd --split` (or `KITH_SPLIT`, off by default) puts what needs root behind a typed request list
+and a socket, and holds the part that reads the network to a confinement of its own: its state
+directory alone in its mount namespace, a user that is not root, no capability, `no_new_privs` and
+a system call filter. It is not complete:
+until the two parts are processes the confinement is built and tested but not applied, and a node
+that runs `--split` has the socket and no more. Even applied, the serving part shares the node's
+network namespace (the host's loopback and abstract `AF_UNIX` sockets stay reachable).
+`docs/adr-privilege.md` says what is done.
 
 `hardened` also stops NodeWorkloads (DaemonSets): turn `host-users` back on to run them. A
 container given a Device, or a mount on a file system that cannot be id-mapped, keeps the node's

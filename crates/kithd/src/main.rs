@@ -17,6 +17,10 @@ mod blocklist;
 mod claims;
 mod clock;
 mod cluster;
+// The serving part's confinement: in unit tests and in the `confine-probe` build, in no release.
+// Nothing applies it to a live serving part yet (docs/adr-privilege.md, "Built so far").
+#[cfg(any(test, feature = "confine-probe"))]
+mod confine;
 mod controller;
 mod controllers;
 mod cron;
@@ -85,6 +89,7 @@ mod ui;
 mod update;
 mod view;
 mod vm;
+mod vm_migrate;
 mod volume_files;
 mod volumes;
 mod wasm;
@@ -425,6 +430,9 @@ fn main() -> ExitCode {
     kith_runtime::exec_shim();
     // Started again to render a package's templates? Then this never returns either.
     releases::render_shim();
+    // Started again to hold the serving part's confinement to what it says? Never returns either.
+    #[cfg(feature = "confine-probe")]
+    confine::probe_shim();
     // Then, before the runtime and its listeners, the limit of open files they share.
     raise_nofile();
     // A test build says so, loudly, each time it starts (ci/vm/access.sh looks for the line).
@@ -701,7 +709,7 @@ async fn membership(
             (me, None)
         }
         None => {
-            let ca = pki::Ca::create()?;
+            let ca = pki::Ca::create()?.keep_in(&dir);
             let (cert, key) = ca.issue(&name)?;
             eprintln!("kithd: new cluster; `kith node token` lets another node join");
             let me = pki::Identity {
@@ -871,6 +879,17 @@ fn strip_node_keys(kept: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Tied lives: the root part's `serve` ends (it returns, or panics) and kithd ends with it, by
+/// `exit(1)`, for the keeper to start both parts again; the containers go on and are adopted.
+fn tied(serve: impl FnOnce(), exit: impl FnOnce(i32)) {
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(serve));
+    eprintln!(
+        "kithd: the root part ended{}: ending, to start both parts again",
+        if ended.is_err() { " in a panic" } else { "" }
+    );
+    exit(1);
+}
+
 fn run(mut args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     let first_process = boot.is_some();
     if let Some(why) = people_refusal(&args, nix::unistd::getuid().is_root()) {
@@ -1008,6 +1027,8 @@ fn run(mut args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     if let Some(said) = runtime.as_ref().ok().and_then(|runtime| runtime.cgroup_problem()) {
         eprintln!("kithd: {said}");
     }
+    // What a kithd before left of `kith run` (before any run is made here).
+    api::run::sweep_stale(&state);
     // Started again by process 1: a container the kithd before made and did not start holds
     // its sockets (this one's address among them) until it is gone.
     if let (Ok(runtime), Some((2.., _))) = (&runtime, keeper::kept()) {
@@ -1079,8 +1100,27 @@ fn run(mut args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let held = shared.clone();
         std::thread::Builder::new()
             .name("root-part".into())
-            .spawn(move || root_part::serve_split(&held.pods, end))
+            .spawn(move || {
+                tied(
+                    || root_part::serve_split(&held.pods, end),
+                    |code| std::process::exit(code),
+                )
+            })
             .map_err(|e| fail("starting the root part", &e))?;
+        // The test build's way to end the root part alone (ci/vm/privilege.sh): a file of this
+        // name in the state directory, taken away and answered with the socket's end closed.
+        #[cfg(feature = "confine-probe")]
+        {
+            let file = state.join("end-root-part");
+            std::thread::spawn(move || {
+                loop {
+                    if std::fs::remove_file(&file).is_ok() {
+                        root_part::end_split();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+        }
     }
     // A viewed worker serves ingress only where its Node says so (as the join of a token for
     // an ingress worker wrote it): only then is its view sent the hosts' certificates. (Its
@@ -1487,6 +1527,22 @@ async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, m
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_root_part_ending_ends_kithd_with_1_returning_or_panicking() {
+        for panics in [false, true] {
+            let mut exited = None;
+            super::tied(
+                || {
+                    if panics {
+                        panic!("the root part's own fault (a test)");
+                    }
+                },
+                |code| exited = Some(code),
+            );
+            assert_eq!(exited, Some(1), "panics: {panics}");
+        }
+    }
+
     #[test]
     fn nofile_soft_is_the_hard_limit_up_to_65536_and_never_less_than_now() {
         use super::nofile_soft;

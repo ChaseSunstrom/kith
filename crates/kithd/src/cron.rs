@@ -207,7 +207,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         // ponytail: a Job Apply signs per entry; the nonce book holds 4096 per node in 5 minutes.
         for command in deletes.chain(makes).chain(last) {
             let said = match command {
-                Command::Apply { .. } => shared.submit_node(command).await,
+                Command::Apply { .. } | Command::Delete { .. } => shared.submit_node(command).await,
                 _ => shared.submit(command).await,
             };
             if let Err(e) = said {

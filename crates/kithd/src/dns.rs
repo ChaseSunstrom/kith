@@ -180,7 +180,7 @@ pub fn zones_serving(
 
     // Our own names. Having the zone means a name that is not in it is answered "no
     // such name" here, and never sent to the internet to ask.
-    let mut own = vec![soa("kith"), soa("cluster.local")];
+    let mut own: Vec<_> = kith_api::kinds::RESERVED_ZONES.into_iter().map(soa).collect();
     let mut empty: Vec<String> = Vec::new();
     for node in store.list(Some("Node")) {
         // (`<node>.node.kith` stays its LAN address, not the mesh one the leader may have moved it to.)

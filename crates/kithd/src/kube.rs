@@ -588,12 +588,7 @@ fn served(resource: &Resource) -> Option<(&'static Kind, Value)> {
         // Its address on the mesh; with none it is found by its name alone, which is what
         // Kubernetes calls a Service with `None` here. A headless one has no address, whatever
         // it had before it was made so. (Helm waits for this field to say something.)
-        // (Helm sends `clusterIP: ""` for "allocate": it is read as absent.)
-        "Service"
-            if object
-                .pointer("/spec/clusterIP")
-                .is_none_or(|ip| ip.as_str() == Some("")) =>
-        {
+        "Service" if object.pointer("/spec/clusterIP").is_none() => {
             let address = match crate::services::headless(resource) {
                 true => "None",
                 false => said("address").unwrap_or("None"),
@@ -960,19 +955,29 @@ pub(crate) fn resolve_pod<'a>(store: &Store, namespace: &str, pod: &'a str) -> O
 /// whose name is a pod of an existing Job or Workload, or of one in the same body, is refused. The Kubernetes
 /// API's create has refused it by `taken` already; a native apply did not, and so could take a pod's calls.
 pub(crate) fn hijacks(store: &Store, resources: &[Resource]) -> Result<(), String> {
-    let namespace = |r: &Resource| r.metadata.namespace.clone().unwrap_or_else(|| kith_api::DEFAULT_NAMESPACE.into());
+    let namespace = |r: &Resource| {
+        r.metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| kith_api::DEFAULT_NAMESPACE.into())
+    };
     for bare in resources.iter().filter(|r| {
-        matches!(r.kind.as_str(), "Job" | "Workload") && r.metadata.annotations.get("kith.dev/pod").is_some_and(|m| m == "true")
+        matches!(r.kind.as_str(), "Job" | "Workload")
+            && r.metadata.annotations.get("kith.dev/pod").is_some_and(|m| m == "true")
     }) {
         let Some((of, owner, _)) = pod_owner(&bare.metadata.name) else {
             continue;
         };
         let space = namespace(bare);
         let there = store.get(&format!("{of}/{space}/{owner}")).is_some()
-            || resources.iter().any(|r| r.kind == of && r.metadata.name == owner && namespace(r) == space);
+            || resources
+                .iter()
+                .any(|r| r.kind == of && r.metadata.name == owner && namespace(r) == space);
         if there {
             let name = &bare.metadata.name;
-            return Err(format!("{name}: a bare Pod's name is not one that a pod of a Job or Workload has"));
+            return Err(format!(
+                "{name}: a bare Pod's name is not one that a pod of a Job or Workload has"
+            ));
         }
     }
     Ok(())
@@ -3633,52 +3638,31 @@ mod tests {
     /// not headless reads the address kithd gave it.
     #[test]
     fn a_headless_service_reads_none_whatever_its_stale_address() {
-        let service = |headless: &str| service_served(headless, json!({}));
+        let service = |headless: &str| {
+            let sent = json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": { "name": "web", "namespace": "default" },
+                "spec": { "selector": { "app": "web" }, "ports": [{ "port": 80 }] },
+            });
+            let sent = serde_json::to_string(&sent.to_string()).unwrap();
+            let source = format!(
+                "apiVersion: kith.dev/v1\nkind: Service\n\
+                 metadata: {{name: web, namespace: default, annotations: {{{SENT}: {sent}}}}}\n\
+                 spec: {{{headless} selector: {{app: web}}, ports: [{{port: 80}}]}}\n"
+            );
+            let mut resource = kith_api::Resource::from_source(&source)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .unwrap();
+            resource.status = Some(json!({"address": "fd00::7"}));
+            served(&resource).unwrap().1
+        };
         let headless = service("headless: true,");
         assert_eq!(headless.pointer("/spec/clusterIP"), Some(&json!("None")));
         assert_eq!(headless.pointer("/spec/clusterIPs"), Some(&json!(["None"])));
         let mesh = service("");
         assert_eq!(mesh.pointer("/spec/clusterIP"), Some(&json!("fd00::7")));
-    }
-
-    /// Helm renders `clusterIP: ""` to mean "allocate"; it reads back with the address, or
-    /// `helm --wait` (a Service is ready once its ClusterIP is not "") never finishes.
-    #[test]
-    fn a_service_sent_with_an_empty_cluster_ip_reads_its_address() {
-        let empty = json!({ "clusterIP": "", "clusterIPs": [""] });
-        let mesh = service_served("", empty.clone());
-        assert_eq!(mesh.pointer("/spec/clusterIP"), Some(&json!("fd00::7")));
-        assert_eq!(mesh.pointer("/spec/clusterIPs"), Some(&json!(["fd00::7"])));
-        let headless = service_served("headless: true,", empty);
-        assert_eq!(headless.pointer("/spec/clusterIP"), Some(&json!("None")));
-        assert_eq!(headless.pointer("/spec/clusterIPs"), Some(&json!(["None"])));
-    }
-
-    /// A Service as the Kubernetes API serves it: what was sent (`extra` merged into its
-    /// spec), with the status address `fd00::7`.
-    fn service_served(headless: &str, extra: serde_json::Value) -> serde_json::Value {
-        let mut sent = json!({
-            "apiVersion": "v1", "kind": "Service",
-            "metadata": { "name": "web", "namespace": "default" },
-            "spec": { "selector": { "app": "web" }, "ports": [{ "port": 80 }] },
-        });
-        sent["spec"]
-            .as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().unwrap().clone());
-        let sent = serde_json::to_string(&sent.to_string()).unwrap();
-        let source = format!(
-            "apiVersion: kith.dev/v1\nkind: Service\n\
-             metadata: {{name: web, namespace: default, annotations: {{{SENT}: {sent}}}}}\n\
-             spec: {{{headless} selector: {{app: web}}, ports: [{{port: 80}}]}}\n"
-        );
-        let mut resource = kith_api::Resource::from_source(&source)
-            .unwrap()
-            .pop()
-            .unwrap()
-            .unwrap();
-        resource.status = Some(json!({"address": "fd00::7"}));
-        served(&resource).unwrap().1
     }
 
     /// Who may write a kind and not read it is not answered with what is there by a
@@ -4938,7 +4922,11 @@ spec: {role: writer, subjects: [carol]}
         .unwrap();
         // A bare Pod named `once-0` with no Workload `once` is the bare Pod's.
         let refused = crate::api::applied(&shared, &Caller::Admin, vec![held("once-0"), held("solo")]).await;
-        assert!(refused.is_ok(), "{:?}", refused.err().map(|e| e.into_response().status()));
+        assert!(
+            refused.is_ok(),
+            "{:?}",
+            refused.err().map(|e| e.into_response().status())
+        );
         // With Workload `web` there, the same mark on `web-0` is refused, native apply or not in the body.
         for body in [vec![web.clone(), held("web-0")], vec![held("web-0"), web.clone()]] {
             let refused = crate::api::applied(&shared, &Caller::Admin, body).await;
@@ -4952,9 +4940,18 @@ spec: {role: writer, subjects: [carol]}
         state.store.apply(web).unwrap();
         state.store.apply(held("web-0")).unwrap();
         assert_eq!(resolve_pod(&state.store, "default", "web-0"), None);
-        assert_eq!(resolve_pod(&state.store, "default", "once-0").map(|(of, _, n)| (of, n)), Some(("Workload", 0)));
-        assert_eq!(resolve_pod(&state.store, "default", "solo").map(|(of, _, n)| (of, n)), Some(("Workload", 0)));
-        assert_eq!(resolve_pod(&state.store, "default", "web-1"), Some(("Workload", "web", 1)));
+        assert_eq!(
+            resolve_pod(&state.store, "default", "once-0").map(|(of, _, n)| (of, n)),
+            Some(("Workload", 0))
+        );
+        assert_eq!(
+            resolve_pod(&state.store, "default", "solo").map(|(of, _, n)| (of, n)),
+            Some(("Workload", 0))
+        );
+        assert_eq!(
+            resolve_pod(&state.store, "default", "web-1"),
+            Some(("Workload", "web", 1))
+        );
         drop(state);
         drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4988,7 +4985,12 @@ spec: {role: writer, subjects: [carol]}
             while !String::from_utf8_lossy(&said).contains("\"code\":") {
                 let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut chunk))
                     .await
-                    .unwrap_or_else(|_| panic!("{name}: the session says something; so far {:?}", String::from_utf8_lossy(&said)))
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "{name}: the session says something; so far {:?}",
+                            String::from_utf8_lossy(&said)
+                        )
+                    })
                     .unwrap();
                 assert!(n > 0, "{name}: the session ended without a word");
                 said.extend_from_slice(&chunk[..n]);

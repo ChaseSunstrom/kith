@@ -99,6 +99,7 @@ is still there when it starts again.
 | Run containers, plain processes and jobs, and change them safely | [What kithd does today](docs/guide/workloads.md#what-kithd-does-today) |
 | Make several machines one cluster | [More than one node](docs/guide/cluster.md#more-than-one-node) |
 | Give what runs a name, inside and outside | [DNS](docs/guide/cluster.md#dns); a host of its own with a certificate: [More than one node](docs/guide/cluster.md#more-than-one-node) |
+| Give a name only your LAN knows a certificate, and trust it on a phone or laptop | [A name only your LAN knows](#a-name-only-your-lan-knows) |
 | Say a thing once: names, functions and imports instead of YAML repeated | [kith's own language](docs/guide/api.md#kiths-own-language) |
 | Install an app with its settings, and upgrade it (a Job annotated `kith.dev/hook` runs before or after: `pre-install`, `post-install`, `pre-upgrade`, `post-upgrade`; delete hooks are not built) | [Packages](docs/guide/packages.md#packages) |
 | Keep a cluster in step with a git repository | [Sources (GitOps)](docs/guide/packages.md#sources-gitops) |
@@ -133,6 +134,38 @@ kith refuses by path and name what it cannot carry: `cap_add` (kith only drops c
 `sysctls`, `devices` (a DeviceClaim hands hardware in), `privileged`, `env_file` (write the
 variables under `environment`), `build`, `security_opt` and `tmpfs`; the guide lists the rest.
 The whole table is [From a docker-compose file](docs/guide/kubernetes.md#from-a-docker-compose-file).
+
+## A name only your LAN knows
+
+ACME (Let's Encrypt) will not sign `nas.home.lan`. A CA of the cluster's own will: say
+`issuer: cluster` and the node that holds the CA key signs a server certificate for the host,
+keeps it in the Secret `tls-<host>`, and makes a new one before it ends (it lasts 30 days).
+That is a separate LAN CA, with a key of its own that stays on that node, and it is
+name-constrained to the cluster's LAN domains: `home.arpa`, `lan`, `internal` and `local`, or the
+list a Cluster's `spec.lanDomains` names. A host outside them (or one its Namespace's
+`spec.hosts` does not keep) is refused when applied or when signed.
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: nas, namespace: home }
+spec:
+  selector: { app: nas }
+  ports: [{ port: 80 }]
+  expose: { host: nas.home.lan, via: edge, issuer: cluster }
+```
+
+```sh
+kith ca export kith-ca.crt     # on the CA's node: the LAN CA's public certificate, never a key
+```
+
+Trust `kith-ca.crt` once on each phone or laptop. A device that trusts it takes what the LAN CA
+signs, but the certificate itself carries the limit (X.509 name constraints), so it cannot
+vouch for any name outside the LAN domains, and a name of the cluster (`cluster.local`, `kith`)
+is never one. Whoever may apply Services may still name a host inside them, so name the hosts in
+a Namespace (`spec.hosts`) where that matters. There is no revocation: a short life is the
+revocation. Wildcards and addresses are never signed. The workloads' `ca.crt` and the mesh
+never trust the LAN CA: a host certificate does not verify against the cluster's own root.
 
 ## How it works
 
@@ -189,6 +222,7 @@ kith get workload/hello -o yaml  # status: each container's state, restarts and 
 kith get -w workload             # the table, then each row as it changes (a long-poll on GET /v1/watch)
 kith logs workload/hello -f      # its output, as it arrives
 kith launch alpine -- echo hi    # a one-off Job, followed, exiting with its code (`-d`: a Workload, and return)
+kith machine create dev          # a dev machine: a Workload that runs as you, its home on a Volume copied to another node (`machine list|run|rm`)
 kith ps -A                       # every replica, Job run and exec unit: node, state, exit code (a Job's, when kithd names it), the resource's age
 kith lint -f examples/           # validate files; needs no daemon
 kith diff -f examples/           # what apply would change; exits 1 if anything

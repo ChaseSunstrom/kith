@@ -36,8 +36,6 @@ use tokio::sync::watch;
 const ROUND: Duration = Duration::from_secs(5);
 /// One that failed is tried again after this long.
 const AGAIN: u64 = 60;
-/// On the Blobs an Image made (as a backup's are marked).
-const MADE: &str = "kith.dev/made-by";
 const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 
 /// An image to make now.
@@ -163,14 +161,14 @@ async fn make(shared: &Shared, state: &Path, job: &Job) -> Result<Value, String>
         }
         let wanted = json!({
             "apiVersion": "kith.dev/v1", "kind": "Blob",
-            "metadata": { "name": blob, "namespace": job.namespace, "annotations": { MADE: "image" } },
+            "metadata": { "name": blob, "namespace": job.namespace, "annotations": { crate::blobs::MADE_BY: crate::blobs::IMAGE } },
             "spec": spec,
         });
         resources.push(serde_json::from_value(wanted).map_err(|e| e.to_string())?);
     }
     if !resources.is_empty() {
         let at = kith_api::store::now();
-        let applied = shared.write(Command::Apply { resources, at }).await;
+        let applied = crate::raft::as_node(shared.write(Command::Apply { resources, at })).await;
         applied.map_err(|e| e.to_string())?;
     }
     let [layer, config, manifest] = &pieces;
@@ -185,7 +183,9 @@ async fn make(shared: &Shared, state: &Path, job: &Job) -> Result<Value, String>
 }
 
 /// Lets go of the Blobs of the image `job` was before, but for those `kept`, those kith
-/// did not make and those another Image or a Backup of the namespace has too.
+/// did not make and those another Image or a Backup of the namespace has too. (When the
+/// image's bytes are a backup's identical bytes, the Blob is the backup's, made by whichever
+/// came first: it is left behind when the image lets go of it, not deleted.)
 async fn forget(shared: &Shared, job: &Job, kept: &Value) {
     let keeps = |blob: &str| {
         kept["blobs"]
@@ -199,10 +199,10 @@ async fn forget(shared: &Shared, job: &Job, kept: &Value) {
             let made = state
                 .store
                 .get(&key)
-                .is_some_and(|blob| blob.metadata.annotations.contains_key(MADE));
+                .is_some_and(|blob| crate::blobs::made_by(blob, crate::blobs::IMAGE));
             made && !crate::backups::listed(&state.store, &job.namespace, &job.key, blob)
         };
-        if ours && let Err(e) = shared.submit(Command::Delete { key: key.clone() }).await {
+        if ours && let Err(e) = shared.submit_node(Command::Delete { key: key.clone() }).await {
             eprintln!("kithd: image {}: {key} was not removed: {e}", job.key);
         }
     }
@@ -1529,5 +1529,32 @@ mod tests {
             found(&cluster(Value::Null, "succeeded"), "/v2/default/hello/manifests/1").is_none(),
             "not made yet"
         );
+    }
+
+    #[tokio::test]
+    async fn an_image_forget_leaves_a_blob_of_another_maker() {
+        use crate::blobs::{BACKUP, IMAGE};
+        let (own, theirs, hand) = ("aa".repeat(31), "bb".repeat(31), "cc".repeat(31));
+        let blobs = [(&*own, IMAGE), (&*theirs, BACKUP), (&*hand, "mine")];
+        let (shared, _dir) = crate::blobs::shared_with_blobs("image-forget", &blobs).await;
+        let job = Job {
+            key: "Image/default/hello".into(),
+            namespace: "default".into(),
+            dir: Dir {
+                namespace: "default".into(),
+                name: "data".into(),
+                path: "d".into(),
+                node: "n".into(),
+                encrypted: false,
+            },
+            spec: serde_json::from_value(json!({ "volume": "data" })).unwrap(),
+            of: "x".into(),
+            old: vec![theirs.clone(), hand.clone(), own.clone()],
+        };
+        forget(&shared, &job, &json!({ "blobs": {} })).await;
+        let has = |name: &str| shared.store.lock().unwrap().store.get(&format!("Blob/default/{name}")).is_some();
+        assert!(!has(&own), "an image's own Blob is let go");
+        assert!(has(&theirs), "a backup's Blob is not an image's to delete");
+        assert!(has(&hand), "nor is one put by hand");
     }
 }
