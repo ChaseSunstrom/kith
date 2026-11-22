@@ -228,15 +228,87 @@ fn docker_inspect_a_host_setting_kith_does_not_read_is_said() {
 }
 
 #[test]
+fn docker_inspect_the_other_host_settings_are_said_and_docker_s_own_defaults_are_not() {
+    let sb = Sandbox::new("docker-inspect-host2");
+    let one = r#"{"Name": "/app", "Config": {"Image": "example/app:1"}, "Mounts": [], "HostConfig": {"Ulimits": [{"Name": "nofile", "Soft": 1, "Hard": 2}],
+        "Dns": ["1.1.1.1"], "DnsSearch": ["lan"], "ExtraHosts": ["a:1.2.3.4"], "ShmSize": 1048576, "PidsLimit": 100, "Memory": 100, "MemorySwap": 500,
+        "MemoryReservation": 50, "CpuShares": 512, "CpusetCpus": "0-1", "BlkioWeight": 300, "OomKillDisable": true, "Runtime": "nvidia", "CgroupParent": "x"}}"#;
+    let (code, _, err) = sb.kith("", one, &["import", "docker", "-f", "-"]);
+    assert_eq!(code, 1, "{err}");
+    for at in [
+        "ulimits",
+        "dns",
+        "dns_search",
+        "extra_hosts",
+        "shm_size",
+        "pids_limit",
+        "mem_limit",
+        "memswap_limit",
+        "mem_reservation",
+        "cpu_shares",
+        "cpuset",
+        "blkio_config",
+        "oom_kill_disable",
+        "runtime",
+        "cgroup_parent",
+    ] {
+        said(&err, &format!("services.app.{at}"), "");
+    }
+    // What a docker that was asked nothing prints: no setting. (A memory limit's swap is twice it.)
+    let none = r#"{"Name": "/app", "Config": {"Image": "example/app:1"}, "Mounts": [], "HostConfig": {"Ulimits": null, "Dns": [], "DnsSearch": null,
+        "ExtraHosts": null, "ShmSize": 67108864, "PidsLimit": null, "Memory": 0, "MemorySwap": 0, "MemoryReservation": 0, "CpuShares": 0,
+        "CpusetCpus": "", "BlkioWeight": 0, "OomKillDisable": false, "Runtime": "runc", "CgroupParent": ""}}"#;
+    let (code, _, err) = sb.kith("", none, &["import", "docker", "-f", "-"]);
+    assert_eq!(code, 0, "{err}");
+    let swapped = r#"{"Name": "/app", "Config": {"Image": "example/app:1"}, "Mounts": [], "HostConfig": {"Memory": 100, "MemorySwap": 200}}"#;
+    let (_, _, err) = sb.kith("", swapped, &["import", "docker", "-f", "-"]);
+    assert!(err.contains("mem_limit") && !err.contains("memswap_limit"), "{err}");
+}
+
+#[test]
+fn docker_inspect_long_volume_names_stay_two_and_63_is_left_as_it_is() {
+    let sb = Sandbox::new("docker-inspect-long");
+    let (a, b) = (
+        "0123456789abcdef".repeat(4),
+        format!("{}0", "0123456789abcdef".repeat(4).trim_end_matches('f')),
+    );
+    let mount = |n: &str| format!(r#"{{"Type": "volume", "Name": "{n}", "Destination": "/{n}", "RW": true}}"#);
+    let one = format!(
+        r#"{{"Name": "/app", "Config": {{"Image": "x:1"}}, "HostConfig": {{}}, "Mounts": [{}, {}]}}"#,
+        mount(&a),
+        mount(&b)
+    );
+    let (_, out, err) = sb.kith("", &one, &["import", "docker", "-f", "-", "--node", "n1"]);
+    let vols: Vec<_> = kinds(&out).into_iter().filter(|k| k.starts_with("Volume/")).collect();
+    assert_eq!(vols.len(), 2, "{out}{err}");
+    assert!(vols.iter().all(|v| v.len() - 7 <= 63), "{vols:?}");
+    // Exactly 63 characters is a name already.
+    let exact = "a".repeat(63);
+    let one = format!(
+        r#"{{"Name": "/app", "Config": {{"Image": "x:1"}}, "HostConfig": {{}}, "Mounts": [{}]}}"#,
+        mount(&exact)
+    );
+    let (_, out, err) = sb.kith("", &one, &["import", "docker", "-f", "-", "--node", "n1"]);
+    assert!(kinds(&out).contains(&format!("Volume/{exact}")), "{out}{err}");
+}
+
+#[test]
 fn docker_inspect_a_bind_mount_in_kith_system_says_it_is_a_host_path() {
     let sb = Sandbox::new("docker-inspect-hostpath");
     let one = r#"{"Name": "/app", "Config": {"Image": "example/app:1"}, "HostConfig": {}, "Mounts": [{"Type": "bind", "Source": "/srv/data", "Destination": "/data", "RW": true}]}"#;
-    let (_, _, err) = sb.kith(
+    let (code, _, err) = sb.kith(
         "",
         one,
         &["import", "docker", "-f", "-", "--node", "n1", "-n", "kith-system"],
     );
     said(&err, "services.app.volumes[0]", "host path");
+    // It is a note: the mount is carried, so nothing is left out and the exit is 0.
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.lines().any(|l| l.starts_with("note: ") && l.contains("host path")),
+        "{err}"
+    );
+    assert!(err.contains("0 things not translated"), "{err}");
 }
 
 #[test]

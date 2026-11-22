@@ -30,6 +30,9 @@ const SAID: &[&str] = &[
     "stop_grace_period",
 ];
 
+/// A report line that starts with this is a word to the reader, not something left out.
+pub const NOTE: &str = "note: ";
+
 const NOTHING: &str = "changes nothing: kith has no use for it";
 
 /// A shell would have to read these: a command with one is written as a list.
@@ -337,8 +340,6 @@ pub fn from_docker(inspected: Vec<Value>) -> Result<(Value, Vec<(String, String)
         }
         // `docker run --tmpfs` is in HostConfig, not Mounts.
         tmpfs.extend(host["Tmpfs"].as_object().into_iter().flatten().map(|(d, _)| json!(d)));
-        // A mode other than the container's own, said by compose's key for it.
-        let mode = |k: &str, own: &[&str]| on(&host[k]).filter(|v| !v.as_str().is_some_and(|s| own.contains(&s)));
         let logging = host["LogConfig"]["Type"]
             .as_str()
             .filter(|t| !["", "json-file", "local"].contains(t));
@@ -394,17 +395,45 @@ pub fn from_docker(inspected: Vec<Value>) -> Result<(Value, Vec<(String, String)
             ("init", on(&host["Init"])),
             ("logging", logging.map(|driver| json!({ "driver": driver }))),
             ("tmpfs", nonempty(json!(tmpfs))),
-            ("mem_limit", on(&host["Memory"]).filter(|v| *v != 0)),
-            ("cpus", on(&host["NanoCpus"]).filter(|v| *v != 0)),
-            ("pid", mode("PidMode", &["private"])),
-            ("ipc", mode("IpcMode", &["private", "shareable"])),
-            ("uts", mode("UTSMode", &["private"])),
-            ("userns_mode", mode("UsernsMode", &["private"])),
-            ("group_add", on(&host["GroupAdd"])),
-            ("volumes_from", on(&host["VolumesFrom"])),
-            ("gpus", on(&host["DeviceRequests"])),
             ("volumes", nonempty(json!(vols))),
         ]);
+        // What else HostConfig sets, that kith has no key for: under compose's name for it, so
+        // the translator says each by path. (A value docker fills in for nothing is not a setting.)
+        let swap = host["Memory"].as_i64().map_or(0, |m| m.saturating_mul(2)).to_string();
+        let mut service = service;
+        for (key, compose, own) in [
+            ("Memory", "mem_limit", &[][..]),
+            ("MemorySwap", "memswap_limit", &[swap.as_str()]),
+            ("MemoryReservation", "mem_reservation", &[]),
+            ("NanoCpus", "cpus", &[]),
+            ("CpuShares", "cpu_shares", &[]),
+            ("CpusetCpus", "cpuset", &[]),
+            ("BlkioWeight", "blkio_config", &[]),
+            ("PidsLimit", "pids_limit", &["-1"]),
+            ("ShmSize", "shm_size", &["67108864"]),
+            ("OomKillDisable", "oom_kill_disable", &[]),
+            ("Runtime", "runtime", &["runc"]),
+            ("CgroupParent", "cgroup_parent", &[]),
+            ("PidMode", "pid", &["private"]),
+            ("IpcMode", "ipc", &["private", "shareable"]),
+            ("UTSMode", "uts", &["private"]),
+            ("UsernsMode", "userns_mode", &["private"]),
+            ("GroupAdd", "group_add", &[]),
+            ("VolumesFrom", "volumes_from", &[]),
+            ("DeviceRequests", "gpus", &[]),
+            ("Ulimits", "ulimits", &[]),
+            ("Dns", "dns", &[]),
+            ("DnsSearch", "dns_search", &[]),
+            ("ExtraHosts", "extra_hosts", &[]),
+        ] {
+            let v = &host[key];
+            let text = v.as_str().map_or_else(|| v.to_string(), String::from);
+            if let (Some(v), false, Value::Object(m)) =
+                (on(v).filter(|v| *v != 0), own.contains(&text.as_str()), &mut service)
+            {
+                m.insert(compose.into(), v);
+            }
+        }
         if services.insert(name.to_string(), service).is_some() {
             return Err(format!("two containers of the name `{name}`: a name is one service"));
         }
@@ -753,7 +782,8 @@ fn slug(s: &str) -> String {
     let hash = s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
     });
-    format!("{}-{:012x}", out[..50].trim_end_matches('-'), hash & 0xffff_ffff_ffff)
+    let head: String = out.chars().take(50).collect();
+    format!("{}-{:012x}", head.trim_end_matches('-'), hash & 0xffff_ffff_ffff)
 }
 
 /// The Volume of a directory: its name, or none, the reason said at `at`.
@@ -776,10 +806,11 @@ fn claim(cx: &mut Cx, env: &mut Env, at: &str, path: &str, named: Option<&str>) 
                 );
                 return None;
             }
-            cx.hint(
-                at,
-                "is a host path of the node, held as it is: check it is the one meant",
-            );
+            // A note, not a thing left out: `kith import` prints it apart and exits as without it.
+            cx.hints.push(format!(
+                "{NOTE}{}: {at} is a host path of the node, held as it is: check it is the one meant",
+                cx.who
+            ));
             path.to_string()
         }
         (true, true) => {
