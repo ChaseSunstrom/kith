@@ -545,7 +545,7 @@ nodes too, and a replay decides alike.
     (`sources`) and the prune that takes one away, the reaper's delete of an orphaned access
     kind, and a NetworkPolicy a Release renders (the only namespaced kind of these). A person
     applies those, signed, not a Release. A step that would make or prune one of the kinds a
-    node never signs (access and network, `own_writes::never_signed`, the one test `signed`
+    node never signs (access and network, `own_writes::never_signed`, the one check `signed`
     uses) proposes nothing, and the Release's status says so, once (`releases::refuse_access`),
     instead of every node refusing and auditing the same entry each round.
   - **What remains.** A taken leader can still write, as the writer of an owner that is there,

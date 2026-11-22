@@ -200,7 +200,7 @@ control node cannot write more than the owner could. A node never signs a change
 RoleBinding, an Identity, a KindDefinition, the Cluster) nor one of the mesh or the network
 policy (an AccessLevel, a RemotePeer, a NetworkPolicy, an Exit), so a Source that brings a KindDefinition
 or a Release that renders a NetworkPolicy is refused under `required`: apply those yourself,
-signed. A worker node cannot sign, so the spec writes it
+signed. Under `required` a Release step that renders a NetworkPolicy applies nothing, and the Release's status says so once. A worker node cannot sign, so the spec writes it
 makes for itself (its Devices, Images and Backups) are refused under `required`, and so is a
 Blob put through the API.
 

@@ -1127,7 +1127,7 @@ pub(crate) fn changes_access(command: &Command) -> bool {
     let access = |kind: &str| {
         // (A KindDefinition says whether a kind is namespaced: which rule matches it. A
         // Cluster holds the admin's key, asked of in the same turn: `access_sign::guard`.)
-        ["Role", "RoleBinding", "Identity", "KindDefinition", "Cluster"]
+        crate::own_writes::ACCESS_KINDS
             .iter()
             .any(|of| of.eq_ignore_ascii_case(kind))
     };

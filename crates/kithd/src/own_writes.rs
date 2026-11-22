@@ -70,14 +70,19 @@ fn class(kind: &str) -> Result<(), String> {
     }
 }
 
-/// Whether `command` applies or deletes one of who joins the mesh and at what level, or of what
-/// traffic flows (an AccessLevel, RemotePeer, NetworkPolicy or Exit): a node never signs one.
-pub(crate) fn reaches_network(command: &Command) -> bool {
-    let network = |kind: &str| {
-        ["AccessLevel", "RemotePeer", "NetworkPolicy", "Exit"]
-            .iter()
-            .any(|of| of.eq_ignore_ascii_case(kind))
-    };
+/// The kinds that decide who may do what (`raft::changes_access` holds a write of one alone).
+pub(crate) const ACCESS_KINDS: [&str; 5] = ["Role", "RoleBinding", "Identity", "KindDefinition", "Cluster"];
+/// The kinds that decide who joins the mesh and at what level, and what traffic flows.
+const NETWORK_KINDS: [&str; 4] = ["AccessLevel", "RemotePeer", "NetworkPolicy", "Exit"];
+
+/// The kinds a node never signs, for a message: the one list [`never_signed`] decides by.
+pub(crate) fn never_signed_kinds() -> String {
+    ACCESS_KINDS.iter().chain(&NETWORK_KINDS).copied().collect::<Vec<_>>().join(", ")
+}
+
+/// Whether `command` applies or deletes a kind of [`NETWORK_KINDS`].
+fn reaches_network(command: &Command) -> bool {
+    let network = |kind: &str| NETWORK_KINDS.iter().any(|of| of.eq_ignore_ascii_case(kind));
     match command {
         Command::Apply { resources, .. } => resources.iter().any(|resource| network(&resource.kind)),
         Command::Delete { key } => network(kind_of(key)),

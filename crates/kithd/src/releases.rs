@@ -1282,10 +1282,10 @@ fn refuse_access(store: &Store, step: &mut Step) -> bool {
         return false;
     }
     let message = format!(
-        "{} makes or removes a Role, RoleBinding, Identity, KindDefinition, AccessLevel, RemotePeer, \
-         NetworkPolicy or Exit, which only a person signs under spec.signing: required; apply it \
-         signed, or set signing open",
-        step.release
+        "{} makes or removes one of {}, which only a person signs under spec.signing: required; \
+         apply it signed, or set signing open",
+        step.release,
+        crate::own_writes::never_signed_kinds()
     );
     let Value::Object(status) = failed(&message, None) else {
         unreachable!("an object")
@@ -1587,6 +1587,8 @@ mod tests {
             assert!(pruned.delete.is_empty(), "{kind}: no delete proposed");
             let status = made.status.clone().expect("says why");
             assert_eq!(status["state"], "error", "{kind}");
+            let message = status["message"].as_str().unwrap();
+            assert!(message.contains(&format!(" {kind},")), "{kind}: the status names it: {message}");
             kith_store::run(
                 &mut store,
                 kith_store::Command::Patch {
