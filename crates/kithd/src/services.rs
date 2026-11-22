@@ -37,6 +37,7 @@ pub(crate) fn links_off() -> bool {
 
 use crate::Shared;
 use crate::ingress::{Idle, Limits, Place};
+use crate::levels::Reach;
 use futures_util::FutureExt;
 use kith_api::Resource;
 use kith_api::kinds::{
@@ -507,6 +508,56 @@ impl Turns {
     }
 }
 
+/// The people's connections to Services on a node started with `--people`: from a peer, to the
+/// Services of its level. (The kernel's table says so first; this is its second look, and what
+/// holds each peer to a few of the places.)
+struct People {
+    /// The people's /64, and its IPv4 range, are the sources that are theirs.
+    people64: Ipv6Addr,
+    /// Places apart from the mesh's, counted by the peer's address whole (never its /64: a
+    /// peer's address is one of the /64's, which many peers share).
+    limits: Limits,
+    reach: Mutex<Reach>,
+}
+
+/// How many of its places one peer holds at a time.
+const PEOPLE_EACH: usize = 8;
+
+impl People {
+    fn new(people64: Ipv6Addr, room: usize) -> People {
+        People {
+            people64,
+            limits: Limits::new(room, PEOPLE_EACH).per_address(),
+            reach: Mutex::default(),
+        }
+    }
+
+    /// The peers and what they reach, as the store says now.
+    fn hold(&self, reach: Reach) {
+        *self.reach.lock().expect("nothing panics holding the reach") = reach;
+    }
+
+    /// Is `from` in the people's ranges?
+    fn holds(&self, from: IpAddr) -> bool {
+        crate::people::holds(self.people64, from)
+    }
+
+    /// A place for a connection from the peer `from` to the Service at `(address, port)`: none
+    /// for another level's, nor for a source that is no peer's (it is not counted either), nor
+    /// for a port the level does not list (a Service listing none is reached on none: fail closed).
+    fn place(&self, from: IpAddr, (address, port): (Ipv6Addr, u16)) -> Option<Place> {
+        let from = from.to_canonical();
+        let allowed = {
+            let reach = self.reach.lock().expect("nothing panics holding the reach");
+            let services = reach.get(&from)?;
+            services
+                .iter()
+                .any(|(at, ports)| *at == address && ports.contains(&port))
+        };
+        allowed.then(|| self.limits.take(from)).flatten()
+    }
+}
+
 struct Proxy {
     shared: Arc<Shared>,
     prefix: Ipv6Addr,
@@ -514,6 +565,8 @@ struct Proxy {
     turns: Turns,
     /// Places for the connections of this node's own clients.
     serving: Limits,
+    /// The people's, with `--people`.
+    people: Option<People>,
     /// Places for the connections another node passes on to a replica here.
     relaying: Limits,
     /// Spares for the over-limit connections of other nodes, to be said no to ([`admit`]).
@@ -769,11 +822,34 @@ impl Proxy {
         });
     }
 
+    /// The place for a connection from `from` to the Service `key`: a person's (of the people's
+    /// ranges, `--people`) from the people's places, and only for its level's Services; anyone
+    /// else's from the mesh's. (A Service's IPv4 address is no level's: a person gets none there.)
+    fn place(&self, from: IpAddr, key: (IpAddr, u16)) -> Option<Place> {
+        match &self.people {
+            Some(people) if people.holds(from) => match key {
+                (IpAddr::V6(address), port) => people.place(from, (address, port)),
+                (IpAddr::V4(_), _) => None,
+            },
+            _ => self.serving.take(from),
+        }
+    }
+
+    /// Does a listener take a connection from `from` at all? The mesh's, and with `people` (the
+    /// listeners of the Services only) a person's. Whoever routes one of our addresses to this
+    /// machine from outside is neither.
+    fn takes(&self, from: IpAddr, people: bool) -> bool {
+        self.is_ours(from) || (people && self.people.as_ref().is_some_and(|people| people.holds(from)))
+    }
+
     /// Someone connected to a Service: pass the connection to its next backend that
     /// takes it.
     async fn serve(&self, key: (IpAddr, u16), mut client: TcpStream) {
         // (The place is held while the connection lasts.)
-        let Some(_place) = client.peer_addr().ok().and_then(|from| self.serving.take(from.ip())) else {
+        let Ok(from) = client.peer_addr().map(|from| from.ip()) else {
+            return;
+        };
+        let Some(_place) = self.place(from, key) else {
             return;
         };
         let backends = {
@@ -893,8 +969,9 @@ impl Proxy {
         }
     }
 
-    /// Accept on `listener` for good, each connection from the mesh handled by `with`.
-    async fn accept<F, Fut>(self: Arc<Self>, listener: TcpListener, with: F)
+    /// Accept on `listener` for good, each connection from the mesh handled by `with`; with
+    /// `people`, those of the people's ranges too (handled by `with` as well: `serve`).
+    async fn accept<F, Fut>(self: Arc<Self>, listener: TcpListener, people: bool, with: F)
     where
         F: Fn(Arc<Proxy>, TcpStream) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
@@ -905,8 +982,7 @@ impl Proxy {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
-            // Whoever routes one of our addresses to this machine from outside is not on the mesh.
-            if self.is_ours(from.ip()) {
+            if self.takes(from.ip(), people) {
                 tokio::spawn(with(self.clone(), stream));
             }
         }
@@ -1359,17 +1435,20 @@ async fn within<T>(doing: impl Future<Output = std::io::Result<T>>) -> std::io::
 /// are not listened on here: the ingress has those ports, and sends what is ours on.
 pub async fn run(
     shared: Arc<Shared>,
+    people: bool,
     mut strays: Option<mpsc::UnboundedReceiver<TcpStream>>,
     mut stopping: watch::Receiver<bool>,
 ) {
     let Some(cluster) = &shared.cluster else { return };
     let prefix = crate::mesh::prefix(&cluster.me.ca);
+    let people64 = crate::people::prefix(&cluster.me.ca);
     let proxy = Arc::new(Proxy {
         shared: shared.clone(),
         prefix,
         table: Mutex::default(),
         turns: Turns::default(),
         serving: Limits::new(SERVING, SERVING),
+        people: people.then(|| People::new(people64, SERVING)),
         relaying: Limits::new(RELAYING, RELAYING_PER_NODE).per_node(),
         spares: Limits::new(SPARE, SPARE_PER_NODE).per_node(),
         kept: Mutex::default(),
@@ -1480,6 +1559,9 @@ pub async fn run(
         let (mut wanted, reports, plans) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let table = table(&state.store, prefix, services);
+            if let Some(people) = &proxy.people {
+                people.hold(crate::levels::reach(&state.store, (prefix, people64), proxy.me()));
+            }
             // (A Service that was refused its host says so, in `expose`; the others say nothing.)
             let refused = crate::ingress::exposed(&state.store, prefix).1;
             // What `kith get service` shows; written by the node that leads the store.
@@ -1614,10 +1696,11 @@ pub async fn run(
                         let take = |proxy: Arc<Proxy>, stream| async move {
                             let _ = proxy.take(stream).await;
                         };
-                        proxy.accept(listener, take).await;
+                        // (The relay is for the other nodes: never for a person.)
+                        proxy.accept(listener, false, take).await;
                     } else {
                         let serve = move |proxy: Arc<Proxy>, stream| async move { proxy.serve(key, stream).await };
-                        proxy.accept(listener, serve).await;
+                        proxy.accept(listener, true, serve).await;
                     }
                 })
             });
@@ -2072,6 +2155,174 @@ mod tests {
         ];
         let gone: Vec<_> = stale(prefix, present, &BTreeSet::from([kept])).collect();
         assert_eq!(gone, [left]);
+    }
+
+    fn people_of(reach: &[(&str, &[(Ipv6Addr, u16)])]) -> (People, Ipv6Addr) {
+        let people64: Ipv6Addr = "fd12:3456:789a:1::".parse().unwrap();
+        let people = People::new(people64, SERVING);
+        people.hold(
+            reach
+                .iter()
+                .map(|(from, services)| {
+                    let services = services.iter().map(|(address, port)| (*address, vec![*port])).collect();
+                    (from.parse().unwrap(), Arc::new(services))
+                })
+                .collect(),
+        );
+        (people, people64)
+    }
+
+    /// A peer reaches the Services of its own level on the people node, and no other's; a
+    /// source that is not a peer of the people's ranges is not served at all.
+    #[test]
+    fn people_serving_a_peer_reaches_its_own_levels_services_only() {
+        let prefix = kith_mesh::prefix(b"a cluster");
+        let (web, db) = (
+            kith_mesh::service_address(prefix, "default", "web"),
+            kith_mesh::service_address(prefix, "default", "db"),
+        );
+        let (people, _) = people_of(&[
+            ("100.89.0.5", &[(web, 443)]),
+            ("fd12:3456:789a:1::5", &[(web, 443)]),
+            ("100.89.0.6", &[(db, 5432)]),
+        ]);
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        for peer in ["100.89.0.5", "fd12:3456:789a:1::5"] {
+            assert!(
+                people.place(ip(peer), (web, 443)).is_some(),
+                "{peer} reaches its level's Service"
+            );
+            assert!(
+                people.place(ip(peer), (db, 5432)).is_none(),
+                "{peer}: another level's Service"
+            );
+            assert!(
+                people.place(ip(peer), (web, 80)).is_none(),
+                "{peer}: a port its level lacks"
+            );
+        }
+        assert!(people.place(ip("100.89.0.6"), (web, 443)).is_none());
+        assert!(people.place(ip("100.89.0.6"), (db, 5432)).is_some());
+        // Not the people's: outside both ranges, or in a range and no peer's.
+        for from in [
+            "203.0.113.9",
+            "fd00:1:2:3::1",
+            "fd12:3456:789a:2::5",
+            "::1",
+            "127.0.0.1",
+        ] {
+            assert!(!people.holds(ip(from)), "{from} is not in the people's ranges");
+            assert!(people.place(ip(from), (web, 443)).is_none(), "{from} is refused");
+        }
+        for from in ["100.89.0.77", "fd12:3456:789a:1::77", "::ffff:100.89.0.77"] {
+            assert!(people.holds(ip(from)), "{from} is in the people's ranges");
+            assert!(
+                people.place(ip(from), (web, 443)).is_none(),
+                "{from}: no peer's address"
+            );
+        }
+        assert!(
+            people.holds(ip("::ffff:100.89.0.5")),
+            "a v4 peer as the dual-stack socket shows it"
+        );
+        assert!(people.place(ip("::ffff:100.89.0.5"), (web, 443)).is_some());
+        assert!(
+            people.limits.sources.lock().unwrap().len() <= 3,
+            "only a peer is counted"
+        );
+    }
+
+    /// A peer holds 8 of the 4096 places, by its own address; two IPv6 peers of one /64 are two.
+    #[test]
+    fn people_serving_a_peer_holds_a_few_places_of_the_many() {
+        let web = kith_mesh::service_address(kith_mesh::prefix(b"a cluster"), "default", "web");
+        let (people, _) = people_of(&[
+            ("fd12:3456:789a:1::5", &[(web, 443)]),
+            ("fd12:3456:789a:1::6", &[(web, 443)]),
+            ("100.89.0.5", &[(web, 443)]),
+        ]);
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        let mut all = Vec::new();
+        for peer in ["fd12:3456:789a:1::5", "fd12:3456:789a:1::6", "100.89.0.5"] {
+            let held: Vec<_> = (0..8).map(|_| people.place(ip(peer), (web, 443))).collect();
+            assert!(held.iter().all(Option::is_some), "{peer} holds 8");
+            assert!(
+                people.place(ip(peer), (web, 443)).is_none(),
+                "{peer}: the 9th is refused"
+            );
+            all.extend(held);
+        }
+        assert_eq!(people.limits.room.available_permits(), SERVING - 24, "of 4096 places");
+    }
+
+    /// A level's Service with no port listed is reached on no port (fail closed), not on all.
+    #[test]
+    fn people_serving_an_empty_port_list_reaches_nothing() {
+        let web = kith_mesh::service_address(kith_mesh::prefix(b"a cluster"), "default", "web");
+        let people = People::new("fd12:3456:789a:1::".parse().unwrap(), SERVING);
+        people.hold(BTreeMap::from([(
+            "100.89.0.5".parse().unwrap(),
+            Arc::new(vec![(web, Vec::new())]),
+        )]));
+        let from: IpAddr = "100.89.0.5".parse().unwrap();
+        for port in [0, 80, 443] {
+            assert!(people.place(from, (web, port)).is_none(), "port {port}");
+        }
+        assert!(people.limits.sources.lock().unwrap().is_empty());
+    }
+
+    /// What `serve` and `accept` do with a source, on a Proxy as `run` makes one: a person is
+    /// taken by the listeners of the Services only, and placed as a peer of its level; the mesh
+    /// keeps the mesh's places; a source in neither is not taken.
+    #[tokio::test]
+    async fn people_serving_admits_by_source_and_listener() {
+        let mut proxy = proxy_of(state_with_web("people-admit").await, 8080, "Workload/default/web", None);
+        let web = kith_mesh::service_address(proxy.prefix, "default", "web");
+        let (people, _) = people_of(&[("100.89.0.5", &[(web, 443)]), ("fd12:3456:789a:1::5", &[(web, 443)])]);
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        let (mesh, person, v6_person) = (
+            IpAddr::V6(kith_mesh::node_address(proxy.prefix, "b")),
+            ip("100.89.0.5"),
+            ip("fd12:3456:789a:1::5"),
+        );
+        // Without --people nobody of the ranges is taken, and none is placed as a person.
+        for from in [person, v6_person, ip("203.0.113.9"), ip("fd00:9::1")] {
+            assert!(!proxy.takes(from, true) && !proxy.takes(from, false), "{from}");
+        }
+        assert!(proxy.takes(mesh, true) && proxy.takes(mesh, false));
+        proxy.people = Some(people);
+        for from in [person, v6_person] {
+            assert!(proxy.takes(from, true), "{from}: the Service listeners take a person");
+            assert!(!proxy.takes(from, false), "{from}: the relay and the strays do not");
+            assert!(
+                proxy.place(from, (web.into(), 443)).is_some(),
+                "{from}: its level's Service"
+            );
+            assert!(
+                proxy.place(from, (web.into(), 80)).is_none(),
+                "{from}: not a port its level lists"
+            );
+        }
+        assert!(!proxy.takes(ip("203.0.113.9"), true));
+        assert!(
+            proxy.takes(ip("100.89.0.77"), true),
+            "a source of the range is taken, then refused a place"
+        );
+        assert!(proxy.place(ip("100.89.0.77"), (web.into(), 443)).is_none());
+        // A Service's IPv4 address is no level's: a person of a level that lists the port gets none.
+        let from = ip("100.89.0.2");
+        assert!(proxy.place(from, (ip("10.96.0.5"), 443)).is_none());
+        // The mesh is placed from the mesh's places, whatever its port; a person from the people's.
+        let (kept_mesh, kept_person) = (
+            proxy.place(mesh, (web.into(), 80)),
+            proxy.place(person, (web.into(), 443)),
+        );
+        assert!(kept_mesh.is_some() && kept_person.is_some());
+        assert_eq!(proxy.serving.room.available_permits(), SERVING - 1);
+        assert_eq!(
+            proxy.people.as_ref().unwrap().limits.room.available_permits(),
+            SERVING - 1
+        );
     }
 
     #[test]
@@ -2717,6 +2968,7 @@ spec:
             table: Mutex::new(BTreeMap::from([((IpAddr::V6(Ipv6Addr::LOCALHOST), 80), vec![backend])])),
             turns: Turns::default(),
             serving: Limits::new(SERVING, SERVING),
+            people: None,
             relaying: Limits::new(RELAYING, RELAYING_PER_NODE).per_node(),
             spares: Limits::new(SPARE, SPARE_PER_NODE).per_node(),
             kept: Mutex::default(),

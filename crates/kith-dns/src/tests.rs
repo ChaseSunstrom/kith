@@ -367,6 +367,51 @@ fn the_longest_matching_prefix_picks_the_view_whatever_the_order() {
     }
 }
 
+/// `Cidr::without` takes a denied network out of an allowed one, exactly: the allowed rest is
+/// every address of the net that is not in the denied one, and nothing else.
+#[test]
+fn cidr_without_takes_the_denied_out_and_keeps_the_rest() {
+    let nets = |list: &[&str]| -> Vec<Cidr> { list.iter().map(|net| net.parse().unwrap()).collect() };
+    let has = |list: &[Cidr], ip: &str| list.iter().any(|net| net.contains(ip.parse().unwrap()));
+    let rest = Cidr::without(
+        &nets(&["fc00::/7", "10.0.0.0/8", "192.168.0.0/16"]),
+        &nets(&["fd12:3456:789a:1::/64", "10.1.0.0/16"]),
+    );
+    for no in [
+        "fd12:3456:789a:1::",
+        "fd12:3456:789a:1:ffff:ffff:ffff:ffff",
+        "10.1.0.1",
+        "10.1.255.255",
+        "::ffff:10.1.2.3",
+    ] {
+        assert!(!has(&rest, no), "{no}");
+    }
+    for yes in [
+        "fc00::1",
+        "fd12:3456:789a:0:ffff:ffff:ffff:ffff",
+        "fd12:3456:789a:2::",
+        "fdff:ffff:ffff:ffff::1",
+        "10.0.255.255",
+        "10.2.0.0",
+        "10.255.255.255",
+        "192.168.1.1",
+    ] {
+        assert!(has(&rest, yes), "{yes}");
+    }
+    assert!(!has(&rest, "8.8.8.8") && !has(&rest, "fe80::1"));
+    // A denied net that holds the allowed one takes it whole; one unrelated changes nothing.
+    assert!(Cidr::without(&nets(&["10.1.0.0/16"]), &nets(&["10.0.0.0/8"])).is_empty());
+    assert_eq!(
+        Cidr::without(&nets(&["10.0.0.0/8"]), &nets(&["100.89.0.0/16"])),
+        nets(&["10.0.0.0/8"])
+    );
+    // (57 networks leave a /7 once a /64 is out of it: a list, not a loop on every query.)
+    assert_eq!(
+        Cidr::without(&nets(&["fc00::/7"]), &nets(&["fd12:3456:789a:1::/64"])).len(),
+        57
+    );
+}
+
 #[test]
 fn cidr_parses_and_matches() {
     let c: Cidr = "10.1.0.0/16".parse().unwrap();

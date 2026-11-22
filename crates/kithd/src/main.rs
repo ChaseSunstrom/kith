@@ -337,7 +337,8 @@ pub struct Shared {
 const DRY_RUNS: usize = 4;
 
 /// The most open files kithd asks for: ingress's 1024 connections hold two each, and the
-/// relays, the API and the listeners come on top (SECURITY.md).
+/// relays, the API and the listeners come on top (SECURITY.md); the API's handshakes and the
+/// line waiting for a slot are about 400 sockets (64 + 256 the others', 16 + 64 the people's).
 const NOFILE_WANTED: u64 = 65536;
 
 /// The soft limit of open files to set: the hard limit, but no more than [`NOFILE_WANTED`],
@@ -1153,8 +1154,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 eprintln!("kithd: --admit-deleted-nodes: a deleted node's certificate is still taken here");
                 cluster::ADMIT_DELETED.store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            let people64 = args.people.map(|_| people::prefix(&cluster.me.ca));
             let mesh_me = kith_mesh::node_address(mesh::prefix(&cluster.me.ca), &cluster.me.name);
-            let listener = cluster::listen_on(tcp, pki::server_config(&cluster.me)?, Some(mesh_me))
+            let listener = cluster::listen_on(tcp, pki::server_config(&cluster.me)?, Some(mesh_me), people64)
                 .map_err(|e| fail("listening", &e))?;
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();
@@ -1288,7 +1290,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();
         let taken = args.ingress.then_some(taken);
         // (Without a mesh too: a node's Services answer its pods there as well, T-0723.)
-        let services = services::run(shared.clone(), taken, stopping.clone());
+        let services = services::run(shared.clone(), args.people.is_some(), taken, stopping.clone());
         // (What each pod may reach, kept in step with its policies: on a node alone too.)
         let held = pods::keep_held(shared.clone(), stopping.clone());
         let proxy = async {
