@@ -9,7 +9,6 @@
 //!
 //! ponytail: nothing calls `migrate_out` yet (slice C2 picks the node and switches the placement after
 //! it), and it takes the pod's name to be the same on both nodes (a replica's name is its owner's).
-#![allow(dead_code)]
 
 use crate::Shared;
 use crate::access::Caller;
@@ -151,12 +150,12 @@ where
         carried
     };
     tokio::pin!(up, down);
-    let first = tokio::select! {
-        done = &mut up => { let _ = timeout(grace, &mut down).await; done }
-        done = &mut down => { let _ = timeout(grace, &mut up).await; done }
+    let (first, second) = tokio::select! {
+        done = &mut up => (done, timeout(grace, &mut down).await),
+        done = &mut down => (done, timeout(grace, &mut up).await),
     };
     // (The one that did not end in time is dropped with the sockets: its side sees the end.)
-    first.map(drop)
+    first.and(second.unwrap_or(Ok(0))).map(drop)
 }
 
 /// Quit the QEMU at `path` (what a migration into it that did not happen leaves), and say so.
@@ -164,6 +163,18 @@ async fn quit(path: &Path, why: &str) {
     eprintln!("kithd: migration into {}: {why}; quitting it", path.display());
     if let Err(e) = ask(path, |qmp| qmp.quit()).await {
         eprintln!("kithd: quit {}: {e}", path.display());
+    }
+}
+
+/// Quits the QEMU at its path when dropped armed: `incoming`'s future is dropped if the hop's request is (the
+/// peer hung up), and a QEMU told to listen would wait for ever.
+struct QuitOnDrop(Option<PathBuf>);
+
+impl Drop for QuitOnDrop {
+    fn drop(&mut self) {
+        if let (Some(path), Ok(runtime)) = (self.0.take(), tokio::runtime::Handle::try_current()) {
+            runtime.spawn(async move { quit(&path, "the hop was dropped").await });
+        }
     }
 }
 
@@ -182,9 +193,11 @@ async fn incoming(qmp_path: &Path) -> Result<UnixStream, (StatusCode, String)> {
     // (Ours to remove: the directory is the replica's own, and a QEMU that listens there makes it new.)
     let _ = std::fs::remove_file(&sock);
     let uri = format!("unix:{}", sock.display());
-    ask(qmp_path, move |qmp| qmp.migrate_incoming(&uri))
-        .await
-        .map_err(|e| down("migrate-incoming", e))?;
+    let mut guard = QuitOnDrop(Some(qmp_path.to_path_buf()));
+    if let Err(e) = ask(qmp_path, move |qmp| qmp.migrate_incoming(&uri)).await {
+        guard.0 = None; // (refused: it does not listen)
+        return Err(down("migrate-incoming", e));
+    }
     let reached = async {
         loop {
             match UnixStream::connect(&sock).await {
@@ -195,7 +208,9 @@ async fn incoming(qmp_path: &Path) -> Result<UnixStream, (StatusCode, String)> {
             }
         }
     };
-    match timeout(CALL, reached).await {
+    let reached = timeout(CALL, reached).await;
+    guard.0 = None;
+    match reached {
         Ok(Ok(stream)) => Ok(stream),
         failed => {
             let e = failed.map_or_else(
@@ -318,7 +333,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let was = ask(qmp_path, |qmp| qmp.status()).await?.running;
-    let mut relaying = None;
+    let mut undo = Undo {
+        qmp: qmp_path.to_path_buf(),
+        was,
+        relaying: None,
+        armed: true,
+    };
     let outcome = 'go: {
         let started = async {
             ask(qmp_path, |qmp| {
@@ -336,7 +356,7 @@ where
             Ok(listener) => listener,
             Err(e) => break 'go Err(e),
         };
-        relaying = Some(tokio::spawn(async move {
+        undo.relaying = Some(tokio::spawn(async move {
             let (qemu, _) = listener.accept().await?;
             relay(qemu, far, pace.end).await
         }));
@@ -367,20 +387,58 @@ where
         }
     };
     let _ = std::fs::remove_file(sock);
-    match (outcome, relaying) {
+    let outcome = match (outcome, undo.relaying.take()) {
         (Ok(sent), Some(mut carrying)) => {
-            // (The tail of the stream is still on its way: it is given `end` to drain.)
-            if timeout(pace.end, &mut carrying).await.is_err() {
-                carrying.abort();
+            // QEMU says completed once the last bytes are in the socket, not once the target has them: the
+            // stream is given time to drain (the relay itself waits up to `end` for the other direction), and a
+            // break in it is a failure, the machine here paused (postmigrate) and the target without its tail.
+            match timeout(pace.end * 2, &mut carrying).await {
+                Ok(Ok(Ok(()))) => Ok(sent),
+                Ok(Ok(Err(e))) => Err(format!("the stream to the target broke: {e}")),
+                Ok(Err(e)) => Err(format!("the stream's task: {e}")),
+                Err(_) => {
+                    carrying.abort();
+                    Err(format!("the stream did not drain in {} ms", pace.end.as_millis() * 2))
+                }
             }
-            Ok(sent)
         }
         (Ok(sent), None) => Ok(sent),
         (Err(why), carrying) => {
             if let Some(carrying) = carrying {
                 carrying.abort();
             }
-            Err(resume(qmp_path, was, why).await)
+            Err(why)
+        }
+    };
+    undo.armed = false;
+    match outcome {
+        Ok(sent) => Ok(sent),
+        Err(why) => Err(resume(qmp_path, was, why).await),
+    }
+}
+
+/// What `near` leaves undone if its future is dropped (the caller gave up): the stream is cut and the machine
+/// resumed, as for a failure.
+struct Undo {
+    qmp: PathBuf,
+    was: bool,
+    relaying: Option<tokio::task::JoinHandle<io::Result<()>>>,
+    armed: bool,
+}
+
+impl Drop for Undo {
+    fn drop(&mut self) {
+        if let Some(carrying) = &self.relaying {
+            carrying.abort();
+        }
+        if self.armed
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let (qmp, was) = (self.qmp.clone(), self.was);
+            runtime.spawn(async move {
+                eprintln!("kithd: migration out of {} was dropped", qmp.display());
+                resume(&qmp, was, String::new()).await;
+            });
         }
     }
 }
@@ -403,6 +461,7 @@ async fn resume(qmp_path: &Path, was: bool, why: String) -> String {
 /// Move the VM replica `pod` of `namespace` from this node to `node` (`there`): the target's gate is asked over the
 /// hop, then the migration is driven here. The bytes sent when it completed, or why it did not (the machine here
 /// is running as before).
+#[allow(dead_code)] // (slice C2 calls it)
 pub(crate) async fn migrate_out(
     shared: &Arc<Shared>,
     namespace: &str,
@@ -488,12 +547,29 @@ mod fakes {
         machine.lock().unwrap().calls.clone()
     }
 
-    /// A private directory (mode 0700) for the test `name`.
-    pub fn dir(name: &str) -> PathBuf {
+    /// A private directory (mode 0700) for a test, removed when dropped.
+    pub struct TestDir(PathBuf);
+
+    impl std::ops::Deref for TestDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A directory for the test `name`.
+    pub fn dir(name: &str) -> TestDir {
         let dir = std::env::temp_dir().join(format!("kithd-vm-migrate-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o700)).unwrap();
-        dir
+        TestDir(dir)
     }
 
     pub fn payload(len: usize) -> Vec<u8> {
@@ -632,6 +708,7 @@ mod fakes {
     }
 }
 
+#[cfg(test)]
 mod relay {
     use super::*;
     use std::time::Duration;
@@ -710,6 +787,7 @@ mod relay {
     }
 }
 
+#[cfg(test)]
 mod drive {
     use super::fakes::*;
     use super::*;
@@ -842,6 +920,32 @@ mod drive {
         resumed(&rig);
     }
 
+    /// A says completed once its last bytes are in the socket; a hop that breaks over them leaves A paused and B
+    /// without its tail, so the move fails and A is resumed.
+    #[tokio::test]
+    async fn drive_a_stream_that_breaks_after_a_completed_resumes_a() {
+        let a_dir = dir("broken");
+        let a = machine(true, "running");
+        let role = Role::Source {
+            payload: payload(1 << 20),
+            end: End::Complete,
+        };
+        let a_qmp = serve(&a_dir, a.clone(), role);
+        let (near_end, far_end) = tokio::io::duplex(1 << 16);
+        drop(far_end); // (the far end is gone: what is written to it is an error)
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let pace = Pace {
+            tick: Duration::from_millis(20),
+            cap: Duration::from_secs(10),
+            end: Duration::from_millis(200),
+        };
+        let result = near(&a_qmp, &a_dir.join("out.sock"), near_end, pace, cancel_rx).await;
+        assert!(result.as_ref().is_err_and(|why| why.contains("stream")), "{result:?}");
+        let calls = calls(&a);
+        assert!(has(&calls, "cont"), "A was not resumed: {calls:?}");
+        assert!(a.lock().unwrap().running);
+    }
+
     /// A that refuses `migrate` fails the move, and a machine that was not running is not started by it.
     #[tokio::test]
     async fn drive_a_machine_that_was_stopped_stays_stopped_when_the_move_fails() {
@@ -860,6 +964,7 @@ mod drive {
     }
 }
 
+#[cfg(test)]
 mod hop {
     use super::fakes::*;
     use crate::access::Caller;

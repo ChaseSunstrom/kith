@@ -10,9 +10,11 @@
 //!                          \-- replica there: POST /v1/pod-hop --> node B (checks it again in
 //!                                             its own store, enters, speaks the channels)
 //! ```
-//! `/v1/pod-hop` is the one route between nodes for a pod: `kubectl port-forward` (kube/portforward.rs) asks
-//! it for a byte stream to a port instead ([`Spec::Connect`]). It has one gate ([`hop`]) and one sender
-//! ([`send`]); what the gate lets through is run by what the body asks.
+//! `/v1/pod-hop` is the one route between nodes for a pod, of three kinds: exec (above), `kubectl port-forward`
+//! (kube/portforward.rs), which asks it for a byte stream to a port ([`Spec::Connect`]), and a VM's live
+//! migration (vm_migrate.rs), the stream to the QEMU waiting for it ([`Spec::Migrate`]: answered at once, by
+//! the node's certificate, with no caller to check). It has one gate ([`hop`]) and one sender ([`send`]); what
+//! the gate lets through is run by what the body asks.
 //! Node A passes the client's bytes on without reading them (the WebSocket is the client's, to
 //! node B, which is the one that answers it). A failure after the upgrade is a Status on channel
 //! 3 and a close: a client that was refused an upgrade would fall back to another protocol.
@@ -425,7 +427,7 @@ pub async fn hop(
     let verb = match hop.spec {
         Spec::Exec(_) => "exec",
         Spec::Connect { .. } => "portforward",
-        Spec::Migrate => unreachable!("answered above"),
+        Spec::Migrate => "migrate",
     };
     let audit = |outcome| {
         let what = vec![format!("pod {}/{}", hop.namespace, hop.pod)];
@@ -459,7 +461,8 @@ pub async fn hop(
             let key = format!("{holder}/{}/{owner}", hop.namespace);
             crate::kube::portforward::tunnel(&shared, &key, replica, port, upgrade).await
         }
-        Spec::Migrate => unreachable!("answered above"),
+        // (Answered above, by the node's certificate alone: a user's hop never gets here.)
+        Spec::Migrate => Err((StatusCode::FORBIDDEN, "a migration is a node's".to_string())),
     };
     if let Err((status, why)) = done {
         audit(Err(why.clone()));
