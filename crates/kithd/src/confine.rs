@@ -18,7 +18,8 @@
 //!
 //! All five are the calling thread's (the filter and the user ids every thread's). A thread made
 //! before keeps the mount namespace and the bounding set it had, so the serving part runs this
-//! while it is one thread, and what it starts after, it starts confined.
+//! while it is one thread (the mount namespace step counts `/proc/self/task` and refuses with
+//! more), and what it starts after, it starts confined.
 //!
 //! WHAT STAYS OPEN: the serving part keeps the node's network namespace, so it reaches the host's
 //! loopback and every abstract AF_UNIX socket of the node (the filter allows AF_UNIX, INET and
@@ -171,6 +172,15 @@ fn held_directories() -> Result<Vec<String>, String> {
     Ok(held)
 }
 
+/// Refused unless the process is one thread: `unshare` and the capability changes are the calling
+/// thread's, so every other thread would go on with the node's mounts and its bounding set.
+fn alone(threads: usize) -> Result<(), String> {
+    match threads {
+        1 => Ok(()),
+        n => Err(format!("it has {n} threads: the confinement is made while it is one")),
+    }
+}
+
 /// The steps on this process.
 pub struct System;
 
@@ -193,6 +203,11 @@ impl Steps for System {
                 held.join(", ")
             ));
         }
+        // (And one thread: a thread made before keeps the namespace and the bounding set it had.)
+        let threads = std::fs::read_dir("/proc/self/task")
+            .map_err(|e| format!("its threads are not listed: {e}"))?
+            .count();
+        alone(threads)?;
         kith_dm_sys::unshare_mounts().map_err(|e| said("unshare")(&e))?;
         // What the node mounts after this must not reach in, nor what is done here reach out.
         mount(none, "/", none, MsFlags::MS_REC | MsFlags::MS_PRIVATE, none).map_err(|e| said("private")(&e))?;
@@ -364,10 +379,11 @@ fn report(plan: &Plan, listener: std::net::TcpListener, mut store: std::fs::File
     let cap = kith_dm_sys::capset([1 << 21; 3]);
     say(format!("capability {}", word(cap.is_err())));
     // (The node's disk: nothing of it is in the root, and a device of it is not a name there.)
-    let names: Vec<_> = std::fs::read_dir("/")
+    let mut names: Vec<_> = std::fs::read_dir("/")
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .collect();
+    names.sort();
     let on_disk = std::fs::File::open("/etc/passwd").is_ok() || std::fs::read_dir("/dev").is_ok();
     say(format!("root {names:?}"));
     say(format!("disk {}", word(!on_disk)));
@@ -552,6 +568,13 @@ mod tests {
         );
         assert_eq!(done, Err("in use".to_string()));
         assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn confine_is_made_by_one_thread_alone() {
+        assert!(alone(1).is_ok());
+        assert!(alone(2).unwrap_err().contains("2 threads"));
+        assert!(alone(0).is_err());
     }
 
     #[test]

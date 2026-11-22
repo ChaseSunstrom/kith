@@ -1711,6 +1711,15 @@ pub fn split() -> std::io::Result<std::os::fd::OwnedFd> {
     Ok(theirs)
 }
 
+/// The serving part's end closed: the root part returns from [`serve_split`] alone, and kithd
+/// ends with it. (The `confine-probe` build's hook, for ci/vm/privilege.sh.)
+#[cfg(feature = "confine-probe")]
+pub fn end_split() {
+    if let Some(socket) = SPLIT.get() {
+        socket.hangup();
+    }
+}
+
 /// The root part of this node on its end of the socket pair: serves until the serving part's end
 /// is closed. (A thread of this process until the root part is a process of its own: T-0811.)
 pub fn serve_split(pods: &Mutex<Pods>, end: std::os::fd::OwnedFd) {
@@ -4793,6 +4802,35 @@ mod tests {
             let tcp = socket_of(socket.request(ask("127.0.0.1", 0, Proto::Tcp)));
             assert!(TcpListener::from(tcp).local_addr().is_ok());
         });
+    }
+
+    #[test]
+    fn root_part_socket_a_lock_taken_near_the_deadline_sends_nothing() {
+        let (book, _) = book("socket-late");
+        let root = Direct::with(Nobody, &book);
+        over_socket(&root, &Limits::default(), |mut socket| {
+            socket.deadline = Duration::from_millis(600);
+            socket.floor = Duration::from_millis(400);
+            // The call in flight ends at 300 ms: 300 ms are left of 600, less than the floor.
+            let why = std::thread::scope(|s| {
+                let (taken, wait) = std::sync::mpsc::channel();
+                let held = &socket;
+                s.spawn(move || {
+                    let _held = held.stuck();
+                    taken.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                });
+                wait.recv().unwrap();
+                socket.request(ask("127.0.0.1", 0, Proto::Tcp)).unwrap_err()
+            });
+            assert!(why.contains("too late"), "{why}");
+            // Nothing of it was sent: no socket was made, and the next call is answered as it is.
+            assert_eq!(book.total(), 0);
+            socket.floor = Duration::from_millis(1);
+            let tcp = socket_of(socket.request(ask("127.0.0.1", 0, Proto::Tcp)));
+            assert!(TcpListener::from(tcp).local_addr().is_ok());
+        });
+        assert_eq!(book.total(), 1);
     }
 
     #[test]

@@ -131,6 +131,9 @@ pub struct Socket {
     call: Mutex<u64>,
     /// (The tests set it, to make a call give up while a slow one is done.)
     pub(super) deadline: Duration,
+    /// The least time a call may have left once it holds the lock: with less, a unit made or
+    /// started would be done at the root part with no one left to hear it. (The tests set it.)
+    pub(super) floor: Duration,
 }
 
 impl Socket {
@@ -142,6 +145,7 @@ impl Socket {
             end,
             call: Mutex::new(0),
             deadline,
+            floor: Duration::from_secs(1),
         }
     }
 
@@ -149,6 +153,13 @@ impl Socket {
     pub fn pair(deadline: Duration) -> std::io::Result<(Socket, OwnedFd)> {
         let (mine, theirs) = socketpair()?;
         Ok((Socket::new(mine, deadline), theirs))
+    }
+
+    /// This end closed both ways: the root part's read ends and it returns, as it does when the
+    /// serving part is gone. (The `confine-probe` build's way to end the root part alone.)
+    #[cfg(feature = "confine-probe")]
+    pub fn hangup(&self) {
+        let _ = self.end.shutdown(Shutdown::Both);
     }
 
     /// The call lock, held: a call in flight that does not end. (For the tests.)
@@ -163,6 +174,8 @@ impl Socket {
         // (One time for the whole call: the wait for the call in flight, a stuck one holds the lock,
         // and the wait for the answer share `wait`, and the send is bounded by the socket's own.)
         let until = Instant::now() + wait;
+        // ponytail: a 5 ms poll of try_lock (std's Mutex has no timed lock); it runs only under
+        // --split, and one call waits at most `wait`. A Condvar with a timeout if the polling shows.
         let mut count = loop {
             match self.call.try_lock() {
                 Ok(count) => break count,
@@ -175,6 +188,12 @@ impl Socket {
                 }
             }
         };
+        // (A call whose lock came near its deadline sends nothing: a Create, Start or Unpack sent
+        // now is done at the root part while this one gives up, and the unit is left unheld.)
+        // The floor is no more than half of `wait`, so a short wait is not refused always.
+        if until.saturating_duration_since(Instant::now()) < self.floor.min(wait / 2) {
+            return Err("the root part's call in flight ended too late to send this one".into());
+        }
         *count += 1;
         let seq = *count;
         let bytes = serde_json::to_vec(&Ask { seq, call }).map_err(|e| format!("the root part's request: {e}"))?;

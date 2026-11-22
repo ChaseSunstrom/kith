@@ -1152,7 +1152,7 @@ const CLONE_NEW: u32 =
 
 /// What a serving part asks of `ioctl` (the request is the second argument): a socket or pipe
 /// made non-blocking or close-on-exec, the bytes waiting, and whether a stream is a terminal
-/// (`TCGETS`, which the C library asks to decide how to buffer). Not `TIOCSTI` (pushing input
+/// (`TCGETS`, which the C library asks to decide how to buffer) and its size (`TIOCGWINSZ`, 0x5413). Not `TIOCSTI` (pushing input
 /// into a terminal), `TIOCLINUX`, `TIOCSCTTY`, a terminal's settings, or a device's.
 const SERVING_IOCTLS: &[u32] = &[0x5421, 0x541B, 0x5451, 0x5450, 0x5401, 0x5413];
 /// What it asks of `prctl` (the option is the first): a thread's name, the parent-death signal,

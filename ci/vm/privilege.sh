@@ -42,6 +42,8 @@ EOF
                 # (Its mounts: its root, its state directory and /proc, and no other.)
                 mounts=$(grep -o 'confine: mountinfo .*' "$work/$job.said" | awk '{print $7}' | sort | tr '\n' ' ')
                 [ "$mounts" = "/ /proc /var/lib/kith/$job " ] || fail "$job: its mounts are not its own state directory's alone: $mounts"
+                # (Its root lists proc and var, and nothing else: the state directory's path is its way in.)
+                [ "$(grep -ao 'confine: root \[[^]]*\]' "$work/$job.said" | cut -d ' ' -f 3- | tr -d '\\')" = '["proc", "var"]' ] || fail "$job: its root is not proc and var alone: $(grep -a 'confine: root ' "$work/$job.said")"
                 # (Its state directory's mount: nosuid, nodev, noexec.)
                 grep "confine: mountinfo .* /var/lib/kith/$job " "$work/$job.said" | awk '{print $8}' | grep -q 'noexec' || fail "$job: its state directory is mounted with exec: $(grep "mountinfo .* /var/lib/kith/$job " "$work/$job.said")"
                 for held in 'serves ok' 'setuid refused' 'capability refused' 'disk refused' 'mount refused' 'procs refused \[\]' 'proc-global refused'; do
@@ -103,6 +105,35 @@ EOF
                 sleep 1
             done
             [ "$(said Workload ticker tick | grep -o 'tick: process [0-9]* started at [0-9]*')" = "$before" ] || fail "the pod's process was not the same after kithd was killed"
+            # The root part ended alone (the test build's hook: a file in the state directory closes the
+            # serving part's end of the socket): kithd ends with it, and the keeper starts both again.
+            ends=$(grep -ac 'kithd: init: kithd ended' "$work/n1.log")
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"endroot"},"spec":{"retries":0,"template":{"exec":[
+  {"name":"put","command":["/var/lib/kith/tools/pod","put","/var/lib/kith/end-root-part","now"]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job that ends the root part was not applied"
+            waited=0
+            until [ "$(grep -ac 'kithd: init: kithd ended' "$work/n1.log")" -gt "$ends" ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 1200 ] || fail "kithd did not end with its root part: $(grep -a 'root part' "$work/n1.log" | tail -n 3)"
+                sleep 0.1
+            done
+            grep -aq 'kithd: the root part ended: ending, to start both parts again' "$work/n1.log" || fail "kithd ended, but not as the root part's end: $(grep -a 'kithd' "$work/n1.log" | tail -n 5)"
+            ended=$(date +%s%N)
+            until patience=1 api 1 GET /v1/resources >/dev/null 2>&1; do
+                [ $(($(date +%s%N) - ended)) -lt 30000000000 ] || fail "kithd did not serve again within 30 s of its root part's end"
+                sleep 0.05
+            done
+            [ "$(grep -ac 'Kernel command line' "$work/n1.log")" = "$booted" ] || fail "the machine restarted when the root part ended"
+            ticks=$(said Workload ticker tick | grep -o 'tick [0-9]*' | tail -n 1 | cut -d ' ' -f 2)
+            waited=0
+            until [ "$(said Workload ticker tick | grep -o 'tick [0-9]*' | tail -n 1 | cut -d ' ' -f 2)" -gt "$ticks" ] 2>/dev/null; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "the pod did not tick on after the root part ended"
+                sleep 1
+            done
+            [ "$(said Workload ticker tick | grep -o 'tick: process [0-9]* started at [0-9]*')" = "$before" ] || fail "the pod's process was not the same after the root part ended"
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: one node with --split: the confined process holds uid and gid 4100, no capability in any set, no_new_privs, a filter, its own state directory's mount alone; setuid, a capability, the node's disk, a mount, a namespace made by clone, clone3 and TIOCSTI refused; kithd killed under a pod: started again, the pod the same process" >&2
+            echo "vm.sh: ok: one node with --split: the confined process holds uid and gid 4100, no capability in any set, no_new_privs, a filter, its own state directory's mount alone (a root of proc and var); setuid, a capability, the node's disk, a mount, a namespace made by clone, clone3 and TIOCSTI refused; kithd killed under a pod, and its root part ended alone: started again each time, the pod the same process" >&2
             exit 0

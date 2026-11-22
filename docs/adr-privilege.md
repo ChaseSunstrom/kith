@@ -280,12 +280,15 @@ alone), `clone` is refused
 when its flags hold any `CLONE_NEW*` bit (so no namespace is made, though `unshare` and `setns`
 are left out), `clone3` answers `ENOSYS` (its flags are behind a pointer a filter cannot read, and
 the C libraries fall back to `clone`), and `ioctl` and `prctl` pass only the requests and options
-the serving part makes (non-blocking, close-on-exec, bytes waiting, `TCGETS`; a thread's name,
+the serving part makes (non-blocking, close-on-exec, bytes waiting, `TCGETS` and `TIOCGWINSZ`; a thread's name,
 `no_new_privs` and dumpable as read or set): not `TIOCSTI`, `TIOCLINUX`, a terminal's settings,
 `PR_SET_MM` or `PR_CAP_AMBIENT`. A request the part meets that is not in the list is refused with
 `EPERM`: the list is read off the code and the VM run, and widened by a line when a run shows one
 (`msync`, `fadvise64`, `signalfd4`, `rt_sigtimedwait`, `epoll_pwait2` and `getcpu` are in it because a
-real serving part, a tokio server over a store file, makes them; `execve` and the fork family are not).
+real serving part, a tokio server over a store file, makes them; `execve` is not, and `fork` and
+`vfork` are, as the allow-list this one is made from has them: a child keeps the filter, the
+empty capability sets and the mount namespace, and it can run no program, so it is no more than a
+thread that is a process).
 `Plan::filter` off leaves the filter out and nothing else (the filter is the
 step most likely to meet a call the list lacks); it is `--no-filter` on the probe, and no kithd
 flag until the serving part is a process. `kithd confine-probe DIR` does the same steps on
