@@ -17,8 +17,12 @@
     # (KITH_OS_SPEC=os/examples/all.yaml tries the image of a spec instead of the plain one.)
     # (modules: the 'all' image, whose drivers are modules.)
     [ "$test" != modules ] || KITH_OS_SPEC=os/examples/all.yaml
+    # (modules-state: a spec whose one driver is a module on the state partition, in an image of its
+    # own; in a folder of its own, so the 'all' image stays what modules tests.)
+    [ "$test" != modules-state ] || KITH_OS_SPEC=os/examples/modules-state-test.yaml
     osdir=$root/target/os
     [ -z "${KITH_OS_SPEC:-}" ] || osdir=$root/target/os-spec
+    [ "$test" != modules-state ] || osdir=$root/target/os-modules-state
     # (access: the image of a kithd built with the feature forge, whose leader can append an entry it
     # was not asked for (ci/vm/access.sh); in a folder of its own, so the plain image stays plain.)
     [ "$test" != access ] || { KITHD_FEATURES=forge osdir=$root/target/os-forge; export KITHD_FEATURES; }
@@ -87,6 +91,9 @@
     fi
     if [ "$test" = modules ]; then
         . "$root/ci/vm/modules.sh"
+    fi
+    if [ "$test" = modules-state ]; then
+        . "$root/ci/vm/modules-state.sh"
     fi
     if [ "$test" = clock ]; then
         . "$root/ci/vm/clock.sh"

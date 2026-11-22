@@ -1479,6 +1479,7 @@ async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, m
         // (What the clock found is said too, and it changes by itself: `clock::CHANGED` wakes this.)
         let mut mine = mine.clone();
         mine.push(("clock", clock::status()));
+        mine.push(("modules", modules::status()));
         // (Not known until the store has this node: asked again when the store changes.)
         let says = {
             let state = shared.store.lock().expect("nothing panics holding the store");
