@@ -1039,33 +1039,6 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// The note of what a reference resolved to (the image index under `refs/`) carries its
-    /// format; one of a newer format than this build reads is refused, not read as if it were
-    /// its own, and one with no number is format 1 (T-0219).
-    #[tokio::test]
-    async fn state_file_format_image_index_newer_is_refused() {
-        let root = std::env::temp_dir().join(format!("kith-index-format-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = kith_runtime::ImageStore::new(root.clone()).unwrap();
-        let reference = "localhost:1/team/hello:1";
-        let note = root.join("refs").join("localhost:1%2fteam%2fhello:1");
-        std::fs::create_dir_all(note.parent().unwrap()).unwrap();
-        let never = kith_runtime::PullPolicy::Never;
-        // No number: format 1, read (the image it names is not here, so it is not an image).
-        std::fs::write(&note, r#"{"digest":"sha256:00"}"#).unwrap();
-        let why = store.pull(reference, never).await.unwrap_err().to_string();
-        assert!(why.contains("is not here"), "{why}");
-        let newer = kith_runtime::INDEX_FORMAT + 1;
-        std::fs::write(&note, format!(r#"{{"format":{newer},"digest":"sha256:00"}}"#)).unwrap();
-        let why = store.pull(reference, never).await.unwrap_err().to_string();
-        let index = kith_runtime::INDEX_FORMAT;
-        assert!(
-            why.contains(&format!("format {newer}")) && why.contains(&format!("up to format {index}")),
-            "{why}"
-        );
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
     /// Where something else has the registry's port, a start from an own Image says so: the
     /// port and why it could not be taken, not that a connection was refused or not trusted.
     #[tokio::test]

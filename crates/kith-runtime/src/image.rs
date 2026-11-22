@@ -30,23 +30,6 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::SystemTime;
 
-/// The newest format of a `refs/` note this build reads (and writes): a note with no number is 1.
-pub const INDEX_FORMAT: u32 = 1;
-
-/// `Err` for a `refs/` note of a format past [`INDEX_FORMAT`]; no `"format"` is 1 (T-0219).
-fn refuse_newer_json(file: &Path, note: Option<&serde_json::Value>) -> Result<()> {
-    let format = note
-        .and_then(|note| note["format"].as_u64())
-        .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX));
-    if format > INDEX_FORMAT {
-        return err(format!(
-            "{} is in format {format} and this kithd reads up to format {INDEX_FORMAT}: start the kithd that wrote it, or a newer one",
-            file.display()
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Clone)]
 pub struct ImageStore {
     root: PathBuf,
@@ -375,18 +358,10 @@ impl ImageStore {
                 found.push((hex.to_string(), used.max(floor)));
             }
         }
-        let mut kept = std::collections::BTreeSet::new();
-        for reference in keep {
-            if let Some(hex) = reference
-                .parse()
-                .ok()
-                .map(|reference| self.noted(&reference))
-                .transpose()?
-                .flatten()
-            {
-                kept.insert(hex);
-            }
-        }
+        let mut kept: std::collections::BTreeSet<String> = keep
+            .iter()
+            .filter_map(|reference| self.noted(&reference.parse().ok()?))
+            .collect();
         for named in self.bundles()? {
             let from = found.iter().map(|(hex, _)| hex);
             kept.extend(from.filter(|hex| named.contains(&format!("/images/{hex}/"))).cloned());
@@ -428,22 +403,9 @@ impl ImageStore {
     }
 
     /// The hex of the manifest `reference` resolved to when last pulled here, if it was.
-    /// A note of a newer format is an error: its image is not one to call unused.
-    fn noted(&self, reference: &Reference) -> Result<Option<String>> {
-        let Ok(file) = self.ref_file(reference) else {
-            return Ok(None);
-        };
-        let Some(saved) = fs::read(&file)
-            .ok()
-            .and_then(|saved| serde_json::from_slice::<serde_json::Value>(&saved).ok())
-        else {
-            return Ok(None);
-        };
-        refuse_newer_json(&file, Some(&saved))?;
-        Ok(saved["digest"]
-            .as_str()
-            .and_then(|digest| sha256_hex(digest).ok())
-            .map(str::to_string))
+    fn noted(&self, reference: &Reference) -> Option<String> {
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(self.ref_file(reference).ok()?).ok()?).ok()?;
+        Some(sha256_hex(saved["digest"].as_str()?).ok()?.to_string())
     }
 
     /// Where the store keeps its files.
@@ -546,8 +508,7 @@ impl ImageStore {
         fs::rename(&dir, &aside).ctx(format!("removing image {digest}"))?;
         // (Only for what it answers: a note of an image not here is asked again all the same.)
         for entry in fs::read_dir(self.root.join("refs")).into_iter().flatten().flatten() {
-            // (A note is a file the store wrote; nothing else is read. One of a newer format is
-            // dropped like the rest: the index is a cache, and the pull that finds none asks again.)
+            // (A note is a file the store wrote; nothing else is read.)
             let note = (entry.file_type().is_ok_and(|kind| kind.is_file())).then(|| fs::read(entry.path()).ok());
             let note = note.flatten();
             let note: Option<serde_json::Value> = note.and_then(|note| serde_json::from_slice(&note).ok());
@@ -650,24 +611,10 @@ impl ImageStore {
         Ok(self.root.join("refs").join(name))
     }
 
-    /// A note a newer kithd wrote (its `format` is past [`INDEX_FORMAT`]) is refused, with the
-    /// format said, not taken for no note; one with no `format` is format 1 (T-0219).
-    /// (The same words as `kith_store::refuse_newer_json`; this crate does not depend on the store.)
-    fn refuse_newer_note(&self, reference: &Reference) -> Result<()> {
-        let file = self.ref_file(reference)?;
-        let saved = fs::read(&file)
-            .ok()
-            .and_then(|saved| serde_json::from_slice(&saved).ok());
-        refuse_newer_json(&file, saved.as_ref())
-    }
-
     /// The image `reference` resolved to last time, if it is still unpacked here: what a pull would
-    /// find already stored, with no pull, no network and nothing written. (A note of a newer
-    /// format is none here: a pull says why, T-0219.)
+    /// find already stored, with no pull, no network and nothing written.
     pub fn here(&self, reference: &str) -> Option<Image> {
-        let reference = reference.parse().ok()?;
-        self.refuse_newer_note(&reference).ok()?;
-        self.cached(&reference)
+        self.cached(&reference.parse().ok()?)
     }
 
     /// The image `reference` resolved to last time, if it is still unpacked here.
@@ -746,7 +693,6 @@ impl ImageStore {
             .await
             .ctx("locking the images")?
             .ctx("locking the images")?;
-        self.refuse_newer_note(&reference)?;
         let here = self.cached(&reference);
         let signed = |image: &Image| keys.is_empty() || keys.iter().any(|key| image.signed_by.contains(&key.id));
         if own.is_none()
@@ -893,7 +839,7 @@ impl ImageStore {
         };
         // Remember the answer. Written whole, then renamed: a reader sees the old one or the new one.
         let saved = serde_json::json!({
-            "format": INDEX_FORMAT, "digest": image.digest, "entrypoint": image.entrypoint, "cmd": image.cmd,
+            "digest": image.digest, "entrypoint": image.entrypoint, "cmd": image.cmd,
             "env": image.env, "workingDir": image.working_dir, "user": image.user, "signedBy": image.signed_by,
         });
         // Best effort: the image is here either way, and without the note the next pull just asks again.
@@ -1483,24 +1429,6 @@ mod tests {
     }
 
     const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
-
-    /// A note of a format past INDEX_FORMAT is no image to call unused (T-0219).
-    #[test]
-    fn state_file_format_newer_note_is_not_taken_for_an_unused_image() {
-        let (dir, _) = sandbox("newer-note");
-        let store = ImageStore::new(dir.join("store")).unwrap();
-        let reference: Reference = "busybox".parse().unwrap();
-        let hex = "a".repeat(64);
-        fs::create_dir_all(dir.join("store/images").join(&hex)).unwrap();
-        fs::write(dir.join("store/images").join(&hex).join("config.json"), "{}").unwrap();
-        let note = |format: u32| serde_json::json!({ "format": format, "digest": format!("sha256:{hex}") });
-        let (file, keep) = (store.ref_file(&reference).unwrap(), ["busybox".to_string()]);
-        fs::write(&file, note(INDEX_FORMAT).to_string()).unwrap();
-        assert!(store.unused(&keep, SystemTime::UNIX_EPOCH).unwrap().is_empty());
-        fs::write(&file, note(INDEX_FORMAT + 1).to_string()).unwrap();
-        let said = store.unused(&keep, SystemTime::UNIX_EPOCH).unwrap_err().to_string();
-        assert!(said.contains(&format!("format {}", INDEX_FORMAT + 1)), "{said}");
-    }
 
     #[test]
     fn a_note_that_does_not_say_the_images_user_is_asked_again() {
@@ -3305,7 +3233,7 @@ mod tests {
         );
         assert_eq!(fs::read_dir(&refs).unwrap().count(), 1, "its note stayed");
         assert_eq!(
-            store.noted(&"b:1".parse().unwrap()).unwrap(),
+            store.noted(&"b:1".parse().unwrap()),
             sha256_hex(&b).ok().map(String::from)
         );
         assert!(!blob('2').exists(), "the layer only it named stayed");

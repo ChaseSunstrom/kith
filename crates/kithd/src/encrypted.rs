@@ -144,28 +144,10 @@ fn keep(state: &Path, dir: &Dir, key: &[u8]) -> Result<(), String> {
     }
 }
 
-/// The newest format of a kept key file this build reads. Format 1 is the bare key (`KEY` bytes),
-/// which is what this build writes too: a stamp ahead of the key would make a kithd of a release
-/// before it find no key where there is one. A later format begins `kith-volume-key format N\n`.
-const KEY_FORMAT: u32 = 1;
-
-/// The key this node keeps for the volume. A file of a format newer than this build reads is
-/// refused, not taken for no key (T-0219).
-fn held(state: &Path, dir: &Dir) -> Result<Option<Vec<u8>>, String> {
-    let path = kept(state, dir);
-    let Ok(key) = std::fs::read(&path) else {
-        return Ok(None);
-    };
-    const STAMP: &[u8] = b"kith-volume-key format ";
-    if let Some(rest) = key.strip_prefix(STAMP) {
-        let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
-        let format = std::str::from_utf8(&rest[..digits])
-            .ok()
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(u32::MAX);
-        kith_store::refuse_newer(&path, format, KEY_FORMAT)?;
-    }
-    Ok(Some(key).filter(|key| key.len() == KEY))
+/// The key this node keeps for the volume.
+fn held(state: &Path, dir: &Dir) -> Option<Vec<u8>> {
+    let key = std::fs::read(kept(state, dir)).ok();
+    key.filter(|key| key.len() == KEY)
 }
 
 /// The node at the other end and the volume it names, if it may have that volume's key.
@@ -191,16 +173,11 @@ pub async fn get(
     match (theirs(&shared, &peer, &namespace, &name), shared.logs.parent()) {
         (Err(why), _) => (StatusCode::FORBIDDEN, why).into_response(),
         (Ok(dir), Some(state)) => match held(state, &dir) {
-            Ok(Some(key)) => {
+            Some(key) => {
                 eprintln!("kithd: handed {} the key of its volume {namespace}/{name}", dir.node);
                 key.into_response()
             }
-            Ok(None) => StatusCode::NO_CONTENT.into_response(),
-            // (The state's path is this node's: said here, not to the peer.)
-            Err(why) => {
-                eprintln!("kithd: the key of {namespace}/{name} is not read: {why}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "format newer than this kithd reads").into_response()
-            }
+            None => StatusCode::NO_CONTENT.into_response(),
         },
         (Ok(_), None) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -873,38 +850,6 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// A kept key file is raw bytes in format 1 (what a kithd before the stamp wrote, and still
-    /// writes); a later format begins with its stamp. One newer than this kithd reads is refused,
-    /// not taken for no key, and not for another volume's (T-0219).
-    #[test]
-    fn state_file_format_volume_key_newer_is_refused() {
-        let dir = Dir {
-            namespace: "default".into(),
-            name: "vault".into(),
-            node: "a".into(),
-            path: String::new(),
-            encrypted: true,
-        };
-        let state = state("key-format");
-        let file = kept(&state, &dir);
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        let key = [7u8; KEY];
-        std::fs::write(&file, key).unwrap();
-        assert_eq!(held(&state, &dir).unwrap().as_deref(), Some(&key[..]));
-        let newer = KEY_FORMAT + 1;
-        std::fs::write(
-            &file,
-            [format!("kith-volume-key format {newer}\n").as_bytes(), &key].concat(),
-        )
-        .unwrap();
-        let said = held(&state, &dir).unwrap_err();
-        assert!(
-            said.contains(&format!("format {newer}")) && said.contains(&format!("up to format {KEY_FORMAT}")),
-            "{said}"
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
     fn state(name: &str) -> PathBuf {
         let state = std::env::temp_dir().join(format!("kith-encrypted-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state);
@@ -1037,13 +982,13 @@ spec: { node: a, path: /srv/data, size: 1Gi, encrypted: true }
 
         let state = state("keep");
         let (first, other) = ([7u8; KEY], [9u8; KEY]);
-        assert_eq!(held(&state, &dir).unwrap(), None);
+        assert_eq!(held(&state, &dir), None);
         keep(&state, &dir, &first).unwrap();
-        assert_eq!(held(&state, &dir).unwrap().as_deref(), Some(&first[..]));
+        assert_eq!(held(&state, &dir).as_deref(), Some(&first[..]));
         // The same again is kept already; another is refused, and the first stays.
         keep(&state, &dir, &first).unwrap();
         assert!(keep(&state, &dir, &other).unwrap_err().contains("keeps another key"));
-        assert_eq!(held(&state, &dir).unwrap().as_deref(), Some(&first[..]));
+        assert_eq!(held(&state, &dir).as_deref(), Some(&first[..]));
         // For this node's kithd alone to read, and nothing left beside it.
         let file = state.join("volume-keys/a/default/vault");
         assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);

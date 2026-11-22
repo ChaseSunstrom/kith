@@ -22,7 +22,7 @@ mod tlog;
 
 pub use container::*;
 pub use image::{
-    INDEX_FORMAT, Image, ImageStore, Local, Progress, PullPolicy, Unpacking, registry, repository, sha256_hex, warm_reference,
+    Image, ImageStore, Local, Progress, PullPolicy, Unpacking, registry, repository, sha256_hex, warm_reference,
 };
 pub use outside::{Patience, read_capped};
 pub use seccomp::REFUSED;
