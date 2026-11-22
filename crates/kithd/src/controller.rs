@@ -3,8 +3,7 @@
 //! what it sees in each one's status.
 //!
 // ponytail: this node's share of each (the scheduler says which replicas are its own).
-// Not handled, and said so in the status where it matters: exec probes. A container's
-// ports only name them (units share the host's network).
+// A container's ports only name them (units share the host's network).
 // A rolling update replaces one replica at a time. A replica that is a pod (as root, no
 // device, seat or volume, and room on the node for a second) is replaced by surge: the new
 // one starts beside the old (the generations take turns at ids with and without a `b`:
@@ -132,6 +131,8 @@ struct Slot {
     /// What its cgroup was last told for its node's seats (memory guaranteed, CPU limit), if
     /// anything; none again each time it starts.
     tuned: Option<(Option<u64>, Option<u64>)>,
+    /// Its template says `priority: idle` (T-1118): its cgroup is told so once it runs.
+    idle: bool,
     handle: Option<Handle>,
     state: &'static str,
     restarts: u32,
@@ -579,9 +580,7 @@ pub async fn run(
         }
     }
     controller.stop.store(true, Ordering::Relaxed);
-    for (id, slot) in &mut controller.slots {
-        stop(id, slot).await;
-    }
+    stop_all(&mut controller.slots, crate::init::handing_over()).await;
     // A count or removal holds directories of the state disk open: it is waited for, a little,
     // so the disk can be unmounted once kithd is gone.
     let counts = controller
@@ -607,6 +606,18 @@ pub async fn run(
             "kithd: gave up waiting after 2 s for {}: the state disk may be busy; what a removal left (the scratch and the scratch.* levels beside it, each listed once, at most four directories open, never `..`, never across a file system) goes as trees of their own at its pod's next count, or with its replica directory once the pod is gone; an image half removed is out of the images already, and goes at the next look at them",
             left.join(", ")
         );
+    }
+}
+
+/// Every unit stopped at kithd's end; but a hand-over to the next kithd (update.rs) stops none:
+/// they run on, and it takes them back.
+async fn stop_all(slots: &mut BTreeMap<String, Slot>, handing_over: bool) {
+    if handing_over {
+        eprintln!("kithd: handing over: units left running for the next kithd");
+        return;
+    }
+    for (id, slot) in slots {
+        stop(id, slot).await;
     }
 }
 
@@ -889,6 +900,15 @@ fn id_prefix(kind: &str, namespace: &str, name: &str) -> String {
     format!("{kind}_{namespace}_{name}_")
 }
 
+/// The Workload (`NS/NAME`) the unit with id `id` (`w_NS_NAME_REPLICA_UNIT`) is a unit of: what
+/// [`id_prefix`] made, read back. None for a Job's or a NodeWorkload's unit, and for what is no
+/// unit id.
+pub fn workload_of_unit(id: &str) -> Option<String> {
+    let mut parts = id.splitn(4, '_');
+    let (_, namespace, name, rest) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    (!rest.is_empty() && id.starts_with(&id_prefix("Workload", namespace, name))).then(|| format!("{namespace}/{name}"))
+}
+
 /// The id of the pod that replica `replica` of the resource with the store key `owner` is,
 /// where its template says `pod`: what its units' ids start with.
 pub fn pod_of(owner: &str, replica: u32) -> String {
@@ -970,6 +990,21 @@ fn live_gen(
         true => !new,
         false => new,
     }
+}
+
+/// Of a replica being replaced beside the old, the generation that answers: the one the status tells of.
+fn answers(
+    gens: &BTreeMap<(String, u32), bool>,
+    surging: &Surging,
+    slots: &BTreeMap<String, Slot>,
+    slot: &Slot,
+) -> bool {
+    is_second(slot) == live_gen(gens, surging, slots, &slot.owner, slot.replica)
+}
+
+/// What the status says of a unit: its revision and whether it is ready (a probe passed, if it has one).
+fn unit_status(slot: &Slot) -> Value {
+    json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts, "revision": slot.revision })
 }
 
 /// Every unit of the generation `b` of the replica is ready: it answers for the replica.
@@ -1653,6 +1688,7 @@ impl Controller {
                             tried: None,
                             accounted: false,
                             tuned: None,
+                            idle: template.priority == Some(kith_api::kinds::Priority::Idle),
                             handle: None,
                             state: "pending",
                             restarts: 0,
@@ -1831,6 +1867,7 @@ impl Controller {
                 || new.exit != slot.exit
                 || new.notes != slot.notes
                 || new.policy != slot.policy
+                || new.idle != slot.idle
                 || devices
                 || new.dmem != slot.dmem
                 || new.seat != slot.seat
@@ -2256,7 +2293,7 @@ impl Controller {
                             ("running", running_said(note, replaced), None, Instant::now());
                         if let Run::Container(c) = &slot.run {
                             let pod = slot.pod.as_ref().map(|(pod, _)| pod.clone());
-                            slot.probes = crate::probe::start(shared.clone(), c, pod);
+                            slot.probes = crate::probe::start(shared.clone(), c, id, pod);
                         }
                         job_moved = true;
                     }
@@ -2286,7 +2323,7 @@ impl Controller {
                 continue;
             };
             let asked = tunes.get(&slot.owner).copied();
-            if asked.is_none() && slot.tuned.is_none() {
+            if asked.is_none() && slot.tuned.is_none() && !slot.idle {
                 continue;
             }
             let (guaranteed, held_back) = asked.unwrap_or_default();
@@ -2303,7 +2340,11 @@ impl Controller {
                 own
             };
             if slot.tuned != Some((guaranteed, cpu)) {
-                match Direct::units().tune(handle, id, guaranteed, cpu) {
+                let memory = resources.as_ref().and_then(|r| r.memory.as_ref());
+                let idle = slot.idle.then(|| kith_runtime::Idle {
+                    memory_high: memory.map(|q| q.value() as u64),
+                });
+                match Direct::units().tune(handle, id, guaranteed, cpu, idle) {
                     Ok(refused) => {
                         for refused in refused {
                             eprintln!("kithd: {id}: its seat's arrangement is not all in place: {refused}");
@@ -2343,27 +2384,34 @@ impl Controller {
                 notes.extend(says.iter().map(|(_, said)| said.clone()));
             }
             // Of a replica being replaced beside the old, the one that answers.
-            let answers = |slot: &&Slot| {
-                is_second(slot) == live_gen(&self.gens, &self.surging, &self.slots, &slot.owner, slot.replica)
-            };
             let mine: Vec<&Slot> = self
                 .slots
                 .values()
                 .filter(|slot| slot.owner == key)
-                .filter(answers)
+                .filter(|slot| answers(&self.gens, &self.surging, &self.slots, slot))
                 .collect();
             let units: Vec<Value> = mine
                 .iter()
                 .map(|slot| {
-                    let mut c = json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts, "revision": slot.revision });
+                    let mut c = unit_status(slot);
                     if let Some(code) = slot.exit_code {
                         c["exitCode"] = json!(code);
                     }
                     if let Some(at) = slot.restarted {
                         c["restarted"] = json!(at);
                     }
-                    let said = says.iter().filter(|(r, _)| *r == slot.replica && me.is_some()).map(|(_, said)| said.as_str());
-                    let message: Vec<&str> = slot.message.as_deref().into_iter().chain(said).collect();
+                    let said = says
+                        .iter()
+                        .filter(|(r, _)| *r == slot.replica && me.is_some())
+                        .map(|(_, said)| said.as_str());
+                    let cannot = slot.probes.as_ref().and_then(|p| p.why());
+                    let message: Vec<&str> = slot
+                        .message
+                        .as_deref()
+                        .into_iter()
+                        .chain(cannot.as_deref())
+                        .chain(said)
+                        .collect();
                     if !message.is_empty() {
                         c["message"] = json!(message.join("; "));
                     }
@@ -3186,6 +3234,14 @@ fn node_root_refusal(said: String) -> String {
     }
 }
 
+/// A volume directory as the runtime is given it: the path it was taken at (what names it in a
+/// message) and the descriptor it is held by, which the runtime's mount, give and bind all go
+/// through, and the path never again.
+fn held_volume(volume: crate::volumes::VolumeDir) -> (PathBuf, Option<kith_runtime::Held>) {
+    let (fd, real) = volume.into_parts();
+    (real, Some(kith_runtime::Held::new(fd)))
+}
+
 /// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
 async fn start(
     shared: &Shared,
@@ -3216,6 +3272,8 @@ async fn start(
         // A NodeWorkload is the node's own: it keeps the node's users.
         host_users: slot.owner.starts_with("NodeWorkload/"),
         project,
+        // ("Kind/namespace/name": the share of the root part's descriptors a give is held to.)
+        namespace: slot.owner.split('/').nth(1).unwrap_or_default().into(),
         ..Unit::default()
     };
     // The volumes' directories are made here, on the node, under the state directory (the
@@ -3224,20 +3282,26 @@ async fn start(
     let state = logs.parent().unwrap_or(logs);
     for (dir, at, read_only) in &slot.volumes {
         // (Only a shared volume of another node ever gets here: `volumes::mounts`.)
-        let host = match mesh.filter(|(_, me)| *me != dir.node) {
-            Some((prefix, me)) => crate::share::mount(state, dir, prefix, me).await,
-            // (It makes the directory, and may ask the root part: blocking file I/O, not on the runtime.)
+        let taken = match mesh.filter(|(_, me)| *me != dir.node) {
+            // (Another node's is a mount of this one's own making, a path no tenant writes.)
+            Some((prefix, me)) => crate::share::mount(state, dir, prefix, me)
+                .await
+                .map(|host| (host, None)),
+            // The descriptor goes with the path it was taken at: the runtime mounts, gives and
+            // binds from it, and never opens that path again (T-1113). (It makes the directory,
+            // and may ask the root part: blocking file I/O, not on the runtime.)
             None => {
                 let (state, dir) = (state.to_path_buf(), dir.clone());
-                tokio::task::spawn_blocking(move || crate::root_part::volume(&state, &dir))
+                tokio::task::spawn_blocking(move || crate::root_part::volume(&state, &dir).map(held_volume))
                     .await
                     .map_err(|e| e.to_string())
                     .and_then(|made| made)
             }
         };
-        let host = host.map_err(|e| format!("volume {}: {e}", dir.name))?;
+        let (host, held) = taken.map_err(|e| format!("volume {}: {e}", dir.name))?;
         unit.mounts.push(kith_runtime::Mount {
             host,
+            held,
             container: at.clone(),
             read_only: *read_only,
             // (Not a directory of the host's that an admin named: that one is theirs. Nor
@@ -3270,6 +3334,7 @@ async fn start(
             };
             unit.mounts.push(kith_runtime::Mount {
                 host,
+                held: None,
                 container: mount.path.clone(),
                 // (A map's files are kithd's to write, never the container's.)
                 read_only: mount.read_only == Some(true) || mount.scratch.is_none(),
@@ -3297,6 +3362,7 @@ async fn start(
             let host = crate::workload_identity::files(shared, &pod, container, &identity).await?;
             unit.mounts.push(kith_runtime::Mount {
                 host,
+                held: None,
                 container: crate::workload_identity::MOUNTED_AT.into(),
                 read_only: true,
                 // (Made the container's user's: its mode lets nobody else read them.)
@@ -3314,6 +3380,7 @@ async fn start(
         made.map_err(|e| format!("seat {seat}: {e}"))?;
         unit.mounts.push(kith_runtime::Mount {
             host,
+            held: None,
             container: "/run/seat".into(),
             read_only: *client,
             give: !*client,
@@ -3356,6 +3423,7 @@ async fn start(
             for (file, at) in given.files.into_iter().zip(["/etc/resolv.conf", "/etc/hosts"]) {
                 unit.mounts.push(kith_runtime::Mount {
                     host: file,
+                    held: None,
                     container: at.into(),
                     read_only: true,
                     give: false,
@@ -3915,6 +3983,7 @@ mod tests {
             tried: None,
             accounted: false,
             tuned: None,
+            idle: false,
             handle: None,
             state: "pending",
             restarts: 0,
@@ -3977,6 +4046,62 @@ mod tests {
         // A new unit that failed to start does not take over.
         slots.get_mut(&new_id).unwrap().state = "failed";
         assert!(!second_is_live(&slots, "Workload/x/a", 0, true));
+    }
+
+    /// A rollout whose container has only an exec readiness probe: until the command has passed, the
+    /// status (and the Deployment kubectl reads off it) keeps the old copy's revision and counts, so
+    /// `kubectl rollout status` and `helm --wait` wait for the probe, not for the container to run.
+    #[tokio::test]
+    async fn rollout_waits_for_exec_readiness() {
+        let owner = "Workload/x/a";
+        let exec: Container = serde_json::from_value(json!({
+            "name": "app", "image": "img", "readiness": { "exec": ["test", "-f", "/tmp/ready"] },
+        }))
+        .unwrap();
+        assert!(crate::probe::problems(&exec).is_empty());
+        let (mut slots, mut gens, mut surging) = (BTreeMap::new(), BTreeMap::new(), Surging::new());
+        let (old_id, mut old) = surge_unit(false, "running");
+        old.revision = Some(1);
+        slots.insert(old_id, old);
+        let (new_id, mut new) = surge_unit(true, "running");
+        new.revision = Some(2);
+        // (Started with the probe running and not yet passed: what `probe::start` gives a container with one.)
+        let (probes, passed) = crate::probe::held(crate::probe::Health {
+            live: true,
+            ready: false,
+        });
+        new.probes = Some(probes);
+        slots.insert(new_id, new);
+        gens.insert((owner.to_string(), 0), true);
+        surging.insert((owner.to_string(), 0), (Instant::now(), None));
+
+        // The Deployment kubectl reads, over what the controller reports.
+        let read = |slots: &BTreeMap<String, Slot>| -> Value {
+            let units: Vec<Value> = slots
+                .values()
+                .filter(|slot| answers(&gens, &surging, slots, slot))
+                .map(unit_status)
+                .collect();
+            let resource: Resource = serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": "Workload",
+                "metadata": { "name": "a", "namespace": "x", "revision": 2 },
+                "spec": {}, "status": { "containers": units },
+            }))
+            .unwrap();
+            crate::kube::status_of("Deployment", &json!({ "spec": { "replicas": 1 } }), &resource).unwrap()
+        };
+        let counts = |status: &Value| {
+            ["replicas", "updatedReplicas", "readyReplicas", "availableReplicas"].map(|n| status[n].as_u64().unwrap())
+        };
+        // Running, the probe not passed: the old copy answers, at its own revision.
+        let before = read(&slots);
+        assert_eq!(counts(&before), [1, 0, 1, 1], "{before}");
+        assert_eq!(before["conditions"][1]["reason"], "ReplicaSetUpdated");
+        // The probe passes: the new copy answers.
+        passed.send_modify(|health| health.ready = true);
+        let after = read(&slots);
+        assert_eq!(counts(&after), [1, 1, 1, 1], "{after}");
+        assert_eq!(after["conditions"][1]["reason"], "NewReplicaSetAvailable");
     }
 
     /// What is held once (a volume, a device, the node's network) is not held by two replicas
@@ -4384,6 +4509,19 @@ mod tests {
         );
     }
 
+    /// The stop at kithd's end stops every unit, but not on a hand-over to the next kithd. (A slot
+    /// that is `leaving` with no handle is the unit stand-in: a stop clears the mark, a hand-over does not.)
+    #[tokio::test]
+    async fn a_hand_over_stops_no_unit() {
+        let mut ended = slot_of("Workload/a/b", &[], "app");
+        ended.leaving = true;
+        let mut slots = BTreeMap::from([("w_a_b_0_app".to_string(), ended)]);
+        stop_all(&mut slots, true).await;
+        assert!(slots["w_a_b_0_app"].leaving, "a hand-over leaves the unit as it is");
+        stop_all(&mut slots, false).await;
+        assert!(!slots["w_a_b_0_app"].leaving, "any other end stops it");
+    }
+
     /// An input device plugged into a running container is no reason to start it over, so the device
     /// alone does not make the slot differ. Only a container that runs takes them so; a DRI node, or
     /// an input device the unit did not start with, still restarts it.
@@ -4476,6 +4614,7 @@ mod tests {
             read_only: false,
             give: false,
             part: None,
+            held: None,
         };
         for over in ["/etc", "/etc/", "//etc"] {
             let why = hides_resolv(&[at("/data"), at(over)]).unwrap_or_else(|| panic!("{over}"));
@@ -4534,6 +4673,30 @@ mod tests {
         assert!(wait_for_storage(Vec::new(), Duration::from_millis(50)).await.is_empty());
     }
 
+    /// The runtime is handed the descriptor a volume directory is held by, and the path it was
+    /// taken at only as a name: the held directory is the one the path named when it was taken,
+    /// whatever the path names after (T-1113).
+    #[test]
+    fn a_volume_dir_goes_to_the_runtime_as_its_held_descriptor() {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!("kith-held-volume-{}", std::process::id()));
+        let (dir, away) = (root.join("data"), root.join("away"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&away).unwrap();
+        let fd = std::os::fd::OwnedFd::from(std::fs::File::open(&dir).unwrap());
+        let (host, held) = held_volume(crate::volumes::VolumeDir::from_parts(fd, dir.clone()));
+        assert_eq!(host, dir);
+        let held = held.expect("a volume dir is held by its descriptor");
+        // The path is swapped for a link to somewhere else: the descriptor is still the directory.
+        let before = std::fs::metadata(&dir).unwrap();
+        std::fs::rename(&dir, root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&away, &dir).unwrap();
+        let got = std::fs::metadata(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&held.fd()))).unwrap();
+        assert_eq!((got.dev(), got.ino()), (before.dev(), before.ino()));
+        assert_ne!(got.ino(), std::fs::metadata(&dir).unwrap().ino());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A Volume made for a claim that is gone has its directory removed by its own node once no
     /// unit mounts it, and only then is the Volume deleted; one a unit mounts waits.
     #[test]
@@ -4564,7 +4727,7 @@ spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volum
         let state = state.canonicalize().unwrap();
         let dir = crate::volumes::dir(&store, "default", "db").unwrap();
         let root = crate::volumes::host_dir(&state, &dir).unwrap();
-        std::fs::write(root.join("file"), "x").unwrap();
+        std::fs::write(root.held().join("file"), "x").unwrap();
         let data = state.join("volumes/default/db");
         // Not on another node, and not while a unit mounts it.
         let held = |store: &kith_api::store::Store| mounting(&crate::volumes::mounts(store, "a"));

@@ -76,6 +76,12 @@ the plan allowed 0.3 ms).
 - Without `--mesh` (kith OS's default) a Service still answers the pods of the node it is on:
   kithd puts the Service's address on the loopback, and its status says the address and
   backends as ever. Other nodes' replicas are out of reach, as no mesh carries them.
+- A cluster turns the mesh on for kith OS nodes with no reinstall: `spec.mesh: { enabled: true }`
+  (`port:` is the UDP port, 51820 without) on its `Cluster`. Every node started without `--mesh`,
+  the members already running included, brings `kith0` up within seconds, and takes it down
+  again, and goes back to loopback Services, when the switch is removed or set to `false`.
+  Nothing restarts. A node started with `--mesh` keeps it whatever the Cluster says. Off is the
+  default. At install, `mesh: true` in the answers starts a node with it on.
 - Each node gets a stable IPv6 address derived from the CA and its name; `kith get node/NAME -o
   yaml` shows it and the public key (`mesh`), `kith node status` the peers and their last
   handshakes. The private key stays in `<state>/pki`.
@@ -264,6 +270,23 @@ ready replica in turn, wherever it runs: kithd relays it, over the mesh if neede
 replica's port on `127.0.0.1` (or `::1`). TCP only; a named `targetPort` is a container port of
 that name. A kithd restart drops the connections through it.
 
+A Service also has an IPv4 address, `status.addressV4`, for a client with no IPv6: the leader gives
+it the first free address of the Service range (`--service-range ADDRESS/BITS` or
+`KITH_SERVICE_RANGE`, default `100.87.0.0/16`; give every node the same one), and the Service's name
+answers it as an A record beside the AAAA. kithd holds it on the loopback as a /32 and relays a
+connection to it as it does one to the mesh address. The range is
+refused if it overlaps the pod range, the people ranges or a network a link of the node holds (a
+default that overlaps is dropped with a warning: that node serves no IPv4 for Services and answers
+no A record, the others do). The default `100.87.0.0/16` is inside `100.64.0.0/10`, the shared
+(CGNAT) range Tailscale gives its addresses from: that check sees only the addresses the node holds
+when kithd starts, so a Tailscale or a link that comes up later, or on another node, is not
+caught. Where such a network is in use, name another range on every node. The next Service gets
+the free address after the highest in use, wrapping at the range's end: the address of a deleted
+Service is free again at once only if it was the highest, and otherwise after the allocation wraps.
+A pod reaches a Service only at its address and a port kithd listens on there (a TCP listener of
+the host on a Service's address at any other port is not open to pods, nor is a Service's port that
+a host listener on every address already holds: kithd cannot listen there).
+
 A Service with `headless: true` (`clusterIP: None` in Kubernetes) has no address of its own: its
 name answers the addresses of its ready replicas, and it cannot be `expose`d. Each ready replica
 is also named `NAME-N.SERVICE.NAMESPACE.svc.cluster.local` (a StatefulSet's pod names) under every
@@ -443,6 +466,19 @@ the mesh's loop, never holding it: until the first answer the holder is called w
 answer is kept and looked up again each minute (each half minute while it does not resolve), and
 kithd logs when it starts or stops resolving, not on each try.
 
+### Usage over time
+
+Each kithd samples its machine every 10 seconds (CPU, memory, the disk under `--state`, disk
+and network rates, load) and each unit of a Workload's replicas (CPU cores from its cgroup's
+`cpu.stat`, memory from `memory.current`), and keeps an hour of 10-second points and a day of
+5-minute points in memory: a restart starts them empty, and nothing goes through Raft or to
+disk. A Workload not seen for an hour is forgotten with its history, and at most 512 are kept.
+
+`GET /v1/metrics?range=15m|1h|6h|24h` on any node answers for all of them: the other nodes'
+series are asked over the node-to-node connection, each given 3 seconds, and one that does not
+answer is `"missing": true` with empty series. A Workload with replicas on several nodes is
+under `NS/NAME` for the first node by name and `NS/NAME@NODE` for each other.
+
 ### Not yet
 
 - Workloads have no mesh addresses (Services do); two nodes behind NATs that give a port per
@@ -460,9 +496,12 @@ kithd logs when it starts or stops resolving, not on each try.
 ## Restarting a node on purpose
 
 Drain a node before restarting or upgrading it. A drain cordons it and adds the `kith.dev/drain`
-taint (`NoExecute`): movable replicas start elsewhere; ones pinned by a Volume, a Device or
-placement stay, as does a running Job (a drain never stops one), and the plan says why, before
-anything changes.
+taint (`NoExecute`): movable replicas start elsewhere, and so do those pinned only by a
+[replicated Volume](storage.md#replicas) with a copy on another node (the drain hands the Volume
+over to that copy, once it is current, and the plan says it moves); ones pinned by a Volume with
+no other copy (or a `shared` or `kith-system` one), a Device or placement stay, as does a running
+Job (a drain never stops one), and the plan says why, before anything changes. A copy that
+cannot be brought up to date leaves the Volume and what mounts it where they are.
 
 ```sh
 kith node drain n1 --dry-run   # says what moves and what stays, and why; changes nothing
@@ -486,8 +525,19 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
   does](os.md#rolling-a-release-through-the-cluster)): it drains the node, restarts it once each replica the
   plan says moves runs on another node (a replica that stays holds nothing), and lifts the drain
   when the node is done, the plan is paused or changed, its OSRelease is gone, or the node leaves
-  its selector. It waits at most `drainSeconds` (300 unless said, 3600 at most). It lifts only a
-  drain it put on: yours, put on first, stays until you undrain.
+  its selector, or the plan is deleted. It waits at most `drainSeconds` (300 unless said, 3600 at
+  most). It lifts only a drain it put on: yours, put on first, stays until you undrain. The plan's
+  name is in the value of its taints (`plan:NAME`), which is how a deleted plan's drain and cordon
+  are found and lifted; a taint without it is never lifted by a plan. A plan that picks a node
+  whose drain a deleted plan left takes that drain over. Three things to know:
+  - The taint values `plan:NAME` and `owner;plan:NAME` are reserved for this; do not set them.
+  - The plan's name can be read by anyone who may read Nodes (`Node.spec.taints[].value`).
+  - During a rolling upgrade, an older kithd reads only the exact value `owner`, so on a node
+    with `owner;plan:NAME` it may lift a cordon that was an operator's, or leave one stuck until
+    `kith node uncordon`. Finish the upgrade before you run an UpdatePlan with `drain: true`.
+  - A plan lifts only a drain or cordon that carries its own stamp. One an older kithd put on
+    has none, so it stays after the plan ends or is deleted, until `kith node undrain` or
+    `kith node uncordon`.
 
 ### Checkpointing a long GPU Job
 

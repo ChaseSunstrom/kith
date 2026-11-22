@@ -58,21 +58,21 @@ EOF
             k get ingress shop 2>&1 | grep -q shop.example.com || fail "the Ingress does not say its host: $(k get ingress 2>&1)"
             must 'kubectl logs of a running pod' k logs shop-0
             must 'kubectl describe of a running pod' k describe pod shop-0
-            # The ways into a running pod are not here, and say so.
-            if timeout 60 env HOME="$work/home" KUBECONFIG="$work/kubeconfig" "$kubectl" port-forward shop-0 "$((port + 10)):80" >"$work/said" 2>&1; then
-                fail "kubectl port-forward was answered"
+            # exec is answered (the StatefulSet of three below goes on to cp and port-forward across the nodes); attach is refused in words.
+            must 'kubectl exec of a running pod' k exec shop-0 -- true
+            if timeout 60 env HOME="$work/home" KUBECONFIG="$work/kubeconfig" "$kubectl" attach shop-0 >"$work/said" 2>&1; then
+                fail "kubectl attach was answered"
             fi
-            grep -q 'not answered here' "$work/said" || fail "kubectl port-forward was not refused in words: $(cat "$work/said")"
 
             # A Job, and a CronJob's Job made by the clock: each hears the three of the shop,
             # what they were told, and the db, which has started once.
             must 'kubectl apply of the Job and the CronJob' k apply -f "$root/ci/kube/jobs.yaml"
             heard ask 'shop-0 hello hunter2' 'shop-1 hello hunter2' 'shop-2 hello hunter2' 'db-0 started 1'
             # The replica's own name and the headless Service's name answer an address each
-            # (AAAA: a client that asks for IPv6, which getaddrinfo does); the pod says so, a
-            # line a name. Anchored, so each line is its own name's: with one replica the
+            # (AAAA: a client that asks for IPv6, which getaddrinfo does; the Service's name
+            # answers its IPv4 address too, so its list has both); the pod says so, a line a name. Anchored, so each line is its own name's: with one replica the
             # headless answer is db-0's address, and not the db Service's.
-            heard replicas '^db-0.db-replicas.default.svc.cluster.local: \["[0-9a-f]*:' '^db-replicas.default.svc.cluster.local: \["[0-9a-f]*:' '^db.default.svc.cluster.local: \["[0-9a-f]*:'
+            heard replicas '^db-0.db-replicas.default.svc.cluster.local: \["[0-9a-f]*:' '^db-replicas.default.svc.cluster.local: \["[0-9a-f]*:' '^db.default.svc.cluster.local: \[.*"[0-9a-f]*:[0-9a-f:]*"'
             own=$(sed -n 's/^db-0\.db-replicas\.default\.svc\.cluster\.local: //p' "$work/replicas.out")
             headless=$(sed -n 's/^db-replicas\.default\.svc\.cluster\.local: //p' "$work/replicas.out")
             svc=$(sed -n 's/^db\.default\.svc\.cluster\.local: //p' "$work/replicas.out")
@@ -90,6 +90,31 @@ EOF
             must 'the StatefulSet did not roll out again' k rollout status statefulset/db --timeout=240s
             must 'kubectl create job --from' k create job again --from=cronjob/tick
             heard again 'db-0 started 2'
+
+            # The Service's IPv4 address (--service-range): a client reaches a Service by the
+            # A record its resolver at the pod range's IPv4 gateway answers with, and by that
+            # address as a literal (which a fallback to IPv6 cannot do). (The replica's peer is
+            # kithd's own connection on the pod's loopback, whose family kithd picks: not asserted.) (A pod cannot turn IPv6 off in its own
+            # namespace, its /proc/sys is read-only: the pod says whether it did, and a
+            # namespace with it off is proved in kith-mesh's pod tests.) The replicas are
+            # on both nodes, so with the client on one, the Service's connections reach one on
+            # its own node and one on the other. A client with IPv6 is still given the AAAA.
+            must 'kubectl apply of the Service with an IPv4 address' k apply -f "$root/ci/kube/v4.yaml"
+            must 'the Deployment behind the IPv4 Service did not roll out' k rollout status deployment/echo4 --timeout=240s
+            must 'kubectl apply of the clients of the IPv4 Service' k apply -f "$root/ci/kube/v4clients.yaml"
+            heard v4only '^ipv6: ' '^addresses: \[100\.87\.[0-9]*\.[0-9]*\]' 'name: HTTP/1.0 200 OK echo4-[0-9] peer[46] ' 'literal: HTTP/1.0 200 OK echo4-[0-9] peer[46] '
+            ! grep -q 'failed' "$work/v4only.out" || fail "a connection to the IPv4 Service failed: $(cat "$work/v4only.out")"
+            must 'kubectl create job, to look the IPv4 Service up with IPv6 on' k create job both --image=kith.test/pod:1 -- /bin/pod lookup echo4.default.svc.cluster.local
+            heard both '^echo4.default.svc.cluster.local: \[.*"100\.87\.[0-9.]*"' '^echo4.default.svc.cluster.local: \[.*"[0-9a-f]*:[0-9a-f:]*"'
+            k get pods -o 'jsonpath={range .items[*]}{.metadata.name} {.spec.nodeName}{"\n"}{end}' >"$work/where" 2>&1 || fail "kubectl get pods: $(cat "$work/where")"
+            client=$(sed -n 's/^v4only[^ ]* //p' "$work/where")
+            [ -n "$client" ] || fail "the client's node is not said: $(cat "$work/where")"
+            grep "^echo4-[0-9] $client\$" "$work/where" >/dev/null || fail "no replica on the client's node $client: $(cat "$work/where")"
+            grep "^echo4-[0-9] " "$work/where" | grep -v " $client\$" >/dev/null || fail "no replica on the other node than $client: $(cat "$work/where")"
+            for replica in $(sed -n 's/^\(echo4-[0-9]\) .*/\1/p' "$work/where"); do
+                grep -q "name: HTTP/1.0 200 OK $replica peer[46] " "$work/v4only.out" || fail "the client's connections by name never reached $replica: $(cat "$work/v4only.out") on $(cat "$work/where")"
+            done
+            must 'kubectl delete of the Service with an IPv4 address' k delete deployment/echo4 service/echo4 job/v4only job/both
 
             # What a stock chart says of a pod beyond its image (ci/kube/files.yaml): a
             # ConfigMap and a Secret as files, directories of its own, what it is told from
@@ -161,6 +186,19 @@ EOF
             must 'the Deployment made by hand did not roll out again' k rollout status deployment/made --timeout=240s
             said=$(k get deployment made -o 'jsonpath={.status.readyReplicas} {.spec.template.spec.containers[0].image}' 2>&1)
             [ "$said" = '3 kith.test/pod:again' ] || fail "the Deployment made by hand says: $said"
+            # A pod whose readinessProbe is an exec (ci/kube/gate.yaml: its file comes five seconds after it
+            # starts): a rollout that has come back has pods each with the file, none called ready before.
+            must 'kubectl apply of the Deployment gated by an exec probe' k apply -f "$root/ci/kube/gate.yaml"
+            must 'the gated Deployment did not roll out' k rollout status deployment/gate --timeout=240s
+            must 'kubectl set env' k set env deployment/gate ROUND=2
+            must 'the gated Deployment did not roll out again' k rollout status deployment/gate --timeout=240s
+            for pod in $(k get pods -l app=gate -o name); do
+                if ! k exec "$pod" -- cat /gate/ready >"$work/said" 2>&1; then
+                    ! k get "$pod" >/dev/null 2>&1 || fail "a rollout of the gated Deployment came back before $pod was ready: $(cat "$work/said")"
+                fi
+            done
+            said=$(k get deployment gate -o 'jsonpath={.status.readyReplicas} {.status.updatedReplicas}' 2>&1)
+            [ "$said" = '3 3' ] || fail "the gated Deployment says: $said"
             must 'kubectl create job' k create job ask-made --image=kith.test/pod:1 -- /bin/pod ask made 80
             heard ask-made made-0 made-1 made-2
 
@@ -210,11 +248,71 @@ EOF
             must 'kubectl rollout restart of the StatefulSet of three' k rollout restart statefulset/ring
             must 'the StatefulSet of three did not roll out again' k rollout status statefulset/ring --timeout=240s
             [ "$(ring_nodes)" = "$ringed" ] || fail "a replica came back on another node than its volume's: before $ringed, after $(ring_nodes)"
+
+            # kubectl exec, cp and port-forward, asked of n1 for each replica: at least one runs on n2,
+            # so its request crosses to that node by the one route a node sends a pod's traffic by.
+            # exec: each replica's own hostname and the file its volume keeps, as a stream of bytes.
+            remote=''
+            for n in 0 1 2; do
+                said=$(k exec "ring-$n" -- cat /proc/sys/kernel/hostname 2>&1) || fail "kubectl exec of ring-$n: $said"
+                [ "$said" = "ring-$n" ] || fail "kubectl exec of ring-$n ran in another pod: $said"
+                started=$(k exec "ring-$n" -- cat /data/started 2>&1) || fail "kubectl exec of ring-$n, to read its volume: $started"
+                [ -n "$started" ] && [ "$(echo "$started" | grep -cvx started)" = 0 ] || fail "ring-$n's volume does not say it started: $started"
+                [ "$(k get pod "ring-$n" -o 'jsonpath={.spec.nodeName}')" = n1 ] || remote=ring-$n
+            done
+            [ -n "$remote" ] || fail "no replica of the three is on the second node: $ringed"
+            # cp, both ways with a compare, and what the pod holds read by exec (a tar run by exec: bytes of any value).
+            head -c 300000 /dev/urandom >"$work/up"
+            must "kubectl cp to $remote" k cp "$work/up" "$remote:/data/up"
+            must "kubectl cp from $remote" k cp "$remote:/data/up" "$work/down"
+            cmp "$work/up" "$work/down" || fail "what kubectl cp took from $remote is not what it was given: $(ls -l "$work/up" "$work/down")"
+            k exec "$remote" -- cat /data/up >"$work/held" 2>"$work/said" || fail "kubectl exec of $remote, to read what cp put there: $(cat "$work/said")"
+            cmp "$work/up" "$work/held" || fail "what $remote holds is not what kubectl cp gave it: $(ls -l "$work/up" "$work/held")"
+            # port-forward: a local port that reaches the pod's port 80, which answers with its name.
+            env HOME="$work/home" KUBECONFIG="$work/kubeconfig" "$kubectl" port-forward "pod/$remote" :80 >"$work/forward" 2>&1 &
+            forward=$!
+            vms="$vms $forward"
+            waited=0
+            until forwarded=$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 80$/\1/p' "$work/forward") && [ -n "$forwarded" ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "kubectl port-forward to $remote did not say where it listens: $(cat "$work/forward")"
+                sleep 1
+            done
+            curl -s --max-time 20 "http://127.0.0.1:$forwarded/" >"$work/forwarded" 2>&1 || fail "no answer through kubectl port-forward to $remote: $(cat "$work/forwarded" "$work/forward")"
+            grep -q "$remote" "$work/forwarded" || fail "port-forward to $remote was answered by another pod: $(cat "$work/forwarded")"
+            kill "$forward"
+            wait "$forward" 2>/dev/null || true
+            # A person who may read and not exec (the admin's Role, taken down to that) is refused all
+            # three, in words, and may still read; given the right back, exec answers again.
+            printf '%s' '[{"apiVersion":"kith.dev/v1","kind":"Role","metadata":{"name":"cluster-admin"},"spec":{"rules":[{"kinds":["*"],"verbs":["get","list","watch"]},{"kinds":["Role","RoleBinding"],"verbs":["apply"]}]}}]' >"$work/reader.json"
+            printf '%s' '[{"apiVersion":"kith.dev/v1","kind":"Role","metadata":{"name":"cluster-admin"},"spec":{"rules":[{"kinds":["*"],"verbs":["get","list","watch","apply","delete","exec"]}]}}]' >"$work/admin.json"
+            api 1 POST /v1/apply "$work/reader.json" >/dev/null || fail "the admin's Role was not taken down to reading"
+            waited=0
+            while k exec "$remote" -- true >"$work/said" 2>&1; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 30 ] || fail "kubectl exec of $remote was answered for a person who may only read"
+                sleep 1
+            done
+            grep -qi "forbidden\|may not" "$work/said" || fail "kubectl exec was refused, not in words: $(cat "$work/said")"
+            ! k cp "$remote:/data/up" "$work/refused" >"$work/said" 2>&1 || fail "kubectl cp was answered for a person who may only read"
+            grep -qi "forbidden\|may not" "$work/said" || fail "kubectl cp was refused, not in words: $(cat "$work/said")"
+            ! timeout 60 env HOME="$work/home" KUBECONFIG="$work/kubeconfig" "$kubectl" port-forward "pod/$remote" :80 >"$work/said" 2>&1 || fail "kubectl port-forward was answered for a person who may only read"
+            grep -qi "forbidden\|may not" "$work/said" || fail "kubectl port-forward was refused, not in words: $(cat "$work/said")"
+            ! [ -e "$work/refused" ] || fail "kubectl cp wrote a file though it was refused"
+            must "kubectl get of $remote, which the reader may do" k get pod "$remote"
+            api 1 POST /v1/apply "$work/admin.json" >/dev/null || fail "the admin's Role was not given back"
+            waited=0
+            until k exec "$remote" -- true >"$work/said" 2>&1; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 30 ] || fail "kubectl exec of $remote is refused though the Role was given back: $(cat "$work/said")"
+                sleep 1
+            done
+
             must 'kubectl delete of one replica'"'"'s claim' k delete pvc data-ring-1
             [ "$(k get pod ring-1 -o 'jsonpath={.status.phase}' 2>&1)" = Running ] || fail "the replica whose claim was deleted stopped: $(k get pods 2>&1)"
 
             # Deleted, nothing of it is left: not the volume made for the claim either.
-            must 'kubectl delete of the manifests' k delete -f "$root/ci/kube"
+            must 'kubectl delete of the manifests' k delete --ignore-not-found -f "$root/ci/kube"
             must 'kubectl delete of what was made by hand' k delete deployment,service made
             must 'kubectl delete of the Jobs made by hand' k delete job again ask-made
             must 'kubectl delete of the claims' k delete pvc data-db-0 data-ring-0 data-ring-2
@@ -238,5 +336,5 @@ for r in found:
             done
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes, and kubectl and helm as they are shipped asking the first: manifests written for Kubernetes applied (a Deployment of three told things by a ConfigMap and a Secret, its Service and Ingress, a StatefulSet whose claim got a volume made for it, and one of three with a claim and a volume for each replica across the two nodes, each back on its own volume's node after a restart), rolled out and running; a Job and a CronJob's Job, made by the clock, heard all of them through their Services (kubectl wait, kubectl logs); after kubectl rollout restart the StatefulSet's new pod had the file the old one wrote; a pod as a chart writes one had a ConfigMap's files (changed in it when the ConfigMap was, with no restart) and one of them alone (subPath), a Secret's file from memory with the mode it asked, two directories of its own (one in memory), what it was told by envFrom and by its own fields, no capability as a user who is not root, and found what its initContainer left; root without two capabilities had the others; told runAsNonRoot an image that names no user did not start and said why; a Deployment made, exposed, scaled and given another image by hand rolled out each time; port-forward was refused in words; helm install, upgrade and uninstall with --wait came back when the chart was ready ($n of helm); deleted, nothing was left; $stock" >&2
+            echo "vm.sh: ok: two nodes, and kubectl and helm as they are shipped asking the first: manifests written for Kubernetes applied (a Deployment of three told things by a ConfigMap and a Secret, its Service and Ingress, a StatefulSet whose claim got a volume made for it, and one of three with a claim and a volume for each replica across the two nodes, each back on its own volume's node after a restart), rolled out and running; a Job and a CronJob's Job, made by the clock, heard all of them through their Services (kubectl wait, kubectl logs); after kubectl rollout restart the StatefulSet's new pod had the file the old one wrote; a pod as a chart writes one had a ConfigMap's files (changed in it when the ConfigMap was, with no restart) and one of them alone (subPath), a Secret's file from memory with the mode it asked, two directories of its own (one in memory), what it was told by envFrom and by its own fields, no capability as a user who is not root, and found what its initContainer left; root without two capabilities had the others; told runAsNonRoot an image that names no user did not start and said why; a Deployment made, exposed, scaled and given another image by hand rolled out each time; kubectl exec, cp (both ways, compared) and port-forward reached the replicas of the StatefulSet of three on both nodes through the first, and were refused in words to a person who may only read; attach was refused in words; helm install, upgrade and uninstall with --wait came back when the chart was ready ($n of helm); deleted, nothing was left; $stock" >&2
             exit 0

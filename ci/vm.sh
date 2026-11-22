@@ -35,6 +35,8 @@
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network; then on the mesh with
 #                               a second node that opens no links (of before), each sends to the other's
+#   sh ci/vm.sh --test mesh     two nodes started with no --mesh: the Cluster's spec.mesh turns the mesh on
+#                               with no reinstall; a pod on one reaches a Service whose replica is on the other
 #   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) and media.yml
 #                               (eight, the media stack's shape) imported with kith import compose, applied,
 #                               ready, each asked for by its compose name; KITH_E2E=1 also runs media.yml
@@ -42,6 +44,8 @@
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
 #                               kills in a minute restart the machine
+#   sh ci/vm.sh --test handover one node: a kithd-only release taken with no restart (boot id and pod
+#                               process kept, the new version reported); a changed kernel restarts it
 #   sh ci/vm.sh --test nested   one node: a container with kith's defaults, then with each opening in
 #                               turn, that starts a second runtime (bubblewrap) and kithd in agent mode and
 #                               says what refused each and the guest kernel's settings; the rows go to
@@ -222,6 +226,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    unit and a Job; the machine stays up, kithd serves again within
                    2 s and takes each back as it ran; killed ten times in a minute,
                    the machine restarts
+  --test handover  instead: one node on the mesh with ci/pod.rs as an image: a release that
+                   differs from the running slot in kithd alone is handed over to with no
+                   restart (same boot id, same pod process, the new version reported), and
+                   a release with another kernel restarts into the other slot (the test
+                   `update` runs it too, after its own)
   --test services  instead: one node with no --mesh (as kith OS starts) with ci/pod.rs as a container image
                    already there: a pod that sends back every byte it is sent, its
                    Service, and a Job on the same node sending through that Service
@@ -234,6 +243,14 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    with --mesh and a second joins it with KITH_NO_LINK set (kithd says
                    no `link` and opens none, as a node of before): a pod on each sends
                    through the Service of a pod on the other, both ways. Needs rustc for
+                   x86_64-unknown-linux-musl
+  --test mesh      instead: two nodes on disk files started with no --mesh (as kith OS starts),
+                   the second joined to the first: neither brings a mesh up. The Cluster then
+                   says spec.mesh {enabled: true} and both do, with no restart: kith0 up, an
+                   address in the cluster's /48 on each Node, and a Job in a pod on the first
+                   sends through a Service whose only replica is on the second, every byte
+                   back, reaching kithd at the Service's mesh address. The switch set to
+                   false takes each node's mesh status back. Needs rustc for
                    x86_64-unknown-linux-musl
   --test compose  instead: one node on the mesh, and on this machine `kith import
                    compose` of ci/compose/stack.yml (four services of the test pod,
@@ -388,7 +405,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | nested | nofile | alone | disk | clock | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, nested, nofile, fido2" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | nested | nofile | alone | disk | clock | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, disk, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, nested, nofile, fido2" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1

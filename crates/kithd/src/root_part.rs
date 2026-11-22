@@ -44,7 +44,7 @@ use socket::{Limits, SPLIT, Socket};
 use crate::pods::{Given, Pods};
 use crate::policy::Policy;
 use crate::volumes::Dir;
-use kith_runtime::{Handle, Image, ImageStore, Mount, Runtime, Unit};
+use kith_runtime::{Handle, Idle, Image, ImageStore, Mount, Runtime, Unit};
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,8 +68,9 @@ const OWN_PORTS: [u16; 3] = [7443, 5000, 51820];
 const MOST_SOCKETS: u8 = 16;
 /// The most name servers a pod's `resolv.conf` is given (the C library reads three).
 const MOST_NAMESERVERS: usize = 8;
-/// The most layers an image is unpacked from.
-const MOST_LAYERS: usize = 256;
+/// The most layers an image is unpacked from: each crosses the socket as a descriptor, so no
+/// more than one message carries ([`kith_dm_sys::MOST_FDS`]); one number, not two that differ.
+const MOST_LAYERS: usize = kith_dm_sys::MOST_FDS;
 /// The most memory one unit may be guaranteed (4 TiB), and the most CPU (1024 of them, in
 /// thousandths): a request for more is for what no node has.
 const MOST_GUARANTEED: u64 = 1 << 42;
@@ -157,11 +158,14 @@ pub enum Request {
     /// The unit `id` killed if it runs, and its cgroup, state and bundle removed.
     Delete { id: String },
     /// The unit `id`'s cgroup arranged: `guaranteed` bytes of memory not reclaimed from it (none:
-    /// no guarantee) and `cpu_millis` thousandths of a CPU (none: no limit).
+    /// no guarantee) and `cpu_millis` thousandths of a CPU (none: no limit), and in the idle
+    /// class if `idle` says so (T-1118; absent from an older sender's request: not idle).
     Tune {
         id: String,
         guaranteed: Option<u64>,
         cpu_millis: Option<u64>,
+        #[serde(default)]
+        idle: Option<Idle>,
     },
     /// The device node `device` (one a claim granted, of the kind that comes and goes) given to
     /// the unit `id` as it runs, and taken from it again.
@@ -217,8 +221,8 @@ impl Place {
 /// What a request gives back.
 #[derive(Debug)]
 pub enum Reply {
-    /// A Volume's directory, as the root part made it.
-    Path(PathBuf),
+    /// A Volume's directory, as the root part made it and holds it.
+    Dir(crate::volumes::VolumeDir),
     /// `(bytes, files, most files)` of a pod's project, or `None` when it has none.
     Usage(Option<(u64, u64, u64)>),
     /// The bytes an image's removal freed, or `None` when it stayed.
@@ -350,11 +354,18 @@ pub fn check(request: &Request) -> Result<(), String> {
             id,
             guaranteed,
             cpu_millis,
+            idle,
         } => {
             label("unit id", id)?;
             match (guaranteed, cpu_millis) {
                 (Some(bytes), _) if *bytes > MOST_GUARANTEED => {
                     Err(format!("{bytes} bytes guaranteed: at most {MOST_GUARANTEED}"))
+                }
+                _ if idle
+                    .and_then(|idle| idle.memory_high)
+                    .is_some_and(|bytes| bytes > MOST_GUARANTEED) =>
+                {
+                    Err(format!("memory.high above {MOST_GUARANTEED} bytes"))
                 }
                 (_, Some(millis)) if *millis > MOST_CPU_MILLIS => {
                     Err(format!("{millis} thousandths of a CPU: at most {MOST_CPU_MILLIS}"))
@@ -560,6 +571,20 @@ fn check_mount(mount: &Mount, ground: &Ground, id: &str) -> Result<(), String> {
     let Ok(real) = host.canonicalize() else {
         return refused("a path that does not resolve");
     };
+    // A volume that comes held is mounted, given and bound from its descriptor, and the path
+    // above is only what was judged: the descriptor must be that directory (T-1113).
+    if let Some(held) = &mount.held {
+        use std::os::unix::fs::MetadataExt;
+        let held = held
+            .fd()
+            .try_clone_to_owned()
+            .map(std::fs::File::from)
+            .and_then(|file| file.metadata());
+        match (held, std::fs::metadata(&real)) {
+            (Ok(held), Ok(named)) if (held.dev(), held.ino()) == (named.dev(), named.ino()) => {}
+            _ => return refused("the descriptor it is mounted from is not the directory it names"),
+        }
+    }
     let (pod, container) = id.rsplit_once('_').unwrap_or((id, ""));
     let replica = pod.strip_suffix('b').unwrap_or(pod);
     let given = "not a directory the node gives to a container's user: it may not be given";
@@ -629,6 +654,12 @@ pub fn check_unit(id: &str, unit: &Unit, ground: &Ground, owns: &dyn Fn(&Path) -
     }
     if let Some(hostname) = &unit.hostname {
         label("hostname", hostname)?;
+    }
+    // (The key of the give pool's share (`GiveSlots`), from the serving part: a name of the form
+    // every namespace has, so a start cannot be its own tenant by a fresh long one each time.
+    // Empty is the one bucket of units that name none.)
+    if !unit.namespace.is_empty() {
+        kith_api::check_name(&unit.namespace).map_err(|e| format!("namespace: {e}"))?;
     }
     if !unit.no_node_root
         && let Some(refusal) = policy.refusal("rootContainers")
@@ -767,12 +798,18 @@ impl Book {
     // own (T-0810) it is given these by its own arguments, which the serving part cannot change.
     pub fn set_mesh(&self, interface: String, port: u16, key: PathBuf, name: String) -> Result<(), String> {
         let mut told = self.mesh.lock().expect("nothing panics holding the book");
-        match told.as_ref() {
+        match told.as_mut() {
             Some(had) if (&had.interface, had.port, &had.key, &had.name) != (&interface, port, &key, &name) => {
-                Err(format!(
-                    "the mesh was told as {} of {} on port {}: not told again as another",
-                    had.interface, had.name, had.port
-                ))
+                // Down, the mesh is told again as another (a Cluster's other port, T-1076): the
+                // cluster's prefix stays. Up, it is not.
+                if had.up {
+                    return Err(format!(
+                        "the mesh was told as {} of {} on port {}: not told again as another while it is up",
+                        had.interface, had.name, had.port
+                    ));
+                }
+                (had.interface, had.port, had.key, had.name) = (interface, port, key, name);
+                Ok(())
             }
             Some(_) => Ok(()),
             None => {
@@ -869,6 +906,20 @@ pub fn usage(pod: &str) -> Option<(u64, u64, u64)> {
     }
 }
 
+/// A process run in the container `id` of this node (`kubectl exec`): in its namespaces, as its
+/// user, with its capabilities and filter. Only a unit made here is entered, which is what the
+/// id is checked against; what it reads and writes is the pipes of what comes back.
+// ponytail: not a request of the `Root` trait (the ADR names `Exec(id, argv, tty)`): as the one
+// part of kithd that is root or the node's user, kithd enters it in its own process, and the
+// trait takes it when a root part of its own does (then TTY too).
+pub fn enter(id: &str, argv: &[String]) -> Result<kith_runtime::Entered, String> {
+    if !BOOK.units.lock().expect("nothing panics holding the book").contains(id) {
+        return Err(format!("`{id}` is not a unit made here"));
+    }
+    let state = BOOK.state().ok_or("the state directory is not told yet")?;
+    kith_runtime::enter(&state.join("runtime"), id, argv).map_err(|e| e.to_string())
+}
+
 /// This process's mesh interface, once it is up: one per node.
 static DEVICE: Mutex<Option<kith_mesh::Device>> = Mutex::new(None);
 
@@ -912,7 +963,13 @@ pub trait Hands {
     /// Killed if it runs, then removed; one whose processes remain comes back with what refused it.
     fn delete(&self, made: Self::Made) -> Result<(), (Option<Self::Made>, String)>;
     /// What could not be written of the arrangement, in plain words.
-    fn tune(&self, made: &Self::Made, guaranteed: Option<u64>, cpu_millis: Option<u64>) -> Vec<String>;
+    fn tune(
+        &self,
+        made: &Self::Made,
+        guaranteed: Option<u64>,
+        cpu_millis: Option<u64>,
+        idle: Option<Idle>,
+    ) -> Vec<String>;
     fn plug(&self, made: &Self::Made, device: &Path) -> Result<(), String>;
     fn unplug(&self, made: &Self::Made, device: &Path) -> Result<(), String>;
 
@@ -1036,6 +1093,7 @@ pub trait Root {
         id: &str,
         guaranteed: Option<u64>,
         cpu_millis: Option<u64>,
+        idle: Option<Idle>,
     ) -> Result<Vec<String>, String>;
     fn plug(&self, made: &Self::Made, id: &str, device: &Path) -> Result<(), String>;
     fn unplug(&self, made: &Self::Made, id: &str, device: &Path) -> Result<(), String>;
@@ -1097,7 +1155,7 @@ impl Hands for Nobody {
     fn delete(&self, made: ()) -> Result<(), (Option<()>, String)> {
         Err((Some(made), "this root part runs no units".into()))
     }
-    fn tune(&self, _: &(), _: Option<u64>, _: Option<u64>) -> Vec<String> {
+    fn tune(&self, _: &(), _: Option<u64>, _: Option<u64>, _: Option<Idle>) -> Vec<String> {
         vec!["this root part runs no units".into()]
     }
     fn plug(&self, _: &(), _: &Path) -> Result<(), String> {
@@ -1197,8 +1255,8 @@ impl Hands for Today<'_> {
             .map_err(|undeleted| (undeleted.handle.map(|handle| *handle), undeleted.error.to_string()))
     }
 
-    fn tune(&self, made: &Handle, guaranteed: Option<u64>, cpu_millis: Option<u64>) -> Vec<String> {
-        kith_runtime::tune(&made.cgroup, guaranteed, cpu_millis)
+    fn tune(&self, made: &Handle, guaranteed: Option<u64>, cpu_millis: Option<u64>, idle: Option<Idle>) -> Vec<String> {
+        kith_runtime::tune(&made.cgroup, guaranteed, cpu_millis, idle)
     }
 
     fn plug(&self, made: &Handle, device: &Path) -> Result<(), String> {
@@ -1413,6 +1471,7 @@ impl<H: Hands> Root for Direct<'_, H> {
         id: &str,
         guaranteed: Option<u64>,
         cpu_millis: Option<u64>,
+        idle: Option<Idle>,
     ) -> Result<Vec<String>, String> {
         self.unit(
             Kind::Tune,
@@ -1420,10 +1479,11 @@ impl<H: Hands> Root for Direct<'_, H> {
                 id: id.into(),
                 guaranteed,
                 cpu_millis,
+                idle,
             },
         )?;
         self.bound(made, id)?;
-        Ok(self.hands.tune(made, guaranteed, cpu_millis))
+        Ok(self.hands.tune(made, guaranteed, cpu_millis, idle))
     }
 
     fn plug(&self, made: &H::Made, id: &str, device: &Path) -> Result<(), String> {
@@ -1545,7 +1605,7 @@ impl<H: Hands> Direct<'_, H> {
             node: String::new(),
             encrypted: volume.encrypted,
         };
-        crate::volumes::host_dir_under(&state, &dir, &self.policy()).map(Reply::Path)
+        crate::volumes::host_dir_under(&state, &dir, &self.policy()).map(Reply::Dir)
     }
 
     fn act(&self, request: Request, files: Vec<File>) -> Result<Reply, String> {
@@ -1703,28 +1763,29 @@ fn asked_of_volumes(state: &Path, request: Request) -> Result<Reply, String> {
     }
 }
 
-fn path_of(state: &Path, request: Request) -> Result<PathBuf, String> {
+fn dir_of(state: &Path, request: Request) -> Result<crate::volumes::VolumeDir, String> {
     match asked_of_volumes(state, request)? {
-        Reply::Path(path) => Ok(path),
+        Reply::Dir(dir) => Ok(dir),
         _ => Err("the root part answered a volume with another reply".into()),
     }
 }
 
 /// The directory of the Volume `dir` on this node, made if it is not there: for what mounts it,
-/// reads it (a backup, a replica's source, a download).
-pub fn volume(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
-    path_of(state, Request::Volume { volume: Place::of(dir) })
+/// reads it (a backup, a replica's source, a download). It derefs to a path through the held
+/// descriptor, so it is read where it was taken: keep it for as long as it is used.
+pub fn volume(state: &Path, dir: &Dir) -> Result<crate::volumes::VolumeDir, String> {
+    dir_of(state, Request::Volume { volume: Place::of(dir) })
 }
 
 /// The directory of the Volume `dir` to write into (an upload, a replica's copy): the files made
 /// take the directory's own owner.
-pub fn open(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
-    path_of(state, Request::Open { volume: Place::of(dir) })
+pub fn open(state: &Path, dir: &Dir) -> Result<crate::volumes::VolumeDir, String> {
+    dir_of(state, Request::Open { volume: Place::of(dir) })
 }
 
 /// The directory of the Volume `dir` a backup is restored into.
-pub fn restore(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
-    path_of(state, Request::Restore { volume: Place::of(dir) })
+pub fn restore(state: &Path, dir: &Dir) -> Result<crate::volumes::VolumeDir, String> {
+    dir_of(state, Request::Restore { volume: Place::of(dir) })
 }
 
 /// The data of the Volume `dir` removed from this node (not there is done).
@@ -1952,6 +2013,8 @@ mod tests {
         failing: Mutex<Vec<&'static str>>,
         /// The units a run before this one left, for `adopt`.
         left: Mutex<Vec<&'static str>>,
+        /// The ports `mesh_up` was asked for, in order.
+        ports: Mutex<Vec<u16>>,
         /// How many of the mesh's calls are inside one at once, and the most there were.
         inside: AtomicUsize,
         most: AtomicUsize,
@@ -2031,6 +2094,9 @@ mod tests {
 
         fn create(&self, create: Create) -> Result<String, String> {
             self.said("create");
+            if create.unit.mounts.iter().any(|mount| mount.held.is_some()) {
+                self.said("create_held");
+            }
             Ok(create.id.into())
         }
 
@@ -2068,7 +2134,7 @@ mod tests {
             }
         }
 
-        fn tune(&self, _: &String, _: Option<u64>, _: Option<u64>) -> Vec<String> {
+        fn tune(&self, _: &String, _: Option<u64>, _: Option<u64>, _: Option<Idle>) -> Vec<String> {
             self.said("tune");
             Vec::new()
         }
@@ -2083,7 +2149,8 @@ mod tests {
             Ok(())
         }
 
-        fn mesh_up(&self, _: &str, _: &Path, _: u16, _: Ipv6Addr) -> Result<kith_mesh::Key, String> {
+        fn mesh_up(&self, _: &str, _: &Path, port: u16, _: Ipv6Addr) -> Result<kith_mesh::Key, String> {
+            self.ports.lock().unwrap().push(port);
             self.slow("mesh_up").map(|()| [7; 32])
         }
 
@@ -2155,6 +2222,7 @@ mod tests {
             read_only: false,
             give: false,
             part: None,
+            held: None,
         }
     }
 
@@ -2186,6 +2254,41 @@ mod tests {
             no_node_root: false,
             ..Unit::default()
         }
+    }
+
+    /// A unit's namespace keys the give pool's shares: refused unless a name of the form every
+    /// namespace has (or empty), and a unit without one deserializes to empty.
+    #[test]
+    fn a_units_namespace_is_a_namespace_name_or_empty() {
+        let (_, state) = book("unit-namespace");
+        let on = ground(&state, "");
+        let with = |namespace: &str| Unit {
+            namespace: namespace.into(),
+            ..plain()
+        };
+        for good in ["", "team-a", "a.b", &"a".repeat(63)] {
+            assert_eq!(refused(&with(good), &on), None, "{good:?}");
+        }
+        for bad in [
+            &"a".repeat(64),
+            &"a".repeat(5000),
+            "a b",
+            "A",
+            "a/b",
+            "a\nb",
+            "-a",
+            "a_b",
+        ] {
+            let why = refused(&with(bad), &on).unwrap_or_else(|| panic!("{bad:?} was let through"));
+            assert!(why.starts_with("namespace:"), "{bad:?}: {why}");
+        }
+        let old: Unit = serde_json::from_str("{}").unwrap_or_else(|_| {
+            // (The serving part's JSON of a unit from before the field: its other fields only.)
+            let mut json = serde_json::to_value(Unit::default()).unwrap();
+            json.as_object_mut().unwrap().remove("namespace");
+            serde_json::from_value(json).unwrap()
+        });
+        assert_eq!(old.namespace, "");
     }
 
     #[test]
@@ -2310,6 +2413,31 @@ mod tests {
             ..ground(&state, "no-host-paths")
         };
         assert!(refused(&with(&inside, "/data"), &none).is_some());
+    }
+
+    /// A volume's mount named by the path `host` and held by the directory `dir` (T-1113).
+    fn held_mount(host: &Path, dir: &Path) -> Mount {
+        Mount {
+            held: Some(kith_runtime::Held::new(OwnedFd::from(File::open(dir).unwrap()))),
+            ..mount(host, "/data")
+        }
+    }
+
+    #[test]
+    fn a_held_volume_is_the_directory_its_mount_names_or_is_refused() {
+        let (_, state) = book("held-mounts");
+        let off = ground(&state, "no-host-paths");
+        let data = on_disk(state.join("volumes").join("ns").join("data"));
+        let other = on_disk(state.join("volumes").join("ns").join("other"));
+        let with = |mount: Mount| Unit {
+            mounts: vec![mount],
+            ..plain()
+        };
+        // Held by the directory it names: made.
+        assert_eq!(refused(&with(held_mount(&data, &data)), &off), None);
+        // Named one directory and held another (a swap, or a caller that lies): refused.
+        let why = refused(&with(held_mount(&data, &other)), &off).expect("a held other directory was mounted");
+        assert!(why.contains("not the directory it names"), "{why}");
     }
 
     /// Make `path` a directory (or, with a file name that has a dot, a file) and say it.
@@ -2832,7 +2960,7 @@ mod tests {
             "a refused delete gives the handle back"
         );
         named(why);
-        named(root.tune(&held, unknown, None, None).unwrap_err());
+        named(root.tune(&held, unknown, None, None, None).unwrap_err());
         named(root.plug(&held, unknown, device).unwrap_err());
         named(root.unplug(&held, unknown, device).unwrap_err());
         named(root.request(Request::Usage { pod: "w_a_b_0".into() }).unwrap_err());
@@ -2857,7 +2985,7 @@ mod tests {
         made_one(&root, "w_a_b_1b_c");
         assert!(root.kill(&mut made, "w_a_b_0_c").is_ok());
         assert!(
-            root.tune(&made, "w_a_b_0_c", Some(1 << 20), Some(500))
+            root.tune(&made, "w_a_b_0_c", Some(1 << 20), Some(500), None)
                 .unwrap()
                 .is_empty()
         );
@@ -2897,7 +3025,7 @@ mod tests {
         });
         // The handle of one with the id of another is refused, whatever else holds.
         not(root.kill(&mut a, "w_a_b_1_c").unwrap_err());
-        not(root.tune(&a, "w_a_b_1_c", None, None).unwrap_err());
+        not(root.tune(&a, "w_a_b_1_c", None, None, None).unwrap_err());
         not(root.plug(&a, "w_a_b_1_c", device).unwrap_err());
         not(root.unplug(&a, "w_a_b_1_c", device).unwrap_err());
         let (back, why) = root.delete(a.clone(), "w_a_b_1_c").unwrap_err();
@@ -2995,12 +3123,24 @@ mod tests {
         assert!(plug(INPUT).is_err());
     }
 
+    /// The idle class's memory.high is bounded as a guarantee is, before the root part writes it (T-1118).
+    #[test]
+    fn idle_class_memory_high_out_of_range_is_refused() {
+        let (book, _) = book("tune-idle");
+        let root = Direct::with(Fake::default(), &book).under(policy(""));
+        let made = made_one(&root, "w_a_b_0_c");
+        let idle = |bytes| root.tune(&made, "w_a_b_0_c", None, None, Some(Idle { memory_high: bytes }));
+        assert!(idle(None).is_ok() && idle(Some(MOST_GUARANTEED)).is_ok());
+        assert!(idle(Some(MOST_GUARANTEED + 1)).unwrap_err().contains("memory.high"));
+        assert_eq!(root.hands.reached(), ["create", "tune", "tune"]);
+    }
+
     #[test]
     fn limits_out_of_range_are_refused() {
         let (book, _) = book("tune");
         let root = Direct::with(Fake::default(), &book).under(policy(""));
         let made = made_one(&root, "w_a_b_0_c");
-        let tune = |guaranteed, cpu| root.tune(&made, "w_a_b_0_c", guaranteed, cpu);
+        let tune = |guaranteed, cpu| root.tune(&made, "w_a_b_0_c", guaranteed, cpu, None);
         assert!(tune(None, None).is_ok());
         assert!(tune(Some(MOST_GUARANTEED), Some(MOST_CPU_MILLIS)).is_ok());
         assert!(tune(Some(MOST_GUARANTEED + 1), None).unwrap_err().contains("bytes"));
@@ -3022,6 +3162,7 @@ mod tests {
                 id: "w_a_b_0_c".into(),
                 guaranteed: Some(1),
                 cpu_millis: None,
+                idle: Some(Idle { memory_high: Some(1) }),
             },
             Request::Plug {
                 id: "w_a_b_0_c".into(),
@@ -3331,12 +3472,21 @@ mod tests {
     }
 
     #[test]
-    fn the_mesh_is_told_once_and_a_second_telling_that_differs_is_refused() {
+    fn the_mesh_told_while_it_is_up_is_not_told_again_as_another() {
         let book = Book::new();
         let key = || PathBuf::from("/nowhere/mesh.key");
         book.set_mesh(WG.into(), 51820, key(), "a".into()).unwrap();
-        // The same again is heeded as nothing; another interface, port, key file or name is refused.
+        // The same again is heeded as nothing.
         book.set_mesh(WG.into(), 51820, key(), "a".into()).unwrap();
+        let prefix = kith_mesh::prefix(b"a cluster");
+        book.set_prefix(prefix).unwrap();
+        let root = Direct::with(Fake::default(), &book);
+        let ask = |name: &str| Request::MeshUp {
+            interface: WG.into(),
+            address: kith_mesh::node_address(prefix, name),
+        };
+        assert!(root.request(ask("a")).is_ok());
+        // Up, another interface, port, key file or name is refused ...
         for (interface, port, path, name) in [
             ("eth0", 51820, key(), "a"),
             (WG, 51821, key(), "a"),
@@ -3346,16 +3496,26 @@ mod tests {
             let why = book.set_mesh(interface.into(), port, path, name.into()).unwrap_err();
             assert!(why.contains("told"), "{why}");
         }
-        // (What was told first still is: a prefix goes with it, and the up is for that name.)
-        let prefix = kith_mesh::prefix(b"a cluster");
-        book.set_prefix(prefix).unwrap();
-        let root = Direct::with(Fake::default(), &book);
-        let ask = |name: &str| Request::MeshUp {
-            interface: WG.into(),
-            address: kith_mesh::node_address(prefix, name),
-        };
+        // ... and what was told first still is.
         assert!(root.request(ask("b")).is_err());
         assert!(root.request(ask("a")).is_ok());
+    }
+
+    #[test]
+    fn a_mesh_that_is_down_is_told_again_with_another_port_and_comes_up_on_it() {
+        // The Cluster's `mesh.port` changed, or the mesh went off and on with another (T-1076):
+        // the real book takes the new port when it is down, keeps the prefix, and the up is on it.
+        let (book, prefix) = meshed("a cluster");
+        let key = || PathBuf::from("/nowhere/mesh.key");
+        let fake = Fake::default();
+        let root = Direct::with(fake, &book);
+        up(&root, prefix).unwrap();
+        // Up: refused. Down: told again.
+        assert!(book.set_mesh(WG.into(), 51999, key(), "a".into()).is_err());
+        root.request(Request::MeshDown { interface: WG.into() }).unwrap();
+        book.set_mesh(WG.into(), 51999, key(), "a".into()).unwrap();
+        up(&root, prefix).unwrap();
+        assert_eq!(*root.hands.ports.lock().unwrap(), [51820, 51999]);
     }
 
     #[test]
@@ -3962,10 +4122,10 @@ mod tests {
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
         // A plain one is made beneath the root, and the reply says where.
         for ask in volume_asks(place("shop", "data", "deep/er")) {
-            let Ok(Reply::Path(at)) = root.request(ask) else {
-                panic!("not a path")
+            let Ok(Reply::Dir(at)) = root.request(ask) else {
+                panic!("not a directory")
             };
-            assert_eq!(at, shop.join("deep/er"));
+            assert_eq!(at.real(), shop.join("deep/er"));
         }
         // And one of the node's own is made where the policy has hostPaths.
         let open = Direct::with(Nobody, &book).under(policy("hardened,host-paths"));
@@ -3973,7 +4133,7 @@ mod tests {
         let ask = Request::Volume {
             volume: place("kith-system", "data", own.to_str().unwrap()),
         };
-        assert!(matches!(open.request(ask), Ok(Reply::Path(at)) if at == own));
+        assert!(matches!(open.request(ask), Ok(Reply::Dir(at)) if at.real() == own));
         std::fs::remove_dir_all(&outside).unwrap();
     }
 
@@ -4001,7 +4161,7 @@ mod tests {
         let ask = Request::Volume {
             volume: place("kith-system", "data", &format!("{at}/own")),
         };
-        assert!(matches!(root.request(ask), Ok(Reply::Path(_))));
+        assert!(matches!(root.request(ask), Ok(Reply::Dir(_))));
         std::fs::remove_dir_all(&outside).unwrap();
     }
 
@@ -4101,9 +4261,9 @@ mod tests {
         };
         let state = state.canonicalize().unwrap();
         let own = state.join("volumes/shop/data/in/side");
-        assert_eq!(volume(&state, &dir).unwrap(), own);
-        assert_eq!(open(&state, &dir).unwrap(), own);
-        assert_eq!(restore(&state, &dir).unwrap(), own);
+        assert_eq!(volume(&state, &dir).unwrap().real(), own);
+        assert_eq!(open(&state, &dir).unwrap().real(), own);
+        assert_eq!(restore(&state, &dir).unwrap().real(), own);
         let climbing = Dir {
             path: "../x".into(),
             ..dir.clone()
@@ -4128,7 +4288,7 @@ mod tests {
             let ask = Request::Volume {
                 volume: place("ns", &format!("data{i}"), "x"),
             };
-            assert!(matches!(root.request(ask), Ok(Reply::Path(_))));
+            assert!(matches!(root.request(ask), Ok(Reply::Dir(_))));
         }
         assert_eq!(book.crossed(Kind::Volume), 2);
         assert_eq!(book.total(), 5);
@@ -4161,6 +4321,24 @@ mod tests {
     /// [`serving`], with the serving part's end as a [`Socket`] (twenty seconds to a call).
     fn over_socket<H: Hands, T: Send>(root: &Direct<H>, limits: &Limits, then: impl FnOnce(Socket) -> T + Send) -> T {
         serving(root, limits, move |fd| then(Socket::new(fd, Duration::from_secs(20))))
+    }
+
+    #[test]
+    fn a_volume_directory_crosses_the_socket_with_its_descriptor() {
+        let (book, state) = book("volume-over-socket");
+        let root = Direct::with(Fake::default(), &book);
+        let at = state.canonicalize().unwrap().join("volumes/shop/data");
+        over_socket(&root, &Limits::default(), |socket| {
+            let Ok(Reply::Dir(got)) = socket.request(Request::Volume {
+                volume: place("shop", "data", "deep/er"),
+            }) else {
+                panic!("not a directory")
+            };
+            assert_eq!(got.real(), at.join("deep/er"));
+            // The descriptor that came over the socket is the directory: a file made through it is in it.
+            std::fs::write(got.held().join("made"), "x").unwrap();
+        });
+        assert_eq!(std::fs::read_to_string(at.join("deep/er/made")).unwrap(), "x");
     }
 
     /// A regular file to stand for a unit's output (`/dev/null` is a device node: refused).
@@ -4258,6 +4436,35 @@ mod tests {
     }
 
     #[test]
+    fn a_held_volume_crosses_the_socket_with_its_descriptor_and_only_where_named() {
+        let (book, state) = book("socket-held");
+        let root = Direct::with(Fake::default(), &book).under(policy("no-host-paths"));
+        let data = on_disk(state.join("volumes").join("ns").join("data"));
+        let other = on_disk(state.join("volumes").join("ns").join("other"));
+        over_socket(&root, &Limits::default(), |socket| {
+            let image = Image::default();
+            let create = |id: &str, held: &Path| {
+                socket.create(Create {
+                    id,
+                    image: &image,
+                    unit: &Unit {
+                        mounts: vec![held_mount(&data, held)],
+                        ..plain()
+                    },
+                    out: regular(),
+                    err: regular(),
+                })
+            };
+            // The descriptor arrives and is the directory the mount names.
+            assert!(create("w_a_b_0_c", &data).is_ok());
+            // One that is another directory is refused at the root part, whatever the unit says.
+            let why = create("w_a_b_1_c", &other).unwrap_err();
+            assert!(why.contains("not the directory it names"), "{why}");
+        });
+        assert_eq!(root.hands.reached(), ["create", "create_held"]);
+    }
+
+    #[test]
     fn root_part_socket_holds_a_unit_by_its_id() {
         let (book, _) = book("socket-units");
         book.claim([PathBuf::from(INPUT)]);
@@ -4281,7 +4488,7 @@ mod tests {
             let made = socket.start(made, id, "ab12").unwrap();
             let mut made = made;
             assert!(socket.kill(&mut made, id).is_ok());
-            assert_eq!(socket.tune(&made, id, Some(1 << 20), Some(500)), Ok(Vec::new()));
+            assert_eq!(socket.tune(&made, id, Some(1 << 20), Some(500), None), Ok(Vec::new()));
             assert!(socket.plug(&made, id, Path::new(INPUT)).is_ok());
             assert!(socket.unplug(&made, id, Path::new(INPUT)).is_ok());
             assert!(matches!(
@@ -4292,7 +4499,7 @@ mod tests {
             let other = Held("w_a_b_1_c".into());
             for why in [
                 socket.kill(&mut other.clone(), id).unwrap_err(),
-                socket.tune(&other, id, None, None).unwrap_err(),
+                socket.tune(&other, id, None, None, None).unwrap_err(),
                 socket.plug(&other, id, Path::new(INPUT)).unwrap_err(),
                 socket.unplug(&other, id, Path::new(INPUT)).unwrap_err(),
                 socket.start(other.clone(), id, "ab12").unwrap_err().1,
@@ -4377,9 +4584,12 @@ mod tests {
             let dir = std::fs::File::open(state.parent().unwrap()).unwrap();
             let device = null();
             let (pipe, _held) = UnixStream::pair().unwrap();
-            let create = json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain()}});
+            let create =
+                json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain(), "volumes": []}});
+            let held =
+                json!({"Create": {"id": "w_a_b_0_c", "image": Image::default(), "unit": plain(), "volumes": [0]}});
             let exec = json!({"Exec": {"id": "w_a_b_0_x", "unit": plain()}});
-            let cases: [(Value, Vec<BorrowedFd>, &str); 9] = [
+            let cases: [(Value, Vec<BorrowedFd>, &str); 11] = [
                 // More files than the call takes is refused as it is read, before it is queued...
                 (
                     as_call(ask("127.0.0.1", 0, Proto::Tcp)),
@@ -4392,6 +4602,9 @@ mod tests {
                 (create.clone(), vec![file.as_fd()], "two files"),
                 (create.clone(), vec![], "two files"),
                 (exec.clone(), vec![file.as_fd()], "two files"),
+                // A held volume needs its directory beside the two, and a mount the unit has.
+                (held.clone(), vec![file.as_fd(); 2], "two files"),
+                (held.clone(), vec![file.as_fd(); 3], "has 0 mounts"),
                 (create.clone(), vec![dir.as_fd(), file.as_fd()], "not a file, a pipe"),
                 (exec.clone(), vec![file.as_fd(), device.as_fd()], "not a file, a pipe"),
                 // A layer that is no regular file would be read for ever.

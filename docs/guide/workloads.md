@@ -34,7 +34,12 @@ directory is refused.
   `localhost` every `intervalSeconds` (10), and once a second until the first success. A liveness
   probe's `startSeconds` (0, none) is how long a container may take to pass its first check: after
   it, a failure counts like any other. (Kubernetes' `initialDelaySeconds` on a liveness probe is
-  imported as `startSeconds`; on a readiness probe it is said and left out.)
+  imported as `startSeconds`; on a readiness probe it is said and left out.) An `exec` probe runs
+  its command in the container's own namespaces, as `kubectl exec` does, with the same interval
+  and thresholds: exit 0 passes, anything else fails, and a command that outlasts
+  `timeoutSeconds` (1) is killed and fails. A container whose only probe is `exec` readiness is
+  not ready (and a rolling update does not move on, nor `kubectl rollout status` return) until
+  the command has passed once. Its output is not read: keep it small.
 - **Updates.** A changed Workload (or a changed `ConfigMap` or `Secret` value in a unit's `env`) is
   replaced one replica at a time, the next once the others are ready: an update that does not come
   up stops at its first replica and the status says where. `strategy: recreate` replaces all at once.
@@ -103,10 +108,49 @@ must be allowed to apply a Job.
 | `startingDeadlineSeconds` | Run, once, the latest minute missed since `status.last` no older than this (a week at most). Without it a missed minute is skipped. |
 | `timezone` not `UTC`, a schedule that cannot be read, a name over 54 characters | The CronJob does not run, and its status says why. |
 
+### Idle work
+
+A template that says `priority: idle` (a Workload's, a Job's or a CronJob's `job`; `normal` is the
+default and changes nothing) runs on what the node does not use. Each of its units gets:
+
+| File of its cgroup | Value | Effect |
+|---|---|---|
+| `cpu.idle` | `1` | The kernel's idle scheduling for the whole unit: it runs only on CPU nothing else wants. |
+| `io.weight` | `default 1` | The lowest disk weight. |
+| `memory.high` | the unit's `resources.memory`, if it states one | Its memory is reclaimed first; without an amount none is set. |
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: build-all }
+spec:
+  parallelism: 8                 # eight at a time, all on the one node the Job runs on
+  completions: 64
+  template:
+    priority: idle               # only spare cycles beside whatever else runs there
+    containers:
+      - name: build
+        image: registry.example/ci/build:1
+        resources: { memory: 2Gi }
+```
+
+- Nothing is made idle unless it says so: a Job or a Workload without `priority` runs as before.
+  A value other than `normal` or `idle` is refused (422).
+- Beside a seat's desktop, idle work takes what the desktop leaves and no more. The seat's
+  `reserve` still comes off the node, and `yieldTo` still holds a unit to a twentieth of a CPU
+  while the seat is busy: `priority: idle` goes under both (see
+  [what a seat keeps for itself](hardware.md#what-a-seat-keeps-for-itself)). A unit that is both
+  idle and held by a seat keeps the lowest weights.
+- Changing `priority` replaces the replica (its cgroup is made again), as changing its image does.
+- To run batch work across the cluster beside people's desktops, give it `priority: idle` and a
+  `resources.memory`, and no `yieldTo` is needed. A Job runs on one node, so spread the work over
+  several Jobs (one per slice of it), or run it as a Workload with `replicas`, which the leader
+  spreads over the nodes with room. Idle is not preemption: the scheduler places it as any unit
+  and nothing is evicted for a busier one.
+
 ### Not yet
 
-- `exec` probes are accepted and do nothing (the status says so). A container's `ports` only name
-  them for probes and Services; nothing is opened or mapped.
+- A container's `ports` only name them for probes and Services; nothing is opened or mapped.
 - A replica that holds a volume, a device or the node's network is stopped before its replacement
   starts, so `replicas: 1` of one is down for a moment during an update. `blueGreen` is treated as
   rolling. A readiness probe's `initialDelaySeconds` is not kept: kith asks at once.

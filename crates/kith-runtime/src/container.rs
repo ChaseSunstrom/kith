@@ -28,6 +28,12 @@
 //! subreaper, see [`Runtime::new`]) once it has ended, so [`Handle::wait`] is as before. The
 //! helper is registered as awaited ([`spawn_awaited`]) while it is forked, so that
 //! [`reap_orphans`] leaves it to the create.
+//!
+//! [`enter`] makes a process in a running container the same way, in a child of `fork`, whose
+//! one extra step is a `setns` into the user namespace that owns the container's pid namespace
+//! (found with `NS_GET_USERNS`, and only when it is not the child's own), because libcontainer's
+//! tenant joins every namespace but that one, and a rootless process may join the others only
+//! from inside it; kithd's own process never does, and an ioctl that fails is a refusal.
 // ponytail: `fork` puts right the allocator's lock only. The child does take locks of tracing's
 // (a subscriber is made and set, and its first events register their call sites), of the
 // environment and of stderr, and another thread of this process may hold one at the fork. A
@@ -44,7 +50,7 @@ use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::syscall::syscall::SyscallType;
 use libcontainer::workload::default::DefaultExecutor;
-use libcontainer::workload::{Executor, ExecutorError, ExecutorValidationError};
+use libcontainer::workload::{Executor, ExecutorError, ExecutorSetEnvsError, ExecutorValidationError};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use oci_spec::runtime::{
@@ -56,7 +62,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -178,6 +185,10 @@ pub struct Unit {
     /// The project its writable root's layers are put in (ext4's, `chattr -p`), whose quota
     /// holds what it writes there at the write: its pod's. `None`: they keep their parent's.
     pub project: Option<u32>,
+    /// The namespace of the resource that made it: a tenant, whose starts share what the root
+    /// part gives a volume's owner with (see `GiveSlots`: half at most). Empty: none is named.
+    #[serde(default)]
+    pub namespace: String,
 }
 
 /// How many ids a container's user namespace has where kithd is root: 0 to 65535, all an
@@ -342,8 +353,12 @@ fn unmappable<'a>(image: &'a Image, unit: &'a Unit) -> Option<&'a Path> {
     let xfs = FsType(0x5846_5342 as _);
     let kinds = [EXT4_SUPER_MAGIC, TMPFS_MAGIC, xfs, BTRFS_SUPER_MAGIC];
     let mappable = |path: &Path| statfs(path).is_ok_and(|fs| kinds.contains(&fs.filesystem_type()));
-    let paths = std::iter::once(&image.rootfs).chain(unit.mounts.iter().map(|volume| &volume.host));
-    paths.map(PathBuf::as_path).find(|path| !mappable(path))
+    if !mappable(&image.rootfs) {
+        return Some(&image.rootfs);
+    }
+    // (A held volume is asked of by its descriptor: what is at its path now is not it.)
+    let volume = unit.mounts.iter().find(|volume| !mappable(&volume.source()));
+    volume.map(|volume| volume.host.as_path())
 }
 
 /// Mounts, in the calling thread's own mount namespace, what a container whose ids start at
@@ -351,23 +366,14 @@ fn unmappable<'a>(image: &'a Image, unit: &'a Unit) -> Option<&'a Path> {
 /// id-mapped to its range (a file of the image's root is its root's, and one a volume's user
 /// owns on disk is that user's in it), and its bundle at `STAGE/bundle`. The container's mount
 /// namespace is made as a copy of this one; the node's never has them, and they go with it.
+///
+/// A volume that comes held ([`Mount::held`]) is cloned from its descriptor, and never opened by
+/// its path: see [`clone_held`].
 fn stage(image: &Image, unit: &Unit, bundle: &Path, base: u32) -> io::Result<()> {
     use kith_dm_sys::{NODEV, NOSUID, RDONLY, mount_mapped};
     use nix::mount::{MsFlags, mount};
-    use std::os::fd::AsFd;
-    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
-    mount(
-        None::<&str>,
-        "/",
-        None::<&str>,
-        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
-        None::<&str>,
-    )?;
-    let stage = Path::new(STAGE);
-    fs::create_dir_all(stage)?;
-    // (Its root may pass through, to what is its own: nothing else of the node's is on the way.)
-    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
-    mount(Some("tmpfs"), stage, Some("tmpfs"), flags, Some("mode=0711"))?;
+    let mut held = clone_held(unit)?;
+    let stage = unshare_stage()?;
     let users = kith_dm_sys::user_namespace(base, RANGE)?;
     fs::create_dir(stage.join("root"))?;
     // (Writable until the container's root is made read-only, after its mount points are made
@@ -387,6 +393,11 @@ fn stage(image: &Image, unit: &Unit, bundle: &Path, base: u32) -> io::Result<()>
     for (n, volume) in unit.mounts.iter().enumerate() {
         let at = stage.join(format!("v{n}"));
         let only = if volume.read_only { RDONLY } else { 0 };
+        if let Some((tree, is_dir)) = held[n].take() {
+            mountpoint(&at, is_dir)?;
+            kith_dm_sys::mount_tree(tree.as_fd(), &at, Some(users.as_fd()), NOSUID | NODEV | only)?;
+            continue;
+        }
         let Some(part) = &volume.part else {
             match fs::metadata(&volume.host)?.is_dir() {
                 true => fs::create_dir(&at)?,
@@ -409,6 +420,72 @@ fn stage(image: &Image, unit: &Unit, bundle: &Path, base: u32) -> io::Result<()>
         nix::sched::setns(File::open(netns)?, nix::sched::CloneFlags::CLONE_NEWNET)?;
     }
     Ok(())
+}
+
+/// [`stage`] for a container that keeps the node's users (no ranges to map to): only its held
+/// volumes are staged, each at `STAGE/v<n>` as it is, for the spec to bind from there.
+fn stage_held(unit: &Unit) -> io::Result<()> {
+    let mut held = clone_held(unit)?;
+    let stage = unshare_stage()?;
+    for (n, tree) in held.iter_mut().enumerate() {
+        if let Some((tree, is_dir)) = tree.take() {
+            let at = stage.join(format!("v{n}"));
+            mountpoint(&at, is_dir)?;
+            kith_dm_sys::mount_tree(tree.as_fd(), &at, None, 0)?;
+        }
+    }
+    Ok(())
+}
+
+/// The calling thread's mount namespace made its own, with a tmpfs at `STAGE` in it.
+fn unshare_stage() -> io::Result<&'static Path> {
+    use nix::mount::{MsFlags, mount};
+    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )?;
+    let stage = Path::new(STAGE);
+    fs::create_dir_all(stage)?;
+    // (Its root may pass through, to what is its own: nothing else of the node's is on the way.)
+    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+    mount(Some("tmpfs"), stage, Some("tmpfs"), flags, Some("mode=0711"))?;
+    Ok(stage)
+}
+
+/// Where a mount is made: a directory, or an empty file for one that is a file.
+fn mountpoint(at: &Path, is_dir: bool) -> io::Result<()> {
+    match is_dir {
+        true => fs::create_dir(at),
+        false => File::create(at).map(drop),
+    }
+}
+
+/// What each held volume of `unit` (the part of it, if it has one) is as a tree of its own, and
+/// whether it is a directory: `None` for a volume that is not held. Taken before the thread's
+/// mount namespace is unshared: a descriptor opened in the node's is not one a bind made in
+/// another namespace may name, and a detached tree is one that goes where it is moved. The part
+/// is opened beneath the held directory, with no link followed.
+fn clone_held(unit: &Unit) -> io::Result<Vec<Option<(OwnedFd, bool)>>> {
+    let one = |volume: &Mount| -> io::Result<Option<(OwnedFd, bool)>> {
+        let Some(held) = &volume.held else { return Ok(None) };
+        let part;
+        let from = match &volume.part {
+            None => held.fd(),
+            Some(name) => {
+                part = kith_dm_sys::beneath(&held.path(), name).map_err(|e| {
+                    io::Error::new(e.kind(), format!("subPath `{name}` of {}: {e}", volume.host.display()))
+                })?;
+                part.as_fd()
+            }
+        };
+        let is_dir = File::from(from.try_clone_to_owned()?).metadata()?.is_dir();
+        Ok(Some((kith_dm_sys::clone_tree(from)?, is_dir)))
+    };
+    unit.mounts.iter().map(one).collect()
 }
 
 /// The words of the refusal of a `no_node_root` unit that would be root, by which whoever
@@ -451,6 +528,57 @@ pub struct Mount {
     /// link followed and mounted as opened ([`kith_dm_sys::beneath`]): only where the
     /// container has users of its own, as an id-mapped mount; elsewhere it is not created.
     pub part: Option<String>,
+    /// The directory `host` is, held open by whoever took it beneath its root. Where it is set
+    /// the runtime mounts, binds and gives what the descriptor is and never names `host` again
+    /// (a path of a Volume is the tenant's to re-point: a link put there between the check and
+    /// the use would be a host directory bound, or given, as root). `host` is then only what
+    /// names it in a message. Not serialized: it crosses a socket as a descriptor.
+    #[serde(skip)]
+    pub held: Option<Held>,
+}
+
+/// A directory held open, shared by the clones of the [`Mount`] it is in.
+#[derive(Debug, Clone)]
+pub struct Held(std::sync::Arc<OwnedFd>);
+
+impl Held {
+    pub fn new(fd: OwnedFd) -> Held {
+        Held(std::sync::Arc::new(fd))
+    }
+
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+
+    /// The directory as a path of this process only: it names what the descriptor is, whatever
+    /// is at the place it was taken.
+    fn path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.0.as_raw_fd()))
+    }
+
+    /// The directory opened again for reading (the descriptor held may be `O_PATH`, which reads
+    /// nothing): the same directory, as a `/proc` link of a descriptor leads to its own.
+    fn reopen(&self) -> io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY)
+            .open(self.path())
+    }
+}
+
+impl PartialEq for Held {
+    fn eq(&self, other: &Held) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Mount {
+    /// What names the directory for a use that takes a path (a file system's kind): the held
+    /// descriptor's, else `host`.
+    fn source(&self) -> PathBuf {
+        self.held.as_ref().map_or_else(|| self.host.clone(), Held::path)
+    }
 }
 
 /// A unit an earlier kithd left running, found by [`Runtime::cleanup_but`]: its cgroup still has
@@ -494,6 +622,12 @@ impl Runtime {
         let images = ImageStore::new(&root)?;
         fs::create_dir_all(root.join("containers")).ctx("creating the runtime directory")?;
         fs::create_dir_all(root.join("state")).ctx("creating the runtime directory")?;
+        // (Copies of an init's spec an enter of a kithd that was killed never removed.)
+        for entry in fs::read_dir(&root).ctx("creating the runtime directory")?.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(SCRATCH) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
         nix::sys::prctl::set_child_subreaper(true).ctx("becoming a child subreaper")?;
         Ok(Runtime {
             root,
@@ -823,6 +957,9 @@ impl Runtime {
             limited.to_mut().dmem.clear();
         }
         let unit = &*limited;
+        // (A held volume of a container that keeps the node's users is bound from its own
+        // clone too: see `stage_held`.)
+        let staged_held = uid.is_root() && shift.is_none() && unit.mounts.iter().any(|volume| volume.held.is_some());
         let spec = spec_shifted(id, image, unit, &cgroup, &bundle, (uid, gid), shift).ctx(&what)?;
         // (The spec names a user only where kithd is root: see `spec_shifted`.)
         let user = spec.process().as_ref().map(|process| process.user());
@@ -836,11 +973,19 @@ impl Runtime {
             // (A volume is its user's on disk as it is in the container: an id-mapped mount
             // shows its owners as they are. A new one is root's until given.)
             for volume in unit.mounts.iter().filter(|volume| volume.give && user.uid() != 0) {
-                give(&volume.host, user.uid(), user.gid()).ctx(format!(
+                let left = give_volume(volume, &unit.namespace, user.uid(), user.gid()).ctx(format!(
                     "{what}: giving {} to user {}",
                     volume.host.display(),
                     user.uid()
                 ))?;
+                if left > 0 {
+                    eprintln!(
+                        "kith: container `{id}`: {left} files of {} have another name too and were not given to user {}: \
+                         the workload may find them not its own",
+                        volume.host.display(),
+                        user.uid()
+                    );
+                }
             }
         }
         fs::create_dir_all(&bundle).ctx(&what)?;
@@ -867,6 +1012,8 @@ impl Runtime {
             File::open(&bundle).and_then(|dir| dir.sync_all()).ctx(&what)?;
             if let Some(base) = shift {
                 stage(image, unit, &bundle, base).ctx(format!("{what}: mounting its image and volumes id-mapped"))?;
+            } else if staged_held {
+                stage_held(unit).ctx(format!("{what}: mounting its volumes from their descriptors"))?;
             }
             let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
                 .with_root_path(self.root.join("state"))
@@ -879,6 +1026,10 @@ impl Runtime {
                 .as_init(&bundle)
                 .with_systemd(false)
                 .with_detach(true);
+            // (Where the bind is by path: see `still_held`.)
+            if !uid.is_root() {
+                still_held(unit).ctx(&what)?;
+            }
             // In a child of `fork`, with one thread: see the module doc's "Clone".
             let log = bundle.join("init.log");
             let said = {
@@ -925,10 +1076,10 @@ impl Runtime {
             }
         };
         let built = match shift {
-            None => build(),
+            None if !staged_held => build(),
             // (In a thread of its own, whose mount namespace `stage` makes its own: the
             // container's is made from the thread's, and the node's stays as it was.)
-            Some(_) => std::thread::scope(|scope| scope.spawn(build).join())
+            _ => std::thread::scope(|scope| scope.spawn(build).join())
                 .unwrap_or_else(|_| err(format!("{what}: its making panicked"))),
         };
         if built.is_err() {
@@ -1048,6 +1199,288 @@ impl Runtime {
     }
 }
 
+/// A process [`enter`] started in a running container: its three ends of the pipes it runs on
+/// (each one `take`n by whoever drives it), and its exit status to [`Entered::wait`] for.
+pub struct Entered {
+    pub stdin: Option<File>,
+    pub stdout: Option<File>,
+    pub stderr: Option<File>,
+    pid: Pid,
+    /// Its status was taken by `wait`: its pid is free for another process, and is not signalled.
+    reaped: AtomicBool,
+    _awaited: Awaited,
+}
+
+/// A process nobody holds any more is ended: one whose handler was cancelled before it took the
+/// pipes would otherwise run on, outside every cap. (A no-op once `wait` has its status.)
+impl Drop for Entered {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+impl Entered {
+    pub fn pid(&self) -> i32 {
+        self.pid.as_raw()
+    }
+
+    /// Ends it, and what it started in its process group (libcontainer makes the tenant a session
+    /// leader, so `sh -c 'sleep 30; true'` loses its sleep too: a probe that times out must not leave
+    /// one running per attempt). Nothing is signalled once `wait` has taken its status: the pid may
+    /// be another process's by then.
+    // ponytail: a pid reused between the check and the signal is not guarded; the window is the
+    // two instructions, and the pid space has to wrap in it. What left the group (a job-control
+    // shell's `set -m`, a double fork with setsid) is not ended: the container's to end.
+    pub fn kill(&self) {
+        if !self.reaped.load(Ordering::SeqCst) {
+            let sigkill = nix::sys::signal::Signal::SIGKILL;
+            let _ = nix::sys::signal::kill(Pid::from_raw(-self.pid.as_raw()), sigkill);
+            let _ = nix::sys::signal::kill(self.pid, sigkill);
+        }
+    }
+
+    /// Blocks until it ends: its exit code, or 128 + the signal that killed it.
+    pub fn wait(&self) -> Result<i32> {
+        loop {
+            match waitpid(self.pid, None) {
+                Err(nix::errno::Errno::EINTR) => {}
+                Ok(WaitStatus::Exited(_, code)) => {
+                    self.reaped.store(true, Ordering::SeqCst);
+                    return Ok(code);
+                }
+                Ok(WaitStatus::Signaled(_, signal, _)) => {
+                    self.reaped.store(true, Ordering::SeqCst);
+                    return Ok(128 + signal as i32);
+                }
+                other => return err(format!("waiting for the process: {other:?}")),
+            }
+        }
+    }
+}
+
+/// The process of an init's spec: one without it has no user to enter as, and is refused rather
+/// than entered as root in `/`.
+fn init_process(spec: &oci_spec::runtime::Spec) -> std::result::Result<&oci_spec::runtime::Process, String> {
+    spec.process()
+        .as_ref()
+        .ok_or_else(|| "its spec has no process".to_string())
+}
+
+/// What the scratch directories of [`enter`] are named under the runtime directory (swept by
+/// [`Runtime::new`]: a kithd killed in an enter leaves one).
+const SCRATCH: &str = "enter-scratch-";
+
+/// The init's `spec` for a tenant to be validated against: the same but for the groups of its
+/// user (a user namespace refuses them, and the tenant is given its own), and a root path that
+/// is relative to the init's `bundle` made absolute (the copy is kept somewhere else).
+/// Namespaces, capabilities and the seccomp filter are not touched: the tenant joins the init's.
+///
+/// A root under [`STAGE`] (a shifted pod's: mounted in the init's own mount namespace, which the
+/// node never sees) is not a path libcontainer can canonicalize from here, and it fails the
+/// tenant ("oci spec error") before anything runs. The tenant joins the init's mount namespace
+/// and never pivots into the root it is told, so it is told `/`.
+fn scratch_spec(spec: &Spec, bundle: &Path) -> Spec {
+    let mut copy = spec.clone();
+    if let Some(mut process) = copy.process().clone() {
+        let mut user = process.user().clone();
+        user.set_additional_gids(None);
+        process.set_user(user);
+        copy.set_process(Some(process));
+    }
+    if let Some(mut root) = copy.root().clone() {
+        if root.path().is_relative() {
+            root.set_path(bundle.join(root.path()));
+        }
+        if root.path().starts_with(STAGE) {
+            root.set_path("/".into());
+        }
+        copy.set_root(Some(root));
+    }
+    copy
+}
+
+/// `e` and each error under it, as one line: libcontainer's top errors are a few words ("oci spec
+/// error") and the cause is what says what is wrong.
+fn with_sources(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut cause = e.source();
+    while let Some(inner) = cause {
+        text.push_str(&format!(": {inner}"));
+        cause = inner.source();
+    }
+    text
+}
+
+/// A private copy of an init's state.json and config.json for a tenant's libcontainer to read
+/// (see [`scratch_spec`]): a directory of this process's user, mode 0700, with the container's
+/// directory in it. Removed when dropped, and so on every way `enter` ends.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    /// A new one under `runtime`, named so that none exists: a name taken (by a link too) is not
+    /// opened, another is tried.
+    fn new(runtime: &Path, id: &str, state: &libcontainer::container::State, spec: &Spec) -> io::Result<Scratch> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let pid = std::process::id();
+        let mut last = None;
+        for _ in 0..16 {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            match Scratch::at(runtime.join(format!("{SCRATCH}{pid}-{n}")), id, state, spec) {
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+                made => return made,
+            }
+        }
+        Err(last.expect("sixteen tries"))
+    }
+
+    /// One at `dir`, which must not exist (`mkdir` and `O_EXCL` follow no link, and the 0700
+    /// directory is nobody else's to put a link in).
+    fn at(dir: PathBuf, id: &str, state: &libcontainer::container::State, spec: &Spec) -> io::Result<Scratch> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let made = |path: &Path| fs::DirBuilder::new().mode(0o700).create(path);
+        made(&dir)?;
+        let scratch = Scratch(dir); // (from here a failure removes what was made)
+        let inner = scratch.0.join(id);
+        made(&inner)?;
+        let write = |name: &str, bytes: Vec<u8>| {
+            let flags = nix::libc::O_NOFOLLOW;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(flags)
+                .open(inner.join(name))?;
+            file.write_all(&bytes)
+        };
+        let mut state = state.clone();
+        let bundle = std::mem::replace(&mut state.bundle, inner.clone());
+        write("state.json", serde_json::to_vec(&state)?)?;
+        write("config.json", serde_json::to_vec(&scratch_spec(spec, &bundle))?)?;
+        Ok(scratch)
+    }
+
+    /// The directory libcontainer is told is its runtime's (the one holding the container's).
+    fn root(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // (A copy left behind holds the init's env, so a failed removal is said, not dropped.)
+        if let Err(e) = fs::remove_dir_all(&self.0)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("kithd: cannot remove {}: {e}", self.0.display());
+        }
+    }
+}
+
+/// Run `argv` in the running container `id` of the runtime kept under `root` (the `root` of
+/// [`Runtime::new`]): in its pid, mount, net and other namespaces, as its init's user, with its
+/// capabilities and its seccomp filter, and in its cgroup. What it reads and writes is the pipes
+/// of the [`Entered`] it returns. Nothing is run if the container is not running, and a program
+/// the image lacks is an error here, not a process that ends 127.
+///
+/// A tenant is made by libcontainer in a child of `fork`, as a create is (see the module doc's
+/// "Clone"); it is a child of this process once that ends, and is held as awaited until
+/// [`Entered`] is gone, so [`reap_orphans`] leaves its exit status to `wait`.
+// ponytail: the caller says the container is one this node made; nothing here checks that.
+pub fn enter(root: &Path, id: &str, argv: &[String]) -> Result<Entered> {
+    let what = format!("running a process in container `{id}`");
+    if argv.is_empty() {
+        return err(format!("{what}: no program to run"));
+    }
+    ContainerBuilder::new(id.into(), SyscallType::Linux)
+        .validate_id()
+        .ctx(&what)?;
+    let pipe = || nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).ctx(&what);
+    let ((stdin, to_stdin), (from_stdout, stdout), (from_stderr, stderr)) = (pipe()?, pipe()?, pipe()?);
+    let container = Container::load(root.join("state").join(id)).ctx(&what)?;
+    // libcontainer's tenant takes no user, groups or working directory of its init's: left
+    // unsaid they are root, no groups and `/`, so they are read from the init's spec and said.
+    let made = oci_spec::runtime::Spec::load(container.bundle().join("config.json")).ctx(&what)?;
+    let process = init_process(&made).ctx(&what)?;
+    let who = process.user();
+    // libcontainer checks the init's spec again, in the user namespace the helper joins below,
+    // and refuses `additionalGids` there (CVE-2014-8989: a user that may not drop its groups
+    // may not name them). So it is given a private copy of the init's state and spec without
+    // them; the tenant says its groups itself, below.
+    let scratch = Scratch::new(root, id, &container.state, &made).ctx(&what)?;
+    let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
+        .with_root_path(scratch.root())
+        .ctx(&what)?
+        .with_stdin(stdin)
+        .with_stdout(stdout)
+        .with_stderr(stderr)
+        // (The same entry as its init's: the filter and the user its image says.)
+        .with_executor(Entry)
+        .as_tenant()
+        .with_container_args(argv.to_vec())
+        .with_user(Some(who.uid()))
+        .with_group(Some(who.gid()))
+        .with_additional_gids(who.additional_gids().clone().unwrap_or_default())
+        .with_cwd(Some(process.cwd().clone()));
+    // libcontainer's tenant joins every namespace of its init but the user one, so a process
+    // without the rights over the container's other namespaces (a rootless kithd) is refused
+    // the first of them. The helper that makes it joins the user namespace that owns the
+    // container's pid namespace first (not its init's own: that may be one the image's user
+    // made inside it, see `Entry`), when that is not this process's: a single-threaded process
+    // may, which the helper is.
+    let init = container
+        .pid()
+        .ok_or(crate::Error(format!("{what}: it is not running")))?;
+    let pidns = File::open(format!("/proc/{init}/ns/pid")).ctx(&what)?;
+    // (Refused by name when the kernel will not say: entering without its user namespace is no fallback.)
+    let owner = kith_dm_sys::owner_userns(&pidns).ctx(format!(
+        "{what}: refused, the user namespace that owns its pid namespace is not found"
+    ))?;
+    let own = File::open("/proc/self/ns/user").ctx(&what)?;
+    let user = (own.metadata().ctx(&what)?.ino() != owner.metadata().ctx(&what)?.ino()).then_some(owner);
+    let log = root.join(format!("enter-{}.log", nix::unistd::gettid()));
+    // FORKING first, then the list, as a create takes them: held the other way round, one thread
+    // holding each and waiting for the other, they wait for ever.
+    let forking = FORKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dispatch = init_dispatch(&log)?;
+    // (Held until the tenant is listed: it is no orphan the reaper may take before that.)
+    let mut awaited = AWAITED.lock().expect("nothing panics holding the list");
+    let said = {
+        let forked = kith_dm_sys::fork_start(|| {
+            let refused = AtomicBool::new(false);
+            let built = || {
+                if let Some(user) = &user {
+                    nix::sched::setns(user, nix::sched::CloneFlags::CLONE_NEWUSER)
+                        .map_err(|e| format!("joining its user namespace: {e}"))?;
+                }
+                builder.build().map_err(|e| with_sources(&e))
+            };
+            match logged_build(dispatch, &log, &refused, built) {
+                Ok(pid) => [&[0][..], &pid.as_raw().to_le_bytes()].concat(),
+                Err(e) => [&[1][..], e.to_string().as_bytes()].concat(),
+            }
+        })
+        .ctx(&what)?;
+        drop(forking);
+        forked.collect(HELPER_DEADLINE).ctx(&what)?
+    };
+    // (The tenant has read the copy by now, or failed to: nothing of it is needed past this.)
+    drop(scratch);
+    let pid = match said.split_first() {
+        Some((0, pid)) if pid.len() == 4 => Pid::from_raw(i32::from_le_bytes(pid.try_into().expect("four bytes"))),
+        Some((_, text)) => return err(format!("{what}: {}", String::from_utf8_lossy(text))),
+        None => return err(format!("{what}: the process making it ended before it said how")),
+    };
+    awaited.push(pid.as_raw());
+    Ok(Entered {
+        stdin: Some(File::from(to_stdin)),
+        stdout: Some(File::from(from_stdout)),
+        stderr: Some(File::from(from_stderr)),
+        pid,
+        reaped: AtomicBool::new(false),
+        _awaited: Awaited(pid.as_raw()),
+    })
+}
+
 /// Held while libcontainer starts a container: it reaches the notify socket by changing the
 /// process's working directory and back, so two at once on different threads would connect in
 /// each other's directory. (A create does the same in a child of its own: see the module doc.)
@@ -1089,8 +1522,13 @@ pub fn spawn_awaited<C>(
 /// exit status belongs to [`Handle::try_wait`], so call this after trying those.
 pub fn reap_orphans(mains: &[i32]) {
     use nix::sys::wait::{Id, WaitPidFlag, waitid};
-    // (Held throughout: nothing is started and taken from its starter in between.)
-    let awaited = AWAITED.lock().expect("nothing panics holding the list");
+    // (Held throughout: nothing is started and taken from its starter in between. A start holds it
+    // while its helper answers, up to HELPER_DEADLINE: a sweep that finds it taken is left to the next
+    // call rather than blocking the caller, the controller's tick, for that long.)
+    let awaited = match AWAITED.try_lock() {
+        Err(std::sync::TryLockError::WouldBlock) => return,
+        held => held.expect("nothing panics holding the list"),
+    };
     // WNOWAIT looks without taking, so a handle's status is never taken from it.
     let peek = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
     while let Ok(Some(pid)) = waitid(Id::All, peek).map(|status| status.pid()) {
@@ -1099,6 +1537,12 @@ pub fn reap_orphans(mains: &[i32]) {
         }
         let _ = waitpid(pid, None);
     }
+}
+
+/// The idle class of a unit (`tune`): `memory_high` is the memory amount it was given, if any.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Idle {
+    pub memory_high: Option<u64>,
 }
 
 /// The most the kernel takes for `cpu.weight` and `io.weight` (the default is 100): a unit with
@@ -1110,17 +1554,33 @@ const TOP_WEIGHT: u32 = 10_000;
 /// (none: no guarantee, the default weights), and `cpu_millis` thousandths of a CPU (none: no
 /// limit). What could not be written is returned in plain words, and the rest is written
 /// anyway: a kernel or a cgroup without the io controller still gives the memory and the CPU.
-pub fn tune(cgroup: &Path, guaranteed: Option<u64>, cpu_millis: Option<u64>) -> Vec<String> {
-    let weight = if guaranteed.is_some() { TOP_WEIGHT } else { 100 };
+///
+/// An `idle` unit (a template that says `priority: idle`) also gets `cpu.idle` 1 (the kernel's
+/// SCHED_IDLE for the whole cgroup: it runs only on CPU nothing else wants), the lowest
+/// `io.weight`, and `memory.high` where it has a memory amount, so its memory is reclaimed first.
+/// A normal unit is written none of these.
+pub fn tune(cgroup: &Path, guaranteed: Option<u64>, cpu_millis: Option<u64>, idle: Option<Idle>) -> Vec<String> {
+    let weight = match (idle, guaranteed) {
+        (Some(_), _) => 1,
+        (None, Some(_)) => TOP_WEIGHT,
+        (None, None) => 100,
+    };
     let cpu = cpu_millis.map_or("max".to_string(), |millis| {
         millis.max(10).saturating_mul(100).to_string()
     });
-    let files = [
+    let mut files = vec![
         ("memory.min", guaranteed.unwrap_or(0).to_string()),
-        ("cpu.weight", weight.to_string()),
         ("io.weight", format!("default {weight}")),
         ("cpu.max", format!("{cpu} 100000")),
     ];
+    if let Some(idle) = idle {
+        // No cpu.weight: the kernel gives an idle group the minimum itself, and refuses (EINVAL)
+        // every write of it once cpu.idle is 1, which a second tune of the same unit would hit.
+        files.push(("cpu.idle", "1".into()));
+        files.extend(idle.memory_high.map(|bytes| ("memory.high", bytes.to_string())));
+    } else {
+        files.push(("cpu.weight", weight.to_string()));
+    }
     let write = |(file, value): &(&str, String)| {
         let done = fs::write(cgroup.join(file), value);
         done.err().map(|e| format!("{file} = {value}: {e}"))
@@ -1515,7 +1975,37 @@ fn cgroup_parent() -> Result<String> {
         return Ok("/kith".into());
     }
     let own = fs::read_to_string("/proc/self/cgroup").ctx("reading /proc/self/cgroup")?;
-    parent_of_own(&own)
+    let parent = parent_of_own(&own)?;
+    #[cfg(test)]
+    let parent = test_parent(Path::new("/sys/fs/cgroup"), &parent);
+    Ok(parent)
+}
+
+/// Tests only (T-1185): this process's own child of the delegated parent, so two test runs at once
+/// (a merge gate and a builder's) never share a container's `kith-ID` cgroup and kill each other's
+/// containers. Its controllers are handed down one by one; empty ones of ended runs are removed
+/// here, since a test run has no end to remove its own at.
+#[cfg(test)]
+fn test_parent(root: &Path, parent: &str) -> String {
+    let dir = root.join(parent.trim_start_matches('/'));
+    for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        if let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("kith-test-"))
+            && !Path::new("/proc").join(pid).exists()
+        {
+            let _ = fs::remove_dir(entry.path()); // (refused while it has containers: left)
+        }
+    }
+    let name = format!("kith-test-{}", std::process::id());
+    match fs::create_dir(dir.join(&name)) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return parent.to_string(), // (as before)
+        _ => {}
+    }
+    let given = fs::read_to_string(dir.join(&name).join("cgroup.controllers")).unwrap_or_default();
+    for controller in given.split_whitespace() {
+        let _ = fs::write(dir.join(&name).join("cgroup.subtree_control"), format!("+{controller}"));
+    }
+    format!("{parent}/{name}")
 }
 
 /// Whether [`Runtime::new`] can find a cgroup to put containers in here (the same question as
@@ -1523,6 +2013,14 @@ fn cgroup_parent() -> Result<String> {
 #[doc(hidden)]
 pub fn has_delegated_cgroup() -> bool {
     cgroup_parent().is_ok()
+}
+
+/// The directory (under the cgroup mount) that holds the cgroups of the units this runtime
+/// starts (`kith-ID` each), where [`Runtime::new`] puts them; for what reads their usage.
+/// None where there is no delegated cgroup.
+pub fn units_cgroup_dir() -> Option<PathBuf> {
+    let parent = cgroup_parent().ok()?;
+    Some(Path::new("/sys/fs/cgroup").join(parent.trim_start_matches('/')))
 }
 
 /// The delegated parent of the cgroup `/proc/self/cgroup` (`proc`) names: its parent, unless that is
@@ -1558,7 +2056,7 @@ fn probe(root: &Path, parent: &str) -> Option<String> {
 const MAX_PIDS: i64 = 4096;
 
 /// Who a container's process is where neither its template nor its image says.
-pub const NOBODY: u32 = 65534;
+pub(crate) const NOBODY: u32 = 65534;
 
 /// The lines of the image's own `/etc/FILE`, split at the colons. Never through a link:
 /// an image says where its own files are, not where the host's are.
@@ -1629,7 +2127,7 @@ const CALLS: &str = "dev.kith.seccomp";
 /// The refused calls a sandbox makes to build namespaces of its own and a root inside them:
 /// those for namespaces, and all those that mount (bubblewrap sets a mount's flags with
 /// `mount_setattr`, and takes "not permitted" for an answer where "no such call" would do).
-pub const NESTED: &[&str] = &[
+pub(crate) const NESTED: &[&str] = &[
     "unshare",
     "setns",
     "clone",
@@ -1661,7 +2159,9 @@ impl Executor for Entry {
             // (Said on the unit's own stderr too: that is where its operator looks.)
             let failed = |what: &str, e: &dyn std::fmt::Display| {
                 let said = format!("kith: the container's user {user}:{group}: {what}: {e}\n");
-                let _ = std::io::Write::write_all(&mut std::io::stderr(), said.as_bytes());
+                // (write(2) on fd 2, not std's `Stderr`: a sibling thread's `eprintln!` holds
+                // std's lock across our fork, and the child would wait on it for good.)
+                let _ = nix::unistd::write(std::io::stderr(), said.as_bytes());
                 ExecutorError::Other(format!("{what}: {e}"))
             };
             nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).map_err(|e| failed("a user namespace", &e))?;
@@ -1696,7 +2196,7 @@ impl Executor for Entry {
             crate::seccomp::filters(&allowed, node_users)
                 .and_then(|filters| crate::seccomp::install(&filters))
                 .map_err(|e| {
-                    let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("kith: {e}\n").as_bytes());
+                    let _ = nix::unistd::write(std::io::stderr(), format!("kith: {e}\n").as_bytes());
                     ExecutorError::Other(e)
                 })?;
         }
@@ -1706,51 +2206,274 @@ impl Executor for Entry {
     fn validate(&self, spec: &Spec) -> std::result::Result<(), ExecutorValidationError> {
         DefaultExecutor {}.validate(spec)
     }
+
+    /// The default does this through `std::env`, whose lock a forked child can hold for good
+    /// (see `kith_dm_sys::replace_environ`): this child is the only thread it has.
+    fn setup_envs(
+        &self,
+        envs: std::collections::HashMap<String, String>,
+    ) -> std::result::Result<(), ExecutorSetEnvsError> {
+        let vars: Vec<(String, String)> = envs.into_iter().collect();
+        kith_dm_sys::replace_environ(&vars).map_err(|e| ExecutorSetEnvsError::Other(e.to_string()))
+    }
 }
 
 /// Gives a volume to a user: all of it, when its directory is not theirs already (a new
 /// volume, one written by root before containers had users, one restored, one whose
 /// workload changed its user).
 ///
-/// Each directory is opened as an entry of the one that holds it and never through a link,
-/// so a program writing the volume meanwhile cannot have something outside it given away.
+/// Each directory is opened as an entry of the one that holds it and never through a link, and
+/// each other entry is given by `fchownat` with no link followed, under the descriptor of the
+/// directory that holds it: a program writing the volume meanwhile cannot have something
+/// outside it given away. A volume that is held ([`Mount::held`]) starts from its descriptor,
+/// and its path is never named; one that is not, from its path.
 //
 // ponytail: a walk of the whole volume when its user changes, and two workloads with two
 // users on one volume walk it at every start. (A container's range of ids never walks one:
 // its volumes are id-mapped, see `stage`.) A mount that maps the volume's owner to the
 // container's user, when a volume is big enough for that to hurt.
-fn give(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    fn held(dir: &Path) -> io::Result<File> {
-        let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW;
-        fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)
+fn give_volume(volume: &Mount, namespace: &str, uid: u32, gid: u32) -> io::Result<u32> {
+    match &volume.held {
+        Some(held) => give_fd(held.reopen()?, namespace, uid, gid),
+        None => give_path(&volume.host, namespace, uid, gid),
     }
+}
+
+/// Refuses a held volume whose path is no longer the directory held: where kithd is not root
+/// there is no clone to bind from (`stage_held` needs the mount namespace and privilege of
+/// root), so the bind source is `host`, which the container's init opens in its own namespaces.
+/// This is the check made just before that init is forked, on the device and inode of the
+/// descriptor and of what the path is now (a link is not followed, so one put there is no match).
+///
+/// What stays: a tenant that swaps `host` for a link in the time between this check and the
+/// init's bind is bound to what the link names. The init is in a user namespace of kithd's own
+/// user, so that bind reaches only what that user can reach: a tenant that can do this is
+/// bound to a directory of kithd's user and no more, and nothing is raised (a kithd that is
+/// root has no such window: it binds from a clone of the descriptor).
+//
+// ponytail: a check, not a bind from the descriptor: the init takes a path in its own
+// namespaces, and a clone of the tree cannot be mounted into the mount namespace it makes.
+fn still_held(unit: &Unit) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for volume in unit.mounts.iter() {
+        let Some(held) = &volume.held else { continue };
+        let (held, named) = (held.reopen()?.metadata()?, fs::symlink_metadata(&volume.host)?);
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(io::Error::other(format!(
+                "{} is no longer the directory it was taken as: it was changed after it was opened",
+                volume.host.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The most directories a volume is given through: a tree deeper is refused whole. A walk holds
+/// one descriptor for each directory it is inside (its listing is that descriptor), so one
+/// costs at most this many and one more, whatever the tree is wide. The walks of a process
+/// together are bounded by [`GiveSlots`], each by this.
+const GIVE_DEEP: u32 = 128;
+
+/// What one walk takes from the process's descriptors, whatever its tree: one for each of
+/// [`GIVE_DEEP`] directories and the top, and one to spare.
+const GIVE_COST: usize = GIVE_DEEP as usize + 2;
+
+/// How long a give waits for descriptors another start's give holds before only it fails.
+const GIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A count of descriptors the gives of this process may hold together: a walk takes its
+/// [`GIVE_COST`] before it opens one and returns it when it is done, so no number of starts, deep
+/// trees or slow ones, can run the root part out of descriptors. A give that finds it short
+/// waits for another to finish, up to a limit, and then fails alone.
+///
+/// One namespace holds at most half of it (its share), so ONE hog waits on its own share and the
+/// other half is there for the rest. Two namespaces can still hold the whole pool between them,
+/// and then a third waits (30 s, then fails alone).
+///
+/// ponytail: a give holds its slots for its whole walk, so a slow volume (a network file system)
+/// holds its namespace's share as long as it is walked, and starts of that namespace past it wait
+/// (30 s, then fail, and the volume is walked again by the next start: the walk is idempotent).
+/// If that ever bites, give the slots back between directories and take them again. The 30 s wait
+/// is a sync Condvar wait run inside the controller's async start: when T-0811/T-0812 add
+/// concurrent gives, run create under `spawn_blocking` (T-1126).
+struct GiveSlots {
+    total: usize,
+    /// The descriptors held, all together and for each namespace.
+    held: std::sync::Mutex<(usize, std::collections::HashMap<String, usize>)>,
+    freed: std::sync::Condvar,
+}
+
+/// The descriptors a take holds, given back on drop (a walk that fails or panics included).
+struct GiveHeld<'a> {
+    slots: &'a GiveSlots,
+    namespace: String,
+}
+
+impl GiveSlots {
+    fn new(total: usize) -> Self {
+        // (At least one walk's worth: a smaller total would refuse every give.)
+        Self {
+            total: total.max(GIVE_COST),
+            held: std::sync::Mutex::new(Default::default()),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// What one namespace may hold: half, and never less than one walk.
+    fn share(&self) -> usize {
+        (self.total / 2).max(GIVE_COST)
+    }
+
+    fn take(&self, namespace: &str, wait: std::time::Duration) -> io::Result<GiveHeld<'_>> {
+        // (A walk that panicked left the counts whole, so a poisoned lock is still a good one.)
+        let held = self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // (Waits while the pool is out of room, or this namespace is at its share.)
+        let blocked = |(all, each): &mut (usize, std::collections::HashMap<String, usize>)| {
+            *all + GIVE_COST > self.total || each.get(namespace).copied().unwrap_or(0) + GIVE_COST > self.share()
+        };
+        let (mut held, timeout) = self
+            .freed
+            .wait_timeout_while(held, wait, blocked)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if timeout.timed_out() && blocked(&mut held) {
+            return Err(io::Error::other(format!(
+                "no descriptors to give the volume with after {wait:?}: the starts giving volumes hold them"
+            )));
+        }
+        held.0 += GIVE_COST;
+        *held.1.entry(namespace.into()).or_insert(0) += GIVE_COST;
+        Ok(GiveHeld {
+            slots: self,
+            namespace: namespace.into(),
+        })
+    }
+}
+
+impl Drop for GiveHeld<'_> {
+    fn drop(&mut self) {
+        let mut held = self.slots.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.0 -= GIVE_COST;
+        if let Some(mine) = held.1.get_mut(&self.namespace) {
+            *mine -= GIVE_COST;
+            if *mine == 0 {
+                held.1.remove(&self.namespace);
+            }
+        }
+        drop(held);
+        self.slots.freed.notify_all();
+    }
+}
+
+/// The process's slots: half its soft limit of descriptors, at most 8192 (each walk also keeps a
+/// listing buffer for every directory it is inside), so the rest stays for everything else.
+/// (The limit is read at the first give, after kithd has raised its soft one to the hard one,
+/// 65536 at most: `raise_nofile`, T-1075. The root part is a thread of kithd; a root part that is
+/// a process of its own must raise its own first, or the pool is half of what it started with.)
+fn give_slots() -> &'static GiveSlots {
+    static SLOTS: std::sync::OnceLock<GiveSlots> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let soft = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+            .map(|(soft, _)| soft)
+            .unwrap_or(1024);
+        GiveSlots::new(usize::try_from(soft / 2).unwrap_or(usize::MAX).min(8192))
+    })
+}
+
+/// [`give_volume`] for a directory named by path (a volume that is not held, one file of a map).
+fn give_path(dir: &Path, namespace: &str, uid: u32, gid: u32) -> io::Result<u32> {
+    use std::os::unix::fs::OpenOptionsExt;
     // (One file of a map, mounted alone.)
     if fs::symlink_metadata(dir)?.is_file() {
         let flags = nix::libc::O_NOFOLLOW | nix::libc::O_PATH;
         let file = fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)?;
-        return std::os::unix::fs::chown(format!("/proc/self/fd/{}", file.as_raw_fd()), Some(uid), Some(gid));
+        std::os::unix::fs::chown(format!("/proc/self/fd/{}", file.as_raw_fd()), Some(uid), Some(gid))?;
+        return Ok(0);
     }
-    fn walk(dir: File, uid: u32, gid: u32, deeper: u32) -> io::Result<()> {
-        for entry in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
+    let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW;
+    give_fd(
+        fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)?,
+        namespace,
+        uid,
+        gid,
+    )
+}
+
+/// [`give_volume`] for the directory `top` is open on, holding at most [`GIVE_DEEP`] and one
+/// descriptors at once, out of the process's [`give_slots`]: how many files it did not give (see
+/// below).
+///
+/// A file with another name too is not given, in this directory or in one outside it (a volume is
+/// one file system, so a link a program made to a file of the node's is one of these): what is
+/// written beside it must not change its owner. The workload may then find such a file not its
+/// own, and the count is what the caller says of it.
+fn give_fd(top: File, namespace: &str, uid: u32, gid: u32) -> io::Result<u32> {
+    give_fd_in(give_slots(), GIVE_WAIT, namespace, top, uid, gid)
+}
+
+/// [`give_fd`] with its slots and how long it waits for them named.
+fn give_fd_in(
+    slots: &GiveSlots,
+    wait: std::time::Duration,
+    namespace: &str,
+    top: File,
+    uid: u32,
+    gid: u32,
+) -> io::Result<u32> {
+    use nix::dir::Dir;
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::{Mode, SFlag, fstatat};
+    use nix::unistd::{Gid, Uid, fchownat};
+    use std::os::unix::fs::MetadataExt;
+    /// One directory, streamed: each entry is given (or its directory entered) as it is read, with
+    /// nothing of the listing kept, so a directory of any width costs a walk no memory of its own.
+    /// The directory's descriptor is its listing too (`fdopendir`), so a walk holds one
+    /// descriptor for each directory it is inside and never a second.
+    fn walk(mut dir: Dir, (uid, gid): (u32, u32), deeper: u32, skipped: &mut u32) -> io::Result<()> {
+        let at = dir.as_raw_fd();
+        for entry in dir.iter() {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                std::os::unix::fs::lchown(entry.path(), Some(uid), Some(gid))?;
-            } else if deeper == 0 {
-                return Err(io::Error::other("directories more than 128 deep"));
+            let name = entry.file_name();
+            if matches!(name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            // (Its type now, from the directory that holds it: what a program swapped it for
+            // since it was listed is what is seen.)
+            let seen = fstatat(Some(at), name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW)?;
+            let kind = SFlag::from_bits_truncate(seen.st_mode) & SFlag::S_IFMT;
+            if kind == SFlag::S_IFDIR {
+                if deeper == 0 {
+                    return Err(io::Error::other(format!("directories more than {GIVE_DEEP} deep")));
+                }
+                // (Opened as an entry of this directory and never through a link.)
+                let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+                let sub = Dir::openat(Some(at), name, flags, Mode::empty())?;
+                walk(sub, (uid, gid), deeper - 1, skipped)?;
+            } else if kind == SFlag::S_IFLNK || seen.st_nlink <= 1 {
+                // (A link is given as the link it is, and no more.)
+                fchownat(
+                    Some(at),
+                    name,
+                    Some(Uid::from_raw(uid)),
+                    Some(Gid::from_raw(gid)),
+                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+                )?;
             } else {
-                walk(held(&entry.path())?, uid, gid, deeper - 1)?;
+                *skipped += 1;
             }
         }
         // (Last, the top of all included: a walk that was cut short is done again.)
-        std::os::unix::fs::fchown(&dir, Some(uid), Some(gid))
+        nix::unistd::fchown(at, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
+        Ok(())
     }
-    let top = held(dir)?;
     let has = top.metadata()?;
     if (has.uid(), has.gid()) == (uid, gid) {
-        return Ok(());
+        return Ok(0);
     }
-    walk(top, uid, gid, 128)
+    // (Taken before the walk opens a directory of its own, given back when it is done.)
+    let _held = slots.take(namespace, wait)?;
+    let mut skipped = 0;
+    walk(Dir::from(top)?, (uid, gid), GIVE_DEEP, &mut skipped)?;
+    Ok(skipped)
 }
 
 #[cfg(test)]
@@ -1844,7 +2567,7 @@ fn init_dispatch(log: &Path) -> Result<tracing::Dispatch> {
 // ponytail: this keeps kith's own subscribers apart; another crate's, or a first event of a
 // call site on another thread, may still hold a lock of tracing's at a fork. The helper's
 // deadline ends that wait.
-static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// How long a create waits for its helper (the process that makes the container) before it
 /// kills it. A create takes milliseconds to seconds; this only bounds a helper that hangs.
@@ -2148,7 +2871,14 @@ fn spec_shifted(
             options.push("ro".into());
         }
         let bind = MountBuilder::default().destination(&volume.container).typ("bind");
-        let source = shift.map_or(volume.host.clone(), |_| staged(&format!("v{n}")));
+        // (A held volume is bound from its own clone in `STAGE`, never from its path: see
+        // `stage_held`. Where kithd is not root a path is the one it has.)
+        let staged_volume = shift.is_some() || (root && volume.held.is_some());
+        let source = if staged_volume {
+            staged(&format!("v{n}"))
+        } else {
+            volume.host.clone()
+        };
         mounts.push(bind.source(source).options(options).build()?);
     }
     spec.set_mounts(Some(mounts));
@@ -2565,7 +3295,7 @@ mod tests {
         let cgroup = std::env::temp_dir().join(format!("kith-tune-guarantee-{}", std::process::id()));
         fs::create_dir_all(&cgroup).unwrap();
         let read = |file: &str| fs::read_to_string(cgroup.join(file)).unwrap();
-        assert!(tune(&cgroup, Some(4 << 30), None).is_empty());
+        assert!(tune(&cgroup, Some(4 << 30), None, None).is_empty());
         assert_eq!(read("memory.min"), "4294967296");
         assert_eq!(
             (read("cpu.weight"), read("io.weight")),
@@ -2573,18 +3303,58 @@ mod tests {
         );
         assert_eq!(read("cpu.max"), "max 100000");
         // Held back to a twentieth of a CPU, with no guarantee: the defaults, and the limit.
-        assert!(tune(&cgroup, None, Some(50)).is_empty());
+        assert!(tune(&cgroup, None, Some(50), None).is_empty());
         assert_eq!((read("memory.min"), read("cpu.weight")), ("0".into(), "100".into()));
         assert_eq!(read("cpu.max"), "5000 100000");
         // A file the kernel will not take (here: a directory in its place) is named; the others are written.
         fs::remove_file(cgroup.join("io.weight")).unwrap();
         fs::create_dir(cgroup.join("io.weight")).unwrap();
-        let said = tune(&cgroup, Some(1), Some(500));
+        let said = tune(&cgroup, Some(1), Some(500), None);
         assert!(said.len() == 1 && said[0].starts_with("io.weight"), "{said:?}");
         assert_eq!(
             (read("memory.min"), read("cpu.max")),
             ("1".into(), "50000 100000".into())
         );
+        let _ = fs::remove_dir_all(cgroup);
+    }
+
+    #[test]
+    fn idle_class_writes_cpu_idle_the_lowest_io_weight_and_memory_high() {
+        let cgroup = std::env::temp_dir().join(format!("kith-tune-idle-{}", std::process::id()));
+        fs::create_dir_all(&cgroup).unwrap();
+        let read = |file: &str| fs::read_to_string(cgroup.join(file)).unwrap();
+        // A normal unit's files are as they were: nothing of the idle class is written.
+        assert!(tune(&cgroup, None, None, None).is_empty());
+        for file in ["cpu.idle", "memory.high"] {
+            assert!(!cgroup.join(file).exists(), "{file} written for a normal unit");
+        }
+        assert_eq!(read("io.weight"), "default 100");
+        // An idle group refuses every write of cpu.weight (EINVAL), so an idle unit is never written it.
+        fs::remove_file(cgroup.join("cpu.weight")).unwrap();
+        // Idle, with a memory amount: reclaimed from at that amount.
+        assert!(
+            tune(
+                &cgroup,
+                None,
+                None,
+                Some(Idle {
+                    memory_high: Some(64 << 20)
+                })
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            (read("cpu.idle"), read("io.weight"), read("memory.high")),
+            ("1".into(), "default 1".into(), "67108864".into())
+        );
+        // Idle with none: no memory.high is written (the one from before stays as it was).
+        fs::remove_file(cgroup.join("memory.high")).unwrap();
+        assert!(tune(&cgroup, None, None, Some(Idle { memory_high: None })).is_empty());
+        assert!(!cgroup.join("memory.high").exists());
+        assert_eq!((read("cpu.idle"), read("io.weight")), ("1".into(), "default 1".into()));
+        // Tuned again (a seat's change): still no cpu.weight.
+        assert!(tune(&cgroup, Some(1 << 20), Some(500), Some(Idle { memory_high: None })).is_empty());
+        assert!(!cgroup.join("cpu.weight").exists());
         let _ = fs::remove_dir_all(cgroup);
     }
 
@@ -2612,6 +3382,7 @@ mod tests {
             read_only,
             give: false,
             part: None,
+            held: None,
         }
     }
 
@@ -2824,7 +3595,7 @@ mod tests {
         symlink(&outside, volume.join("a/to-dir")).unwrap();
         let group = |path: &str| fs::symlink_metadata(dir.join(path)).unwrap().gid();
 
-        give(&volume, uid, other).unwrap();
+        give_path(&volume, "", uid, other).unwrap();
         for given in [
             "volume",
             "volume/top",
@@ -2840,11 +3611,602 @@ mod tests {
         }
         // Theirs already: nothing is walked (what is under it is as it was left).
         nix::unistd::chown(&volume.join("a/b/file"), None, Some(gid.into())).unwrap();
-        give(&volume, uid, other).unwrap();
+        give_path(&volume, "", uid, other).unwrap();
         assert_eq!(group("volume/a/b/file"), gid);
         // A volume that is itself a link is not a volume.
-        assert!(give(&volume.join("a/to-dir"), uid, other).is_err());
+        assert!(give_path(&volume.join("a/to-dir"), "", uid, other).is_err());
         assert_eq!(group("outside"), gid);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A volume held open, as the controller makes one: `host` names it in a message only.
+    fn held_mount(dir: &Path, at: &str, path_only: bool) -> Mount {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = if path_only { nix::libc::O_PATH } else { 0 };
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags | nix::libc::O_DIRECTORY)
+            .open(dir)
+            .unwrap();
+        Mount {
+            give: true,
+            held: Some(Held::new(OwnedFd::from(file))),
+            ..bind(dir.to_str().unwrap(), at, false)
+        }
+    }
+
+    /// A second group of this user, to give files to (only root can give them to another user);
+    /// `None`, with a line, for a user with one.
+    fn second_group() -> Option<(u32, u32, u32)> {
+        let (uid, gid) = (nix::unistd::getuid().as_raw(), nix::unistd::getgid().as_raw());
+        let other = nix::unistd::getgroups()
+            .unwrap()
+            .iter()
+            .map(|g| g.as_raw())
+            .find(|g| *g != gid);
+        if other.is_none() {
+            eprintln!("skipped: this user has one group, so nothing can be given");
+        }
+        other.map(|other| (uid, gid, other))
+    }
+
+    /// A volume that is held is given from its descriptor, whatever its path became: a link
+    /// put there after it was opened, even to a directory of the node's, is given nothing, nor
+    /// is what is below it.
+    #[test]
+    fn held_volume_swapped_for_a_symlink_is_given_as_opened() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-held-swap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside, moved) = (dir.join("volume"), dir.join("outside"), dir.join("moved"));
+        fs::create_dir_all(volume.join("sub")).unwrap();
+        fs::create_dir_all(outside.join("sub")).unwrap();
+        for file in ["volume/sub/f", "outside/f", "outside/sub/f"] {
+            fs::write(dir.join(file), "x").unwrap();
+        }
+        for path_only in [false, true] {
+            let mount = held_mount(&volume, "/data", path_only);
+            // The swap, after the descriptor was taken and before the use.
+            fs::rename(&volume, &moved).unwrap();
+            symlink(&outside, &volume).unwrap();
+
+            give_volume(&mount, "", uid, other).unwrap();
+            let group = |path: &str| fs::symlink_metadata(dir.join(path)).unwrap().gid();
+            for given in ["moved", "moved/sub", "moved/sub/f"] {
+                assert_eq!(group(given), other, "{given} (path only: {path_only})");
+            }
+            for kept in ["outside", "outside/f", "outside/sub", "outside/sub/f"] {
+                assert_eq!(group(kept), gid, "{kept} (path only: {path_only})");
+            }
+            // And what a unit's own questions of it are asked of it, not of the link.
+            assert_eq!(
+                mount.source().metadata().unwrap().ino(),
+                fs::metadata(&moved).unwrap().ino()
+            );
+
+            fs::remove_file(&volume).unwrap();
+            fs::rename(&moved, &volume).unwrap();
+            nix::unistd::chown(&volume, None, Some(gid.into())).unwrap();
+            nix::unistd::chown(&volume.join("sub"), None, Some(gid.into())).unwrap();
+            nix::unistd::chown(&volume.join("sub/f"), None, Some(gid.into())).unwrap();
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A program swapping the volume's directory for a link and back, over and over, while it is
+    /// given: nothing of the directory it is swapped for is ever given.
+    #[test]
+    fn held_volume_swap_thread_never_reaches_what_it_is_swapped_for() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        use std::sync::atomic::AtomicBool;
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-held-thread-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside, moved) = (dir.join("volume"), dir.join("outside"), dir.join("moved"));
+        fs::create_dir_all(&volume).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("f"), "x").unwrap();
+        fs::write(volume.join("f"), "x").unwrap();
+        let mount = held_mount(&volume, "/data", false);
+        // The held directory is moved off its name once, and the name is a link and a
+        // directory in turn (made in a hurry, as a program would).
+        fs::rename(&volume, &moved).unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = symlink(&outside, &volume);
+                    let _ = fs::remove_file(&volume);
+                    let _ = fs::create_dir(&volume);
+                    let _ = fs::remove_dir(&volume);
+                }
+            });
+            for round in 0..200 {
+                // (Given back to the group it had, then given again.)
+                nix::unistd::chown(&moved, None, Some(gid.into())).unwrap();
+                nix::unistd::chown(&moved.join("f"), None, Some(gid.into())).unwrap();
+                give_volume(&mount, "", uid, other).unwrap();
+                assert_eq!(fs::metadata(moved.join("f")).unwrap().gid(), other, "round {round}");
+                for kept in [&outside, &outside.join("f")] {
+                    assert_eq!(
+                        fs::metadata(kept).unwrap().gid(),
+                        gid,
+                        "round {round}: {}",
+                        kept.display()
+                    );
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A held volume is bound from its own clone beneath `STAGE`, where kithd is root, whether or
+    /// not it has a range of ids of its own; never by its path, which is what a program may have
+    /// swapped. Where kithd is not root, no such clone can be made, and the path is the bind's.
+    #[test]
+    fn held_volume_is_bound_from_its_clone_and_never_its_path() {
+        use nix::unistd::{Gid, Uid};
+        let dir = std::env::temp_dir().join(format!("kith-held-bind-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let unit = Unit {
+            mounts: vec![bind("/srv/plain", "/plain", false), held_mount(&dir, "/data", false)],
+            ..Unit::default()
+        };
+        let source = |spec: &Spec, at: &str| {
+            let mounts = spec.mounts().clone().unwrap();
+            let found = mounts.iter().find(|m| m.destination() == Path::new(at)).unwrap();
+            found.source().clone().unwrap()
+        };
+        let root = (Uid::from_raw(0), Gid::from_raw(0));
+        let user = (Uid::from_raw(1000), Gid::from_raw(1000));
+        for (ids, shift) in [(root, None), (root, Some(100_000)), (user, None)] {
+            let made = spec_shifted("a", &image, &unit, "/kith/a", Path::new("/b"), ids, shift).unwrap();
+            let (plain, data) = (source(&made, "/plain"), source(&made, "/data"));
+            let staged = ids == root;
+            assert_eq!(
+                data,
+                if staged {
+                    Path::new(STAGE).join("v1")
+                } else {
+                    dir.clone()
+                },
+                "{ids:?} {shift:?}"
+            );
+            assert_eq!(
+                plain,
+                if shift.is_some() {
+                    Path::new(STAGE).join("v0")
+                } else {
+                    PathBuf::from("/srv/plain")
+                },
+                "{ids:?} {shift:?}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Where kithd is not root a held volume is bound by its path, so a path that is not the
+    /// directory held is refused before the bind: a link put there, and the directory moved off.
+    #[test]
+    fn held_volume_by_path_is_refused_when_its_path_was_swapped() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("kith-held-still-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside, moved) = (dir.join("volume"), dir.join("outside"), dir.join("moved"));
+        fs::create_dir_all(&volume).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let unit = Unit {
+            mounts: vec![bind("/srv/plain", "/plain", false), held_mount(&volume, "/data", false)],
+            ..Unit::default()
+        };
+        still_held(&unit).unwrap();
+        fs::rename(&volume, &moved).unwrap();
+        symlink(&outside, &volume).unwrap();
+        let said = still_held(&unit).unwrap_err().to_string();
+        assert!(said.contains("no longer the directory"), "{said}");
+        // A directory of the same name that is another one is no more the one held.
+        fs::remove_file(&volume).unwrap();
+        fs::create_dir(&volume).unwrap();
+        assert!(still_held(&unit).is_err());
+        // And nothing there at all.
+        fs::remove_dir(&volume).unwrap();
+        assert!(still_held(&unit).is_err());
+        fs::rename(&moved, &volume).unwrap();
+        still_held(&unit).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A create by a kithd that is not root, of a unit whose held volume's path was swapped for a
+    /// link after it was opened, fails and names it; the same create with the path intact gets as
+    /// far as the rootfs it cannot mount (it is a file).
+    #[test]
+    fn create_by_a_user_refuses_a_held_volume_swapped_for_a_link() {
+        use std::os::unix::fs::symlink;
+        if nix::unistd::getuid().is_root() || !delegated_or_skip() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("kith-create-held-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        let rootfs = root.join("rootfs-is-a-file");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&rootfs, "").unwrap();
+        let (volume, outside, moved) = (root.join("volume"), root.join("outside"), root.join("moved"));
+        fs::create_dir_all(&volume).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let image = Image {
+            rootfs,
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let unit = Unit {
+            mounts: vec![held_mount(&volume, "/data", false)],
+            ..Unit::default()
+        };
+        let create = |id: &str| {
+            let (out, err) = (
+                File::create(root.join(format!("{id}.out"))).unwrap(),
+                File::create(root.join(format!("{id}.err"))).unwrap(),
+            );
+            runtime.create(id, &image, &unit, out, err).err().map(|e| e.to_string())
+        };
+        let intact = create("intact").expect("a rootfs that is a file makes no container");
+        if let Some(line) = cgroup_skip(&intact) {
+            let _ = fs::remove_dir_all(&root);
+            return report_skip(&line);
+        }
+        assert!(!intact.contains("no longer the directory"), "{intact}");
+        fs::rename(&volume, &moved).unwrap();
+        symlink(&outside, &volume).unwrap();
+        let said = create("swapped").expect("a swapped volume makes no container");
+        assert!(said.contains("no longer the directory"), "{said}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A tree 128 directories deep is given, one 129 deep is refused cleanly, and a refused walk
+    /// leaves no descriptor open.
+    #[test]
+    fn give_nofollow_bounds_the_depth_and_the_descriptors_it_holds() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-deep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let nested = |levels: usize| dir.join(vec!["d"; levels].join("/"));
+        let open = |path: &Path| {
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_DIRECTORY)
+                .open(path)
+                .unwrap()
+        };
+        fs::create_dir_all(nested(128)).unwrap();
+        assert_eq!(give_fd(open(&dir), "", uid, other).unwrap(), 0);
+        assert_eq!(fs::metadata(nested(128)).unwrap().gid(), other);
+
+        // One level more is refused, and says so.
+        fs::create_dir_all(nested(129)).unwrap();
+        nix::unistd::chown(&dir, None, Some(gid.into())).unwrap();
+        let said = give_fd(open(&dir), "", uid, other).unwrap_err().to_string();
+        assert!(said.contains("128 deep"), "{said}");
+        // Nothing of it is left open: the same tree is walked again and again (a leak of the
+        // descriptors of a failed walk would show as the process running out of them).
+        let limit = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+            .unwrap()
+            .0;
+        for _ in 0..(limit / 100).min(2000) {
+            assert!(give_fd(open(&dir), "", uid, other).is_err());
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Walks that run at once do not fail one another: each holds its own descriptors, at most one
+    /// for a directory it is inside, and the process's slots make the rest wait. Sixteen volumes
+    /// of the deepest tree given together, each several times, all succeed.
+    #[test]
+    fn give_nofollow_walks_at_once_do_not_fail_each_other() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-many-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        const WALKS: usize = 16;
+        for walk in 0..WALKS {
+            fs::create_dir_all(dir.join(format!("v{walk}")).join(vec!["d"; 128].join("/"))).unwrap();
+        }
+        let open = |path: &Path| {
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_DIRECTORY)
+                .open(path)
+                .unwrap()
+        };
+        std::thread::scope(|scope| {
+            let walks: Vec<_> = (0..WALKS)
+                .map(|walk| {
+                    let (dir, open) = (&dir, &open);
+                    scope.spawn(move || {
+                        let volume = dir.join(format!("v{walk}"));
+                        for round in 0..4 {
+                            // (Given back to the group it had, then given again.)
+                            let (to, from) = if round % 2 == 0 { (other, gid) } else { (gid, other) };
+                            nix::unistd::chown(&volume, None, Some(from.into())).unwrap();
+                            give_fd(open(&volume), "", uid, to).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for walk in walks {
+                walk.join().expect("a walk failed");
+            }
+        });
+        for walk in 0..WALKS {
+            assert_eq!(fs::metadata(dir.join(format!("v{walk}"))).unwrap().gid(), gid);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// More gives than the slots hold at once all finish, by waiting for one another: with room
+    /// for a single walk, eight of the deepest tree given together are done one after the other.
+    #[test]
+    fn give_nofollow_gives_over_the_slots_wait_and_all_finish() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let Some((uid, _, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-queue-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        const WALKS: usize = 8;
+        for walk in 0..WALKS {
+            fs::create_dir_all(dir.join(format!("v{walk}")).join(vec!["d"; 128].join("/"))).unwrap();
+        }
+        let slots = GiveSlots::new(GIVE_COST);
+        std::thread::scope(|scope| {
+            let walks: Vec<_> = (0..WALKS)
+                .map(|walk| {
+                    let (dir, slots) = (&dir, &slots);
+                    scope.spawn(move || {
+                        let flags = nix::libc::O_DIRECTORY;
+                        let open = fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(flags)
+                            .open(dir.join(format!("v{walk}")))
+                            .unwrap();
+                        give_fd_in(slots, std::time::Duration::from_secs(120), "", open, uid, other).unwrap();
+                    })
+                })
+                .collect();
+            for walk in walks {
+                walk.join().expect("a give failed instead of waiting");
+            }
+        });
+        for walk in 0..WALKS {
+            let volume = dir.join(format!("v{walk}"));
+            assert_eq!(fs::metadata(&volume).unwrap().gid(), other);
+            assert_eq!(
+                fs::metadata(volume.join(vec!["d"; 128].join("/"))).unwrap().gid(),
+                other
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A give that cannot get its slots within the time it waits fails alone, with a plain error,
+    /// and the slots are whole again when the holder lets go.
+    #[test]
+    fn give_nofollow_a_give_that_waits_too_long_fails_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let short = std::time::Duration::from_millis(100);
+        let slots = GiveSlots::new(GIVE_COST);
+        let held = slots.take("", short).unwrap();
+        let said = slots.take("", short).err().expect("no slot was free").to_string();
+        assert!(said.contains("no descriptors to give the volume with"), "{said}");
+        // (A total smaller than one walk is made one walk: it never refuses every give.)
+        assert!(GiveSlots::new(1).take("", short).is_ok());
+        let Some((uid, _, other)) = second_group() else {
+            drop(held);
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-late-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("a")).unwrap();
+        let open = || fs::OpenOptions::new().read(true).open(&dir).unwrap();
+        let said = give_fd_in(&slots, short, "", open(), uid, other)
+            .unwrap_err()
+            .to_string();
+        assert!(said.contains("no descriptors to give the volume with"), "{said}");
+        // (Nothing was given, nothing opened.)
+        assert_ne!(fs::metadata(dir.join("a")).unwrap().gid(), other);
+        drop(held);
+        assert_eq!(give_fd_in(&slots, short, "", open(), uid, other).unwrap(), 0);
+        assert_eq!(fs::metadata(dir.join("a")).unwrap().gid(), other);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One namespace holding its whole share (half the pool) cannot stop another's give: its own
+    /// next give waits and times out, and the other namespace's gives finish, here with real walks
+    /// while the first namespace's slots are held. Counts are whole again after.
+    #[test]
+    fn give_nofollow_a_namespace_at_its_share_leaves_the_rest_to_the_others() {
+        use std::os::unix::fs::MetadataExt;
+        let short = std::time::Duration::from_millis(100);
+        // (Room for four walks: a share is two.)
+        let slots = GiveSlots::new(4 * GIVE_COST);
+        assert_eq!(slots.share(), 2 * GIVE_COST);
+        let greedy = [slots.take("big", short).unwrap(), slots.take("big", short).unwrap()];
+        let said = slots
+            .take("big", short)
+            .err()
+            .expect("a third slot of one namespace")
+            .to_string();
+        assert!(said.contains("no descriptors to give the volume with"), "{said}");
+        // (The others have the other half, between them and whatever they ask.)
+        let small = [slots.take("small", short).unwrap(), slots.take("other", short).unwrap()];
+        assert!(slots.take("third", short).is_err(), "the pool is full");
+        drop(small);
+        let Some((uid, _, other)) = second_group() else {
+            drop(greedy);
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-share-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("a")).unwrap();
+        let open = || fs::OpenOptions::new().read(true).open(&dir).unwrap();
+        // (A give of a namespace that has none of its own held, while "big" holds all it may.)
+        assert_eq!(give_fd_in(&slots, short, "small", open(), uid, other).unwrap(), 0);
+        assert_eq!(fs::metadata(dir.join("a")).unwrap().gid(), other);
+        // (And "big" gets its own back when one of its walks is done.)
+        let [first, second] = greedy;
+        drop(first);
+        drop(slots.take("big", short).unwrap());
+        drop(second);
+        assert_eq!(slots.held.lock().unwrap().0, 0);
+        assert!(slots.held.lock().unwrap().1.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A directory with very many subdirectories is walked as it is read: every one is given, and
+    /// the walk keeps no list of them (the only memory a level has is the directory's own listing
+    /// buffer), so a tenant's width cannot grow the root part.
+    #[test]
+    fn give_nofollow_a_wide_level_is_given_as_it_is_read() {
+        use std::os::unix::fs::MetadataExt;
+        let Some((uid, _, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-wide-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        const WIDE: usize = 20_000;
+        fs::create_dir_all(&dir).unwrap();
+        for sub in 0..WIDE {
+            fs::create_dir(dir.join(format!("{sub}"))).unwrap();
+        }
+        let open = fs::OpenOptions::new().read(true).open(&dir).unwrap();
+        assert_eq!(give_fd(open, "", uid, other).unwrap(), 0);
+        for sub in [0, WIDE / 2, WIDE - 1] {
+            assert_eq!(fs::metadata(dir.join(format!("{sub}"))).unwrap().gid(), other);
+        }
+        assert_eq!(fs::metadata(&dir).unwrap().gid(), other);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A volume with files that have another name too says how many it left: the count is what
+    /// the create logs.
+    #[test]
+    fn give_nofollow_counts_the_files_it_leaves() {
+        use std::os::unix::fs::MetadataExt;
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-count-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside) = (dir.join("volume"), dir.join("outside"));
+        fs::create_dir_all(volume.join("a")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("one"), "x").unwrap();
+        fs::write(outside.join("two"), "x").unwrap();
+        fs::write(volume.join("own"), "x").unwrap();
+        fs::hard_link(outside.join("one"), volume.join("hard")).unwrap();
+        fs::hard_link(outside.join("two"), volume.join("a/hard")).unwrap();
+        assert_eq!(
+            give_volume(&held_mount(&volume, "/data", false), "", uid, other).unwrap(),
+            2
+        );
+        assert_eq!(fs::metadata(outside.join("one")).unwrap().gid(), gid);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A volume that is held is cloned from its descriptor, a volume that is not is not cloned:
+    /// nothing is taken from a path here.
+    #[test]
+    fn held_volume_clones_only_what_is_held() {
+        let unit = Unit {
+            mounts: vec![bind("/srv/plain", "/plain", false)],
+            ..Unit::default()
+        };
+        assert!(clone_held(&unit).unwrap().iter().all(Option::is_none));
+    }
+
+    /// A link in the volume is given as a link (not what it names, a file or a directory), and
+    /// a file that has a second name is not given: a name made outside the volume for a file of
+    /// the node's is how a program would have that given away.
+    #[test]
+    fn give_nofollow_gives_a_link_as_a_link_and_leaves_a_hardlinked_file() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-nofollow-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside) = (dir.join("volume"), dir.join("outside"));
+        fs::create_dir_all(volume.join("a")).unwrap();
+        fs::create_dir_all(outside.join("deep")).unwrap();
+        for file in ["volume/a/own", "outside/file", "outside/deep/file"] {
+            fs::write(dir.join(file), "x").unwrap();
+        }
+        symlink(outside.join("file"), volume.join("a/to-file")).unwrap();
+        symlink(&outside, volume.join("a/to-dir")).unwrap();
+        symlink("/proc/self/fd/0", volume.join("to-proc")).unwrap();
+        fs::hard_link(outside.join("file"), volume.join("a/hard")).unwrap();
+        let group = |path: &str| fs::symlink_metadata(dir.join(path)).unwrap().gid();
+
+        give_volume(&held_mount(&volume, "/data", false), "", uid, other).unwrap();
+        for given in [
+            "volume",
+            "volume/a",
+            "volume/a/own",
+            "volume/a/to-file",
+            "volume/a/to-dir",
+            "volume/to-proc",
+        ] {
+            assert_eq!(group(given), other, "{given}");
+        }
+        for kept in [
+            "outside",
+            "outside/file",
+            "outside/deep",
+            "outside/deep/file",
+            "volume/a/hard",
+        ] {
+            assert_eq!(group(kept), gid, "{kept}");
+        }
+        assert_eq!(fs::metadata(outside.join("file")).unwrap().nlink(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An entry swapped for a link after the directory was listed, in the walk of it, is given as
+    /// a link; what it names is not: the walk is under the descriptor of each directory.
+    #[test]
+    fn give_nofollow_entry_that_is_a_directory_no_longer_is_not_entered() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let Some((uid, gid, other)) = second_group() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (volume, outside) = (dir.join("volume"), dir.join("outside"));
+        fs::create_dir_all(volume.join("d")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("file"), "x").unwrap();
+        // `d` is a link to a directory, not a directory: it is not entered.
+        fs::remove_dir(volume.join("d")).unwrap();
+        symlink(&outside, volume.join("d")).unwrap();
+        give_volume(&held_mount(&volume, "/data", false), "", uid, other).unwrap();
+        assert_eq!(fs::metadata(outside.join("file")).unwrap().gid(), gid);
+        assert_eq!(fs::metadata(&outside).unwrap().gid(), gid);
+        assert_eq!(fs::symlink_metadata(volume.join("d")).unwrap().gid(), other);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3289,6 +4651,65 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A container's first process sets its environment without the lock Rust's std keeps on it:
+    /// `Command::spawn` of any other thread holds that lock across its fork, so a child forked
+    /// then holds it for good, and std's `remove_var` waits for it forever (the 60 s stalls of
+    /// `create`). The children here run `setup_envs` while other threads spawn processes
+    /// without pause; each must end with exactly the spec's environment, within the deadline.
+    #[test]
+    fn setup_envs_does_not_wait_for_the_environment_lock() {
+        // (No other test forks meanwhile, or its child holds what the test has open: the spawns
+        // here are many, and an image test whose lock they hold finds it taken.)
+        let _forking = FORKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::process::Command::new("/bin/true").status();
+                    }
+                })
+            })
+            .collect();
+        let mut failed = None;
+        for _ in 0..150 {
+            // (Awaited, as a create's helper is: another test's `reap_orphans` takes any child.)
+            let (forked, _awaited) = spawn_awaited(
+                || {
+                    kith_dm_sys::fork_start(|| {
+                        let spec = std::collections::HashMap::from([("ONLY".to_string(), "1".to_string())]);
+                        if Entry.setup_envs(spec).is_err() {
+                            return b"error".to_vec();
+                        }
+                        // (A read of std's lock: one a spawning thread holds is shared, so it never waits.)
+                        std::env::vars()
+                            .map(|(k, v)| format!("{k}={v}\n"))
+                            .collect::<String>()
+                            .into_bytes()
+                    })
+                },
+                |forked| u32::try_from(forked.pid()).ok(),
+            )
+            .unwrap();
+            match forked.collect(std::time::Duration::from_secs(10)) {
+                Ok(said) if said == b"ONLY=1\n" => {}
+                other => {
+                    failed = Some(format!("{other:?}"));
+                    break;
+                }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert!(
+            failed.is_none(),
+            "a child did not end with the spec's environment: {failed:?}"
+        );
+    }
+
     /// Creates from many threads of one process (as kithd's are, from its tokio workers) all return:
     /// libcontainer clones its intermediate process with a raw `clone3`, which a thread of this
     /// process may have caught holding a lock, and that child then waits for it forever. Each create
@@ -3428,6 +4849,491 @@ mod tests {
             Some(0),
             "the container's process ignores SIGPIPE: {ignored:x?}"
         );
+    }
+
+    /// A rootfs of this host's own programs: each of `bins` under `/bin`, and the libraries
+    /// `ldd` names for it at the same paths.
+    fn host_rootfs(rootfs: &Path, bins: &[&str]) {
+        for dir in [
+            "dev", "etc", "proc", "run", "sys", "tmp", "bin", "lib", "lib64", "usr/lib",
+        ] {
+            fs::create_dir_all(rootfs.join(dir)).unwrap();
+        }
+        for bin in bins {
+            let from = Path::new("/usr/bin").join(bin);
+            fs::copy(&from, rootfs.join("bin").join(bin)).unwrap();
+            let listed = Command::new("ldd").arg(&from).output().unwrap();
+            for lib in String::from_utf8_lossy(&listed.stdout)
+                .lines()
+                .filter_map(|line| line.split_whitespace().find(|word| word.starts_with('/')))
+            {
+                let to = rootfs.join(lib.trim_start_matches('/'));
+                fs::create_dir_all(to.parent().unwrap()).unwrap();
+                let _ = fs::copy(lib, to);
+            }
+        }
+    }
+
+    /// A process entered into a running container runs in its pid and mount namespaces (it sees
+    /// the container's own init as pid 1, and the image's files), takes input and gives output
+    /// by the pipes it is handed, and its exit status is the one `wait` returns; a program the
+    /// image lacks is an error, not a hang.
+    #[test]
+    fn enter_runs_a_process_in_the_containers_namespaces() {
+        use std::io::Read;
+        let root = std::env::temp_dir().join(format!("kith-enter-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        host_rootfs(&root.join("rootfs"), &["sleep", "sh", "cat"]);
+        let image = Image {
+            rootfs: root.join("rootfs"),
+            entrypoint: vec!["/bin/sleep".into(), "300".into()],
+            ..Image::default()
+        };
+        let (out, err) = (
+            File::create(root.join("out")).unwrap(),
+            File::create(root.join("err")).unwrap(),
+        );
+        let mut handle = match runtime.create("enter1", &image, &Unit::default(), out, err) {
+            Err(e) if cgroup_skip(&e.to_string()).is_some() => {
+                let _ = fs::remove_dir_all(&root);
+                return report_skip(&cgroup_skip(&e.to_string()).unwrap());
+            }
+            made => made.unwrap(),
+        };
+        handle.start().unwrap();
+        let state = root.join("runtime");
+        // A create takes FORKING and then the awaited list; so `enter` must too, and never hold
+        // the list while it waits for FORKING (two threads, one holding each, wait for ever).
+        // Here a thread is held at FORKING, and the list must be free while it waits.
+        let forking = FORKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let waiting = std::thread::spawn({
+            let state = state.clone();
+            move || enter(&state, "enter1", &["/bin/cat".into()]).map(drop)
+        });
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < until
+            && !fs::read_dir(&state)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(SCRATCH))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // (Past the scratch copy, the next thing `enter` does is take its locks.)
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // (A sweep or a start on another test's thread may hold the list for a moment: retry.)
+        let list_free = (0..100).any(|_| {
+            AWAITED.try_lock().is_ok() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        drop(forking);
+        let _ = waiting.join();
+        assert!(
+            list_free,
+            "enter holds the awaited list while it waits for FORKING: a create holding FORKING waits for the list, and neither goes on"
+        );
+        let run = |argv: &[&str], input: &str| {
+            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            let mut entered = enter(&state, "enter1", &argv)?;
+            let mut stdin = entered.stdin.take().unwrap();
+            stdin.write_all(input.as_bytes()).unwrap();
+            drop(stdin);
+            let (mut out, mut err) = (String::new(), String::new());
+            entered.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+            entered.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+            Ok::<_, crate::Error>((out, err, entered.wait()?))
+        };
+        let seen = run(&["/bin/cat", "/proc/1/cmdline"], "");
+        let echoed = run(&["/bin/sh", "-c", "cat; echo oops >&2; exit 7"], "hello");
+        // The user, capabilities and seccomp filter of the process are the container init's own, not
+        // those of the helper that joined its user namespace to make it.
+        let mine = |pid: &str| {
+            let said = run(&["/bin/cat", &format!("/proc/{pid}/status")], "").unwrap().0;
+            let keep = [
+                "Uid:",
+                "Gid:",
+                "CapInh:",
+                "CapPrm:",
+                "CapEff:",
+                "CapBnd:",
+                "CapAmb:",
+                "NoNewPrivs:",
+                "Seccomp:",
+            ];
+            said.lines()
+                .filter(|l| keep.iter().any(|k| l.starts_with(k)))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let (tenant, init) = (mine("self"), mine("1"));
+        let missing = run(&["/bin/nothing"], "").map(|_| ());
+        // One dropped unwaited is ended (zombie or gone: its parent here has not reaped it).
+        let dropped = enter(&state, "enter1", &["/bin/sleep".into(), "300".into()]).map(|entered| {
+            let pid = entered.pid();
+            drop(entered);
+            let ended = || match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+                Err(_) => true,
+            };
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ended() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            ended()
+        });
+        // One killed takes what it started with it: `sh -c 'sleep 300; true'` has a sleep to end too.
+        let tree = enter(
+            &state,
+            "enter1",
+            &["/bin/sh".into(), "-c".into(), "sleep 300; true".into()],
+        )
+        .map(|entered| {
+            let ppid = |pid: i32| {
+                let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                stat.rsplit(')').next()?.split_whitespace().nth(1)?.parse::<i32>().ok()
+            };
+            let ended = |pid: i32| match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+                Err(_) => true,
+            };
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut child = None;
+            while child.is_none() && std::time::Instant::now() < until {
+                child = fs::read_dir("/proc")
+                    .unwrap()
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+                    .find(|p| ppid(*p) == Some(entered.pid()));
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            entered.kill();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while child.is_some_and(|c| !ended(c)) && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            child.is_some_and(ended)
+        });
+        let _ = handle.kill();
+        // (A process that failed to start is left a zombie in the container's pid namespace, which
+        // its init waits for before it ends: kithd's reaper takes it, here the test does.)
+        while let Ok(None) = handle.try_wait() {
+            reap_orphans(&[handle.pid()]);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = handle.delete();
+        let _ = fs::remove_dir_all(&root);
+        let (out, _, code) = seen.unwrap();
+        assert!(
+            out.starts_with("/bin/sleep"),
+            "pid 1 of the container is its init: {out:?}"
+        );
+        assert_eq!(code, 0);
+        assert_eq!(echoed.unwrap(), ("hello".into(), "oops\n".into(), 7));
+        assert!(missing.is_err(), "a program the image lacks");
+        assert!(
+            dropped.unwrap(),
+            "a process dropped with no one to wait for it is ended"
+        );
+        assert!(tree.unwrap(), "a process killed takes its children with it");
+        assert_eq!(tenant, init, "the tenant has its init's user, capabilities and filter");
+        assert!(
+            init.iter().any(|l| l.starts_with("Seccomp:") && l.ends_with('2')),
+            "{init:?}"
+        );
+        assert!(init.len() >= 9, "{init:?}");
+    }
+
+    /// An init's spec as a root kithd writes it: a user with its group said once more, and the
+    /// namespaces, capabilities and seccomp filter a tenant must have as well.
+    fn init_spec_with_groups() -> Spec {
+        let mut spec = oci_spec::runtime::Spec::default();
+        let user = UserBuilder::default()
+            .uid(1234u32)
+            .gid(5678u32)
+            .additional_gids(vec![5678u32]);
+        let mut process = spec.process().clone().unwrap();
+        process.set_user(user.build().unwrap());
+        process.set_no_new_privileges(Some(true));
+        spec.set_process(Some(process));
+        let mut linux = spec.linux().clone().unwrap_or_default();
+        let filter = oci_spec::runtime::LinuxSeccompBuilder::default()
+            .default_action(oci_spec::runtime::LinuxSeccompAction::ScmpActErrno)
+            .build()
+            .unwrap();
+        linux.set_seccomp(Some(filter));
+        spec.set_linux(Some(linux));
+        spec.set_root(Some(RootBuilder::default().path("rootfs").build().unwrap()));
+        spec
+    }
+
+    /// The copy a tenant is validated against differs from the init's spec in the one field that
+    /// a user namespace refuses (`process.user.additionalGids`): its namespaces, capabilities,
+    /// seccomp filter and the rest are the init's own, and a relative root stays where it was.
+    #[test]
+    fn enter_scratch_spec_drops_only_additional_gids() {
+        let init = init_spec_with_groups();
+        let copy = scratch_spec(&init, Path::new("/bundle"));
+        let user = copy.process().as_ref().unwrap().user();
+        assert_eq!((user.uid(), user.gid(), user.additional_gids()), (1234, 5678, &None));
+        // Put the one field back and the copy is the init's spec, but for the root's path.
+        let (mut back, mut same) = (copy.clone(), init.clone());
+        let mut process = back.process().clone().unwrap();
+        process.set_user(init.process().as_ref().unwrap().user().clone());
+        back.set_process(Some(process));
+        assert_eq!(back.root().as_ref().unwrap().path(), Path::new("/bundle/rootfs"));
+        same.set_root(back.root().clone());
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&same).unwrap()
+        );
+        let (a, b) = (copy.linux().as_ref().unwrap(), init.linux().as_ref().unwrap());
+        assert_eq!(a.namespaces(), b.namespaces());
+        assert_eq!(a.seccomp(), b.seccomp());
+        assert!(a.seccomp().is_some());
+        let caps = |spec: &Spec| spec.process().as_ref().unwrap().capabilities().clone();
+        assert_eq!(caps(&copy), caps(&init));
+    }
+
+    /// A shifted pod's init has its root at `STAGE/root`, a mount only its own mount namespace has:
+    /// libcontainer's tenant canonicalizes the root of the spec it loads (`canonicalize_rootfs`)
+    /// from the node, and failed on it with "oci spec error". The copy names a root that is there.
+    #[test]
+    fn enter_scratch_spec_has_a_root_the_node_can_canonicalize() {
+        let mut init = init_spec_with_groups();
+        let root = RootBuilder::default()
+            .path(Path::new(STAGE).join("root"))
+            .readonly(true);
+        init.set_root(Some(root.build().unwrap()));
+        let bundle = std::env::temp_dir();
+        assert!(
+            init.clone().canonicalize_rootfs(&bundle).is_err(),
+            "the failure this is for"
+        );
+        let mut copy = scratch_spec(&init, &bundle);
+        copy.canonicalize_rootfs(&bundle).unwrap();
+        assert_eq!(copy.root().as_ref().unwrap().path(), Path::new("/"));
+        assert_eq!(copy.root().as_ref().unwrap().readonly(), Some(true));
+    }
+
+    /// What libcontainer's top error leaves out is said: the cause of an "oci spec error".
+    #[test]
+    fn enter_error_says_its_causes() {
+        let cause = Spec::load(std::env::temp_dir().join("kith-no-such-config.json")).unwrap_err();
+        let top = libcontainer::error::LibcontainerError::from(cause);
+        let said = with_sources(&top);
+        assert!(said.starts_with("oci spec error: "), "{said}");
+        assert!(
+            said.contains("kith-no-such-config.json") || said.to_lowercase().contains("no such file"),
+            "{said}"
+        );
+    }
+
+    /// The scratch directory is private to this process's user (0700, its own), holds the copied
+    /// state.json (naming the copy as the bundle) and config.json and nothing else, never follows
+    /// a link (one planted at its name is refused and its target left alone), and is gone when
+    /// dropped.
+    #[test]
+    fn enter_scratch_dir_is_private_complete_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("kith-scratch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (planted, elsewhere) = (root.join("planted"), root.join("elsewhere"));
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+        let state = libcontainer::container::State {
+            id: "c".into(),
+            bundle: "/old/bundle".into(),
+            ..Default::default()
+        };
+        let init = init_spec_with_groups();
+        assert!(
+            Scratch::at(planted.clone(), "c", &state, &init).is_err(),
+            "a link is not followed"
+        );
+        assert_eq!(
+            fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "nothing was made through it"
+        );
+
+        let scratch = Scratch::new(&root, "c", &state, &init).unwrap();
+        let dir = scratch.root().to_path_buf();
+        let meta = fs::symlink_metadata(&dir).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
+        assert_eq!(meta.uid(), nix::unistd::geteuid().as_raw());
+        let inner = dir.join("c");
+        assert_eq!(fs::metadata(&inner).unwrap().permissions().mode() & 0o7777, 0o700);
+        let mut names: Vec<_> = fs::read_dir(&inner)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["config.json", "state.json"]);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "only the container's directory");
+        let loaded = Container::load(dir.join("c"));
+        // (Its pid is not one: the status is refreshed to stopped, the rest is what was copied.)
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.bundle(), &inner);
+        let config = Spec::load(inner.join("config.json")).unwrap();
+        assert_eq!(config.process().as_ref().unwrap().user().additional_gids(), &None);
+        drop(scratch);
+        assert!(!dir.exists(), "removed with its guard");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Nothing of the scratch copy is left in the runtime directory when `enter` is done with a
+    /// container, whether the process started or the program was one the image lacks.
+    #[test]
+    fn enter_scratch_is_removed_whether_the_tenant_starts_or_not() {
+        let root = std::env::temp_dir().join(format!("kith-enter-scratch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        host_rootfs(&root.join("rootfs"), &["sleep", "cat"]);
+        let image = Image {
+            rootfs: root.join("rootfs"),
+            entrypoint: vec!["/bin/sleep".into(), "300".into()],
+            ..Image::default()
+        };
+        let (out, err) = (
+            File::create(root.join("out")).unwrap(),
+            File::create(root.join("err")).unwrap(),
+        );
+        let mut handle = match runtime.create("scratch1", &image, &Unit::default(), out, err) {
+            Err(e) if cgroup_skip(&e.to_string()).is_some() => {
+                let _ = fs::remove_dir_all(&root);
+                return report_skip(&cgroup_skip(&e.to_string()).unwrap());
+            }
+            made => made.unwrap(),
+        };
+        handle.start().unwrap();
+        let state = root.join("runtime");
+        let left = || {
+            fs::read_dir(&state)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(SCRATCH))
+                .count()
+        };
+        let ok = enter(&state, "scratch1", &["/bin/cat".into(), "/proc/1/cmdline".into()]);
+        let started = ok.map(|entered| entered.wait()).is_ok();
+        let missing = enter(&state, "scratch1", &["/bin/nothing".into()]).is_err();
+        let not_running = enter(&state, "nothing-here", &["/bin/cat".into()]).is_err();
+        let counted = left();
+        let _ = handle.kill();
+        while let Ok(None) = handle.try_wait() {
+            reap_orphans(&[handle.pid()]);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = handle.delete();
+        let _ = fs::remove_dir_all(&root);
+        assert!(started && missing && not_running);
+        assert_eq!(counted, 0, "no scratch copy left behind");
+    }
+
+    /// A scratch directory a stopped kithd left (it was killed in an `enter`) is swept by the
+    /// next runtime on that directory.
+    #[test]
+    fn enter_scratch_left_by_a_dead_kithd_is_swept() {
+        let root = std::env::temp_dir().join(format!("kith-scratch-swept-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(format!("{SCRATCH}stale/c"))).unwrap();
+        fs::write(root.join(format!("{SCRATCH}stale/c/state.json")), "{}").unwrap();
+        fs::write(root.join("enter-1.log"), "").unwrap();
+        let _runtime = Runtime::new(&root).unwrap();
+        assert!(!root.join(format!("{SCRATCH}stale")).exists());
+        assert!(
+            root.join("enter-1.log").exists(),
+            "what is not a scratch directory stays"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An init whose spec has no process is refused: there is no user to enter as.
+    #[test]
+    fn enter_refuses_an_init_with_no_process_in_its_spec() {
+        let mut spec = oci_spec::runtime::Spec::default();
+        assert!(init_process(&spec).is_ok());
+        spec.set_process(None);
+        assert_eq!(init_process(&spec).unwrap_err(), "its spec has no process");
+    }
+
+    /// A process entered into a container whose unit has a user and a working directory runs as
+    /// that user, with its groups, in that directory: the init's own, not root in "/". (Root only:
+    /// a non-root runtime gives the init no user of its own to compare.)
+    #[test]
+    fn enter_runs_as_the_inits_user_groups_and_directory() {
+        use std::io::Read;
+        if !nix::unistd::getuid().is_root() {
+            return report_skip("not root: the init's user is not set by the runtime");
+        }
+        let root = std::env::temp_dir().join(format!("kith-enter-user-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        host_rootfs(&root.join("rootfs"), &["sleep", "sh", "cat"]);
+        fs::create_dir_all(root.join("rootfs/work")).unwrap();
+        let image = Image {
+            rootfs: root.join("rootfs"),
+            entrypoint: vec!["/bin/sleep".into(), "300".into()],
+            ..Image::default()
+        };
+        let unit = Unit {
+            user: Some(1234),
+            working_dir: Some("/work".into()),
+            ..Unit::default()
+        };
+        let (out, err) = (
+            File::create(root.join("out")).unwrap(),
+            File::create(root.join("err")).unwrap(),
+        );
+        let mut handle = match runtime.create("enter2", &image, &unit, out, err) {
+            Err(e) if cgroup_skip(&e.to_string()).is_some() => {
+                let _ = fs::remove_dir_all(&root);
+                return report_skip(&cgroup_skip(&e.to_string()).unwrap());
+            }
+            made => made.unwrap(),
+        };
+        handle.start().unwrap();
+        let state = root.join("runtime");
+        let run = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            let mut entered = enter(&state, "enter2", &argv)?;
+            drop(entered.stdin.take());
+            let mut out = String::new();
+            entered.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+            Ok::<_, crate::Error>((out, entered.wait()?))
+        };
+        let mine = |pid: &str| {
+            let said = run(&["/bin/cat", &format!("/proc/{pid}/status")]).unwrap().0;
+            said.lines()
+                .filter(|l| ["Uid:", "Gid:", "Groups:"].iter().any(|k| l.starts_with(k)))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let (tenant, init) = (mine("self"), mine("1"));
+        let cwd = run(&["/bin/sh", "-c", "pwd"]);
+        let _ = handle.kill();
+        while let Ok(None) = handle.try_wait() {
+            reap_orphans(&[handle.pid()]);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = handle.delete();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(tenant, init, "the tenant has its init's uid, gid and groups");
+        assert!(
+            init.iter().any(|l| l.starts_with("Uid:") && l.contains("1234")),
+            "the init is the unit's user: {init:?}"
+        );
+        assert_eq!(cwd.unwrap().0.trim(), "/work", "the init's working directory");
     }
 
     /// Only the overlay's EPERM is the kernel refusing the overlay root: the other failures of a

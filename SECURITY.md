@@ -93,7 +93,8 @@ Only the newest version is fixed. There are no security releases of older ones.
   Node) is not taken: what it passes on is refused whoever it names (see "A node that
   is taken").
 - **Node-to-node routes** (Raft, copies of blobs and volumes, a volume's key, running a
-  command on another node) take a node's certificate only, and, like the API, only
+  command on another node, a node's usage series for `GET /v1/metrics`, which the asked
+  node answers an Identity with only if its Role may list Nodes) take a node's certificate only, and, like the API, only
   while that node's Node is in the store: each request is asked again.
 - **What one node passes on to another is pinned to its name.** A passphrase, a Volume's
   key, a caller's Volume files, a restore, `kith run`, a unit's output, a Volume's copy,
@@ -169,6 +170,14 @@ Only the newest version is fixed. There are no security releases of older ones.
   a device does once open, and nothing of an `exec` unit, which is a process of the host.
   Where kithd is not root there is none: the user namespace a container is in there
   makes no device nodes.
+  A process entered into a pod (`kubectl exec`, `cp`, `attach`, `port-forward`) joins the
+  pod's namespaces, user namespace first, and runs as its init's user and groups with its
+  capabilities and seccomp filter. The container library refuses a spec with supplementary
+  groups once the process is in a user namespace, so it reads a private copy of the init's
+  state and spec made for that one entry (a directory of kithd's own user, mode 0700,
+  created without following a link, removed when the process has started or failed to, and
+  swept at the next start if kithd was killed in between); the copy differs from the
+  init's spec in `additionalGids` alone (and in the paths that name where the copy is kept), which the entered process is given as its own.
   A GPU share (`share: { vram }`) is a ceiling only where the Device has a `dmem` region
   and kithd can hand the dmem controller down: the kernel then keeps the container's use
   of that GPU's memory under the share (`dmem.max`). Elsewhere it is a count the scheduler
@@ -293,6 +302,18 @@ Only the newest version is fixed. There are no security releases of older ones.
   give nothing; a pod is given no token and no API to ask. `privileged`, the host's
   namespaces, `hostPath` and added capabilities have no field in kith, and an object
   that asks for one is refused by its name. Of a body in protobuf 50,000 fields are read.
+- **`kubectl exec`, `cp` and `port-forward` are one right, `exec`, on the Workload or Job that
+  owns the pod.** `get` alone reads a pod and is refused all three. A `port-forward` reaches
+  any port of the pod, whatever listens there and whatever a NetworkPolicy says: a policy holds
+  a pod's own packets going out, and this is a connection into it from its node, so it asks no
+  policy; the right to `exec` is the right to reach the pod's ports. The right is asked again
+  for each new connection of a session (a binding taken away refuses the next, and ends none
+  that is open). A replica on another node is reached by one route, `/v1/pod-hop`, which only a
+  control node may send (a worker is refused, not asked) and which carries the caller's name
+  with the sender's signature: the node that runs the replica checks the signature, the named
+  caller and the `exec` right on that node, from its own copy of the Roles, before it enters
+  the pod or opens a connection. A pod not yet made on its node is refused, never answered by
+  the host's own ports.
 - **What a resource makes for itself is asked for with it.** Whoever writes a CronJob
   must be allowed to write a Job, and whoever writes a claim that says `provision`
   (every PersistentVolumeClaim does, unless it names no storage class) a Volume.
@@ -414,7 +435,28 @@ Only the newest version is fixed. There are no security releases of older ones.
   which nothing here defends against.
 - **A Volume's archive** (a Backup, an Image, a replica's copy) is read through directory
   handles that are held open: nothing in the volume is reached by a path the workload
-  could point elsewhere meanwhile. When one is unpacked, no entry writes outside the
+  could point elsewhere meanwhile. A Volume's directory is opened beneath its root by
+  openat2 (no link out of it, no `..`, and no mount below the root; the root itself may be
+  the mount of an encrypted Volume), and a share, a backup, a replica, the volume files, an
+  image and the controller's check read and write its contents through that held
+  descriptor. A container's start works from the held descriptor too: the controller hands
+  it to the runtime (over the socket, in `--split`), which as root mounts, gives and binds
+  the volume from it and never names the path again, so swapping the directory for a link
+  after it is opened gets no bind or chown of what the link points at; the chown does not
+  follow a link and leaves a file with another hard link alone (the start logs how many
+  files it left, as it is not given them). A kithd that is not root has no clone to bind
+  from: it refuses the start when the path is no longer the directory held (device and
+  inode, checked just before the container's init binds it), but a tenant that swaps the
+  directory for a link in the short time after that check is bound what the link names,
+  which is anything kithd's own user can reach: here the tenant and kithd's user are two
+  sides of a boundary, and only a kithd that is root closes it fully. Still by path, and not
+  closed by this: a subPath without the id-mapped mount (refused); a container's scratch
+  directory, its map files, its identity, seat and pod files, which kithd makes and the
+  runtime reads by path; a restore's
+  and a replica's new copy, whose directory is read with `read_dir` and renamed into place
+  by path; and an NFS export, which is by path. A node's own `hostPaths` directory refuses
+  a link at its last component. A workload that can swap a directory on one of these
+  paths for a link can redirect that step. When one is unpacked, no entry writes outside the
   volume; a restored Backup has no setuid or setgid file (a replica's copy keeps them
   as its volume had them). A restore, a replica's first copy and each sync unpack no more
   than the Volume's `size`, where it says one: the entries are counted as they come, each

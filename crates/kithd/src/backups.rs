@@ -754,7 +754,7 @@ async fn make(shared: &Shared, state: &Path, job: &Job, at: u64) -> Result<Value
     let from = crate::root_part::volume(state, &job.dir)?;
     let blobs = crate::blobs::dir(shared);
     let into = blobs.clone();
-    let archived = tokio::task::spawn_blocking(move || archive(&from, &into)).await;
+    let archived = tokio::task::spawn_blocking(move || archive(from.held(), &into)).await;
     let (blob, size) = archived.map_err(|e| e.to_string())??;
     let Some(bucket) = bucket else {
         let key = format!("Blob/{}/{blob}", job.namespace);
@@ -1001,12 +1001,20 @@ pub async fn restore(
         match (entry["blob"].as_str(), entry["object"].as_str(), &spec.s3) {
             (Some(blob), _, _) => {
                 let archive = crate::blobs::here(&shared, &format!("Blob/{namespace}/{blob}")).await?;
-                let unpacked = tokio::task::spawn_blocking(move || unpack(&archive, &into, cap)).await;
+                // (The directory is replaced by its name: the path it was taken at.)
+                let unpacked = tokio::task::spawn_blocking(move || unpack(&archive, into.real(), cap)).await;
                 unpacked.map_err(|e| e.to_string())?
             }
             (None, Some(object), Some(s3_spec)) => {
                 let bucket = bucket(&shared, &namespace, s3_spec)?;
-                from_bucket(&bucket, object, &crate::blobs::dir(&shared), into, cap).await
+                from_bucket(
+                    &bucket,
+                    object,
+                    &crate::blobs::dir(&shared),
+                    into.real().to_path_buf(),
+                    cap,
+                )
+                .await
             }
             _ => Err("the backup says neither which blob nor which object it is".to_string()),
         }
