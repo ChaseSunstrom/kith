@@ -381,7 +381,9 @@ port 80 redirects. The ports need CAP_NET_BIND_SERVICE.
   with X.509 name constraints for the cluster's LAN domains, `home.arpa`, `lan`, `internal` and
   `local` unless a Cluster's `spec.lanDomains` names others. `kith ca export [FILE]`, run on the
   CA's node, writes that certificate (never a key) for a phone or laptop to trust once; a device
-  that trusts it takes nothing outside those domains from it. A host outside them, under
+  that trusts it takes nothing outside those domains from it. Change the domains and the CA's
+  certificate is made again (another serial, the same key): on each device remove the old
+  certificate, which keeps vouching for the old domains, and import the new. A host outside them, under
   `cluster.local` or `kith`, a single label, a wildcard or an address is refused when applied
   (the domains are checked too once a Cluster names them) and again when signed, and a
   Namespace's `spec.hosts` still keeps the hosts it names. The workloads' `ca.crt` and the mesh

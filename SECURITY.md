@@ -888,7 +888,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   does not verify against the cluster's root. Within the domains, whoever may write a Service may
   name a host (key those in a Namespace's `spec.hosts`), and there is no revocation: a certificate
   lasts 30 days and is made again in its last third. The LAN CA's own certificate lasts ten years;
-  changing the domains makes a new certificate with the same key, which a device trusts again. A
+  changing the domains makes a new certificate with the same key and another serial, and a device
+  keeps trusting the old, broader one until its owner removes it and imports the new. The name
+  constraints also exclude every IP address, and the LAN CA's key is only read, never made again over
+  a file that is there but unreadable. `kith ca export` only works on the CA node. A
   refused or failed issuance waits an hour, as ACME's, and the same error is written to the status once.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and

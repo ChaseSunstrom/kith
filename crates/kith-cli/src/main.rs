@@ -1983,8 +1983,12 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("the CA is kithd's: leave out --store");
             };
-            let pem = String::from_utf8(raw(&kithd, "GET", "/v1/ca/lan", b"")?)
-                .map_err(|_| "error: kithd's reply is not text".to_string())?;
+            let on_the_node = "kith ca export runs on the node that holds the CA (kithd's admin socket serves the certificate, no remote context does)";
+            if matches!(kithd.route, Route::Node { .. }) {
+                return fail(format!("error: {on_the_node}"));
+            }
+            let reply = raw(&kithd, "GET", "/v1/ca/lan", b"").map_err(|e| format!("{e}\n(note: {on_the_node})"))?;
+            let pem = String::from_utf8(reply).map_err(|_| "error: kithd's reply is not text".to_string())?;
             // (A certificate and nothing else: what is written for the world to trust holds no key.)
             if pem.contains("PRIVATE KEY") || !pem.contains("BEGIN CERTIFICATE") {
                 return fail("kithd's reply is not a certificate alone (a private key is never exported)");

@@ -939,8 +939,6 @@ fn cluster_fields_nothing_reads_are_said() {
     assert!(code == 0 && !said.contains("note:"), "{code}: {said}");
 }
 
-/// A kithd on a unix socket that answers each request with `answer(method, path, body)`, a JSON
-/// text, and keeps what it was asked as `METHOD PATH BODY`. (The cluster's signing is open.)
 /// The socket [`fake_kithd`] binds: removed when the test is done with it.
 struct Socket(PathBuf);
 
@@ -957,6 +955,8 @@ impl Drop for Socket {
     }
 }
 
+/// A kithd on a unix socket that answers each request with `answer(method, path, body)`, a JSON
+/// text, and keeps what it was asked as `METHOD PATH BODY`. (The cluster's signing is open.)
 fn fake_kithd(
     sb: &Sandbox,
     answer: impl Fn(&str, &str, &str) -> String + Send + 'static,
@@ -1037,7 +1037,7 @@ fn bare(
 /// laptop to trust once; without a FILE it prints it. A reply that carries a key is refused and
 /// nothing is written: the CA key stays where it is.
 #[test]
-fn ca_export_writes_the_cluster_ca_certificate_only() {
+fn ca_export_writes_the_lan_ca_certificate_only() {
     let pem = "-----BEGIN CERTIFICATE-----\nMIIBcluster\n-----END CERTIFICATE-----\n";
     let sb = Sandbox::new("ca-export");
     let (socket, seen) = fake_kithd(&sb, move |_, _, _| pem.to_string());

@@ -15,8 +15,8 @@
 // dependency of rcgen's, and the walk to them is a few lines.
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, NameConstraints,
+    BasicConstraints, CertificateParams, CidrSubnet, DnType, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose, NameConstraints,
 };
 use ring::rand::SecureRandom;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -190,10 +190,21 @@ fn lan_ca_params(domains: &[String]) -> CertificateParams {
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
     params.not_after = rcgen::date_time_ymd(year_in(10), 1, 1);
+    // No address either: a DNS constraint holds no IP SAN, so every address is excluded.
+    let mut excluded: Vec<GeneralSubtree> = dns(kith_api::kinds::RESERVED_ZONES.to_vec());
+    excluded.push(GeneralSubtree::IpAddress(CidrSubnet::V4([0; 4], [0; 4])));
+    excluded.push(GeneralSubtree::IpAddress(CidrSubnet::V6([0; 16], [0; 16])));
     params.name_constraints = Some(NameConstraints {
         permitted_subtrees: dns(domains.iter().map(String::as_str).collect()),
-        excluded_subtrees: dns(kith_api::kinds::RESERVED_ZONES.to_vec()),
+        excluded_subtrees: excluded,
     });
+    // A serial of the domains, as well as the key's (rcgen's default is of the key alone): the
+    // certificate made again for other domains is another certificate to a device, which a
+    // browser imports beside the old one. At most 20 octets, positive.
+    let hash = ring::digest::digest(&ring::digest::SHA256, domains.join(",").as_bytes());
+    let mut serial = hash.as_ref()[..20].to_vec();
+    serial[0] &= 0x7f;
+    params.serial_number = Some(serial.into());
     params
 }
 
@@ -215,7 +226,10 @@ impl LanCa {
             return Err("a host certificate lasts more than 0 and at most 90 days".into());
         }
         let mut params = tls("naming the certificate", CertificateParams::new(vec![host.to_string()]))?;
-        params.distinguished_name.push(DnType::CommonName, host);
+        // A Common Name is at most 64 characters (the name is in the SAN whatever it is).
+        if host.len() <= 64 {
+            params.distinguished_name.push(DnType::CommonName, host);
+        }
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.use_authority_key_identifier_extension = true;
@@ -314,23 +328,29 @@ impl Ca {
         if let Some(lan) = held.as_ref().filter(|lan| lan.domains == domains) {
             return Ok(lan.clone());
         }
-        let read = |file: &str| {
-            let dir = self.dir.as_ref()?;
-            std::fs::read_to_string(dir.join(file)).ok()
+        // A file that is not there is none; one that is there and cannot be read is an error (a new
+        // key made over it would end the CA every device trusts).
+        let read = |file: &str| -> Fallible<Option<String>> {
+            let Some(dir) = &self.dir else { return Ok(None) };
+            match std::fs::read_to_string(dir.join(file)) {
+                Ok(text) => Ok(Some(text)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("reading {file}: {e}").into()),
+            }
         };
-        let key_pem = held
-            .as_ref()
-            .map(|lan| lan.key.serialize_pem())
-            .or_else(|| read("lan-ca.key"));
+        let key_pem = match held.as_ref() {
+            Some(lan) => Some(lan.key.serialize_pem()),
+            None => read("lan-ca.key")?,
+        };
         let key = match &key_pem {
             Some(pem) => tls("reading the LAN CA key", KeyPair::from_pem(pem))?,
             None => tls("making the LAN CA key", KeyPair::generate())?,
         };
         // The certificate kept, if it was made for these domains: what was exported stays what it was.
-        let kept = read("lan-ca.domains")
-            .filter(|kept| kept.trim() == domains.join(","))
-            .and_then(|_| read("lan-ca.crt"))
-            .filter(|_| key_pem.is_some());
+        let kept = match read("lan-ca.domains")? {
+            Some(kept) if kept.trim() == domains.join(",") && key_pem.is_some() => read("lan-ca.crt")?,
+            _ => None,
+        };
         let cert = match kept {
             Some(cert) => cert,
             None => {
@@ -342,10 +362,20 @@ impl Ca {
                 if let Some(dir) = &self.dir {
                     let made = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
                     tls(&format!("creating {}", dir.display()), made)?;
-                    write_private(&dir.join("lan-ca.key"), &key.serialize_pem())?;
-                    write_private(&dir.join("lan-ca.crt"), &cert)?;
+                    // Whole or not at all, the key only when it is new (one that was read stays as it is).
+                    let keep = |file: &str, text: &str| {
+                        let path = dir.join(file);
+                        tls(
+                            &format!("writing {}", path.display()),
+                            write_whole(&path, text.as_bytes()),
+                        )
+                    };
+                    if key_pem.is_none() {
+                        keep("lan-ca.key", &key.serialize_pem())?;
+                    }
+                    keep("lan-ca.crt", &cert)?;
                     // Last: it says the certificate is for these domains.
-                    write_private(&dir.join("lan-ca.domains"), &domains.join(","))?;
+                    keep("lan-ca.domains", &domains.join(","))?;
                 }
                 cert
             }
@@ -1517,6 +1547,116 @@ mod tests {
             .unwrap();
         assert_eq!(again.cert, other.cert);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A key file that is there but cannot be read is an error, not "no key": a new key made over
+    /// it would be the end of the CA every device was given.
+    #[test]
+    fn an_unreadable_lan_ca_key_is_an_error_and_is_not_made_again() {
+        let dir = std::env::temp_dir().join(format!("kith-lan-ca-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A directory in its place: reading it fails with EISDIR (whoever runs the test), not NotFound.
+        std::fs::create_dir_all(dir.join("lan-ca.key")).unwrap();
+        let ca = Ca::create().unwrap().keep_in(&dir);
+        assert!(ca.lan(&[]).is_err());
+        assert!(dir.join("lan-ca.key").is_dir(), "the key's place is left as it was");
+        assert!(!dir.join("lan-ca.crt").exists());
+        assert!(!dir.join("lan-ca.domains").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The certificate made again for other domains is another certificate to a device (another
+    /// serial: a browser refuses to import a second one with the same issuer and serial), and a
+    /// key that was read is not written again.
+    #[test]
+    fn another_set_of_domains_makes_a_certificate_with_another_serial() {
+        // Certificate ::= SEQUENCE { tbs SEQUENCE { [0] version, INTEGER serial, .. }, .. }
+        let serial = |cert: &str| {
+            let der = certs(cert).unwrap().remove(0);
+            let content = |der: &[u8]| -> (u8, Vec<u8>, usize) {
+                let (len, head) = match der[1] {
+                    n @ 0..=0x7f => (n as usize, 2),
+                    n => (
+                        der[2..2 + (n & 0x7f) as usize]
+                            .iter()
+                            .fold(0, |l, b| l << 8 | *b as usize),
+                        2 + (n & 0x7f) as usize,
+                    ),
+                };
+                (der[0], der[head..head + len].to_vec(), head + len)
+            };
+            let (tag, outer, _) = content(&der);
+            assert_eq!(tag, 0x30);
+            let (_, tbs, _) = content(&outer);
+            let (tag, _, skip) = content(&tbs); // the version
+            assert_eq!(tag, 0xa0);
+            let (tag, serial, _) = content(&tbs[skip..]);
+            assert_eq!(tag, 0x02);
+            serial
+        };
+        let dir = std::env::temp_dir().join(format!("kith-lan-ca-serial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ca = Ca::create().unwrap().keep_in(&dir);
+        let lan = ca.lan(&[]).unwrap();
+        let home = ca.lan(&["home.arpa".to_string()]).unwrap();
+        assert_ne!(serial(&lan.cert), serial(&home.cert));
+        assert!(serial(&home.cert).len() <= 20 && serial(&home.cert)[0] & 0x80 == 0);
+        // The same domains, the same serial: made again from the files.
+        let key = std::fs::read(dir.join("lan-ca.key")).unwrap();
+        let modified = std::fs::metadata(dir.join("lan-ca.key")).unwrap().modified().unwrap();
+        let again = Ca::create()
+            .unwrap()
+            .keep_in(&dir)
+            .lan(&["home.arpa".to_string()])
+            .unwrap();
+        assert_eq!(serial(&again.cert), serial(&home.cert));
+        let other = Ca::create().unwrap().keep_in(&dir).lan(&["lan".to_string()]).unwrap();
+        assert_ne!(serial(&other.cert), serial(&home.cert));
+        assert_eq!(std::fs::read(dir.join("lan-ca.key")).unwrap(), key);
+        assert_eq!(
+            std::fs::metadata(dir.join("lan-ca.key")).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(!dir.join("lan-ca.new").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The LAN CA vouches for no address (name constraints do not hold an IP SAN to a DNS
+    /// subtree), and a name longer than a Common Name may be still gets its certificate.
+    #[test]
+    fn the_lan_ca_signs_no_address_and_a_long_name_gets_no_common_name() {
+        let ca = Ca::create().unwrap();
+        let lan = ca.lan(&[]).unwrap();
+        let (now, life) = (1_900_000_000, Duration::from_secs(600));
+        let mut params = CertificateParams::new(vec!["10.0.0.7".to_string(), "fd00::7".to_string()]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.use_authority_key_identifier_extension = true;
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now - 60);
+        params.not_after = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now + 600);
+        let key = KeyPair::generate().unwrap();
+        let issuer = Issuer::new(lan_ca_params(&lan.domains), &lan.key);
+        let der = certs(&params.signed_by(&key, &issuer).unwrap().pem())
+            .unwrap()
+            .remove(0);
+        for address in ["10.0.0.7", "fd00::7"] {
+            let verifier = WebPkiServerVerifier::builder_with_provider(roots(&lan.cert).unwrap(), provider());
+            let name = ServerName::try_from(address).unwrap();
+            let at = UnixTime::since_unix_epoch(Duration::from_secs(now));
+            assert!(
+                verifier
+                    .build()
+                    .unwrap()
+                    .verify_server_cert(&der, &[], &name, &[], at)
+                    .is_err(),
+                "{address}"
+            );
+        }
+        // 81 characters, under the 253 a name may be: a Common Name stops at 64.
+        let long = format!("{}.{}.lan", "a".repeat(38), "b".repeat(38));
+        assert!(long.len() > 64);
+        let (cert, key) = lan.issue_host(&long, now, life).unwrap();
+        certified(&cert, &key, &long).unwrap();
+        assert!(verifies(&lan.cert, &certs(&cert).unwrap().remove(0), &long, now));
     }
 
     fn secs() -> u64 {
