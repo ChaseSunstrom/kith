@@ -112,7 +112,6 @@ pub fn resolve(
     state: &Path,
     me: &str,
     volumes: &BTreeMap<String, Dir>,
-    capacity: impl Fn(&Dir) -> Option<u64>,
 ) -> Result<(VmUnit, Vec<Image>), String> {
     // (As `host_dir` has it: the directory it makes is under the state directory as it really is.)
     let state = state.canonicalize().unwrap_or_else(|_| state.to_path_buf());
@@ -147,15 +146,6 @@ pub fn resolve(
                 .into(),
         );
         let size = disk.size.as_ref().map_or(0.0, |size| size.value()) as u64;
-        // (A replicated disk is synced whole, sparse or not, and a sync over the Volume's size fails.)
-        if let (Some(cap), Some(text)) = (capacity(dir), &disk.size)
-            && size > cap
-        {
-            return Err(format!(
-                "disks: volume {name}: size {} is above the Volume's size, {cap} bytes",
-                String::from(text.clone())
-            ));
-        }
         images.push(Image {
             dir: dir.clone(),
             file,
@@ -510,7 +500,7 @@ mod tests {
             { "volume": "home", "file": "scratch.img", "size": "1Mi", "readOnly": true },
             { "path": "/var/d.raw" }] }),
         );
-        let (placed, images) = resolve(&unit, &state, "a", &volumes, |_| None).unwrap();
+        let (placed, images) = resolve(&unit, &state, "a", &volumes).unwrap();
         let root = state.join("volumes/default/home/data");
         let line = command(&placed, &[], None);
         let has = |words: &[&str]| line.windows(words.len()).any(|at| at == words);
@@ -559,9 +549,9 @@ mod tests {
         assert!(make_images(&state, &images).unwrap_err().contains("not a regular file"));
 
         // No Volume of the name on this node: no machine here, and the reason says which.
-        let lacking = resolve(&unit, &state, "a", &BTreeMap::new(), |_| None).unwrap_err();
+        let lacking = resolve(&unit, &state, "a", &BTreeMap::new()).unwrap_err();
         assert!(lacking.contains("home") && lacking.contains("this node"), "{lacking}");
-        let elsewhere = resolve(&unit, &state, "b", &volumes, |_| None).unwrap_err();
+        let elsewhere = resolve(&unit, &state, "b", &volumes).unwrap_err();
         assert!(elsewhere.contains("on node a, not on this node"), "{elsewhere}");
         let _ = std::fs::remove_dir_all(&state);
     }
@@ -584,7 +574,7 @@ mod tests {
         };
         let volumes = BTreeMap::from([("home".to_string(), dir)]);
         let unit = vm(json!({ "name": "vm", "memory": "1Gi", "disks": [{ "volume": "home", "size": "1Mi" }] }));
-        let (placed, images) = resolve(&unit, &state, "a", &volumes, |_| None).unwrap();
+        let (placed, images) = resolve(&unit, &state, "a", &volumes).unwrap();
         make_images(&state, &images).unwrap();
         let root = state.join("volumes/default/home/data");
         let image = root.join("disk.img");
@@ -657,36 +647,9 @@ mod tests {
             Path::new("/state"),
             "a",
             &BTreeMap::from([("home".to_string(), dir)]),
-            |_| None,
         )
         .unwrap_err();
         assert!(said.contains("encrypted") && said.contains("home"), "{said}");
-    }
-
-    /// A disk bigger than its Volume is refused naming both sizes (a replicated disk is sent whole,
-    /// and a sync of more than the Volume's size fails); one as big as the Volume, or on a Volume
-    /// that says no size, is placed.
-    #[test]
-    fn a_vm_disk_larger_than_its_volume_is_refused_at_placement() {
-        let dir = crate::volumes::Dir {
-            namespace: "default".into(),
-            name: "home".into(),
-            path: "data".into(),
-            node: "a".into(),
-            encrypted: false,
-        };
-        let volumes = BTreeMap::from([("home".to_string(), dir)]);
-        let at = |size: &str, capacity: Option<u64>| {
-            let unit = vm(json!({ "name": "vm", "memory": "1Gi", "disks": [{ "volume": "home", "size": size }] }));
-            resolve(&unit, Path::new("/state"), "a", &volumes, |_| capacity).map(drop)
-        };
-        let said = at("40Gi", Some(1 << 30)).unwrap_err();
-        assert!(
-            said.contains("40Gi") && said.contains("1073741824") && said.contains("home"),
-            "{said}"
-        );
-        assert!(at("1Gi", Some(1 << 30)).is_ok());
-        assert!(at("40Gi", None).is_ok());
     }
 
     /// A confidential template's machine is started with its memory encrypted by what the

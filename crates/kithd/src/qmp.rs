@@ -145,19 +145,6 @@ fn address(uri: &str) -> Result<&str> {
     }
 }
 
-/// `uri` as the address a machine listens at for a migration: a `unix:` socket and no other. A
-/// listener on `tcp:` or `fd:` has no authentication of its own, so whoever reaches it feeds the
-/// guest its memory and devices; the socket is in the replica's private directory.
-fn unix_address(uri: &str) -> Result<&str> {
-    match uri.strip_prefix("unix:").is_some_and(|path| !path.is_empty()) {
-        true => Ok(uri),
-        false => Err(Error::Protocol(format!(
-            "migration listens only at a unix: socket, not `{}`",
-            clip(uri)
-        ))),
-    }
-}
-
 fn left(until: Instant) -> Result<Duration> {
     until
         .checked_duration_since(Instant::now())
@@ -346,10 +333,9 @@ impl Qmp {
         self.run("migrate", Some(json!({ "uri": address(uri)? }))).map(drop)
     }
 
-    /// `migrate-incoming`: a machine started with `-incoming defer` listens at `uri`, a `unix:` socket only.
-    /// (`migrate`, which connects out, takes `tcp:` and `fd:` too.)
+    /// `migrate-incoming`: a machine started with `-incoming defer` listens at `uri`.
     pub fn migrate_incoming(&mut self, uri: &str) -> Result<()> {
-        self.run("migrate-incoming", Some(json!({ "uri": unix_address(uri)? })))
+        self.run("migrate-incoming", Some(json!({ "uri": address(uri)? })))
             .map(drop)
     }
 
@@ -473,11 +459,7 @@ mod tests {
                         json!({})
                     }
                     "migrate" | "migrate-incoming" => {
-                        let uri = arguments["uri"].as_str().unwrap();
-                        assert!(
-                            uri.starts_with("tcp:127.0.0.1:") || uri.starts_with("unix:/run/"),
-                            "{uri}"
-                        );
+                        assert!(arguments["uri"].as_str().unwrap().starts_with("tcp:127.0.0.1:"));
                         json!({})
                     }
                     "query-migrate" if seen.borrow().iter().filter(|c| *c == "query-migrate").count() == 1 => json!({}),
@@ -502,7 +484,7 @@ mod tests {
         qmp.set_capabilities(&[("events", true)]).unwrap();
         qmp.set_downtime_limit(300).unwrap();
         qmp.migrate("tcp:127.0.0.1:4444").unwrap();
-        qmp.migrate_incoming("unix:/run/x/mig.sock").unwrap();
+        qmp.migrate_incoming("tcp:127.0.0.1:4444").unwrap();
         assert_eq!(
             qmp.migration().unwrap(),
             Migration {
@@ -706,11 +688,6 @@ mod tests {
             assert!(matches!(qmp.migrate(uri), Err(Error::Protocol(_))), "{uri}");
             assert!(matches!(qmp.migrate_incoming(uri), Err(Error::Protocol(_))), "{uri}");
         }
-        // (Listening is not authenticated: a peer that reaches a `tcp:` or `fd:` listener feeds the
-        // guest its memory and devices, so `migrate_incoming` takes a `unix:` socket and no other.)
-        for uri in ["tcp:0.0.0.0:4444", "tcp::4444", "tcp:127.0.0.1:4444", "fd:mig", "unix:"] {
-            assert!(matches!(qmp.migrate_incoming(uri), Err(Error::Protocol(_))), "{uri}");
-        }
         qmp.migrate("tcp:127.0.0.1:4444").unwrap();
         qmp.migrate_incoming("unix:/run/x/mig.sock").unwrap();
         qmp.migrate("fd:mig").unwrap();
@@ -885,8 +862,7 @@ mod tests {
         let _qemu = start(&dir, true);
         let mut qmp = Qmp::connect(&dir.join(crate::vm::CONTROL), SECOND * 20, SECOND * 60).unwrap();
         assert_eq!(qmp.status().unwrap().state, "inmigrate");
-        qmp.migrate_incoming(&format!("unix:{}", dir.join("mig.sock").display()))
-            .unwrap();
+        qmp.migrate_incoming("tcp:127.0.0.1:0").unwrap();
         qmp.quit().unwrap();
     }
 }

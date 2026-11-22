@@ -363,9 +363,7 @@ spec:
   names a [Volume](storage.md) instead of a `path` (one of the two, not both; `file` is
   `disk.img` unless said, one name in the Volume's directory). The machine runs where the
   Volume is, as a container that mounts it does, and kithd makes the image there once, sparse and
-  `size` big, if the file is missing; it never resizes or overwrites one that exists. A `size`
-  above the Volume's own `size` is refused, the unit's note naming both: a sync sends the image
-  whole, sparse or not, and stops at the Volume's size. A node
+  `size` big, if the file is missing; it never resizes or overwrites one that exists. A node
   without the Volume is not given the machine: it says why in the unit's note. When the Volume
   is handed over to another replica, the machine follows it and starts from the same image. Keep
   one replica of the machine. The hypervisor opens kithd's own hard link to the image (in
