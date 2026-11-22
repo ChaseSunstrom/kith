@@ -960,19 +960,29 @@ pub(crate) fn resolve_pod<'a>(store: &Store, namespace: &str, pod: &'a str) -> O
 /// whose name is a pod of an existing Job or Workload, or of one in the same body, is refused. The Kubernetes
 /// API's create has refused it by `taken` already; a native apply did not, and so could take a pod's calls.
 pub(crate) fn hijacks(store: &Store, resources: &[Resource]) -> Result<(), String> {
-    let namespace = |r: &Resource| r.metadata.namespace.clone().unwrap_or_else(|| kith_api::DEFAULT_NAMESPACE.into());
+    let namespace = |r: &Resource| {
+        r.metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| kith_api::DEFAULT_NAMESPACE.into())
+    };
     for bare in resources.iter().filter(|r| {
-        matches!(r.kind.as_str(), "Job" | "Workload") && r.metadata.annotations.get("kith.dev/pod").is_some_and(|m| m == "true")
+        matches!(r.kind.as_str(), "Job" | "Workload")
+            && r.metadata.annotations.get("kith.dev/pod").is_some_and(|m| m == "true")
     }) {
         let Some((of, owner, _)) = pod_owner(&bare.metadata.name) else {
             continue;
         };
         let space = namespace(bare);
         let there = store.get(&format!("{of}/{space}/{owner}")).is_some()
-            || resources.iter().any(|r| r.kind == of && r.metadata.name == owner && namespace(r) == space);
+            || resources
+                .iter()
+                .any(|r| r.kind == of && r.metadata.name == owner && namespace(r) == space);
         if there {
             let name = &bare.metadata.name;
-            return Err(format!("{name}: a bare Pod's name is not one that a pod of a Job or Workload has"));
+            return Err(format!(
+                "{name}: a bare Pod's name is not one that a pod of a Job or Workload has"
+            ));
         }
     }
     Ok(())
@@ -4938,7 +4948,11 @@ spec: {role: writer, subjects: [carol]}
         .unwrap();
         // A bare Pod named `once-0` with no Workload `once` is the bare Pod's.
         let refused = crate::api::applied(&shared, &Caller::Admin, vec![held("once-0"), held("solo")]).await;
-        assert!(refused.is_ok(), "{:?}", refused.err().map(|e| e.into_response().status()));
+        assert!(
+            refused.is_ok(),
+            "{:?}",
+            refused.err().map(|e| e.into_response().status())
+        );
         // With Workload `web` there, the same mark on `web-0` is refused, native apply or not in the body.
         for body in [vec![web.clone(), held("web-0")], vec![held("web-0"), web.clone()]] {
             let refused = crate::api::applied(&shared, &Caller::Admin, body).await;
@@ -4952,9 +4966,18 @@ spec: {role: writer, subjects: [carol]}
         state.store.apply(web).unwrap();
         state.store.apply(held("web-0")).unwrap();
         assert_eq!(resolve_pod(&state.store, "default", "web-0"), None);
-        assert_eq!(resolve_pod(&state.store, "default", "once-0").map(|(of, _, n)| (of, n)), Some(("Workload", 0)));
-        assert_eq!(resolve_pod(&state.store, "default", "solo").map(|(of, _, n)| (of, n)), Some(("Workload", 0)));
-        assert_eq!(resolve_pod(&state.store, "default", "web-1"), Some(("Workload", "web", 1)));
+        assert_eq!(
+            resolve_pod(&state.store, "default", "once-0").map(|(of, _, n)| (of, n)),
+            Some(("Workload", 0))
+        );
+        assert_eq!(
+            resolve_pod(&state.store, "default", "solo").map(|(of, _, n)| (of, n)),
+            Some(("Workload", 0))
+        );
+        assert_eq!(
+            resolve_pod(&state.store, "default", "web-1"),
+            Some(("Workload", "web", 1))
+        );
         drop(state);
         drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4988,7 +5011,12 @@ spec: {role: writer, subjects: [carol]}
             while !String::from_utf8_lossy(&said).contains("\"code\":") {
                 let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut chunk))
                     .await
-                    .unwrap_or_else(|_| panic!("{name}: the session says something; so far {:?}", String::from_utf8_lossy(&said)))
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "{name}: the session says something; so far {:?}",
+                            String::from_utf8_lossy(&said)
+                        )
+                    })
                     .unwrap();
                 assert!(n > 0, "{name}: the session ended without a word");
                 said.extend_from_slice(&chunk[..n]);

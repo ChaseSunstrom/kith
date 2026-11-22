@@ -619,6 +619,35 @@ pub async fn copy(
     }
 }
 
+/// The annotation on a Blob that a maker put there, so that its pruning never takes a Blob
+/// put by hand; its value is the maker's name ([`BACKUP`], [`IMAGE`]).
+pub const MADE_BY: &str = "kith.dev/made-by";
+pub const BACKUP: &str = "backup";
+pub const IMAGE: &str = "image";
+
+/// Whether `blob` says `who` ([`BACKUP`] or [`IMAGE`]) made it: the annotation's value, not
+/// just that the key is there. It is a mark, not a proof: a person may still put a Blob
+/// with a maker's name there, and that Blob is pruned like the maker's own.
+pub fn made_by(blob: &kith_api::Resource, who: &str) -> bool {
+    blob.metadata.annotations.get(MADE_BY).is_some_and(|by| by == who)
+}
+
+/// For the tests of what a maker forgets: a node of its own whose store has a Blob in
+/// `default` for each (name, made-by value), put in directly (an apply makes no new Blob).
+#[cfg(test)]
+pub(crate) async fn shared_with_blobs(tag: &str, blobs: &[(&str, &str)]) -> (Arc<Shared>, crate::scratch::Scratch) {
+    let dir = crate::scratch::Scratch::new(&format!("kithd-blobs-{tag}"));
+    let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+    for (name, by) in blobs {
+        let source = format!(
+            "apiVersion: kith.dev/v1\nkind: Blob\nmetadata: {{ name: {name}, annotations: {{ {MADE_BY}: {by} }} }}\nspec: {{ size: 2 }}\n"
+        );
+        let blob = kith_api::Resource::from_source(&source).unwrap().remove(0).unwrap();
+        shared.store.lock().unwrap().store.apply(blob).unwrap();
+    }
+    (shared, dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,6 +700,23 @@ mod tests {
             0,
             "x was asked, and its bytes could have been passed on"
         );
+    }
+
+    #[test]
+    fn a_blob_is_made_by_only_its_own_maker() {
+        let blob = |notes: &str| {
+            let source = format!(
+                "apiVersion: kith.dev/v1\nkind: Blob\nmetadata: {{ name: x, annotations: {{ {notes} }} }}\nspec: {{ size: 2 }}\n"
+            );
+            kith_api::Resource::from_source(&source).unwrap().remove(0).unwrap()
+        };
+        let by = |who: &str| blob(&format!("{MADE_BY}: {who}"));
+        assert!(made_by(&by(BACKUP), BACKUP));
+        assert!(made_by(&by(IMAGE), IMAGE));
+        assert!(!made_by(&by(IMAGE), BACKUP), "an image's Blob is not a backup's");
+        assert!(!made_by(&by(BACKUP), IMAGE));
+        assert!(!made_by(&by("mine"), BACKUP), "a user's value is no maker's");
+        assert!(!made_by(&blob("other: backup"), BACKUP), "no key, no maker");
     }
 
     #[test]

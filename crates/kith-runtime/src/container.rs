@@ -1455,7 +1455,10 @@ pub struct Options {
 fn own_root(spec: &Spec) -> std::result::Result<u32, String> {
     let maps = spec.linux().as_ref().and_then(|linux| linux.uid_mappings().as_ref());
     let host = maps.and_then(|maps| maps.iter().find(|m| m.container_id() == 0 && m.size() > 0));
-    let rootless = spec.annotations().as_ref().is_some_and(|notes| notes.contains_key(BECOMES));
+    let rootless = spec
+        .annotations()
+        .as_ref()
+        .is_some_and(|notes| notes.contains_key(BECOMES));
     match host.map(|m| m.host_id()) {
         None => Err("it has no user namespace of its own: uid 0 there would be the node's root".into()),
         Some(host) if host == 0 || host == nix::unistd::geteuid().as_raw() || rootless => Err(format!(
@@ -2204,6 +2207,17 @@ fn parent_of_own(proc: &str) -> Result<String> {
         Some(parent) if parent != Path::new("/") => Ok(parent.display().to_string()),
         _ => err("no delegated cgroup: run kith inside a systemd user session or scope"),
     }
+}
+
+/// A new cgroup called `name` next to where container cgroups go ([`cgroup_parent`]), made now:
+/// its path. An error where none can be made (no cgroup v2, no delegation). The caller moves
+/// processes in through `cgroup.procs`, ends them with `cgroup.kill` and removes it when empty.
+pub fn leaf_cgroup(name: &str) -> Result<PathBuf> {
+    let parent = Path::new("/sys/fs/cgroup").join(cgroup_parent()?.trim_start_matches('/'));
+    let leaf = parent.join(name);
+    fs::create_dir_all(&parent).ctx("making the cgroup parent")?;
+    fs::create_dir(&leaf).ctx("making a cgroup")?;
+    Ok(leaf)
 }
 
 /// What to tell the person when a cgroup cannot be made in `parent` (below `root`, the cgroup
@@ -5996,8 +6010,15 @@ mod tests {
         let other = if me == 4_000_000 { 4_000_001 } else { 4_000_000 };
         assert!(own_root(&spec(None, false)).unwrap_err().contains("no user namespace"));
         assert!(own_root(&spec(Some(0), false)).unwrap_err().contains("node's user 0"));
-        assert!(own_root(&spec(Some(me), false)).unwrap_err().contains("the one kithd runs as"));
-        assert!(own_root(&spec(Some(other), true)).is_err(), "rootless: its 0 is kithd's user");
+        assert!(
+            own_root(&spec(Some(me), false))
+                .unwrap_err()
+                .contains("the one kithd runs as")
+        );
+        assert!(
+            own_root(&spec(Some(other), true)).is_err(),
+            "rootless: its 0 is kithd's user"
+        );
         assert_eq!(own_root(&spec(Some(other), false)), Ok(other));
     }
 

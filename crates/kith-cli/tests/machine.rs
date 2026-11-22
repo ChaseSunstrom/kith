@@ -139,6 +139,23 @@ fn machine_create_never_overwrites_what_is_not_its_own() {
     assert_eq!(code, 2);
     assert!(err.contains("other settings"), "{err}");
     assert!(sb.kith(&args("dev", "alpine")).1.contains("unchanged"));
+    // Another home, the Volume kept: named, and what changes it says it deletes.
+    let (code, _, err) = sb.kith(&[
+        "machine",
+        "create",
+        "dev",
+        "--node",
+        "alpha",
+        "--distro",
+        "alpine",
+        "--replicas",
+        "3",
+    ]);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains("dev-home") && err.contains("rm dev --purge") && err.contains("data"),
+        "{err}"
+    );
     // A home that is copied nowhere is not what a machine is.
     let (code, _, err) = sb.kith(&["machine", "create", "one", "--replicas", "1", "--node", "alpha"]);
     assert_eq!(code, 2);
@@ -170,6 +187,8 @@ fn machine_lifecycle_lists_runs_and_removes() {
     let (_, jobs, _) = sb.kith(&["get", "job"]);
     let job = jobs.lines().find(|l| l.contains("dev-run-")).expect("a Job");
     let name = job.split_whitespace().nth(2).unwrap();
+    // A command that fails is not run again behind the user's back.
+    assert_eq!(sb.json(&format!("job/{name}"))["spec"]["retries"], 0);
     let c = &sb.json(&format!("job/{name}"))["spec"]["template"]["containers"][0];
     assert_eq!(c["command"], serde_json::json!(["make", "index"]));
     assert_eq!(c["volumeMounts"][0]["volume"], "dev-home");
@@ -193,8 +212,9 @@ fn machine_lifecycle_lists_runs_and_removes() {
     assert_eq!(sb.kith(&["delete", "workload/other"]).0, 0);
 
     // rm takes the machine and its Jobs, and keeps the home unless told.
-    let (code, _, err) = sb.kith(&["machine", "rm", "dev"]);
+    let (code, out, err) = sb.kith(&["machine", "rm", "dev"]);
     assert_eq!(code, 0, "{err}");
+    assert!(out.contains("dev-home") && out.contains("--purge"), "{out}");
     let (_, workloads, _) = sb.kith(&["get", "workload"]);
     assert!(workloads.contains("web") && !workloads.contains("dev"), "{workloads}");
     assert!(!sb.kith(&["get", "job"]).1.contains("dev-run-"));
@@ -325,9 +345,12 @@ fn fake_kithd(dir: &Path, workload: String) -> (PathBuf, mpsc::Receiver<Seen>, m
             if !path.contains("/exec") {
                 let (code, body) = match path.as_str() {
                     "/v1/resources/Workload/default/dev" => ("200 OK", workload.clone()),
-                    _ => ("404 Not Found", r#"{"error":"nothing here"}"#.to_string()),
+                    _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
                 };
-                let reply = format!("HTTP/1.1 {code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let reply = format!(
+                    "HTTP/1.1 {code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
                 stream.write_all(reply.as_bytes()).unwrap();
                 continue;
             }
@@ -349,7 +372,8 @@ fn fake_kithd(dir: &Path, workload: String) -> (PathBuf, mpsc::Receiver<Seen>, m
 }
 
 fn next(saw: &mpsc::Receiver<Seen>) -> Seen {
-    saw.recv_timeout(Duration::from_secs(30)).expect("kith said nothing for 30 s")
+    saw.recv_timeout(Duration::from_secs(30))
+        .expect("kith said nothing for 30 s")
 }
 
 /// `kith ARGS` against the fake kithd, with `stdio` for its three streams.
@@ -393,20 +417,33 @@ fn machine_shell_gives_a_terminal_follows_its_window_and_returns_the_exit_code()
     let mut child = kith_shell(&sb, &socket, &["machine", "shell", "dev"], [stdio(), stdio(), stdio()]);
 
     // The pod of the machine's one replica, on a terminal, with stdin.
-    let Seen::Head(head) = next(&saw) else { panic!("the request comes first") };
+    let Seen::Head(head) = next(&saw) else {
+        panic!("the request comes first")
+    };
     let line = head.lines().next().unwrap();
-    assert!(line.starts_with("GET /api/v1/namespaces/default/pods/dev-0/exec?"), "{line}");
+    assert!(
+        line.starts_with("GET /api/v1/namespaces/default/pods/dev-0/exec?"),
+        "{line}"
+    );
     for want in ["tty=true", "stdin=true", "stdout=true", "command="] {
         assert!(line.contains(want), "{want} in {line}");
     }
     assert!(!line.contains("root=true"), "{line}");
     let lower = head.to_ascii_lowercase();
-    assert!(lower.contains("upgrade: websocket") && lower.contains("sec-websocket-version: 13"), "{head}");
+    assert!(
+        lower.contains("upgrade: websocket") && lower.contains("sec-websocket-version: 13"),
+        "{head}"
+    );
     assert!(lower.contains("sec-websocket-protocol: v5.channel.k8s.io"), "{head}");
 
     // Its window first, and what the server printed reaches the terminal.
-    let Seen::Frame(4, size) = next(&saw) else { panic!("the window comes first") };
-    assert_eq!(serde_json::from_slice::<serde_json::Value>(&size).unwrap(), serde_json::json!({"Width": 100, "Height": 30}));
+    let Seen::Frame(4, size) = next(&saw) else {
+        panic!("the window comes first")
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&size).unwrap(),
+        serde_json::json!({"Width": 100, "Height": 30})
+    );
     let (to_read, shown) = mpsc::channel();
     let mut output = master.try_clone().unwrap();
     std::thread::spawn(move || {
@@ -417,24 +454,39 @@ fn machine_shell_gives_a_terminal_follows_its_window_and_returns_the_exit_code()
     });
     let mut text = Vec::new();
     while !String::from_utf8_lossy(&text).contains("ready$ ") {
-        text.extend(shown.recv_timeout(Duration::from_secs(30)).expect("the prompt reached the terminal"));
+        text.extend(
+            shown
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the prompt reached the terminal"),
+        );
     }
     // The terminal is raw while it runs: nothing is echoed by it, nothing waits for a line.
     let raw = tcgetattr(&pty.slave).unwrap();
-    assert!(!raw.local_flags.intersects(LocalFlags::ICANON | LocalFlags::ECHO), "{:?}", raw.local_flags);
+    assert!(
+        !raw.local_flags.intersects(LocalFlags::ICANON | LocalFlags::ECHO),
+        "{:?}",
+        raw.local_flags
+    );
 
     // Keys typed go to channel 0 as they are.
     master.write_all(b"bye\n").unwrap();
     let mut typed = Vec::new();
     while typed != b"bye\n" {
-        let Seen::Frame(0, data) = next(&saw) else { panic!("only keys are sent") };
+        let Seen::Frame(0, data) = next(&saw) else {
+            panic!("only keys are sent")
+        };
         typed.extend(data);
     }
     // A new window size goes on channel 4 (the window changed: SIGWINCH).
     kith_dm_sys::set_window(&master, 50, 120).unwrap();
     kill(nix::unistd::Pid::from_raw(child.id() as i32), Signal::SIGWINCH).unwrap();
-    let Seen::Frame(4, size) = next(&saw) else { panic!("the new window is sent") };
-    assert_eq!(serde_json::from_slice::<serde_json::Value>(&size).unwrap(), serde_json::json!({"Width": 120, "Height": 50}));
+    let Seen::Frame(4, size) = next(&saw) else {
+        panic!("the new window is sent")
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&size).unwrap(),
+        serde_json::json!({"Width": 120, "Height": 50})
+    );
 
     // The shell's exit code is kith's, and the terminal is as it was.
     say.send(ended(7)).unwrap();
@@ -453,21 +505,33 @@ fn machine_shell_without_a_terminal_runs_the_command_on_pipes() {
     say.send(said(1, b"out\n")).unwrap();
     say.send(said(2, b"err\n")).unwrap();
     // A machine that is not one is refused before anything is opened.
-    let none = kith_shell(&sb, &socket, &["machine", "shell", "ghost"], [Stdio::null(), Stdio::piped(), Stdio::piped()]);
+    let none = kith_shell(
+        &sb,
+        &socket,
+        &["machine", "shell", "ghost"],
+        [Stdio::null(), Stdio::piped(), Stdio::piped()],
+    );
     let out = none.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no machine `ghost`"));
     let piped = || Stdio::piped();
     let args = ["machine", "shell", "dev", "--", "cat", "a b"];
     let mut child = kith_shell(&sb, &socket, &args, [piped(), piped(), piped()]);
-    let Seen::Head(head) = next(&saw) else { panic!("the request comes first") };
+    let Seen::Head(head) = next(&saw) else {
+        panic!("the request comes first")
+    };
     let line = head.lines().next().unwrap();
     // No terminal here: no tty, and the command is its words, one `command` each.
-    assert!(line.contains("tty=false") && line.contains("command=cat&command=a%20b"), "{line}");
+    assert!(
+        line.contains("tty=false") && line.contains("command=cat&command=a%20b"),
+        "{line}"
+    );
     child.stdin.take().unwrap().write_all(b"in").unwrap(); // (dropped: stdin is over)
     let mut got = Vec::new();
     while got.last() != Some(&255) {
-        let Seen::Frame(channel, data) = next(&saw) else { panic!("frames only") };
+        let Seen::Frame(channel, data) = next(&saw) else {
+            panic!("frames only")
+        };
         got.push(channel);
         if channel == 0 {
             assert_eq!(data, b"in");
@@ -479,7 +543,10 @@ fn machine_shell_without_a_terminal_runs_the_command_on_pipes() {
     drop(say);
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!((out.stdout.as_slice(), out.stderr.as_slice()), (&b"out\n"[..], &b"err\n"[..]));
+    assert_eq!(
+        (out.stdout.as_slice(), out.stderr.as_slice()),
+        (&b"out\n"[..], &b"err\n"[..])
+    );
 }
 
 #[test]
@@ -494,13 +561,82 @@ fn machine_shell_root_asks_for_root_and_says_why_it_is_refused() {
     let refusal = serde_json::json!({"kind": "Status", "status": "Failure", "reason": "InternalError", "code": 500, "message": why});
     say.send(said(3, refusal.to_string().as_bytes())).unwrap();
     drop(say);
-    let child = kith_shell(&sb, &socket, &["machine", "shell", "dev", "--root"], [Stdio::null(), Stdio::piped(), Stdio::piped()]);
-    let Seen::Head(head) = next(&saw) else { panic!("the request comes first") };
+    let child = kith_shell(
+        &sb,
+        &socket,
+        &["machine", "shell", "dev", "--root"],
+        [Stdio::null(), Stdio::piped(), Stdio::piped()],
+    );
+    let Seen::Head(head) = next(&saw) else {
+        panic!("the request comes first")
+    };
     assert!(head.lines().next().unwrap().contains("root=true"), "{head}");
     let out = child.wait_with_output().unwrap();
     // A refusal is kith's own (2), not the shell's exit code, and it says why.
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--root is refused") && err.contains("no user namespace of its own"), "{err}");
+    assert!(
+        err.contains("--root is refused") && err.contains("no user namespace of its own"),
+        "{err}"
+    );
     assert!(out.stdout.is_empty());
+}
+
+/// A read kithd refuses (403) is an error, not "no such resource": nothing is written over what
+/// could not be read, and no Volume is called deleted that was skipped.
+#[test]
+fn machine_get_error_is_not_absent() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    if caller() == 0 {
+        return;
+    }
+    let sb = Sandbox::new("machine_get_error");
+    let socket = sb.0.join("kithd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut line = String::new();
+            let mut reader = BufReader::new(&stream);
+            reader.read_line(&mut line).unwrap();
+            log.lock().unwrap().push(line.trim().to_string());
+            // The cluster is open (a write would go through unsigned); every resource read is refused.
+            let (status, body) = if line.contains("/v1/cluster") {
+                ("200 OK", r#"{"signing":"open"}"#)
+            } else {
+                ("403 Forbidden", r#"{"error":"denied by role"}"#)
+            };
+            let mut stream = &stream;
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    for args in [
+        &["machine", "create", "dev", "--node", "alpha"][..],
+        &["machine", "rm", "dev", "--purge"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_kith"))
+            .args(args)
+            .env_remove("KITH_STORE")
+            .env("KITH_SOCKET", &socket)
+            .env("HOME", &sb.0)
+            .env("USER", "ada")
+            .output()
+            .unwrap();
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains("denied by role"), "{err}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("deleted"));
+    }
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter().all(|l| l.starts_with("GET ")),
+        "only reads were sent: {seen:?}"
+    );
 }
