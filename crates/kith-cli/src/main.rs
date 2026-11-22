@@ -2652,7 +2652,7 @@ fn encrypt_text(name: &str, cancel: bool, said: &serde_json::Value) -> Result<St
         "No recovery key was shown. If {name} marked its state before this failed, `kith node encrypt {name} --cancel` takes the mark away until it starts."
     ))?;
     Ok(format!(
-        "{name}'s recovery key, shown this once and kept nowhere: write it down. {name} restarts now and encrypts its state as it starts, which takes a while: it is down until that is done. Typed at {name}'s console when it starts and no node hands its key out, the key opens its state. `kith node encrypt {name} --cancel` takes the encryption away only until it starts.\n\n    {key}\n"
+        "{name}'s recovery key, shown this once and kept nowhere: write it down. {name} restarts now and encrypts its state as it starts, which takes a while: it is down until that is done. Typed at {name}'s console when it starts and no node hands its key out, the key opens its state. `kith node encrypt {name} --cancel` takes the encryption away only until it starts. On flash, old plain blocks may survive: see the cluster guide.\n\n    {key}\n"
     ))
 }
 
@@ -2685,6 +2685,7 @@ mod node_encrypt_tests {
         let text = encrypt_text("n1", false, &json!({ "node": "n1", "recovery": key })).unwrap();
         assert_eq!(text.matches(key).count(), 1, "{text}");
         assert!(text.contains("restarts") && text.contains("--cancel"), "{text}");
+        assert!(text.contains("On flash, old plain blocks may survive"), "{text}");
         assert!(encrypt_text("n1", false, &json!({ "node": "n1" })).is_err());
     }
 
