@@ -218,7 +218,6 @@ spec:
         seccomp:
           allow: [ptrace]          # refused calls it may make after all [none]
         userNamespaces: true       # it may start a sandbox of its own inside [false]
-        cgroupDelegation: true     # it may make cgroups below its own [false]
 ```
 
 - **Who it is.** `runAsUser` (a number; the group the same), else the image's `User`, else nobody
@@ -250,11 +249,6 @@ spec:
   and `/sys/firmware` uncovered, and on kith OS drops the capability for ports below 1024. The
   cost: inside a user namespace a program reaches kernel code a plain user never calls, where much
   of what has made a user the node's root was found. The node's root is not started with it.
-- **Cgroups of its own inside** (a runtime for containers in a container: a nested kithd) needs
-  `cgroupDelegation: true`. Its `/sys/fs/cgroup` is then read-write and its cgroup's directory
-  and the files that make a child cgroup and move a process into it are its user's, so it can make
-  cgroups below its own, and not above. The limits stay the node's, on the container. It asks for
-  the same right as `userNamespaces` (`unconfined`), and the node's root is not started with it.
 - **Whose image it is.** With `signedBy`, the image runs only if one of those keys signed it, as
   `cosign sign --key` does: the signature (the tag `sha256-DIGEST.sig` in the image's repository)
   is checked against the manifest's digest before any layer is fetched. Keys are ECDSA P-256 or

@@ -170,9 +170,7 @@ Only the newest version is fixed. There are no security releases of older ones.
   A container whose template says `userNamespaces: true` (off unless said: a sandbox
   inside it, as Steam's runtime and Flatpak start) may make namespaces and mount in them,
   and nothing in its `/proc` is covered; it is refused to a container that is the node's
-  root. One with `cgroupDelegation: true` (off unless said, the same ask) has its
-  cgroup handed to its user and `/sys/fs/cgroup` read-write: it can make cgroups on the
-  node below its own, at most 64 of them and 8 deep, and the limits stay the container's.
+  root.
   On kith OS each container's cgroup has a device filter (a BPF program kithd loads; the
   kernel asks it at every open and `mknod` of a device node): the few nodes every
   container has, its own terminals, and the devices its claims gave it, to read and
@@ -589,7 +587,7 @@ Only the newest version is fixed. There are no security releases of older ones.
 
 - **What works inside a container with the defaults.** kithd in agent mode starts and serves its socket; plain processes run. A user namespace, a second runtime's sandbox and a second kithd's containers do not.
 - **What needs which opening.** A user namespace of its own is refused by kith's seccomp filter (clone and unshare with namespace flags), not by the guest kernel (`max_user_namespaces` 1816, no sysctl that restricts it; with the filter off, `unshare` works). bubblewrap is also refused by the capability kept in the bounding set. `userNamespaces: true` on the container is the smallest opening, of the four tried, that let it run: the bounding set is empty and the filter lets those calls through, with the cost "What is not defended" gives for it (more of the kernel to get wrong). `seccomp: {unconfined: true}` alone lets `unshare` through but not bubblewrap.
-- **What is not recommended.** `runAsUser: 0` for nesting: the filter still refuses, and the container is more privileged for nothing. Unconfined seccomp to get a runtime inside a container: it takes off the whole filter for a few calls. A second kithd that is meant to run workloads inside a container: under the openings tried its containers did not run (under four of the five it stopped at the cgroup check, so what comes after is untested), because the cgroup2 mount inside a container is read-only and the container's cgroup is the root of its namespace ("no delegated cgroup"). That is kith's mount, and the opening that changes it is `cgroupDelegation: true` on the container (off unless said): its `/sys/fs/cgroup` is read-write, and its cgroup's directory and the files that make a child cgroup and move a process into it (`cgroup.procs`, `cgroup.subtree_control`, `cgroup.threads`) are its user's. A program in it can then make cgroups below its own and move itself into them; it cannot leave that subtree (the kernel keeps a user who is not root out of the cgroups above), and the limits (`memory.max`, `pids.max`…) stay root's, on the container, so what it makes shares what the container was given. The cost is a way for a container to make cgroups on the node: it takes the same right as `userNamespaces` (`unconfined`, so a node with `no-unconfined` refuses it, and the root part asks again), and it is refused for a container that is the node's root. Whether it is enough for a nested kithd's containers to run is the `--nested` VM row's to show; the unit tests only show the mount and the owners.
+- **What is not recommended.** `runAsUser: 0` for nesting: the filter still refuses, and the container is more privileged for nothing. Unconfined seccomp to get a runtime inside a container: it takes off the whole filter for a few calls. A second kithd that is meant to run workloads inside a container: under the openings tried its containers did not run (under four of the five it stopped at the cgroup check, so what comes after is untested), because the cgroup2 mount inside a container is read-only and the container's cgroup is the root of its namespace ("no delegated cgroup"). That is kith's mount; a writable, delegated cgroup subtree would be a new opening, a way for a container to make cgroups on the node, and it is not offered.
 
 The nested kithd shares the node's network, so its registry port meets the node's.
 
@@ -679,7 +677,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   word: `exec` units (`no-exec-units`); containers that would be the node's root, which
   is root in one that keeps the node's users, not root in a pod's range of its own
   (`no-root-containers`); `seccomp` unconfined or with
-  refused calls allowed back, `nested` and `cgroupDelegation` included (`no-unconfined`); containers that keep the
+  refused calls allowed back, `nested` included (`no-unconfined`); containers that keep the
   node's own users with no range of ids of their own, as a NodeWorkload's do (`no-host-users`);
   containers on the node's own network
   (`no-node-network`); VMs (`no-vms`), a VM's kernel, firmware or disks as paths on the

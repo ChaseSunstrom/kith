@@ -63,9 +63,7 @@ the node today:
   with its image or a volume on a file system that takes no id-mapped mount. A pod's
   container otherwise has a range of ids of its own on kith OS (T-0242), and its root
   is not the node's;
-- a container with `seccomp: { unconfined: true }` or calls allowed back by name, or with
-  `cgroupDelegation` (a read-write cgroup mount, and its own cgroup handed to its user: it
-  makes cgroups on the node, up to 64 below its own and 8 deep);
+- a container with `seccomp: { unconfined: true }` or calls allowed back by name;
 - a container that is no pod: it shares the node's network;
 - a device given to a container by a DeviceClaim: `/dev/input/event*` reads what is
   typed at the console (a passphrase among it), `/dev/bus/usb` is a plugged-in disk;
@@ -470,8 +468,7 @@ and sysfs, as one process cannot:**
 - *`check_create` and the fields it once ignored* (T-0915). `host_users` is held to the
   `hostUsers` key (a serving part could send it with `no_node_root`, skip `rootContainers`, and
   have the node's users with no range of its own; not `rootContainers`, since every NodeWorkload
-  has it). `nested` and `cgroupDelegation` are held to `unconfined` (the first lets the refused
-  calls back, the second makes cgroups on the node). `drop` needs no
+  has it). `nested` is held to `unconfined` (it lets the refused calls back). `drop` needs no
   check: it only narrows. `project` and `dmem` are left to the Devices item above: the root
   part holds no project id or device share to bound them against.
 
@@ -498,7 +495,7 @@ as a Node's status says them, each on where nothing is said:
 policy:
   execUnits: true        # a process of the node's root, with all of /dev
   rootContainers: true   # a container that is the node's root (root, and no range of ids of its own)
-  unconfined: true       # seccomp unconfined, or refused calls allowed back by name, or a nested unit, or a writable cgroup subtree
+  unconfined: true       # seccomp unconfined, or refused calls allowed back by name, or a nested unit
   hostUsers: true        # a container with host_users (a NodeWorkload's): the node's own users; hardened stops NodeWorkloads
   nodeNetwork: true      # containers that are no pod: the node's own network
   devices: [all]         # which classes a DeviceClaim may hand a container: gpu, input, usb, …

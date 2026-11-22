@@ -1818,13 +1818,6 @@
           ],
           "description": "The container may make user namespaces of its own, as a sandbox inside it does\n(bubblewrap: Steam's, Flatpak's). The filter then lets through the calls that\ntakes (`unshare`, `setns`, `clone`, `clone3`, and those that mount: `mount`,\n`umount2`, `pivot_root`, `open_tree`, `move_mount`, the `fs…` four, `mount_setattr`)\nand its `/proc` hides nothing, which a `/proc` mounted inside needs; on kith OS it\nstarts without the capability for ports below 1024, which bubblewrap refuses. In a\nnamespace of its own a program has every capability over it, and with them far\nmore of the kernel to call: off unless said, and refused for a container that\nis the node's root."
         },
-        "cgroupDelegation": {
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "description": "The container's `/sys/fs/cgroup` is read-write, and its cgroup's directory and the\nfiles that make a child cgroup and move a process into it are its user's, so a\nprogram in it (a runtime for containers of its own) can make cgroups below its\nown and move itself into them. It cannot leave its subtree, and the limits stay\nthe node's, on the container. It makes cgroups on the node: off unless said,\nrefused where the node has no `unconfined`, and for a container that is the\nnode's root."
-        },
         "resources": {
           "anyOf": [
             {

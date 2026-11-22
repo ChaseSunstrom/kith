@@ -42,8 +42,6 @@ EOF
             variant unconfined ',"seccomp":{"unconfined":true}'
             variant userns ',"userNamespaces":true'
             variant userns-unconfined ',"userNamespaces":true,"seccomp":{"unconfined":true}'
-            # (A writable cgroup subtree for the nested kithd's own containers: the one the cgroup check stopped.)
-            variant delegate ',"userNamespaces":true,"cgroupDelegation":true'
             variant root ',"runAsUser":0'
             # The smallest opening: the first variant whose container (kithd's) ran.
             first=$(grep -m1 'its container: ran' "$work/nested.rows" | cut -d ' ' -f 2 || true)
