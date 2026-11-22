@@ -16,6 +16,7 @@ mod context;
 mod docker_store;
 mod import;
 mod launch;
+mod machine;
 mod remote;
 mod signing;
 mod ui;
@@ -231,6 +232,11 @@ enum Command {
     Source {
         #[command(subcommand)]
         command: SourceCommand,
+    },
+    /// Dev machines: a Workload that runs as you, its home on a replicated Volume
+    Machine {
+        #[command(subcommand)]
+        command: machine::Machine,
     },
     /// Translate Kubernetes manifests or a Helm chart into kith resources
     Import {
@@ -1323,6 +1329,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             kith_docker::serve_with(listener, Some(Box::new(store)));
             return Ok(ExitCode::SUCCESS);
         }
+        Command::Machine { command } => return machine::run(command, &backend),
         Command::Lint { files } => {
             let n = load(&files)?.len();
             println!("{n} resource{} ok", if n == 1 { "" } else { "s" });
