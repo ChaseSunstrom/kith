@@ -17,8 +17,8 @@ mod keyless;
 mod outside;
 mod seccomp;
 pub mod signed;
-mod tlog;
 pub mod timeline;
+mod tlog;
 
 pub use container::*;
 pub use image::{
