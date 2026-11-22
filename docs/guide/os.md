@@ -14,7 +14,10 @@ As process 1, kithd:
 - names the machine `kith.hostname=NAME` from the kernel command line, else `kith-` and the last
   six digits of its first network card's address;
 - brings every card up and asks for an address (DHCP, renewed). Where there is none, say
-  `kith.ip=10.0.0.5/24,10.0.0.1` (address, gateway) and `kith.dns=9.9.9.9`;
+  `kith.ip=10.0.0.5/24,10.0.0.1` (address, gateway) and `kith.dns=9.9.9.9`. A card that comes
+  later (plugged in, or its driver loaded after boot) is found within 5 seconds and asks the
+  same way; a veth, bridge or tunnel that kithd makes is never asked. IPv6 on a link is the
+  kernel's (router advertisements); there is no DHCPv6;
 - keeps the time: a machine has no clock battery to trust, so after the network is up kithd asks
   an SNTP server for the time at start and every hour, and sets the clock when it is more than
   two seconds off. The server is the one you name, `kith.ntp=ADDRESS[:PORT]` (the only one asked

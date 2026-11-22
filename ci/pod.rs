@@ -40,6 +40,8 @@
 //!   pod link TARGET PATH       make PATH a link to TARGET, and say how it went
 //!   pod tick [N]               say which process it is and when it started, then `tick N`
 //!                              each second, for as long as it runs (or N times, then end)
+//!   pod net                    run on a node: its global IPv6 addresses (SLAAC) and the name
+//!                              servers in /run/resolv.conf, a line each
 //!   pod memory                 run on a node: process 1's and kithd's resident memory
 //!                              ("memory: PID COMM VmRSS RssAnon", kB)
 //!   pod kill N SECONDS         run on a node (an exec unit): N times, SECONDS apart, kill
@@ -903,6 +905,23 @@ fn main() {
             // This boot of the machine (the kernel's, the same for every container on it).
             let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
             println!("bootid: {}", id.trim());
+        }
+        ["net"] => {
+            // What this machine's network is, as the host's: "inet6: IFACE ADDRESS" for each
+            // address (not link-local, scope 20, nor host's, 10: those prove no router; QEMU's
+            // router advertises fec0::/64, which is site scope), and "resolv: SERVER" for
+            // each name server in /run/resolv.conf.
+            let inet6 = std::fs::read_to_string("/proc/net/if_inet6").unwrap_or_default();
+            for line in inet6.lines() {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() == 6 && f[3] != "20" && f[3] != "10" {
+                    println!("inet6: {} {}", f[5], f[0]);
+                }
+            }
+            let resolv = std::fs::read_to_string("/run/resolv.conf").unwrap_or_default();
+            for server in resolv.lines().filter_map(|l| l.strip_prefix("nameserver ")) {
+                println!("resolv: {}", server.trim());
+            }
         }
         ["memory"] => {
             // Process 1 and kithd: "memory: PID COMM VmRSS RssAnon" (kB).

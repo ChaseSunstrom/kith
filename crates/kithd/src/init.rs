@@ -715,6 +715,8 @@ pub fn mount_state(device: &std::path::Path) {
 pub struct Boot {
     name: String,
     asking: Vec<kith_mesh::Card>,
+    /// The link indexes there at boot, the first card (with a command line's address) too.
+    seen: Vec<u32>,
     dns: Option<IpAddr>,
     slot: Option<char>,
     /// kithd's arguments from the node's config partition: ahead of the command line's.
@@ -743,18 +745,9 @@ impl Boot {
     pub fn network(self) {
         power_button();
         for card in self.asking {
-            // (A name server on the command line is one the network's own may not replace.)
-            let told = self.dns;
-            let got = move |lease: &crate::dhcp::Lease| {
-                let _ = ADDRESS.set(lease.address);
-                crate::clock::learn(&lease.ntp, lease.router);
-                match told {
-                    Some(server) => resolvers(&[server]),
-                    None => resolvers(&lease.dns.iter().copied().map(IpAddr::from).collect::<Vec<_>>()),
-                }
-            };
-            tokio::spawn(crate::dhcp::keep(card, self.name.clone(), got));
+            tokio::spawn(crate::dhcp::keep(card, self.name.clone(), got(self.dns)));
         }
+        tokio::spawn(rescan(self.seen, self.name.clone(), self.dns));
         let Some(slot) = self.slot else { return };
         // ponytail: good means kithd started, has its state to use, and is still running a
         // little later (one that cannot start ends, and the machine restarts, well within
@@ -772,19 +765,88 @@ impl Boot {
     }
 }
 
+/// What a lease changes on this node. (A name server on the command line is one the
+/// network's own may not replace.)
+fn got(told: Option<IpAddr>) -> impl Fn(&crate::dhcp::Lease) + Send + 'static {
+    move |lease| {
+        let _ = ADDRESS.set(lease.address);
+        crate::clock::learn(&lease.ntp, lease.router);
+        match told {
+            Some(server) => resolvers(&[server]),
+            None => resolvers(&lease.dns.iter().copied().map(IpAddr::from).collect::<Vec<_>>()),
+        }
+    }
+}
+
+/// The cards in `found` that came after `seen` (link indexes) and are physical: a USB or
+/// hot-plugged card, one whose driver loaded late. Marking a card seen is the caller's,
+/// once it is up: one that failed is offered again by the next scan.
+fn late(seen: &[u32], found: &[kith_mesh::Card], physical: impl Fn(&kith_mesh::Card) -> bool) -> Vec<kith_mesh::Card> {
+    let new = found.iter().filter(|card| !seen.contains(&card.index));
+    new.filter(|card| physical(card)).cloned().collect()
+}
+
+/// The indexes in `seen` that `found` no longer lists: cards unplugged.
+fn gone(seen: &[u32], found: &[kith_mesh::Card]) -> Vec<u32> {
+    let there = |index: &u32| found.iter().any(|card| card.index == *index);
+    seen.iter().copied().filter(|index| !there(index)).collect()
+}
+
+/// A card with a device behind it, not a veth, bridge or tunnel that kithd makes itself:
+/// those are never asked for an address.
+fn physical(card: &kith_mesh::Card) -> bool {
+    std::path::Path::new("/sys/class/net")
+        .join(&card.name)
+        .join("device")
+        .exists()
+}
+
+/// Every few seconds look for cards that came after boot: bring each up and ask its network
+/// for an address as the others do, and end the asking of one that is unplugged.
+//
+// ponytail: a dump of a few links every 5 s, not the kernel's link messages (a netlink
+// multicast socket in kith-mesh): that is for a machine that needs it sooner.
+async fn rescan(mut seen: Vec<u32>, name: String, dns: Option<IpAddr>) {
+    let mut asking = std::collections::HashMap::<u32, tokio::task::AbortHandle>::new();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let Ok(Ok((found, _))) = tokio::task::spawn_blocking(kith_mesh::cards).await else {
+            continue;
+        };
+        for index in gone(&seen, &found) {
+            seen.retain(|seen| *seen != index);
+            if let Some(task) = asking.remove(&index) {
+                task.abort();
+            }
+        }
+        for card in late(&seen, &found, physical) {
+            if let Err(e) = kith_mesh::up(card.index) {
+                eprintln!("kithd: init: bringing {} up: {e}", card.name);
+                continue;
+            }
+            eprintln!(
+                "kithd: init: {} came after boot: asking its network for an address",
+                card.name
+            );
+            seen.push(card.index);
+            let keep = crate::dhcp::keep(card.clone(), name.clone(), got(dns));
+            asking.insert(card.index, tokio::spawn(keep).abort_handle());
+        }
+    }
+}
+
 /// Links up, and the address the command line gives the first card. The cards returned
 /// are left to ask their networks: all of them, or with such an address all but the first.
-//
-// ponytail: the cards there at this moment. One plugged in later, or whose driver loads
-// later, stays down: watch the kernel's link messages when a machine needs that.
-fn links(options: &Options) -> Vec<kith_mesh::Card> {
+/// And the link indexes seen, for the scan of cards that come later ([`rescan`]).
+fn links(options: &Options) -> (Vec<kith_mesh::Card>, Vec<u32>) {
     let (cards, loopback) = match kith_mesh::cards() {
         Ok(found) => found,
         Err(e) => {
             eprintln!("kithd: init: listing the network cards: {e}");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
+    let seen: Vec<u32> = cards.iter().map(|card| card.index).collect();
     let named = cards.iter().map(|card| (card.index, &*card.name));
     for (index, what) in loopback.iter().map(|lo| (*lo, "lo")).chain(named) {
         if let Err(e) = kith_mesh::up(index) {
@@ -802,9 +864,9 @@ fn links(options: &Options) -> Vec<kith_mesh::Card> {
         }
         resolvers(&options.dns.into_iter().collect::<Vec<_>>());
         // (The other cards still ask their networks: a second network is not the first's.)
-        return cards.into_iter().skip(1).collect();
+        return (cards.into_iter().skip(1).collect(), seen);
     }
-    cards
+    (cards, seen)
 }
 
 /// What kithd says goes to every console the kernel has (a screen and a serial line, say),
@@ -1050,8 +1112,10 @@ pub fn early(again: bool) -> Boot {
         }
     }
     eprintln!("kithd: init: {name} is up");
+    let (asking, seen) = links(&options);
     Boot {
-        asking: links(&options),
+        asking,
+        seen,
         dns: options.dns,
         slot: options.slot.filter(|_| !installing),
         name,
@@ -1188,6 +1252,53 @@ pub fn end(failed: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn card(index: u32, name: &str) -> kith_mesh::Card {
+        kith_mesh::Card {
+            index,
+            name: name.into(),
+            mac: [index as u8; 6],
+        }
+    }
+
+    fn indexes(cards: &[kith_mesh::Card]) -> Vec<u32> {
+        cards.iter().map(|card| card.index).collect()
+    }
+
+    #[test]
+    fn init_late_cards_are_the_ones_not_seen_and_physical() {
+        let found = [card(1, "eth0"), card(2, "eth1"), card(3, "veth9"), card(4, "br0")];
+        let physical = |card: &kith_mesh::Card| card.name.starts_with("eth");
+        // eth0 was there at boot, eth1 came later; the veth and the bridge never count.
+        assert_eq!(indexes(&late(&[1, 3], &found, physical)), [2]);
+        assert_eq!(indexes(&late(&[], &found, physical)), [1, 2]);
+        assert!(late(&[1, 2, 3, 4], &found, physical).is_empty());
+    }
+
+    #[test]
+    fn init_late_cards_keep_seen_cards_seen() {
+        let found = [card(1, "eth0"), card(2, "eth1")];
+        let mut seen = vec![1];
+        for _ in 0..3 {
+            for card in late(&seen, &found, |_| true) {
+                seen.push(card.index);
+            }
+        }
+        // (eth1 is asked once, not on each scan; eth0 not at all.)
+        assert_eq!(seen, [1, 2]);
+        assert!(late(&seen, &found, |_| true).is_empty());
+        assert!(gone(&seen, &found).is_empty());
+    }
+
+    #[test]
+    fn init_late_cards_retry_and_forget() {
+        let found = [card(1, "eth0"), card(2, "eth1")];
+        // eth1's up failed: it was not marked seen, so the next scan offers it again.
+        assert_eq!(indexes(&late(&[1], &found, |_| true)), [2]);
+        assert_eq!(indexes(&late(&[1], &found, |_| true)), [2]);
+        // eth1 is unplugged: its index is gone from the dump, and eth0's is not.
+        assert_eq!(gone(&[1, 2], &found[..1]), [2]);
+    }
 
     #[test]
     fn init_a_wait_ends_when_its_stop_flag_is_raised() {
