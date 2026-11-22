@@ -802,7 +802,7 @@ spec:
         let gone = tv.dir.join("input/event9").to_string_lossy().into_owned();
         assert!(!tv.memory.touched(&gone) && tv.memory.refused.is_empty());
         let path = tv.dir.join("input/event0");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let path = path.to_string_lossy().into_owned();
         assert!(!tv.memory.touched(&path));
         assert!(tv.memory.refused.contains(&path));

@@ -9,8 +9,9 @@
 //
 // ponytail: the migration is started and polled by URI, and only `tcp:`, `unix:` and `fd:`
 // are sent (`exec:` and `file:` run a program or write a file as QEMU's user); handing QEMU
-// an open descriptor (SCM_RIGHTS) is not done: the migration stream between two nodes is a
-// TCP connection QEMU makes itself. Each is left for later.
+// an open descriptor (SCM_RIGHTS) is not done: the migration stream between two nodes is
+// carried by kithd over the node hop (`vm_migrate.rs`), QEMU's ends being `unix:` sockets in
+// the replicas' private directories. Each is left for later.
 
 // (Nothing calls it yet: the migration of slices C and D of T-1135 does.)
 #![allow(dead_code)]
@@ -336,6 +337,11 @@ impl Qmp {
     pub fn migrate_incoming(&mut self, uri: &str) -> Result<()> {
         self.run("migrate-incoming", Some(json!({ "uri": address(uri)? })))
             .map(drop)
+    }
+
+    /// `migrate_cancel`: stop the migration this machine is sending (it ends as `cancelled`, and the machine runs on).
+    pub fn migrate_cancel(&mut self) -> Result<()> {
+        self.run("migrate_cancel", None).map(drop)
     }
 
     pub fn migration(&mut self) -> Result<Migration> {

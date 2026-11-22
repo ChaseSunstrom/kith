@@ -34,8 +34,12 @@
     # the kernel command line a data disk at start (kith.disk-add=SERIAL), so the real mapping and the
     # mount are seen without the verbs; in a folder of its own, so the plain image stays plain.)
     [ "$test" != disk ] || { KITHD_FEATURES=disk-test osdir=$root/target/os-disk; export KITHD_FEATURES; }
+    # (privilege: the image of a kithd built with the cargo feature confine-probe, whose
+    # `confine-probe` subcommand confines itself as the serving part does (ci/vm/privilege.sh); in a
+    # folder of its own, so the plain image stays plain.)
+    [ "$test" != privilege ] || { KITHD_FEATURES=confine-probe osdir=$root/target/os-probe; export KITHD_FEATURES; }
     sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC"} --out "$osdir" >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = clockleader ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = mesh ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = clockleader ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ] || [ "$test" = privilege ] || [ "$test" = nested ] || [ "$test" = nofile ] || [ "$test" = handover ]; then
         . "$root/ci/vm/cluster.sh"
     fi
     if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ] || [ "$test" = blackout ] || [ "$test" = alone ]; then

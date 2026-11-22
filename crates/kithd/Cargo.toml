@@ -18,6 +18,11 @@ fido2-test = []
 # that folder take it): the word `kith.disk-add=SERIAL` on the command line makes the disk of that
 # serial a data disk at the start, until the add verb does (data_disk/boot.rs), for the disk VM test.
 disk-test = []
+# Test only, in no release (ci/musl.sh builds it into a folder of its own, os/build.sh lets only
+# that folder take it): `kithd confine-probe DIR` confines itself as the serving part does and says
+# what it still can do, so the privilege VM test can hold the confinement to what it says
+# (confine.rs). As root it makes and gives away a directory, so it is no part of a build that ships.
+confine-probe = []
 
 [dependencies]
 # The same as kith-runtime pulls images with.
@@ -84,6 +89,8 @@ zeroize = "1"
 log = { version = "0.4", features = ["release_max_level_off"] }
 
 [dev-dependencies]
+# (A process on this host in the place of a container's, to test exec's terminal with.)
+kith-runtime = { path = "../kith-runtime", features = ["host"] }
 # (A clock a test owns: the waiting console answers at a fixed time.)
 tokio = { version = "1", features = ["test-util"] }
 serde_json.workspace = true

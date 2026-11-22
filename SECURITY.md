@@ -24,6 +24,7 @@ Only the newest version is fixed. There are no security releases of older ones.
 | A workload | Nothing: it is a process on a node | What its container, machine or sandbox lets it reach (see "What is not defended") |
 | A Workload that runs as an Identity | A certificate for `IDENTITY.runs.kith`, `NAME.NAMESPACE.workload.kith` and `NODE.on.kith`, for two hours, while the store says that Workload, placed on that node, runs as that Identity and the Identity names it | What the Identity's Roles say (see "A Workload that runs as an Identity") |
 | Anyone who reaches a node's port | Nothing | Fetch the CA certificate, spend a join token, ask for a locked disk's key by its id |
+| A device that trusts the LAN CA (`kith ca export`) | Nothing: it holds a public certificate | Takes the host certificates the LAN CA signs for the cluster's LAN names, and no others: the certificate is name-constrained to `spec.lanDomains` (default `home.arpa`, `lan`, `internal`, `local`, never `cluster.local` or `kith`) |
 | Whoever writes what kith fetches | Nothing by itself | What follows from it: a Source's repository is applied, a package is rendered, an image is run, an archive is restored |
 
 ## The boundaries, as they are in the code
@@ -118,7 +119,9 @@ Only the newest version is fixed. There are no security releases of older ones.
   membership goes on being sent the log at its address, held by its id alone, and the
   deleted node's own certificate (signed by the CA) still answers there until the
   membership change is through: seconds, longer with no leader or majority. A node's
-  certificate outlives its Node, and nothing revokes it.
+  certificate outlives its Node: a node that has the delete refuses the certificate
+  when it is shown to it (below), but a node that calls the voter takes what the voter
+  shows as stated here.
   **A join with a token that names its maker talks only to that node.** A token holds
   that node's name and key print beside the CA's fingerprint, and the joining node, which
   has no store, talks only to the node that made the token: it takes no other
@@ -182,6 +185,22 @@ Only the newest version is fixed. There are no security releases of older ones.
   and kithd can hand the dmem controller down: the kernel then keeps the container's use
   of that GPU's memory under the share (`dmem.max`). Elsewhere it is a count the scheduler
   keeps, and a container that takes more is not stopped.
+  A Device cannot grant raw memory or a block device, whoever wrote it: when kithd hands nodes
+  to a container it stats each path (links not followed) and gives the Device's nodes only if
+  all are character devices that are there and not mem, kmem, port, kmsg, oldmem, the
+  device-mapper's control, a TPM, sg (major 21), the misc nodes nvram, watchdog, vfio and
+  mcelog, snapshot, cpu/microcode and hpet (10:144, 10:130, 10:196, 10:227, 10:231, 10:184,
+  10:228: the kernel reports them only as `misc`), or of the
+  kernel subsystems `scsi_generic`,
+  `bsg`, `nvme`, `nvme-generic`, `mtd`, `tpm`, `tpmrm`, `msr`, `dax`, `ubi`, `ublk-char`, `vfio`, `i2c-dev`,
+  `nvram`, `cpuid`, `mei`, `watchdog`, `vfio-dev`, `uio`, `spidev`, `ipmi`, `usbmon` or
+  `drm_dp_aux` or `drm_dp_aux_dev` (read from `/sys/dev/char`; where that is there and a
+  node's subsystem cannot be read the node is refused, and with no `/sys/dev/char` at all only
+  the fixed numbers are known). This is a denylist, not an allowlist, because a Device is set
+  by the admin for hardware no list could name. A block device, a file, a link or a missing node grants nothing, and the
+  workload is not run, its status saying which Device and path. Other character devices that
+  reach hardware (a USB or PCI node, `/dev/input`, `/dev/dri`) are what a Device is for and are
+  given.
   A device node a unit was given (an exclusive Device's, most of all) is not given to another
   unit while the unit that had it still runs: a unit whose stop failed with processes left
   keeps its devices and its name, its stop is retried at a later pass and no more often than
@@ -302,6 +321,12 @@ Only the newest version is fixed. There are no security releases of older ones.
   give nothing; a pod is given no token and no API to ask. `privileged`, the host's
   namespaces, `hostPath` and added capabilities have no field in kith, and an object
   that asks for one is refused by its name. Of a body in protobuf 50,000 fields are read.
+- **A terminal and `--root` in an exec add no right.** `kubectl exec -it` and `kith machine shell`
+  are the same `exec` right as without a terminal; the process gets a pseudo-terminal of its own
+  (kithd keeps the master end), and kith puts its own terminal back when it ends. `--root`
+  (`root=true` in the request, which any client may send) runs as uid 0 of the pod's own user
+  namespace only: it is refused, with the reason, when that uid 0 would be the node's root or the
+  user kithd runs as, so a pod with no user namespace of its own is never entered as root of the node.
 - **`kubectl exec`, `cp` and `port-forward` are one right, `exec`, on the Workload or Job that
   owns the pod.** `get` alone reads a pod and is refused all three. A `port-forward` reaches
   any port of the pod, whatever listens there and whatever a NetworkPolicy says: a policy holds
@@ -313,7 +338,9 @@ Only the newest version is fixed. There are no security releases of older ones.
   with the sender's signature: the node that runs the replica checks the signature, the named
   caller and the `exec` right on that node, from its own copy of the Roles, before it enters
   the pod or opens a connection. A pod not yet made on its node is refused, never answered by
-  the host's own ports.
+  the host's own ports. The `exec` right on a NodeWorkload opens nothing:
+  a NodeWorkload's pod runs on the host, not in a container, so `exec`, `cp` and `port-forward`
+  into it are refused (501), and `kith run` is the way onto its node.
 - **The web UI's Terminal tab is `kubectl exec` over a WebSocket, `GET /v1/exec/NAMESPACE/POD`,
   and asks the same.** The `exec` right on the owning Workload or Job (and on `Node` for a
   NodeWorkload) is asked before anything of the request is read, again on the replica's node
@@ -514,7 +541,9 @@ Only the newest version is fixed. There are no security releases of older ones.
   What a get gives was written by whatever ran in the Volume: unpacked as root it keeps
   their owners and setuid bits.
 - **An encrypted disk or Volume** cannot be read by whoever takes it out of its machine:
-  the key is with the other nodes.
+  the key is with the other nodes. That does not hold for blocks written before the pass
+  on a node encrypted in place (`kith node encrypt`) on flash: the controller may keep the old
+  plain blocks ([cluster guide](docs/guide/cluster.md#encrypting-a-node-that-was-installed-plain)).
 
 ## Running a runtime inside a container
 
@@ -531,7 +560,17 @@ The nested kithd shares the node's network, so its registry port meets the node'
 Design in `docs/adr-privilege.md` (T-0334). Built today: the node's own policy and the
 typed request list's seam (`crates/kithd/src/root_part.rs`, for listeners, pods and the mesh), in one
 process. There is no second process yet, so everything below is what the split is for,
-not what a node has.
+not what a node has. **No part of a live node is confined today.** The confinement the serving part
+will take is built (T-0811, `crates/kithd/src/confine.rs`: its own mount namespace holding only its
+state directory, no exec, with a `/proc` that shows its own process alone; a user and group that are
+not 0, no capability in any set, `no_new_privs`, a seccomp allow-list last) and held to what it says
+by a probe, `kithd confine-probe`, in a test build that no release has (`sh ci/vm.sh --test privilege`),
+and not applied to the serving part, which is a thread of the root part's process; `--split` is off by
+default, and until the two are processes a node has none of it. What stays open when it is applied: the
+serving part shares the node's network namespace, so it reaches the host's loopback and every abstract
+`AF_UNIX` socket (a `CLONE_NEWNET` after its listeners are open would close that if it makes no outbound
+connection; not done). The filter can be left out alone (`--no-filter`, on the probe only today, for
+a call the list lacks); without it a hole in the serving part has every system call its user may make.
 
 **What the split does not change.** The part that reads the network still reads the
 store: every Secret of every namespace, and on a node that holds it the cluster's CA key.
@@ -539,6 +578,15 @@ A hole there is still the cluster: it can write any object as anyone, and so ask
 root part for whatever the store may ask of the node (a privileged pod, a host path, a
 VM's disks, each only where the node's own policy allows it). The split does not make
 Secrets safer from that part.
+
+**A VM's disk in a Volume is never opened by a path a container writes.** kithd opens the
+image without following a link (`O_NOFOLLOW`, `O_PATH`), refuses what is no regular file,
+and hard-links that very file into `<state>/vm-images/<namespace>/<volume>/` (mode 0700, no
+container mounts it) at every start; the hypervisor is given that link. A container of the
+Volume that swaps the image for a link to a node's file after the check changes nothing the
+hypervisor opens. The link keeps the image's blocks until the next start or the wipe. A Volume on
+another file system than the state directory's, and an encrypted Volume, holds no VM disk: the
+machine is refused at placement, with that said.
 
 **A hole in the part that reads the network** (TLS, HTTP, the APIs, DNS, ingress, the
 Service proxy) is, after the split, the cluster's data and every request on the root
@@ -855,6 +903,22 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   is each node's own word (`status.serves`, and the address it joined from): an ingress worker (its
   Node says `ingress`, below) or a worker that is sent the whole store can say it serves ingress and is
   then answered beside the others; any other worker cannot.
+- **`expose.issuer: cluster` has a LAN CA sign a host's certificate, and a device that trusts it takes
+  what it signs.** The LAN CA is apart from the cluster's root: its own key, kept beside the CA key on
+  the CA node and never leaving it, and a self-signed certificate with X.509 name constraints that
+  permit only the cluster's LAN domains (`spec.lanDomains` of a Cluster: the admin's list, by the
+  lowest key's if several name one; `home.arpa`, `lan`, `internal` and `local` where none does) and
+  exclude `kith` and `cluster.local`. `kith ca export` hands out that certificate alone, from the
+  node that holds it, over the local socket. A device that trusts it is bound by those constraints
+  whatever the CA signs; the workloads' `ca.crt` and the mesh never trust it, and a host certificate
+  does not verify against the cluster's root. Within the domains, whoever may write a Service may
+  name a host (key those in a Namespace's `spec.hosts`), and there is no revocation: a certificate
+  lasts 30 days and is made again in its last third. The LAN CA's own certificate lasts ten years;
+  changing the domains makes a new certificate with the same key and another serial, and a device
+  keeps trusting the old, broader one until its owner removes it and imports the new. The name
+  constraints also exclude every IP address, and the LAN CA's key is only read, never made again over
+  a file that is there but unreadable. `kith ca export` only works on the CA node. A
+  refused or failed issuance waits an hour, as ACME's, and the same error is written to the status once.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and
   PipeWire sockets are, and connects as any program the session started would: it can
@@ -1262,8 +1326,34 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     asked node has no Node for. On a worker that runs from a view and is started
     with the flag, that includes the deleted node's word for who asked: do not
     start a worker with it.
-  Certificates still last ten years (a Workload's pod's, two hours: above); nothing but
-  the Node's deletion ends one.
+  Certificates still last ten years (a Workload's pod's, two hours: above); a node's is
+  made again before it ends and a deleted Node's or a replaced Identity's is refused at
+  the handshake (next).
+- **A node's certificate: its life, its renewal, and its revocation.**
+  - A node's certificate lasts ten years. A node with under a third of that left (an
+    hour's look, and at the start) asks a node that holds the CA key for a new one over
+    the one it has: members only, the asking node's Node must stand, and the CA node
+    signs for the key and the birth index of the certificate on the link, never for a
+    name or key the request gives. The new one is for the same key and names (so the
+    Node's `status.certificate`, join tokens and pins hold), is written to `node.crt`
+    before it is shown, and is served from the next handshake on, to clients and as the
+    client of calls to other nodes, with no restart; connections already open keep the
+    old one until they end. One certificate a minute for one node, each in the audit
+    log (`renew-certificate`). A failure (no CA node reachable, a certificate that is
+    not for this key or does not end later) leaves the old one in place and is asked
+    again. A certificate that has ended cannot ask: the node joins again. The CA's own
+    certificate (twenty years) is not renewed.
+  - A node refuses at the TLS handshake, not only at each request, the certificate of a
+    node whose Node is deleted or holds another key print, and the certificate of an
+    Identity whose `publicKey` is another (the Identity was made again). This is
+    decided by the store the node has, and only on what it positively shows: a node
+    still catching up, or an Identity it has not heard of, is not refused here, and
+    each request is asked again as before. A node started with
+    `--admit-deleted-nodes` does not refuse at the handshake (and still signs no
+    certificate for a node its store has no Node for). A node resumes no TLS session, so
+    each connection shows the certificate again and is checked. A Workload's pod
+    certificate is checked at each request only. There is no CRL and no OCSP service:
+    the store is the list.
 - **A Release and a Source act with their writer's rights, as far as these go:**
   - Deleting one removes what it installed as the node does: leave to delete the
     Release or Source is enough, not leave to delete each thing.

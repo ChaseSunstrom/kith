@@ -104,8 +104,10 @@ include!(concat!(env!("OUT_DIR"), "/os_features.rs"));
 /// sorted: what this node's hardware wants of them, for its status (`os.wants`). A feature with
 /// no such line is never wanted by hardware: it is chosen by hand. A `vendor:*` id matches a
 /// display card (PCI class 03) of that vendor, not its audio function or any card whose class
-/// sysfs does not say. `all` is wanted alone: build.sh refuses it with `gpu-amd-phoenix` (the
-/// same driver, as modules and built in) and its modules cover that card.
+/// sysfs does not say, and only one that no feature names by its exact id (a Pascal card
+/// is `gpu-nvidia-pascal`'s, which `10de:*` of `all` is not for). `all` is wanted alone:
+/// build.sh refuses it with `gpu-amd-phoenix` or `gpu-nvidia-pascal` (the same driver, as
+/// modules and built in) and its modules cover those cards.
 pub fn wants(sys: &Path) -> Vec<&'static str> {
     let pci = sys.join("bus/pci/devices");
     let mut cards = BTreeSet::new();
@@ -116,22 +118,28 @@ pub fn wants(sys: &Path) -> Vec<&'static str> {
             continue;
         };
         if id(&dir.join("class")).is_some_and(|class| class.starts_with("03")) {
-            displays.insert(vendor.clone());
+            displays.insert((vendor.clone(), device.clone()));
         }
         cards.insert((vendor, device));
     }
+    // A display card that a feature names by its exact id is that feature's, not a wildcard's.
+    let named = |vendor: &str, device: &str| {
+        OS_FEATURES
+            .iter()
+            .any(|(_, ids)| ids.iter().any(|(v, d)| (*v, *d) == (vendor, device)))
+    };
     let mut wanted: Vec<&'static str> = OS_FEATURES
         .iter()
         .filter(|(_, ids)| {
             ids.iter().any(|(vendor, device)| match *device {
-                "*" => displays.contains(*vendor),
+                "*" => displays.iter().any(|(v, d)| v == vendor && !named(v, d)),
                 _ => cards.contains(&(vendor.to_string(), device.to_string())),
             })
         })
         .map(|(name, _)| *name)
         .collect();
     if wanted.contains(&"all") {
-        wanted.retain(|name| *name != "gpu-amd-phoenix");
+        wanted.retain(|name| !["gpu-amd-phoenix", "gpu-nvidia-pascal"].contains(name));
     }
     wanted
 }
@@ -242,6 +250,18 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
         if let Some(n) = number(&name, "card") {
             let model = read(&sys.join("class/sound").join(&name).join("id"));
             let labels = model.map(|model| ("model", label(&model))).into_iter().collect();
+            // Its playback PCM nodes come with it (the control node alone plays nothing): the
+            // card's own, `pcmC{n}D{d}p`, not card 10's for card 1, and not a capture `…c`.
+            let pcm = format!("pcmC{n}D");
+            let nodes = names(&sys.join("class/sound"))
+                .into_iter()
+                .filter(|other| {
+                    let device = other.strip_prefix(&pcm).and_then(|rest| rest.strip_suffix('p'));
+                    device.is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .map(|other| format!("/dev/snd/{other}"))
+                .collect();
+            also.insert(("audio", name.clone()), nodes);
             found.push(("audio", name.clone(), Some(format!("/dev/snd/controlC{n}")), labels));
         }
     }
@@ -596,12 +616,12 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>, dmem:
         }
         if !resources.is_empty() {
             let at = kith_api::store::now();
-            if let Err(e) = shared.submit(Command::Apply { resources, at }).await {
+            if let Err(e) = shared.submit_node(Command::Apply { resources, at }).await {
                 eprintln!("kithd: devices: listing this node's hardware: {e}");
             }
         }
         for key in gone {
-            if let Err(e) = shared.submit(Command::Delete { key: key.clone() }).await {
+            if let Err(e) = shared.submit_node(Command::Delete { key: key.clone() }).await {
                 // (The rest wait for the next round: each would wait out the same trouble.)
                 eprintln!("kithd: devices: taking {key} away: {e}");
                 break;
@@ -649,6 +669,17 @@ mod tests {
             .find(|(name, _)| *name == "all")
             .expect("all is in the table");
         assert_eq!(all.1.to_vec(), vec![("10de", "*")]);
+        // Pascal's display functions (a GTX 1060 6GB, a GTX 1050 Ti, a GT 1030), not its audio's.
+        let pascal = OS_FEATURES
+            .iter()
+            .find(|(name, _)| *name == "gpu-nvidia-pascal")
+            .expect("gpu-nvidia-pascal is in the table");
+        for id in ["1c03", "1c82", "1d01", "1b06", "1b80"] {
+            assert!(pascal.1.contains(&("10de", id)), "{id}");
+        }
+        for id in ["10ef", "10f0", "10f1", "0fb8", "0fb9", "1e04"] {
+            assert!(!pascal.1.contains(&("10de", id)), "{id}");
+        }
         assert!(OS_FEATURES.iter().all(|(_, ids)| !ids.is_empty()));
     }
 
@@ -688,13 +719,32 @@ mod tests {
     }
 
     #[test]
-    fn os_wants_all_for_an_nvidia_display_card_of_any_id() {
-        // A GTX 1060 (VGA, 0x1c03) and a 3D controller (0x0302), both class 03.
+    fn os_wants_all_for_an_nvidia_display_card_no_feature_names() {
+        // A Turing card (an RTX 2080 Ti, VGA, 0x1e04) and a 3D controller (0x0302), both class 03.
         let root = tree("os-wants-nvidia");
-        function(&root, "0000:01:00.0", "0x10de", "0x1c03", "0x030000");
+        function(&root, "0000:01:00.0", "0x10de", "0x1e04", "0x030000");
         assert_eq!(wants(&root), ["all"]);
         let root = tree("os-wants-nvidia-3d");
         function(&root, "0000:01:00.0", "0x10de", "0x20b0", "0x030200");
+        assert_eq!(wants(&root), ["all"]);
+    }
+
+    /// A Pascal card (a GTX 1060, 0x1c03) is named by gpu-nvidia-pascal's own ids: it wants that
+    /// feature and not `all`, whose `10de:*` is for the cards no feature names.
+    #[test]
+    fn os_wants_gpu_nvidia_pascal_for_a_pascal_card_and_not_all() {
+        let root = tree("os-wants-pascal");
+        function(&root, "0000:01:00.0", "0x10de", "0x1c03", "0x030000");
+        function(&root, "0000:01:00.1", "0x10de", "0x10f1", "0x040300");
+        assert_eq!(wants(&root), ["gpu-nvidia-pascal"]);
+        // With an AMD Phoenix card as well: both features, not `all`.
+        function(&root, "0000:05:00.0", "0x1002", "0x15bf", "0x030000");
+        assert_eq!(wants(&root), ["gpu-amd-phoenix", "gpu-nvidia-pascal"]);
+        // With a Turing card too, `all` alone: its modules cover the Pascal card (build.sh refuses
+        // all with gpu-nvidia-pascal, one driver as modules and built in).
+        let root = tree("os-wants-pascal-turing");
+        function(&root, "0000:01:00.0", "0x10de", "0x1c03", "0x030000");
+        function(&root, "0000:02:00.0", "0x10de", "0x1e04", "0x030000");
         assert_eq!(wants(&root), ["all"]);
     }
 
@@ -705,7 +755,7 @@ mod tests {
         assert!(wants(&root).is_empty());
         // A class that cannot be read does not make a wildcard match.
         let root = tree("os-wants-nvidia-noclass");
-        cards(&root, &[("0x10de", "0x1c03")]);
+        cards(&root, &[("0x10de", "0x1e04")]);
         assert!(wants(&root).is_empty());
         // Another vendor's display card.
         let root = tree("os-wants-intel-display");
@@ -718,7 +768,7 @@ mod tests {
         // build.sh refuses all with gpu-amd-phoenix (one driver, modules and built in): all
         // has the AMD driver as modules, so it alone covers both cards.
         let root = tree("os-wants-both");
-        function(&root, "0000:01:00.0", "0x10de", "0x1c03", "0x030000");
+        function(&root, "0000:01:00.0", "0x10de", "0x1e04", "0x030000");
         function(&root, "0000:05:00.0", "0x1002", "0x15bf", "0x030000");
         assert_eq!(wants(&root), ["all"]);
     }
@@ -757,6 +807,49 @@ mod tests {
             .iter()
             .find(|r| r.metadata.name == name)
             .unwrap_or_else(|| panic!("no {name}"))
+    }
+
+    /// A sound card's Device lists its own playback PCM nodes (`pcmC{n}D{d}p`): not another
+    /// card's whose number starts the same (card 1 and card 10), not a capture node (`…c`).
+    #[test]
+    fn an_audio_card_lists_its_own_playback_pcm_nodes() {
+        let root = tree("audio-pcm");
+        for (card, id) in [(0, "PCH"), (1, "HDMI"), (10, "USB")] {
+            put(&root, &format!("class/sound/card{card}/id"), &format!("{id}\n"));
+            put(&root, &format!("class/sound/controlC{card}/dev"), "116:2\n");
+        }
+        for pcm in [
+            "pcmC0D0p",
+            "pcmC0D0c",
+            "pcmC0D3p",
+            "pcmC1D3p",
+            "pcmC1D7p",
+            "pcmC1D7c",
+            "pcmC10D0p",
+            "pcmC10D1p",
+            "pcmC10D0c",
+        ] {
+            put(&root, &format!("class/sound/{pcm}/dev"), "116:16\n");
+        }
+        let found = scan(&root, "n1");
+        let nodes = |name: &str| get(&found, name).spec["nodes"].clone();
+        assert_eq!(
+            nodes("n1-audio-card0"),
+            json!(["/dev/snd/pcmC0D0p", "/dev/snd/pcmC0D3p"])
+        );
+        assert_eq!(
+            nodes("n1-audio-card1"),
+            json!(["/dev/snd/pcmC1D3p", "/dev/snd/pcmC1D7p"])
+        );
+        assert_eq!(
+            nodes("n1-audio-card10"),
+            json!(["/dev/snd/pcmC10D0p", "/dev/snd/pcmC10D1p"])
+        );
+        assert_eq!(get(&found, "n1-audio-card1").spec["path"], "/dev/snd/controlC1");
+        // A card with no PCM (no sound to play) lists none.
+        let root = tree("audio-no-pcm");
+        put(&root, "class/sound/card0/id", "PCH\n");
+        assert!(get(&scan(&root, "n1"), "n1-audio-card0").spec.get("nodes").is_none());
     }
 
     #[test]

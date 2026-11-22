@@ -1,8 +1,9 @@
 //! `kubectl exec` and `kubectl cp` (a tar run by exec) into a replica: a process run in the
 //! replica's own mount, pid and net namespaces on the node that runs it, its stdin, stdout, stderr
 //! and exit status carried as the channels of a WebSocket (`v5.channel.k8s.io`, or `v4`): channel
-//! 0 is stdin, 1 stdout, 2 stderr, 3 the Status that says how it ended, and `[255, 0]` (v5) that
-//! stdin is over.
+//! 0 is stdin, 1 stdout, 2 stderr, 3 the Status that says how it ended, 4 the size of the terminal
+//! (`{"Width": W, "Height": H}`), and `[255, 0]` (v5) that stdin is over. With `tty=true` the process runs
+//! on a terminal (tty.rs): its output is all on channel 1, and a client that goes hangs it up.
 //!
 //! ```text
 //! kubectl --WebSocket--> node A (checks Exec on the pod's owner)
@@ -10,15 +11,17 @@
 //!                          \-- replica there: POST /v1/pod-hop --> node B (checks it again in
 //!                                             its own store, enters, speaks the channels)
 //! ```
-//! `/v1/pod-hop` is the one route between nodes for a pod: `kubectl port-forward` (kube/portforward.rs) asks
-//! it for a byte stream to a port instead ([`Spec::Connect`]). It has one gate ([`hop`]) and one sender
-//! ([`send`]); what the gate lets through is run by what the body asks.
+//! `/v1/pod-hop` is the one route between nodes for a pod, of three kinds: exec (above), `kubectl port-forward`
+//! (kube/portforward.rs), which asks it for a byte stream to a port ([`Spec::Connect`]), and a VM's live
+//! migration (vm_migrate.rs), the stream to the QEMU waiting for it ([`Spec::Migrate`]: answered at once, by
+//! the node's certificate, with no caller to check). It has one gate ([`hop`]) and one sender ([`send`]); what
+//! the gate lets through is run by what the body asks.
 //! Node A passes the client's bytes on without reading them (the WebSocket is the client's, to
 //! node B, which is the one that answers it). A failure after the upgrade is a Status on channel
 //! 3 and a close: a client that was refused an upgrade would fall back to another protocol.
 //!
-//! Not carried, said in that Status: a TTY, resize, attach to the main process, and a
-//! NodeWorkload's pod (its unit runs on the host, not in a container).
+//! Not carried, said in that Status: attach to the main process, and a NodeWorkload's pod (its
+//! unit runs on the host, not in a container).
 //!
 //! A process whose client has gone is killed (`pump` ends it, and `hop` ends one whose upgrade
 //! fails), but not while kithd is blocked writing its stdin: that one ends when it does.
@@ -48,6 +51,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::unix::pipe;
 use tokio::sync::{Mutex, watch};
 
+mod tty;
+use tty::Pty;
+
 /// The largest frame a client may send: a frame longer than this is refused before its body is read.
 // ponytail: one frame's bytes held at a time; a stdin larger than this comes as more frames.
 pub(crate) const FRAME_MAX: usize = 1 << 20;
@@ -59,6 +65,10 @@ const HOP: Duration = Duration::from_secs(15);
 const FAREWELL: Duration = Duration::from_secs(5);
 /// How long what a process wrote is carried on after it ended (a program it started may hold the pipe).
 const DRAIN: Duration = Duration::from_secs(2);
+/// How long a process on a terminal that went away has to end on its SIGHUP before it is killed.
+const HANGUP: Duration = Duration::from_secs(3);
+/// The size a terminal starts with, until the client's first resize says its own.
+const WINDOW: (u16, u16) = (24, 80);
 /// The most a command may be, in bytes of all its words: the hop's body has room for it.
 const COMMAND_MAX: usize = 32 << 10;
 
@@ -109,6 +119,13 @@ pub struct Ask {
     pub command: Vec<String>,
     pub container: Option<String>,
     pub stdin: bool,
+    /// Run it on a terminal (`kubectl exec -t`). (Defaults: a hop from a node older than this has neither.)
+    #[serde(default)]
+    pub tty: bool,
+    /// Run it as root of the container's own user namespace (`kith machine shell --root`); refused
+    /// where that would be the node's root.
+    #[serde(default)]
+    pub root: bool,
 }
 
 /// An answer that is no: the Status's code and reason, and what it says.
@@ -150,7 +167,7 @@ impl Failed {
 
 impl Ask {
     /// The query of `exec`: `command` once for each word, `container`, and `stdin`, `stdout`,
-    /// `stderr` and `tty` as `true` or `false`. A TTY is not carried.
+    /// `stderr` and `tty` as `true` or `false`, and (kith's own) `root`.
     fn parse(query: &str) -> Result<Ask, Failed> {
         let invalid = |why: String| Failed::new(400, "BadRequest", why);
         let url = reqwest::Url::parse(&format!("http://kith/?{query}")).map_err(|e| invalid(e.to_string()))?;
@@ -160,10 +177,8 @@ impl Ask {
                 "command" => ask.command.push(value.into_owned()),
                 "container" => ask.container = Some(value.into_owned()).filter(|c| !c.is_empty()),
                 "stdin" => ask.stdin = value == "true",
-                "tty" if value == "true" => {
-                    let why = "a TTY is not carried: run `kubectl exec` without -t";
-                    return Err(Failed::new(501, "NotImplemented", why));
-                }
+                "tty" => ask.tty = value == "true",
+                "root" => ask.root = value == "true",
                 _ => {}
             }
         }
@@ -189,13 +204,14 @@ struct Placed {
 /// runs it. The id is made from the stored resource, never from what the client sent.
 fn place(shared: &Shared, namespace: &str, pod: &str, container: Option<&str>) -> Result<Placed, Failed> {
     let missing = || Failed::new(404, "NotFound", format!("pod {namespace}/{pod} is not found"));
-    let (holder, owner, replica) = crate::kube::pod_owner(pod).ok_or_else(missing)?;
+    let me = shared.cluster.as_ref().map_or("local", |c| c.me.name.as_str());
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    // (A bare Pod's name too: it is held under the name it was sent as.)
+    let (holder, owner, replica) = crate::kube::resolve_pod(&state.store, namespace, pod).ok_or_else(missing)?;
     if holder == "NodeWorkload" {
         let why = "a NodeWorkload's pod runs on the host, not in a container: `kith run` runs a command there";
         return Err(Failed::new(501, "NotImplemented", why));
     }
-    let me = shared.cluster.as_ref().map_or("local", |c| c.me.name.as_str());
-    let state = shared.store.lock().expect("a handler panicked holding the store");
     let resource = state
         .store
         .get(&format!("{holder}/{namespace}/{owner}"))
@@ -221,8 +237,13 @@ fn place(shared: &Shared, namespace: &str, pod: &str, container: Option<&str>) -
 }
 
 /// Enters the container `id`, off the runtime's threads: it forks and waits for a helper.
-async fn enter(id: String, command: Vec<String>) -> Result<Entered, Failed> {
-    let entered = tokio::task::spawn_blocking(move || crate::root_part::enter(&id, &command)).await;
+async fn enter(id: String, ask: &Ask) -> Result<Entered, Failed> {
+    let options = kith_runtime::Options {
+        tty: ask.tty.then_some(WINDOW),
+        root: ask.root,
+    };
+    let command = ask.command.clone();
+    let entered = tokio::task::spawn_blocking(move || crate::root_part::enter(&id, &command, options)).await;
     match entered {
         Ok(Ok(entered)) => Ok(entered),
         Ok(Err(why)) => Err(Failed::new(422, "Invalid", why)),
@@ -278,7 +299,7 @@ pub async fn session<IO>(
         })
         .collect();
     let said = status_frames(failed.status(), &websocket::close_body(1011, &why));
-    farewell(&to, said, listen(from, &to, None)).await;
+    farewell(&to, said, listen(from, &to, None, None)).await;
 }
 
 async fn prepare(
@@ -296,7 +317,7 @@ async fn prepare(
     let ask = Ask::parse(query)?;
     let placed = place(shared, namespace, pod, ask.container.as_deref())?;
     let Some(there) = &placed.there else {
-        return Ok(Run::Here(enter(placed.id, ask.command.clone()).await?, ask.stdin));
+        return Ok(Run::Here(enter(placed.id, &ask).await?, ask.stdin));
     };
     // The replica is on another node: its session is that node's, and this one passes the bytes.
     send(shared, who, namespace, pod, Spec::Exec(ask), &placed.node, there)
@@ -366,7 +387,11 @@ struct Hop {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Spec {
     Exec(Ask),
-    Connect { port: u16 },
+    Connect {
+        port: u16,
+    },
+    /// The migration stream of a VM replica waiting for one (nodes only: `vm_migrate`).
+    Migrate,
 }
 
 /// `POST /v1/pod-hop`: the node that runs the replica, asked by the node the client reached
@@ -399,6 +424,10 @@ pub async fn hop(
         Ok(hop) => hop,
         Err(e) => return say(StatusCode::BAD_REQUEST, e.to_string()),
     };
+    // A migration is a node's own business (no user asked), so it is answered here: the node's certificate is the gate.
+    if matches!(hop.spec, Spec::Migrate) {
+        return crate::vm_migrate::hop(&shared, &from, &hop.namespace, &hop.pod, upgrade).await;
+    }
     // The first node checked the caller, and so does this one, in its own store: it takes a
     // node's word for who asked, not for what they may do.
     let Some(who) = Caller::named(&hop.caller) else {
@@ -417,6 +446,7 @@ pub async fn hop(
     let verb = match hop.spec {
         Spec::Exec(_) => "exec",
         Spec::Connect { .. } => "portforward",
+        Spec::Migrate => "migrate",
     };
     let audit = |outcome| {
         let what = vec![format!("pod {}/{}", hop.namespace, hop.pod)];
@@ -427,7 +457,12 @@ pub async fn hop(
         return say(StatusCode::FORBIDDEN, why);
     }
     // (What the pod's name says is enough to ask: a caller without the right is refused whether or not the pod is there.)
-    let Some((holder, owner, replica)) = crate::kube::pod_owner(&hop.pod) else {
+    let named = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let named = crate::kube::resolve_pod(&state.store, &hop.namespace, &hop.pod);
+        named.map(|(holder, owner, replica)| (holder, owner.to_string(), replica))
+    };
+    let Some((holder, owner, replica)) = named else {
         let why = format!("pod {}/{} is not found", hop.namespace, hop.pod);
         audit(Err(why.clone()));
         return say(StatusCode::NOT_FOUND, why);
@@ -450,12 +485,19 @@ pub async fn hop(
             let key = format!("{holder}/{}/{owner}", hop.namespace);
             crate::kube::portforward::tunnel(&shared, &key, replica, port, upgrade).await
         }
+        // (Answered above, by the node's certificate alone: a user's hop never gets here.)
+        Spec::Migrate => Err((StatusCode::FORBIDDEN, "a migration is a node's".to_string())),
     };
     if let Err((status, why)) = done {
         audit(Err(why.clone()));
         return say(status, why);
     }
     audit(Ok(()));
+    switching()
+}
+
+/// The `101` that hands the connection over to what the hop set up.
+pub(crate) fn switching() -> Response {
     let mut reply = Response::new(Body::empty());
     *reply.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
     let headers = reply.headers_mut();
@@ -485,7 +527,7 @@ async fn exec_here(
         return Err((StatusCode::CONFLICT, why));
     }
     let slot = take(caller).map_err(|failed| no(failed, StatusCode::TOO_MANY_REQUESTS))?;
-    let run = enter(placed.id, ask.command)
+    let run = enter(placed.id, &ask)
         .await
         .map_err(|failed| no(failed, StatusCode::UNPROCESSABLE_ENTITY))?;
     let (stop, stdin) = (shared.stop.subscribe(), ask.stdin);
@@ -527,13 +569,19 @@ async fn farewell<W: AsyncWrite + Unpin>(to: &Mutex<W>, said: Vec<u8>, closed: i
     .await;
 }
 
+/// Where the client's stdin goes: the pipe of a process, or the terminal it runs on.
+type Stdin = Box<dyn AsyncWrite + Unpin + Send>;
+/// Where its output comes from.
+type Output = Box<dyn AsyncRead + Unpin + Send>;
+
 /// Reads the client's frames until it closes or ends. What is on channel 0 goes to `stdin`,
-/// `[255, 0]` ends it; a ping is answered with its pong. (A message in parts keeps the channel
-/// its first part named.)
+/// `[255, 0]` ends it, and what is on channel 4 sizes `pty`; a ping is answered with its pong. (A
+/// message in parts keeps the channel its first part named.)
 async fn listen<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut from: R,
     to: &Mutex<W>,
-    mut stdin: Option<pipe::Sender>,
+    mut stdin: Option<Stdin>,
+    pty: Option<Pty>,
 ) {
     let (mut buf, mut channel) = (Vec::new(), None);
     loop {
@@ -563,10 +611,20 @@ async fn listen<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     },
                     Op::Continue => frame.payload,
                 };
-                if let (Some(0), Some(pipe)) = (channel, stdin.as_mut())
-                    && pipe.write_all(&data).await.is_err()
-                {
-                    stdin = None;
+                match channel {
+                    Some(0) => {
+                        if let Some(pipe) = stdin.as_mut()
+                            && pipe.write_all(&data).await.is_err()
+                        {
+                            stdin = None;
+                        }
+                    }
+                    Some(4) => {
+                        if let Some(pty) = &pty {
+                            pty.resize(&data);
+                        }
+                    }
+                    _ => {}
                 }
             }
             Ok(None) => {
@@ -581,10 +639,10 @@ async fn listen<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 }
 
-/// What `run` wrote to a pipe, as frames of `channel`, until it ends; a client that did not ask
-/// for it (`kept`) has it read and dropped, so the process is not held up writing it.
-async fn carry<W: AsyncWrite + Unpin>(to: &Mutex<W>, channel: u8, file: Option<std::fs::File>, kept: bool) {
-    let Some(Ok(mut pipe)) = file.map(pipe::Receiver::from_file) else {
+/// What a process wrote (to a pipe, or its terminal), as frames of `channel`, until it ends; a client
+/// that did not ask for it (`kept`) has it read and dropped, so the process is not held up writing it.
+async fn carry<W: AsyncWrite + Unpin>(to: &Mutex<W>, channel: u8, pipe: Option<Output>, kept: bool) {
+    let Some(mut pipe) = pipe else {
         return;
     };
     let mut chunk = [channel; 1 + (16 << 10)];
@@ -626,18 +684,32 @@ async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     stdin: bool,
     mut stop: watch::Receiver<bool>,
 ) {
-    let stdin = run
-        .stdin
-        .take()
-        .filter(|_| stdin)
-        .and_then(|file| pipe::Sender::from_file(file).ok());
-    let (out, err) = (run.stdout.take(), run.stderr.take());
+    // (On a terminal the process's output is one stream, and its input the same one: all on the master.)
+    let pty = run.tty.take().and_then(|master| Pty::new(master).ok());
+    let tty = pty.is_some();
+    let piped = |file: Option<std::fs::File>| -> Option<Output> {
+        let pipe = pipe::Receiver::from_file(file?).ok()?;
+        Some(Box::new(pipe))
+    };
+    let (out, err): (Option<Output>, Option<Output>) = match &pty {
+        Some(pty) => (Some(Box::new(pty.clone())), None),
+        None => (piped(run.stdout.take()), piped(run.stderr.take())),
+    };
+    let stdin: Option<Stdin> = match &pty {
+        Some(pty) => Some(Box::new(pty.clone()) as Stdin),
+        None => run
+            .stdin
+            .take()
+            .and_then(|file| pipe::Sender::from_file(file).ok())
+            .map(|pipe| Box::new(pipe) as Stdin),
+    }
+    .filter(|_| stdin);
     let run = Arc::new(run);
     let mut wait = {
         let run = run.clone();
         tokio::task::spawn_blocking(move || run.wait().map_err(|e| e.to_string()))
     };
-    let listening = listen(from, to, stdin);
+    let listening = listen(from, to, stdin, pty);
     tokio::pin!(listening);
     let main = async {
         let drain = async { tokio::join!(carry(to, 1, out, true), carry(to, 2, err, true)) };
@@ -654,11 +726,16 @@ async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let code = tokio::select! {
         code = main => code,
         _ = &mut listening => {
-            // The client is gone: the process goes with it.
+            // The client is gone: the process goes with it (one on a terminal is hung up on first).
+            if tty {
+                run.hangup();
+                let _ = tokio::time::timeout(HANGUP, &mut wait).await;
+            }
             run.kill();
             return;
         }
-        _ = stop.wait_for(|stopped| *stopped) => {
+        // (Its guard is not `Send`, and the arm above awaits.)
+        _ = async { let _ = stop.wait_for(|stopped| *stopped).await; } => {
             run.kill();
             return;
         }
@@ -725,7 +802,7 @@ mod tests {
             Failed::new(501, "NotImplemented", "x").status(),
             &websocket::close_body(1011, "x"),
         );
-        farewell(&to, said, listen(from, &to, None)).await;
+        farewell(&to, said, listen(from, &to, None, None)).await;
     }
 
     /// A caller holds at most `PER_CALLER` sessions and the node `SESSIONS_MAX`: the next is a
@@ -756,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_asks_for_a_command_in_the_words_it_was_sent_and_refuses_a_tty() {
+    fn exec_asks_for_a_command_in_the_words_it_was_sent() {
         let ask = Ask::parse(
             "command=sh&command=-c&command=echo%20a%26b&container=app&stdin=true&stdout=true&stderr=true&tty=false",
         );
@@ -766,9 +843,10 @@ mod tests {
                 command: vec!["sh".into(), "-c".into(), "echo a&b".into()],
                 container: Some("app".into()),
                 stdin: true,
+                tty: false,
+                root: false,
             })
         );
-        assert_eq!(Ask::parse("command=ls&tty=true").err().map(|f| f.code), Some(501));
         assert_eq!(Ask::parse("stdout=true").err().map(|f| f.code), Some(400));
         let long = format!("command={}", "a".repeat(COMMAND_MAX + 1));
         assert_eq!(Ask::parse(&long).err().map(|f| f.code), Some(400));
@@ -847,6 +925,16 @@ metadata: {name: far, namespace: default}
 spec: {replicas: 1, template: {exec: [{name: sleep, command: [sleep, '3600']}]}}
 ---
 apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: solo
+  namespace: default
+  annotations:
+    kith.dev/pod: 'true'
+    kube.kith.dev/sent: '{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"solo\",\"namespace\":\"default\"}}'
+spec: {replicas: 1, template: {exec: [{name: sleep, command: [sleep, '3600']}]}}
+---
+apiVersion: kith.dev/v1
 kind: NodeWorkload
 metadata: {name: agent, namespace: default}
 spec: {template: {exec: [{name: sleep, command: [sleep, '3600']}]}}
@@ -913,7 +1001,11 @@ spec: {role: execer, subjects: [alice]}
                 state.store.apply(resource.unwrap()).unwrap();
             }
             // web runs on b, far and the host's agent elsewhere.
-            for (key, node) in [("Workload/default/web", "b"), ("Workload/default/far", "a")] {
+            for (key, node) in [
+                ("Workload/default/web", "b"),
+                ("Workload/default/far", "a"),
+                ("Workload/default/solo", "b"),
+            ] {
                 let unit = json!({"replica": 0, "node": node, "state": "running"});
                 let status = json!({"nodes": {"0": node}, "containers": [unit]});
                 state.store.set_status(key, Some(status)).unwrap();
@@ -948,6 +1040,10 @@ spec: {role: execer, subjects: [alice]}
         let (status, why) = ask_hop(&a, world.b_port, "alice", "web-0", &exec).await;
         assert_eq!(status, 422, "{why}");
         assert!(why.contains("not a unit made here"), "{why}");
+        // A bare Pod's replica on that node is found by its own name, as web-0 is: the exec goes on to enter.
+        let (status, why) = ask_hop(&a, world.b_port, "alice", "solo", &exec).await;
+        assert_eq!(status, 422, "{why}");
+        assert_eq!(ask_hop(&a, world.b_port, "bob", "solo", &exec).await.0, 403);
         let (status, why) = ask_hop(&a, world.b_port, "alice", "web-0", &connect).await;
         assert_eq!(status, 502, "{why}");
         // Neither a spec that names nothing nor one that names both is a hop.

@@ -17,6 +17,10 @@ mod blocklist;
 mod claims;
 mod clock;
 mod cluster;
+// The serving part's confinement: in unit tests and in the `confine-probe` build, in no release.
+// Nothing applies it to a live serving part yet (docs/adr-privilege.md, "Built so far").
+#[cfg(any(test, feature = "confine-probe"))]
+mod confine;
 mod controller;
 mod controllers;
 mod cron;
@@ -68,9 +72,13 @@ mod qmp;
 mod raft;
 mod registry;
 mod releases;
+mod renew;
 mod replicas;
+mod resolver;
 mod root_part;
 mod sched;
+#[cfg(test)]
+mod scratch;
 mod seats;
 mod services;
 mod share;
@@ -81,6 +89,7 @@ mod ui;
 mod update;
 mod view;
 mod vm;
+mod vm_migrate;
 mod volume_files;
 mod volumes;
 mod wasm;
@@ -183,6 +192,9 @@ struct Args {
     /// The name of the mesh's network interface
     #[arg(long, env = "KITH_MESH_INTERFACE", value_name = "NAME", default_value = "kith0")]
     mesh_interface: String,
+    /// Give this machine's own programs the cluster's .kith names: serve DNS at 127.0.0.87:53 and, while the mesh is up, have systemd-resolved send .kith (and nothing else) there. Answers this machine only; needs the mesh (--mesh, or the Cluster's mesh switch) and systemd-resolved
+    #[arg(long, env = "KITH_RESOLVER")]
+    resolver: bool,
     /// Run the people's WireGuard device on this UDP port (docs/adr-people.md): kwg0, beside the
     /// mesh's interface. Needs --mesh, and root
     #[arg(long, env = "KITH_PEOPLE", value_name = "PORT", num_args = 0..=1, default_missing_value = "51821", requires = "mesh", value_parser = clap::value_parser!(u16).range(1..))]
@@ -274,6 +286,7 @@ fn mesh_options(args: &Args, state: &std::path::Path, port: u16) -> mesh::Option
         interface: args.mesh_interface.clone(),
         port,
         key: state.join("pki").join("mesh.key"),
+        resolver: args.resolver,
     }
 }
 
@@ -331,6 +344,9 @@ pub struct Shared {
     pub upstream: Mutex<Option<(String, reqwest::Client)>>,
     /// How long a node may be out of contact before its replicas move (`--lost-after`).
     pub lost_after: std::time::Duration,
+    /// A test's data directory, removed with the last hold of this state.
+    #[cfg(test)]
+    pub scratch: std::sync::OnceLock<scratch::Scratch>,
 }
 
 /// How many dry runs at once.
@@ -413,6 +429,9 @@ fn main() -> ExitCode {
     kith_runtime::exec_shim();
     // Started again to render a package's templates? Then this never returns either.
     releases::render_shim();
+    // Started again to hold the serving part's confinement to what it says? Never returns either.
+    #[cfg(feature = "confine-probe")]
+    confine::probe_shim();
     // Then, before the runtime and its listeners, the limit of open files they share.
     raise_nofile();
     // A test build says so, loudly, each time it starts (ci/vm/access.sh looks for the line).
@@ -689,7 +708,7 @@ async fn membership(
             (me, None)
         }
         None => {
-            let ca = pki::Ca::create()?;
+            let ca = pki::Ca::create()?.keep_in(&dir);
             let (cert, key) = ca.issue(&name)?;
             eprintln!("kithd: new cluster; `kith node token` lets another node join");
             let me = pki::Identity {
@@ -775,6 +794,8 @@ async fn replica(
         view: watch::channel(None).0,
         upstream: Mutex::default(),
         lost_after,
+        #[cfg(test)]
+        scratch: std::sync::OnceLock::new(),
     });
     // (Raft's links look a voter's Node up in the store; the state holds Raft, so by a weak hold.)
     let _ = reach.set(Arc::downgrade(&shared));
@@ -857,7 +878,18 @@ fn strip_node_keys(kept: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
+/// Tied lives: the root part's `serve` ends (it returns, or panics) and kithd ends with it, by
+/// `exit(1)`, for the keeper to start both parts again; the containers go on and are adopted.
+fn tied(serve: impl FnOnce(), exit: impl FnOnce(i32)) {
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(serve));
+    eprintln!(
+        "kithd: the root part ended{}: ending, to start both parts again",
+        if ended.is_err() { " in a panic" } else { "" }
+    );
+    exit(1);
+}
+
+fn run(mut args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     let first_process = boot.is_some();
     if let Some(why) = people_refusal(&args, nix::unistd::getuid().is_root()) {
         return Err(why);
@@ -994,6 +1026,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     if let Some(said) = runtime.as_ref().ok().and_then(|runtime| runtime.cgroup_problem()) {
         eprintln!("kithd: {said}");
     }
+    // What a kithd before left of `kith run` (before any run is made here).
+    api::run::sweep_stale(&state);
     // Started again by process 1: a container the kithd before made and did not start holds
     // its sockets (this one's address among them) until it is gone.
     if let (Ok(runtime), Some((2.., _))) = (&runtime, keeper::kept()) {
@@ -1037,6 +1071,16 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             None => Ok(None),
         }
     })?;
+    // (Not fatal: a desktop's kithd is not to be lost to someone else's DNS on 127.0.0.87:53.)
+    // (And then nothing is registered with systemd-resolved: it would send names to no one.)
+    let resolving = match args.resolver {
+        true => rt
+            .block_on(dns::bind(resolver::SERVER))
+            .map_err(|e| eprintln!("kithd: --resolver: {e}: this machine's programs do not get .kith names"))
+            .ok(),
+        false => None,
+    };
+    args.resolver = resolving.is_some();
     let shared = rt.block_on(replica(
         membership,
         &state,
@@ -1055,8 +1099,27 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let held = shared.clone();
         std::thread::Builder::new()
             .name("root-part".into())
-            .spawn(move || root_part::serve_split(&held.pods, end))
+            .spawn(move || {
+                tied(
+                    || root_part::serve_split(&held.pods, end),
+                    |code| std::process::exit(code),
+                )
+            })
             .map_err(|e| fail("starting the root part", &e))?;
+        // The test build's way to end the root part alone (ci/vm/privilege.sh): a file of this
+        // name in the state directory, taken away and answered with the socket's end closed.
+        #[cfg(feature = "confine-probe")]
+        {
+            let file = state.join("end-root-part");
+            std::thread::spawn(move || {
+                loop {
+                    if std::fs::remove_file(&file).is_ok() {
+                        root_part::end_split();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+        }
     }
     // A viewed worker serves ingress only where its Node says so (as the join of a token for
     // an ingress worker wrote it): only then is its view sent the hosts' certificates. (Its
@@ -1154,8 +1217,12 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 cluster::ADMIT_DELETED.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             let mesh_me = kith_mesh::node_address(mesh::prefix(&cluster.me.ca), &cluster.me.name);
-            let listener = cluster::listen_on(tcp, pki::server_config(&cluster.me)?, Some(mesh_me))
-                .map_err(|e| fail("listening", &e))?;
+            // (A certificate this node knows is revoked is refused in the handshake: it weakly holds the node.)
+            let knows = Arc::downgrade(&shared);
+            let revoked: pki::Revoked =
+                Arc::new(move |cert| knows.upgrade().is_some_and(|shared| cluster::revoked(&shared, cert)));
+            let serving = pki::served(&cluster.me.ca, cluster.live.clone(), Some(revoked))?;
+            let listener = cluster::listen_on(tcp, serving, Some(mesh_me)).map_err(|e| fail("listening", &e))?;
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();
             let served = axum::serve(listener, app).with_graceful_shutdown(async move { drop(stop.changed().await) });
@@ -1252,10 +1319,15 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let pods = pods::names(shared.clone(), upstreams.clone(), stopping.clone());
             let asked = async {
                 if let Some(sockets) = names {
-                    dns::run(shared.clone(), sockets, upstreams, stopping.clone()).await;
+                    dns::run(shared.clone(), sockets, upstreams.clone(), stopping.clone()).await;
                 }
             };
-            tokio::join!(pods, asked);
+            let resolver = async {
+                if let Some(sockets) = resolving {
+                    dns::run(shared.clone(), sockets, upstreams.clone(), stopping.clone()).await;
+                }
+            };
+            tokio::join!(pods, asked, resolver);
         };
         let mesh = mesh::follow(shared.clone(), args.mesh, stopping.clone(), |port, ended| {
             let shared = shared.clone();
@@ -1310,6 +1382,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         // The second disk's known disks, mounted once, now that the state is open.
         let data = data_disk::boot::run(state.clone());
         let identities = workload_identity::run(shared.clone(), stopping.clone());
+        let renewing = renew::run(shared.clone(), state.join("pki"), stopping.clone());
         let registry = images::serve(shared.clone(), door, stopping.clone());
         let storage = async {
             tokio::join!(
@@ -1321,7 +1394,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 apart(registry),
                 apart(encrypted),
                 apart(data),
-                apart(identities)
+                apart(identities),
+                apart(renewing)
             )
         };
         let says = vec![
@@ -1451,6 +1525,22 @@ async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, m
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_root_part_ending_ends_kithd_with_1_returning_or_panicking() {
+        for panics in [false, true] {
+            let mut exited = None;
+            super::tied(
+                || {
+                    if panics {
+                        panic!("the root part's own fault (a test)");
+                    }
+                },
+                |code| exited = Some(code),
+            );
+            assert_eq!(exited, Some(1), "panics: {panics}");
+        }
+    }
+
     #[test]
     fn nofile_soft_is_the_hard_limit_up_to_65536_and_never_less_than_now() {
         use super::nofile_soft;
@@ -1861,5 +1951,22 @@ spec: {}
         let args = Args::from_arg_matches(&matched).unwrap();
         assert_eq!(args.dns_upstream, ["9.9.9.9", "1.1.1.1"]);
         assert_eq!(args.listen.map(|at| at.to_string()).as_deref(), Some("127.0.0.1:1"));
+    }
+
+    /// `--resolver` is a switch (off unless given) that `KITH_RESOLVER` also sets.
+    #[test]
+    fn resolver_flag_is_off_unless_given_and_reads_its_variable() {
+        let parse =
+            |given: &[&str]| Args::from_arg_matches(&Args::command().try_get_matches_from(given).unwrap()).unwrap();
+        assert!(!parse(&["kithd"]).resolver);
+        assert!(parse(&["kithd", "--resolver"]).resolver);
+        assert!(
+            Args::command()
+                .try_get_matches_from(["kithd", "--resolver=yes"])
+                .is_err()
+        );
+        let command = Args::command();
+        let flag = command.get_arguments().find(|arg| arg.get_id() == "resolver").unwrap();
+        assert_eq!(flag.get_env().and_then(|env| env.to_str()), Some("KITH_RESOLVER"));
     }
 }

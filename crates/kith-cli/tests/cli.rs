@@ -20,14 +20,28 @@ fn write_executable(path: &Path, text: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-struct Sandbox(PathBuf);
+/// The second field says the directory is a short one made for a socket, removed when dropped.
+struct Sandbox(PathBuf, bool);
 
 impl Sandbox {
     fn new(name: &str) -> Sandbox {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Sandbox(dir)
+        Sandbox(dir, false)
+    }
+
+    /// A sandbox under the temp dir, not CARGO_TARGET_TMPDIR (a merge train's is long): a path
+    /// that is to hold a Unix socket must stay under the 107 bytes `sun_path` takes.
+    fn short(name: &str) -> Sandbox {
+        let mut dir = std::env::temp_dir().join(format!("kr-{}-{name}", std::process::id()));
+        // (A long temp dir, a train's scratch, is passed over for /tmp, as kithd's run dir does.)
+        if dir.join("kithd.sock").as_os_str().len() > 107 {
+            dir = Path::new("/tmp").join(format!("kr-{}-{name}", std::process::id()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Sandbox(dir, true)
     }
 
     fn write(&self, file: &str, content: &str) {
@@ -44,6 +58,14 @@ impl Sandbox {
             .unwrap();
         let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
         (out.status.code().unwrap(), text(out.stdout), text(out.stderr))
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -288,7 +310,7 @@ fn examples_and_schemas() {
 
 #[test]
 fn a_silent_daemon_times_out() {
-    let sb = Sandbox::new("silent");
+    let sb = Sandbox::short("silent");
     let socket = sb.0.join("kithd.sock");
     // Accepts connections (the kernel does) and never answers.
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -391,6 +413,144 @@ fn node_encrypt_asks_its_route_and_shows_the_recovery_key_once() {
             == 2,
         "{seen:?}"
     );
+}
+
+/// A fake carrier (what `waypipe client` is to `kith run`) that writes its pid beside itself,
+/// listens on the socket it is given, takes the connection and then does `after`; and a fake
+/// kithd that answers `101` to the ask and then holds the tunnel (`hold`) or closes it. Starts
+/// `kith run` against them, with its temp dir in the sandbox; the receiver says when the tunnel
+/// is up.
+fn kith_run(
+    sb: &Sandbox,
+    tmp: &Path,
+    after: &str,
+    hold: bool,
+) -> (std::process::Child, std::sync::mpsc::Receiver<()>, PathBuf) {
+    use std::io::{Read, Write};
+    let socket = sb.0.join("kithd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (up, tunnel) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8];
+                if conn.read(&mut byte).unwrap() == 0 {
+                    return;
+                }
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+            let length = head.split("content-length:").nth(1).unwrap().lines().next().unwrap();
+            conn.read_exact(&mut vec![0; length.trim().parse().unwrap()]).unwrap();
+            if head.starts_with("get ") {
+                // kith asks the cluster whether its writes are signed first: they are not.
+                let body = r#"{"signing":"none"}"#;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                conn.write_all(reply.as_bytes()).unwrap();
+                continue;
+            }
+            conn.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: kith-run\r\n\r\n")
+                .unwrap();
+            let _ = up.send(());
+            if hold {
+                // Until kith lets go of it.
+                let _ = conn.read_to_end(&mut Vec::new());
+            }
+            return;
+        }
+    });
+    let carrier = sb.0.join("carrier");
+    let script = format!(
+        "#!/usr/bin/env python3\nimport os, socket, sys, time\nargs = sys.argv[1:]\nif args[0] == \"--secctx\":\n    args = args[2:]\nopen(sys.argv[0] + \".pid\", \"w\").write(str(os.getpid()))\ns = socket.socket(socket.AF_UNIX)\ns.bind(args[1])\ns.listen(1)\ns.accept()\n{after}\n"
+    );
+    write_executable(&carrier, &script);
+    let child = Command::new(env!("CARGO_BIN_EXE_kith"))
+        .args(["--timeout", "60", "run", "--on", "b", "--via"])
+        .arg(&carrier)
+        .args(["--", "true"])
+        .env("KITH_SOCKET", &socket)
+        .env("TMPDIR", tmp)
+        .env_remove("KITH_STORE")
+        .spawn()
+        .unwrap();
+    (child, tunnel, carrier)
+}
+
+fn run_dirs(sb: &Sandbox) -> usize {
+    let names = std::fs::read_dir(&sb.0).unwrap().map(|e| e.unwrap().file_name());
+    names
+        .filter(|name| name.to_string_lossy().starts_with("kith-run-"))
+        .count()
+}
+
+/// The carrier's word is the one `kith run` has of how the run went: its exit status is `kith`'s.
+#[test]
+fn kith_run_returns_the_status_the_carrier_ends_with() {
+    let sb = Sandbox::short("run-status");
+    let (mut kith, _, _) = kith_run(&sb, &sb.0, "sys.exit(7)", false);
+    assert_eq!(kith.wait().unwrap().code(), Some(7));
+    assert_eq!(run_dirs(&sb), 0, "the run's directory stays");
+}
+
+/// A carrier a signal ended has no code: `kith run` ends with the shell's 128 and the signal's
+/// number, not with 0 (a run that went well).
+#[test]
+fn kith_run_ends_with_128_and_the_signal_for_a_carrier_a_signal_ended() {
+    let sb = Sandbox::short("run-signalled");
+    let (mut kith, _, _) = kith_run(&sb, &sb.0, "os.kill(os.getpid(), 9)", false);
+    assert_eq!(kith.wait().unwrap().code(), Some(137));
+    assert_eq!(run_dirs(&sb), 0, "the run's directory stays");
+}
+
+/// A TMPDIR too long for the carrier's socket (past the 107 bytes of `sun_path`, as a build's
+/// is) is passed over: the carrier binds, the run goes, and no run directory is made there.
+#[test]
+fn kith_run_keeps_its_socket_short_whatever_the_temp_dir() {
+    let sb = Sandbox::short("run-long");
+    let long = sb.0.join("a".repeat(60)).join("b".repeat(60));
+    std::fs::create_dir_all(&long).unwrap();
+    let (mut kith, _, _) = kith_run(&sb, &long, "sys.exit(7)", false);
+    assert_eq!(
+        kith.wait().unwrap().code(),
+        Some(7),
+        "the carrier could not bind its socket"
+    );
+    assert_eq!(
+        std::fs::read_dir(&long).unwrap().count(),
+        0,
+        "a run directory is in the long temp dir"
+    );
+}
+
+/// An interrupt ends the run as an end of the tunnel does: the carrier is killed, the directory
+/// goes, and the exit status is the shell's for the signal (128 + 2).
+#[test]
+fn kith_run_cleans_up_and_exits_130_on_an_interrupt() {
+    let sb = Sandbox::short("run-interrupt");
+    let (mut kith, tunnel, carrier) = kith_run(&sb, &sb.0, "time.sleep(300)", true);
+    tunnel.recv_timeout(std::time::Duration::from_secs(90)).unwrap();
+    assert_eq!(run_dirs(&sb), 1, "the run's directory is not there while it runs");
+    let pid = std::fs::read_to_string(format!("{}.pid", carrier.display())).unwrap();
+    let sent = Command::new("kill")
+        .args(["-INT", &kith.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    assert_eq!(kith.wait().unwrap().code(), Some(130));
+    assert_eq!(run_dirs(&sb), 0, "the run's directory stays after an interrupt");
+    let alive = || Path::new(&format!("/proc/{pid}")).exists();
+    for _ in 0..100 {
+        if !alive() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!alive(), "the carrier stays after an interrupt");
 }
 
 /// The nas package: a Share for the volume, and (when it names SMB users) the Samba
@@ -939,14 +1099,34 @@ fn cluster_fields_nothing_reads_are_said() {
     assert!(code == 0 && !said.contains("note:"), "{code}: {said}");
 }
 
+/// The socket [`fake_kithd`] binds: removed when the test is done with it.
+struct Socket(PathBuf);
+
+impl std::ops::Deref for Socket {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// A kithd on a unix socket that answers each request with `answer(method, path, body)`, a JSON
 /// text, and keeps what it was asked as `METHOD PATH BODY`. (The cluster's signing is open.)
 fn fake_kithd(
     sb: &Sandbox,
     answer: impl Fn(&str, &str, &str) -> String + Send + 'static,
-) -> (PathBuf, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+) -> (Socket, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{Read, Write};
-    let socket = sb.0.join("kithd.sock");
+    // A unix socket path is cut at about 100 bytes, and a lane's target dir is longer: bind in
+    // the short temp dir, named by the sandbox.
+    let name = sb.0.file_name().unwrap().to_string_lossy().to_string();
+    let socket = std::env::temp_dir().join(format!("kfk-{}-{name}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let kept = seen.clone();
@@ -985,7 +1165,7 @@ fn fake_kithd(
             );
         }
     });
-    (socket, seen)
+    (Socket(socket), seen)
 }
 
 fn kith_at(socket: &Path, args: &[&str]) -> (i32, String, String) {
@@ -1013,11 +1193,42 @@ fn bare(
     })
 }
 
+/// `kith ca export FILE` writes the LAN CA's certificate, the public half, for a phone or a
+/// laptop to trust once; without a FILE it prints it. A reply that carries a key is refused and
+/// nothing is written: the CA key stays where it is.
+#[test]
+fn ca_export_writes_the_lan_ca_certificate_only() {
+    let pem = "-----BEGIN CERTIFICATE-----\nMIIBcluster\n-----END CERTIFICATE-----\n";
+    let sb = Sandbox::new("ca-export");
+    let (socket, seen) = fake_kithd(&sb, move |_, _, _| pem.to_string());
+    let file = sb.0.join("kith-ca.crt");
+    let (code, _, said) = kith_at(&socket, &["ca", "export", file.to_str().unwrap()]);
+    assert_eq!(code, 0, "{said}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), pem);
+    // (The LAN CA's certificate, the one the name constraints bind; never the cluster root.)
+    assert_eq!(seen.lock().unwrap().as_slice(), ["GET /v1/ca/lan "]);
+    // Without a file: on stdout, for a pipe.
+    let (code, out, said) = kith_at(&socket, &["ca", "export"]);
+    assert!(code == 0 && out == pem, "{code}: {out} {said}");
+
+    let leaky = format!("{pem}-----BEGIN PRIVATE KEY-----\nMIIsecret\n-----END PRIVATE KEY-----\n");
+    let sb = Sandbox::new("ca-export-leak");
+    let (socket, _) = fake_kithd(&sb, move |_, _, _| leaky.clone());
+    let other = sb.0.join("never.crt");
+    let (code, out, said) = kith_at(&socket, &["ca", "export", other.to_str().unwrap()]);
+    assert!(
+        code != 0 && !out.contains("secret") && !said.contains("secret"),
+        "{code}: {out} {said}"
+    );
+    assert!(said.contains("private key"), "{said}");
+    assert!(!other.exists(), "a refused export wrote a file");
+}
+
 /// `kith launch IMAGE -- CMD` applies a Job that never retries, prints the unit's output as it
 /// comes and exits with the unit's code; its name is the first free `IMAGE-N`.
 #[test]
 fn launch_makes_a_job_follows_its_logs_and_exits_with_its_code() {
-    let sb = Sandbox::new("launch-job");
+    let sb = Sandbox::short("launch-job");
     let polled = std::sync::atomic::AtomicUsize::new(0);
     let (socket, seen) = fake_kithd(&sb, move |method, path, body| match (method, path) {
         ("GET", "/v1/resources?kind=Job") => serde_json::json!([bare(
@@ -1088,7 +1299,7 @@ fn launch_makes_a_job_follows_its_logs_and_exits_with_its_code() {
 /// A Job that succeeded exits 0.
 #[test]
 fn launch_exits_0_for_a_job_that_succeeded() {
-    let sb = Sandbox::new("launch-ok");
+    let sb = Sandbox::short("launch-ok");
     let (socket, _) = fake_kithd(&sb, |method, path, body| match (method, path) {
         ("GET", "/v1/resources?kind=Job") => "[]".into(),
         ("POST", "/v1/apply") => {
@@ -1113,7 +1324,7 @@ fn launch_exits_0_for_a_job_that_succeeded() {
 /// `-d` makes a Workload of one replica and returns: no logs are asked for.
 #[test]
 fn launch_detached_makes_a_workload_of_one_replica() {
-    let sb = Sandbox::new("launch-detached");
+    let sb = Sandbox::short("launch-detached");
     let (socket, seen) = fake_kithd(&sb, |method, path, body| match (method, path) {
         ("GET", "/v1/resources?kind=Workload") => "[]".into(),
         ("POST", "/v1/apply") => {
@@ -1165,7 +1376,7 @@ fn launch_against_a_store_file() {
 /// code, what it runs and its age; `-n` and `-A` choose the namespaces.
 #[test]
 fn ps_lists_replicas_job_runs_and_exec_units() {
-    let sb = Sandbox::new("ps");
+    let sb = Sandbox::short("ps");
     let three_hours_ago = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

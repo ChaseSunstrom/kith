@@ -332,6 +332,38 @@ egress rules, which decide where a pod may connect, are below.
   says `partial` and why until every rule is written on the node, then `enforced`. Not tested:
   a policy changing under a running pod; access returning after the policy is deleted.
 
+### Scale to zero: a Service that lets its Workload sleep
+
+A Service may opt in with `spec.scaleToZero: { idle: 15m, start: 60s }` (both durations like
+`90s` or `30m`; `idle` from `30s` to `30d`, `start` at most `10m`; unset means off). Its Workload then sleeps after no
+connection to the Service for `idle`: no replica runs, `status.asleep` is `true`, and
+`spec.replicas` stays as it is (sleep is state, not a spec edit, so `kith apply` of the same file
+changes nothing). The first connection to a sleeping Service is held by the kithd it reached
+while a replica starts, up to `start`, then passed on as any other; at the deadline, or when 256
+connections to that Service already wait, the connection is closed after one line saying why. A
+client that hangs up while it waits gives up its place and its wake. Only a client the Workload's
+NetworkPolicies let in counts as a connection or wakes anything; a refused one is closed at once.
+
+- **TCP only.** Only a TCP connection to the Service's address wakes it. A datagram wakes
+  nothing, so a Service with a `udp` port is refused when applied, and so is a headless one (no
+  address a connection could reach). A Workload with no Service, or with any Service that has no
+  `scaleToZero`, never sleeps; a sleeping one whose Service loses `scaleToZero` is woken.
+- **How idle is counted.** Each node says in its own Node's status which Services it met a
+  connection to (`seen`, now while one is open) and which it holds one for (`wake`); the node
+  that leads the store reads them. The idle time is therefore right to within about ten seconds
+  (the sleep comes `idle` plus ten seconds after the last connection), and the nodes' clocks are
+  taken to agree to within a minute (a word dated further ahead than that is ignored, one older
+  than a minute and a half is stale). A node that is down stops saying, so its old word does not
+  keep a Workload awake.
+- **Who can say it.** A node can only keep awake or wake the Services whose Workloads its
+  NetworkPolicies let it connect to, those it serves or relays for (a Workload with no policy lets
+  every node in). Its word about any other Service is not read. `status.asleep` is the leader's
+  alone: a worker's report cannot set, clear or flip it.
+- **Kernel path.** A Service that may sleep is passed by kithd, not by the kernel's connect
+  hook (the kernel would not count the connection), so it does not have the same-node fast path.
+- A Workload that was never seen idle is counted from when the leader first saw it awake, so a
+  new Workload does not sleep at once.
+
 ### Rolling updates
 
 A changed Workload is replaced one replica at a time, on the node that runs it. The replacement
@@ -371,8 +403,23 @@ port 80 redirects. The ports need CAP_NET_BIND_SERVICE.
   accepts its terms) to get and renew one from Let's Encrypt. Point the host's DNS at the
   ingress nodes first, and give `--acme` to every control node that may lead (the leader orders
   for ingress workers; under `spec.signing: required` a control node that does not lead orders only once the admin has set `spec.ingress: true` on its Node). `kith get service/NAME -o yaml` shows `tls`; a failure is retried an
-  hour later. Keys, and the ACME account's (`Secret/kith-system/acme-account`), are Secrets in
+  hour later, for either issuer, and the same failure is not written to the status twice. Keys, and the ACME account's (`Secret/kith-system/acme-account`), are Secrets in
   the store.
+- **A name only the LAN knows:** `expose.issuer: cluster` (the default is `acme`) has a CA of
+  the cluster's own sign the host's certificate, with no authority asked: the node that holds
+  the CA key makes it for 30 days, keeps it in `tls-<host>`, says `tls.source: cluster` in the
+  Service's status, and makes a new one in the last third of its life. The signer is a LAN CA,
+  apart from the cluster's root: its own key (which never leaves that node) and a certificate
+  with X.509 name constraints for the cluster's LAN domains, `home.arpa`, `lan`, `internal` and
+  `local` unless a Cluster's `spec.lanDomains` names others. `kith ca export [FILE]`, run on the
+  CA's node, writes that certificate (never a key) for a phone or laptop to trust once; a device
+  that trusts it takes nothing outside those domains from it. Change the domains and the CA's
+  certificate is made again (another serial, the same key): on each device remove the old
+  certificate, which keeps vouching for the old domains, and import the new. A host outside them, under
+  `cluster.local` or `kith`, a single label, a wildcard or an address is refused when applied
+  (the domains are checked too once a Cluster names them) and again when signed, and a
+  Namespace's `spec.hosts` still keeps the hosts it names. The workloads' `ca.crt` and the mesh
+  do not trust the LAN CA. There is no revocation: the short life is it.
 - **Bytes as they are:** TLS ends at the ingress and nothing is added; NetworkPolicy sees the
   ingress node. `expose.proxyProtocol: true` sends a PROXY v1 line (`PROXY TCP4 <client>
   <ingress> <client port> <ingress port>`) first; clients inside the mesh send none, so the
@@ -622,6 +669,42 @@ it is shown once, and no log has it. A power cut in the instant between the key 
 stops that start with a message naming it; take the lock record off the config partition to start
 the node plain again.
 
+**How long it takes.** Every byte of the state partition is read and written back through the key,
+in chunks of 256 KiB with a journal beside each, so the pass runs at a fraction of the disk's
+copy speed: minutes for a small partition, hours for a large one or a slow disk. n1 is down for
+all of it. Its console (and the installer's panel, if the machine has a screen) shows a line a
+second: `37% of 61000 MB, 48.2 MB/s, about 11 min left (chunk 37 of 233)`. The estimate is the rate so far, rounded
+up. Start it when n1 can be away for that long, with its replicas and Volumes elsewhere.
+
+**A power cut during the pass is not a failure.** The journal says where the pass was. The next
+start, with nobody asking, finds it and goes on from there (`kithd: init: encrypting the state in
+place, resumed at chunk N of M`); a cut inside that start is the same. Do not run `--cancel`: the
+pass has begun, and it is refused. Do not take the disk out to mount the state as plain: part of
+it is encrypted. If a start stops with an error naming a chunk (a bad sector, or a partition
+whose size changed), the journal is kept and the node does not start as plain: fix the disk and
+start again.
+
+**The SSD caveat.** The pass overwrites each sector in place, and that is all it can do. A flash
+disk (an SSD, an NVMe drive, an eMMC or SD card) does not write where it is told: its controller
+puts new data in a fresh block and keeps the old one, plain, until it needs the space. After the
+pass, the state reads as ciphertext through the disk's interface, yet old plain blocks may still
+sit in flash the interface cannot reach, and someone who reads the chips, or the disk before the
+controller reuses them, may find them. A spinning disk has no such copies, bar a few remapped
+bad sectors. So this verb protects against a thief who uses the disk as a disk; against one who
+reads the flash, it protects what was written after the pass, and nothing from before.
+
+The remedy is to not leave the plain data there. For a node whose plain state would matter, take it
+out of the cluster, erase the whole drive with the drive's own command (`nvme sanitize`, or
+`blkdiscard --secure` or `hdparm --security-erase` where the drive supports it; a plain `dd` of
+zeros is no remedy on flash), reinstall with `encrypt: true`, and join it again: the state is then
+encrypted from its first write. A drive that encrypts itself (an SED) erased by changing its key is
+the same remedy. On a rented or virtual disk (a VPS installed by kexec) there is no drive of yours
+to erase: ask the provider to destroy the volume and its snapshots, or reinstall on a new volume
+and have the old one destroyed. An SD card or eMMC with no secure erase cannot be cleaned: replace
+the medium. Whatever the node held in plain before the pass (a Secret, a Volume's key, the
+CA key if it started the cluster) may be on the flash still: treat it as read by whoever has the
+chips, and make it again if that matters.
+
 ## When every node was off
 
 A power cut takes every node at once, and a cluster of [encrypted
@@ -775,5 +858,27 @@ documentation, not a device: check your version.
 kithd then sees the resolver, not each device, as the client: include it in the zone's `clients`
 (`[192.0.2.1/32]`). `dig @<house resolver> www.apps.example.test` should give kithd's answer,
 and other names the same answer as before.
+
+### This machine's own programs: `--resolver`
+
+`kithd --listen --mesh --resolver` makes `.kith` names work for programs on that machine
+(`getent hosts web.default.kith`, `curl`, a browser):
+
+- **What it needs:** the mesh (`--mesh`, or the Cluster's mesh switch; without a mesh nothing is
+  registered), systemd-resolved running, and programs that ask it (the usual ones do, through
+  `/etc/resolv.conf` or `nss-resolve`). A program that reads its own server list does not.
+- **What it does:** kithd answers on `127.0.0.87:53` and, while the mesh interface is up, tells
+  systemd-resolved (`resolvectl`) to send the domain `~kith` there on that link, with no default
+  route: no other name goes to kithd and no other link changes. It writes no file and never
+  touches `/etc/resolv.conf`.
+- **It answers this machine only:** `127.0.0.0/8` is not reachable from any other machine. An
+  unknown name under `.kith` is answered `NXDOMAIN` by kithd, not forwarded.
+- **How it goes:** kithd takes the entry back (`resolvectl revert`) before it takes the interface
+  down, and the entry lives in resolved's memory only, so a reboot loses it too (a kithd killed
+  outright leaves it while the link stays, and the next one sets it again). It is looked at every
+  half minute and set again if resolved forgot it (a restart of resolved). The server is set after
+  the domain, so a failure part way never leaves a link that sends every name to kithd. Without
+  `/run/systemd/resolve`, kithd says so once and does nothing else. If `127.0.0.87:53` is taken,
+  kithd says so and registers nothing.
 
 Not yet: DNSSEC and zone transfers.

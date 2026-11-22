@@ -15,8 +15,7 @@ use std::net::Ipv6Addr;
 
 /// The annotation a control node puts on a Blob a worker made: the worker's name.
 pub const MADE_ON: &str = "kith.dev/made-on";
-/// What `images` and `backups` put on the Blobs they make.
-const MADE_BY: &str = "kith.dev/made-by";
+use crate::blobs::{BACKUP, IMAGE, MADE_BY};
 const DISCOVERED: &str = "kith.dev/discovered";
 
 /// Who sent the write, as the node that checks it knows them.
@@ -313,8 +312,16 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
                     "peopleNotes",
                     "alone",
                     "shares",
+                    "seen",
+                    "wake",
                 ],
             )?;
+            // (Which Services it met a connection to, and holds one for: the leader sleeps and wakes by them.)
+            for field in ["seen", "wake"] {
+                if let Some(said) = fields.get(field) {
+                    crate::services::wake::shape(said).map_err(|why| refused(key, format!("`{field}` {why}")))?;
+                }
+            }
             // (The Shares it serves over NFS, by name: for the leader to say a Share is served.)
             if let Some(shares) = fields.get("shares") {
                 let names = shares.as_array().filter(|names| names.len() <= 256);
@@ -556,6 +563,7 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
                 "notes",
             ],
         )?,
+        // (Not `asleep`: the leader's word (T-1210), which a report keeps as the store has it.)
         _ => only(key, &said, &["replicas", "containers", "notes"])?,
     }
     // (A NodeWorkload's copies too: the scheduler gives each node it selects a number.)
@@ -579,7 +587,9 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
     let units: Vec<Value> = units.as_ref().and_then(Value::as_array).cloned().unwrap_or_default();
     // (`hostUsers`: whether a container keeps the node's users, which the node says of its own unit.)
     // (`gen`: which generation of a replica it is, the second where a rolling update started it beside the old.)
-    const UNIT: [&str; 11] = [
+    // (`pull`: how far the pull of its image is, which the node says while it goes on.)
+    const UNIT: [&str; 12] = [
+        "pull",
         "gen",
         "name",
         "replica",
@@ -594,7 +604,29 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
     ];
     for unit in &units {
         match unit.as_object() {
-            Some(unit) => only(key, unit, &UNIT)?,
+            Some(unit) => {
+                only(key, unit, &UNIT)?;
+                if let Some(pull) = unit.get("pull") {
+                    // Four counts, each a small number: it is shown as it is.
+                    let counts = pull.as_object().filter(|p| p.len() == 4);
+                    let sane = |field: &str, most: u64| {
+                        counts
+                            .and_then(|p| p.get(field))
+                            .and_then(Value::as_u64)
+                            .is_some_and(|n| n <= most)
+                    };
+                    if !(sane("layers", 1 << 16)
+                        && sane("layersTotal", 1 << 16)
+                        && sane("bytes", 1 << 50)
+                        && sane("bytesTotal", 1 << 50))
+                    {
+                        return Err(refused(
+                            key,
+                            "`pull` is four counts: layers, layersTotal, bytes, bytesTotal",
+                        ));
+                    }
+                }
+            }
             None => return Err(refused(key, "a unit is an object")),
         }
     }
@@ -685,8 +717,12 @@ pub(crate) fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Res
             }
             let wanted = |kind: &'static str| store.list(Some(kind)).filter(|of| self::namespace(of) == namespace);
             let mut volumes = wanted("Image").chain(wanted("Backup"));
-            if !resource.metadata.annotations.contains_key(MADE_BY) || !volumes.any(|of| of_its_volume(store, of, node))
-            {
+            let by_a_maker = resource
+                .metadata
+                .annotations
+                .get(MADE_BY)
+                .is_some_and(|by| by == BACKUP || by == IMAGE);
+            if !by_a_maker || !volumes.any(|of| of_its_volume(store, of, node)) {
                 return Err(refused(
                     &key,
                     "no Image or Backup of that namespace is of a Volume on this node",
@@ -876,7 +912,7 @@ spec: { volume: there, every: 1d }
     }
 
     fn blob(namespace: &str, name: &str, on: Option<&str>) -> Resource {
-        let mut annotations = json!({ MADE_BY: "backup" });
+        let mut annotations = json!({ MADE_BY: BACKUP });
         if let Some(on) = on {
             annotations[MADE_ON] = on.into();
         }
@@ -1033,6 +1069,24 @@ spec: { volume: there, every: 1d }
             )
             .is_err()
         );
+    }
+
+    /// A worker says which Services it met a connection to (`seen`) and which it holds one for
+    /// (`wake`) in its own Node: an object of unix seconds by Service, or null (T-1210).
+    #[test]
+    fn a_worker_says_which_services_it_met_connections_to_and_holds_one_for() {
+        let store = store();
+        for field in ["seen", "wake"] {
+            for ok in [json!({ "default/web": 5 }), json!({}), json!(null)] {
+                assert!(try_as(&store, "w", patch_of("Node/w", json!({ field: ok }))).is_ok());
+            }
+            let many: serde_json::Map<String, Value> = (0..300).map(|i| (format!("ns/s{i}"), json!(1))).collect();
+            for bad in [json!(["default/web"]), json!({ "default/web": "now" }), json!(many)] {
+                assert!(try_as(&store, "w", patch_of("Node/w", json!({ field: bad }))).is_err());
+            }
+            let said = json!({ field: { "default/web": 5 } });
+            assert!(try_as(&store, "w-b", patch_of("Node/w", said)).is_err());
+        }
     }
 
     #[test]
@@ -1364,6 +1418,45 @@ spec: { volume: there, every: 1d }
         let store = store();
         let said = json!({ "state": "running", "succeeded": 0, "failed": 0, "containers": [], "notes": ["restartPolicy is ignored"] });
         assert!(try_as(&store, "a", report_of("a", "Job/default/once", said)).is_ok());
+    }
+
+    /// `asleep` is the leader's word (T-1210): no report carries it, and none that leaves it out or
+    /// says otherwise changes what the store has (`kith_store::reported` keeps it).
+    #[test]
+    fn a_report_cannot_set_or_clear_asleep() {
+        let mut store = store();
+        let report = |store: &Store, said: Value| try_as(store, "w", report_of("w", "Workload/default/web", said));
+        for asleep in [json!(true), json!(false), json!("yes")] {
+            let said = json!({ "containers": [], "asleep": asleep });
+            assert!(report(&store, said).unwrap_err().contains("asleep"), "{asleep}");
+        }
+        for was in [true, false] {
+            let status = json!({ "nodes": { "0": "w" }, "asleep": was });
+            store.set_status("Workload/default/web", Some(status)).unwrap();
+            let taken = reported(report(&store, json!({ "containers": [] })).unwrap()).unwrap();
+            let live = store.get("Workload/default/web").unwrap().status.clone();
+            assert_eq!(kith_store::reported(live, "w", Some(taken))["asleep"], was);
+        }
+    }
+
+    #[test]
+    fn a_report_may_carry_how_far_a_pull_is_and_nothing_else_in_its_place() {
+        let store = store();
+        let pull = json!({ "layers": 1, "layersTotal": 2, "bytes": 5, "bytesTotal": 10 });
+        let said = |pull: Value| json!({ "containers": [unit(0, json!({ "pull": pull }))] });
+        let try_pull = |pull: Value| try_as(&store, "w", report_of("w", "Workload/default/web", said(pull)));
+        let taken = reported(try_pull(pull.clone()).unwrap()).unwrap();
+        assert_eq!(taken["containers"][0]["pull"], pull);
+        for bad in [
+            json!("lots"),
+            json!({ "layers": 1 }),
+            json!({ "layers": -1, "layersTotal": 2, "bytes": 5, "bytesTotal": 10 }),
+            json!({ "layers": 1, "layersTotal": 2, "bytes": 5, "bytesTotal": 1e30 }),
+            json!({ "layers": 1, "layersTotal": 2, "bytes": 5, "bytesTotal": 10, "more": 1 }),
+            json!({ "layers": 1, "layersTotal": 2, "bytes": "5", "bytesTotal": 10 }),
+        ] {
+            assert!(try_pull(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -1720,6 +1813,14 @@ spec: { volume: there, every: 1d }
             panic!("an apply")
         };
         assert_eq!(resources[0].metadata.annotations[MADE_ON], "w");
+        // Only a maker's name is the mark: an image's passes, a person's own word does not.
+        let by = |who: &str| {
+            let mut blob = blob("default", OWN, Some("a"));
+            blob.metadata.annotations.insert(MADE_BY.into(), who.into());
+            apply(blob)
+        };
+        assert!(try_as(&store, "w", by(IMAGE)).is_ok());
+        assert!(try_as(&store, "w", by("mine")).is_err());
         // For a name a Blob has already, here or in any namespace; where it has no Volume.
         assert!(try_as(&store, "w", apply(blob("default", OTHERS, None))).is_err());
         assert!(try_as(&store, "w", apply(blob("other", OTHERS, None))).is_err());

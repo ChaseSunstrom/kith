@@ -239,7 +239,10 @@ pub fn bundle(bytes: &[u8]) -> std::result::Result<Signed, String> {
         .map(Vec::as_slice)
         .unwrap_or_default();
     if listed.len() > STAMPS {
-        return Err(format!("a bundle with {} timestamps, not more than {STAMPS}", listed.len()));
+        return Err(format!(
+            "a bundle with {} timestamps, not more than {STAMPS}",
+            listed.len()
+        ));
     }
     let stamps = listed
         .iter()
@@ -1772,7 +1775,12 @@ pub(crate) mod tests {
         let said = refused_under(&v2(&made, &cert, &key, None, 3_600, ""), &rule);
         assert!(said.contains("outside its authority's certificate's time"), "{said}");
         // A certificate that starts at START + 7,200: a timestamp at 60 is before it.
-        let (late, late_key) = tsa.leaf(START + 7_200, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let (late, late_key) = tsa.leaf(
+            START + 7_200,
+            "tsa@example.test",
+            ISSUED,
+            ExtendedKeyUsagePurpose::TimeStamping,
+        );
         let said = refused_under(&v2(&made, &late, &late_key, None, 60, ""), &rule);
         assert!(said.contains("outside its authority's certificate's time"), "{said}");
     }
@@ -1795,7 +1803,12 @@ pub(crate) mod tests {
         // The signer's certificate runs START to START + 600; a timestamp at 700, by a TSA
         // certificate that runs past it, is after it.
         let made = Making::new(&authority, &log, DIGEST);
-        let (later, later_key) = tsa.leaf(START + 300, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let (later, later_key) = tsa.leaf(
+            START + 300,
+            "tsa@example.test",
+            ISSUED,
+            ExtendedKeyUsagePurpose::TimeStamping,
+        );
         let said = refused_under(&v2(&made, &later, &later_key, None, 700, ""), &rule);
         assert!(said.contains("outside its certificate's time"), "{said}");
     }
@@ -1862,7 +1875,9 @@ pub(crate) mod tests {
         let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
         let good = v2(&made, &cert, &key, None, 60, "");
         let bad = v2(&made, &cert, &key, Some(b"another signature"), 60, "");
-        let entry = |bundle: &Value| bundle["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"][0].clone();
+        let entry = |bundle: &Value| {
+            bundle["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"][0].clone()
+        };
         for (first, second) in [(&good, &bad), (&bad, &good)] {
             let mut two = good.clone();
             two["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"] =
@@ -1886,7 +1901,7 @@ pub(crate) mod tests {
         for cut in [0, 1, 5, response.len() / 2, response.len() - 1] {
             let mut cuts = super::bundle(good.to_string().as_bytes()).unwrap();
             cuts.stamps = vec![response[..cut].to_vec()];
-            let said = timestamp(&mut cuts, &[tsa.root.clone()]).unwrap_err();
+            let said = timestamp(&mut cuts, std::slice::from_ref(&tsa.root)).unwrap_err();
             assert!(said.contains("cannot be read"), "{cut}: {said}");
         }
     }
@@ -1966,7 +1981,10 @@ pub(crate) mod tests {
         assert_eq!(stamp(&token).map(|read| read.time), Some((START + 60) as i64));
         let mut bundle = super::bundle(good.to_string().as_bytes()).unwrap();
         bundle.stamps = vec![token];
-        assert_eq!(timestamp(&mut bundle, &[tsa.root.clone()]), Ok((START + 60) as i64));
+        assert_eq!(
+            timestamp(&mut bundle, std::slice::from_ref(&tsa.root)),
+            Ok((START + 60) as i64)
+        );
     }
 
     /// Over 16 KiB, nesting past the limit, a fifth certificate and BER are each refused, saying why.
@@ -1980,7 +1998,7 @@ pub(crate) mod tests {
             assert!(stamp(&der).is_none(), "{why}");
             let mut bundle = super::bundle(good.to_string().as_bytes()).unwrap();
             bundle.stamps = vec![der];
-            let said = timestamp(&mut bundle, &[tsa.root.clone()]).unwrap_err();
+            let said = timestamp(&mut bundle, std::slice::from_ref(&tsa.root)).unwrap_err();
             assert!(said.contains(why), "expected `{why}`, got `{said}`");
         };
         let imprint = super::bundle(good.to_string().as_bytes()).unwrap().signature;
@@ -2030,7 +2048,7 @@ pub(crate) mod tests {
             read += usize::from(stamp(&input).is_some());
             let mut damaged = super::bundle(good.to_string().as_bytes()).unwrap();
             damaged.stamps = vec![input];
-            let _ = timestamp(&mut damaged, &[tsa.root.clone()]);
+            let _ = timestamp(&mut damaged, std::slice::from_ref(&tsa.root));
         }
         // (Some alterations leave it readable, say a byte of the certificate's name: they
         // are refused by the checks, not the reader. None of the cuts is readable.)

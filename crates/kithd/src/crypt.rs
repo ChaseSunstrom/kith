@@ -2409,7 +2409,7 @@ pub async fn keep(
             (None, _) => {
                 let resources = vec![to_hold(&cluster.me.name, &id, &record.secret, &opened)];
                 let at = kith_api::store::now();
-                if let Err(e) = shared.submit(Command::Apply { resources, at }).await {
+                if let Err(e) = shared.submit_node(Command::Apply { resources, at }).await {
                     eprintln!("kithd: giving the cluster this node's key to hold: {e}");
                 }
             }
@@ -5845,7 +5845,7 @@ mod encrypt_verb {
         let status = answer.status();
         assert_eq!(answer.headers()["cache-control"], "no-store");
         let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap();
-        let log = std::env::temp_dir().join(format!("kithd-pinned-{tag}-{}/audit.log", std::process::id()));
+        let log = shared.scratch.get().unwrap().join("audit.log");
         Asked {
             status,
             body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
@@ -5914,8 +5914,7 @@ mod encrypt_verb {
 
     #[tokio::test]
     async fn the_verb_is_refused_in_no_cluster_and_cancel_takes_the_marker_away() {
-        let dir = std::env::temp_dir().join(format!("kithd-pinned-enc-nocluster-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::scratch::Scratch::new("kithd-pinned-enc-nocluster");
         let alone = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
         let none = || None;
         let answer = encrypt_by(&alone, &Caller::Admin, "a", false, &none, &|| false).await;

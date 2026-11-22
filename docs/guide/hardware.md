@@ -24,6 +24,9 @@ its `spec` has `node`, `class` and the device node as `path`. The class is `gpu`
 - **NVIDIA's own driver.** A card on it also has `nodes`: what CUDA, OpenGL and Vulkan open
   beside the card (`/dev/nvidiactl`, `nvidia-uvm`, `nvidia-uvm-tools`, `nvidia-modeset`,
   `/dev/nvidiaN`), those that exist. **Not tried on a real card.**
+- **A sound card** also has `nodes`: its own playback PCM nodes (`/dev/snd/pcmC1D3p`, one per
+  output, not capture and not another card's), so a claim of it, or of a seat that has it, plays
+  sound as well as opening the control node.
 
 ### Claiming hardware
 
@@ -58,7 +61,27 @@ spec:
 - A container gets its Devices' nodes in its own `/dev`, beside `null`, `zero`, `full`,
   `random`, `urandom`, `tty`; a GPU brings its render node (`/dev/dri/renderD*`). A missing
   Device or claim stops the unit and says which. `/dev/mem`, `/dev/kmem`, `/dev/port` and
-  `/dev/tpm*` are given to no pod, whatever a Device says.
+  `/dev/tpm*` are given to no pod, whatever a Device says. Nor is `/dev/kmsg`, a disk's or
+  flash's raw node (`/dev/sg*`, `/dev/nvme0`, `/dev/ng*`, `/dev/mtd*`, `/dev/mapper/control`),
+  any block device (`/dev/sda`, `/dev/block/8:0`), a link or a plain file: a Device grants a
+  node only if it is a character device that is there, whoever wrote the Device. One path that
+  is not (or is missing, an unplugged camera or a driver not yet loaded) stops the unit, and
+  its status says which Device and path.
+  The kernel subsystems refused are `scsi_generic`, `bsg`, `nvme`, `nvme-generic`, `mtd`,
+  `tpm`, `tpmrm`, `msr`, `dax`, `ubi`, `ublk-char`, `vfio`, `i2c-dev`, `nvram`, `cpuid`, `mei`, `watchdog`,
+  `vfio-dev`, `uio`, `spidev`, `ipmi`, `usbmon`, `drm_dp_aux` and `drm_dp_aux_dev` (read from
+  `/sys/dev/char`), and so are char major 21 (sg) and the misc nodes the kernel reports only as
+  `misc`: nvram (10:144), watchdog (10:130), vfio (10:196), mcelog (10:227), snapshot (10:231),
+  cpu/microcode (10:184) and hpet (10:228). Where `/sys/dev/char` is there
+  and a node's subsystem cannot be read, the node is refused too. This is a list of what to
+  refuse, not of what to allow: a Device is set by the admin for hardware no list could name,
+  and an allowlist would break it. Other raw nodes may exist; a Device is the admin's grant.
+  Given on purpose:
+  - `/dev/kvm` (10:232) is given: VM workloads need it.
+  - `hidraw` nodes are given: security keys and gamepads are such devices.
+  - `/dev/loop-control` (10:237) is given: it does nothing without a block device, which is never granted.
+  - `userfaultfd` is given: it is a syscall, not a node a Device grants.
+  - `/dev/hwrng` (10:183) is given: it only reads random bytes.
 - **On kith OS** a device filter on each container's cgroup checks every open and `mknod`: it
   lets through the usual few, the terminals of the container's own `/dev/pts` and each device it
   was given, and refuses the rest, even to a root pod. A pod that made its own node
@@ -198,6 +221,119 @@ spec:
   a `memory.high`, on every node and whatever the seat does. Batch work beside a desktop takes
   only spare cycles (see [idle work](workloads.md#idle-work)).
 
+### A TV or kiosk seat
+
+A PC on a TV that shows one web page (a media server's TV page) is a seat held by one container:
+a Wayland compositor (cage) with a browser in it. The seat's sound goes out of the TV's HDMI. The
+node runs a kith OS image with the card's driver built in (`gpu-nvidia-pascal` for a GeForce GTX
+10xx, `gpu-amd-phoenix` for a Ryzen's GPU: [kith OS](os.md#a-node-that-needs-more-a-spec)).
+
+**The image is yours to build.** kith ships no kiosk image: this recipe starts from stock Alpine
+and you build and push one image of your own, with the packages in it, to a registry the nodes
+reach. Nothing is installed when the seat starts, so the session needs no root and no network but
+the page's:
+
+```dockerfile
+FROM docker.io/library/alpine:3.22@sha256:<digest of the Alpine you checked>
+RUN apk add --no-cache cage chromium mesa-dri-gallium mesa-gbm alsa-utils wlr-randr font-noto \
+ && adduser -D -u 1000 kiosk && addgroup kiosk video && addgroup kiosk audio
+USER 1000
+```
+
+The page is trusted with the seat: a page that runs in the kiosk reads the seat's keyboards and
+pads and sets its sound, so point it only at a server you run, and keep the seat in a namespace of
+its own (`tv` below) that no one else's workloads share. The seat and each Device of it are given
+to that namespace by their label (`kith.dev/namespaces: tv`: add it under `metadata.labels` of
+`kith get seat tv-seat0 -o yaml` and of each of the seat's `kith get device`, and apply them), as
+under [who may claim what](#claiming-hardware); until then the claim is refused and says why.
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: tv, namespace: tv }
+spec: { node: tv, path: /var/lib/kith/tv, size: 1Gi }   # the browser's profile
+---
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: { name: tv, namespace: tv }
+spec: { seat: tv-seat0, access: exclusive }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: tv, namespace: tv }
+spec:
+  replicas: 1
+  template:
+    deviceClaims: [tv]
+    initContainers:
+      - name: own-profile        # the Volume is root's: give it to the browser's user, then end
+        image: registry.example/tv/kiosk@sha256:<digest>
+        runAsUser: 0
+        command: [chown, "1000:1000", /data]
+        volumeMounts: [{ volume: tv, path: /data }]
+    containers:
+      - name: session
+        image: registry.example/tv/kiosk@sha256:<digest>   # pinned by digest, built as above
+        runAsUser: 1000
+        runAsNonRoot: true
+        userNamespaces: true     # Chromium's own sandbox starts: no --no-sandbox
+        resources: { memory: 3Gi }     # no cpu: see below
+        volumeMounts: [{ volume: tv, path: /data }]
+        env:
+          - { name: URL, value: "https://media.example/tv" }
+          - { name: CARD, value: NVidia }      # the sound card's id: the audio Device's `model` label
+          - { name: PCM, value: "3" }          # its output PCM: see Sound below
+          - { name: XDG_RUNTIME_DIR, value: /tmp/run }
+          - { name: LIBSEAT_BACKEND, value: noop }
+        command:
+          - sh
+          - -c
+          - |
+            mkdir -p /tmp/run && chmod 700 /tmp/run
+            for i in 0 1 2 3; do amixer -q -c "$CARD" sset "IEC958,$i" on; done
+            exec cage -- chromium --kiosk --ozone-platform=wayland --ignore-gpu-blocklist \
+              --autoplay-policy=no-user-gesture-required --user-data-dir=/data/profile \
+              --alsa-output-device="plughw:CARD=$CARD,DEV=$PCM" "$URL"
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: encode, namespace: tv }
+spec:
+  template:
+    priority: idle              # only spare cycles, and a twentieth of a CPU while the TV is full screen
+    yieldTo: { seat: tv-seat0, when: [fullscreen] }
+    containers: [{ name: run, image: "registry.example/batch/encode@sha256:<digest>", resources: { memory: 2Gi } }]
+```
+
+The seat's sound card is a Device with its playback PCM nodes (`/dev/snd/pcmC1D3p`, one per
+output), so the claim gives the container the sound as well as the screen. `userNamespaces: true`
+costs something (see [workloads](workloads.md#what-a-container-is-given)): a browser's sandbox
+reaches kernel code a plain user never calls, which is why the seat has a namespace to itself.
+Not tried: this form, with a user that is not root; the first recipe on a spare PC (a GTX 1060)
+and on a Ryzen's GPU ran as root with `--no-sandbox`, and that is what these notes come from.
+
+- **Memory only.** A container's `resources.cpu` is a hard `cpu.max`, and drawing in software
+  uses every core. The seat's `reserve` is the browser's guarantee; a Workload beside it that must
+  stay out of the way is `priority: idle` with `yieldTo` (the second Workload).
+- **The screen's mode.** An LG TV prefers 3840x2160 at 30 Hz and offers 4K at 60 Hz only with
+  HDMI Ultra HD Deep Colour on for that input. Pick 1080p at 60 Hz (`wlr-randr --output NAME
+  --mode 1920x1080@60Hz` in cage) where drawing is in software.
+- **Sound.** NVIDIA's HDMI sound starts with its IEC958 switches off (`amixer sset IEC958,0
+  on`, up to `,3`). The output PCM is the one whose ELD control (`iface=PCM,name=ELD,device=N`) is
+  not empty, which shows once the compositor has set the mode (`amixer cget` splits the jack
+  control's name at its comma, so ask for the ELD). A container does not see `/proc/asound`
+  (masked): read `/dev/snd/pcmC*D*p` and ask `amixer`.
+- **nouveau.** On Pascal it has no reclocking and no video decode: 4K and HEVC play better on a
+  GPU with VAAPI (a Ryzen's Radeon 780M). With the firmware built in, cage needs no `WLR_RENDERER`;
+  Chromium needs `--ignore-gpu-blocklist` on nouveau.
+- **The image.** It comes from a registry (kith reaches a plain-HTTP registry only on the same
+  machine), or from a stock Alpine as above, with `apk add` into the Volume so the next start
+  has the packages.
+- **`status.activity`.** kithd sets it: `fullscreen` while the HDMI sound plays, so `encode`
+  drops to a twentieth of a CPU as a film starts and returns about ten seconds after it stops (a
+  session may say better with a POST, as above). A seat with no sound card is judged by its
+  inputs only.
+
 ### Virtual machines
 
 A template's `vms` are virtual machines, beside or instead of its `containers` and `exec` units,
@@ -230,8 +366,11 @@ spec:
   `size` big, if the file is missing; it never resizes or overwrites one that exists. A node
   without the Volume is not given the machine: it says why in the unit's note. When the Volume
   is handed over to another replica, the machine follows it and starts from the same image. Keep
-  one replica of the machine, and mount the Volume nowhere else: a container that shares its
-  directory could swap the image for a link between kithd's check and the hypervisor's open.
+  one replica of the machine. The hypervisor opens kithd's own hard link to the image (in
+  `<state>/vm-images`, which no container mounts, made at every start), so a container that
+  shares the Volume cannot swap the image for a link to a node's file. A Volume on another file
+  system than the state directory's, and an encrypted Volume, holds no machine's disk: the unit's
+  note says so and the machine does not start.
 - kithd supervises the hypervisor; the serial console (`console=ttyS0`) is the unit's log: `kith
   logs Workload/windows --unit machine`. `hypervisor: qemu` (default, with KVM) or
   `cloudHypervisor`; the node needs `qemu-system-x86_64` (`-aarch64` on arm64) or

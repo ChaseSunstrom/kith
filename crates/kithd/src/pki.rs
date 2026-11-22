@@ -8,22 +8,31 @@
 // ponytail: the node that holds the CA key also makes each joiner's key pair, and sends
 // it back over the pinned TLS channel. A signing request would keep the key on the
 // joiner, but reading one needs an X.509 parser nothing else uses; the CA node can mint
-// any certificate anyway. Certificates last ten years: there is no renewal yet. (A
-// Workload's pod's lasts two hours, for a key its node made: `workload_identity`.)
+// any certificate anyway. Certificates last ten years, and a node asks for a new one for its
+// own key at under a third of that (`renew`); the ten years are not shortened. (A Workload's
+// pod's lasts two hours, for a key its node made: `workload_identity`.) The dates of a
+// certificate are read by hand (`validity`): the one parser that would do it is a dev
+// dependency of rcgen's, and the walk to them is a few lines.
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, CidrSubnet, DnType, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose, NameConstraints,
 };
 use ring::rand::SecureRandom;
-use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::server::WebPkiClientVerifier;
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use rustls::sign::{CertifiedKey, SigningKey};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig,
+    SignatureScheme,
+};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The name every node certificate is valid for.
@@ -44,6 +53,9 @@ const WORKLOAD_SUFFIX: &str = ".workload.kith";
 const ON_SUFFIX: &str = ".on.kith";
 /// How long a Workload's certificate lasts: it is made again at half.
 pub const WORKLOAD_LIFE: Duration = Duration::from_secs(2 * 3600);
+/// How long a node's certificate lasts when it is made, or made again: ten years. (One made
+/// before dates are written by `issue` reads as ten years too, whatever its `notBefore`.)
+pub const NODE_LIFE: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 /// A P-256 public key's SubjectPublicKeyInfo (DER) up to its point, as `KeyPair::generate`
 /// makes them: the one kind of key a node may send for a Workload's certificate.
 pub(crate) const P256_SPKI: [u8; 26] = [
@@ -62,6 +74,14 @@ impl rcgen::PublicKeyData for NodeKey<'_> {
         &rcgen::PKCS_ECDSA_P256_SHA256
     }
 }
+/// The point of the P-256 key `public` (SubjectPublicKeyInfo, DER), as `KeyPair::generate` makes them.
+fn p256_point(public: &[u8]) -> Fallible<&[u8]> {
+    let point = public
+        .strip_prefix(&P256_SPKI)
+        .filter(|point| point.len() == 65 && point[0] == 4);
+    point.ok_or("the key is not a P-256 public key".into())
+}
+
 const TOKEN_LIFE: Duration = Duration::from_secs(3600);
 
 type Fallible<T> = Result<T, String>;
@@ -108,17 +128,131 @@ fn ca_params() -> CertificateParams {
     params
 }
 
+/// The longest a host certificate may last.
+const HOST_LIFE_MAX: Duration = Duration::from_secs(90 * 86_400);
+
+/// `host` is a name the cluster CA will sign a server certificate for: two or more labels of
+/// lowercase letters, digits and `-` (so no wildcard, `_` or space), the last not all digits (an
+/// address), and not `kith` or under it (a node's or an Identity's name must not be had by a host).
+fn host_name(host: &str) -> Fallible<()> {
+    let label = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    let last = host.rsplit('.').next().unwrap_or_default();
+    let fine = host.len() <= 253
+        && host.contains('.')
+        && host.split('.').all(label)
+        && !last.bytes().all(|b| b.is_ascii_digit())
+        && last != "kith";
+    match fine {
+        true => Ok(()),
+        false => Err(format!(
+            "`{host}` is not a name for a host certificate: lowercase labels of a-z, 0-9 and `-`, two or more, not an address, not under `kith`"
+        )
+        .into()),
+    }
+}
+
 /// The cluster's certificate authority: only a node that holds its key can admit nodes.
 pub struct Ca {
     key: KeyPair,
     pub cert: String,
+    /// Where the LAN CA's files go (`keep_in`).
+    dir: Option<std::path::PathBuf>,
+    lan: Mutex<Option<Arc<LanCa>>>,
+}
+
+/// The certificate authority for names only a LAN knows (`issuer: cluster`): a key of its own,
+/// that signs no node, Identity or Workload and that no mesh or Workload trusts, and a certificate
+/// that holds it to the cluster's LAN domains (X.509 name constraints). That certificate, and not
+/// the cluster's, is the one a phone or laptop is given (`kith ca export`).
+pub struct LanCa {
+    key: KeyPair,
+    pub cert: String,
+    domains: Vec<String>,
+}
+
+/// The LAN CA's certificate: constrained to `domains` and, whatever they are, kept out of the
+/// zones the cluster answers for itself (`cluster.local` is under `local`).
+fn lan_ca_params(domains: &[String]) -> CertificateParams {
+    let dns = |names: Vec<&str>| {
+        names
+            .into_iter()
+            .map(|d| GeneralSubtree::DnsName(d.to_string()))
+            .collect()
+    };
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, "kith LAN CA");
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    params.not_after = rcgen::date_time_ymd(year_in(10), 1, 1);
+    // No address either: a DNS constraint holds no IP SAN, so every address is excluded.
+    let mut excluded: Vec<GeneralSubtree> = dns(kith_api::kinds::RESERVED_ZONES.to_vec());
+    excluded.push(GeneralSubtree::IpAddress(CidrSubnet::V4([0; 4], [0; 4])));
+    excluded.push(GeneralSubtree::IpAddress(CidrSubnet::V6([0; 16], [0; 16])));
+    params.name_constraints = Some(NameConstraints {
+        permitted_subtrees: dns(domains.iter().map(String::as_str).collect()),
+        excluded_subtrees: excluded,
+    });
+    // A serial of the domains, as well as the key's (rcgen's default is of the key alone): the
+    // certificate made again for other domains is another certificate to a device, which a
+    // browser imports beside the old one. At most 20 octets, positive.
+    let hash = ring::digest::digest(&ring::digest::SHA256, domains.join(",").as_bytes());
+    let mut serial = hash.as_ref()[..20].to_vec();
+    serial[0] &= 0x7f;
+    params.serial_number = Some(serial.into());
+    params
+}
+
+impl LanCa {
+    /// A server certificate for the LAN name `host` and a new key, as (certificate, key): good
+    /// from a minute before `now` (seconds since 1970) for `life`, and for serving TLS only. It
+    /// names no node, Identity or Workload. A short life is the only revocation there is. Not
+    /// for a name `cluster_host_refused` refuses (the one rule the apply of a Service reads too).
+    pub fn issue_host(&self, host: &str, now: u64, life: Duration) -> Fallible<(String, String)> {
+        host_name(host)?;
+        if let Some(refused) = kith_api::kinds::cluster_host_refused(host, Some(&self.domains)) {
+            return Err(refused);
+        }
+        self.sign_host(host, now, life)
+    }
+
+    fn sign_host(&self, host: &str, now: u64, life: Duration) -> Fallible<(String, String)> {
+        if life.is_zero() || life > HOST_LIFE_MAX {
+            return Err("a host certificate lasts more than 0 and at most 90 days".into());
+        }
+        let mut params = tls("naming the certificate", CertificateParams::new(vec![host.to_string()]))?;
+        // A Common Name is at most 64 characters (the name is in the SAN whatever it is).
+        if host.len() <= 64 {
+            params.distinguished_name.push(DnType::CommonName, host);
+        }
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.use_authority_key_identifier_extension = true;
+        // A minute before, for a clock behind the CA holder's.
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now.saturating_sub(60));
+        params.not_after = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now) + life;
+        let key = tls("making the key", KeyPair::generate())?;
+        let issuer = Issuer::new(lan_ca_params(&self.domains), &self.key);
+        let cert = tls("signing the certificate", params.signed_by(&key, &issuer))?;
+        Ok((cert.pem(), key.serialize_pem()))
+    }
 }
 
 impl Ca {
     pub fn create() -> Fallible<Ca> {
         let key = tls("making the CA key", KeyPair::generate())?;
         let cert = tls("making the CA certificate", ca_params().self_signed(&key))?.pem();
-        Ok(Ca { key, cert })
+        Ok(Ca {
+            key,
+            cert,
+            dir: None,
+            lan: Mutex::new(None),
+        })
     }
 
     /// A key pair and certificate for the node `name`, as (certificate, key).
@@ -158,10 +292,7 @@ impl Ca {
         public: &[u8],
         now: u64,
     ) -> Fallible<String> {
-        let point = public
-            .strip_prefix(&P256_SPKI)
-            .filter(|point| point.len() == 65 && point[0] == 4);
-        let point = point.ok_or("the key is not a P-256 public key")?;
+        let point = p256_point(public)?;
         for part in [namespace, name, node] {
             valid_name(part)?;
         }
@@ -174,6 +305,105 @@ impl Ca {
         // A minute before, for a clock behind the CA holder's.
         params.not_before = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now.saturating_sub(60));
         params.not_after = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now) + WORKLOAD_LIFE;
+        let issuer = Issuer::new(ca_params(), &self.key);
+        Ok(tls("signing the certificate", params.signed_by(&NodeKey(point), &issuer))?.pem())
+    }
+
+    /// Where the LAN CA's files are kept (beside the CA key). Without it the LAN CA lives as long
+    /// as this `Ca` does.
+    pub fn keep_in(mut self, dir: &Path) -> Ca {
+        self.dir = Some(dir.to_path_buf());
+        self
+    }
+
+    /// The LAN CA for the domains `named` (a Cluster's `spec.lanDomains`; none is the defaults):
+    /// made on first use with a key of its own, which is kept like this CA's and goes nowhere,
+    /// and a certificate that holds it to those domains. Asked for other domains, it is made
+    /// again for them, with the same key.
+    pub fn lan(&self, named: &[String]) -> Fallible<Arc<LanCa>> {
+        let mut domains = kith_api::kinds::lan_domains(named);
+        domains.sort();
+        domains.dedup();
+        let mut held = self.lan.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lan) = held.as_ref().filter(|lan| lan.domains == domains) {
+            return Ok(lan.clone());
+        }
+        // A file that is not there is none; one that is there and cannot be read is an error (a new
+        // key made over it would end the CA every device trusts).
+        let read = |file: &str| -> Fallible<Option<String>> {
+            let Some(dir) = &self.dir else { return Ok(None) };
+            match std::fs::read_to_string(dir.join(file)) {
+                Ok(text) => Ok(Some(text)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("reading {file}: {e}").into()),
+            }
+        };
+        let key_pem = match held.as_ref() {
+            Some(lan) => Some(lan.key.serialize_pem()),
+            None => read("lan-ca.key")?,
+        };
+        let key = match &key_pem {
+            Some(pem) => tls("reading the LAN CA key", KeyPair::from_pem(pem))?,
+            None => tls("making the LAN CA key", KeyPair::generate())?,
+        };
+        // The certificate kept, if it was made for these domains: what was exported stays what it was.
+        let kept = match read("lan-ca.domains")? {
+            Some(kept) if kept.trim() == domains.join(",") && key_pem.is_some() => read("lan-ca.crt")?,
+            _ => None,
+        };
+        let cert = match kept {
+            Some(cert) => cert,
+            None => {
+                let cert = tls(
+                    "making the LAN CA certificate",
+                    lan_ca_params(&domains).self_signed(&key),
+                )?
+                .pem();
+                if let Some(dir) = &self.dir {
+                    let made = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+                    tls(&format!("creating {}", dir.display()), made)?;
+                    // Whole or not at all, the key only when it is new (one that was read stays as it is).
+                    let keep = |file: &str, text: &str| {
+                        let path = dir.join(file);
+                        tls(
+                            &format!("writing {}", path.display()),
+                            write_whole(&path, text.as_bytes()),
+                        )
+                    };
+                    if key_pem.is_none() {
+                        keep("lan-ca.key", &key.serialize_pem())?;
+                    }
+                    keep("lan-ca.crt", &cert)?;
+                    // Last: it says the certificate is for these domains.
+                    keep("lan-ca.domains", &domains.join(","))?;
+                }
+                cert
+            }
+        };
+        let lan = Arc::new(LanCa { key, cert, domains });
+        *held = Some(lan.clone());
+        Ok(lan)
+    }
+
+    /// The certificate of the node `name` (born by the index `born`, if its certificate says) made
+    /// again for the same key `public` (SubjectPublicKeyInfo, DER, P-256): so what the store
+    /// keeps of the key, and every token and pin made of it, still holds. Good from a minute
+    /// before `now` (seconds since 1970) for `life`.
+    pub fn renew_node(
+        &self,
+        name: &str,
+        born: Option<u64>,
+        public: &[u8],
+        now: u64,
+        life: Duration,
+    ) -> Fallible<String> {
+        let point = p256_point(public)?;
+        let mut names = vec![format!("{name}{NODE_SUFFIX}"), ANY_NODE.into()];
+        names.extend(born.map(|born| format!("{born}{BORN_SUFFIX}")));
+        let both = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
+        let mut params = self.params(name, names, both)?;
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now.saturating_sub(60));
+        params.not_after = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now) + life;
         let issuer = Issuer::new(ca_params(), &self.key);
         Ok(tls("signing the certificate", params.signed_by(&NodeKey(point), &issuer))?.pem())
     }
@@ -231,6 +461,7 @@ pub fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .write(true)
         .create(true)
         .truncate(true)
+        .mode(0o600)
         .open(&new)?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -262,6 +493,8 @@ pub fn load(dir: &Path) -> Fallible<Option<(Identity, Option<Ca>)>> {
         true => Some(Ca {
             key: tls("reading the CA key", KeyPair::from_pem(&read("ca.key")?))?,
             cert: identity.ca.clone(),
+            dir: Some(dir.to_path_buf()),
+            lan: Mutex::new(None),
         }),
         false => None,
     };
@@ -323,22 +556,239 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 }
 
 /// TLS for the node API: a client may come without a certificate (to join), and one it
-/// does present must be from the cluster CA.
+/// does present must be from the cluster CA. (Tests: kithd serves [`served`] with its [`Live`].)
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn server_config(identity: &Identity) -> Fallible<Arc<ServerConfig>> {
-    let verifier = WebPkiClientVerifier::builder_with_provider(roots(&identity.ca)?, provider())
+    served(&identity.ca, Live::new(identity)?, None)
+}
+
+/// Says whether the certificate of a client has been revoked: asked of each one that is
+/// verified, in the handshake, so a revoked one is refused before a request is sent.
+pub type Revoked = Arc<dyn Fn(&CertificateDer<'_>) -> bool + Send + Sync>;
+
+/// [`server_config`] showing `live` (so a certificate made again is shown at the next handshake),
+/// and refusing in the handshake a client certificate `revoked` says is.
+pub fn served(ca: &str, live: Arc<Live>, revoked: Option<Revoked>) -> Fallible<Arc<ServerConfig>> {
+    let verifier = WebPkiClientVerifier::builder_with_provider(roots(ca)?, provider())
         .allow_unauthenticated()
         .build();
-    let key = tls(
-        "reading the node key",
-        PrivateKeyDer::from_pem_slice(identity.key.as_bytes()),
-    )?;
-    let config = tls(
+    let verifier = Refusing(tls("setting up TLS", verifier)?, revoked);
+    let mut config = tls(
         "setting up TLS",
         ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions(),
     )?
-    .with_client_cert_verifier(tls("setting up TLS", verifier)?)
-    .with_single_cert(certs(&identity.cert)?, key);
-    Ok(Arc::new(tls("setting up TLS", config)?))
+    .with_client_cert_verifier(Arc::new(verifier))
+    .with_cert_resolver(live);
+    // No sessions to resume (and so no tickets sent): a resumed connection takes the client's
+    // certificate from its session and does not verify it again, so a certificate revoked after
+    // its first handshake would go on getting in. (The server's default is a cache of 256.)
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
+    Ok(Arc::new(config))
+}
+
+/// The CA's own check of a client certificate, and then the node's: nothing the CA signed is
+/// let in once `Revoked` says it is not good.
+struct Refusing(Arc<dyn ClientCertVerifier>, Option<Revoked>);
+
+impl std::fmt::Debug for Refusing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Refusing").field("revoked", &self.1.is_some()).finish()
+    }
+}
+
+impl ClientCertVerifier for Refusing {
+    fn offer_client_auth(&self) -> bool {
+        self.0.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.0.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.0.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let verified = self.0.verify_client_cert(end_entity, intermediates, now)?;
+        match &self.1 {
+            Some(revoked) if revoked(end_entity) => Err(rustls::Error::InvalidCertificate(CertificateError::Revoked)),
+            _ => Ok(verified),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_verify_schemes()
+    }
+}
+
+/// The certificate a node shows, as a server and as a client, and the key it signs with.
+/// Both configurations hold the one of these, so a certificate made again is shown at the
+/// next handshake, with no restart: connections already open keep the one they began with.
+#[derive(Debug)]
+pub struct Live {
+    key: Arc<dyn SigningKey>,
+    shown: RwLock<Arc<CertifiedKey>>,
+}
+
+/// The chain `pem` with `key`, if the key is the one the leaf is for.
+fn pair(key: &Arc<dyn SigningKey>, pem: &str) -> Fallible<Arc<CertifiedKey>> {
+    let certified = CertifiedKey::new(certs(pem)?, key.clone());
+    tls("a certificate and its key", certified.keys_match())?;
+    Ok(Arc::new(certified))
+}
+
+impl Live {
+    pub fn new(me: &Identity) -> Fallible<Arc<Live>> {
+        let key = tls("reading the node key", PrivateKeyDer::from_pem_slice(me.key.as_bytes()))?;
+        let key = tls("reading the node key", provider().key_provider.load_private_key(key))?;
+        let shown = RwLock::new(pair(&key, &me.cert)?);
+        Ok(Arc::new(Live { key, shown }))
+    }
+
+    pub fn current(&self) -> Arc<CertifiedKey> {
+        self.shown
+            .read()
+            .expect("nothing panics holding the certificate")
+            .clone()
+    }
+
+    /// Show the certificate `pem` from now on. Only one for the key held is taken.
+    pub fn swap(&self, pem: &str) -> Fallible<()> {
+        self.show(self.parse(pem)?);
+        Ok(())
+    }
+
+    /// The certificate `pem`, if it is for the key held: to be kept on disk before it is shown.
+    pub fn parse(&self, pem: &str) -> Fallible<Arc<CertifiedKey>> {
+        pair(&self.key, pem)
+    }
+
+    pub fn show(&self, new: Arc<CertifiedKey>) {
+        *self.shown.write().expect("nothing panics holding the certificate") = new;
+    }
+}
+
+impl ResolvesServerCert for Live {
+    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.current())
+    }
+}
+
+impl ResolvesClientCert for Live {
+    fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        Some(self.current())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+/// The `notBefore` and `notAfter` of a certificate (DER), in seconds since 1970. Read by
+/// walking the DER to them (certificate, TBS, version, serial, algorithm, issuer, validity),
+/// as no parser here gives them; none if it does not read as one.
+pub fn validity(cert: &[u8]) -> Option<(u64, u64)> {
+    /// One DER element: its tag, its content and what follows it.
+    fn element(der: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let (&tag, der) = der.split_first()?;
+        let (&first, der) = der.split_first()?;
+        let (len, der) = match first {
+            0..=0x7f => (first as usize, der),
+            0x81..=0x84 => {
+                let width = (first & 0x7f) as usize;
+                let (len, der) = der.split_at_checked(width)?;
+                (len.iter().fold(0, |len, byte| len << 8 | *byte as usize), der)
+            }
+            _ => return None,
+        };
+        let (content, rest) = der.split_at_checked(len)?;
+        Some((tag, content, rest))
+    }
+    /// A UTCTime (`YYMMDDHHMMSSZ`, 1950 to 2049) or a GeneralizedTime (`YYYYMMDDHHMMSSZ`).
+    fn time(der: &[u8]) -> Option<(u64, &[u8])> {
+        let (tag, text, rest) = element(der)?;
+        let digits = match (tag, text) {
+            (0x17, [digits @ .., b'Z']) if digits.len() == 12 => digits,
+            (0x18, [digits @ .., b'Z']) if digits.len() == 14 => digits,
+            _ => return None,
+        };
+        let number = |at: usize, width: usize| -> Option<i64> {
+            digits[at..at + width]
+                .iter()
+                .try_fold(0i64, |n, b| b.is_ascii_digit().then(|| n * 10 + (b - b'0') as i64))
+        };
+        let (year, at) = match tag {
+            0x17 => (number(0, 2)?, 2),
+            _ => (number(0, 4)?, 4),
+        };
+        let year = if tag == 0x17 {
+            year + if year >= 50 { 1900 } else { 2000 }
+        } else {
+            year
+        };
+        let (month, day) = (number(at, 2)?, number(at + 2, 2)?);
+        let (hour, minute, second) = (number(at + 4, 2)?, number(at + 6, 2)?, number(at + 8, 2)?);
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        // Days from 1970 by the civil calendar (March first, so February's end is the year's).
+        let y = if month <= 2 { year - 1 } else { year };
+        let era = y.div_euclid(400);
+        let year_of_era = y - era * 400;
+        let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        let days = era * 146_097 + day_of_era - 719_468;
+        let seconds = days * 86_400 + hour * 3600 + minute * 60 + second;
+        Some((u64::try_from(seconds).ok()?, rest))
+    }
+    let (_, certificate, _) = element(cert)?;
+    let (_, tbs, _) = element(certificate)?;
+    // (A version is [0] and left out in v1; then serial, signature algorithm and issuer.)
+    let mut rest = tbs;
+    if let (0xa0, _, after) = element(rest)? {
+        rest = after;
+    }
+    for _ in 0..3 {
+        rest = element(rest)?.2;
+    }
+    let (_, dates, _) = element(rest)?;
+    let (from, rest) = time(dates)?;
+    let (to, _) = time(rest)?;
+    Some((from, to))
+}
+
+/// Whether a certificate good from `from` to `to` (seconds since 1970) is to be made again at
+/// `now`: it has under a third of its life left, or none. Its life is at most [`NODE_LIFE`]:
+/// a certificate made before its dates were written down began in 1975 and ends on the first
+/// of January ten years on, and counts as ten years, not as fifty.
+pub fn renewal_due(from: u64, to: u64, now: u64) -> bool {
+    let life = to.saturating_sub(from).min(NODE_LIFE.as_secs());
+    to.saturating_sub(now) * 3 < life
 }
 
 /// TLS for the node's own registry, for this start only: a certificate for `localhost`
@@ -491,9 +941,10 @@ impl ServerCertVerifier for AnyNode {
     }
 }
 
-/// TLS for calling a node: its certificate must be from `ca`. With `me`, ours is presented.
-/// With `pin`, only the node it names is called, whoever answers at the address.
-pub fn client_config(ca: &str, me: Option<&Identity>, pin: Option<Held>) -> Fallible<ClientConfig> {
+/// TLS for calling a node: its certificate must be from `ca`. With `me`, ours is presented (the
+/// one it holds at each handshake). With `pin`, only the node it names is called, whoever
+/// answers at the address.
+pub fn client_config(ca: &str, me: Option<Arc<Live>>, pin: Option<Held>) -> Fallible<ClientConfig> {
     let verifier = WebPkiServerVerifier::builder_with_provider(roots(ca)?, provider()).build();
     let builder = tls(
         "setting up TLS",
@@ -501,13 +952,10 @@ pub fn client_config(ca: &str, me: Option<&Identity>, pin: Option<Held>) -> Fall
     )?
     .dangerous()
     .with_custom_certificate_verifier(Arc::new(AnyNode(tls("setting up TLS", verifier)?, pin)));
-    match me {
-        None => Ok(builder.with_no_client_auth()),
-        Some(me) => {
-            let key = tls("reading the node key", PrivateKeyDer::from_pem_slice(me.key.as_bytes()))?;
-            tls("setting up TLS", builder.with_client_auth_cert(certs(&me.cert)?, key))
-        }
-    }
+    Ok(match me {
+        None => builder.with_no_client_auth(),
+        Some(live) => builder.with_client_cert_resolver(live),
+    })
 }
 
 /// TLS for asking the node that made a join token (`maker`: its name and key print) for the
@@ -760,7 +1208,7 @@ mod tests {
             key,
         };
         server_config(&me).unwrap();
-        client_config(&ca.cert, Some(&me), None).unwrap();
+        client_config(&ca.cert, Some(Live::new(&me).unwrap()), None).unwrap();
         // The cluster's verifier takes it for `kith`; another cluster's CA does not.
         let verify = |trusted: &str| {
             let verifier = WebPkiServerVerifier::builder_with_provider(roots(trusted).unwrap(), provider());
@@ -944,5 +1392,552 @@ mod tests {
         // Into a directory that is not there: an error, and nothing made.
         assert!(write_whole(&dir.join("gone/marker.json"), b"x").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Does `der`, shown for `host` at `at` (seconds since 1970), verify against the trusted `root`?
+    fn verifies(root: &str, der: &CertificateDer<'_>, host: &str, at: u64) -> bool {
+        let verifier = WebPkiServerVerifier::builder_with_provider(roots(root).unwrap(), provider());
+        let name = ServerName::try_from(host.to_string()).unwrap();
+        let at = UnixTime::since_unix_epoch(Duration::from_secs(at));
+        verifier
+            .build()
+            .unwrap()
+            .verify_server_cert(der, &[], &name, &[], at)
+            .is_ok()
+    }
+
+    /// The LAN CA signs a server certificate for a LAN name, for the life asked and no longer: a
+    /// client that trusts the LAN CA takes it for that name only, in that time only, and the
+    /// cluster's own root, which the mesh and every Workload trust, does not vouch for it. It is no
+    /// node's, no Identity's, and the names the LAN CA must not vouch for (the cluster's own, a
+    /// wildcard, an address, a name outside the LAN domains) are not signed.
+    #[test]
+    fn pki_issue_host_signs_a_server_certificate_for_the_name_for_the_life_asked() {
+        let ca = Ca::create().unwrap();
+        let lan = ca.lan(&[]).unwrap();
+        let (now, life) = (1_900_000_000, Duration::from_secs(600));
+        let (cert, key) = lan.issue_host("nas.home.lan", now, life).unwrap();
+        certified(&cert, &key, "nas.home.lan").unwrap();
+        let der = certs(&cert).unwrap().remove(0);
+        assert!(
+            subject_of(&der).is_none(),
+            "a host's certificate names no node, Identity or Workload"
+        );
+        // Good for its name, from a minute before it was made until the life is out.
+        assert!(verifies(&lan.cert, &der, "nas.home.lan", now));
+        assert!(verifies(&lan.cert, &der, "nas.home.lan", now - 30));
+        assert!(verifies(&lan.cert, &der, "nas.home.lan", now + 599));
+        assert!(!verifies(&lan.cert, &der, "nas.home.lan", now + 601));
+        assert!(!verifies(&lan.cert, &der, "nas.home.lan", now - 3600));
+        // For no other name, and by no other CA: not the cluster's root either.
+        assert!(!verifies(&lan.cert, &der, "other.home.lan", now));
+        assert!(!verifies(&ca.cert, &der, "nas.home.lan", now));
+        assert!(!verifies(&Ca::create().unwrap().cert, &der, "nas.home.lan", now));
+        assert_ne!(lan.cert, ca.cert);
+        // Never as a client or as a CA of its own: a server certificate and nothing more.
+        let as_client = WebPkiClientVerifier::builder_with_provider(roots(&lan.cert).unwrap(), provider());
+        let at = UnixTime::since_unix_epoch(Duration::from_secs(now));
+        assert!(as_client.build().unwrap().verify_client_cert(&der, &[], at).is_err());
+        for refused in [
+            "*.home.lan",
+            "kith",
+            "x.node.kith",
+            "a.kith",
+            "10.0.0.7",
+            "Nas.home.lan",
+            "a_b.lan",
+            "-a.lan",
+            "a..lan",
+            "",
+            "nas",
+            "nas.example.com",
+            "a.cluster.local",
+            "cluster.local",
+        ] {
+            assert!(lan.issue_host(refused, now, life).is_err(), "{refused:?} is signed");
+        }
+        assert!(lan.issue_host("nas.home.arpa", now, life).is_ok());
+        assert!(lan.issue_host("a.b.internal", now, life).is_ok());
+        assert!(lan.issue_host("printer.local", now, life).is_ok());
+        assert!(
+            lan.issue_host("nas.lan", now, Duration::from_secs(91 * 86_400))
+                .is_err()
+        );
+    }
+
+    /// What a phone is given is the LAN CA's certificate, and it holds the CA to the cluster's LAN
+    /// domains by X.509 name constraints: a certificate the LAN CA's own key signed for another
+    /// name does not verify, whoever signed it, and neither does one for the cluster's own zones.
+    #[test]
+    fn the_lan_ca_certificate_carries_the_name_constraints_of_the_lan_domains() {
+        let ca = Ca::create().unwrap();
+        let (now, life) = (1_900_000_000, Duration::from_secs(600));
+        let lan = ca.lan(&[]).unwrap();
+        assert!(!lan.cert.contains("PRIVATE KEY"));
+        let signed = |lan: &LanCa, host: &str| {
+            let (cert, _) = lan.sign_host(host, now, life).unwrap();
+            certs(&cert).unwrap().remove(0)
+        };
+        for host in ["nas.home.arpa", "nas.lan", "a.b.internal", "printer.local", "lan"] {
+            assert!(verifies(&lan.cert, &signed(&lan, host), host, now), "{host}");
+        }
+        for host in [
+            "www.example.com",
+            "nas.lan.example.com",
+            "nas.kith",
+            "x.node.kith",
+            "kith",
+            "nas.cluster.local",
+            "cluster.local",
+            "xlan",
+        ] {
+            assert!(!verifies(&lan.cert, &signed(&lan, host), host, now), "{host}");
+        }
+        // The domains are the Cluster's: asked for others, the same key signs under those.
+        let home = ca.lan(&["Home.Arpa".to_string()]).unwrap();
+        assert_ne!(home.cert, lan.cert);
+        assert!(verifies(
+            &home.cert,
+            &signed(&home, "nas.home.arpa"),
+            "nas.home.arpa",
+            now
+        ));
+        assert!(!verifies(&home.cert, &signed(&home, "nas.lan"), "nas.lan", now));
+        assert!(home.issue_host("nas.lan", now, life).is_err());
+        assert!(home.issue_host("nas.home.arpa", now, life).is_ok());
+        // The same domains in any order or case are the same CA.
+        let again = ca.lan(&["home.arpa".to_string()]).unwrap();
+        assert!(Arc::ptr_eq(&home, &again));
+    }
+
+    /// The LAN CA is made once, with a key that stays in the node's PKI directory (read by the
+    /// owner only) and a certificate that is what it was when the node starts again: what was
+    /// exported keeps being the CA.
+    #[test]
+    fn the_lan_ca_is_kept_beside_the_cluster_ca_key_and_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("kith-lan-ca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let made = Ca::create().unwrap().keep_in(&dir);
+        let first = made.lan(&[]).unwrap();
+        let mode = |file: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(dir.join(file)).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!((mode("lan-ca.key"), mode("lan-ca.crt")), (0o600, 0o600));
+        let restarted = Ca::create().unwrap().keep_in(&dir);
+        let second = restarted.lan(&[]).unwrap();
+        assert_eq!(first.cert, second.cert);
+        let (now, life) = (1_900_000_000, Duration::from_secs(600));
+        let (cert, _) = first.issue_host("nas.lan", now, life).unwrap();
+        let der = certs(&cert).unwrap().remove(0);
+        assert!(verifies(&second.cert, &der, "nas.lan", now));
+        // Other domains: the certificate is made again, for the same key.
+        let other = restarted.lan(&["home.arpa".to_string()]).unwrap();
+        assert_ne!(other.cert, first.cert);
+        let (cert, _) = other.issue_host("nas.home.arpa", now, life).unwrap();
+        let der = certs(&cert).unwrap().remove(0);
+        assert!(verifies(&other.cert, &der, "nas.home.arpa", now));
+        // (Same key: what the first made for `lan` is no longer vouched for by the new certificate.)
+        let (cert, _) = first.issue_host("nas.lan", now, life).unwrap();
+        assert!(!verifies(&other.cert, &certs(&cert).unwrap().remove(0), "nas.lan", now));
+        let again = Ca::create()
+            .unwrap()
+            .keep_in(&dir)
+            .lan(&["home.arpa".to_string()])
+            .unwrap();
+        assert_eq!(again.cert, other.cert);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A key file that is there but cannot be read is an error, not "no key": a new key made over
+    /// it would be the end of the CA every device was given.
+    #[test]
+    fn an_unreadable_lan_ca_key_is_an_error_and_is_not_made_again() {
+        let dir = std::env::temp_dir().join(format!("kith-lan-ca-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A directory in its place: reading it fails with EISDIR (whoever runs the test), not NotFound.
+        std::fs::create_dir_all(dir.join("lan-ca.key")).unwrap();
+        let ca = Ca::create().unwrap().keep_in(&dir);
+        assert!(ca.lan(&[]).is_err());
+        assert!(dir.join("lan-ca.key").is_dir(), "the key's place is left as it was");
+        assert!(!dir.join("lan-ca.crt").exists());
+        assert!(!dir.join("lan-ca.domains").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The certificate made again for other domains is another certificate to a device (another
+    /// serial: a browser refuses to import a second one with the same issuer and serial), and a
+    /// key that was read is not written again.
+    #[test]
+    fn another_set_of_domains_makes_a_certificate_with_another_serial() {
+        // Certificate ::= SEQUENCE { tbs SEQUENCE { [0] version, INTEGER serial, .. }, .. }
+        let serial = |cert: &str| {
+            let der = certs(cert).unwrap().remove(0);
+            let content = |der: &[u8]| -> (u8, Vec<u8>, usize) {
+                let (len, head) = match der[1] {
+                    n @ 0..=0x7f => (n as usize, 2),
+                    n => (
+                        der[2..2 + (n & 0x7f) as usize]
+                            .iter()
+                            .fold(0, |l, b| l << 8 | *b as usize),
+                        2 + (n & 0x7f) as usize,
+                    ),
+                };
+                (der[0], der[head..head + len].to_vec(), head + len)
+            };
+            let (tag, outer, _) = content(&der);
+            assert_eq!(tag, 0x30);
+            let (_, tbs, _) = content(&outer);
+            let (tag, _, skip) = content(&tbs); // the version
+            assert_eq!(tag, 0xa0);
+            let (tag, serial, _) = content(&tbs[skip..]);
+            assert_eq!(tag, 0x02);
+            serial
+        };
+        let dir = std::env::temp_dir().join(format!("kith-lan-ca-serial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ca = Ca::create().unwrap().keep_in(&dir);
+        let lan = ca.lan(&[]).unwrap();
+        let home = ca.lan(&["home.arpa".to_string()]).unwrap();
+        assert_ne!(serial(&lan.cert), serial(&home.cert));
+        assert!(serial(&home.cert).len() <= 20 && serial(&home.cert)[0] & 0x80 == 0);
+        // The same domains, the same serial: made again from the files.
+        let key = std::fs::read(dir.join("lan-ca.key")).unwrap();
+        let modified = std::fs::metadata(dir.join("lan-ca.key")).unwrap().modified().unwrap();
+        let again = Ca::create()
+            .unwrap()
+            .keep_in(&dir)
+            .lan(&["home.arpa".to_string()])
+            .unwrap();
+        assert_eq!(serial(&again.cert), serial(&home.cert));
+        let other = Ca::create().unwrap().keep_in(&dir).lan(&["lan".to_string()]).unwrap();
+        assert_ne!(serial(&other.cert), serial(&home.cert));
+        assert_eq!(std::fs::read(dir.join("lan-ca.key")).unwrap(), key);
+        assert_eq!(
+            std::fs::metadata(dir.join("lan-ca.key")).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(!dir.join("lan-ca.new").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The LAN CA vouches for no address (name constraints do not hold an IP SAN to a DNS
+    /// subtree), and a name longer than a Common Name may be still gets its certificate.
+    #[test]
+    fn the_lan_ca_signs_no_address_and_a_long_name_gets_no_common_name() {
+        let ca = Ca::create().unwrap();
+        let lan = ca.lan(&[]).unwrap();
+        let (now, life) = (1_900_000_000, Duration::from_secs(600));
+        let mut params = CertificateParams::new(vec!["10.0.0.7".to_string(), "fd00::7".to_string()]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.use_authority_key_identifier_extension = true;
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now - 60);
+        params.not_after = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now + 600);
+        let key = KeyPair::generate().unwrap();
+        let issuer = Issuer::new(lan_ca_params(&lan.domains), &lan.key);
+        let der = certs(&params.signed_by(&key, &issuer).unwrap().pem())
+            .unwrap()
+            .remove(0);
+        for address in ["10.0.0.7", "fd00::7"] {
+            let verifier = WebPkiServerVerifier::builder_with_provider(roots(&lan.cert).unwrap(), provider());
+            let name = ServerName::try_from(address).unwrap();
+            let at = UnixTime::since_unix_epoch(Duration::from_secs(now));
+            assert!(
+                verifier
+                    .build()
+                    .unwrap()
+                    .verify_server_cert(&der, &[], &name, &[], at)
+                    .is_err(),
+                "{address}"
+            );
+        }
+        // 81 characters, under the 253 a name may be: a Common Name stops at 64.
+        let long = format!("{}.{}.lan", "a".repeat(38), "b".repeat(38));
+        assert!(long.len() > 64);
+        let (cert, key) = lan.issue_host(&long, now, life).unwrap();
+        certified(&cert, &key, &long).unwrap();
+        assert!(verifies(&lan.cert, &certs(&cert).unwrap().remove(0), &long, now));
+    }
+
+    fn secs() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    #[test]
+    fn a_certificate_is_due_for_renewal_with_under_a_third_of_its_life_left() {
+        let year = 365 * 24 * 3600u64;
+        let (from, to) = (1_000_000_000u64, 1_000_000_000 + 10 * year);
+        assert!(!renewal_due(from, to, from));
+        assert!(!renewal_due(from, to, to - 4 * year));
+        assert!(renewal_due(from, to, to - 3 * year));
+        // One that ended is due too, and no less so for being far past.
+        assert!(renewal_due(from, to, to + 1) && renewal_due(from, to, to + 100 * year));
+        // A short life is judged by its own: a third of an hour is twenty minutes.
+        assert!(!renewal_due(0, 3600, 2300) && renewal_due(0, 3600, 2500));
+        // A certificate made before they were dated at their making began in 1975: its life
+        // counts as the ten years it was meant to have.
+        assert!(!renewal_due(0, 40 * year, 36 * year) && renewal_due(0, 40 * year, 37 * year));
+    }
+
+    #[test]
+    fn a_certificates_dates_are_read_from_it() {
+        let ca = Ca::create().unwrap();
+        let (cert, _) = ca.issue("alpha").unwrap();
+        let der = certs(&cert).unwrap().remove(0);
+        let (from, to) = validity(&der).unwrap();
+        let (now, year) = (secs(), 365 * 24 * 3600);
+        assert!(from < now && to > now + 9 * year && to < now + 11 * year, "{from} {to}");
+        // To the second, in a year before 2050 (UTCTime) and after (GeneralizedTime) alike.
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["x.node.kith".into()]).unwrap();
+        for (year, at) in [(2031, 1_924_992_000), (2051, 2_556_144_000)] {
+            params.not_before = rcgen::date_time_ymd(year, 1, 1);
+            params.not_after = rcgen::date_time_ymd(year + 1, 1, 1);
+            let der = params.clone().self_signed(&key).unwrap();
+            let (from, to) = validity(der.der()).unwrap();
+            assert_eq!((from, to), (at, at + 365 * 24 * 3600), "{year}");
+        }
+        assert_eq!(validity(&CertificateDer::from(vec![0x30, 0x00])), None);
+        assert_eq!(validity(&CertificateDer::from(Vec::new())), None);
+    }
+
+    #[test]
+    fn a_node_certificate_is_made_again_for_the_same_key_name_and_birth() {
+        let ca = Ca::create().unwrap();
+        let (cert, _) = ca.issue_born("beta", 41).unwrap();
+        let der = certs(&cert).unwrap().remove(0);
+        let Some(Subject::Node(name, public, born)) = subject_of(&der) else {
+            panic!("a node's certificate");
+        };
+        let now = secs();
+        let again = ca
+            .renew_node(&name, born, &public, now, Duration::from_secs(600))
+            .unwrap();
+        let new = certs(&again).unwrap().remove(0);
+        assert_eq!(subject_of(&new), subject_of(&der));
+        assert_eq!(print_of(&again).unwrap(), print_of(&cert).unwrap());
+        // A minute before, for a clock behind; and the life it was asked for.
+        assert_eq!(validity(&new), Some((now - 60, now + 600)));
+        // Good as a node's, to the same checks: for a server and as a client, for its life only.
+        let verifier = WebPkiClientVerifier::builder_with_provider(roots(&ca.cert).unwrap(), provider())
+            .build()
+            .unwrap();
+        let at = |secs| verifier.verify_client_cert(&new, &[], UnixTime::since_unix_epoch(Duration::from_secs(secs)));
+        assert!(at(now + 300).is_ok() && at(now + 700).is_err());
+        let end = webpki::EndEntityCert::try_from(&new).unwrap();
+        let named: Vec<_> = end.valid_dns_names().collect();
+        assert_eq!(named, ["beta.node.kith", "kith", "41.born.kith"]);
+        // A P-256 key, whole, and a name that can be named.
+        let life = Duration::from_secs(60);
+        assert!(ca.renew_node("beta", None, &public[1..], now, life).is_err());
+        assert!(ca.renew_node("Beta", None, &public, now, life).is_err());
+    }
+
+    /// A handshake in memory between `server` and `client`: the certificate the server was
+    /// shown (or why it refused), and the one the client was.
+    async fn shake(
+        server: Arc<ServerConfig>,
+        client: ClientConfig,
+    ) -> (
+        Result<Option<CertificateDer<'static>>, String>,
+        Option<CertificateDer<'static>>,
+    ) {
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let acceptor = tokio_rustls::TlsAcceptor::from(server);
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        // (Each keeps its end open until both are done: the server writes after the client is through.)
+        let serving = async {
+            let stream = acceptor.accept(far).await.map_err(|e| e.to_string())?;
+            Ok((
+                stream.get_ref().1.peer_certificates().and_then(|c| c.first().cloned()),
+                stream,
+            ))
+        };
+        let calling = async {
+            let stream = connector
+                .connect(ServerName::try_from("kith").unwrap(), near)
+                .await
+                .ok()?;
+            Some((stream.get_ref().1.peer_certificates()?.first().cloned(), stream))
+        };
+        let (served, called) = tokio::join!(serving, calling);
+        (served.map(|(cert, _)| cert), called.and_then(|(cert, _)| cert))
+    }
+
+    /// A client that was let in and is revoked after is refused on its next connection, though it
+    /// holds the session of the first to resume: a server that kept sessions would take the
+    /// certificate back from the session and not ask `Revoked` again.
+    #[tokio::test]
+    async fn a_revoked_certificate_cannot_resume_a_session() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ca = Ca::create().unwrap();
+        let identity = |name: &str| {
+            let (cert, key) = ca.issue(name).unwrap();
+            Identity {
+                name: name.into(),
+                ca: ca.cert.clone(),
+                cert,
+                key,
+            }
+        };
+        let (a, b) = (identity("a"), identity("b"));
+        let gone = Arc::new(AtomicBool::new(false));
+        let flag = gone.clone();
+        let revoked: Revoked = Arc::new(move |_| flag.load(Ordering::SeqCst));
+        let server = served(&a.ca, Live::new(&a).unwrap(), Some(revoked)).unwrap();
+        // (One configuration for both: it is what keeps the session between the connections.)
+        let client = Arc::new(client_config(&b.ca, Some(Live::new(&b).unwrap()), None).unwrap());
+        let connect = || async {
+            let (near, far) = tokio::io::duplex(1 << 16);
+            let acceptor = tokio_rustls::TlsAcceptor::from(server.clone());
+            let connector = tokio_rustls::TlsConnector::from(client.clone());
+            let serving = async {
+                let mut stream = acceptor.accept(far).await.map_err(|e| e.to_string())?;
+                stream.write_all(b"x").await.map_err(|e| e.to_string())?;
+                stream.flush().await.map_err(|e| e.to_string())?;
+                drop(stream.read_to_end(&mut Vec::new()).await);
+                Ok::<(), String>(())
+            };
+            let calling = async {
+                let name = ServerName::try_from("kith").unwrap();
+                let mut stream = connector.connect(name, near).await.map_err(|e| e.to_string())?;
+                // (The session comes with what the server sends after the handshake.)
+                stream.read_exact(&mut [0u8; 1]).await.map_err(|e| e.to_string())?;
+                stream.shutdown().await.map_err(|e| e.to_string())
+            };
+            tokio::join!(serving, calling)
+        };
+        let (served, called) = connect().await;
+        assert_eq!((served, called), (Ok(()), Ok(())));
+        gone.store(true, Ordering::SeqCst);
+        let (served, _) = connect().await;
+        let said = served.unwrap_err();
+        assert!(said.contains("Revoked"), "{said}");
+    }
+
+    /// The file that holds a certificate is made private, as the key beside it is, whatever the umask.
+    #[test]
+    fn write_whole_makes_a_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kithd-whole-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.crt");
+        write_whole(&path, b"x").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_certificate_is_refused_in_the_handshake_not_only_per_request() {
+        let ca = Ca::create().unwrap();
+        let identity = |name: &str| {
+            let (cert, key) = ca.issue(name).unwrap();
+            Identity {
+                name: name.into(),
+                ca: ca.cert.clone(),
+                cert,
+                key,
+            }
+        };
+        let (a, b, gone) = (identity("a"), identity("b"), identity("gone"));
+        // What the node says is revoked: the node `gone`, and the Identity `mallory`.
+        let revoked: Revoked = Arc::new(|cert| match subject_of(cert) {
+            Some(Subject::Node(name, ..)) => name == "gone",
+            Some(Subject::User(name, ..)) => name == "mallory",
+            _ => false,
+        });
+        let server = served(&a.ca, Live::new(&a).unwrap(), Some(revoked)).unwrap();
+        let call = |me: &Identity| client_config(&me.ca, Some(Live::new(me).unwrap()), None).unwrap();
+
+        let (heard, _) = shake(server.clone(), call(&b)).await;
+        assert_eq!(
+            heard.unwrap().map(|c| key_print(&c)),
+            Some(key_print(&certs(&b.cert).unwrap()[0]))
+        );
+        let (heard, _) = shake(server.clone(), call(&gone)).await;
+        let said = heard.unwrap_err();
+        assert!(said.contains("Revoked"), "{said}");
+
+        let user = |name: &str| {
+            let (cert, key, _) = ca.issue_user(name).unwrap();
+            Identity {
+                name: name.into(),
+                ca: ca.cert.clone(),
+                cert,
+                key,
+            }
+        };
+        assert!(shake(server.clone(), call(&user("alice"))).await.0.is_ok());
+        assert!(shake(server.clone(), call(&user("mallory"))).await.0.is_err());
+        // One with no certificate at all still comes in (to join), and a stranger's is no better.
+        let bare = client_config(&a.ca, None, None).unwrap();
+        assert!(shake(server, bare).await.0.unwrap().is_none());
+        let other = Ca::create().unwrap().issue("b").unwrap();
+        let stranger = Identity {
+            name: "b".into(),
+            ca: a.ca.clone(),
+            cert: other.0,
+            key: other.1,
+        };
+        let server = served(&a.ca, Live::new(&a).unwrap(), None).unwrap();
+        assert!(shake(server, call(&stranger)).await.0.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_renewed_certificate_is_shown_by_server_and_client_alike_with_no_restart() {
+        let ca = Ca::create().unwrap();
+        let (cert, key) = ca.issue("b").unwrap();
+        let der = certs(&cert).unwrap().remove(0);
+        let Some(Subject::Node(_, public, _)) = subject_of(&der) else {
+            panic!("a node's certificate");
+        };
+        // One an hour old with ten minutes left: the kind a node renews.
+        let now = secs();
+        let short = ca
+            .renew_node("b", None, &public, now - 3540, Duration::from_secs(4140))
+            .unwrap();
+        let b = Identity {
+            name: "b".into(),
+            ca: ca.cert.clone(),
+            cert: short.clone(),
+            key: key.clone(),
+        };
+        let (a_cert, a_key) = ca.issue("a").unwrap();
+        let a = Identity {
+            name: "a".into(),
+            ca: ca.cert.clone(),
+            cert: a_cert,
+            key: a_key,
+        };
+        let live = Live::new(&b).unwrap();
+        let (listening, calling) = (
+            served(&b.ca, live.clone(), None).unwrap(),
+            client_config(&b.ca, Some(live.clone()), None).unwrap(),
+        );
+        let (sees_a, sees_b) = (
+            served(&a.ca, Live::new(&a).unwrap(), None).unwrap(),
+            client_config(&a.ca, Some(Live::new(&a).unwrap()), None).unwrap(),
+        );
+        let ends = |cert: &Option<CertificateDer<'_>>| validity(cert.as_ref().unwrap()).unwrap().1;
+        // As a server, to a client that is the other node's, and as a client, to its server.
+        let (_, shown) = shake(listening.clone(), sees_b.clone()).await;
+        assert_eq!(ends(&shown), now + 600);
+        let (took, _) = shake(sees_a.clone(), calling.clone()).await;
+        assert_eq!(ends(&took.unwrap()), now + 600);
+
+        // Made again: the very same configurations show the new one at the next handshake.
+        let again = ca.renew_node("b", None, &public, now, NODE_LIFE).unwrap();
+        live.swap(&again).unwrap();
+        let (_, shown) = shake(listening, sees_b).await;
+        assert_eq!(ends(&shown), now + NODE_LIFE.as_secs());
+        let (took, _) = shake(sees_a, calling).await;
+        assert_eq!(ends(&took.unwrap()), now + NODE_LIFE.as_secs());
+
+        // Only a certificate for the key it holds is taken: not another's, nor a stranger's.
+        let (other, _) = ca.issue("b").unwrap();
+        assert!(live.swap(&other).is_err() && live.swap("not a certificate").is_err());
+        let (mine, _) = Ca::create().unwrap().issue("b").unwrap();
+        assert!(live.swap(&mine).is_err());
+        assert_eq!(live.current().cert.len(), 1);
     }
 }

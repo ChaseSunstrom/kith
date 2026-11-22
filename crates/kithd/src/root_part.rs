@@ -5,7 +5,7 @@
 //! [`decode`] reading each one. Here are the Listeners family (`Bind`), the Pods family (`Pod`,
 //! `Sockets`, [`Root::create`] and [`Root::start`]) and, through the last, what Services and
 //! probes connect into a pod by, and the Mesh family (`MeshUp`, `Mesh`, `MeshSeen`, `MeshDown`, `MeshKey`:
-//! the WireGuard interface, its addresses, its peers and the steps of replacing its key) and the Images family (`Unpack`, with
+//! the WireGuard interface, its addresses, its peers and the steps of replacing its key; `MeshResolver`: `~kith` to 127.0.0.87 on its link in systemd-resolved) and the Images family (`Unpack`, with
 //! the layers as files beside the request, and `Drop`: both name a digest, and the path is
 //! derived from it here) and the Units family (`Kill`, `Delete`, `Tune`, `Plug`, `Unplug`: each
 //! names a unit by the id this part made at Create, and is refused one it did not; `Plug` a
@@ -140,6 +140,10 @@ pub enum Request {
     MeshSeen { interface: String },
     /// The interface taken away.
     MeshDown { interface: String },
+    /// systemd-resolved told (`on`) to send `~kith` and nothing else to kithd's DNS at 127.0.0.87:53 on
+    /// the mesh's link, or told to forget the link (`resolvectl revert`). The address and the domain
+    /// are the root part's own ([`crate::resolver`]): the request names the interface alone.
+    MeshResolver { interface: String, on: bool },
     /// A step of this node's WireGuard key being replaced, which only the root part touches: the
     /// key file and the interface's key are its own, and what it was told of the mesh names them.
     MeshKey { interface: String, step: KeyStep },
@@ -319,6 +323,8 @@ pub fn check(request: &Request) -> Result<(), String> {
                 count => Err(format!("{count} sockets: from 1 to {MOST_SOCKETS}")),
             }
         }
+        // (The interface goes to a program as an argument: a name, never an option.)
+        Request::MeshResolver { interface, .. } => label("interface", interface),
         // (Against what the root part was told of the mesh, which is not in the request: [`check_mesh`].)
         Request::MeshUp { .. }
         | Request::Mesh { .. }
@@ -427,6 +433,7 @@ fn check_mesh(request: &Request, told: &Option<MeshTold>) -> Result<(), String> 
         | Request::Mesh { interface, .. }
         | Request::MeshSeen { interface }
         | Request::MeshDown { interface }
+        | Request::MeshResolver { interface, .. }
         | Request::MeshKey { interface, .. } => interface,
         _ => return Ok(()),
     };
@@ -448,6 +455,9 @@ fn check_mesh(request: &Request, told: &Option<MeshTold>) -> Result<(), String> 
         )),
         // (A key is replaced on an interface that is up: the steps run on it, and the file is its.)
         Request::MeshKey { .. } if !told.up => Err("the mesh is not up".into()),
+        // (Registered on a link that is there; taken back whether or not.)
+        Request::MeshResolver { on: true, .. } if !told.up => Err("the mesh is not up".into()),
+        Request::MeshResolver { .. } => Ok(()),
         Request::Mesh { peers, addresses, .. } => {
             if !told.up {
                 return Err("the mesh is not up".into());
@@ -912,12 +922,12 @@ pub fn usage(pod: &str) -> Option<(u64, u64, u64)> {
 // ponytail: not a request of the `Root` trait (the ADR names `Exec(id, argv, tty)`): as the one
 // part of kithd that is root or the node's user, kithd enters it in its own process, and the
 // trait takes it when a root part of its own does (then TTY too).
-pub fn enter(id: &str, argv: &[String]) -> Result<kith_runtime::Entered, String> {
+pub fn enter(id: &str, argv: &[String], options: kith_runtime::Options) -> Result<kith_runtime::Entered, String> {
     if !BOOK.units.lock().expect("nothing panics holding the book").contains(id) {
         return Err(format!("`{id}` is not a unit made here"));
     }
     let state = BOOK.state().ok_or("the state directory is not told yet")?;
-    kith_runtime::enter(&state.join("runtime"), id, argv).map_err(|e| e.to_string())
+    kith_runtime::enter_with(&state.join("runtime"), id, argv, options).map_err(|e| e.to_string())
 }
 
 /// This process's mesh interface, once it is up: one per node.
@@ -998,6 +1008,10 @@ pub trait Hands {
     }
     fn mesh_seen(&self) -> Result<Vec<kith_mesh::Seen>, String> {
         device(|device| device.peers())
+    }
+    /// systemd-resolved sent `~kith` to kithd's DNS on `interface` (`on`), or the link forgotten.
+    fn mesh_resolver(&self, interface: &str, on: bool) -> Result<(), String> {
+        crate::resolver::apply(interface, on)
     }
     fn mesh_down(&self) -> Result<(), String> {
         let device = DEVICE.lock().expect("nothing panics holding the device").take();
@@ -1360,6 +1374,7 @@ impl<'a, H: Hands> Direct<'a, H> {
             }
             Request::Mesh { peers, addresses, .. } => self.hands.mesh(&peers, &addresses).map(|()| Reply::Done),
             Request::MeshSeen { .. } => self.hands.mesh_seen().map(Reply::Seen),
+            Request::MeshResolver { interface, on } => self.hands.mesh_resolver(&interface, on).map(|()| Reply::Done),
             Request::MeshDown { .. } => {
                 // Only a down that worked is a node that is not up: one that failed leaves the
                 // link, and it is still the node's.
@@ -1617,9 +1632,11 @@ impl<H: Hands> Direct<'_, H> {
             Request::Bind { .. } => Kind::Bind,
             Request::Pod { .. } => Kind::Pod,
             Request::Sockets { .. } => Kind::Sockets,
-            Request::MeshUp { .. } | Request::Mesh { .. } | Request::MeshDown { .. } | Request::MeshKey { .. } => {
-                Kind::Mesh
-            }
+            Request::MeshUp { .. }
+            | Request::Mesh { .. }
+            | Request::MeshDown { .. }
+            | Request::MeshResolver { .. }
+            | Request::MeshKey { .. } => Kind::Mesh,
             Request::MeshSeen { .. } => Kind::Seen,
             Request::Unpack { .. } => Kind::Unpack,
             Request::Drop { .. } => Kind::Drop,
@@ -1670,6 +1687,7 @@ impl<H: Hands> Direct<'_, H> {
             | Request::Mesh { .. }
             | Request::MeshSeen { .. }
             | Request::MeshDown { .. }
+            | Request::MeshResolver { .. }
             | Request::MeshKey { .. }) => self.mesh_request(mesh),
             Request::Bind { address, port, proto } => {
                 let at = SocketAddr::new(address, port);
@@ -1709,6 +1727,15 @@ pub fn split() -> std::io::Result<std::os::fd::OwnedFd> {
         .set(socket)
         .map_err(|_| std::io::Error::other("the root part is split already"))?;
     Ok(theirs)
+}
+
+/// The serving part's end closed: the root part returns from [`serve_split`] alone, and kithd
+/// ends with it. (The `confine-probe` build's hook, for ci/vm/privilege.sh.)
+#[cfg(feature = "confine-probe")]
+pub fn end_split() {
+    if let Some(socket) = SPLIT.get() {
+        socket.hangup();
+    }
 }
 
 /// The root part of this node on its end of the socket pair: serves until the serving part's end
@@ -1874,6 +1901,17 @@ pub fn mesh_seen<R: Root>(root: &R, interface: &str) -> Result<Vec<kith_mesh::Se
         interface: interface.into(),
     })? {
         Reply::Seen(seen) => Ok(seen),
+        _ => Err("the root part answered a request for the mesh with something else".into()),
+    }
+}
+
+/// systemd-resolved told to send `~kith` to kithd's DNS on the mesh's link (`on`), or to forget the link.
+pub fn mesh_resolver<R: Root>(root: &R, interface: &str, on: bool) -> Result<(), String> {
+    match root.request(Request::MeshResolver {
+        interface: interface.into(),
+        on,
+    })? {
+        Reply::Done => Ok(()),
         _ => Err("the root part answered a request for the mesh with something else".into()),
     }
 }
@@ -2162,6 +2200,11 @@ mod tests {
         fn mesh_seen(&self) -> Result<Vec<kith_mesh::Seen>, String> {
             self.said("mesh_seen");
             Ok(Vec::new())
+        }
+
+        fn mesh_resolver(&self, _: &str, _: bool) -> Result<(), String> {
+            self.said("mesh_resolver");
+            Ok(())
         }
 
         fn mesh_down(&self) -> Result<(), String> {
@@ -3215,6 +3258,31 @@ mod tests {
             allowed,
             keepalive: 25,
         }
+    }
+
+    /// The resolver request names an interface and nothing more: one that is not a label (an option, a
+    /// path, a line break) or not the mesh's is refused before anything runs, and it is only asked of an
+    /// interface that is up (taking the entry back is asked of one that is gone too).
+    #[test]
+    fn resolver_request_refuses_what_is_not_the_mesh_interface_and_reaches_the_machine_otherwise() {
+        let (book, prefix) = meshed("resolver-request");
+        let root = Direct::with(Fake::default(), &book);
+        let ask = |interface: &str, on| Request::MeshResolver {
+            interface: interface.into(),
+            on,
+        };
+        assert!(root.request(ask(WG, true)).unwrap_err().contains("not up"));
+        for name in ["--help", "-x", "kith0\nfoo", "../kith0", "", "eth0", "kith0 eth0"] {
+            for on in [true, false] {
+                assert!(root.request(ask(name, on)).is_err(), "{name:?}");
+            }
+        }
+        assert!(decode(br#"{"MeshResolver":{"interface":"kith0","on":true,"address":"10.0.0.1"}}"#).is_err());
+        assert!(root.hands.reached().is_empty(), "{:?}", root.hands.reached());
+        up(&root, prefix).unwrap();
+        assert!(matches!(root.request(ask(WG, true)), Ok(Reply::Done)));
+        assert!(matches!(root.request(ask(WG, false)), Ok(Reply::Done)));
+        assert_eq!(root.hands.reached(), ["mesh_up", "mesh_resolver", "mesh_resolver"]);
     }
 
     fn mesh_ask(interface: &str, peers: Vec<kith_mesh::Peer>, addresses: &[Ipv6Addr]) -> Request {
@@ -4775,6 +4843,53 @@ mod tests {
             let seen = Request::MeshSeen { interface: WG.into() };
             assert!(matches!(socket.request(seen), Ok(Reply::Seen(seen)) if seen.is_empty()));
         });
+    }
+
+    #[test]
+    fn root_part_socket_a_call_waits_no_longer_than_its_deadline_for_one_in_flight() {
+        let (book, _) = book("socket-stuck");
+        let root = Direct::with(Nobody, &book);
+        over_socket(&root, &Limits::default(), |mut socket| {
+            socket.deadline = Duration::from_millis(100);
+            let stuck = socket.stuck();
+            let started = Instant::now();
+            let why = socket.request(ask("127.0.0.1", 0, Proto::Tcp)).unwrap_err();
+            assert!(why.contains("in time"), "{why}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+            drop(stuck);
+            // The lock is let go: the next call is answered.
+            let tcp = socket_of(socket.request(ask("127.0.0.1", 0, Proto::Tcp)));
+            assert!(TcpListener::from(tcp).local_addr().is_ok());
+        });
+    }
+
+    #[test]
+    fn root_part_socket_a_lock_taken_near_the_deadline_sends_nothing() {
+        let (book, _) = book("socket-late");
+        let root = Direct::with(Nobody, &book);
+        over_socket(&root, &Limits::default(), |mut socket| {
+            socket.deadline = Duration::from_millis(600);
+            socket.floor = Duration::from_millis(300);
+            // The call in flight ends at 500 ms: about 100 ms are left of 600, well under the floor.
+            let why = std::thread::scope(|s| {
+                let (taken, wait) = std::sync::mpsc::channel();
+                let held = &socket;
+                s.spawn(move || {
+                    let _held = held.stuck();
+                    taken.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(500));
+                });
+                wait.recv().unwrap();
+                socket.request(ask("127.0.0.1", 0, Proto::Tcp)).unwrap_err()
+            });
+            assert!(why.contains("too late"), "{why}");
+            // Nothing of it was sent: no socket was made, and the next call is answered as it is.
+            assert_eq!(book.total(), 0);
+            socket.floor = Duration::from_millis(1);
+            let tcp = socket_of(socket.request(ask("127.0.0.1", 0, Proto::Tcp)));
+            assert!(TcpListener::from(tcp).local_addr().is_ok());
+        });
+        assert_eq!(book.total(), 1);
     }
 
     #[test]

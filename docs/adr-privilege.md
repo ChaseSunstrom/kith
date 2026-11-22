@@ -202,8 +202,8 @@ serves one end with the node's `Direct` (`root_part::serve_split`); `Direct::new
 the other end (a `Socket`, which is a `Root`), so a request that needs no handle crosses it, and
 every check and every count is the root part's, once (a `Book` is shared, so there is no second
 count). The controller's own `Create`, `Start`, `Kill` and the rest of a unit's verbs stay local until
-T-0811 moves the unit's handle to the other process. Nothing is confined yet: no uid or
-capability drop, no `no_new_privs`, no filter, no tied lives (T-0811).
+T-0811 moves the unit's handle to the other process. Confinement is built (see "Built so far
+(confined)") but is not applied to the serving part yet, which is still a thread of the root part's process.
 
 - **Wrappers.** `kith-dm-sys` is the one crate with the unsafe code: `socketpair`, `send_fds`
   and `recv_fds` (`SCM_RIGHTS`; `MSG_NOSIGNAL`; descriptors arrive close-on-exec; a message or a
@@ -235,13 +235,79 @@ capability drop, no `no_new_privs`, no filter, no tied lives (T-0811).
 
 **Not done, said here**: a single worker serializes the requests, and a long one (an unpack) holds the
 rest behind it, up to their deadline (T-0812 measures it before it is changed); a caller waiting for the
-lock has no deadline of its own; `send_fds` and `recv_fds` take up a call a signal cut short
-(`EINTR`) but wait the socket's whole timeout again, rather than what was left of it (kithd takes few
-signals; an absolute deadline is T-0811's, with the worker thread's restart); more than 253 layers cannot be sent in one `Unpack` though the
+lock waits as long as its call may (T-0811: it gives up at its own deadline, and the call is made on the
+calling thread, so an async caller is held for that long at most; `spawn_blocking` at each caller is not
+done); `send_fds` and `recv_fds` take up a call a signal cut short (`EINTR`) until the end of the
+socket's own timeout, counted from the start of the call (the kernel restarts that timeout at each
+signal, so it alone does not bound it); a socket with no timeout is retried as long as the signals
+come, and the caller's own timeouts (`ask`: one deadline for the lock and the wait) are what bound it (T-0811); more than 253 layers cannot be sent in one `Unpack` though the
 limit on layers is 256; a caller that gives up after a `Create` leaves the unit held by the root
-part, to be taken by `Adopt` or deleted; a layer that is a FIFO is refused; the serving thread is
-not started again if the peer ends (the root part is a thread of kithd until T-0811 makes it a
-process, so the two end together).
+part, to be taken by `Adopt` or deleted; a layer that is a FIFO is refused; the root part's thread is
+not started again if it ends: kithd ends with it (T-0811), for the keeper to start both again.
+
+## Built so far (confined)
+
+**What is enforced today: nothing on a live node.** The confinement below is built and held to what
+it says by a probe (`kithd confine-probe`, in a test build, in no release, run by `sh ci/vm.sh --test
+privilege`) and by unit tests; no serving part calls it, because there is no serving process yet (see
+"Not done"). The module is compiled in unit tests and the `confine-probe` build alone. **What stays
+open even when it is applied**: the serving part keeps the node's network namespace, so it reaches the
+host's loopback and every abstract `AF_UNIX` socket of the node (the filter allows `AF_UNIX`, `AF_INET`
+and `AF_INET6` and no other family, but a name in the abstract space is no file of a mount); a
+`CLONE_NEWNET` after the listeners are open closes both, if the part makes no outbound connection,
+and is not done. Nothing beyond what this section lists is claimed closed.
+
+T-0811, `crates/kithd/src/confine.rs` and the wrappers in `kith-dm-sys`. `confine::serving` takes
+the steps in this order, after the listeners and the store are open (a failed step ends it, and the
+part serves nothing): its own mount namespace holding only its state directory (mounted `nosuid`,
+`nodev`, `noexec`: the filter has no `execve` for the part either; the new root is read only) and a
+fresh `/proc` mounted `hidepid=invisible,subset=pid` (the part sees its own process and no other, and
+none of `/proc/sys`, `kcore` and the like; not a bind of the node's `/proc`). A process that holds a
+directory open or an `O_PATH` descriptor is refused before the first step, since after `pivot_root` such a
+descriptor (`fchdir`, then `..` or a relative open) still reaches the node's tree: the part that
+confines holds none, and the check lists them (not closed from here: they are not this code's to close).
+The state directory is a plain absolute path (no `..`, not `/`). Then a user and group that are not 0 and no other group (`setgroups`, `setresgid`,
+`setresuid`, with `PR_SET_KEEPCAPS` so what the next step drops is still held), no capability in
+any set (effective raised from permitted, the bounding set dropped one by one, ambient cleared,
+`capset` to nothing, then read back and refused if anything is left), `no_new_privs`, and last a
+seccomp filter: an allow-list by call number, `EPERM` for the rest, and the process killed on a
+foreign architecture (the x32 ABI, the same architecture with bit 30 of the number set, answers `EPERM`
+like any call not listed; the architecture is a named constant for x86-64 and aarch64 and a compile
+error elsewhere; a thread that cannot take the filter is reported by thread, not as a stale errno).
+Five calls are allowed in part (the arguments decide): `socket` and `socketpair` make `AF_UNIX`,
+`AF_INET` and `AF_INET6` only (no netlink, packet or vsock socket; `socketpair` `AF_UNIX`
+alone), `clone` is refused
+when its flags hold any `CLONE_NEW*` bit (so no namespace is made, though `unshare` and `setns`
+are left out), `clone3` answers `ENOSYS` (its flags are behind a pointer a filter cannot read, and
+the C libraries fall back to `clone`), and `ioctl` and `prctl` pass only the requests and options
+the serving part makes (non-blocking, close-on-exec, bytes waiting, `TCGETS` and `TIOCGWINSZ`; a thread's name,
+`no_new_privs` and dumpable as read or set): not `TIOCSTI`, `TIOCLINUX`, a terminal's settings,
+`PR_SET_MM` or `PR_CAP_AMBIENT`. A request the part meets that is not in the list is refused with
+`EPERM`: the list is read off the code and the VM run, and widened by a line when a run shows one
+(`msync`, `fadvise64`, `signalfd4`, `rt_sigtimedwait`, `epoll_pwait2` and `getcpu` are in it because a
+real serving part, a tokio server over a store file, makes them; `execve` is not, and `fork` and
+`vfork` are on x86_64 (aarch64 has neither syscall), as the allow-list this one is made from has them: a child keeps the filter, the
+empty capability sets and the mount namespace, and it can run no program, so it is no more than a
+thread that is a process).
+`Plan::filter` off leaves the filter out and nothing else (the filter is the
+step most likely to meet a call the list lacks); it is `--no-filter` on the probe, and no kithd
+flag until the serving part is a process. `kithd confine-probe DIR` does the same steps on
+itself and reports its own `/proc` status and mountinfo and what it tried and was refused (setuid,
+a capability, the node's disk, a mount, a process of another user in `/proc`, a call outside the
+filter, a namespace made by `clone` of each kind (each with `CLONE_NEWUSER`, which an unprivileged
+process may make: the `--no-filter` run shows they are made without the filter), `clone3`, `TIOCSTI`,
+a netlink socket, a directory held open when it confines), and `sh ci/vm.sh --test
+privilege` holds the node to it, then kills kithd under a pod.
+
+**Not done, said here** (the first is the reason `--split` stays off): confinement is per thread
+(capabilities, the bounding set, the mount namespace, `no_new_privs`) or per process (ids, the
+filter with `TSYNC`), so it cannot be applied to the serving part while the root part is a thread of
+the same process: it would confine both. The serving part has to be a process of its own, the root
+part the one that keeps the runtime, the `Book` and the units' handles (the controller's `Handle`s
+and `Direct::units` are in process today). Until then the tied lives are the thread model's: the
+root part's thread ends, kithd ends. The families that still need what the filter and the dropped
+capabilities take away (the BPF service table, OS update, encrypted state, share and loop mounts,
+people peers) are not moved.
 
 ## The requests
 
@@ -260,7 +326,7 @@ what it is, never for who asked.
 | Family | Requests | Checked again by the root part |
 |---|---|---|
 | Listeners | `Bind(address, port, tcp or udp)` → a socket | not a port the root part uses itself; counted |
-| Mesh | `MeshUp(interface, address)` → the public key; `Mesh(interface, peers, addresses)`; `MeshSeen(interface)` → when each peer shook hands (a read, counted as `Seen` and not `Mesh`: the loop asks it every 10 s, for the peers' paths); `MeshDown(interface)`. In process today (T-0809), with the interface, port, key file, this node's name and the cluster's range told the root part once by the serving part (a second telling that differs is refused; the root part is to have them from its own arguments and the CA: T-0810) | the interface is the one kith made; the node's address is the first of the /80 its name gives in the cluster's /48 (`node_address`), and no other, whatever an earlier up or down said; every allowed address is another node's whole /80 in it (not a service's, not this node's own, no IPv4 or IPv4-mapped address and no other length), every address added is a service's; a peer's key is not zero and is no other peer's; an endpoint is not loopback, unspecified, inside the mesh's /48 or at port 0. One bad peer refuses the whole `Mesh` request (fail-closed: nothing of it is set). Requests of the family are one at a time, from the check to the act, and a node is up from before its up is made until a failed up (when it was not up before) or a down that worked says it is not; the private key never leaves the root part. **Not checked**: a peer's keepalive, and an endpoint that is any other address (the serving part's to say: a peer at a wrong public address is a peer that does not answer); that two peers are not allowed the same /80. **Not checked, and it cannot be**: that a peer's key is the node whose address it is given. A node's mesh address comes from its name (`kith-mesh`, `node_address`) and who has which key is the store's word, so a hole in the store can stand at another node's mesh address (and be that node to an NFS share, which knows clients by address). Said in SECURITY.md |
+| Mesh | `MeshUp(interface, address)` → the public key; `Mesh(interface, peers, addresses)`; `MeshSeen(interface)` → when each peer shook hands (a read, counted as `Seen` and not `Mesh`: the loop asks it every 10 s, for the peers' paths); `MeshDown(interface)`; `MeshResolver(interface, on)` (`--resolver`, T-1260: runs `resolvectl` to send `~kith`, never another domain, to 127.0.0.87 on that link with no default route, or `revert`; the interface must be a label and, to turn it on, the one kith made and up; with no `/run/systemd/resolve` it runs nothing). In process today (T-0809), with the interface, port, key file, this node's name and the cluster's range told the root part once by the serving part (a second telling that differs is refused; the root part is to have them from its own arguments and the CA: T-0810) | the interface is the one kith made; the node's address is the first of the /80 its name gives in the cluster's /48 (`node_address`), and no other, whatever an earlier up or down said; every allowed address is another node's whole /80 in it (not a service's, not this node's own, no IPv4 or IPv4-mapped address and no other length), every address added is a service's; a peer's key is not zero and is no other peer's; an endpoint is not loopback, unspecified, inside the mesh's /48 or at port 0. One bad peer refuses the whole `Mesh` request (fail-closed: nothing of it is set). Requests of the family are one at a time, from the check to the act, and a node is up from before its up is made until a failed up (when it was not up before) or a down that worked says it is not; the private key never leaves the root part. **Not checked**: a peer's keepalive, and an endpoint that is any other address (the serving part's to say: a peer at a wrong public address is a peer that does not answer); that two peers are not allowed the same /80. **Not checked, and it cannot be**: that a peer's key is the node whose address it is given. A node's mesh address comes from its name (`kith-mesh`, `node_address`) and who has which key is the store's word, so a hole in the store can stand at another node's mesh address (and be that node to an NFS share, which knows clients by address). Said in SECURITY.md |
 | People: device | `PeopleUp` → the device `kwg0` up with the people key, its port, `100.89.0.1/16` and the people /64's `::1`, and no peers | nothing from the asker: the port and the addresses come from the node's own `--people` and configuration, the key is made here once in `pki/people.key` (mode 0600) and kept, and the reply carries only the public key |
 | People: table | `PeopleTable` → the `inet kith-people` table, written before the device | nothing from the asker: the rules are kith-mesh's `people::build` from the node's own settings, with default drop and the masquerade rules required, so a kernel without them refuses and `--people` does not start |
 | People: peers | `set_peers` on `kwg0` → the device's peers made equal to the list, after the table and rules | nothing from the asker: kithd's `levels.rs` lists them from the store (each one's own /32 and /128 only), and empties the device when a table or rule step fails |

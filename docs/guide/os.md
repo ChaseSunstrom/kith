@@ -109,6 +109,17 @@ update is 43 MB against 34 and the ESP's two kernels 36 of its 64 MB; the root i
 Built and started under UEFI in QEMU, the kernel brings amdgpu up (`amdgpu: Topology: Add CPU
 node`) and kithd serves; on a 780M itself it has not run yet.
 
+`gpu-nvidia-pascal`, the nouveau driver and HDMI sound (HDA with its NVIDIA codec) built in, for
+an NVIDIA card before Turing (GeForce GTX 10xx, Quadro Pxxx; `os/examples/gpu-nvidia-pascal.yaml`).
+Nouveau's display and HDMI sound work on any card before Turing that it knows; the firmware it
+brings (`nvidia/gp102` to `gp108`) gives 3D on a desktop Pascal card, GP102 to GP108. There is no
+reclocking (the card stays at its boot clock) and no video decode under nouveau, and NVIDIA's own
+driver is not part of kith OS. Most of that firmware is named again in linux-firmware's `WHENCE`
+(`Link:` lines): `os/firmware.sh` makes the links a glob names, as copy-firmware.sh does, with the
+files they point at, and refuses a link out of the tree, a cycle or a glob that names nothing. A
+spec for it with `all` is refused (nouveau as modules and built in). Its first real use is a TV
+seat: [a TV or kiosk seat](hardware.md#a-tv-or-kiosk-seat).
+
 `vfio`, to prepare the kernel for handing a PCI card (a GPU, a USB controller) to a virtual
 machine: the IOMMU switched on (Intel's, with interrupt remapping) and `vfio-pci` built in
 (`os/examples/vfio.yaml`). That is all it does: binding a card to `vfio-pci`, and `vms` on kith
@@ -137,9 +148,11 @@ A node with no card a feature matches prints `features: []`; a node that runs no
 `wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
 card the catalogue does not list yet) is chosen by hand, as above. A line may give `vendor:*`
 instead of a device id, which matches any display card (PCI class 03) of that vendor and not its
-audio function: `all` has `10de:*`, so a node with an NVIDIA GPU wants `all` (nouveau's driver is
-in it). A node that also has an AMD Phoenix GPU wants `all` alone, which build.sh would refuse with
-`gpu-amd-phoenix` and whose modules cover that GPU.
+audio function, and only one that no feature names by its exact id: `all` has `10de:*`, so a node
+with an NVIDIA display card no feature lists wants `all` (nouveau's driver is in it), while a
+Pascal card (`10de:1c03`) wants `gpu-nvidia-pascal`, not `all`. A node that also has an AMD Phoenix
+or a Pascal GPU and a card of another NVIDIA family (a Turing) wants `all` alone, which build.sh
+would refuse with `gpu-amd-phoenix` or `gpu-nvidia-pascal` and whose modules cover those GPUs.
 
 #### The `all` feature: drivers as signed modules
 
@@ -237,6 +250,26 @@ say why, and the node serves as before. The disk and the network come up before 
 `build.sh` refuses a block or network driver as a module in such a spec, at the config and
 again over the modules built, and a `.ko` in the root fails the build. Not here: the update path
 (an update's slot-b image), NVIDIA's modules.
+### Secure Boot: an image signed with your own key
+
+```sh
+mkdir -m 700 ~/kith-sb && openssl req -new -x509 -newkey rsa:3072 -nodes -days 3650 -subj '/CN=my kith db/' -keyout ~/kith-sb/db.key -out ~/kith-sb/db.crt
+sh os/build.sh --secure-boot ~/kith-sb   # needs sbsign and sbverify (sbsigntools)
+```
+
+`--secure-boot KEYDIR` signs systemd-boot (the `BOOTX64.EFI` of both disks) and every kernel
+image (slot a and b, so the update's too, and the installer's) with `KEYDIR/db.key` and
+`KEYDIR/db.crt`, then checks each against the certificate before it goes into an ESP or the
+update (`sh ci/secure-boot-check.sh` does this with a throwaway key, and builds twice to show the same bytes; it needs sbsign, sbverify, mcopy and openssl, and exits 3 without them). The certificate is part of the update's kernel digest, so an update that only signs, or changes the key, is a full one, not a kithd-only one. A firmware that has that certificate as a `db` entry then checks the one file that
+carries the root's hash. Without sbsign the build stops with exit 3 (this machine cannot build
+it), and a directory without both files is refused (exit 2). The key is only read: it is
+never copied into an image, and keep it outside the repo. The signature is not part of what the
+TPM measures into PCR 4 (the Authenticode hash leaves it out), so sealing to PCR 4 is as before.
+
+Not done yet: enrolling the certificate. The installer does not write it into the firmware, so
+until it does you enroll it by hand (your firmware's setup, or `sbctl`/`virt-fw-vars` on the
+variable store); and the netboot image is not signed. Until then an image built with
+`--secure-boot` is the same as one without on a firmware with Secure Boot off.
 
 ### Updating a node: two slots
 
@@ -690,7 +723,9 @@ dm-crypt, with the key not on the machine: the cluster holds it. At each start t
 its network up, asks the nodes it knows for its key and only then opens its state. A disk taken
 out of its cluster, thrown away, or sent back under warranty opens for nobody. It is chosen when
 the machine is installed: `encrypt: true` in the [installer's
-answers](#installing-on-a-machine), or `kith node netboot --encrypt`.
+answers](#installing-on-a-machine), or `kith node netboot --encrypt`. A node installed plain can be
+encrypted where it stands with `kith node encrypt` ([how, how long, and why an SSD keeps old plain
+blocks](cluster.md#encrypting-a-node-that-was-installed-plain)); installing with `encrypt: true` is better.
 
 ```sh
 kith node lock beta                    # the cluster stops handing beta's key out: beta restarts, and waits
@@ -819,7 +854,7 @@ What is and is not protected:
 - The config partition (name, address, the spent join token) and the system are not encrypted.
 
 Not yet: a passphrase and the TPM both asked for, the cluster's key and the TPM both asked for,
-a keyboard layout at the console, encrypting a node not installed that way, the disk's secret
+a keyboard layout at the console, the disk's secret
 kept in the TPM, a duress code that opens a decoy.
 
 ### Not in kith OS yet
