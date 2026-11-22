@@ -447,6 +447,13 @@ fn render(
     said
 }
 
+/// The mark after a check: one lost datagram or a short outage (one check with no answer) keeps
+/// it; two in a row drop it. `missed` counts the checks in a row with no answer.
+fn keep_mark(vouched: bool, missed: &mut u32, answered: bool) -> bool {
+    *missed = if answered { 0 } else { *missed + 1 };
+    vouched && *missed <= 1
+}
+
 /// The status of a check that found no time.
 fn nothing(why: &str, at: i64) -> Value {
     json!({ "error": why, "checked": at / 1_000_000 })
@@ -644,7 +651,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         let mut said = String::new();
         let mut spent = 0;
         let mut vouched = false;
-        let mut missed = 0;
+        let mut missed = 0u32;
         let mut generation = shared.generation.subscribe();
         loop {
             let ntp = cluster_ntp(&shared.store.lock().expect("nothing panics holding the store").store);
@@ -661,11 +668,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 &mut vouched,
             )
             .await;
-            // (One lost datagram or a short outage keeps the mark; two checks in a row with no answer drop it.)
-            missed = if now["server"].is_string() { 0 } else { missed + 1 };
-            if missed > 1 {
-                vouched = false;
-            }
+            vouched = keep_mark(vouched, &mut missed, now["server"].is_string());
             VOUCHED.store(vouched, Ordering::Relaxed);
             if now["error"].is_null() && now["server"].is_string() {
                 synced = true;
@@ -1617,6 +1620,20 @@ mod tests {
         // A network's server says the same: no mark, and no majority: the leader as before.
         let (system, _, said) = fresh(&[fake(0, |_| {}).await], false, EIGHT_HOURS, false, &[], true).await;
         assert!(system.is_some(), "{said}");
+    }
+
+    #[test]
+    fn clock_the_mark_survives_one_missed_check_and_not_two() {
+        let mut missed = 0;
+        // One check with no answer keeps it; the next one that answers resets the count.
+        assert!(keep_mark(true, &mut missed, false));
+        assert!(keep_mark(true, &mut missed, true));
+        assert!(keep_mark(true, &mut missed, false));
+        // Two in a row drop it, and it stays dropped while no one answers.
+        assert!(!keep_mark(true, &mut missed, false));
+        assert!(!keep_mark(true, &mut missed, false));
+        // No mark is never made by a miss.
+        assert!(!keep_mark(false, &mut 0, false));
     }
 
     #[tokio::test]
