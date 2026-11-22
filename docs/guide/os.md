@@ -227,6 +227,27 @@ missing file) is one console line, never an end. Not supported: module parameter
 `modprobe.d` (blacklists, options), soft dependencies. Compressed modules (`.ko.xz`,
 `.zst`) are loaded by the kernel itself, from 5.17, if it was built to.
 
+### Secure Boot: an image signed with your own key
+
+```sh
+mkdir sb && openssl req -new -x509 -newkey rsa:3072 -nodes -days 3650 -subj '/CN=my kith db/' -keyout sb/db.key -out sb/db.crt
+sh os/build.sh --secure-boot sb        # needs sbsign and sbverify (sbsigntools)
+```
+
+`--secure-boot KEYDIR` signs systemd-boot (the `BOOTX64.EFI` of both disks) and every kernel
+image (slot a and b, so the update's too, and the installer's) with `KEYDIR/db.key` and
+`KEYDIR/db.crt`, then checks each against the certificate before it goes into an ESP or the
+update. A firmware that has that certificate as a `db` entry then checks the one file that
+carries the root's hash. Without sbsign the build stops with exit 3 (this machine cannot build
+it), and a directory without both files is refused (exit 2). The key is only read: it is
+never copied into an image, and keep it outside the repo. The signature is not part of what the
+TPM measures into PCR 4 (the Authenticode hash leaves it out), so sealing to PCR 4 is as before.
+
+Not done yet: enrolling the certificate. The installer does not write it into the firmware, so
+until it does you enroll it by hand (your firmware's setup, or `sbctl`/`virt-fw-vars` on the
+variable store); and the netboot image is not signed. Until then an image built with
+`--secure-boot` is the same as one without on a firmware with Secure Boot off.
+
 ### Updating a node: two slots
 
 ```sh

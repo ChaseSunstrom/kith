@@ -17,6 +17,7 @@
 #
 # Nothing needs root, nothing outside --out and the cache is written, and no disk is
 # touched: the result is files, kith-os.raw, kith-os.qcow2 and kith-os-installer.raw.
+# shellcheck disable=SC2015,SC2012,SC2017 # (A && B || C where C only reports; ls of a fixed directory; MB sizes)
 set -eu
 
 kernel_version=6.18.63
@@ -46,7 +47,7 @@ limit=$((300 * 1024 * 1024))
 
 usage() {
     cat <<'EOF'
-usage: sh os/build.sh [--out DIR] [--spec FILE] [--check] [--twice]
+usage: sh os/build.sh [--out DIR] [--spec FILE] [--secure-boot KEYDIR] [--check] [--twice]
 
 Builds DIR/kith-os.raw, DIR/kith-os.qcow2 and the installer, DIR/kith-os-installer.raw
 (default DIR: target/os).
@@ -69,6 +70,13 @@ KITH_OS_BIN is a folder with the kithd and kith to put in it (default: what ci/m
               modules with a key made for this build and deleted after, and puts the
               modules and the firmware they name (`firmware: [all]`: all of
               linux-firmware) in the root's /lib/modules and /lib/firmware
+  --secure-boot KEYDIR
+              sign systemd-boot and every kernel image (both slots', the update's and
+              the installer's) with KEYDIR/db.key and KEYDIR/db.crt, the owner's own
+              key, which is only read here and never goes into an image; an owner who
+              enrolls that certificate as db has the firmware check the file that
+              carries the root's hash. Enrolling it is not done by kith yet (docs/guide/os.md).
+              Needs sbsign and sbverify (sbsigntools)
   --check     fail unless the raw image is under 300 MB (4 GB with modules)
   --twice     build the root and the image a second time and fail unless both are
               byte for byte the same (the kernel comes from the cache both times)
@@ -83,7 +91,7 @@ or mcopy is missing and nix is there, they come from nix.
 EOF
 }
 
-out='' check='' twice='' spec=''
+out='' check='' twice='' spec='' sbdir=''
 while [ $# -gt 0 ]; do
     case $1 in
     --help | -h) usage; exit 0 ;;
@@ -92,6 +100,10 @@ while [ $# -gt 0 ]; do
     --spec)
         [ $# -ge 2 ] && [ -f "$2" ] && [ -r "$2" ] || { echo "build.sh: --spec needs a file it can read" >&2; exit 2; }
         spec=$(realpath "$2"); shift 2 ;;
+    --secure-boot)
+        [ $# -ge 2 ] && [ -f "$2/db.key" ] && [ -r "$2/db.key" ] && [ -f "$2/db.crt" ] && [ -r "$2/db.crt" ] \
+            || { echo "build.sh: --secure-boot needs a directory with a db.key and db.crt it can read" >&2; exit 2; }
+        sbdir=$(realpath "$2"); shift 2 ;;
     --out)
         [ $# -ge 2 ] || { echo "build.sh: --out needs a directory" >&2; exit 2; }
         out=$2; shift 2 ;;
@@ -146,6 +158,7 @@ if ! command -v bc >/dev/null 2>&1 || ! command -v mcopy >/dev/null 2>&1; then
         [ -z "$check" ] || set -- "$@" --check
         [ -z "$twice" ] || set -- "$@" --twice
         [ -z "$spec" ] || set -- "$@" --spec "$spec"
+        [ -z "$sbdir" ] || set -- "$@" --secure-boot "$sbdir"
         exec nix shell nixpkgs#bc nixpkgs#mtools -c sh "$0" --out "$out" "$@"
     fi
     lacks "bc and mcopy (mtools)"
@@ -153,6 +166,11 @@ fi
 for tool in gcc make flex bison cargo flock objdump sfdisk mksquashfs veritysetup objcopy systemd-repart mkfs.vfat mkfs.ext4 qemu-img curl cpio zstd; do
     command -v "$tool" >/dev/null 2>&1 || lacks "$tool"
 done
+if [ -n "$sbdir" ]; then
+    for tool in sbsign sbverify; do
+        command -v "$tool" >/dev/null 2>&1 || lacks "$tool (sbsigntools: --secure-boot signs the boot loader and the kernel images)"
+    done
+fi
 if ! [ -r "$efi/linuxx64.efi.stub" ] || ! [ -r "$efi/systemd-bootx64.efi" ]; then lacks "systemd's EFI stub and systemd-boot in $efi"; fi
 
 mkdir -p "$out" "$cache"
@@ -243,9 +261,11 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
         fwextra=$globs
         limit=$((4096 * 1024 * 1024))
     elif [ -n "$globs" ]; then
+        # shellcheck disable=SC2116,SC2086 # (the echo joins the lines of a list; globbing is off)
         case " $(echo $globs) " in *" all "*) die "--spec: firmware: [all] is for a kernel with modules (os/examples/all.yaml)" ;; esac
         # (The tarball is 640 MB, read once per new list of files: what it gave is kept.)
         if [ "$(cat "$fwdir/.kith-globs" 2>/dev/null)" != "$globs" ]; then
+            # shellcheck disable=SC2116,SC2086
             echo "build.sh: firmware from linux-firmware $firmware_date: $(echo $globs)" >&2
             fetch "$firmware_url" "$firmware_sha256" "$cache/linux-firmware-$firmware_date.tar.xz"
             [ ! -d "$fwdir" ] || find "$fwdir" -delete
@@ -445,6 +465,7 @@ if [ -n "$modules" ]; then
     fwlist=$cache/kernel-$key/firmware-$(printf 'links2\n%s\n%s\n' "$firmware_sha256" "$fwextra" | sha256sum | cut -c 1-16).list
     if ! [ -s "$fwlist" ]; then
         set -f
+        # shellcheck disable=SC2116,SC2086
         case " $(echo $fwextra) " in
         # (Every file and every link, a link to a directory too: not what is under one.)
         *" all "*) (cd "$fwall" && find . \( -type f -o -type l \) ! -name '.kith-*' | sed 's|^\./||' | LC_ALL=C sort) >"$fwlist.part" ;;
@@ -583,6 +604,16 @@ assemble() { # DIR
     # slots by it, and a node told to go to an older release would never start it. The
     # order is the N in the file's name, which the node gives it: crates/kithd/src/os.rs.)
     printf 'NAME="kith OS"\nID=kith\nPRETTY_NAME="kith OS"\n' >"$w/osrel"
+    # With --secure-boot: the owner's db key signs the file and the owner's certificate must
+    # verify it, so a file the firmware would refuse is never put in an ESP or an update.
+    # (The signature is added after the sections are, so the hashes above do not change.)
+    sign() { # FILE
+        [ -z "$sbdir" ] || {
+            sbsign --key "$sbdir/db.key" --cert "$sbdir/db.crt" --output "$1.signed" "$1" >/dev/null || die "sbsign could not sign $1"
+            mv "$1.signed" "$1"
+            sbverify --cert "$sbdir/db.crt" "$1" >/dev/null || die "$1 does not verify against $sbdir/db.crt"
+        }
+    }
     cmdline() { # SLOT BLOCKS HASH
         table="root,,,ro,0 $(($2 * 8)) verity 1 PARTLABEL=root-$1 PARTLABEL=verity-$1 4096 4096 $2 1 sha256 $3 $salt"
         printf '%s' "console=ttyS0 console=tty0 dm-mod.create=\"$table\" dm-mod.waitfor=PARTLABEL=root-$1,PARTLABEL=verity-$1 root=/dev/dm-0 ro rootwait kith.slot=$1"
@@ -594,6 +625,7 @@ assemble() { # DIR
             --add-section .cmdline="$w/cmdline-$slot" --change-section-vma .cmdline=0x14dfd0000 \
             --add-section .linux="$kernel" --change-section-vma .linux=0x14e000000 \
             "$efi/linuxx64.efi.stub" "$w/kith-$slot.efi"
+        sign "$w/kith-$slot.efi"
         touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-$slot.efi"
     done
     # The installer's: slot a's, told to install and not to serve (crates/kithd/src/install.rs),
@@ -609,6 +641,7 @@ assemble() { # DIR
         --add-section .cmdline="$w/cmdline-install" --change-section-vma .cmdline=0x14dfd0000 \
         --add-section .linux="$kernel" --change-section-vma .linux=0x14e000000 \
         "$efi/linuxx64.efi.stub" "$w/kith-install.efi"
+    sign "$w/kith-install.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-install.efi"
     # What tells a node a kithd-only update from a full one (the header's `kithd` object,
     # crates/kithd/src/os.rs): the digests of kithd; of the boot file but for the root's own
@@ -630,6 +663,7 @@ assemble() { # DIR
     printf 'timeout 0\neditor no\n' >"$w/loader.conf"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/loader.conf"
     cp -p "$efi/systemd-bootx64.efi" "$w/boot.efi"
+    sign "$w/boot.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/boot.efi"
     mmd -i "$w/esp.img" ::EFI ::EFI/BOOT ::EFI/Linux ::loader
     mcopy -m -i "$w/esp.img" "$w/boot.efi" ::EFI/BOOT/BOOTX64.EFI
