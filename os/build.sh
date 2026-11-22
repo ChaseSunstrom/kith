@@ -90,7 +90,10 @@ while [ $# -gt 0 ]; do
     --check) check=1; shift ;;
     --twice) twice=1; shift ;;
     --spec)
-        [ $# -ge 2 ] && [ -f "$2" ] && [ -r "$2" ] || { echo "build.sh: --spec needs a file it can read" >&2; exit 2; }
+        if ! { [ $# -ge 2 ] && [ -f "$2" ] && [ -r "$2" ]; }; then
+            echo "build.sh: --spec needs a file it can read" >&2
+            exit 2
+        fi
         spec=$(realpath "$2"); shift 2 ;;
     --out)
         [ $# -ge 2 ] || { echo "build.sh: --out needs a directory" >&2; exit 2; }
@@ -211,7 +214,7 @@ if [ -n "$spec" ]; then
     for f in $(spec_list features); do
         case $f in *[!a-z0-9-]*) die "--spec: '$f' is not a feature's name" ;; esac
         [ -r "$root/os/features/$f.config" ] ||
-            die "--spec: no feature '$f' (os/features has: $(cd "$root/os/features" && ls | sed 's/\.config$//' | tr '\n' ' '))"
+            die "--spec: no feature '$f' (os/features has: $(cd "$root/os/features" && for c in *.config; do printf '%s ' "${c%.config}"; done))"
         # (uhid-test puts /dev/uhid in the kernel: only for the image of the fido2 test, which
         # has the software key that opens it, and which ships nowhere.)
         [ "$f" != uhid-test ] || [ "$out" = "$root/target/os-fido2" ] ||
@@ -243,9 +246,11 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
         fwextra=$globs
         limit=$((4096 * 1024 * 1024))
     elif [ -n "$globs" ]; then
+        # shellcheck disable=SC2116,SC2086 # (the unquoted echo squeezes the list's blanks: kept)
         case " $(echo $globs) " in *" all "*) die "--spec: firmware: [all] is for a kernel with modules (os/examples/all.yaml)" ;; esac
         # (The tarball is 640 MB, read once per new list of files: what it gave is kept.)
         if [ "$(cat "$fwdir/.kith-globs" 2>/dev/null)" != "$globs" ]; then
+            # shellcheck disable=SC2116,SC2086 # (as above: the unquoted echo squeezes the blanks)
             echo "build.sh: firmware from linux-firmware $firmware_date: $(echo $globs)" >&2
             fetch "$firmware_url" "$firmware_sha256" "$cache/linux-firmware-$firmware_date.tar.xz"
             [ ! -d "$fwdir" ] || find "$fwdir" -delete
@@ -360,7 +365,10 @@ if ! [ -r "$kernel" ]; then
             have=$(modinfo -F sig_key "$sample" | hexid)
             serial=$(openssl x509 -inform DER -in certs/signing_key.x509 -noout -serial | sed 's/^serial=//' | hexid)
             ski=$(openssl x509 -inform DER -in certs/signing_key.x509 -noout -ext subjectKeyIdentifier | sed -n 2p | hexid)
-            [ -n "$have" ] && [ -n "$(modinfo -F signer "$sample")" ] || { echo "build.sh: amdgpu.ko has no signer: $(modinfo "$sample" | tail -n 5)" >&2; exit 1; }
+            if ! { [ -n "$have" ] && [ -n "$(modinfo -F signer "$sample")" ]; }; then
+                echo "build.sh: amdgpu.ko has no signer: $(modinfo "$sample" | tail -n 5)" >&2
+                exit 1
+            fi
             [ "$have" = "$serial" ] || [ "$have" = "$ski" ] ||
                 { echo "build.sh: amdgpu.ko is signed by $have, which is not the kernel's key (serial $serial, id $ski)" >&2; exit 1; }
             for f in nvidia nvidia-modeset nvidia-uvm nvidia-drm; do
@@ -454,6 +462,7 @@ if [ -n "$modules" ]; then
     fwlist=$cache/kernel-$key/firmware-$(printf 'links2\n%s\n%s\n' "$firmware_sha256" "$fwextra" | sha256sum | cut -c 1-16).list
     if ! [ -s "$fwlist" ]; then
         set -f
+        # shellcheck disable=SC2116,SC2086 # (as above: the unquoted echo squeezes the blanks)
         case " $(echo $fwextra) " in
         # (Every file and every link, a link to a directory too: not what is under one.)
         *" all "*) (cd "$fwall" && find . \( -type f -o -type l \) ! -name '.kith-*' | sed 's|^\./||' | LC_ALL=C sort) >"$fwlist.part" ;;
@@ -666,7 +675,9 @@ assemble() { # DIR
     rootsz=88M veritysz=4M
     if [ -n "$modules" ]; then
         s=$(stat -c %s "$w/root.squashfs")
+        # shellcheck disable=SC2017 # (whole MiB first, then a quarter more: the sizes the images were made with)
         rootsz=$((s / 1048576 * 5 / 4 + 64))M
+        # shellcheck disable=SC2017 # (same)
         veritysz=$(($(stat -c %s "$w/root.verity") / 1048576 * 5 / 4 + 4))M
     fi
     part 10-esp esp esp 64M "CopyBlocks=$w/esp.img"
