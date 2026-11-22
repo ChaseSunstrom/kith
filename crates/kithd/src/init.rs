@@ -717,6 +717,8 @@ pub struct Boot {
     asking: Vec<kith_mesh::Card>,
     /// The link indexes there at boot, the first card (with a command line's address) too.
     seen: Vec<u32>,
+    /// The card a command line's address was given to, to give it again if it comes back.
+    fixed: Option<Fixed>,
     dns: Option<IpAddr>,
     slot: Option<char>,
     /// kithd's arguments from the node's config partition: ahead of the command line's.
@@ -745,9 +747,11 @@ impl Boot {
     pub fn network(self) {
         power_button();
         for card in self.asking {
-            tokio::spawn(crate::dhcp::keep(card, self.name.clone(), got(self.dns)));
+            tokio::spawn(crate::dhcp::keep(card, self.name.clone(), got(self.dns, false), || {
+                true
+            }));
         }
-        tokio::spawn(rescan(self.seen, self.name.clone(), self.dns));
+        tokio::spawn(rescan(self.seen, self.fixed, self.name.clone(), self.dns));
         let Some(slot) = self.slot else { return };
         // ponytail: good means kithd started, has its state to use, and is still running a
         // little later (one that cannot start ends, and the machine restarts, well within
@@ -765,17 +769,96 @@ impl Boot {
     }
 }
 
+/// What the node has been given by a network or its command line: a way out (default
+/// route), name servers, time servers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Has {
+    way: bool,
+    dns: bool,
+    ntp: bool,
+}
+
+static HAS: std::sync::Mutex<Has> = std::sync::Mutex::new(Has {
+    way: false,
+    dns: false,
+    ntp: false,
+});
+
+fn held() -> std::sync::MutexGuard<'static, Has> {
+    HAS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What a lease may set. Any, from the cards of the boot; from a card that came after it
+/// (a rogue USB card on a wire is one), only what the node has none of: its address and
+/// the on-link route are the card's own, the default route, the name servers and the time
+/// servers are the node's.
+fn may(late: bool, has: Has) -> Has {
+    Has {
+        way: !late || !has.way,
+        dns: !late || !has.dns,
+        ntp: !late || !has.ntp,
+    }
+}
+
+/// What the node has once a lease set what it `may` of what the lease `gave`.
+fn took(has: Has, may: Has, gave: Has) -> Has {
+    Has {
+        way: has.way || (may.way && gave.way),
+        dns: has.dns || (may.dns && gave.dns),
+        ntp: has.ntp || (may.ntp && gave.ntp),
+    }
+}
+
 /// What a lease changes on this node. (A name server on the command line is one the
-/// network's own may not replace.)
-fn got(told: Option<IpAddr>) -> impl Fn(&crate::dhcp::Lease) + Send + 'static {
+/// network's own may not replace.) A card that came `late` changes only what [`may`] allows.
+fn got(told: Option<IpAddr>, late: bool) -> impl Fn(&crate::dhcp::Lease) + Send + 'static {
     move |lease| {
         let _ = ADDRESS.set(lease.address);
-        crate::clock::learn(&lease.ntp, lease.router);
-        match told {
-            Some(server) => resolvers(&[server]),
-            None => resolvers(&lease.dns.iter().copied().map(IpAddr::from).collect::<Vec<_>>()),
+        let servers: Vec<IpAddr> = match told {
+            Some(server) => vec![server],
+            None => lease.dns.iter().copied().map(IpAddr::from).collect(),
+        };
+        let gave = Has {
+            way: lease.router.is_some(),
+            dns: !servers.is_empty(),
+            ntp: !lease.ntp.is_empty() || lease.router.is_some(),
+        };
+        let mut has = held();
+        let may = may(late, *has);
+        if may.ntp {
+            crate::clock::learn(&lease.ntp, lease.router.filter(|_| may.way));
         }
+        if may.dns && (gave.dns || !late) {
+            resolvers(&servers);
+        }
+        *has = took(*has, may, gave);
     }
+}
+
+/// May a lease of a card that came after the boot set the default route?
+fn way_for_late() -> bool {
+    may(true, *held()).way
+}
+
+/// The command line's address, and the card it was given to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Fixed {
+    mac: [u8; 6],
+    ip: (Ipv4Addr, u8, Option<Ipv4Addr>),
+}
+
+/// The address a card that came late is to have from the command line, not from a network:
+/// the card that was given it, plugged in again (it has the same MAC, and no other card
+/// of `found` has: a second one with it asks its network like any other).
+fn fixed_for(
+    card: &kith_mesh::Card,
+    found: &[kith_mesh::Card],
+    fixed: Option<Fixed>,
+) -> Option<(Ipv4Addr, u8, Option<Ipv4Addr>)> {
+    let alone = found.iter().filter(|other| other.mac == card.mac).count() == 1;
+    fixed
+        .filter(|fixed| alone && fixed.mac == card.mac)
+        .map(|fixed| fixed.ip)
 }
 
 /// The cards in `found` that came after `seen` (link indexes) and are physical: a USB or
@@ -806,7 +889,7 @@ fn physical(card: &kith_mesh::Card) -> bool {
 //
 // ponytail: a dump of a few links every 5 s, not the kernel's link messages (a netlink
 // multicast socket in kith-mesh): that is for a machine that needs it sooner.
-async fn rescan(mut seen: Vec<u32>, name: String, dns: Option<IpAddr>) {
+async fn rescan(mut seen: Vec<u32>, fixed: Option<Fixed>, name: String, dns: Option<IpAddr>) {
     let mut asking = std::collections::HashMap::<u32, tokio::task::AbortHandle>::new();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -824,12 +907,26 @@ async fn rescan(mut seen: Vec<u32>, name: String, dns: Option<IpAddr>) {
                 eprintln!("kithd: init: bringing {} up: {e}", card.name);
                 continue;
             }
+            seen.push(card.index);
+            if let Some((address, bits, gateway)) = fixed_for(&card, &found, fixed) {
+                match kith_mesh::address4(card.index, address, bits, gateway) {
+                    Ok(()) => eprintln!(
+                        "kithd: init: {} came after boot: it has {address}/{bits} from the command line",
+                        card.name
+                    ),
+                    Err(e) => {
+                        // (Not seen: the next scan gives it again.)
+                        seen.retain(|seen| *seen != card.index);
+                        eprintln!("kithd: init: giving {} {address}/{bits}: {e}", card.name);
+                    }
+                }
+                continue;
+            }
             eprintln!(
                 "kithd: init: {} came after boot: asking its network for an address",
                 card.name
             );
-            seen.push(card.index);
-            let keep = crate::dhcp::keep(card.clone(), name.clone(), got(dns));
+            let keep = crate::dhcp::keep(card.clone(), name.clone(), got(dns, true), way_for_late);
             asking.insert(card.index, tokio::spawn(keep).abort_handle());
         }
     }
@@ -838,12 +935,12 @@ async fn rescan(mut seen: Vec<u32>, name: String, dns: Option<IpAddr>) {
 /// Links up, and the address the command line gives the first card. The cards returned
 /// are left to ask their networks: all of them, or with such an address all but the first.
 /// And the link indexes seen, for the scan of cards that come later ([`rescan`]).
-fn links(options: &Options) -> (Vec<kith_mesh::Card>, Vec<u32>) {
+fn links(options: &Options) -> (Vec<kith_mesh::Card>, Vec<u32>, Option<Fixed>) {
     let (cards, loopback) = match kith_mesh::cards() {
         Ok(found) => found,
         Err(e) => {
             eprintln!("kithd: init: listing the network cards: {e}");
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), None);
         }
     };
     let seen: Vec<u32> = cards.iter().map(|card| card.index).collect();
@@ -863,10 +960,19 @@ fn links(options: &Options) -> (Vec<kith_mesh::Card>, Vec<u32>) {
             Err(e) => eprintln!("kithd: init: giving {} {address}/{bits}: {e}", card.name),
         }
         resolvers(&options.dns.into_iter().collect::<Vec<_>>());
+        *held() = Has {
+            way: gateway.is_some(),
+            dns: options.dns.is_some(),
+            ntp: gateway.is_some(),
+        };
+        let fixed = Fixed {
+            mac: card.mac,
+            ip: (address, bits, gateway),
+        };
         // (The other cards still ask their networks: a second network is not the first's.)
-        return (cards.into_iter().skip(1).collect(), seen);
+        return (cards.into_iter().skip(1).collect(), seen, Some(fixed));
     }
-    (cards, seen)
+    (cards, seen, None)
 }
 
 /// What kithd says goes to every console the kernel has (a screen and a serial line, say),
@@ -1112,10 +1218,11 @@ pub fn early(again: bool) -> Boot {
         }
     }
     eprintln!("kithd: init: {name} is up");
-    let (asking, seen) = links(&options);
+    let (asking, seen, fixed) = links(&options);
     Boot {
         asking,
         seen,
+        fixed,
         dns: options.dns,
         slot: options.slot.filter(|_| !installing),
         name,
@@ -1298,6 +1405,61 @@ mod tests {
         assert_eq!(indexes(&late(&[1], &found, |_| true)), [2]);
         // eth1 is unplugged: its index is gone from the dump, and eth0's is not.
         assert_eq!(gone(&[1, 2], &found[..1]), [2]);
+    }
+
+    #[test]
+    fn init_late_card_lease_sets_only_what_the_node_has_none_of() {
+        let all = Has {
+            way: true,
+            dns: true,
+            ntp: true,
+        };
+        let none = Has::default();
+        // The cards of the boot set what they are given, whatever is set.
+        assert_eq!(may(false, all), all);
+        assert_eq!(may(false, none), all);
+        // A node with a way out, name servers and time servers: a late card sets none of them.
+        assert_eq!(may(true, all), none);
+        // A node with none of them: it may.
+        assert_eq!(may(true, none), all);
+        // A node with a way out and no name servers: only the name servers (and the time).
+        let way = Has { way: true, ..none };
+        let only = may(true, way);
+        assert_eq!(
+            only,
+            Has {
+                way: false,
+                dns: true,
+                ntp: true
+            }
+        );
+        // What the node has after: what it had, and what the lease gave of what it may set.
+        assert_eq!(took(way, only, all), all);
+        assert_eq!(took(all, may(true, all), all), all);
+        assert_eq!(took(none, may(true, way), Has { way: true, ..none }), none);
+        assert_eq!(
+            took(none, may(false, none), Has { dns: true, ..none }),
+            Has { dns: true, ..none }
+        );
+    }
+
+    #[test]
+    fn init_late_card_with_the_static_cards_mac_gets_the_static_config() {
+        let ip = (Ipv4Addr::new(10, 0, 0, 5), 24, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        let fixed = Some(Fixed { mac: [1; 6], ip });
+        let (first, other) = (card(1, "eth0"), card(2, "eth1"));
+        // The first card plugged in again (another index, the same MAC): the command line's address.
+        let back = kith_mesh::Card {
+            index: 7,
+            ..first.clone()
+        };
+        assert_eq!(fixed_for(&back, &[back.clone(), other.clone()], fixed), Some(ip));
+        // Another card, or no address on the command line: its network's.
+        assert_eq!(fixed_for(&other, &[back.clone(), other.clone()], fixed), None);
+        assert_eq!(fixed_for(&back, &[back.clone()], None), None);
+        // Two cards with that MAC: neither is given it.
+        let twin = kith_mesh::Card { index: 8, ..first };
+        assert_eq!(fixed_for(&back, &[back.clone(), twin], fixed), None);
     }
 
     #[test]

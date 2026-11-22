@@ -228,12 +228,13 @@ fn frame(mac: [u8; 6], message: &[u8]) -> Vec<u8> {
 /// Keep `card` addressed for as long as this process lives: ask, put the address on it
 /// (`got` is told each one), ask again halfway through the lease; until a server answers,
 /// every few seconds, then every minute. (A task of kithd's one thread, not a thread of
-/// its own: kithd forks containers.)
-pub async fn keep(card: Card, hostname: String, got: impl Fn(&Lease)) {
+/// its own: kithd forks containers.) The lease's router becomes the default route only
+/// where `way` says so (a card that came after boot may not replace the node's: init.rs).
+pub async fn keep(card: Card, hostname: String, got: impl Fn(&Lease), way: impl Fn() -> bool) {
     let (mut wait, mut had) = (1, None);
     loop {
         let lease = ask(&card, &hostname).await.and_then(|lease| {
-            kith_mesh::address4(card.index, lease.address, lease.bits, lease.router)?;
+            kith_mesh::address4(card.index, lease.address, lease.bits, lease.router.filter(|_| way()))?;
             Ok(lease)
         });
         let pause = match lease {
