@@ -214,6 +214,30 @@ missing file) is one console line, never an end. Not supported: module parameter
 `modprobe.d` (blacklists, options), soft dependencies. Compressed modules (`.ko.xz`,
 `.zst`) are loaded by the kernel itself, from 5.17, if it was built to.
 
+#### Modules on the state partition: `# modules: state`
+
+```sh
+sh ci/vm.sh --test modules-state   # the image loads virtio-input from it; six tampered disks load nothing
+```
+
+A feature whose first line is `# modules: state` (`os/features/modules-state-test.config` is the
+test's) keeps its modules and the firmware they name out of the root. `build.sh` packs them into
+`kith-modules.img` (squashfs, zstd) with a dm-verity tree (`kith-modules.img.verity`), and the
+raw image's state partition carries both as `os/modules-a.img(.verity)`. The root, which the
+UKI's verity hash covers, pins the tree's root hash, its salt and both sizes in
+`/usr/share/kith/modules`, so the chain is the same as the root's: nothing on the state
+partition is trusted for what it says, only for its bytes, and those are checked against a hash
+the root holds. After the state mounts, kithd takes the slot's image (`kith.slot` on the command
+line), opens it without following a link and with the pinned size, attaches it read-only to
+loop devices, maps dm-verity with the pinned hash, mounts the squashfs at `/run/kith/modules`
+(read-only, nosuid, nodev), points `firmware_class.path` at its `lib/firmware`, and runs the
+loader above over its `lib/modules`. A missing, altered, longer, linked or other build's image
+loads nothing: one console line (`kithd: init: modules: ...`) and the Node's status (`modules`)
+say why, and the node serves as before. The disk and the network come up before the state, so
+`build.sh` refuses a block or network driver as a module in such a spec, at the config and
+again over the modules built, and a `.ko` in the root fails the build. Not here: the update path
+(an update's slot-b image), NVIDIA's modules.
+
 ### Updating a node: two slots
 
 ```sh

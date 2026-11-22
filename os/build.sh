@@ -241,6 +241,7 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
     # modules built are asked again, in assemble).
     if [ -n "$mstate" ]; then
         [ -n "$modules" ] || die "--spec: '# modules: state' is for a kernel with modules (CONFIG_MODULES=y)"
+        ! spec_list features | grep -qx all || die "--spec: '# modules: state' and 'all' do not go together (all keeps its modules in the root)"
         netblk=$(grep -E '^CONFIG_(VIRTIO_(BLK|NET)|BLK_DEV[A-Z0-9_]*|NVME[A-Z0-9_]*|ATA[A-Z0-9_]*|SATA_[A-Z0-9_]*|PATA_[A-Z0-9_]*|SCSI[A-Z0-9_]*|MMC[A-Z0-9_]*|USB_STORAGE|MD[A-Z0-9_]*|DM_[A-Z0-9_]*|EXT4_FS|SQUASHFS[A-Z0-9_]*|NETDEVICES|ETHERNET|NET_VENDOR_[A-Z0-9_]*|E1000E?|IGBV?F?|IGC|IXGBEV?F?|R8169|TIGON3|BNX2X?|MLX[45][A-Z0-9_]*|ATL1[A-Z0-9_]*|ALX|WLAN[A-Z0-9_]*)=m$' "$kconfig" | head -n 1) || true
         [ -z "$netblk" ] || die "--spec: '# modules: state' with a block or network driver as a module ($netblk): the disk and the network come up before the state does"
     fi
@@ -407,7 +408,12 @@ else
     grep -qxF '# CONFIG_UHID is not set' "$built" ||
         die "a shipped kernel's .config must say '# CONFIG_UHID is not set' (only --spec with the feature uhid-test has /dev/uhid): $(grep 'CONFIG_UHID' "$built" || echo 'no CONFIG_UHID line')"
 fi
-if [ -n "$modules" ]; then
+# (Modules on state that name no firmware: linux-firmware's 640 MB is not fetched for them.)
+mfw=$modules
+if [ -n "$mstate" ]; then
+    [ -n "$({ find "$mods/lib/modules" -name '*.ko' -exec modinfo -F firmware {} + ; echo "$fwextra"; } | tr -d ' \n')" ] || mfw=''
+fi
+if [ -n "$mfw" ]; then
     # What the modules ask for, from linux-firmware: the whole of it for `all`, and the files
     # named in the spec. The list is kept; the tarball (640 MB) is read once, into a tree.
     fwall=$cache/firmware-$firmware_date-all
@@ -434,7 +440,7 @@ if [ -n "$modules" ]; then
     # release's .run (423 MB, a shell header and a zstd tar behind it, the line it starts at in
     # `skip=`), of which only they are kept. The .run is the file pinned above.
     nvfw=$cache/nvidia-firmware-$nvidia_version
-    if ! [ -e "$nvfw/.kith-done" ]; then
+    if [ -z "$mstate" ] && ! [ -e "$nvfw/.kith-done" ]; then
         echo "build.sh: NVIDIA $nvidia_version's GSP firmware" >&2
         fetch "$nvidia_run_url" "$nvidia_run_sha256" "$cache/nvidia-$nvidia_version.run"
         skip=$(sed -n '2,20s/^skip=\([0-9][0-9]*\)$/\1/p' "$cache/nvidia-$nvidia_version.run")
@@ -531,8 +537,46 @@ assemble() { # DIR
     truncate -s 64M "$r/usr/share/kith/data.ext4"
     E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -b 4096 -N 4096 -J size=16 -L kith-data -U "$seed" \
         -E "hash_seed=$seed,root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0,resize=1073741824" "$r/usr/share/kith/data.ext4" >&2
-    msize=0 fsize=0
-    if [ -n "$modules" ]; then
+    msize=0 fsize=0 mimg=0 rootmods=$modules
+    if [ -n "$mstate" ]; then
+        # Modules on the state partition: not in the root. Their own squashfs and verity tree,
+        # which the root pins (hash, salt, sizes: /usr/share/kith/modules) and the state
+        # partition carries as os/modules-a.img and os/modules-a.img.verity; kithd maps it
+        # through dm-verity once the state is mounted (crates/kithd/src/modules.rs).
+        rootmods=''
+        [ -r "$mods/lib/modules/$(ls "$mods/lib/modules")/modules.alias" ] || die "$mods has no modules: the kernel in the cache is not this build's"
+        # (The config was asked in --spec; the modules built are asked here: not one of the disk,
+        # the network, the root's file systems or dm-verity, which are up before the state is.)
+        bad=$(find "$mods/lib/modules" -name '*.ko' | grep -E '/kernel/(drivers/(block|net|ata|nvme|scsi|mmc|md|usb/storage)|fs/(ext4|squashfs|jbd2|overlayfs))' | head -n 3) || true
+        [ -z "$bad" ] || die "'# modules: state' with a driver the state needs to be mounted, as a module: $bad"
+        mi=$w/modules-image
+        mkdir -p "$mi/lib/firmware"
+        cp -a "$mods/lib/modules" "$mi/lib/modules"
+        if [ -n "$mfw" ]; then
+            (cd "$fwall" && cpio -pd --quiet "$mi/lib/firmware") <"$fwlist"
+            find "$mi/lib/firmware" -xtype l -delete
+        fi
+        find "$mi/lib/firmware" -maxdepth 0 -empty -delete
+        find "$mi/lib" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+        [ -z "$(find "$mi" \( -name '*.pem' -o -name 'signing_key*' \))" ] || die "a key is in the modules image"
+        ! grep -rlaE -e '-----BEGIN [A-Z ]*PRIVATE KEY' "$mi/lib/modules" || die "a private key is in the modules"
+        msize=$(du -sb "$mi/lib/modules" | cut -f 1)
+        fsize=$(du -sb "$mi/lib/firmware" 2>/dev/null | cut -f 1) || fsize=0
+        fsize=${fsize:-0}
+        chmod -R u=rwX,go=rX "$mi"
+        mksquashfs "$mi" "$w/kith-modules.img" -comp zstd -Xcompression-level 19 -all-root -noappend -no-xattrs -quiet -no-progress
+        veritysetup format "$w/kith-modules.img" "$w/kith-modules.img.verity" --salt="$salt" --uuid="$seed" >"$w/verity-modules.txt"
+        mhash=$(awk '/^Root hash/ { print $3 }' "$w/verity-modules.txt")
+        mimg=$(stat -c %s "$w/kith-modules.img")
+        [ -n "$mhash" ] && [ $((mimg % 4096)) -eq 0 ] || die "the modules image: no root hash, or not whole blocks"
+        printf 'hash=%s\nsalt=%s\nsize=%s\nverity=%s\n' "$mhash" "$salt" "$mimg" "$(stat -c %s "$w/kith-modules.img.verity")" >"$r/usr/share/kith/modules"
+        # (Where repart's CopyFiles= takes them from.)
+        mkdir -p "$w/state-files/os"
+        cp "$w/kith-modules.img" "$w/state-files/os/modules-a.img"
+        cp "$w/kith-modules.img.verity" "$w/state-files/os/modules-a.img.verity"
+        find "$mi" -delete
+    fi
+    if [ -n "$rootmods" ]; then
         # The modules (signed, with depmod's index and the list of what is built in, so the
         # loader skips those) and the firmware they name, in the root: it is checked block
         # by block, and the 64 MB ESP stays as it is.
@@ -567,6 +611,8 @@ assemble() { # DIR
         msize=$(du -sb "$r/lib/modules" | cut -f 1)
         fsize=$(du -sb "$r/lib/firmware" | cut -f 1)
     fi
+    # (Modules on state are not in the root, not one: they are checked there, or not loaded.)
+    [ -z "$mstate" ] || [ -z "$(find "$r" \( -name '*.ko' -o -name '*.ko.*' \))" ] || die "a .ko is in the root of a build with modules on state: $(find "$r" -name '*.ko*' | head -n 3)"
     chmod -R u=rwX,go=rX "$r"
     mksquashfs "$r" "$w/root.squashfs" -comp zstd -Xcompression-level 19 -all-root -noappend -no-xattrs -quiet -no-progress
     veritysetup format "$w/root.squashfs" "$w/root.verity" --salt="$salt" --uuid="$seed" >"$w/verity.txt"
@@ -658,7 +704,7 @@ assemble() { # DIR
     # (88 MB and 4 MB; with modules, the root's size and a quarter more and 64 MB, and its
     # tree's size and 4 MB, for the next version to be bigger.)
     rootsz=88M veritysz=4M
-    if [ -n "$modules" ]; then
+    if [ -n "$rootmods" ]; then
         s=$(stat -c %s "$w/root.squashfs")
         rootsz=$((s / 1048576 * 5 / 4 + 64))M
         veritysz=$(($(stat -c %s "$w/root.verity") / 1048576 * 5 / 4 + 4))M
@@ -675,7 +721,14 @@ assemble() { # DIR
     # node's first start there (crates/kithd/src/gpt.rs). Its file system grows with it,
     # 128 MB at a time, each with as many inodes as this first part has: 8192, one for
     # every 16 KiB, which is what the images of containers need.)
-    part 40-state linux-generic state 32M "Format=ext4"
+    # (With modules on state: room for the image and its tree, and the 32 MB. Its files are
+    # put in by repart as os/modules-a.img(+.verity), the slot a system's; slot b's comes with an update.)
+    statesz=32M statefiles=''
+    if [ -n "$mstate" ]; then
+        statesz=$((($(stat -c %s "$w/kith-modules.img") + $(stat -c %s "$w/kith-modules.img.verity")) / 1048576 + 33))M
+        statefiles="CopyFiles=$w/state-files/os:/os"
+    fi
+    part 40-state linux-generic state "$statesz" "Format=ext4" $statefiles
     # (project: each pod's writable files are a project of their own, and quota keeps
     # the count and the limit of each: T-0470.)
     SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-N 8192 -O quota,project' systemd-repart --empty=create --size=auto --dry-run=no --seed="$seed" --definitions="$d" "$w/kith-os.raw" >"$w/repart.log" 2>&1 \
@@ -700,7 +753,7 @@ assemble() { # DIR
     # file. The kernel unpacks it and starts /init: no disk is needed to get there.
     i=$w/initramfs
     mkdir "$i"
-    if [ -n "$modules" ]; then
+    if [ -n "$rootmods" ]; then
         # (Not the modules and the firmware: it installs the image it carries, it runs nothing.)
         for e in "$r"/*; do [ "$e" = "$r/lib" ] || cp -a "$e" "$i/"; done
     else
@@ -738,13 +791,14 @@ assemble() { # DIR
         "$efi/linuxx64.efi.stub" "$w/kith-netboot.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-netboot.efi"
     # (With the firmware the root dir is a GB the image has: kept only where it is small.)
-    [ -z "$modules" ] || find "$r" -delete
+    [ -z "$rootmods" ] || find "$r" -delete
 }
 
 assemble "$out"
 size=$(stat -c %s "$out/kith-os.raw")
 sizes="kernel $kernel_version, $(($(stat -c %s "$kernel") / 1024 / 1024)) MB; root $(($(stat -c %s "$out/root.squashfs") / 1024 / 1024)) MB"
 [ -z "$modules" ] || sizes="$sizes (modules $((msize / 1024 / 1024)) MB and firmware $((fsize / 1024 / 1024)) MB, before compression)"
+[ -z "$mstate" ] || sizes="$sizes; modules image $(stat -c %s "$out/kith-modules.img") bytes and its tree $(stat -c %s "$out/kith-modules.img.verity"), on the state partition"
 echo "build.sh: $out/kith-os.raw: $((size / 1024 / 1024)) MB ($(($(stat -c %s "$out/kith-os.qcow2") / 1024 / 1024)) MB as qcow2); $sizes"
 if [ -n "$check" ]; then
     [ "$size" -lt "$limit" ] || die "the image is $size bytes: over $((limit / 1024 / 1024)) MB"
@@ -753,6 +807,9 @@ fi
 if [ -n "$twice" ]; then
     assemble "$out/again"
     for piece in root.squashfs root.verity kith-a.efi kith-b.efi kith-install.efi kith-os.update esp.img kith-os.raw kith-os-installer.raw kith-install.cpio.zst kith-netboot.efi; do
+        cmp "$out/$piece" "$out/again/$piece" || die "$piece differs between two builds"
+    done
+    [ -z "$mstate" ] || for piece in kith-modules.img kith-modules.img.verity; do
         cmp "$out/$piece" "$out/again/$piece" || die "$piece differs between two builds"
     done
     find "$out/again" -delete

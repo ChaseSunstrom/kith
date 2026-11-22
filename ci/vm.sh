@@ -72,6 +72,8 @@
 #   sh ci/vm.sh --test fido2    the client of kithd against a software security key (the fido2-test
 #                               build) through the kernel's uhid and hidraw: the hmac-secret each seed
 #                               says it must be, another seed another secret, a withheld touch timing out
+#   sh ci/vm.sh --test modules-state   a driver kept in a dm-verity image on the state partition is
+#                               loaded at start; a changed, swapped, longer, shorter or absent image loads nothing
 #   sh ci/vm.sh --test policy   two nodes whose policy turns off exec units, VM paths and /v1/run: kithd
 #                               cut its bounding set, and a pod that is root, a container with no filter
 #                               and a sandbox inside a container still run
@@ -332,6 +334,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    seconds are printed), and two cards are never heard answering at
                    once, not when the stopped one goes on again; needs socat and
                    python3 as --test chaos does
+  --test modules-state  instead: an image whose one driver (virtio-rng) is a module kept in a
+                   dm-verity image on the state partition, which the root pins: kithd loads
+                   it at start; the same disk with a changed byte, another build's .verity
+                   alone, an image a block longer or shorter, another build's image and
+                   .verity, or none, loads nothing and says why; build.sh refuses a block
+                   or network driver as a module of such a feature, and the root holds no
+                   .ko; same needs as image, and the image is built (a kernel, once)
   --test fido2     instead: the image of a kithd built with the cargo feature fido2-test
                    (and a kernel with /dev/uhid), one machine: it makes three software
                    security keys on uhid in turn and runs the client against each through
@@ -416,7 +425,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | nested | nofile | alone | disk | clock | clockleader | encrypt | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, clock, clockleader, disk, encrypt, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, nested, nofile, fido2" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | modules-state | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | nested | nofile | alone | disk | clock | clockleader | encrypt | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, modules-state, clock, clockleader, disk, encrypt, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, nested, nofile, fido2" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1

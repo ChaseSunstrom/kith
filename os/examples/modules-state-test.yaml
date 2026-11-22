@@ -1,4 +1,4 @@
-# kith OS whose one module (virtio-rng) is on the state partition, in a dm-verity image the
+# kith OS whose one module (virtio-input) is on the state partition, in a dm-verity image the
 # root pins, not in the root: the image of ci/vm/modules-state.sh.
 #
 #   sh os/build.sh --spec os/examples/modules-state-test.yaml --out target/os-modules-state
