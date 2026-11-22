@@ -150,10 +150,20 @@ fn mounts(r: &Resource, volume: &str) -> bool {
         .any(|c| all(&c["volumeMounts"]).iter().any(|m| m["volume"] == volume))
 }
 
+/// The resource `key`, or None when the store or kithd says it is not there. Any other error
+/// (a refusal, a timeout) stays one: what could not be read is not known to be absent.
+fn lookup(backend: &Backend, key: &str) -> Result<Option<Resource>, String> {
+    match backend.get(key) {
+        Ok(r) => Ok(Some(r)),
+        Err(e) if e.ends_with(" not found") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The machine `name`: a Workload that is part of it.
 fn find(backend: &Backend, name: &str) -> Result<Resource, String> {
-    match backend.get(&key("Workload", name)) {
-        Ok(w) if mine(&w, name) => Ok(w),
+    match lookup(backend, &key("Workload", name))? {
+        Some(w) if mine(&w, name) => Ok(w),
         _ => fail(format!("no machine `{name}` (`kith machine list`)")),
     }
 }
@@ -181,9 +191,15 @@ pub fn run(command: Machine, backend: &dyn Fn() -> Result<Backend, String>) -> R
             let new = resources(&name, &image(&distro)?, &user, uid, &node, replicas)?;
             // Never over another's resource, nor a changed machine: remove it, then create.
             for r in &new {
-                if let Ok(old) = backend.get(&r.key()) {
+                if let Some(old) = lookup(&backend, &r.key())? {
                     if !mine(&old, &name) {
                         return fail(format!("{} exists and is not machine `{name}`'s", r.key()));
+                    }
+                    if old.spec != r.spec && r.kind == "Volume" {
+                        return fail(format!(
+                            "machine `{name}`'s home Volume {} exists with other settings: changing it needs `kith machine rm {name} --purge`, which deletes its data",
+                            r.metadata.name
+                        ));
                     }
                     if old.spec != r.spec {
                         return fail(format!(
@@ -230,7 +246,7 @@ pub fn run(command: Machine, backend: &dyn Fn() -> Result<Backend, String>) -> R
             let job = make(json!({
                 "apiVersion": "kith.dev/v1", "kind": "Job",
                 "metadata": { "name": job, "labels": { LABEL: name } },
-                "spec": { "template": { "containers": [container] } },
+                "spec": { "retries": 0, "template": { "containers": [container] } },
             }))?;
             for change in backend.apply(vec![job], false)? {
                 println!(
@@ -243,7 +259,7 @@ pub fn run(command: Machine, backend: &dyn Fn() -> Result<Backend, String>) -> R
         Machine::Rm { name, purge } => {
             // Whatever of it is left (a first `rm` may have stopped midway, or kept the home).
             let volume = format!("{name}-home");
-            let home = backend.get(&key("Volume", &volume)).ok();
+            let home = lookup(&backend, &key("Volume", &volume))?;
             let mut all = backend.list(Some("Workload"))?;
             all.extend(backend.list(Some("Job"))?);
             let ours: Vec<_> = all.iter().filter(|r| mine(r, &name)).collect();
@@ -266,7 +282,11 @@ pub fn run(command: Machine, backend: &dyn Fn() -> Result<Backend, String>) -> R
             }
             println!(
                 "machine {name} deleted{}",
-                if purge { "" } else { " (its home Volume stays: --purge)" }
+                if purge {
+                    String::new()
+                } else {
+                    format!(" (its home Volume {volume} stays; `kith machine rm {name} --purge` deletes it, data and all)")
+                }
             );
         }
     }
