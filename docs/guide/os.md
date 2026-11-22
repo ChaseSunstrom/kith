@@ -73,6 +73,7 @@ sh ci/vm.sh --test image   # boot a copy of it under UEFI in QEMU and check it
 | --- | --- |
 | kernel | 6.18, 13 MB, from kernel.org's source at a pinned version and checksum (`os/kernel.config`): no modules, no initramfs; NVMe, SATA, USB and SD storage, the common wired cards, virtio, WireGuard, dm-verity, dm-crypt, KVM, the IOMMU drivers (Intel and AMD). The first build takes ten minutes or so |
 | root | a read-only squashfs of about 6 MB: kithd as `/sbin/init`, `kith`, curl's CA bundle. No shell, no libc, no package manager |
+| lockdown | the kernel has no kexec (a root workload cannot load an unsigned kernel past verity and the slots) and boots locked down at integrity: no `/dev/mem` write, raw MSR, `ioperm`, unsigned module or hibernation image; `build.sh` refuses a kernel whose `.config` says otherwise |
 | verity | the root's dm-verity hash is on the command line inside the one EFI file the firmware starts (systemd's stub, the kernel, the command line), so a changed root is refused block by block |
 | disk | GPT: `esp` (systemd-boot, `kith-1-a.efi`), `root-a` and `verity-a`, `root-b` and `verity-b` (empty: an update goes there), `state` (ext4), the only partition a running node writes |
 
