@@ -1470,6 +1470,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("remote apps go through kithd: leave out --store");
             };
+            remote::watch();
             return remote::run(&kithd, &on, via.as_deref(), &argv);
         }
         Command::Logs {

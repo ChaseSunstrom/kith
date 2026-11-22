@@ -1007,6 +1007,8 @@ fn run(mut args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     if let Some(said) = runtime.as_ref().ok().and_then(|runtime| runtime.cgroup_problem()) {
         eprintln!("kithd: {said}");
     }
+    // What a kithd before left of `kith run` (before any run is made here).
+    api::run::sweep_stale(&state);
     // Started again by process 1: a container the kithd before made and did not start holds
     // its sockets (this one's address among them) until it is gone.
     if let (Ok(runtime), Some((2.., _))) = (&runtime, keeper::kept()) {
