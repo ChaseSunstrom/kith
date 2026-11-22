@@ -280,9 +280,10 @@ spare PC (a GTX 1060) and on a Ryzen's GPU:
 - **The image.** It comes from a registry (kith reaches a plain-HTTP registry only on the same
   machine), or from a stock Alpine as above, with `apk add` into the Volume so the next start
   has the packages.
-- **`status.activity`.** A session sets it (`POST /v1/seats/tv-seat0/activity?state=fullscreen`),
-  or kithd once it judges it; kithd does not set it by itself yet, so until a session does, the
-  seat shows no activity.
+- **`status.activity`.** kithd sets it: `fullscreen` while the HDMI sound plays, so `encode`
+  drops to a twentieth of a CPU as a film starts and returns about ten seconds after it stops (a
+  session may say better with a POST, as above). A seat with no sound card is judged by its
+  inputs only.
 
 ### Virtual machines
 
