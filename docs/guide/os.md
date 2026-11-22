@@ -730,6 +730,27 @@ The script refuses, with nothing done, a machine that starts by BIOS (`ls /sys/f
 tells), one with under 1 GB of memory, one without `kexec` or `cpio`, and a disk that is not
 there. A cloud that takes disk images takes `kith-os.raw` or `kith-os.qcow2`.
 
+A cloud image has no installer to tell the node its name and address. Write them into the
+image before you upload it: `os/config.sh` takes the image and the installer's answers, and writes
+the config the installer would have written for them (the hostname, `ip:`, the join token, release
+keys, `mesh:`), into the image's config partition, in place:
+
+```sh
+umask 077                                 # the copy and the answers hold the join token in plain text
+cp target/os/kith-os.raw node-a.raw
+sh os/config.sh node-a.raw answers.yaml   # nothing else in the image changes; a second call replaces the first
+qemu-img convert -O qcow2 node-a.raw node-a.qcow2
+```
+
+The image and the answers file hold the join token in plain text: keep them to yourself (the
+script makes the image readable by you alone), and delete them once the node is up. A token is good
+once, for an hour ([a cluster](cluster.md#more-than-one-node)): write the config just before you
+launch the node, and do not boot a configured image twice (a second node from it is refused).
+
+`disk:` must be in the answers and is not used. `encrypt: true` (the key is the machine's) and
+`size:` (a disk of that machine) are refused, and so is any answer the installer would refuse.
+Convert to qcow2 after writing, not before.
+
 ### Encrypted state
 
 A node's state partition (its certificates, the store, Secrets, volumes) can be kept under
