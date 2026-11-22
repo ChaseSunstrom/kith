@@ -77,7 +77,12 @@ const NETWORK_KINDS: [&str; 4] = ["AccessLevel", "RemotePeer", "NetworkPolicy", 
 
 /// The kinds a node never signs, for a message: the one list [`never_signed`] decides by.
 pub(crate) fn never_signed_kinds() -> String {
-    ACCESS_KINDS.iter().chain(&NETWORK_KINDS).copied().collect::<Vec<_>>().join(", ")
+    ACCESS_KINDS
+        .iter()
+        .chain(&NETWORK_KINDS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether `command` applies or deletes a kind of [`NETWORK_KINDS`].

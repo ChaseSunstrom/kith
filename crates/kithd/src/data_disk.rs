@@ -10,12 +10,13 @@
 //! The add's order of writes ([`add`]), what a disk is to this node ([`standing`], [`off_ours`])
 //! and the remove ([`remove`]) are here too; the mapping step is the [`Mapper`] trait, so a file
 //! and a fake show every cut of the order. The real mapper and the mount are [`seed`], the task
-//! that mounts the known disks after the state opens is [`boot`]; the verbs are T-0958's.
-// (The add and the remove are called by the verbs, the second half of T-0958: not yet.)
-#![allow(dead_code)]
+//! that mounts the known disks after the state opens is [`boot`]; the verbs (`kith node disk add`,
+//! `remove`, `list`) are [`verbs`], and what they tell the audit log is [`audit`].
 
+pub mod audit;
 pub mod boot;
 pub mod seed;
+pub mod verbs;
 
 use ring::digest;
 use std::fs::File;
@@ -59,6 +60,7 @@ pub fn write_header(clear: &Clear<impl Dev>, id: &Id) -> io::Result<()> {
 /// The id of the header at the start of `file`, or why there is none. Strict: the header is
 /// taken only when it is, byte for byte, what [`write_header`] writes for the id it names
 /// (a sum that is wrong, a byte of the room that is not zero, an upper-case digit all fail).
+#[cfg(test)] // the tests read a file with it; the boot and the verbs have the 4 KiB already and call `parse`
 pub fn read_header(file: &File) -> Result<Id, String> {
     let mut room = [0u8; ROOM];
     file.read_exact_at(&mut room, 0)
@@ -66,7 +68,7 @@ pub fn read_header(file: &File) -> Result<Id, String> {
     parse(&room)
 }
 
-/// [`read_header`] on the 4 KiB already read.
+/// What `read_header` reads, on the 4 KiB already read.
 fn parse(room: &[u8; ROOM]) -> Result<Id, String> {
     if !room.starts_with(FIRST.as_bytes()) {
         return Err("no kith-disk header".into());
@@ -494,7 +496,7 @@ fn fresh<D: Dev>(
     hit: &mut dyn FnMut(Point) -> io::Result<()>,
 ) -> Result<Id, AddError> {
     // A `pending` entry of this serial that no header followed is taken again, not left behind.
-    let id = pending_of(state, serial).unwrap_or_else(new_id);
+    let id = entry_of(state, serial, false).unwrap_or_else(new_id);
     let dir = dir_of(state, &id);
     hit(Point::Pending)?;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
@@ -522,15 +524,16 @@ fn fresh<D: Dev>(
     Ok(id)
 }
 
-/// The id of a `pending` entry of `serial`, the first by id when there are several.
-fn pending_of(state: &Path, serial: &str) -> Option<Id> {
+/// The id of an entry of `serial` that is `ready` or, if not, `pending`: the first by id when there
+/// are several.
+fn entry_of(state: &Path, serial: &str, ready: bool) -> Option<Id> {
     let mut found: Vec<Id> = std::fs::read_dir(state.join("disks"))
         .ok()?
         .filter_map(|item| {
             let item = item.ok()?;
             let id = hex_id(item.file_name().to_str()?)?;
             let entry = read_entry(&item.path())?;
-            (!entry.ready && entry.serial == serial).then_some(id)
+            (entry.ready == ready && entry.serial == serial).then_some(id)
         })
         .collect();
     found.sort();
@@ -622,6 +625,7 @@ mod support {
     /// A mapper that writes nothing and says what was asked of it. `fail` makes one call fail
     /// (by its name), `answers` is what the resume's check says, and `headed` lists the calls
     /// made while the disk's first 4 KiB were not zero (the header comes last, so none for an add).
+    #[derive(Debug)]
     pub struct Map {
         pub disk: File,
         pub calls: Vec<&'static str>,

@@ -154,8 +154,9 @@ each matching an exit pod's link or a tunnel's own address, so none meets a peer
 | 9011 | IPv4 | in by `kwg0`, from a peer of a level with `internet: true` | main |
 | 9012 | both | in by `kwg0` | unreachable |
 
-**A narrowed level or a removed peer holds within seconds, open connections too.** The loop
-wakes on every store change (as `exits.rs`'s `run`, on the generation) and every 10 s. Every
+**A narrowed level or a removed peer holds within 5 seconds, open connections too.** The loop
+wakes at once on every store change (as `exits.rs`'s `run`, on the generation) and every 10 s
+besides, which only puts back what was undone by hand. Every
 packet, both ways, is checked against the level as it is now; connection state only tells a
 reply from a request, never lets one through alone. Flushed: the connections carrying the
 peer's mark (`0x6b79` and 16 bits of the peer), by `exit.rs`'s `forget` with the mark as an
@@ -202,7 +203,9 @@ hard-coded on 53 is refused and sees no answer.
 To LAN hosts every peer is the node (masquerade), so the filter sees one client (see Open).
 `.kith` names are answered by kithd's DNS only: the filter forwards `kith.` there. kithd's
 resolver forwards only for private and ULA clients (`may_forward`, `kith-dns/src/server.rs`),
-where `100.64.0.0/10` is not private: by IPv4 a peer gets no name it does not hold.
+where `100.64.0.0/10` is not private: by IPv4 a peer gets no name it does not hold. The people's
+/64 is inside fc00::/7, so kithd refuses it by name: the forwarders are less the people's prefixes
+(slice E2b, below).
 
 ## Exits
 
@@ -301,10 +304,10 @@ is "anyone who reaches a node's port" (SECURITY.md).
 
 | Threat | What holds | What does not |
 |---|---|---|
-| A stolen unlocked phone | What its level reaches, no more; deleting the peer holds within seconds, open connections too | Until deleted it is the peer: the app asks no unlock to turn on, and kith has no expiry |
+| A stolen unlocked phone | What its level reaches, no more; deleting the peer holds within 5 seconds, open connections too | Until deleted it is the peer: the app asks no unlock to turn on, and kith has no expiry |
 | A guest screenshots or re-shares the QR | The copy reaches only the guest's level, and one delete ends both; two devices on one key take turns (the last handshake wins), which shows in the handshake age | kith cannot tell a copy from the phone; a photo in a cloud backup is a copy |
 | A peer sets another's address | WireGuard drops it (allowed addresses per key); the table jumps by source after that; a people source in by any other link is dropped in `pre` | Nothing known |
-| A peer floods | It reaches only its level; the Service proxy's limits per address (`services.rs`, `serving`) and the API's slots (SECURITY.md) hold each peer | No rate in the table: a peer can fill the uplink. Over IPv6 all peers are one /64, so they share the API's 8 slots of a /64 |
+| A peer floods | It reaches only its level; the Service proxy holds each peer to 8 of 4096 places by its own address (`services.rs`, `People`, built in slice E2b), and the API's handshakes have 16 slots for the people, 2 to a peer, apart from the mesh's 64 | No rate in the table: a peer can fill the uplink |
 | The node that ends tunnels is taken | Peers' private keys are not there; the API still asks peers for certificates | Beyond what it has today (a control node is the cluster, a worker what its view holds): the people key, so it can be the server to every phone; peers' traffic in clear where not TLS; any rule. Choose a node you trust with your phones' traffic |
 | Whoever may write a level widens their own | Cluster-scoped kinds: only a Role with no namespace grants them; every write is audited by Identity and decided again where the log is kept | Roles go by kind, not name: who may write one level or peer may write all, and put any peer at admin |
 | An Exit provider sees traffic | Only the internet traffic of levels that name it, as the tunnel's address; not the LAN, not the phones' addresses | Destinations and whatever is not TLS. Names asked of the home's filter leave by its upstream instead |
@@ -521,9 +524,9 @@ RemotePeers, their AccessLevels and Services) and makes what the kernel holds ma
   lines of 200 characters; a worker may say only its own).
 
 Not built: a conntrack flush for a peer deleted while kithd was down; the node's own IPv6 links
-in the table's link list (IPv4 only); the kithd resolver's own `may_forward` check that a people
-prefix may be forwarded to (condition 8's other half); a start failure's reason beyond stderr;
-exit levels (slice E2a, below), the Service listener and per-peer limits (slice E2).
+in the table's link list (IPv4 only); a start failure's reason beyond stderr; exit levels (slice
+E2a, below). The Service listener, the per-peer limits and the resolver's refusal are slice E2b,
+below.
 
 ## Built: slice E2a
 
@@ -542,7 +545,7 @@ A level that names an `exit` leaves by that Exit, on the node that holds it:
   of each rule, and a rule counts as held only with the table wanted. A pass takes away a rule
   9011 whose table is not the wanted one before it makes the right one (a peer never has two, and
   between them falls to 9012), and the steps say `rule 9011 + ADDRESS to table 0x6b780007`. An
-  Exit that goes (or stops listing the level) loses the rule within 10 s: the peer is held, with
+  Exit that goes (or stops listing the level) loses the rule within 5 s: the peer is held, with
   no internet.
 - `inet kith-pods`, with its guard (policy drop), passes what comes in by `kwg0` and what goes
   out by it, by the whole name; the people table's own chains still decide what a peer may
@@ -553,8 +556,74 @@ A level that names an `exit` leaves by that Exit, on the node that holds it:
 
 Not built: IPv6 through an Exit, the Exit of another node, the API or DNS through an Exit.
 
+## Built: slice E2b
+
+- **The Service listener takes the people.** A node started with `--people` accepts, on the
+  Services' listeners it has, a connection from the people's ranges (100.89.0.0/16, the people /64)
+  as well as the mesh's; the relay for the other nodes, and the strays the ingress hands over, stay
+  mesh-only. A person is served only if its address (exact, not the /64) is a RemotePeer's whose
+  level names that Service address and port (`levels::reach`, read from the store each round; a
+  Service with no port listed is reached on none: fail closed, though the level never makes one):
+  another level's Service, and a source in the ranges that is no peer's, are hung up on. The
+  kernel's table said so first; this is the second look. What `serve` and `accept` decide by
+  source is `Proxy::place` and `Proxy::takes`.
+- **NetworkPolicy sees a person as the serving node.** The Workload's NetworkPolicies are asked
+  with this node's mesh address as the source (`Proxy::reach`), as for every client of a Service
+  on this node, not the person's: a person's address is not passed down, because a connection
+  passed on to another node's replica is asked there as the caller node, so a rule on a person's
+  address could not hold on both paths. A level's Services are the person's reach; a policy that
+  must keep a person out of a Workload keeps the level's Service from naming it.
+- **Limits of their own.** Places for the people are apart from the mesh's 4096 (`Proxy.people`):
+  a peer holds 8 of 4096 by its address at 128 bits, so two IPv6 peers of one /64 are two, and the
+  table of sources holds only peers, so it is no bigger than the peers (and never the room). The
+  API's handshakes (`cluster::Pools`) have 16 slots for the people besides the others' 64: a full
+  people pool leaves the 64 free; each peer holds 2 of the 16 (`PEOPLE_GUESTS_EACH`; the others
+  hold 8 of 64), by its address, so eight peers fill it, not one. A connection is accepted first
+  and then takes a place in its own pool's line (a full line, or an address at its share: it is hung
+  up on) and waits there for a slot, up to 15 s, and then has 5 s of its own to shake hands, so a burst of members beyond 64 waits its turn
+  and a crowd of strangers holding the others' 64 does not keep a person's connection from being
+  picked up. The API port is still
+  not opened to peers by this slice.
+- **The resolver does not forward for a person.** `kithd`'s forwarders are the local networks and
+  the pods' range less the people's range and /64 (`dns::forwarders`, `Cidr::without`), so the deny
+  wins over fc00::/7, which holds the /64; a mesh source is forwarded as before.
+- Not built: bandwidth limits (the table has no rate); a person to a Service on port 443 or 80 of
+  a node with the ingress (those are the ingress's: the strays are mesh-only).
+
+## Built: slice F
+
+`sh ci/vm.sh --test access` drives a person's tunnel end to end (`ci/vm/access.sh`, before its
+"signing required" step; `ci/pod.rs` gains `pod watch`). Its three nodes all start with `--mesh`,
+n1 also with `--people --people-endpoint 10.9.0.1:51821`. Two phone machines and an Exit's
+provider are not nodes: each starts from memory with `ip`, `wg` and `pod` as its first process,
+on the nodes' network, and a phone sets its WireGuard link from the configuration `POST /v1/peers`
+answered (the CLI's `kith peer add` is not built into VM tests; the route is what it calls).
+`pod watch NAME HOST PORT` holds one connection to a `pod echo` and makes a new one every third
+of a second, each of which counts a byte back, and prints `held`, `fresh` and `failed`: the
+test reads those from the console.
+
+| Case | Read |
+|---|---|
+| phone-a on `guest` (Service `echo`) reaches echo; the Service `hidden`, in no level, is refused | `held` and `fresh` grow; `fresh` of hidden stays 0 while `failed` grows |
+| phone-b on `roamer` (echo, and `exit: vpn`) leaves by the Exit | a TCP connection to the provider's `198.51.100.1`, an address only it has, answers |
+| `guest` narrowed to an empty level | five seconds on, neither `held` nor `fresh` of echo grows, and the phone keeps trying |
+| `guest` widened again | `held` grows again (a new connection) |
+| the Exit deleted | phone-b's connections to the provider stop |
+| the RemotePeer phone-a deleted | its open connection and new ones stop |
+
+Not driven, and said: an IPv6 range a level names, two IPv6 peers of one /64 (the phones' IPv6
+/128 is driven: the Services' addresses are IPv6, so every case above passes over it), a real phone, the stock app, a real router, UDP, the forged-source, resolver and "no
+new way in" cases of the table under "Tests" (those that need a second LAN machine or a capture:
+the unit tests and `kith-mesh`'s namespace tests hold them). The "Tests" plan above is the
+design; this is what was built.
+
 ## Open
 
+- **People do not reach the Services on an `--ingress` node's 443 and 80 (not built).** Those
+  ports are the ingress's: its listener hands the strays over to the Service listener, and that
+  hand-over is mesh-only, so a person's connection to a Service on them is hung up on, though the
+  kernel's table lets it in. A level that names such a Service is not served on those ports until
+  the ingress takes the people's ranges too (with the same places and the level's reach).
 - **Should the filter tell people apart?** Then the router routes `100.89.0.0/16` to the node
   and the node stops masquerading to the LAN; otherwise every peer is the node there.
 - **A resolver hard-coded on 53: refused (here), or answered by the level's resolver** (one

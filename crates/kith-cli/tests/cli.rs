@@ -415,6 +415,71 @@ fn node_encrypt_asks_its_route_and_shows_the_recovery_key_once() {
     );
 }
 
+/// `kith node disk list` against a stand-in kithd on a socket: it asks `GET /v1/disks/{node}` and
+/// shows the disks the node reports, the data disks and the ones left alone, each as the node
+/// says (and its refusal, a 409, as `error:` on stderr with exit 2). (That kithd's own answer is
+/// `data_disk::verbs` in kithd.)
+#[test]
+fn node_disk_list_asks_its_route_and_shows_the_disks() {
+    use std::io::{Read, Write};
+    let sb = Sandbox::new("node-disk-list");
+    let socket = sb.0.join("kithd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for answer in [
+            (
+                200,
+                r#"{"known":[{"disk":"sdb","serial":"S1","state":"open","id":"ab12"}],"unknown":[{"disk":"sda","serial":"R0","state":"holds the system"}]}"#,
+            ),
+            (409, r#"{"error":"this machine is not running as the machine's init"}"#),
+        ] {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !String::from_utf8_lossy(&got).contains("\r\n\r\n") {
+                let n = conn.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            seen.push(String::from_utf8_lossy(&got).lines().next().unwrap_or("").to_string());
+            let (code, body) = answer;
+            let reply = format!(
+                "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            conn.write_all(reply.as_bytes()).unwrap();
+        }
+        seen
+    });
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_kith"))
+            .args(args)
+            .env("KITH_SOCKET", &socket)
+            .env_remove("KITH_STORE")
+            .output()
+            .unwrap()
+    };
+    let listed = run(&["node", "disk", "list", "n1"]);
+    let (out, err) = (
+        String::from_utf8(listed.stdout).unwrap(),
+        String::from_utf8(listed.stderr).unwrap(),
+    );
+    assert_eq!(listed.status.code(), Some(0), "{err}");
+    assert_eq!(
+        out, "data disks:\n  sdb  open  id ab12\nleft alone:\n  sda  holds the system\n",
+        "{err}"
+    );
+    let refused = run(&["node", "disk", "list", "n1"]);
+    let err = String::from_utf8(refused.stderr).unwrap();
+    assert_eq!(refused.status.code(), Some(2), "{err}");
+    assert!(err.contains("not running as the machine's init"), "{err}");
+    let seen = server.join().unwrap();
+    assert!(seen.iter().all(|l| l.starts_with("GET /v1/disks/n1 ")), "{seen:?}");
+}
+
 /// A fake carrier (what `waypipe client` is to `kith run`) that writes its pid beside itself,
 /// listens on the socket it is given, takes the connection and then does `after`; and a fake
 /// kithd that answers `101` to the ask and then holds the tunnel (`hold`) or closes it. Starts

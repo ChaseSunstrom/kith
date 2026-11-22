@@ -697,6 +697,8 @@ pub fn mount_state(device: &std::path::Path) {
             if let Some(grown) = grown {
                 eprintln!("{grown}");
             }
+            // (A feature's modules in an image on the state, where the system pins one.)
+            crate::modules::from_state(std::path::Path::new(STATE));
         }
         // (Not in memory instead: the node would come up as a new one, with nothing.)
         Err(e) => {

@@ -353,7 +353,8 @@ pub struct Shared {
 const DRY_RUNS: usize = 4;
 
 /// The most open files kithd asks for: ingress's 1024 connections hold two each, and the
-/// relays, the API and the listeners come on top (SECURITY.md).
+/// relays, the API and the listeners come on top (SECURITY.md); the API's handshakes and the
+/// line waiting for a slot are about 400 sockets (64 + 256 the others', 16 + 64 the people's).
 const NOFILE_WANTED: u64 = 65536;
 
 /// The soft limit of open files to set: the hard limit, but no more than [`NOFILE_WANTED`],
@@ -1216,13 +1217,15 @@ fn run(mut args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 eprintln!("kithd: --admit-deleted-nodes: a deleted node's certificate is still taken here");
                 cluster::ADMIT_DELETED.store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            let people64 = args.people.map(|_| people::prefix(&cluster.me.ca));
             let mesh_me = kith_mesh::node_address(mesh::prefix(&cluster.me.ca), &cluster.me.name);
             // (A certificate this node knows is revoked is refused in the handshake: it weakly holds the node.)
             let knows = Arc::downgrade(&shared);
             let revoked: pki::Revoked =
                 Arc::new(move |cert| knows.upgrade().is_some_and(|shared| cluster::revoked(&shared, cert)));
             let serving = pki::served(&cluster.me.ca, cluster.live.clone(), Some(revoked))?;
-            let listener = cluster::listen_on(tcp, serving, Some(mesh_me)).map_err(|e| fail("listening", &e))?;
+            let listener =
+                cluster::listen_on(tcp, serving, Some(mesh_me), people64).map_err(|e| fail("listening", &e))?;
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();
             let served = axum::serve(listener, app).with_graceful_shutdown(async move { drop(stop.changed().await) });
@@ -1360,7 +1363,7 @@ fn run(mut args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();
         let taken = args.ingress.then_some(taken);
         // (Without a mesh too: a node's Services answer its pods there as well, T-0723.)
-        let services = services::run(shared.clone(), taken, stopping.clone());
+        let services = services::run(shared.clone(), args.people.is_some(), taken, stopping.clone());
         // (What each pod may reach, kept in step with its policies: on a node alone too.)
         let held = pods::keep_held(shared.clone(), stopping.clone());
         let proxy = async {
@@ -1479,6 +1482,7 @@ async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, m
         // (What the clock found is said too, and it changes by itself: `clock::CHANGED` wakes this.)
         let mut mine = mine.clone();
         mine.push(("clock", clock::status()));
+        mine.push(("modules", modules::status()));
         // (Not known until the store has this node: asked again when the store changes.)
         let says = {
             let state = shared.store.lock().expect("nothing panics holding the store");

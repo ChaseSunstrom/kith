@@ -205,6 +205,16 @@ pub fn window(tty: BorrowedFd) -> Result<(u16, u16)> {
 /// gone again when the last thing that has it open closes it, so keep what is returned open
 /// until something else (a mapping over it) holds the device.
 pub fn attach(file: &File) -> Result<(File, PathBuf)> {
+    attach_as(file, 0)
+}
+
+/// [`attach`], and the device read-only (LO_FLAGS_READ_ONLY): nothing writes through it,
+/// whatever `file` was opened for.
+pub fn attach_read_only(file: &File) -> Result<(File, PathBuf)> {
+    attach_as(file, 1)
+}
+
+fn attach_as(file: &File, flags: u32) -> Result<(File, PathBuf)> {
     const GET_FREE: u32 = 0x4C82;
     const CONFIGURE: u32 = 0x4C0A;
     let control = File::options().read(true).write(true).open("/dev/loop-control")?;
@@ -214,10 +224,10 @@ pub fn attach(file: &File) -> Result<(File, PathBuf)> {
         let path = PathBuf::from(format!("/dev/loop{}", ioctl(&control, GET_FREE, &mut [])?));
         let device = File::options().read(true).write(true).open(&path)?;
         // `struct loop_config`: the file, a block size (the default), then `struct
-        // loop_info64`, whose flags are 52 bytes in: LO_FLAGS_AUTOCLEAR.
+        // loop_info64`, whose flags are 52 bytes in: LO_FLAGS_AUTOCLEAR, and `flags`.
         let mut config = [0u8; 304];
         config[0..4].copy_from_slice(&(file.as_raw_fd() as u32).to_ne_bytes());
-        config[60..64].copy_from_slice(&4u32.to_ne_bytes());
+        config[60..64].copy_from_slice(&(4 | flags).to_ne_bytes());
         match ioctl(&device, CONFIGURE, &mut config) {
             Ok(_) => return Ok((device, path)),
             Err(busy) => failed = busy,
@@ -403,6 +413,12 @@ pub fn crypt(name: &str, device: &Path, from: u64, sectors: u64, key: &[u8]) -> 
     let load = request(name, SECURE, Some((sectors, "crypt", &told)));
     // (The key is in `told` and in the request: neither is left lying in memory.)
     told.into_bytes().fill(0);
+    make(name, load)
+}
+
+/// Make the mapping `name` with the one table `load`, and put it in use. Says where the
+/// opened device is (`/dev/dm-N`). A mapping that fails is removed again.
+fn make(name: &str, load: Result<Vec<u8>>) -> Result<PathBuf> {
     let control = control()?;
     let made = call(&control, CREATE, request(name, 0, None)?)?;
     let loaded = load.and_then(|load| call(&control, LOAD, load).map(|mut said| said.fill(0)));
@@ -420,6 +436,144 @@ pub fn crypt(name: &str, device: &Path, from: u64, sectors: u64, key: &[u8]) -> 
 /// Remove the mapping `name`: what it showed is unreadable again. Refused while it is in use.
 pub fn remove(name: &str) -> Result<()> {
     call(&control()?, REMOVE, request(name, 0, None)?).map(drop)
+}
+
+/// DM_READONLY_FLAG: a table no write goes through (dm-verity takes no other).
+const READONLY: u32 = 1;
+
+/// What dm-verity is told of `data` (`data_blocks` of 4096 bytes) and its hash tree in
+/// `hash` from block `hash_start`, under sha256 with the tree's `root` and `salt` (hex, as
+/// veritysetup prints them; an empty salt is none). With no options: a block whose hash is
+/// not the tree's reads as an I/O error.
+///
+/// Every number comes from the caller, never from a superblock on the disk: the root and
+/// salt are what the system pinned, and what is on the disk can only match them or fail.
+fn verity_table(data: &Path, hash: &Path, data_blocks: u64, hash_start: u64, root: &str, salt: &str) -> Result<String> {
+    let path = |device: &Path| {
+        let told = device
+            .to_str()
+            .filter(|path| !path.is_empty() && !path.contains([' ', '\0']));
+        told.map(str::to_owned)
+            .ok_or_else(|| Error::other(format!("{}: cannot be told to the kernel", device.display())))
+    };
+    let hex = |text: &str| text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if data_blocks == 0 || data_blocks.checked_mul(8).is_none() {
+        return Err(Error::other(format!("{data_blocks} blocks of data")));
+    }
+    if root.len() != 64 || !hex(root) {
+        return Err(Error::other("the root hash is not 64 lowercase hex digits"));
+    }
+    // (The kernel takes up to 256 bytes of salt.)
+    if !salt.len().is_multiple_of(2) || salt.len() > 512 || !hex(salt) {
+        return Err(Error::other(
+            "the salt is not whole bytes of lowercase hex, at most 256",
+        ));
+    }
+    let salt = if salt.is_empty() { "-" } else { salt };
+    let (data, hash) = (path(data)?, path(hash)?);
+    Ok(format!(
+        "1 {data} {hash} 4096 4096 {data_blocks} {hash_start} sha256 {root} {salt}"
+    ))
+}
+
+/// Make the mapping `name`: `data` (`data_blocks` of 4096 bytes) read through dm-verity,
+/// each block checked against the tree in `hash` from its block `hash_start` (1, for a tree
+/// file veritysetup wrote with its superblock first) whose top is `root`, salted with `salt`.
+/// Read-only, and a block that does not match is an I/O error. Says where it is (`/dev/dm-N`).
+pub fn verity(
+    name: &str,
+    data: &Path,
+    hash: &Path,
+    data_blocks: u64,
+    hash_start: u64,
+    root: &str,
+    salt: &str,
+) -> Result<PathBuf> {
+    let told = verity_table(data, hash, data_blocks, hash_start, root, salt)?;
+    make(name, request(name, READONLY, Some((data_blocks * 8, "verity", &told))))
+}
+
+#[cfg(test)]
+mod verity_tests {
+    use super::*;
+
+    const ROOT: &str = "4f0b3e6a1c2d5e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7";
+
+    /// A hash tree in a file of its own (veritysetup format IMG IMG.verity): its superblock
+    /// is the file's first block, so the tree starts at block 1.
+    #[test]
+    fn verity_table_of_two_files() {
+        let told = verity_table(Path::new("/dev/loop0"), Path::new("/dev/loop1"), 256, 1, ROOT, "00ff").unwrap();
+        assert_eq!(
+            told,
+            format!("1 /dev/loop0 /dev/loop1 4096 4096 256 1 sha256 {ROOT} 00ff")
+        );
+    }
+
+    /// The tree after the data in one file (veritysetup --hash-offset): the superblock is the
+    /// block after the data's last, and the tree the one after that.
+    #[test]
+    fn verity_table_of_one_file() {
+        let told = verity_table(Path::new("/dev/loop3"), Path::new("/dev/loop3"), 256, 257, ROOT, "").unwrap();
+        assert_eq!(
+            told,
+            format!("1 /dev/loop3 /dev/loop3 4096 4096 256 257 sha256 {ROOT} -")
+        );
+    }
+
+    #[test]
+    fn verity_table_refuses_what_is_not_a_hash_a_salt_a_path_or_data() {
+        let table = |data: &str, blocks, root: &str, salt: &str| {
+            verity_table(Path::new(data), Path::new("/dev/loop1"), blocks, 1, root, salt)
+        };
+        assert!(table("/dev/loop0", 0, ROOT, "00").is_err(), "no data");
+        assert!(table("/dev/loop0", 1, &ROOT[1..], "00").is_err(), "63 digits");
+        assert!(
+            table("/dev/loop0", 1, &ROOT.to_uppercase(), "00").is_err(),
+            "not as veritysetup writes it"
+        );
+        assert!(table("/dev/loop0", 1, &format!("{}g", &ROOT[1..]), "00").is_err());
+        assert!(table("/dev/loop0", 1, ROOT, "0").is_err(), "half a byte of salt");
+        assert!(table("/dev/loop0", 1, ROOT, "zz").is_err());
+        assert!(
+            table("/dev/loop0", 1, ROOT, &"00".repeat(257)).is_err(),
+            "more salt than the kernel takes"
+        );
+        assert!(
+            table("/dev/loop 0", 1, ROOT, "00").is_err(),
+            "a space ends a path in a table"
+        );
+        assert!(table("", 1, ROOT, "00").is_err());
+        assert!(
+            table("/dev/loop0", u64::MAX / 4, ROOT, "00").is_err(),
+            "more sectors than a u64"
+        );
+    }
+
+    /// The table is loaded read-only (dm-verity takes no other), with no options: a block
+    /// that does not match is an I/O error, never logged and let through.
+    #[test]
+    fn verity_requests_are_read_only_and_have_no_options() {
+        let told = verity_table(Path::new("/dev/loop0"), Path::new("/dev/loop1"), 2, 1, ROOT, "ab").unwrap();
+        let load = request("kith-modules", READONLY, Some((16, "verity", &told))).unwrap();
+        assert_eq!(load[28..32], 1u32.to_ne_bytes());
+        assert_eq!(load[312 + 8..312 + 16], 16u64.to_ne_bytes());
+        assert_eq!(&load[312 + 24..312 + 31], b"verity\0");
+        assert!(load[352..].starts_with(format!("{told}\0").as_bytes()));
+        assert!(told.ends_with(&format!("{ROOT} ab")));
+    }
+
+    /// Where device-mapper can be reached (as root): a verity mapping of what is no device
+    /// is the kernel's error, and leaves no mapping behind.
+    #[test]
+    fn verity_refusals_are_errors() {
+        if control().is_err() {
+            return;
+        }
+        let none = Path::new("/dev/null/none");
+        assert!(verity("kith-dm-sys-verity-test", none, none, 1, 1, ROOT, "").is_err());
+        assert!(remove("kith-dm-sys-verity-test").is_err());
+    }
 }
 
 /// `bpf(2)`: `command` with `request` as its `union bpf_attr`, as far as it is filled in

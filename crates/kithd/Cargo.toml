@@ -15,10 +15,6 @@ forge = []
 # keys on /dev/uhid and runs the client against them, for the fido2 VM test (fido2_test.rs).
 fido2-test = []
 # Test only, in no release (ci/musl.sh builds it into a folder of its own, os/build.sh lets only
-# that folder take it): the word `kith.disk-add=SERIAL` on the command line makes the disk of that
-# serial a data disk at the start, until the add verb does (data_disk/boot.rs), for the disk VM test.
-disk-test = []
-# Test only, in no release (ci/musl.sh builds it into a folder of its own, os/build.sh lets only
 # that folder take it): `kithd confine-probe DIR` confines itself as the serving part does and says
 # what it still can do, so the privilege VM test can hold the confinement to what it says
 # (confine.rs). As root it makes and gives away a directory, so it is no part of a build that ships.

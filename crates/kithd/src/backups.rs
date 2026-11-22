@@ -2055,9 +2055,19 @@ mod tests {
             backups: vec![],
         };
         for blob in [&theirs, &hand, &own] {
-            forget(&shared, &job, &json!({ "at": 1, "size": 2, "blob": blob })).await.unwrap();
+            forget(&shared, &job, &json!({ "at": 1, "size": 2, "blob": blob }))
+                .await
+                .unwrap();
         }
-        let has = |name: &str| shared.store.lock().unwrap().store.get(&format!("Blob/default/{name}")).is_some();
+        let has = |name: &str| {
+            shared
+                .store
+                .lock()
+                .unwrap()
+                .store
+                .get(&format!("Blob/default/{name}"))
+                .is_some()
+        };
         assert!(!has(&own), "a backup's own Blob is let go");
         assert!(has(&theirs), "an Image's Blob is not a backup's to delete");
         assert!(has(&hand), "nor is one put by hand");

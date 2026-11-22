@@ -2778,10 +2778,10 @@ impl Spec for ServiceSpec {
             return Err(refused);
         }
         // (The Cluster's own domains are not known here: the signer checks them too.)
-        if expose.issuer == Some(ExposeIssuer::Cluster) {
-            if let Some(refused) = cluster_host_refused(&expose.host.to_ascii_lowercase(), None) {
-                return Err(refused);
-            }
+        if expose.issuer == Some(ExposeIssuer::Cluster)
+            && let Some(refused) = cluster_host_refused(&expose.host.to_ascii_lowercase(), None)
+        {
+            return Err(refused);
         }
         if expose.proxy_protocol == Some(true) && !(expose.paths.is_empty() && expose.headers.is_empty()) {
             return Err(

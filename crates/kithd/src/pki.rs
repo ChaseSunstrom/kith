@@ -152,8 +152,7 @@ fn host_name(host: &str) -> Fallible<()> {
         true => Ok(()),
         false => Err(format!(
             "`{host}` is not a name for a host certificate: lowercase labels of a-z, 0-9 and `-`, two or more, not an address, not under `kith`"
-        )
-        .into()),
+        )),
     }
 }
 
@@ -335,7 +334,7 @@ impl Ca {
             match std::fs::read_to_string(dir.join(file)) {
                 Ok(text) => Ok(Some(text)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(format!("reading {file}: {e}").into()),
+                Err(e) => Err(format!("reading {file}: {e}")),
             }
         };
         let key_pem = match held.as_ref() {
