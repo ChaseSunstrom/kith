@@ -549,17 +549,52 @@ pub fn write(image: &mut File, disk: &mut File, config: &str, mut said: impl FnM
         );
     }
     zero_after(disk, length, &mut block).map_err(io("clearing the disk past kith OS"))?;
-    // (To its end: a config from an install before this one would otherwise show through.)
+    put_config(disk, at, room, config)
+}
+
+/// Write `config` at `at` in the config partition (`room` long), and read it back. It is
+/// padded with zeros to the partition's end (or 64 KiB): a config written before this one
+/// would otherwise show through.
+fn put_config(file: &File, at: u64, room: u64, config: &str) -> Result<(), String> {
+    let io = |what: &'static str| move |e: std::io::Error| format!("{what}: {e}");
     let mut text = config.as_bytes().to_vec();
     text.resize(room.min(64 << 10) as usize, 0);
-    disk.write_all_at(&text, at).map_err(io("writing the node's config"))?;
-    disk.sync_all().map_err(io("writing the node's config"))?;
+    file.write_all_at(&text, at).map_err(io("writing the node's config"))?;
+    file.sync_all().map_err(io("writing the node's config"))?;
     let mut back = vec![0; text.len()];
-    disk.read_exact_at(&mut back, at)
+    file.read_exact_at(&mut back, at)
         .map_err(io("reading the node's config back"))?;
     (back == text)
         .then_some(())
         .ok_or("the node's config did not stay on the disk as written".into())
+}
+
+/// Write into the built image `image` the config the installer would write for `yaml` (its
+/// answers), and say it: so a cloud image starts as the node meant. Only the image's `config`
+/// partition changes. What needs a machine (`encrypt`, `size`) is refused: there is none.
+pub fn config_image(image: &File, yaml: &str) -> Result<String, String> {
+    let answers = answers(yaml)?;
+    if answers.encrypt {
+        return Err(
+            "`encrypt: true` is for a machine: its key is held by its cluster, and an image has no machine yet".into(),
+        );
+    }
+    if answers.size.is_some() {
+        return Err("`size` is a disk of a machine: an image has none".into());
+    }
+    let (length, at, room) = layout(image)?;
+    // The disk the answers name is not used: a stand-in, of the name (or serial) they give.
+    let wanted = answers.disk.trim().trim_start_matches("/dev/");
+    let stand_in = Disk {
+        name: wanted.into(),
+        bytes: length,
+        model: String::new(),
+        serial: wanted.strip_prefix("serial:").unwrap_or_default().trim().into(),
+        removable: false,
+    };
+    let (_, config) = plan(&answers, &[stand_in], length, room)?;
+    put_config(image, at, room, &config)?;
+    Ok(config)
 }
 
 /// What a reused disk held past `from` (an older install's state, someone's files) made to
@@ -1743,6 +1778,84 @@ mod tests {
             layout(&open("none", &[0; 4096]))
                 .unwrap_err()
                 .contains("no partition table")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `bytes` as a file in `dir`, open to read and write.
+    fn opened(dir: &Path, name: &str, bytes: &[u8]) -> File {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), bytes).unwrap();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(name))
+            .unwrap()
+    }
+
+    const NODE: &str = "disk: sda\nhostname: alpha\nip: 10.0.0.5/24\njoin:\n  address: 10.0.0.1:7443\n  token: abc.def-node\nmesh: true\n";
+
+    #[test]
+    fn install_config_image_writes_what_the_installer_would() {
+        let dir = std::env::temp_dir().join(format!("kith-config-image-same-{}", std::process::id()));
+        let source = image("config");
+        let made = opened(&dir, "made", &source);
+        let said = config_image(&made, NODE).unwrap();
+        // What the installer plans for the same answers, on a disk the image's size...
+        let (_, planned) = plan(&answers(NODE).unwrap(), &[disk("sda", 1)], 64 * 512, 4 * 512).unwrap();
+        assert_eq!(said, planned);
+        // ...and writes to a disk: the two files are the same, byte for byte.
+        let mut disk = opened(&dir, "disk", &vec![0xee; 64 * 512]);
+        write(&mut opened(&dir, "image", &source), &mut disk, &planned, |_| ()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("made")).unwrap(),
+            std::fs::read(dir.join("disk")).unwrap()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn install_config_image_refuses_encrypt_and_size() {
+        let dir = std::env::temp_dir().join(format!("kith-config-image-refuse-{}", std::process::id()));
+        let source = image("config");
+        let made = opened(&dir, "made", &source);
+        for (yaml, word) in [
+            ("disk: sda\nencrypt: true\n", "encrypt"),
+            ("disk: sda\nsize: 32768\n", "size"),
+        ] {
+            let err = config_image(&made, yaml).unwrap_err();
+            assert!(err.contains(word), "{err}");
+        }
+        assert!(config_image(&made, "disk: sda\nhostname: a b\n").is_err());
+        assert_eq!(
+            std::fs::read(dir.join("made")).unwrap(),
+            source,
+            "a refusal writes nothing"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn install_config_image_leaves_the_rest_of_the_image_alone() {
+        let dir = std::env::temp_dir().join(format!("kith-config-image-rest-{}", std::process::id()));
+        let source = image("config");
+        let made = opened(&dir, "made", &source);
+        let long = config_image(&made, NODE).unwrap();
+        let short = config_image(&made, "disk: only\n").unwrap();
+        assert!(long.len() > short.len());
+        let now = std::fs::read(dir.join("made")).unwrap();
+        assert_eq!(now.len(), source.len());
+        assert_eq!(now[..40 * 512], source[..40 * 512]);
+        assert_eq!(now[44 * 512..], source[44 * 512..]);
+        // The second call replaced the first: its words, then zeros to the partition's end.
+        let part = &now[40 * 512..44 * 512];
+        assert!(part.starts_with(short.as_bytes()) && part[short.len()..].iter().all(|byte| *byte == 0));
+        // An image with no config partition is said, not written.
+        let other = opened(&dir, "other", &image("state"));
+        assert!(
+            config_image(&other, NODE)
+                .unwrap_err()
+                .contains("no partition named config")
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
