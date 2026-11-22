@@ -113,7 +113,7 @@ pub fn reply(packet: &[u8], xid: u32, mac: [u8; 6]) -> Option<(u8, Lease)> {
     (usable && (1..=32).contains(&lease.bits)).then_some((kind?, lease))
 }
 
-async fn hear(socket: &UdpSocket, xid: u32, mac: [u8; 6], wanted: u8) -> Result<Lease> {
+async fn hear(socket: &UdpSocket, xid: u32, mac: [u8; 6], wanted: u8, secs: u64) -> Result<Lease> {
     let answer = async {
         let mut packet = [0; 1500];
         loop {
@@ -126,7 +126,7 @@ async fn hear(socket: &UdpSocket, xid: u32, mac: [u8; 6], wanted: u8) -> Result<
         }
     };
     let none = |_| Error::new(ErrorKind::TimedOut, "no DHCP server answered");
-    tokio::time::timeout(Duration::from_secs(4), answer)
+    tokio::time::timeout(Duration::from_secs(secs), answer)
         .await
         .map_err(none)?
 }
@@ -149,16 +149,41 @@ pub fn socket(card: &str, port: u16) -> Result<UdpSocket> {
     UdpSocket::from_std(fd.into())
 }
 
+/// How many DISCOVERs [`ask`] sends, a second apart, before it gives up on an OFFER.
+const DISCOVERS: u32 = 4;
+
+/// Whether `got` is told of a lease the card has: it is new, or its router became the node's
+/// way out (`now`) when it was not (`routed`) at the last one.
+fn tell(changed: bool, now: bool, routed: bool) -> bool {
+    changed || (now && !routed)
+}
+
+/// Whether to send the DISCOVER again: nothing was heard (the wait ran out) and fewer than
+/// [`DISCOVERS`] have been sent. Any other error, or an answer, is the end of it.
+fn resend(heard: &Result<Lease>, sent: u32) -> bool {
+    matches!(heard, Err(e) if e.kind() == ErrorKind::TimedOut) && sent < DISCOVERS
+}
+
 /// Ask once, on `card` (which is up): what a server gives it.
 pub async fn ask(card: &Card, hostname: &str) -> Result<Lease> {
     let socket = socket(&card.name, 68)?;
     let mut xid = [0; 4];
     std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut xid)?;
     let xid = u32::from_be_bytes(xid);
-    broadcast(card, &message(DISCOVER, xid, card.mac, hostname, None))?;
-    let offer = hear(&socket, xid, card.mac, OFFER).await?;
+    // (The DISCOVER again each second, four times: a card just plugged in has no carrier for a
+    // moment, and a frame sent before it does is lost, which cost the 4 s of waiting for it.)
+    let discover = message(DISCOVER, xid, card.mac, hostname, None);
+    let mut tries = 0;
+    let offer = loop {
+        broadcast(card, &discover)?;
+        tries += 1;
+        let heard = hear(&socket, xid, card.mac, OFFER, 1).await;
+        if !resend(&heard, tries) {
+            break heard?;
+        }
+    };
     broadcast(card, &message(REQUEST, xid, card.mac, hostname, Some(&offer)))?;
-    hear(&socket, xid, card.mac, ACK).await
+    hear(&socket, xid, card.mac, ACK, 4).await
 }
 
 /// Send `message` to every server on `card`'s network, from no address: as a frame of its
@@ -228,23 +253,39 @@ fn frame(mac: [u8; 6], message: &[u8]) -> Vec<u8> {
 /// Keep `card` addressed for as long as this process lives: ask, put the address on it
 /// (`got` is told each one), ask again halfway through the lease; until a server answers,
 /// every few seconds, then every minute. (A task of kithd's one thread, not a thread of
-/// its own: kithd forks containers.)
-pub async fn keep(card: Card, hostname: String, got: impl Fn(&Lease)) {
-    let (mut wait, mut had) = (1, None);
+/// its own: kithd forks containers.) The lease's router becomes the default route only
+/// where `way` says so (a card that came after boot may not replace the node's: init.rs),
+/// and a lease `admit` refuses (its error says why) is not taken.
+pub async fn keep(
+    card: Card,
+    hostname: String,
+    got: impl Fn(&Lease),
+    way: impl Fn() -> bool,
+    admit: impl Fn(&Lease) -> Result<()>,
+) {
+    let (mut wait, mut had, mut routed) = (1, None, false);
     loop {
         let lease = ask(&card, &hostname).await.and_then(|lease| {
-            kith_mesh::address4(card.index, lease.address, lease.bits, lease.router)?;
+            admit(&lease)?;
+            kith_mesh::address4(card.index, lease.address, lease.bits, lease.router.filter(|_| way()))?;
             Ok(lease)
         });
         let pause = match lease {
             Ok(lease) => {
-                if had.as_ref() != Some(&lease) {
+                let changed = had.as_ref() != Some(&lease);
+                if changed {
                     eprintln!(
                         "kithd: init: {} has {}/{} by DHCP",
                         card.name, lease.address, lease.bits
                     );
+                }
+                // (The same lease is told again when its router is the node's way out now:
+                // the card that was is gone, and what this one gave was not taken.)
+                let now = lease.router.is_some() && way();
+                if tell(changed, now, routed) {
                     got(&lease);
                 }
+                routed = now;
                 wait = 1;
                 let pause = (lease.secs / 2).clamp(30, 86_400);
                 had = Some(lease);
@@ -266,6 +307,37 @@ pub async fn keep(card: Card, hostname: String, got: impl Fn(&Lease)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_dhcp_an_unchanged_lease_is_told_again_when_its_router_becomes_the_way_out() {
+        assert!(tell(true, false, false));
+        assert!(!tell(false, false, false));
+        // The card that was the way out went: this one's router may be it now.
+        assert!(tell(false, true, false));
+        assert!(!tell(false, true, true));
+        // Not again when it was the way out and is no longer only because it took it itself.
+        assert!(!tell(false, false, true));
+    }
+
+    #[test]
+    fn init_dhcp_discover_is_sent_again_only_when_nothing_was_heard_and_tries_are_left() {
+        let silent = || Err::<Lease, _>(Error::from(ErrorKind::TimedOut));
+        assert!(resend(&silent(), 1));
+        assert!(resend(&silent(), DISCOVERS - 1));
+        assert!(!resend(&silent(), DISCOVERS));
+        // Another error, or an answer: no more tries.
+        assert!(!resend(&Err(Error::from(ErrorKind::PermissionDenied)), 1));
+        let lease = Lease {
+            address: Ipv4Addr::new(10, 0, 0, 5),
+            bits: 24,
+            router: None,
+            dns: vec![],
+            ntp: vec![],
+            server: Ipv4Addr::new(10, 0, 0, 1),
+            secs: 60,
+        };
+        assert!(!resend(&Ok(lease), 1));
+    }
 
     #[test]
     fn init_dhcp_messages_and_answers() {

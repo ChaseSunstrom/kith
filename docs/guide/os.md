@@ -14,7 +14,19 @@ As process 1, kithd:
 - names the machine `kith.hostname=NAME` from the kernel command line, else `kith-` and the last
   six digits of its first network card's address;
 - brings every card up and asks for an address (DHCP, renewed). Where there is none, say
-  `kith.ip=10.0.0.5/24,10.0.0.1` (address, gateway) and `kith.dns=9.9.9.9`;
+  `kith.ip=10.0.0.5/24,10.0.0.1` (address, gateway) and `kith.dns=9.9.9.9`. A card that comes
+  later (plugged in, or its driver loaded after boot) is found within 5 seconds and asks the
+  same way, but its lease sets only its own address and the route to its own network: the
+  default route, the name servers and the time servers it names are used only if no card that
+  is there gave the node one (a card unplugged takes its part with it, so the same card
+  plugged in again may give it anew), so a card put on another wire cannot take them over.
+  Its network must be one of a private block (10/8, 172.16/12, 192.168/16, 100.64/10,
+  169.254/16) that overlaps no route the node has; a lease of another is refused and said so.
+  The card that had `kith.ip`, plugged in again, gets that address, not a lease. A veth,
+  bridge or tunnel that kithd makes is never asked. (The kernel has PCIe hot-plug, so a card
+  put in a slot of a running machine appears; on Intel the IOMMU is off by default, so a PCIe or
+  ExpressCard device plugged into a running machine can read all its memory there.) IPv6 on a link is the
+  kernel's (router advertisements); there is no DHCPv6;
 - keeps the time: a machine has no clock battery to trust, so after the network is up kithd asks
   an SNTP server for the time at start and every hour, and sets the clock when it is more than
   two seconds off. The server is the one you name, `kith.ntp=ADDRESS[:PORT]` (the only one asked
@@ -932,5 +944,4 @@ The design is in [adr-second-disk.md](../adr-second-disk.md).
 ### Not in kith OS yet
 
 A CD image, starting by BIOS, a watchdog for a slot that hangs without stopping, Secure Boot
-(the image is not signed), drivers for Wi-Fi and sound, graphics but by a [spec](#a-node-that-needs-more-a-spec), a card plugged in later, IPv6
-addresses from the network, arm64.
+(the image is not signed), drivers for Wi-Fi and sound, graphics but by a [spec](#a-node-that-needs-more-a-spec), arm64.

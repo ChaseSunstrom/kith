@@ -49,6 +49,8 @@
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
 #                               kills in a minute restart the machine
+#   sh ci/vm.sh --test latecard one node: a network card plugged in after the boot comes up and takes a
+#                               DHCP lease within 10 s; the card that asks gets SLAAC and the DHCP name server
 #   sh ci/vm.sh --test handover one node: a kithd-only release taken with no restart (boot id and pod
 #                               process kept, the new version reported); a changed kernel restarts it
 #   sh ci/vm.sh --test nested   one node: a container with kith's defaults, then with each opening in
@@ -253,6 +255,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    unit and a Job; the machine stays up, kithd serves again within
                    2 s and takes each back as it ran; killed ten times in a minute,
                    the machine restarts
+  --test latecard  instead: one node with ci/pod.rs on its disk and a PCIe root port free:
+                   a second user-network card is added through the monitor after the
+                   boot (netdev_add, device_add); kithd brings it up and it takes a
+                   DHCP lease within 10 s. The card that asks at boot has a SLAAC IPv6
+                   address (QEMU's router advertisement, nothing of kithd's) and
+                   /run/resolv.conf lists the DHCP server, kith.ip's empty list gone
   --test handover  instead: one node on the mesh with ci/pod.rs as an image: a release that
                    differs from the running slot in kithd alone is handed over to with no
                    restart (same boot id, same pod process, the new version reported), and
@@ -444,7 +452,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | modules | modules-state | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | privilege | nested | nofile | alone | disk | clock | clockleader | encrypt | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, modules-state, clock, clockleader, disk, encrypt, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, privilege, nested, nofile, fido2" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | modules | modules-state | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | mesh | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive | handover | privilege | nested | nofile | latecard | alone | disk | clock | clockleader | encrypt | fido2) ;; *) echo "vm.sh: --test knows: init, image, update, modules, modules-state, clock, clockleader, disk, encrypt, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, mesh, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive, handover, privilege, nested, nofile, latecard, fido2" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
