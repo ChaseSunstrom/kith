@@ -300,8 +300,15 @@ whoever can change the command line has the machine anyway. An image that holds 
 stick's update only with a signature by one of them: before `dd`, append what
 `sh os/update.sh --sign KEYFILE kith-os.update` prints to the file
 (`sh os/update.sh --sign KEYFILE kith-os.update >sig && cat sig >>kith-os.update`). It sits
-right after the last piece, which an older kithd never reads. An update with none, with another
-key's, or when the key file cannot be read is refused with the other slot untouched.
+right after the last piece, which an older kithd never reads, and what follows it is not read
+either: a stick written with `dd` has the device's old bytes there. The key is checked as a
+release's is: the keys given to kithd, else those a release's handover kept, else the image's,
+so a key a handover retired does not sign a stick; the signature is checked over the very header
+the node then writes from, and the update's version must not be under the node's floor (below).
+An update with none, with another key's, under the floor, or when the key file cannot be read is
+refused with the other slot untouched. A node whose image holds keys and whose state is
+encrypted takes no update from a stick: the handover that may have retired the image's keys is
+in that state, which is not open when the stick is read. Use the cluster's update there.
 
 ### What an update keeps: the format of the store
 
@@ -489,8 +496,9 @@ state, written when the slot is marked good) and takes no release under it, not 
 back and not with `allowDowngrade: true`. So stolen admin credentials cannot walk a cluster back
 to a release with a hole since mended. To go back on purpose, release the older system again
 under a newer version, or remove `os-release-floor` at the node. A floor that cannot be read is
-not "no floor": the node takes no update until the file says a version or is gone. A stick
-ignores the floor.
+not "no floor": the node takes no update until the file says a version or is gone. A stick's
+update is held to the floor too when the image holds release keys; with none, a stick is taken
+newer or older, on the word of whoever is at the machine.
 
 **The order.** The node that leads picks who goes next: nodes that do not vote on the store
 first, `maxUnavailable` at a time; then the voters, one at a time, each only while every other
