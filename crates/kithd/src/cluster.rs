@@ -1351,7 +1351,7 @@ async fn register(
     };
     if !known {
         let (resources, at) = (vec![node], kith_api::store::now());
-        shared.submit(Command::Apply { resources, at }).await?;
+        shared.submit_node(Command::Apply { resources, at }).await?;
     }
     let status = serde_json::json!({ "address": address, "raftId": id.to_string(), "certificate": print });
     let serde_json::Value::Object(mut status) = status else {
@@ -1546,8 +1546,7 @@ async fn join(
     });
     let resources = vec![serde_json::from_value(node).expect("a Node with a valid name")];
     let at = kith_api::store::now();
-    let (_, born) = shared
-        .write_at(Command::Apply { resources, at })
+    let (_, born) = crate::raft::as_node(shared.write_at(Command::Apply { resources, at }))
         .await
         .map_err(unavailable)?;
     let (cert, key) = ca.issue_born(&request.name, born).map_err(failed)?;
