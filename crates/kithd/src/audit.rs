@@ -118,10 +118,7 @@ impl Audit {
                 .collect();
             // (Refused, not skipped: an entry this kithd cannot read is not one it may drop.)
             for entry in &entries {
-                let format = entry["format"]
-                    .as_u64()
-                    .map_or(1, |format| u32::try_from(format).unwrap_or(u32::MAX));
-                kith_store::refuse_newer(path, format, FORMAT).map_err(std::io::Error::other)?;
+                kith_store::refuse_newer_json(path, entry, FORMAT).map_err(std::io::Error::other)?;
             }
             Ok(entries)
         };

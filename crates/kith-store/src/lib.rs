@@ -129,6 +129,15 @@ pub fn refuse_newer(file: &Path, format: u32, reads: u32) -> Result<(), String> 
     Ok(())
 }
 
+/// [`refuse_newer`] for a JSON note that names its format in `"format"` (no field: format 1;
+/// one past `u32`: refused).
+pub fn refuse_newer_json(file: &Path, note: &serde_json::Value, reads: u32) -> Result<(), String> {
+    let format = note["format"]
+        .as_u64()
+        .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX));
+    refuse_newer(file, format, reads)
+}
+
 /// One change to the store. Everything a replica needs to repeat it exactly is in here,
 /// the time included.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -190,7 +190,11 @@ pub async fn get(
                 key.into_response()
             }
             Ok(None) => StatusCode::NO_CONTENT.into_response(),
-            Err(why) => (StatusCode::INTERNAL_SERVER_ERROR, why).into_response(),
+            // (The state's path is this node's: said here, not to the peer.)
+            Err(why) => {
+                eprintln!("kithd: the key of {namespace}/{name} is not read: {why}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "format newer than this kithd reads").into_response()
+            }
         },
         (Ok(_), None) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }

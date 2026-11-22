@@ -1622,9 +1622,6 @@ fn forgotten_key_refused_write_is_in_no_log_entry() {
     });
 }
 
-/// A store brought in over one that holds a NodeKey the new one lacks: the log, which has the
-/// write of that key still, is dropped up to the Import as it is applied, with no restart.
-/// (kithd brings a store in only where there is none; this holds for a caller that does not.)
 /// The format a node must read to read `command`: the one that brought its variant. A kithd
 /// that does not know a variant reads its entry as a reading error (serde_json), so the leader
 /// sends one only once every member reads that format (the marks, raft.rs). No wildcard: a
@@ -1644,6 +1641,24 @@ fn came_in(command: &Command) -> u32 {
         // (A signed entry runs only once the store keeps nonces: format 3. What it carries came in when it did.)
         Command::Signed { command, .. } => 3.max(came_in(command)),
         Command::MarkChecked => 4,
+    }
+}
+
+/// A number for each variant, 0 up with no gap: the test below holds its samples to every one, so
+/// a variant added and mapped but not sampled is caught (no wildcard here either).
+fn slot(command: &Command) -> usize {
+    match command {
+        Command::Apply { .. } => 0,
+        Command::Delete { .. } => 1,
+        Command::Rollback { .. } => 2,
+        Command::Status { .. } => 3,
+        Command::Patch { .. } => 4,
+        Command::Report { .. } => 5,
+        Command::Import { .. } => 6,
+        Command::Mark => 7,
+        Command::MarkSigned => 8,
+        Command::Signed { .. } => 9,
+        Command::MarkChecked => 10,
     }
 }
 
@@ -1678,6 +1693,9 @@ fn every_command_has_a_format() {
         Command::MarkSigned,
         Command::MarkChecked,
     ];
+    let slots: std::collections::BTreeSet<usize> = samples.iter().map(slot).collect();
+    let all = (0..=slots.last().copied().unwrap()).collect();
+    assert_eq!(slots, all, "a Command variant has no sample (or `slot` skips a number)");
     let newest = samples.iter().map(came_in).max().unwrap();
     assert_eq!(
         newest,
@@ -1710,6 +1728,9 @@ fn every_command_has_a_format() {
     }
 }
 
+/// A store brought in over one that holds a NodeKey the new one lacks: the log, which has the
+/// write of that key still, is dropped up to the Import as it is applied, with no restart.
+/// (kithd brings a store in only where there is none; this holds for a caller that does not.)
 #[test]
 fn import_over_a_key_scrubs_the_log() {
     let runtime = tokio::runtime::Builder::new_current_thread()
