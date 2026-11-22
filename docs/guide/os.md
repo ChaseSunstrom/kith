@@ -4,7 +4,7 @@ On a kith OS machine there is the kernel and kithd, nothing else: no systemd, no
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../../docs/assets/diagrams/os-dark.svg">
-  <img src="../../docs/assets/diagrams/os-light.svg" alt="kith OS from power-on: the firmware starts systemd-boot, which starts the newest kernel image that has tries left; the image names the hash of its 6 MB read-only root, of which a changed block is refused; kithd is the first process, reads the config partition and mounts the state partition, the two that no update replaces. An update, one node at a time: an OSRelease signed by the release's key (an update from a stick is not signed) is written into the other slot, the node restarts into it, and it is marked good or the node is back on the old slot after three tries" width="100%">
+  <img src="../../docs/assets/diagrams/os-light.svg" alt="kith OS from power-on: the firmware starts systemd-boot, which starts the newest kernel image that has tries left; the image names the hash of its 6 MB read-only root, of which a changed block is refused; kithd is the first process, reads the config partition and mounts the state partition, the two that no update replaces. An update, one node at a time: an OSRelease signed by the release's key (an update from a stick carries its signature after its last piece, when the image holds release keys) is written into the other slot, the node restarts into it, and it is marked good or the node is back on the old slot after three tries" width="100%">
 </picture>
 
 As process 1, kithd:
@@ -295,7 +295,20 @@ slot. The state partition is in no slot: the node is the same node after an upda
 going back. An update can also reach one node from a stick: `dd if=kith-os.update of=/dev/sdX`,
 then start the node once with `kith.update=sdX` on its command line. It writes the other slot and
 restarts into it, newer or older; one given while its own slot is not yet good is refused.
-Nothing checks who made it: whoever can change the command line has the machine anyway.
+An image with no release keys (`/etc/kith/release-keys`) checks nothing about who made it:
+whoever can change the command line has the machine anyway. An image that holds keys takes a
+stick's update only with a signature by one of them: before `dd`, append what
+`sh os/update.sh --sign KEYFILE kith-os.update` prints to the file
+(`sh os/update.sh --sign KEYFILE kith-os.update >sig && cat sig >>kith-os.update`). It sits
+right after the last piece, which an older kithd never reads, and what follows it is not read
+either: a stick written with `dd` has the device's old bytes there. The key is checked as a
+release's is: the keys given to kithd, else those a release's handover kept, else the image's,
+so a key a handover retired does not sign a stick; the signature is checked over the very header
+the node then writes from, and the update's version must not be under the node's floor (below).
+An update with none, with another key's, under the floor, or when the key file cannot be read is
+refused with the other slot untouched. A node whose image holds keys and whose state is
+encrypted takes no update from a stick: the handover that may have retired the image's keys is
+in that state, which is not open when the stick is read. Use the cluster's update there.
 
 ### What an update keeps: the format of the store
 
@@ -483,8 +496,9 @@ state, written when the slot is marked good) and takes no release under it, not 
 back and not with `allowDowngrade: true`. So stolen admin credentials cannot walk a cluster back
 to a release with a hole since mended. To go back on purpose, release the older system again
 under a newer version, or remove `os-release-floor` at the node. A floor that cannot be read is
-not "no floor": the node takes no update until the file says a version or is gone. A stick
-ignores the floor.
+not "no floor": the node takes no update until the file says a version or is gone. A stick's
+update is held to the floor too when the image holds release keys; with none, a stick is taken
+newer or older, on the word of whoever is at the machine.
 
 **The order.** The node that leads picks who goes next: nodes that do not vote on the store
 first, `maxUnavailable` at a time; then the voters, one at a time, each only while every other
@@ -715,6 +729,27 @@ and bnx2 cards, none for Xen, Hyper-V, VMware or AWS ENA: there it has no networ
 The script refuses, with nothing done, a machine that starts by BIOS (`ls /sys/firmware/efi`
 tells), one with under 1 GB of memory, one without `kexec` or `cpio`, and a disk that is not
 there. A cloud that takes disk images takes `kith-os.raw` or `kith-os.qcow2`.
+
+A cloud image has no installer to tell the node its name and address. Write them into the
+image before you upload it: `os/config.sh` takes the image and the installer's answers, and writes
+the config the installer would have written for them (the hostname, `ip:`, the join token, release
+keys, `mesh:`), into the image's config partition, in place:
+
+```sh
+umask 077                                 # the copy and the answers hold the join token in plain text
+cp target/os/kith-os.raw node-a.raw
+sh os/config.sh node-a.raw answers.yaml   # nothing else in the image changes; a second call replaces the first
+qemu-img convert -O qcow2 node-a.raw node-a.qcow2
+```
+
+The image and the answers file hold the join token in plain text: keep them to yourself (the
+script makes the image readable by you alone), and delete them once the node is up. A token is good
+once, for an hour ([a cluster](cluster.md#more-than-one-node)): write the config just before you
+launch the node, and do not boot a configured image twice (a second node from it is refused).
+
+`disk:` must be in the answers and is not used. `encrypt: true` (the key is the machine's) and
+`size:` (a disk of that machine) are refused, and so is any answer the installer would refuse.
+Convert to qcow2 after writing, not before.
 
 ### Encrypted state
 

@@ -939,6 +939,30 @@ impl Keys {
         }
     }
 
+    /// What a stick's update (`kith.update=`, taken by init) must show: the keys one of which
+    /// signed it, in the order a release is taken (`mine`: given, then kept by a handover, then
+    /// the image's), and the floor it must clear. With no key in the image, nothing is asked
+    /// (whoever can change the command line has the machine). `state_open`: the state is
+    /// mounted; if it is not (encrypted and not yet opened) a handover in it cannot be seen,
+    /// and the image's keys may be retired there: a node that holds keys takes no stick then.
+    pub(crate) fn for_stick(&self, state_open: bool) -> Result<crate::os::Vouch, String> {
+        let image = match &self.image {
+            Some(image) => keys_in(image)?,
+            None => Vec::new(),
+        };
+        let nothing = crate::os::Vouch {
+            keys: Vec::new(),
+            floor: None,
+        };
+        match (image.is_empty(), state_open) {
+            (true, _) => Ok(nothing),
+            (false, false) => Err("this system holds release keys, and the state, where a release may have handed over \
+                                   others, is not open yet: an update from a stick is not taken until it is (use the cluster's)"
+                .into()),
+            (false, true) => Ok(crate::os::Vouch { keys: self.mine()?.0, floor: Some(self.floor.clone()) }),
+        }
+    }
+
     /// Whose keys this node takes releases from, for its status (`os.releaseKeys`). One
     /// it cannot read says `unread`: it takes nothing then.
     fn whose(&self) -> &'static str {
@@ -1166,7 +1190,7 @@ fn floor(file: &Path) -> Result<Option<String>, String> {
 }
 
 /// Refuses a release under the floor.
-fn above(file: &Path, version: &str) -> Result<(), String> {
+pub(crate) fn above(file: &Path, version: &str) -> Result<(), String> {
     match floor(file)? {
         Some(floor) if before(version, &floor) => Err(format!(
             "kith OS {version} is older than {floor}, the newest this node has run well: it takes nothing under \
@@ -1872,6 +1896,39 @@ mod tests {
         let unread = Keys::new(Vec::new(), &dir.join("unread"));
         std::fs::create_dir_all(&unread.kept).unwrap();
         assert!(unread.refused(Some(theirs)).is_err());
+    }
+
+    /// A stick's update (`kith.update=`) is checked by the keys a release is: a key a handover
+    /// retired signs nothing, and the floor is the node's.
+    #[test]
+    fn a_stick_is_vouched_by_the_keys_a_release_is_and_the_floor() {
+        let dir = scratch("stick");
+        let image = dir.join("image-keys");
+        std::fs::write(&image, "# the image's\naa11\nbb22\n").unwrap();
+        let with = |given: Vec<String>| Keys {
+            image: Some(image.clone()),
+            ..Keys::new(given, &dir)
+        };
+        let keys = |keys: &Keys, open| keys.for_stick(open).map(|vouch| vouch.keys);
+        // The image's, and the floor the state keeps.
+        let plain = with(Vec::new());
+        assert_eq!(keys(&plain, true), Ok(vec!["aa11".into(), "bb22".into()]));
+        assert_eq!(plain.for_stick(true).unwrap().floor, Some(dir.join("os-release-floor")));
+        // Keys the config gave (the image's, as vetted) are the ones.
+        assert_eq!(keys(&with(vec!["bb22".into()]), true), Ok(vec!["bb22".into()]));
+        // A handover kept others: the image's key it retired is not taken.
+        crate::pki::write_whole(&plain.kept, b"cc33\n").unwrap();
+        assert_eq!(keys(&plain, true), Ok(vec!["cc33".into()]));
+        // A state that is not open may hold a handover: nothing is taken from a stick then.
+        let why = keys(&plain, false).unwrap_err();
+        assert!(why.contains("not open yet"), "{why}");
+        // An image with no key asks nothing, open or not; and one that cannot be read is no key.
+        std::fs::write(&image, "# none\n").unwrap();
+        assert_eq!(keys(&plain, false), Ok(Vec::new()));
+        assert_eq!(keys(&Keys::new(Vec::new(), &dir), true), Ok(Vec::new()));
+        std::fs::remove_file(&image).unwrap();
+        std::fs::create_dir(&image).unwrap();
+        assert!(keys(&plain, true).is_err());
     }
 
     #[test]

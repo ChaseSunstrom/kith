@@ -256,7 +256,10 @@ pub fn start() {
     {
         let before = std::fs::read_to_string(SAID).ok();
         let image = before.and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
-        let image = image.as_ref().and_then(|said| said["image"].as_str()).unwrap_or("the image");
+        let image = image
+            .as_ref()
+            .and_then(|said| said["image"].as_str())
+            .unwrap_or("the image");
         set(said(&Ok((image.to_string(), count))));
     }
 }
@@ -420,7 +423,8 @@ fn mapped(state: &Path, pinned: &str) -> Result<(String, usize), String> {
     let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let image = open_image(state, crate::init::options(&line).0.slot, &pin)?;
     let name = &image.name;
-    let attached = |file: &std::fs::File| kith_dm_sys::attach_read_only(file).map_err(|e| format!("{name}: a loop device: {e}"));
+    let attached =
+        |file: &std::fs::File| kith_dm_sys::attach_read_only(file).map_err(|e| format!("{name}: a loop device: {e}"));
     let (data, hash) = (attached(&image.data)?, attached(&image.hash)?);
     let _ = kith_dm_sys::remove("kith-modules");
     let device = kith_dm_sys::verity(
@@ -694,14 +698,23 @@ mod tests {
     #[test]
     fn modules_state_pin_is_four_fields() {
         let pin = pin();
-        assert_eq!((pin.hash.as_str(), pin.salt.as_str(), pin.size, pin.verity), (HASH, "00ff", 8192, 4096));
+        assert_eq!(
+            (pin.hash.as_str(), pin.salt.as_str(), pin.size, pin.verity),
+            (HASH, "00ff", 8192, 4096)
+        );
         // (A line it does not know is left for a later kithd; an empty salt is none.)
         let later = Pin::parse(&format!("hash={HASH}\nsalt=\nsize=4096\nverity=4096\nmore=1\n")).unwrap();
         assert_eq!(later.salt, "");
         for (text, why) in [
-            (format!("salt=00\nsize=4096\nverity=4096\n"), "hash"),
-            (format!("hash={}\nsalt=00\nsize=4096\nverity=4096\n", &HASH[1..]), "hash"),
-            (format!("hash={}\nsalt=00\nsize=4096\nverity=4096\n", HASH.to_uppercase()), "hash"),
+            ("salt=00\nsize=4096\nverity=4096\n".to_string(), "hash"),
+            (
+                format!("hash={}\nsalt=00\nsize=4096\nverity=4096\n", &HASH[1..]),
+                "hash",
+            ),
+            (
+                format!("hash={}\nsalt=00\nsize=4096\nverity=4096\n", HASH.to_uppercase()),
+                "hash",
+            ),
             (format!("hash={HASH}\nsalt=0\nsize=4096\nverity=4096\n"), "salt"),
             (format!("hash={HASH}\nsize=4096\nverity=4096\n"), "salt"),
             (format!("hash={HASH}\nsalt=00\nsize=4000\nverity=4096\n"), "size"),
@@ -742,10 +755,26 @@ mod tests {
     #[test]
     fn modules_state_a_size_not_the_pins_is_refused_before_it_is_attached() {
         for (name, files, why) in [
-            ("longer", [("modules-a.img", 12288), ("modules-a.img.verity", 4096)], "os/modules-a.img is 12288 bytes"),
-            ("shorter", [("modules-a.img", 4096), ("modules-a.img.verity", 4096)], "os/modules-a.img is 4096 bytes"),
-            ("tree", [("modules-a.img", 8192), ("modules-a.img.verity", 8192)], "os/modules-a.img.verity is 8192"),
-            ("notree", [("modules-a.img", 8192), ("other", 0)], "os/modules-a.img.verity"),
+            (
+                "longer",
+                [("modules-a.img", 12288), ("modules-a.img.verity", 4096)],
+                "os/modules-a.img is 12288 bytes",
+            ),
+            (
+                "shorter",
+                [("modules-a.img", 4096), ("modules-a.img.verity", 4096)],
+                "os/modules-a.img is 4096 bytes",
+            ),
+            (
+                "tree",
+                [("modules-a.img", 8192), ("modules-a.img.verity", 8192)],
+                "os/modules-a.img.verity is 8192",
+            ),
+            (
+                "notree",
+                [("modules-a.img", 8192), ("other", 0)],
+                "os/modules-a.img.verity",
+            ),
         ] {
             let dir = state(name, &files);
             let said = open_image(&dir, Some('a'), &pin()).unwrap_err();
@@ -770,12 +799,21 @@ mod tests {
 
     #[test]
     fn modules_state_status_says_what_was_loaded_or_why_not() {
-        assert_eq!(said(&Ok(("os/modules-a.img".into(), 1))), serde_json::json!({"image": "os/modules-a.img", "loaded": 1}));
+        assert_eq!(
+            said(&Ok(("os/modules-a.img".into(), 1))),
+            serde_json::json!({"image": "os/modules-a.img", "loaded": 1})
+        );
         // None needed yet is a note, not a refusal.
         let none = said(&Ok(("os/modules-b.img".into(), 0)));
         assert_eq!(none["loaded"], 0);
         assert!(none["error"].is_null(), "{none}");
-        assert!(none["note"].as_str().unwrap().contains("no device needs a module of os/modules-b.img yet"), "{none}");
+        assert!(
+            none["note"]
+                .as_str()
+                .unwrap()
+                .contains("no device needs a module of os/modules-b.img yet"),
+            "{none}"
+        );
         assert_eq!(said(&Err("gone".into())), serde_json::json!({"error": "gone"}));
     }
 
@@ -789,7 +827,9 @@ mod tests {
         assert!(read_pin(&dir.join("absent")).is_none());
         assert_eq!(read_pin(&dir.join("fine")), Some(Ok("hash=1\n".into())));
         for bad in ["isdir", "binary"] {
-            let why = read_pin(&dir.join(bad)).expect("an unreadable pin is not a plain image").unwrap_err();
+            let why = read_pin(&dir.join(bad))
+                .expect("an unreadable pin is not a plain image")
+                .unwrap_err();
             assert!(why.contains(bad), "{why}");
         }
         let _ = std::fs::remove_dir_all(&dir);

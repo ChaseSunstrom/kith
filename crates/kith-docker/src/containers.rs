@@ -2054,7 +2054,10 @@ mod tests {
             closed
         });
         let (result, raw) = streamed_with(&rig.c, "POST", &format!("/exec/{id}/start"), "{}", b"", true);
-        assert!(!feed.join().unwrap(), "a half-close is not a hang-up: the command is not killed");
+        assert!(
+            !feed.join().unwrap(),
+            "a half-close is not a hang-up: the command is not killed"
+        );
         result.unwrap();
         assert_eq!(unframe(after_head(&raw)), [(1, "hi\n".to_string())]);
         let (_, after) = call(&rig.c, "GET", &format!("/exec/{id}/json"), "");
