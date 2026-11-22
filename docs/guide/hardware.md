@@ -66,12 +66,14 @@ spec:
   its status says which Device and path.
   The kernel subsystems refused are `scsi_generic`, `bsg`, `nvme`, `nvme-generic`, `mtd`,
   `tpm`, `tpmrm`, `msr`, `dax`, `ubi`, `ublk-char`, `vfio`, `i2c-dev`, `nvram`, `cpuid`, `mei`, `watchdog`,
-  `vfio-dev`, `uio`, `spidev`, `ipmi`, `usbmon` and `drm_dp_aux` (read from `/sys/dev/char`),
-  and so are char major 21 (sg) and the misc nodes the kernel reports only as `misc`: nvram
-  (10:144), watchdog (10:130), vfio (10:196) and mcelog (10:227). Where `/sys/dev/char` is there
+  `vfio-dev`, `uio`, `spidev`, `ipmi`, `usbmon`, `drm_dp_aux` and `drm_dp_aux_dev` (read from
+  `/sys/dev/char`), and so are char major 21 (sg) and the misc nodes the kernel reports only as
+  `misc`: nvram (10:144), watchdog (10:130), vfio (10:196), mcelog (10:227), snapshot (10:231),
+  cpu/microcode (10:184) and hpet (10:228). Where `/sys/dev/char` is there
   and a node's subsystem cannot be read, the node is refused too. This is a list of what to
   refuse, not of what to allow: a Device is set by the admin for hardware no list could name,
-  and an allowlist would break it. Given on purpose:
+  and an allowlist would break it. Other raw nodes may exist; a Device is the admin's grant.
+  Given on purpose:
   - `/dev/kvm` (10:232) is given: VM workloads need it.
   - `hidraw` nodes are given: security keys and gamepads are such devices.
   - `/dev/loop-control` (10:237) is given: it does nothing without a block device, which is never granted.

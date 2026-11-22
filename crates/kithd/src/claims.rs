@@ -525,7 +525,7 @@ fn in_dev(p: &str) -> bool {
 /// access to a disk, flash, a TPM, persistent or physical memory, a bus or the CPU's registers;
 /// their majors are not fixed. (A list to deny, not one to allow: a Device is set by the admin
 /// for hardware no list could name, so an allowlist would break it.)
-const RAW_SUBSYSTEMS: [&str; 23] = [
+const RAW_SUBSYSTEMS: [&str; 24] = [
     "scsi_generic",
     "bsg",
     "nvme",
@@ -549,6 +549,7 @@ const RAW_SUBSYSTEMS: [&str; 23] = [
     "ipmi",
     "usbmon",
     "drm_dp_aux",
+    "drm_dp_aux_dev", // the kernel's class name; the one above is kept beside it
 ];
 
 /// Why the character device `major:minor` may not be given: it is raw memory, the kernel's log,
@@ -560,10 +561,11 @@ fn denied(major: u64, minor: u64, sys: &Path) -> Option<&'static str> {
         "is raw memory, the kernel's log, or raw access to a disk, flash, a TPM or a bus, which no Device gives";
     // 1:1 mem, 1:2 kmem, 1:4 port, 1:11 kmsg, 1:12 oldmem, 10:224 tpm0, 10:236 mapper/control,
     // 21 sg; and misc nodes whose subsystem is just "misc": 10:144 nvram, 10:130 watchdog,
-    // 10:196 vfio, 10:227 mcelog. (10:183 hwrng, 10:232 kvm and 10:237 loop-control are given.)
+    // 10:196 vfio, 10:227 mcelog, 10:231 snapshot, 10:184 cpu/microcode, 10:228 hpet.
+    // (10:183 hwrng, 10:232 kvm and 10:237 loop-control are given.)
     if matches!(
         (major, minor),
-        (1, 1 | 2 | 4 | 11 | 12) | (10, 130 | 144 | 196 | 224 | 227 | 236) | (21, _)
+        (1, 1 | 2 | 4 | 11 | 12) | (10, 130 | 144 | 184 | 196 | 224 | 227 | 228 | 231 | 236) | (21, _)
     ) {
         return Some(RAW);
     }
@@ -1436,6 +1438,7 @@ spec: { node: b, devices: [b-usb0] }
             "ipmi",
             "usbmon",
             "drm_dp_aux",
+            "drm_dp_aux_dev",
         ] {
             assert!(RAW_SUBSYSTEMS.contains(&new), "{new}");
         }
@@ -1454,6 +1457,9 @@ spec: { node: b, devices: [b-usb0] }
             (10, 130, "misc", true),  // watchdog
             (10, 196, "misc", true),  // vfio
             (10, 227, "misc", true),  // mcelog
+            (10, 231, "misc", true),  // snapshot
+            (10, 184, "misc", true),  // cpu/microcode
+            (10, 228, "misc", true),  // hpet
             (10, 183, "misc", false), // hwrng
             (10, 232, "misc", false), // kvm
             (10, 237, "misc", false), // loop-control
