@@ -694,6 +694,14 @@ enum DiskCommand {
     List { node: String },
 }
 
+/// A character of Unicode's format category (Cf), or a line or paragraph separator, which a terminal
+/// can use to reorder or hide text (right-to-left overrides, zero-width marks, tag characters).
+fn is_format(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}')
+}
+
 /// What `kith image scan` says of the answer: how many packages were looked at, and a row for each
 /// advisory id of each package OSV has any for, with the id's osv.dev link. (Package names and ids
 /// come out of an image: what is not printable is a `?`, whatever a node sent.)
@@ -703,7 +711,7 @@ fn scan_said(said: &serde_json::Value) -> String {
             .as_str()
             .unwrap_or("?")
             .chars()
-            .map(|c| if c.is_control() { '?' } else { c })
+            .map(|c| if c.is_control() || is_format(c) { '?' } else { c })
             .collect()
     };
     let hits = said["vulnerable"].as_array().cloned().unwrap_or_default();
@@ -715,6 +723,22 @@ fn scan_said(said: &serde_json::Value) -> String {
         text(&said["ecosystem"]),
         hits.len()
     );
+    // (A scan that read less than all of it is not a clean one: it says what it left out.)
+    let (skipped, incomplete) = (
+        said["skipped"].as_u64().unwrap_or(0),
+        said["incomplete"].as_u64().unwrap_or(0),
+    );
+    if skipped > 0 {
+        out.push_str(&format!(
+            "note: {skipped} records of the package list were not looked at (not a package name and version)\n"
+        ));
+    }
+    if incomplete > 0 {
+        out.push_str(&format!(
+            "note: {incomplete} package{} had more advisories than were read (OSV gave more pages than a scan follows)\n",
+            if incomplete == 1 { "" } else { "s" }
+        ));
+    }
     let mut rows = vec![];
     for hit in &hits {
         let ids = hit["ids"].as_array().cloned().unwrap_or_default();
@@ -3269,6 +3293,30 @@ mod drain_tests {
         );
         assert!(lines[4].starts_with("ba?sh"), "{out}");
         assert!(!out.contains('\u{1b}'));
+        // Format characters (a right-to-left override, a zero-width space, a byte-order mark) are not printed either.
+        let tricky = super::scan_said(&json!({
+            "node": "a\u{202e}b", "image": "i\u{200b}\u{feff}\u{2066}", "ecosystem": "E", "packages": 1,
+            "vulnerable": [{ "name": "n\u{061c}", "version": "1", "ids": ["CVE-1\u{2069}"] }],
+        }));
+        assert!(
+            !tricky
+                .chars()
+                .any(|c| ['\u{202e}', '\u{200b}', '\u{feff}', '\u{2066}', '\u{2069}', '\u{061c}'].contains(&c)),
+            "{tricky:?}"
+        );
+        // A scan that did not read it all says so, and says what it left out.
+        let partial = super::scan_said(&json!({
+            "node": "a", "image": "i", "ecosystem": "E", "packages": 3, "skipped": 2, "incomplete": 1,
+            "vulnerable": [],
+        }));
+        assert!(
+            partial.contains("2 records") && partial.contains("not looked at"),
+            "{partial}"
+        );
+        assert!(
+            partial.contains("1 package") && partial.contains("more advisories"),
+            "{partial}"
+        );
         // Nothing found: the header alone.
         let clean = super::scan_said(
             &json!({ "node": "a", "image": "i", "ecosystem": "Alpine:v3.19", "packages": 3, "vulnerable": [] }),

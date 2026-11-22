@@ -33,6 +33,9 @@ pub struct Package {
 pub struct Found {
     pub ecosystem: String,
     pub packages: Vec<Package>,
+    /// How many records of the list were not taken (a name or version that is not one).
+    #[serde(default)]
+    pub skipped: usize,
 }
 
 /// A package OSV has ids for.
@@ -56,6 +59,10 @@ const MOST_PACKAGES: usize = 200_000;
 const MOST_FIELD: usize = 200;
 /// OSV's limit of queries in one batch.
 const MOST_BATCH: usize = 1000;
+/// The most pages of one package's ids that are followed (`next_page_token`): past it, it is said to be incomplete.
+const MOST_PAGES: usize = 10;
+/// The longest `next_page_token` that is sent back.
+const MOST_TOKEN: usize = 1024;
 /// The most of one OSV answer that is read.
 const MOST_ANSWER: usize = 16 << 20;
 /// Where OSV is. (The one address: a node asks no other for a scan.)
@@ -101,7 +108,11 @@ fn slurp(root: &Path, path: &str, most: u64) -> Result<Option<String>, String> {
             }
         }
     }
-    // (A pipe is not waited on, and a link swapped in since is not followed.)
+    // (What is not a regular file is not opened at all: a pipe, a device, a directory.)
+    if !std::fs::symlink_metadata(whole(&at)).is_ok_and(|meta| meta.is_file()) {
+        return Ok(None);
+    }
+    // (A pipe swapped in since is not waited on, and a link is not followed.)
     let flags = nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_NOFOLLOW;
     let opened = std::fs::OpenOptions::new()
         .read(true)
@@ -204,6 +215,7 @@ pub fn read(rootfs: &Path) -> Result<Found, String> {
         return Err(format!("no package list in this image for {ecosystem}"));
     };
     let mut found = std::collections::BTreeSet::new();
+    let (mut bytes, mut skipped) = (0, 0);
     for fields in paragraphs(&list, is_dpkg) {
         let get = |key: &str| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
         let (name, version) = if is_dpkg {
@@ -231,21 +243,25 @@ pub fn read(rootfs: &Path) -> Result<Found, String> {
             };
             (get("o").filter(|origin| !origin.is_empty()).unwrap_or(package), version)
         };
-        found.insert((plain("name", name)?, plain("version", version)?));
-    }
-    if found
-        .iter()
-        .map(|(name, version)| name.len() + version.len() + 40)
-        .sum::<usize>()
-        > MOST_PACKAGES
-    {
-        return Err(format!(
-            "more packages than a scan takes ({} of them): at most about {MOST_PACKAGES} bytes of names and versions",
-            found.len()
-        ));
+        // (A record that is not a package is left out and counted: one odd one is not the end of a scan.)
+        let (Ok(name), Ok(version)) = (plain("name", name), plain("version", version)) else {
+            skipped += 1;
+            continue;
+        };
+        let size = name.len() + version.len() + 40;
+        if found.insert((name, version)) {
+            bytes += size;
+        }
+        // (Stopped as it is read: a list of tiny records is not built whole to be refused.)
+        if bytes > MOST_PACKAGES {
+            return Err(format!(
+                "more packages than a scan takes: at most about {MOST_PACKAGES} bytes of names and versions"
+            ));
+        }
     }
     Ok(Found {
         ecosystem,
+        skipped,
         packages: found
             .into_iter()
             .map(|(name, version)| Package { name, version })
@@ -260,8 +276,9 @@ fn is_id(id: &str) -> bool {
 
 /// Each package of `found` that OSV at `base` has ids for (`POST /v1/querybatch`, a thousand at a
 /// time: the ecosystem, name and version of each, and nothing more of the node or the image), in the
-/// order of `found`, each with its ids sorted. What is not an id is dropped.
-pub async fn osv(base: &str, found: &Found) -> Result<Vec<Hit>, String> {
+/// order of `found`, each with its ids sorted, and how many packages have more ids than were read
+/// (a package's `next_page_token` is followed for at most [`MOST_PAGES`] pages). What is not an id is dropped.
+pub async fn osv(base: &str, found: &Found) -> Result<(Vec<Hit>, usize), String> {
     let url = format!("{base}/v1/querybatch");
     let failed = |e: &dyn std::error::Error| format!("OSV ({url}): {}", crate::cluster::why(e));
     // (A second install is refused, and is no matter.)
@@ -274,49 +291,81 @@ pub async fn osv(base: &str, found: &Found) -> Result<Vec<Hit>, String> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| failed(&e))?;
-    let mut hits = Vec::new();
-    for batch in found.packages.chunks(MOST_BATCH) {
-        let queries: Vec<_> = batch
-            .iter()
-            .map(|package| {
-                serde_json::json!({
-                    "package": { "name": package.name, "ecosystem": found.ecosystem },
-                    "version": package.version,
-                })
-            })
-            .collect();
-        let reply = client
-            .post(&url)
-            .json(&serde_json::json!({ "queries": queries }))
-            .send()
-            .await
-            .map_err(|e| failed(&e))?;
-        if !reply.status().is_success() {
-            return Err(format!("OSV ({url}) answered {}", reply.status()));
+    // One request: the results of `queries`, one each, in order.
+    let ask = |queries: Vec<serde_json::Value>| {
+        let (client, url) = (&client, &url);
+        async move {
+            let count = queries.len();
+            let reply = client
+                .post(url)
+                .json(&serde_json::json!({ "queries": queries }))
+                .send()
+                .await
+                .map_err(|e| failed(&e))?;
+            if !reply.status().is_success() {
+                return Err(format!("OSV ({url}) answered {}", reply.status()));
+            }
+            let body = crate::acme::capped(reply, url, MOST_ANSWER)
+                .await
+                .map_err(|e| format!("OSV: {e}"))?;
+            let said: serde_json::Value =
+                serde_json::from_slice(&body).map_err(|e| format!("OSV ({url}) answered what is not JSON: {e}"))?;
+            match said["results"].as_array() {
+                Some(results) if results.len() == count => Ok(results.clone()),
+                _ => Err(format!(
+                    "OSV ({url}) did not answer with a result for each of the {count} packages"
+                )),
+            }
         }
-        let body = crate::acme::capped(reply, &url, MOST_ANSWER)
-            .await
-            .map_err(|e| format!("OSV: {e}"))?;
-        let said: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|e| format!("OSV ({url}) answered what is not JSON: {e}"))?;
-        let results = said["results"]
-            .as_array()
-            .filter(|results| results.len() == batch.len())
-            .ok_or_else(|| {
-                format!(
-                    "OSV ({url}) did not answer with a result for each of the {} packages",
-                    batch.len()
-                )
-            })?;
-        for (package, result) in batch.iter().zip(results) {
-            let mut ids: Vec<String> = result["vulns"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|vuln| vuln["id"].as_str())
-                .filter(|id| is_id(id))
-                .map(String::from)
+    };
+    let (mut hits, mut incomplete) = (Vec::new(), 0);
+    for batch in found.packages.chunks(MOST_BATCH) {
+        let mut ids: Vec<Vec<String>> = vec![Vec::new(); batch.len()];
+        // (What is still to be asked: the package's place in the batch, and the page token it goes on from.)
+        let mut pending: Vec<(usize, Option<String>)> = (0..batch.len()).map(|n| (n, None)).collect();
+        for _page in 0..MOST_PAGES {
+            let queries = pending
+                .iter()
+                .map(|(n, token)| {
+                    let mut query = serde_json::json!({
+                        "package": { "name": batch[*n].name, "ecosystem": found.ecosystem },
+                        "version": batch[*n].version,
+                    });
+                    if let Some(token) = token {
+                        query["page_token"] = token.as_str().into();
+                    }
+                    query
+                })
                 .collect();
+            let results = ask(queries).await?;
+            let mut next = Vec::new();
+            for ((n, _), result) in pending.iter().zip(&results) {
+                ids[*n].extend(
+                    result["vulns"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|vuln| vuln["id"].as_str())
+                        .filter(|id| is_id(id))
+                        .map(String::from),
+                );
+                // (A package with a page more is asked again, with the token, and only it.)
+                match result["next_page_token"].as_str() {
+                    Some(token) if !token.is_empty() && token.len() <= MOST_TOKEN => {
+                        next.push((*n, Some(token.to_string())));
+                    }
+                    Some(token) if !token.is_empty() => incomplete += 1,
+                    _ => {}
+                }
+            }
+            pending = next;
+            if pending.is_empty() {
+                break;
+            }
+        }
+        // (Pages past the most: what was read is shown, and the package is counted, not called clean.)
+        incomplete += pending.len();
+        for (package, mut ids) in batch.iter().zip(ids) {
             ids.sort();
             ids.dedup();
             if !ids.is_empty() {
@@ -328,7 +377,7 @@ pub async fn osv(base: &str, found: &Found) -> Result<Vec<Hit>, String> {
             }
         }
     }
-    Ok(hits)
+    Ok((hits, incomplete))
 }
 
 /// What `GET /v1/scan/{node}?image=REF` is asked: `here` is what a node that passed it on says
@@ -353,12 +402,19 @@ pub async fn scan(
     crate::root_part::label("node", &node).map_err(|e| ApiError::Store(Error::Invalid(e)))?;
     permit_key(&shared, &caller, Verb::Get, &format!("Node/{node}"))?;
     let done = scanned(&shared, &caller, &node, &asked).await;
-    // (A scan sends names to a third party: it is in the audit log, whoever asked and whatever came of it.)
+    // (A scan sends names to a third party: the audit log has who asked, of which node and image, and how it came out.)
     let said = done.as_ref().map(drop).map_err(|e| match e {
         ApiError::Store(e) => e.to_string(),
         ApiError::Refused(why) | ApiError::Unauthorized(why) => why.clone(),
     });
-    shared.audit.record(&caller, "scan", vec![format!("Node/{node}")], said);
+    let what = vec![
+        format!("Node/{node}"),
+        format!(
+            "image {}",
+            asked.image.chars().take(200).collect::<String>().escape_debug()
+        ),
+    ];
+    shared.audit.record(&caller, "scan", what, said);
     done.map(Json)
 }
 
@@ -442,12 +498,14 @@ async fn scanned(
                 1,
             )))
         })?;
-    let hits = osv(OSV, &found).await.map_err(io)?;
+    let (hits, incomplete) = osv(OSV, &found).await.map_err(io)?;
     Ok(serde_json::json!({
         "node": node,
         "image": image,
         "ecosystem": found.ecosystem,
         "packages": found.packages.len(),
+        "skipped": found.skipped,
+        "incomplete": incomplete,
         "vulnerable": hits,
     }))
 }
@@ -653,6 +711,7 @@ C:Q1jkl=\nP:alpine-baselayout-data\nV:3.4.3-r2\n\n";
     fn found(packages: &[(&str, &str)]) -> Found {
         Found {
             ecosystem: "Debian:12".into(),
+            skipped: 0,
             packages: packages.iter().map(|(n, v)| pkg(n, v)).collect(),
         }
     }
@@ -664,7 +723,7 @@ C:Q1jkl=\nP:alpine-baselayout-data\nV:3.4.3-r2\n\n";
             _ => serde_json::json!({}),
         })
         .await;
-        let hits = osv(&base, &found(&[("bash", "5.2.15-2"), ("openssl", "3.0.11-1")]))
+        let (hits, _) = osv(&base, &found(&[("bash", "5.2.15-2"), ("openssl", "3.0.11-1")]))
             .await
             .unwrap();
         assert_eq!(
@@ -696,7 +755,7 @@ C:Q1jkl=\nP:alpine-baselayout-data\nV:3.4.3-r2\n\n";
         .await;
         let many: Vec<(String, String)> = (0..2501).map(|n| (format!("p{n}"), "1".to_string())).collect();
         let many: Vec<(&str, &str)> = many.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
-        let hits = osv(&base, &found(&many)).await.unwrap();
+        let (hits, _) = osv(&base, &found(&many)).await.unwrap();
         assert_eq!(
             hits.iter()
                 .map(|h| (h.name.as_str(), h.ids.clone()))
@@ -723,7 +782,6 @@ C:Q1jkl=\nP:alpine-baselayout-data\nV:3.4.3-r2\n\n";
         let why = osv("http://127.0.0.1:9", &found(&[("a", "1")])).await.unwrap_err();
         assert!(why.contains("OSV"), "{why}");
         // An answer for a different number of packages is no answer.
-        let (base, _) = osv_standin(|_| serde_json::json!({})).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let short = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         tokio::spawn(async move {
@@ -743,6 +801,85 @@ C:Q1jkl=\nP:alpine-baselayout-data\nV:3.4.3-r2\n\n";
         });
         let why = osv(&short, &found(&[("a", "1")])).await.unwrap_err();
         assert!(why.contains("OSV"), "{why}");
-        let _ = base;
+    }
+
+    #[tokio::test]
+    async fn scan_osv_follows_a_next_page_token_to_the_ids_past_the_first_page() {
+        // `a` has ids on two pages; `b` on one.
+        let (base, asked) = osv_standin(
+            |q| match (q["package"]["name"].as_str().unwrap(), q["page_token"].as_str()) {
+                ("a", None) => serde_json::json!({ "vulns": [{ "id": "CVE-1-1" }], "next_page_token": "t1" }),
+                ("a", Some("t1")) => serde_json::json!({ "vulns": [{ "id": "CVE-1-2" }] }),
+                ("b", None) => serde_json::json!({ "vulns": [{ "id": "CVE-2-1" }] }),
+                _ => serde_json::json!({}),
+            },
+        )
+        .await;
+        let (hits, incomplete) = osv(&base, &found(&[("a", "1"), ("b", "1")])).await.unwrap();
+        assert_eq!(incomplete, 0);
+        assert_eq!(
+            hits.iter()
+                .map(|h| (h.name.as_str(), h.ids.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("a", vec!["CVE-1-1".to_string(), "CVE-1-2".to_string()]),
+                ("b", vec!["CVE-2-1".to_string()])
+            ]
+        );
+        // (The second request asks only what has a next page, with its token.)
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 2);
+        assert_eq!(
+            asked[1]["queries"],
+            serde_json::json!([{ "package": { "name": "a", "ecosystem": "Debian:12" }, "version": "1", "page_token": "t1" }])
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_osv_counts_what_it_stops_reading_pages_of_rather_than_calling_it_clean() {
+        // A package that has a next page for ever: a bounded number of pages, then said to be incomplete.
+        let (base, asked) = osv_standin(|q| match q["package"]["name"].as_str().unwrap() {
+            "a" => serde_json::json!({ "vulns": [], "next_page_token": "more" }),
+            _ => serde_json::json!({}),
+        })
+        .await;
+        let (hits, incomplete) = osv(&base, &found(&[("a", "1"), ("b", "1")])).await.unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(incomplete, 1);
+        assert_eq!(asked.lock().unwrap().len(), MOST_PAGES);
+        // A token that is not a token (too long) is not sent back: the package is incomplete too.
+        let big = "x".repeat(5000);
+        let (base, asked) = osv_standin(move |_| serde_json::json!({ "next_page_token": big })).await;
+        let (_, incomplete) = osv(&base, &found(&[("a", "1")])).await.unwrap();
+        assert_eq!(incomplete, 1);
+        assert_eq!(asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scan_packages_skip_a_record_that_is_not_a_package_and_count_it() {
+        let root = Scratch::new("scan-skip");
+        put(&root, "etc/os-release", "ID=debian\nVERSION_ID=12\n");
+        put(
+            &root,
+            "var/lib/dpkg/status",
+            "Package: good\nStatus: install ok installed\nVersion: 1.0\n\n\
+Package: bad name\nStatus: install ok installed\nVersion: 1.0\n\n\
+Package: odd\nStatus: install ok installed\nVersion: 1.0 \u{202e}x\n",
+        );
+        let found = read(&root).unwrap();
+        assert_eq!(found.packages, [pkg("good", "1.0")]);
+        assert_eq!(found.skipped, 2);
+    }
+
+    #[test]
+    fn scan_packages_past_the_most_are_refused_as_they_are_read() {
+        let root = Scratch::new("scan-many");
+        put(&root, "etc/os-release", "ID=debian\nVERSION_ID=12\n");
+        let list: String = (0..6000)
+            .map(|n| format!("Package: p{n}\nStatus: install ok installed\nVersion: 1\n\n"))
+            .collect();
+        put(&root, "var/lib/dpkg/status", &list);
+        let why = read(&root).unwrap_err();
+        assert!(why.contains("more packages than a scan takes"), "{why}");
     }
 }

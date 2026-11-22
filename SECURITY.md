@@ -1774,6 +1774,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   node-side kithd asks OSV over HTTPS with them (no proxy, no redirect, a capped reply, ids kept only
   when they look like advisory ids). Nothing else leaves the node, nothing is pulled or stored, and a
   scan says nothing of a package the list does not name (a language package, a binary put there by hand).
+  The three files the root part opens are `/etc/os-release` (or `/usr/lib/os-release`), `/var/lib/dpkg/status`
+  and `/lib/apk/db/installed`, each a regular file at most so large. Anyone who may Get the Node can have a
+  scan run on it (one request to OSV for each thousand packages and each page more; each scan is in the
+  audit log with the image), OSV sees the node's own IP address, and no proxy is used, so an operator who
+  does not want either leaves Get on Nodes to those they trust, or blocks api.osv.dev.
 
 ## The review before 1.0
 
