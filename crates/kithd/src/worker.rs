@@ -15,8 +15,7 @@ use std::net::Ipv6Addr;
 
 /// The annotation a control node puts on a Blob a worker made: the worker's name.
 pub const MADE_ON: &str = "kith.dev/made-on";
-/// What `images` and `backups` put on the Blobs they make.
-const MADE_BY: &str = "kith.dev/made-by";
+use crate::blobs::{BACKUP, IMAGE, MADE_BY};
 const DISCOVERED: &str = "kith.dev/discovered";
 
 /// Who sent the write, as the node that checks it knows them.
@@ -709,8 +708,12 @@ pub(crate) fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Res
             }
             let wanted = |kind: &'static str| store.list(Some(kind)).filter(|of| self::namespace(of) == namespace);
             let mut volumes = wanted("Image").chain(wanted("Backup"));
-            if !resource.metadata.annotations.contains_key(MADE_BY) || !volumes.any(|of| of_its_volume(store, of, node))
-            {
+            let by_a_maker = resource
+                .metadata
+                .annotations
+                .get(MADE_BY)
+                .is_some_and(|by| by == BACKUP || by == IMAGE);
+            if !by_a_maker || !volumes.any(|of| of_its_volume(store, of, node)) {
                 return Err(refused(
                     &key,
                     "no Image or Backup of that namespace is of a Volume on this node",
@@ -900,7 +903,7 @@ spec: { volume: there, every: 1d }
     }
 
     fn blob(namespace: &str, name: &str, on: Option<&str>) -> Resource {
-        let mut annotations = json!({ MADE_BY: "backup" });
+        let mut annotations = json!({ MADE_BY: BACKUP });
         if let Some(on) = on {
             annotations[MADE_ON] = on.into();
         }
@@ -1764,6 +1767,14 @@ spec: { volume: there, every: 1d }
             panic!("an apply")
         };
         assert_eq!(resources[0].metadata.annotations[MADE_ON], "w");
+        // Only a maker's name is the mark: an image's passes, a person's own word does not.
+        let by = |who: &str| {
+            let mut blob = blob("default", OWN, Some("a"));
+            blob.metadata.annotations.insert(MADE_BY.into(), who.into());
+            apply(blob)
+        };
+        assert!(try_as(&store, "w", by(IMAGE)).is_ok());
+        assert!(try_as(&store, "w", by("mine")).is_err());
         // For a name a Blob has already, here or in any namespace; where it has no Volume.
         assert!(try_as(&store, "w", apply(blob("default", OTHERS, None))).is_err());
         assert!(try_as(&store, "w", apply(blob("other", OTHERS, None))).is_err());
