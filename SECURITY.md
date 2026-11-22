@@ -1117,7 +1117,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     worker's own, with the labels discovery writes and no other, the node and the
     class among them its own), the status of an Image or a Backup of
     a Volume that is on it, a Blob it made, its own name among a Blob's holders, and
-    when it synced as a Volume's replica, the notes of a Job placed on it, and the delete of
+    when it synced as a Volume's replica, why an encrypted Volume of it is not open (`reason`: a text of
+    at most 1 KiB without control characters), which encrypted Volumes' files it holds (its own Node's
+    `encrypted`: up to 1024 names), the notes of a Job placed on it, and the delete of
     a Volume that is on it whose data it was told to wipe (its claim gone, not retained, not
     encrypted, and no unit placed on it mounts it). Everything else is refused and written to
     the audit log under the worker's name: a template, a Secret, a Role, a Node's
@@ -1131,7 +1133,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     Volume's whole copy is sent only to a node the store names among its replicas
     (any node, not workers alone). The key of an encrypted Volume is given to control
     nodes to keep and to no worker, and a node made a worker deletes the keys it
-    kept. Of a worker's word about which nodes are there, only what it says of itself
+    kept. **A Volume gone from the store for a day has its key copies and its file erased,
+    and that cannot be undone:** the Volume's own node closes it if it is open (unmounts it and
+    removes its mapping; one still in use is left and tried again), then unlinks the file; a
+    node that keeps a key copy waits until that node says (its Node's `encrypted`, `[]` for
+    none) it holds no file of it, and a day more, so an owner that still mounts the file, or
+    that restarted, keeps its keys; a node that has said nothing of its files keeps them too.
+    A node's word that it holds a file can keep a key copy longer, and never erase one. Of a worker's word about which nodes are there, only what it says of itself
     is taken. A worker's replica takes over a lost Volume only when no control node
     has one, whatever time it says it synced. A worker's `status.serves` (the DNS port
     it says it answers, and ingress) is its own word and nothing more: a control node
