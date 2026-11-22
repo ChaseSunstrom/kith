@@ -362,7 +362,7 @@ fn unreadable(e: nix::errno::Errno) -> String {
 fn said(outcome: &Result<(String, usize), String>) -> serde_json::Value {
     match outcome {
         Ok((image, 0)) => {
-            serde_json::json!({"image": image, "loaded": 0, "error": format!("no device here needs a module of {image}")})
+            serde_json::json!({"image": image, "loaded": 0, "note": format!("no device needs a module of {image} yet")})
         }
         Ok((image, count)) => serde_json::json!({"image": image, "loaded": count}),
         Err(why) => serde_json::json!({"error": why}),
@@ -385,14 +385,33 @@ pub fn status() -> serde_json::Value {
 /// device from its `lib/modules/<release>` (and from no other place). Nothing loaded is said
 /// on the console and in the Node's status, with why.
 pub fn from_state(state: &Path) {
-    let Ok(pinned) = std::fs::read_to_string(PIN) else { return };
-    let outcome = mapped(state, &pinned);
+    // (No pin is a plain image, quiet; a pin that cannot be read is said.)
+    let outcome = match read_pin(Path::new(PIN)) {
+        None => return,
+        Some(pinned) => pinned.and_then(|pinned| mapped(state, &pinned)),
+    };
     let value = said(&outcome);
     if let Some(why) = value["error"].as_str() {
         eprintln!("kithd: init: modules: {why}: no module of the state's image is loaded");
+    } else if let Some(note) = value["note"].as_str() {
+        eprintln!("kithd: init: modules: {note}");
     }
     let _ = std::fs::write(SAID, value.to_string());
     set(value);
+}
+
+/// The pin's text: None where there is no pin (a plain image), why not where it cannot be read.
+fn read_pin(path: &Path) -> Option<Result<String, String>> {
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(Err(format!("{}: {e}", path.display()))),
+        Ok(text) => Some(Ok(text)),
+    }
+}
+
+/// An I/O error's `errno` (which dm-verity sets to EIO on a block that does not match).
+fn errno(e: &std::io::Error) -> nix::errno::Errno {
+    nix::errno::Errno::from_raw(e.raw_os_error().unwrap_or(0))
 }
 
 fn mapped(state: &Path, pinned: &str) -> Result<(String, usize), String> {
@@ -416,6 +435,13 @@ fn mapped(state: &Path, pinned: &str) -> Result<(String, usize), String> {
     .map_err(|e| format!("{name}: dm-verity: {e}"))?;
     // (The mapping holds both loop devices now, which go when it does.)
     drop((data, hash));
+    // Every block of it once, before any is trusted: dm-verity answers EIO to one that does
+    // not match, and what is read at finit would fail there, said as "no device needs a module".
+    let read = std::fs::File::open(&device).and_then(|mut dev| std::io::copy(&mut dev, &mut std::io::sink()));
+    if let Err(e) = read {
+        let _ = kith_dm_sys::remove("kith-modules");
+        return Err(format!("{name}: {}", unreadable(errno(&e))));
+    }
     std::fs::create_dir_all(MOUNTED).map_err(|e| format!("{MOUNTED}: {e}"))?;
     let flags = MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
     if let Err(e) = nix::mount::mount(Some(&device), MOUNTED, Some("squashfs"), flags, None::<&str>) {
@@ -426,9 +452,14 @@ fn mapped(state: &Path, pinned: &str) -> Result<(String, usize), String> {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
     // (What dm-verity refuses past the file system's first blocks shows here.)
     let alias = modules.join(release.trim()).join("modules.alias");
+    // (A failure from here on leaves no half state: the mount and the map go.)
+    let undo = || {
+        let _ = nix::mount::umount(MOUNTED);
+        let _ = kith_dm_sys::remove("kith-modules");
+    };
     if let Err(e) = std::fs::read(&alias) {
-        let e = nix::errno::Errno::from_raw(e.raw_os_error().unwrap_or(0));
-        return Err(format!("{name}: {}: {}", alias.display(), unreadable(e)));
+        undo();
+        return Err(format!("{name}: {}: {}", alias.display(), unreadable(errno(&e))));
     }
     let firmware = Path::new(MOUNTED).join("lib/firmware");
     if firmware.is_dir() {
@@ -437,8 +468,13 @@ fn mapped(state: &Path, pinned: &str) -> Result<(String, usize), String> {
             eprintln!("kithd: init: modules: the firmware loader is not told of {path}: {e}");
         }
     }
-    let count = start_in(&modules).ok_or_else(|| format!("{name}: no modules.alias for kernel {}", release.trim()))?;
-    Ok((name.clone(), count))
+    match start_in(&modules) {
+        Some(count) => Ok((name.clone(), count)),
+        None => {
+            undo();
+            Err(format!("{name}: no modules.alias for kernel {}", release.trim()))
+        }
+    }
 }
 
 /// What `start` does for the modules under `modules` (a `lib/modules`): none, without
@@ -735,9 +771,28 @@ mod tests {
     #[test]
     fn modules_state_status_says_what_was_loaded_or_why_not() {
         assert_eq!(said(&Ok(("os/modules-a.img".into(), 1))), serde_json::json!({"image": "os/modules-a.img", "loaded": 1}));
-        let why = said(&Ok(("os/modules-b.img".into(), 0)));
-        assert!(why["error"].as_str().unwrap().contains("no device here needs"), "{why}");
+        // None needed yet is a note, not a refusal.
+        let none = said(&Ok(("os/modules-b.img".into(), 0)));
+        assert_eq!(none["loaded"], 0);
+        assert!(none["error"].is_null(), "{none}");
+        assert!(none["note"].as_str().unwrap().contains("no device needs a module of os/modules-b.img yet"), "{none}");
         assert_eq!(said(&Err("gone".into())), serde_json::json!({"error": "gone"}));
+    }
+
+    #[test]
+    fn modules_state_pin_is_quiet_only_where_there_is_none() {
+        let dir = std::env::temp_dir().join(format!("kith-modules-{}-pin", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("isdir")).unwrap();
+        std::fs::write(dir.join("binary"), [0xff, 0xfe, 0x00]).unwrap();
+        std::fs::write(dir.join("fine"), "hash=1\n").unwrap();
+        assert!(read_pin(&dir.join("absent")).is_none());
+        assert_eq!(read_pin(&dir.join("fine")), Some(Ok("hash=1\n".into())));
+        for bad in ["isdir", "binary"] {
+            let why = read_pin(&dir.join(bad)).expect("an unreadable pin is not a plain image").unwrap_err();
+            assert!(why.contains(bad), "{why}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

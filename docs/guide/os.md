@@ -217,7 +217,7 @@ missing file) is one console line, never an end. Not supported: module parameter
 #### Modules on the state partition: `# modules: state`
 
 ```sh
-sh ci/vm.sh --test modules-state   # the image loads virtio-input from it; six tampered disks load nothing
+sh ci/vm.sh --test modules-state   # the image loads virtio-input from it; ten tampered disks load nothing
 ```
 
 A feature whose first line is `# modules: state` (`os/features/modules-state-test.config` is the

@@ -100,6 +100,12 @@ CONFIG_VIRTIO_NET=m' >"$bad"
     refused 'blocks do not match the hash' "a block of the image altered"
     said 'device-mapper: verity: ' || fail "the kernel did not name dm-verity for the altered block"
 
+    # A block past the first, where a .ko is: the file system mounts and modules.alias reads, so
+    # only the whole read before the mount sees it (else finit fails with EIO, said as no device).
+    fresh
+    flip modules-a.img 5
+    refused 'blocks do not match the hash' "a block of the image altered, past the first"
+
     fresh
     flip modules-a.img.verity 1
     refused 'blocks do not match the hash' "a block of the hash tree altered"
