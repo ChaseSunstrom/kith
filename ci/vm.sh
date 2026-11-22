@@ -71,7 +71,10 @@
 #   sh ci/vm.sh --test access   three nodes: a write let through by a node that had not heard its
 #                               RoleBinding was deleted is refused where the log is kept; and
 #                               three entries a forging leader appends (bare, a changed body,
-#                               a replayed nonce) are refused at apply by every node
+#                               a replayed nonce) are refused at apply by every node; and a
+#                               phone's tunnel added by POST /v1/peers (--people): its level's
+#                               Service, a narrowed level cut, a removed peer's connection
+#                               ended, an exit level leaving by its Exit
 #   sh ci/vm.sh --test fido2    the client of kithd against a software security key (the fido2-test
 #                               build) through the kernel's uhid and hidraw: the hmac-secret each seed
 #                               says it must be, another seed another secret, a withheld touch timing out
@@ -370,6 +373,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    nonce and one with a command its signed body does not make;
                    every node refuses each at apply (and audits it), and the
                    three nodes' lists agree; needs what --test rollout needs.
+                   Also a phone (a VM running the kernel's WireGuard) whose
+                   peer is added by POST /v1/peers on n1, started with
+                   --people: it reaches its level's Service, is cut when the
+                   level narrows, loses its open connection when the peer is
+                   removed, and leaves an exit level by its Exit.
                    The first run per checkout does a cold forge release build
                    (kithd and kith, into a target folder of its own) and an
                    image of it in target/os-forge: far longer than a warm one
