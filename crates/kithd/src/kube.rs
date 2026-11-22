@@ -3511,7 +3511,16 @@ async fn pod_decision(
         &parts.headers,
         parts.uri.query().unwrap_or_default(),
     );
-    pod_run(call, namespace, pod, Verb::Exec, ui)?;
+    let (key, _) = pod_run(call, namespace, pod, Verb::Exec, ui)?;
+    // Root of the container's user namespace (`root=true`, which only kith's own client sends) takes Apply on the
+    // holder as well as Exec; the node the pod runs on checks it again where the hop arrives. Attach has no root.
+    if verb == "exec" && crate::pod_exec::asks_root(query) {
+        let holder = vec![(
+            key.split('/').next().unwrap_or_default().to_string(),
+            Some(namespace.to_string()),
+        )];
+        api::permit(&call.shared, &call.caller, Verb::Apply, |_| holder).map_err(refusal)?;
+    }
     // kubectl sends no Origin: one is a browser's, and a browser is not let upgrade to a shell,
     // unless it is the UI's route and the page is the UI's own.
     if let Some(why) = foreign_origin(headers, ui) {
@@ -3609,6 +3618,95 @@ mod tests {
         }
         assert!(ask(&own, false), "the Kubernetes route refuses any Origin");
         assert!(!ask(&[own[0]], false));
+    }
+
+    /// The Kubernetes route carries kith's `root=true` too: it takes Apply on the holder as well as Exec, refused
+    /// (403, before any upgrade) for a caller with Exec alone, who still gets a plain exec.
+    #[tokio::test]
+    async fn exec_root_needs_apply_on_the_kubernetes_route() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-exec-root-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let held = "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: {name: web, namespace: default}
+spec: {replicas: 1, template: {exec: [{name: sleep, command: [sleep, '3600']}]}}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: alice}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: dana}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: execer}
+spec:
+  rules:
+    - {kinds: [Workload], verbs: [exec], namespaces: [default]}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: rooter}
+spec:
+  rules:
+    - {kinds: [Workload], verbs: [exec, apply], namespaces: [default]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: alice-execer}
+spec: {role: execer, subjects: [alice]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: dana-rooter}
+spec: {role: rooter, subjects: [dana]}
+";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(held).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        let ask = |who: &str, query: &str| {
+            let call = Call {
+                shared: shared.clone(),
+                caller: Caller::Identity(who.into()),
+                certificate: None,
+                asked: Asked::new(),
+                table: false,
+            };
+            let request = axum::http::Request::builder()
+                .uri(format!("/exec?{query}"))
+                .body(())
+                .unwrap();
+            (call, request.into_parts().0)
+        };
+        // (A request that is no upgrade is 400 once past the gate: that is the plain exec's way here.)
+        for (who, query, want) in [
+            ("alice", "command=true", 400),
+            ("alice", "command=true&root=true", 403),
+            ("alice", "command=true&root=false", 400),
+            ("dana", "command=true&root=true", 400),
+            ("dana", "command=true", 400),
+        ] {
+            let (call, parts) = ask(who, query);
+            let no = pod_decision(&call, "exec", "default", "web-0", &parts, None, true)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(no.code.as_u16(), want, "{who} {query}: {}", no.why);
+            if want == 403 {
+                assert!(no.why.contains("alice may not apply Workload"), "{}", no.why);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A status is kithd's own word for what runs: a client's PUT or PATCH of it is refused

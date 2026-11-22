@@ -192,6 +192,11 @@ impl Ask {
     }
 }
 
+/// Whether an exec's query asks for root (a query that is no exec's is refused later, where it is parsed).
+pub(crate) fn asks_root(query: &str) -> bool {
+    Ask::parse(query).is_ok_and(|ask| ask.root)
+}
+
 /// Where a pod's unit runs: its container's id, and the node.
 struct Placed {
     id: String,
@@ -467,10 +472,15 @@ pub async fn hop(
         audit(Err(why.clone()));
         return say(StatusCode::NOT_FOUND, why);
     };
-    let right = vec![(holder.to_string(), Some(hop.namespace.clone()))];
-    if let Err(refused) = permit(&shared, &who, Verb::Exec, |_| right) {
-        audit(Err("refused".into()));
-        return refused.into_response();
+    // (Root of the container's user namespace takes Apply on the holder as well: whoever may only exec gets a plain exec.)
+    let rooted = matches!(&hop.spec, Spec::Exec(ask) if ask.root);
+    let verbs = [Some(Verb::Exec), rooted.then_some(Verb::Apply)];
+    for verb in verbs.into_iter().flatten() {
+        let right = vec![(holder.to_string(), Some(hop.namespace.clone()))];
+        if let Err(refused) = permit(&shared, &who, verb, |_| right) {
+            audit(Err("refused".into()));
+            return refused.into_response();
+        }
     }
     // (Past the gate: what is asked is done here, or refused with a status that says why.)
     let done = match hop.spec {
@@ -1069,6 +1079,63 @@ spec: {role: execer, subjects: [alice]}
             "{bob:?}"
         );
         assert!(!verbs("alice via node a").is_empty(), "{entries:?}");
+    }
+
+    /// Root of the container's user namespace is a hand on the Workload's own unit: it takes Apply on the
+    /// holder as well as Exec, checked where the hop arrives. A caller with Exec alone still gets a plain exec.
+    #[tokio::test]
+    async fn exec_root_needs_apply_on_the_holder_where_the_hop_arrives() {
+        let world = crate::api::run::tests::World::new("pod-hop-root").await;
+        world.user("alice");
+        let rooter = "
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: dana}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: rooter}
+spec:
+  rules:
+    - {kinds: [Workload], verbs: [exec, apply], namespaces: [default]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: dana-rooter}
+spec: {role: rooter, subjects: [dana]}
+";
+        for shared in [&world.a, &world.b] {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(&format!("{HOP_STORE}{rooter}")).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+            let unit = json!({"replica": 0, "node": "b", "state": "running"});
+            let status = json!({"nodes": {"0": "b"}, "containers": [unit]});
+            state.store.set_status("Workload/default/web", Some(status)).unwrap();
+        }
+        let client = world.a.cluster.as_ref().unwrap().client.clone();
+        let exec = |root: bool| json!({"exec": {"command": ["true"], "container": null, "stdin": false, "root": root}});
+        let (status, why) = ask_hop(&client, world.b_port, "alice", "web-0", &exec(true)).await;
+        assert_eq!(status, 403, "{why}");
+        assert!(why.contains("alice via node a may not apply Workload"), "{why}");
+        // (Past the gate the hop goes on to enter a container this node did not make: 422.)
+        for (who, root) in [("alice", false), ("dana", true), ("dana", false)] {
+            let (status, why) = ask_hop(&client, world.b_port, who, "web-0", &exec(root)).await;
+            assert_eq!(status, 422, "{who} root={root}: {why}");
+        }
+        let entries = world.b.audit.tail(60).unwrap();
+        let refused = |verb: &str, error: &str| {
+            let refused = |e: &&Value| e["who"] == "alice via node a" && e["ok"] == false && e["verb"] == verb;
+            entries
+                .iter()
+                .filter(refused)
+                .filter(|e| e["error"].as_str().unwrap_or_default().contains(error))
+                .count()
+        };
+        assert_eq!(refused("apply", "may not apply Workload"), 1, "{entries:?}");
+        assert_eq!(refused("exec", "refused"), 1, "{entries:?}");
     }
 
     /// The two routes this one replaced are gone: a node that asks for either is told there is no such route,
