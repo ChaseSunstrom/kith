@@ -9,7 +9,8 @@
 // one starts beside the old (the generations take turns at ids with and without a `b`:
 // `unit_id`, `pod_id`), and the old is stopped once the new is ready and has answered for
 // a `DRAIN`. Any other is stopped before its replacement starts, and says why in a note.
-// Images are pulled one at a time.
+// Images are pulled one at a time; the layers of one image are fetched side by side (a few at once).
+// The pull counts in the status stay at all layers while an image unpacks, until the pull ends.
 // A Job's progress lives in memory: kithd restarted under a running Job starts it over.
 
 mod prune;
@@ -1007,6 +1008,110 @@ fn answers(
 /// What the status says of a unit: its revision and whether it is ready (a probe passed, if it has one).
 fn unit_status(slot: &Slot) -> Value {
     json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts, "revision": slot.revision })
+}
+
+/// How often the status says how far a pull is.
+const PULL_SAID: Duration = Duration::from_secs(1);
+
+/// The status of a workload while this node pulls the image of `unit`: what `live` says of the
+/// units of this node, as it says it (a serving unit of a replica being updated stays ready, with
+/// its `gen`), the unit of the pull with `pull` (layers and bytes, done and in all) added. Only
+/// what a worker may report is in it (`worker::report`), and no unit is taken away; `unit` is added
+/// only where this node has said nothing of that replica yet. No other unit keeps a `pull`: one
+/// pull goes on at a time here, so a `pull` left on another unit is a stale one.
+///
+/// With no `pull` (the pull of `unit` is over) it is the same status with every `pull` taken off,
+/// or none at all where no unit of this node carries one (nothing to take off: a report of no
+/// units would say that this node runs none).
+fn pulling(
+    live: Option<&Value>,
+    node: &str,
+    job: bool,
+    unit: &Value,
+    pull: Option<kith_runtime::Progress>,
+) -> Option<Value> {
+    pulling_from(live, node, job, unit, pull, false)
+}
+
+/// `pulling`, with `sure` for a clear that is made even where `live` shows no `pull` to take off:
+/// a report that was cut off may still land, and `live` does not have it yet. The status then holds
+/// the units of this node as they are, `unit` among them (never none: that would say it runs none).
+fn pulling_from(
+    live: Option<&Value>,
+    node: &str,
+    job: bool,
+    unit: &Value,
+    pull: Option<kith_runtime::Progress>,
+    sure: bool,
+) -> Option<Value> {
+    // (What `worker::report` takes of a Job, and of the rest.)
+    const JOB: [&str; 7] = [
+        "state",
+        "succeeded",
+        "failed",
+        "observedRevision",
+        "containers",
+        "message",
+        "notes",
+    ];
+    const REST: [&str; 3] = ["replicas", "containers", "notes"];
+    let said: &[&str] = if job { &JOB } else { &REST };
+    let mut status = json!({});
+    for (field, value) in live.and_then(Value::as_object).into_iter().flatten() {
+        if said.contains(&field.as_str()) {
+            status[field] = value.clone();
+        }
+    }
+    let mut ours: Vec<Value> = status["containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|other| other["node"].as_str().is_none_or(|n| n == node))
+        .cloned()
+        .collect();
+    let stale = ours.iter().any(|other| other.get("pull").is_some());
+    for other in &mut ours {
+        if let Some(other) = other.as_object_mut() {
+            other.remove("pull");
+        }
+    }
+    let Some(pull) = pull else {
+        return (stale || sure).then(|| {
+            if ours.is_empty() {
+                ours.push(unit.clone());
+            }
+            status["containers"] = json!(ours);
+            status
+        });
+    };
+    let of_replica = |other: &Value| other["name"] == unit["name"] && other["replica"] == unit["replica"];
+    let at = match ours.iter().position(of_replica) {
+        Some(at) => at,
+        None => {
+            ours.push(unit.clone());
+            ours.len() - 1
+        }
+    };
+    // (The counts are a registry's word; a report holds each within its caps, whatever it said.)
+    ours[at]["pull"] = json!({
+        "layers": pull.layers.min(1 << 16),
+        "layersTotal": pull.layers_total.min(1 << 16),
+        "bytes": pull.bytes.min(1 << 50),
+        "bytesTotal": pull.bytes_total.min(1 << 50),
+    });
+    status["containers"] = json!(ours);
+    Some(status)
+}
+
+/// Whether a pull that is at `now` is worth a status write (each is one through the cluster's
+/// log) after the one at `last`, said `since` ago: another layer is done, or the bytes moved by
+/// a twentieth of the whole, or it has been five seconds.
+fn pull_worth_saying(last: Option<kith_runtime::Progress>, now: kith_runtime::Progress, since: Duration) -> bool {
+    let Some(last) = last else { return true };
+    last.layers != now.layers
+        || last.layers_total != now.layers_total
+        || now.bytes.abs_diff(last.bytes) >= (now.bytes_total / 20).max(1)
+        || (last != now && since >= Duration::from_secs(5))
 }
 
 /// Every unit of the generation `b` of the replica is ready: it answers for the replica.
@@ -2277,8 +2382,17 @@ impl Controller {
                         continue;
                     }
                 };
-                let started = tokio::select! {
-                    started = async {
+                // While it pulls, the status says how far (the pass waits for the start).
+                let (unit, owner) = (unit_status(slot), slot.owner.clone());
+                let image = match &slot.run {
+                    Run::Container(c) => Some(c.image.clone()),
+                    Run::Exec(_) => None,
+                };
+                let started = {
+                    let mut reported: Option<tokio::task::JoinHandle<()>> = None;
+                    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + PULL_SAID, PULL_SAID);
+                    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let mut starting = std::pin::pin!(async {
                         if let Some((handle, _)) = taken {
                             eprintln!("kithd: {id}: taken back, as it ran");
                             if let Some((pod, _)) = slot.pod.as_ref().filter(|_| nix::unistd::getuid().is_root()) {
@@ -2298,9 +2412,91 @@ impl Controller {
                         let project = given.transpose()?;
                         kith_runtime::timeline::mark("start");
                         start(shared, &self.runtime, &self.logs, mesh, id, slot, project).await
-                    } => started,
-                    // A pull can take minutes; shutting down does not wait for it.
-                    _ = stop_now.changed() => return TICK,
+                    });
+                    let mut last: Option<(kith_runtime::Progress, Instant)> = None;
+                    let started = loop {
+                        tokio::select! {
+                            started = &mut starting => break started,
+                            // A pull can take minutes; shutting down does not wait for it.
+                            _ = stop_now.changed() => {
+                                if let Some(r) = reported.take() {
+                                    r.abort();
+                                }
+                                return TICK;
+                            }
+                            _ = ticks.tick() => {
+                                // (By the reference the image is asked with, so another asker of the same
+                                // reference, an API pull, is read as this unit's: both pull the same layers.)
+                                let pull = image.as_deref().and_then(|i| self.runtime.images.pull_progress(i));
+                                let Some(pull) = pull else { continue };
+                                // Each report is a write through the cluster's log: only when it says more.
+                                let since = last.map_or(Duration::MAX, |(_, at)| at.elapsed());
+                                if !pull_worth_saying(last.map(|(said, _)| said), pull, since) {
+                                    continue;
+                                }
+                                // Not waited for, and one at a time: a report that is late is not stacked.
+                                if reported.as_ref().is_some_and(|r| !r.is_finished()) {
+                                    continue;
+                                }
+                                last = Some((pull, Instant::now()));
+                                let node = shared.members.me().to_string();
+                                let status = {
+                                    let held = shared.store.lock().expect("a handler panicked holding the store");
+                                    let Some(live) = held.store.get(&owner) else { continue };
+                                    pulling(live.status.as_ref(), &node, live.kind == "Job", &unit, Some(pull))
+                                };
+                                let Some(status) = status else { continue };
+                                let (shared, owner) = (shared.clone(), owner.clone());
+                                reported = Some(tokio::spawn(async move {
+                                    for report in crate::raft::in_parts(&node, vec![(owner, Some(status))]) {
+                                        if let Err(e) = shared.submit(report).await {
+                                            eprintln!("kithd: saving status: {e}");
+                                        }
+                                    }
+                                }));
+                            }
+                        }
+                    };
+                    // A report still on its way must not land after the one that takes the pull off:
+                    // waited for a little, then dropped. (The pass's own report comes only at its end,
+                    // and until then the next unit may be pulling for minutes: the last count would stay.)
+                    let mut cut_off = false;
+                    if let Some(mut r) = reported.take()
+                        && tokio::time::timeout(PULL_SAID * 5, &mut r).await.is_err()
+                    {
+                        r.abort();
+                        cut_off = true;
+                    }
+                    if last.is_some() {
+                        let node = shared.members.me().to_string();
+                        let cleared = {
+                            let held = shared.store.lock().expect("a handler panicked holding the store");
+                            held.store.get(&owner).and_then(|live| {
+                                // (A report cut off may have reached the leader without being applied yet.)
+                                pulling_from(live.status.as_ref(), &node, live.kind == "Job", &unit, None, cut_off)
+                            })
+                        };
+                        if let Some(status) = cleared {
+                            // Bounded, and shutting down does not wait for it: with no majority a submit
+                            // retries for ten seconds, and the pass starts nothing meanwhile.
+                            let say = async {
+                                for report in crate::raft::in_parts(&node, vec![(owner.clone(), Some(status))]) {
+                                    if let Err(e) = shared.submit(report).await {
+                                        eprintln!("kithd: saving status: {e}");
+                                    }
+                                }
+                            };
+                            tokio::select! {
+                                said = tokio::time::timeout(PULL_SAID * 5, say) => {
+                                    if said.is_err() {
+                                        eprintln!("kithd: {id}: the end of its pull was not saved in time");
+                                    }
+                                }
+                                _ = stop_now.changed() => return TICK,
+                            }
+                        }
+                    }
+                    started
                 };
                 // A cached image starts without ever waiting; let the API answer between starts.
                 tokio::task::yield_now().await;
@@ -3675,6 +3871,161 @@ mod tests {
         assert_eq!(kith_runtime::timeline::line("api", 5), "kith-timeline api 5\n");
         // Off (KITH_TIMELINE unset in the tests), a mark writes nothing and does not panic.
         kith_runtime::timeline::mark("api");
+    }
+
+    /// While a pull goes on the status carries its layers and bytes on the unit that pulls, keeps
+    /// the other units of this node, and leaves those of other nodes alone.
+    #[test]
+    fn pull_progress_goes_in_the_status_of_the_unit_that_pulls() {
+        let unit = json!({ "name": "web", "replica": 1, "state": "starting", "ready": false, "restarts": 0 });
+        let live = json!({ "replicas": 3, "containers": [
+            { "name": "web", "replica": 0, "ready": true, "node": "a" },
+            { "name": "web", "replica": 1, "ready": false, "node": "a", "state": "pending" },
+            { "name": "side", "replica": 1, "ready": true, "node": "a" },
+            { "name": "web", "replica": 2, "ready": true, "node": "b" },
+        ]});
+        let pull = kith_runtime::Progress {
+            layers: 3,
+            layers_total: 7,
+            bytes: 12_000_000,
+            bytes_total: 40_000_000,
+        };
+        let status = pulling(Some(&live), "a", false, &unit, Some(pull)).unwrap();
+        let said: Vec<&Value> = status["containers"].as_array().unwrap().iter().collect();
+        assert_eq!(said.len(), 3, "{status}");
+        assert!(
+            said.iter().all(|u| u["node"] != "b"),
+            "another node's unit was taken: {status}"
+        );
+        let mine = said.iter().find(|u| u["name"] == "web" && u["replica"] == 1).unwrap();
+        assert_eq!(
+            mine["pull"],
+            json!({ "layers": 3, "layersTotal": 7, "bytes": 12_000_000, "bytesTotal": 40_000_000 })
+        );
+        assert!(said.iter().filter(|u| u.get("pull").is_some()).count() == 1);
+        assert_eq!(status["replicas"], 3);
+        // Nothing said yet: the unit is all there is.
+        let first = pulling(None, "a", false, &unit, Some(pull)).unwrap();
+        assert_eq!(first["containers"].as_array().unwrap().len(), 1);
+        // And once the store merges it, the other node's units are still there, with this one's pull.
+        let merged = kith_store::reported(Some(live), "a", Some(status));
+        assert_eq!(merged["containers"].as_array().unwrap().len(), 4, "{merged}");
+    }
+
+    /// A rolling update pulls the new image while the old unit serves: that unit stays ready, with
+    /// its `gen`, and gets the `pull`; no unit is added or taken away; and the report holds only
+    /// what a worker may send (no `ready`, `nodes`), a Job's `state` kept.
+    #[test]
+    fn a_pull_leaves_the_serving_unit_serving() {
+        let unit = json!({ "name": "web", "replica": 0, "gen": 1, "state": "starting", "ready": false });
+        let live = json!({
+            "replicas": 1, "ready": 1, "nodes": ["a"], "unschedulable": 0, "state": "running",
+            "containers": [{ "name": "web", "replica": 0, "gen": 0, "ready": true, "state": "running", "node": "a" }],
+        });
+        let pull = kith_runtime::Progress {
+            layers: 1,
+            layers_total: 2,
+            bytes: 5,
+            bytes_total: 10,
+        };
+        let status = pulling(Some(&live), "a", false, &unit, Some(pull)).unwrap();
+        let said = status["containers"].as_array().unwrap();
+        assert_eq!(said.len(), 1, "{status}");
+        assert_eq!(said[0]["ready"], true, "{status}");
+        assert_eq!(said[0]["gen"], 0, "{status}");
+        assert_eq!(said[0]["pull"]["layersTotal"], 2);
+        for field in ["ready", "nodes", "unschedulable", "state"] {
+            assert!(status.get(field).is_none(), "`{field}` in a worker's report: {status}");
+        }
+        let job = pulling(Some(&live), "a", true, &unit, Some(pull)).unwrap();
+        assert_eq!(job["state"], "running");
+        // The merge keeps it serving.
+        let merged = kith_store::reported(Some(live), "a", Some(status));
+        assert_eq!(merged["containers"][0]["ready"], true, "{merged}");
+    }
+
+    /// When a pull ends the status says so: the unit's last count is taken off (or Workload B's pull would
+    /// leave Workload A reading "3 of 7 layers"), no other unit keeps one, and a status with nothing to
+    /// take off is not made. The counts a report holds stay within what the leader takes.
+    #[test]
+    fn pull_progress_is_taken_off_when_the_pull_ends() {
+        let pull = kith_runtime::Progress {
+            layers: 3,
+            layers_total: 7,
+            bytes: 1,
+            bytes_total: 2,
+        };
+        let unit = json!({ "name": "web", "replica": 0, "state": "starting", "ready": false });
+        let live = json!({ "replicas": 2, "containers": [
+            { "name": "web", "replica": 0, "ready": false, "node": "a", "pull": { "layers": 3 } },
+            { "name": "web", "replica": 1, "ready": false, "node": "a", "pull": { "layers": 1 } },
+            { "name": "web", "replica": 2, "ready": true, "node": "b", "pull": { "layers": 9 } },
+        ]});
+        let cleared = pulling(Some(&live), "a", false, &unit, None).unwrap();
+        let said = cleared["containers"].as_array().unwrap();
+        assert_eq!(said.len(), 2, "{cleared}");
+        assert!(said.iter().all(|u| u.get("pull").is_none()), "{cleared}");
+        // Another unit's stale count goes too when a pull is told.
+        let told = pulling(Some(&live), "a", false, &unit, Some(pull)).unwrap();
+        let told = told["containers"].as_array().unwrap();
+        assert_eq!(told.iter().filter(|u| u.get("pull").is_some()).count(), 1, "{told:?}");
+        // Nothing to take off: nothing to say (an empty report would say this node runs none).
+        let clean = json!({ "replicas": 1, "containers": [{ "name": "web", "replica": 0, "node": "a" }] });
+        assert!(pulling(Some(&clean), "a", false, &unit, None).is_none());
+        assert!(pulling(None, "a", false, &unit, None).is_none());
+        // A report cut off may still land: the clear is made though the store shows no count yet,
+        // with the unit in it where the store has none of this node's (never a report of no units).
+        let sure = pulling_from(Some(&clean), "a", false, &unit, None, true).unwrap();
+        assert_eq!(sure["containers"].as_array().unwrap().len(), 1, "{sure}");
+        assert!(sure["containers"][0].get("pull").is_none(), "{sure}");
+        let bare = pulling_from(None, "a", false, &unit, None, true).unwrap();
+        assert_eq!(bare["containers"][0]["name"], "web", "{bare}");
+        // A count past what a report may hold is held there, not refused every tick.
+        let vast = kith_runtime::Progress {
+            layers: usize::MAX,
+            layers_total: usize::MAX,
+            bytes: u64::MAX,
+            bytes_total: u64::MAX,
+        };
+        let held = pulling(None, "a", false, &unit, Some(vast)).unwrap();
+        assert_eq!(held["containers"][0]["pull"]["bytesTotal"], 1u64 << 50, "{held}");
+        assert_eq!(held["containers"][0]["pull"]["layers"], 1u64 << 16, "{held}");
+    }
+
+    /// A pull is said when another layer is done, when the bytes moved by a twentieth, or after five seconds.
+    #[test]
+    fn pull_progress_is_said_when_it_moved_enough() {
+        let at = |layers, bytes| kith_runtime::Progress {
+            layers,
+            layers_total: 4,
+            bytes,
+            bytes_total: 1000,
+        };
+        let sec = Duration::from_secs(1);
+        assert!(pull_worth_saying(None, at(0, 0), sec), "the first look");
+        assert!(!pull_worth_saying(Some(at(1, 100)), at(1, 100), sec), "the same");
+        assert!(!pull_worth_saying(Some(at(1, 100)), at(1, 149), sec), "a little");
+        assert!(
+            pull_worth_saying(Some(at(1, 100)), at(1, 150), sec),
+            "a twentieth of the whole"
+        );
+        assert!(pull_worth_saying(Some(at(1, 100)), at(2, 101), sec), "a layer");
+        assert!(
+            pull_worth_saying(Some(at(1, 100)), at(1, 101), Duration::from_secs(5)),
+            "five seconds"
+        );
+        assert!(
+            !pull_worth_saying(Some(at(1, 100)), at(1, 100), Duration::from_secs(60)),
+            "nothing new"
+        );
+        // A total of nothing (a registry's word) does not make every look worth saying.
+        let empty = kith_runtime::Progress {
+            layers: 1,
+            layers_total: 1,
+            bytes: 0,
+            bytes_total: 0,
+        };
+        assert!(!pull_worth_saying(Some(empty), empty, sec));
     }
 
     #[test]

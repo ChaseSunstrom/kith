@@ -331,13 +331,19 @@ fn nodes_join_over_mutual_tls() {
 
 /// A raw HTTPS request with the node certificate kept in `dir`; returns the status code.
 fn status_as_node(address: &str, dir: &Path, method: &str, path: &str) -> String {
+    curl_as_node(address, dir, method, path).0
+}
+
+/// (The status curl says, and curl's own exit code: 0 for an answer, 28 for a timeout, 35 or 56 for a
+/// TLS connection that was cut.)
+fn curl_as_node(address: &str, dir: &Path, method: &str, path: &str) -> (String, i32) {
     let out = Command::new("curl")
         .args([
             "-sk",
             "-o",
             "/dev/null",
             "-w",
-            "%{http_code}",
+            "%{http_code} %{exitcode}",
             "--max-time",
             "5",
             "-X",
@@ -350,7 +356,23 @@ fn status_as_node(address: &str, dir: &Path, method: &str, path: &str) -> String
         .arg(format!("https://{address}{path}"))
         .output()
         .unwrap();
-    String::from_utf8(out.stdout).unwrap()
+    let said = String::from_utf8(out.stdout).unwrap();
+    let (code, exit) = said.split_once(' ').unwrap_or_else(|| panic!("curl said {said:?}"));
+    (code.to_string(), exit.trim().parse().unwrap())
+}
+
+/// Is the certificate in `dir` refused at the TLS handshake (a revoked one is, before a request is
+/// read, so it has no status: curl says 000 and its connection fails with 35 or 56)? Not a timeout
+/// (28), not a port that does not answer (7), not a status of the API (a 401 is the request's check).
+fn refused_at_handshake(address: &str, dir: &Path, method: &str, path: &str) -> bool {
+    let (code, exit) = curl_as_node(address, dir, method, path);
+    code == "000" && [35, 56].contains(&exit)
+}
+
+/// `refused_at_handshake` for the API and for a node route, the two a taken certificate would try.
+fn is_shut_out(address: &str, dir: &Path) -> bool {
+    refused_at_handshake(address, dir, "GET", "/v1/resources")
+        && refused_at_handshake(address, dir, "POST", "/v1/raft/write")
 }
 
 /// (Not behind KITH_E2E: it pulls nothing, and a test that is skipped proves nothing.)
@@ -384,11 +406,17 @@ fn an_evicted_nodes_certificate_is_refused_at_once_and_stays_refused() {
     assert_eq!(api(), "403");
     assert!(!["401", "403"].contains(&route().as_str()), "{}", route());
 
-    // Deleted: refused by the next request, with alpha never restarted.
+    // Deleted: refused at the next handshake, with alpha never restarted (T-1014).
     alpha.ok(&["delete", "node/beta"]);
-    assert_eq!((api(), route()), ("401".to_string(), "401".to_string()));
+    assert!(
+        is_shut_out(&address, &taken),
+        "refused at the handshake: {:?} {:?}",
+        curl_as_node(&address, &taken, "GET", "/v1/resources"),
+        curl_as_node(&address, &taken, "POST", "/v1/raft/write")
+    );
     beta.stop();
-    // A Node of that name made by hand admits nobody: it never joined.
+    // A Node of that name made by hand admits nobody: it never joined. (It names no key, so the
+    // handshake cannot tell the certificate is revoked; the request is refused instead.)
     let node = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: beta }\nspec: {}\n";
     std::fs::write(alpha.dir.join("node.yaml"), node).unwrap();
     alpha.ok(&["apply", "-f", "node.yaml"]);
@@ -403,11 +431,18 @@ fn an_evicted_nodes_certificate_is_refused_at_once_and_stays_refused() {
         status_as_node(&address, &beta.dir.join("state/pki"), "GET", "/v1/resources"),
         "403"
     );
-    assert_eq!((api(), route()), ("401".to_string(), "401".to_string()));
+    assert!(
+        is_shut_out(&address, &taken),
+        "refused at the handshake: {:?} {:?}",
+        curl_as_node(&address, &taken, "GET", "/v1/resources"),
+        curl_as_node(&address, &taken, "POST", "/v1/raft/write")
+    );
     assert!(beta.ok(&["get", "ConfigMap/shared"]).contains("shared"));
     // The new node refuses it too, by the store it was sent.
-    assert_eq!(status_as_node(&beta.address(), &taken, "GET", "/v1/resources"), "401");
-    assert_eq!(status_as_node(&beta.address(), &taken, "POST", "/v1/raft/write"), "401");
+    assert!(
+        is_shut_out(&beta.address(), &taken),
+        "the new beta takes the old certificate in"
+    );
 
     // For a cluster locked out of itself: a node started with the switch takes it again.
     alpha.stop();
@@ -445,7 +480,7 @@ fn deleted_first_node_is_not_made_again_by_its_restart() {
     }
     beta.ok(&["delete", "node/alpha"]);
     wait_for("alpha to be refused", || {
-        status_as_node(&beta.address(), &taken, "GET", "/v1/resources") == "401"
+        refused_at_handshake(&beta.address(), &taken, "GET", "/v1/resources")
     });
     // beta takes a deleted node's certificate again (as for a cluster that locked itself out), so that
     // what alpha writes at its start could commit: only alpha's own guard keeps its Node out.

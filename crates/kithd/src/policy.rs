@@ -329,7 +329,8 @@ pub fn needs(template: &Template, pci: bool, node_workload: bool) -> Vec<&'stati
             .as_ref()
             .is_some_and(|h| *h != kith_api::kinds::Hypervisor::Qemu);
         other || vm.kernel.is_some() || vm.initrd.is_some() || vm.firmware.is_some()
-            // (A disk that is a Volume's file is no path on the node: it is in the tenant's Volume.)
+            // (A disk that is a Volume's file is not asked for here: the hypervisor opens kithd's own
+            // link to it, in a directory no container mounts, never a path a tenant chose: T-1283.)
             || vm.disks.iter().any(|disk| disk.path.is_some())
     };
     let vms = !template.vms.is_empty();
