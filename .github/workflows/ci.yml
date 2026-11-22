@@ -84,6 +84,10 @@ jobs:
       # (After the budgets: run before them, kithd's idle RSS there read 9.42 MB, not 5.42.)
       - name: dist/kithd.service under the runner's systemd
         run: cargo build -p kithd -p kith-cli && sh ci/systemd.sh
+      # Two kith-runtime test processes at once must not kill each other's containers (T-1185); it
+      # skips, saying so, where there is no delegated cgroup (so it runs in the runner's user scope).
+      - name: Two kith-runtime test processes at once
+        run: systemd-run --user --scope --quiet sh ci/runtime_twice.sh
       # Compares files only: the page, docs/numbers.json, ci/compare.txt and the README's drawings.
       - name: The website shows the numbers that were measured
         run: python3 ci/site_numbers.py --check
