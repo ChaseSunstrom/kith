@@ -129,6 +129,32 @@ out, and a value that still holds a `$` is refused by name.
 | refused by path and name, as `kith import k8s` does | `privileged`, `cap_add`, `sysctls`, `devices` (a [DeviceClaim](hardware.md#claiming-hardware) is how kith gives hardware), `network_mode: host`, `env_file`, `tmpfs`, a UDP port, a port published on the node's own address, a `depends_on` condition (kith waits for nothing: an app retries), two networks in one file (a namespace is one network), an absolute host path (kith takes one in `kith-system` only, and never `/`, `/proc`, `/sys`, `/dev` or a docker socket), two volumes that would make one name, and every key it does not know |
 | a variable named like a secret (`PASSWORD`, `TOKEN`, `KEY`) | carried and said: it is in the output as plain text, and a Secret with `envFrom` keeps it out of the Workload |
 
+### From Docker containers
+
+For containers made with `docker run` (no compose file), as when moving off Docker Desktop:
+`kith import docker web db --node n1 -n media` runs `docker inspect --type container web db` (no
+shell) and reads what it says of each container as the compose service it is, so the table above
+holds as it is: the same Workloads, Services and Volumes, and the same refusals by path
+(`services.web.privileged`, `services.web.cap_add[0]`, a bind mount as `services.web.volumes[0]`
+being an absolute host path). `-f FILE` reads a saved `docker inspect` instead, and `-f -` reads
+stdin; with no docker installed, pipe it: `docker inspect web db | kith import docker -f -`.
+The exit status is the same: 0, 1 when something was left out, 2 for input that could not be read.
+
+The image reference is kept and kith pulls it: no image is moved. A bind mount is not copied.
+A container's labels, its image's `Env`, `Cmd` and `Entrypoint` are all in what `docker inspect`
+prints, and are carried or said like a compose service's.
+
+Each named volume a Workload mounts also gets a line on stderr, to run after the printed
+resources are applied (a Volume must be there before files go in):
+
+```
+volume web-data: once applied, copy the docker volume's files in: docker run --rm -v web_data:/v:ro busybox tar -C /v -c . | kith volume put web-data - -n media
+```
+
+It is not done for you: kith does not read Docker Desktop's data directory or its VM. Stop the
+container first so the files are whole, and see [Files in and out of a
+volume](storage.md#files-in-and-out-of-a-volume) for what `kith volume put` takes.
+
 ## Coming from Proxmox or docker compose
 
 A guest on a hypervisor is a whole system with one job. On kith the job is a Workload from the
@@ -141,6 +167,7 @@ is kith OS. What each kind of guest becomes, and what is still missing:
 | an app with its database and helpers beside it (a file cloud, a Git forge) | one pod: the containers share `localhost`; a Volume each | works; a port other than HTTPS (the forge's SSH) is a published port, on the pod's node only |
 | a media server with a GPU | a Workload with a `DeviceClaim` on the card | the claim works; transcoding is not tried on a real card |
 | a compose stack | [`kith import compose FILE`](#from-a-docker-compose-file) prints it as Workloads, Services and Volumes, and refuses by name what it cannot carry | works for what it carries |
+| containers made with `docker run` (Docker Desktop) | [`kith import docker NAME...`](#from-docker-containers) reads `docker inspect` as the same Workloads, Services and Volumes, and prints the line that copies each named volume in | works for what it carries; the copy is a line you run |
 | a reverse proxy | kith's own ingress: a Service's `expose`, a certificate by ACME or your own | by host name and by path, with headers set; no rewriting of paths, no login in front of an app, no HTTP/2 to a host read by path |
 | a DNS filter | kith's own [DNS](cluster.md#dns) with a `DNSBlockList`: hosts files and filter lists' plain rules | works; no per-client statistics or query log |
 | a mail relay, or anything on a port of the LAN that is not HTTPS | a pod whose port says [`publish: true`](workloads.md#a-pod-behind-a-vpn-exit), or a Workload that shares its node's network (root, not a pod) | works; a published port is on one node, the first pod's there to ask for it |

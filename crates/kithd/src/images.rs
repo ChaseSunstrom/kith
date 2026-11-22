@@ -1650,7 +1650,15 @@ mod tests {
             old: vec![theirs.clone(), hand.clone(), own.clone()],
         };
         forget(&shared, &job, &json!({ "blobs": {} })).await;
-        let has = |name: &str| shared.store.lock().unwrap().store.get(&format!("Blob/default/{name}")).is_some();
+        let has = |name: &str| {
+            shared
+                .store
+                .lock()
+                .unwrap()
+                .store
+                .get(&format!("Blob/default/{name}"))
+                .is_some()
+        };
         assert!(!has(&own), "an image's own Blob is let go");
         assert!(has(&theirs), "a backup's Blob is not an image's to delete");
         assert!(has(&hand), "nor is one put by hand");
