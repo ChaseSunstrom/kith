@@ -1,6 +1,6 @@
 # A second disk for a node's data, under the state's key
 
-Status: built in part: the core on files (T-0957), the real mapping, the seed made with `resize=` and grown at the mount, and the task that mounts the known disks after `STATE_OPEN` (T-0972, with `ci/vm.sh --test disk` on disk files, which uses a build with the cargo feature `disk-test`: the verbs `add`, `remove` and `list` are T-0958's other half and not built). It decides how a disk other than the one kith OS runs
+Status: built: the core on files (T-0957), the real mapping, the seed made with `resize=` and grown at the mount, the task that mounts the known disks after `STATE_OPEN` (T-0972), and the verbs `kith node disk add`, `remove` and `list` with their audit entries and the no-cluster route (T-0975), tried by `ci/vm.sh --test disk` on disk files. It decides how a disk other than the one kith OS runs
 from holds data, encrypted, and how it is opened, with what kithd does to a disk it does not
 know. Where the code differs from a line here, the code is the word. It builds on
 [adr-unlock.md](adr-unlock.md), which settled how a node's state is opened, and on the ways of
@@ -153,8 +153,8 @@ decides it in three cases, each with a unit test:
 a lone box with a data disk is likely the first user of this feature, so the disk verbs are
 **not** copied from `pass` in that line: they act on the node itself with no cluster needed, and
 another node is asked as `pass` does only where there is one. Whether `permit`
-(`crate::api::permit`) works with no cluster is unverified; T-0958 settles it and has a test on
-a node with no cluster, and if it does not, says in the verb's answer that it cannot.
+(`crate::api::permit`) works with no cluster: it does (T-0975, `data_disk/verbs.rs` has a test on
+a node with no cluster); with a cluster the NODE must be this node, and another node is not yet asked.
 
 1. The serial is **typed**, and kithd matches it with the disk's (the serial the installer shows and matches against what was typed,
    `install.rs:95-97`), so `sdb` moved by a reboot is not the disk meant. A disk that says no
@@ -282,8 +282,8 @@ None of it reaches a real disk, a real TPM or a real key.
 | Task | Slice |
 |---|---|
 | T-0957 | **The core, on files.** The header (written and read back by unit tests on a disk file in a temporary directory), the entry and key under `disks/<id>/`, the signature check, the order of writes of an add with the mapping step behind a trait (a fake in the tests, so a cut at each point is tested, including between the header and `ready`, and the resume), `off_ours` with its three cases (section 2), the refusal of a root disk or a removable one, and the zeroing of the header and the key on remove. No mapping, no boot, no verb. |
-| T-0972 | **The mapping and the boot, built.** What a file cannot show: the real mapping (`kith_dm_sys::crypt` needs root and device-mapper), the overwrite through it, the seed written and grown (made with `-E resize=`, section 2), the mount; the task after `STATE_OPEN` that mounts the known disks and leaves the unknown alone, the node's status line of disks (`status.disks`), and `ci/vm.sh --test disk` (section 3) on a disk file, with a build of the cargo feature `disk-test` that adds the disk of a serial named on the kernel command line. |
-| T-0958 | **The verbs.** `kith node disk add`, `remove` and `list` with the audit entries and the no-cluster route, on the core and the mapping above; they replace the `disk-test` hook. |
+| T-0972 | **The mapping and the boot, built.** What a file cannot show: the real mapping (`kith_dm_sys::crypt` needs root and device-mapper), the overwrite through it, the seed written and grown (made with `-E resize=`, section 2), the mount; the task after `STATE_OPEN` that mounts the known disks and leaves the unknown alone, the node's status line of disks (`status.disks`). |
+| T-0975 | **The verbs, built.** `kith node disk add`, `remove` and `list` (`data_disk/verbs.rs`) with the audit entries (`data_disk/audit.rs`) and the no-cluster route, on the core and the mapping above; `ci/vm.sh --test disk` (section 3) runs them on disk files, on an installed encrypted node. The `disk-test` build feature the test used before is gone. |
 
 T-0957's unit tests run on files in a directory, so **they cannot cover the mapping, the mount or
 the grow**; those need root and device-mapper, are **VM-only**, and are covered by T-0972 and
@@ -321,6 +321,19 @@ with the earlier wording that put the seed in T-0957 and the boot in T-0958: thi
 - **A removed disk's old key** may survive in the state's free space, journal or an SSD's
   remapped blocks (section 2): remove is as strong as the state's erasure, and the strong way is
   a duress or a discard.
+- **Known limits of the verbs (T-0975)**:
+  - The disk is read through its path (`/dev/<name>`) and written through it again: a disk
+    pulled and another put in its name between the two is written. The check is of the 4 KiB
+    read, not of the handle written to; closing it takes one handle through read, check and write
+    (`seed.rs`, `write_first`). The window is the time of the core's own checks, and the verbs
+    run one at a time.
+  - A `remove` of a disk that is not in the machine (unplugged, dead) forgets its entry and key:
+    nothing could be zeroed, and the entry is not kept for ever. The disk, put back, keeps a header the node
+    no longer knows and has no key: its data is unreadable, as a remove makes it. One unplugged
+    while mounted keeps its mount point busy; the remove says so, and a restart lets a second end it.
+  - The audit log has a `started` entry for an add and a remove when it begins, and the ending
+    entry after: a cut machine leaves the first alone. A refusal is written as the verb that was
+    asked; a remove needs the right to `delete` a NodeKey, an add to `apply` one, a list to `get`.
 - **Unverified here**: `O_EXCL` refusing a block device that a device-mapper mapping holds,
   on the kernel kith OS ships (it does on mainline for a mounted or held device; the test of
   step 2 is the check).

@@ -121,16 +121,14 @@ out=$(cd "$out" && pwd)
 # KITHD_FEATURES (ci/musl.sh) builds a kithd with test-only code: only into the folder
 # ci/vm.sh gives that image, so one left in the environment never makes an image that ships.
 # (forge: a route a leader appends an unchecked entry by; fido2-test: a software security key
-# on /dev/uhid, docs/adr-fido2.md section 2; disk-test: a data disk made at boot from the
-# command line, until the add verb is, docs/adr-second-disk.md; confine-probe: `kithd confine-probe`,
+# on /dev/uhid, docs/adr-fido2.md section 2; confine-probe: `kithd confine-probe`,
 # which confines itself as the serving part does, docs/adr-privilege.md.)
 case "${KITHD_FEATURES:-}" in
     '') ;;
     forge) want=$root/target/os-forge ;;
     fido2-test) want=$root/target/os-fido2 ;;
-    disk-test) want=$root/target/os-disk ;;
     confine-probe) want=$root/target/os-probe ;;
-    *) echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): it knows forge, fido2-test, disk-test and confine-probe (unset it)" >&2; exit 2 ;;
+    *) echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): it knows forge, fido2-test and confine-probe (unset it)" >&2; exit 2 ;;
 esac
 if [ -n "${KITHD_FEATURES:-}" ] && [ "$out" != "$want" ]; then
     echo "build.sh: KITHD_FEATURES is set ('$KITHD_FEATURES'): only for --out ${want#"$root"/}, not $out (unset it)" >&2

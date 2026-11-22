@@ -12,6 +12,7 @@
 {"u":"guide/os.html#installing-from-the-network","t":"kith OS: kithd as the machine's first process","h":"Installing from the network"},
 {"u":"guide/os.html#installing-on-a-rented-machine","t":"kith OS: kithd as the machine's first process","h":"Installing on a rented machine"},
 {"u":"guide/os.html#encrypted-state","t":"kith OS: kithd as the machine's first process","h":"Encrypted state"},
+{"u":"guide/os.html#a-second-disk-for-a-nodes-data","t":"kith OS: kithd as the machine's first process","h":"A second disk for a node's data"},
 {"u":"guide/os.html#not-in-kith-os-yet","t":"kith OS: kithd as the machine's first process","h":"Not in kith OS yet"},
 {"u":"guide/cluster.html","t":"A cluster","h":""},
 {"u":"guide/cluster.html#more-than-one-node","t":"A cluster","h":"More than one node"},

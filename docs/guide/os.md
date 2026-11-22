@@ -160,7 +160,7 @@ would refuse with `gpu-amd-phoenix` or `gpu-nvidia-pascal` and whose modules cov
 KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
 KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
 sh ci/vm.sh --test modules   # the same image: drivers load at start, on a device added, and a bad signature is refused
-sh ci/vm.sh --test disk      # a disk file made a data disk (a build with the feature disk-test) and mounted; another file left alone, unchanged
+sh ci/vm.sh --test disk      # kith node disk add on a disk file, mounted after a restart and listed, removed; a file with a signature refused, another file left alone
 ```
 
 For a node whose hardware is not known when the image is built, `features: [all]` turns on
@@ -856,6 +856,34 @@ What is and is not protected:
 Not yet: a passphrase and the TPM both asked for, the cluster's key and the TPM both asked for,
 a keyboard layout at the console, the disk's secret
 kept in the TPM, a duress code that opens a decoy.
+
+### A second disk for a node's data
+
+A machine with a second disk can keep data on it, encrypted as a whole under a key kept in the
+node's own state (so a node whose state is not encrypted adds none). Run these where kithd runs
+(its own socket, as root): `NODE` is the node that kithd is.
+
+```
+kith node disk list NODE                   # the disks it has, and the ones it left alone
+kith node disk add NODE SERIAL [--wipe] [--quick]
+kith node disk remove NODE ID
+```
+
+- `list` shows each disk by its serial (and its id once it is a data disk). Nothing is taken
+  that has not been added: a stick, a backup disk or the disk the system runs from is left alone.
+- `add` names a disk by its **serial** (as `list` shows it), overwrites it through the
+  encryption (a large disk takes hours; `--quick` discards its blocks instead, which is fast
+  and shows which regions held data) and mounts it. The node mounts it again at every start. It
+  refuses a disk that holds a partition table, a filesystem or any data unless given `--wipe`,
+  and always the disk the system runs from.
+- `remove` takes the disk's id: its header is zeroed and its key forgotten, so what it holds can
+  no longer be read (the disk is not erased). A disk that is not in the machine any more has its
+  entry and key forgotten. One in use is refused.
+- Who may ask: whoever may apply (`add`), delete (`remove`) or get (`list`) a NodeKey. Each add and
+  remove, done or refused, is written to the audit log with who asked and the serial; an add
+  and a remove are written again when they begin, since they take long. Never a key.
+
+The design is in [adr-second-disk.md](../adr-second-disk.md).
 
 ### Not in kith OS yet
 
