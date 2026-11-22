@@ -1455,7 +1455,10 @@ pub struct Options {
 fn own_root(spec: &Spec) -> std::result::Result<u32, String> {
     let maps = spec.linux().as_ref().and_then(|linux| linux.uid_mappings().as_ref());
     let host = maps.and_then(|maps| maps.iter().find(|m| m.container_id() == 0 && m.size() > 0));
-    let rootless = spec.annotations().as_ref().is_some_and(|notes| notes.contains_key(BECOMES));
+    let rootless = spec
+        .annotations()
+        .as_ref()
+        .is_some_and(|notes| notes.contains_key(BECOMES));
     match host.map(|m| m.host_id()) {
         None => Err("it has no user namespace of its own: uid 0 there would be the node's root".into()),
         Some(host) if host == 0 || host == nix::unistd::geteuid().as_raw() || rootless => Err(format!(
@@ -5996,8 +5999,15 @@ mod tests {
         let other = if me == 4_000_000 { 4_000_001 } else { 4_000_000 };
         assert!(own_root(&spec(None, false)).unwrap_err().contains("no user namespace"));
         assert!(own_root(&spec(Some(0), false)).unwrap_err().contains("node's user 0"));
-        assert!(own_root(&spec(Some(me), false)).unwrap_err().contains("the one kithd runs as"));
-        assert!(own_root(&spec(Some(other), true)).is_err(), "rootless: its 0 is kithd's user");
+        assert!(
+            own_root(&spec(Some(me), false))
+                .unwrap_err()
+                .contains("the one kithd runs as")
+        );
+        assert!(
+            own_root(&spec(Some(other), true)).is_err(),
+            "rootless: its 0 is kithd's user"
+        );
         assert_eq!(own_root(&spec(Some(other), false)), Ok(other));
     }
 

@@ -1306,10 +1306,15 @@ spec: { node: b, devices: [b-usb0] }
             ["/dev/snd/controlC1", "/dev/snd/pcmC1D3p", "/dev/snd/pcmC1D7p"].map(PathBuf::from)
         );
         // The card on its own, claimed by name, gives the same to a namespace its label names.
-        let source = source.replace("name: a-audio-card1 }", "name: a-audio-card1, labels: { kith.dev/namespaces: default } }");
+        let source = source.replace(
+            "name: a-audio-card1 }",
+            "name: a-audio-card1, labels: { kith.dev/namespaces: default } }",
+        );
         let source = source.replace("{ seat: a-seat1 }", "{ device: a-audio-card1 }");
         assert_eq!(
-            granted(&store(&source), "a", &empty)["Workload/default/player"].devices.len(),
+            granted(&store(&source), "a", &empty)["Workload/default/player"]
+                .devices
+                .len(),
             3
         );
         let _ = std::fs::remove_dir_all(&empty);

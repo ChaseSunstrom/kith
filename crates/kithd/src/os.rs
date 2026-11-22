@@ -898,16 +898,23 @@ mod tests {
              Link: dirlink/z -> x\n\
              Link: this line is prose, not a link\n",
         );
-        for file in ["b/x", "b/z", "b/other", "a/file", "d/f", "d/deep/m", "e/one/f", "e/two/g"] {
+        for file in [
+            "b/x", "b/z", "b/other", "a/file", "d/f", "d/deep/m", "e/one/f", "e/two/g",
+        ] {
             put(file, file);
         }
         let tarball = base.join("linux-firmware-1.tar.xz");
-        let made = sh(&format!("tar -cJf {} -C {} linux-firmware-1", tarball.display(), base.display()));
+        let made = sh(&format!(
+            "tar -cJf {} -C {} linux-firmware-1",
+            tarball.display(),
+            base.display()
+        ));
         assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
         let dir = base.join("out");
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../os/firmware.sh");
         let mut cmd = std::process::Command::new("sh");
-        cmd.args([script, tarball.to_str().unwrap(), dir.to_str().unwrap()]).args(globs);
+        cmd.args([script, tarball.to_str().unwrap(), dir.to_str().unwrap()])
+            .args(globs);
         if let Some(path) = path {
             cmd.env("PATH", format!("{path}:{}", std::env::var("PATH").unwrap_or_default()));
         }
@@ -943,7 +950,9 @@ mod tests {
     /// a file the glob names is taken; what no glob names is not.
     #[test]
     fn built_in_firmware_makes_the_links_a_glob_names_and_takes_their_targets() {
-        let Some((dir, said)) = firmware("links", &["a/*"]) else { return };
+        let Some((dir, said)) = firmware("links", &["a/*"]) else {
+            return;
+        };
         assert_eq!(said, Ok(()));
         assert_eq!(pointing(&dir, "a/x").as_deref(), Some("../b/x"));
         // A link to a link: a/y is made, a/x it points at is too, and b/x at the end.
@@ -957,7 +966,9 @@ mod tests {
     /// A glob that names only links (no file of linux-firmware's own) works, not a tar "not found".
     #[test]
     fn built_in_firmware_takes_a_glob_that_names_only_links() {
-        let Some((dir, said)) = firmware("only-links", &["c/*"]) else { return };
+        let Some((dir, said)) = firmware("only-links", &["c/*"]) else {
+            return;
+        };
         assert_eq!(said, Ok(()));
         assert_eq!(found(&dir), ["b/z", "c/only"]);
         assert_eq!(pointing(&dir, "c/only").as_deref(), Some("../b/z"));
@@ -966,7 +977,9 @@ mod tests {
     /// A glob that names neither a file nor a link is an error, and says which.
     #[test]
     fn built_in_firmware_dies_for_a_glob_that_matches_nothing() {
-        let Some((_, said)) = firmware("nothing", &["a/*", "zz/*"]) else { return };
+        let Some((_, said)) = firmware("nothing", &["a/*", "zz/*"]) else {
+            return;
+        };
         let said = said.unwrap_err();
         assert!(said.contains("zz/*") && !said.contains("a/*"), "{said}");
     }
@@ -974,7 +987,9 @@ mod tests {
     /// Links that point at each other stop with an error, not a loop that never ends.
     #[test]
     fn built_in_firmware_stops_a_cycle_of_links() {
-        let Some((_, said)) = firmware("cycle", &["loop/*"]) else { return };
+        let Some((_, said)) = firmware("cycle", &["loop/*"]) else {
+            return;
+        };
         assert!(said.unwrap_err().contains("cycle"));
     }
 
@@ -989,12 +1004,22 @@ mod tests {
             ("long/*", "out of"),
             ("dangling/*", "lacks"),
         ] {
-            let Some((dir, said)) = firmware("out-of-tree", &[glob]) else { return };
+            let Some((dir, said)) = firmware("out-of-tree", &[glob]) else {
+                return;
+            };
             let said = said.unwrap_err();
             assert!(said.contains(why), "{glob}: {said}");
             // Nothing leaves the tree: no link was made for it, in the directory or beside it.
-            assert!(!dir.join("etc").exists() && !dir.parent().unwrap().join("etc").exists(), "{glob}");
-            assert!(found(&dir).iter().all(|f| !f.starts_with("bad/") && !f.starts_with("abs/") && !f.starts_with("long/")), "{glob}");
+            assert!(
+                !dir.join("etc").exists() && !dir.parent().unwrap().join("etc").exists(),
+                "{glob}"
+            );
+            assert!(
+                found(&dir)
+                    .iter()
+                    .all(|f| !f.starts_with("bad/") && !f.starts_with("abs/") && !f.starts_with("long/")),
+                "{glob}"
+            );
         }
     }
 
@@ -1002,7 +1027,9 @@ mod tests {
     /// where the lexical walk does not say, so it is refused.
     #[test]
     fn built_in_firmware_refuses_a_link_whose_directory_is_a_link() {
-        let Some((_, said)) = firmware("dirlink", &["dirlink/*"]) else { return };
+        let Some((_, said)) = firmware("dirlink", &["dirlink/*"]) else {
+            return;
+        };
         assert!(said.unwrap_err().contains("directory that is a link"));
     }
 
@@ -1010,7 +1037,9 @@ mod tests {
     /// says so, not an empty directory and a build without its firmware.
     #[test]
     fn built_in_firmware_dies_for_a_glob_that_names_only_directories() {
-        let Some((_, said)) = firmware("dirs", &["e/*"]) else { return };
+        let Some((_, said)) = firmware("dirs", &["e/*"]) else {
+            return;
+        };
         let said = said.unwrap_err();
         assert!(said.contains("e/*") && said.contains("directories"), "{said}");
     }
@@ -1024,7 +1053,9 @@ mod tests {
         let mut mode = std::fs::metadata(fake.join("awk")).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
         std::fs::set_permissions(fake.join("awk"), mode).unwrap();
-        let Some((_, said)) = firmware_with("awk-fails", &["a/*"], fake.to_str()) else { return };
+        let Some((_, said)) = firmware_with("awk-fails", &["a/*"], fake.to_str()) else {
+            return;
+        };
         assert!(said.is_err(), "an awk that failed was not noticed");
     }
 
@@ -1032,10 +1063,14 @@ mod tests {
     /// file deeper, and `e/*/*` goes down two.
     #[test]
     fn built_in_firmware_star_does_not_cross_a_slash() {
-        let Some((dir, said)) = firmware("star", &["d/*"]) else { return };
+        let Some((dir, said)) = firmware("star", &["d/*"]) else {
+            return;
+        };
         assert_eq!(said, Ok(()));
         assert_eq!(found(&dir), ["d/f"]);
-        let Some((dir, said)) = firmware("star-down", &["e/*/*", "d/*/*"]) else { return };
+        let Some((dir, said)) = firmware("star-down", &["e/*/*", "d/*/*"]) else {
+            return;
+        };
         assert_eq!(said, Ok(()));
         assert_eq!(found(&dir), ["b/x", "d/deep/m", "d/deep/n", "e/one/f", "e/two/g"]);
     }
