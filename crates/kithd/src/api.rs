@@ -551,6 +551,11 @@ pub(crate) async fn applied(
     let resources = stamped_by(shared, caller, resources);
     // Each resource of the body is asked about: one that is not allowed refuses them all.
     allowed(shared, caller, |store| takes(store, &resources))?;
+    // (After the right is asked: what a refusal says of the store is for whoever may write to it.)
+    {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        crate::kube::hijacks(&state.store, &resources).map_err(|why| ApiError::Store(Error::Invalid(why)))?;
+    }
     let keys: Vec<String> = resources.iter().map(Resource::key).collect();
     let claimed = {
         let state = shared.store.lock().expect("a handler panicked holding the store");

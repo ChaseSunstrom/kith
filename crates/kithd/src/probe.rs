@@ -162,7 +162,7 @@ pub fn held(health: Health) -> (Probes, watch::Sender<Health>) {
 fn enter_unit(unit: String, why: Arc<Mutex<Option<String>>>, poke: Arc<Notify>) -> Exec {
     Arc::new(move |argv, timeout| {
         let begun = std::time::Instant::now();
-        let entered = crate::root_part::enter(&unit, argv);
+        let entered = crate::root_part::enter(&unit, argv, Default::default());
         let said = entered
             .as_ref()
             .err()

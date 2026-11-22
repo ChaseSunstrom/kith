@@ -176,8 +176,9 @@ context is left alone when `--store`, `--socket` or `--server` is given (a conte
 error that names the file. The identity is held to its Roles exactly as over `--server`: what they
 do not allow is refused.
 
-Renewal and revocation of a node's own certificate is not here: it is a change to kithd's PKI,
-and is T-1014.
+A node's own certificate is not part of a context: kithd makes it again before it ends and
+refuses a deleted Node's or a replaced Identity's at the next handshake (SECURITY.md, "A node's
+certificate: its life, its renewal, and its revocation").
 
 ## What a node refuses, whatever the cluster says
 

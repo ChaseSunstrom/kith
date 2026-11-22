@@ -57,6 +57,33 @@ fn every_guide_is_read() {
     );
 }
 
+/// The guide's docker section says what streams (T-1261): logs, run in front and exec work, and stdin
+/// to a container's main process is refused, with the reason and the way round it.
+#[test]
+fn the_docker_section_says_what_streams_and_what_stdin_is_refused() {
+    let guide = DOCS.iter().find(|(path, _)| path.ends_with("kubernetes.md")).unwrap().1;
+    let section = guide
+        .split("\n## ")
+        .find(|s| s.starts_with("The docker command"))
+        .expect("kubernetes.md has no section on the docker command");
+    for said in [
+        "docker logs",
+        "docker run IMAGE CMD",
+        "docker exec",
+        "exit code",
+        "`docker run -i`",
+        "`docker attach` with stdin",
+        "no input",
+        "`docker exec -i`",
+    ] {
+        assert!(section.contains(said), "the docker section does not say: {said}");
+    }
+    assert!(
+        !section.contains("waits for step 3"),
+        "the docker section still says run without -d waits"
+    );
+}
+
 /// The front page says how a compose stack becomes kith's and names each key the reader
 /// refuses: the names are read from compose.rs's REFUSED, so the list cannot drift from it.
 #[test]
@@ -268,7 +295,7 @@ fn readme_says_what_a_deleted_claim_takes_with_it_and_how_to_retain() {
 }
 
 /// T-0031: how a laptop reaches a remote cluster by a context, the file it is kept in, and that
-/// renewing and revoking a node's certificate is not part of it (T-1014).
+/// a node's certificate is not part of it (renewed and revoked by kithd: T-1014).
 #[test]
 fn readme_and_access_say_how_a_context_reaches_a_remote_cluster() {
     let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -281,8 +308,8 @@ fn readme_and_access_say_how_a_context_reaches_a_remote_cluster() {
         "~/.config/kith/contexts.yaml",
         "mode 0600 in a 0700 directory",
         "A flag given as well wins over the entry",
-        "Renewal and revocation of a node's own certificate is not here",
-        "is T-1014",
+        "A node's own certificate is not part of a context",
+        "A node's certificate: its life, its renewal, and its revocation",
     ] {
         assert!(access.contains(said), "access.md no longer says {said:?}");
     }

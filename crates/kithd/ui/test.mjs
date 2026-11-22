@@ -576,6 +576,11 @@ assert.equal(health({ status: { controller: { state: 'error' } } }), 'bad');
 assert.equal(health({ status: { state: 'served' } }), 'ok');
 assert.equal(health({}), 'none');
 assert.equal(summary({}), '');
+// An image pull that goes on: how many layers and bytes (pull progress), over the message.
+const pulling = { status: { ready: 0, replicas: 1, containers: [{ message: 'pending', pull: { layers: 3, layersTotal: 7, bytes: 12e6, bytesTotal: 40e6 } }] } };
+assert.equal(summary(pulling), '0/1 ready: pulling 3 of 7 layers, 12 of 40 MB');
+assert.equal(summary({ status: { ready: 0, replicas: 1, containers: [{ pull: { layers: 0, layersTotal: 1, bytes: 0, bytesTotal: 4500 } }] } }), '0/1 ready: pulling 0 of 1 layers, 0.0 of 4.5 KB');
+assert.equal(summary({ status: { ready: 0, replicas: 1, containers: [{ message: 'stopped', pull: {} }] } }), '0/1 ready: stopped');
 
 // A diff, line by line.
 const diff = '--- a (live)\n+++ a (desired)\n@@ -1,2 +1,2 @@\n spec:\n-  map: dust\n+  map: ice\n';

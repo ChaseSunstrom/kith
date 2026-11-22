@@ -171,6 +171,36 @@ pub fn set_graphics(tty: &File, graphics: bool) -> Result<()> {
     Ok(())
 }
 
+/// Makes the terminal that `tty` is the calling session's controlling one (`TIOCSCTTY`): the
+/// caller must be a session leader without one. Without it a shell has no job control, and no
+/// hangup or Ctrl-C reaches it from the terminal.
+pub fn controlling_tty(tty: BorrowedFd) -> Result<()> {
+    // SAFETY: an ioctl on a descriptor `tty` holds open; its argument is a number (0: not stolen
+    // from another session) and the kernel reads no memory through it.
+    let said = unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCSCTTY as _, 0) };
+    if said < 0 { Err(Error::last_os_error()) } else { Ok(()) }
+}
+
+/// Tells the terminal `tty` (the master or the slave of a pty) that its window is `rows` by
+/// `cols` characters (`TIOCSWINSZ`): its foreground program is sent SIGWINCH.
+pub fn set_window(tty: &File, rows: u16, cols: u16) -> Result<()> {
+    // struct winsize: rows, columns, then two pixel sizes the kernel keeps and does not use.
+    let mut size = [0u8; 8];
+    size[0..2].copy_from_slice(&rows.to_ne_bytes());
+    size[2..4].copy_from_slice(&cols.to_ne_bytes());
+    ioctl(tty, libc::TIOCSWINSZ as u32, &mut size)?;
+    Ok(())
+}
+
+/// The size of the terminal `tty` is, in rows and columns (`TIOCGWINSZ`).
+pub fn window(tty: BorrowedFd) -> Result<(u16, u16)> {
+    let file = File::from(tty.try_clone_to_owned()?);
+    let mut size = [0u8; 8];
+    ioctl(&file, libc::TIOCGWINSZ as u32, &mut size)?;
+    let at = |from: usize| u16::from_ne_bytes([size[from], size[from + 1]]);
+    Ok((at(0), at(2)))
+}
+
 /// Give `file` a block device (`/dev/loopN`): what `losetup --find` does. The device is
 /// gone again when the last thing that has it open closes it, so keep what is returned open
 /// until something else (a mapping over it) holds the device.

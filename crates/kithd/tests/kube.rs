@@ -955,18 +955,21 @@ fn workflows_helm_test_runs_the_chart_test_pod_and_delete_pod_deletes_it() {
     }
 }
 
-/// The Deployment `web` of one replica whose image is `kith.test/box:1`, made and applied. Its
-/// container is `box`: a unit's id holds it, and the containers of the tests that run at once
-/// (each in a kithd of its own, in one cgroup tree) must not share an id, or one's delete ends the other's.
-fn apply_box(cluster: &Cluster) {
+/// A Deployment of one replica whose image is `kith.test/box:1`, made and applied; its run-unique name is returned
+/// (its pod is NAME-0). A unit's id holds the name, and the containers of the tests that run at once (each in a kithd
+/// of its own, in one cgroup tree) must not share an id, or one's delete ends the other's.
+fn apply_box(cluster: &Cluster) -> String {
     cluster.fill_box();
+    let name = unique("web");
     let web = WEB
+        .replace("  name: web\n", &format!("  name: {name}\n"))
         .replace("- name: web\n", "- name: box\n")
         .replace("mirror.gcr.io/library/busybox:1.36", "kith.test/box:1")
         .replace("replicas: 2", "replicas: 1")
         .replace("[sleep,", "[/bin/sleep,");
     cluster.write("box.yaml", &web);
     cluster.ok(&["apply", "-f", "box.yaml"]);
+    name
 }
 
 /// `kubectl exec` and `kubectl cp` (a tar run by exec, both ways) run in the replica's own mount and
@@ -981,47 +984,44 @@ fn workflows_kubectl_exec_and_cp_run_in_the_replica() {
     let may = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: execer }\nspec:\n  rules:\n    - kinds: [Workload]\n      verbs: [exec]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: alice-execer }\nspec:\n  role: execer\n  subjects: [alice]\n";
     cluster.write("execer.yaml", may);
     cluster.kith(&["apply", "-f", "execer.yaml"]);
-    apply_box(&cluster);
+    let web = apply_box(&cluster);
+    let web0 = format!("{web}-0");
     // The replica is up when a process can be run in it (a unit starts a moment after its pod is listed).
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        let (ok, _, err) = cluster.kubectl(&["exec", "web-0", "--", "sh", "-c", ":"]);
+        let (ok, _, err) = cluster.kubectl(&["exec", &web0, "--", "sh", "-c", ":"]);
         if ok {
             break;
         }
-        let status = cluster.kith(&["get", "workload/web", "-o", "json"]);
+        let status = cluster.kith(&["get", &format!("workload/{web}"), "-o", "json"]);
         if status.contains("cgroup error") {
             eprintln!("::warning title=SKIP::SKIP (not a pass): this host's cgroup takes no container");
             return;
         }
-        assert!(Instant::now() < deadline, "web-0 never took a process: {err}\n{status}");
+        assert!(
+            Instant::now() < deadline,
+            "{web0} never took a process: {err}\n{status}"
+        );
         std::thread::sleep(Duration::from_millis(250));
     }
     // In the container's pid namespace, its init is pid 1 and the shell has a small pid; its files are the image's.
     says(
-        &cluster.ok(&["exec", "web-0", "--", "cat", "/proc/1/cmdline"]),
+        &cluster.ok(&["exec", &web0, "--", "cat", "/proc/1/cmdline"]),
         &["/bin/sleep"],
     );
-    let pid = cluster.ok(&["exec", "web-0", "--", "sh", "-c", "echo $$"]);
+    let pid = cluster.ok(&["exec", &web0, "--", "sh", "-c", "echo $$"]);
     assert!(pid.trim().parse::<u32>().unwrap() < 1000, "{pid}");
     // (The host has /home, and the image does not.)
-    cluster.refused(&["exec", "web-0", "--", "sh", "-c", "test -e /home"], &["exit code 1"]);
+    cluster.refused(&["exec", &web0, "--", "sh", "-c", "test -e /home"], &["exit code 1"]);
     // stdout and stderr each on their channel, and the exit status.
-    let (ok, out, err) = cluster.kubectl(&[
-        "exec",
-        "web-0",
-        "--",
-        "sh",
-        "-c",
-        "echo to-out; echo to-err >&2; exit 3",
-    ]);
+    let (ok, out, err) = cluster.kubectl(&["exec", &web0, "--", "sh", "-c", "echo to-out; echo to-err >&2; exit 3"]);
     assert!(!ok && out == "to-out\n", "{ok} {out:?} {err}");
     says(&err, &["to-err", "exit code 3"]);
     // stdin, to its end, and more of it than one frame holds.
-    let (ok, out, err) = cluster.kubectl_in(&["exec", "-i", "web-0", "--", "cat"], b"hello\n");
+    let (ok, out, err) = cluster.kubectl_in(&["exec", "-i", &web0, "--", "cat"], b"hello\n");
     assert!(ok && out == b"hello\n", "{ok} {out:?} {err}");
     let big: Vec<u8> = (0..3u32 << 20).map(|n| (n % 251) as u8).collect();
-    let (ok, out, err) = cluster.kubectl_in(&["exec", "-i", "web-0", "--", "cat"], &big);
+    let (ok, out, err) = cluster.kubectl_in(&["exec", "-i", &web0, "--", "cat"], &big);
     assert!(
         ok && out == big,
         "{ok} {} bytes back of {}: {err}",
@@ -1030,16 +1030,16 @@ fn workflows_kubectl_exec_and_cp_run_in_the_replica() {
     );
     // cp up, then down.
     cluster.write("up.txt", "uploaded\n");
-    cluster.ok(&["cp", "up.txt", "web-0:/tmp/up.txt"]);
-    assert_eq!(cluster.ok(&["exec", "web-0", "--", "cat", "/tmp/up.txt"]), "uploaded\n");
-    cluster.ok(&["cp", "web-0:/tmp/up.txt", "down.txt"]);
+    cluster.ok(&["cp", "up.txt", &format!("{web0}:/tmp/up.txt")]);
+    assert_eq!(cluster.ok(&["exec", &web0, "--", "cat", "/tmp/up.txt"]), "uploaded\n");
+    cluster.ok(&["cp", &format!("{web0}:/tmp/up.txt"), "down.txt"]);
     assert_eq!(
         std::fs::read_to_string(cluster.dir.join("down.txt")).unwrap(),
         "uploaded\n"
     );
     // A program the image lacks is an error, and attach and a TTY are refused by name.
-    cluster.refused(&["exec", "web-0", "--", "nothing-here"], &[]);
-    cluster.refused(&["attach", "web-0"], &["attach to the main process is not carried"]);
+    cluster.refused(&["exec", &web0, "--", "nothing-here"], &[]);
+    cluster.refused(&["attach", &web0], &["attach to the main process is not carried"]);
 }
 
 #[test]
@@ -1708,8 +1708,12 @@ fn access_first_exec_attach_and_cp_are_refused_before_any_upgrade() {
     cluster.kith(&["apply", "-f", "roles.yaml"]);
     // A Deployment `web` of two replicas and a Job `tidy`: their pods are web-0 and tidy-j0.
     let json = ["Content-Type: application/json"];
-    cluster.write("web.json", r#"{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"web"},"spec":{"replicas":2,"selector":{"matchLabels":{"app":"web"}},"template":{"metadata":{"labels":{"app":"web"}},"spec":{"containers":[{"name":"web","image":"mirror.gcr.io/library/busybox:1.36","command":["sleep","3600"]}]}}}}"#);
-    cluster.write("tidy.json", r#"{"apiVersion":"batch/v1","kind":"Job","metadata":{"name":"tidy"},"spec":{"template":{"spec":{"restartPolicy":"Never","containers":[{"name":"tidy","image":"mirror.gcr.io/library/busybox:1.36","command":["true"]}]}}}}"#);
+    let (web, tidy) = (unique("web"), unique("tidy"));
+    cluster.write("web.json", &web_json(&web));
+    let tidy_json = format!(
+        r#"{{"apiVersion":"batch/v1","kind":"Job","metadata":{{"name":"{tidy}"}},"spec":{{"template":{{"spec":{{"restartPolicy":"Never","containers":[{{"name":"tidy","image":"mirror.gcr.io/library/busybox:1.36","command":["true"]}}]}}}}}}}}"#
+    );
+    cluster.write("tidy.json", &tidy_json);
     assert_eq!(
         cluster.reply(
             "alice",
@@ -1731,14 +1735,28 @@ fn access_first_exec_attach_and_cp_are_refused_before_any_upgrade() {
         "201"
     );
     eventually("the pods of web and of tidy", 30, || {
-        cluster.reply("alice", "GET", "/api/v1/namespaces/team/pods/web-0", &[], None) == "200"
-            && cluster.reply("alice", "GET", "/api/v1/namespaces/team/pods/tidy-j0", &[], None) == "200"
+        cluster.reply(
+            "alice",
+            "GET",
+            &format!("/api/v1/namespaces/team/pods/{web}-0"),
+            &[],
+            None,
+        ) == "200"
+            && cluster.reply(
+                "alice",
+                "GET",
+                &format!("/api/v1/namespaces/team/pods/{tidy}-j0"),
+                &[],
+                None,
+            ) == "200"
     });
-    let exec = "/api/v1/namespaces/team/pods/web-0/exec?command=true&stdin=true&stdout=true&stderr=true";
-    let attach = "/api/v1/namespaces/team/pods/web-0/attach?stdin=true&stdout=true&stderr=true";
-    let tar =
-        "/api/v1/namespaces/team/pods/web-0/exec?command=tar&command=xf&command=-&stdin=true&stdout=true&stderr=true";
-    let job = "/api/v1/namespaces/team/pods/tidy-j0/exec?command=true&stdout=true&stderr=true";
+    let exec = format!("/api/v1/namespaces/team/pods/{web}-0/exec?command=true&stdin=true&stdout=true&stderr=true");
+    let attach = format!("/api/v1/namespaces/team/pods/{web}-0/attach?stdin=true&stdout=true&stderr=true");
+    let tar = format!(
+        "/api/v1/namespaces/team/pods/{web}-0/exec?command=tar&command=xf&command=-&stdin=true&stdout=true&stderr=true"
+    );
+    let job = format!("/api/v1/namespaces/team/pods/{tidy}-j0/exec?command=true&stdout=true&stderr=true");
+    let (exec, attach, tar, job) = (exec.as_str(), attach.as_str(), tar.as_str(), job.as_str());
     // (A WebSocket asks for its upgrade as kubectl does: a GET with these headers.)
     let upgrade = [
         "Connection: Upgrade",
@@ -1750,7 +1768,13 @@ fn access_first_exec_attach_and_cp_are_refused_before_any_upgrade() {
 
     // bob may get the pod (cp asks for it first), and no more: what runs in it is refused.
     assert_eq!(
-        cluster.reply("bob", "GET", "/api/v1/namespaces/team/pods/web-0", &[], None),
+        cluster.reply(
+            "bob",
+            "GET",
+            &format!("/api/v1/namespaces/team/pods/{web}-0"),
+            &[],
+            None
+        ),
         "200"
     );
     for path in [exec, attach, tar, job] {
@@ -1786,15 +1810,16 @@ fn access_kubectl_exec_and_cp_are_refused_without_the_right_to_exec() {
     let roles = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: reader }\nspec:\n  rules:\n    - kinds: [Workload]\n      verbs: [get, list, watch]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob-reader }\nspec:\n  role: reader\n  subjects: [bob]\n";
     cluster.write("roles.yaml", roles);
     cluster.kith(&["apply", "-f", "roles.yaml"]);
-    apply_box(&cluster);
-    eventually("web-0 is a pod", 30, || cluster.kubectl(&["get", "pod", "web-0"]).0);
+    let web = apply_box(&cluster);
+    let web0 = format!("{web}-0");
+    eventually("the pod is made", 30, || cluster.kubectl(&["get", "pod", &web0]).0);
     let bob = cluster.as_("bob");
-    assert!(bob.kubectl(&["get", "pod", "web-0"]).0, "bob may get it");
+    assert!(bob.kubectl(&["get", "pod", &web0]).0, "bob may get it");
     cluster.write("up.txt", "uploaded\n");
     for args in [
-        &["exec", "web-0", "--", "true"][..],
-        &["cp", "up.txt", "web-0:/tmp/up.txt"],
-        &["cp", "web-0:/tmp/up.txt", "down.txt"],
+        &["exec", &web0, "--", "true"][..],
+        &["cp", "up.txt", &format!("{web0}:/tmp/up.txt")],
+        &["cp", &format!("{web0}:/tmp/up.txt"), "down.txt"],
     ] {
         let (ok, _, err) = bob.kubectl(args);
         assert!(!ok && err.contains("bob may not exec Workload"), "{args:?}: {ok} {err}");
@@ -1803,7 +1828,7 @@ fn access_kubectl_exec_and_cp_are_refused_without_the_right_to_exec() {
     let audit = cluster.kith(&["audit"]);
     let refused = audit
         .lines()
-        .filter(|line| line.contains("pod default/web-0") && line.split_whitespace().nth(1) == Some("bob"))
+        .filter(|line| line.contains(&format!("pod default/{web0}")) && line.split_whitespace().nth(1) == Some("bob"))
         .filter(|line| !line.ends_with(" ok"))
         .count();
     assert!(refused >= 1, "bob's refusals are in the audit log: {audit}");
@@ -1902,7 +1927,7 @@ fn access_an_upgrade_that_carries_an_origin_is_refused() {
 /// node (here this node's own certificate), and an Identity is refused (403) at both, for the hop is the cluster's nodes'.
 #[test]
 fn access_one_hop_route_for_a_pod_and_no_identity_uses_it() {
-    let cluster = with_team("kube-one-hop");
+    let (cluster, _web) = with_team("kube-one-hop");
     for who in ["bob", "carol"] {
         for path in ["/v1/exec-hop", "/v1/pod-hop"] {
             assert_eq!(cluster.reply(who, "POST", path, &[], None), "403", "{who} {path}");
@@ -1931,19 +1956,21 @@ const FORWARD: [&str; 5] = [
     "Sec-WebSocket-Protocol: SPDY/3.1+portforward.k8s.io",
 ];
 
-/// A cluster with a Deployment `web` in `team`, and bob who may get it and carol who may also run in it.
-fn with_team(test: &str) -> Cluster {
+/// A cluster with a Deployment in `team` (its unique name returned), and bob who may get it and carol who may also run
+/// in it.
+fn with_team(test: &str) -> (Cluster, String) {
     with_team_as(test, false)
 }
 
-fn with_team_as(test: &str, host: bool) -> Cluster {
+fn with_team_as(test: &str, host: bool) -> (Cluster, String) {
     let cluster = Cluster::boot_with(test, host);
     cluster.kith(&["identity", "cert", "bob", "--out", "."]);
     cluster.kith(&["identity", "cert", "carol", "--out", "."]);
     let roles = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: reader }\nspec:\n  rules:\n    - kinds: [Workload, Job]\n      verbs: [get, list, watch]\n      namespaces: [team]\n---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: runner }\nspec:\n  rules:\n    - kinds: [Workload, Job]\n      verbs: [get, list, exec]\n      namespaces: [team]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob-reader }\nspec:\n  role: reader\n  subjects: [bob]\n---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: carol-runner }\nspec:\n  role: runner\n  subjects: [carol]\n";
     cluster.write("roles.yaml", roles);
     cluster.kith(&["apply", "-f", "roles.yaml"]);
-    cluster.write("web.json", r#"{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"web"},"spec":{"replicas":2,"selector":{"matchLabels":{"app":"web"}},"template":{"metadata":{"labels":{"app":"web"}},"spec":{"containers":[{"name":"web","image":"mirror.gcr.io/library/busybox:1.36","command":["sleep","3600"]}]}}}}"#);
+    let web = unique("web");
+    cluster.write("web.json", &web_json(&web));
     let json = ["Content-Type: application/json"];
     let made = cluster.reply(
         "alice",
@@ -1954,9 +1981,22 @@ fn with_team_as(test: &str, host: bool) -> Cluster {
     );
     assert_eq!(made, "201");
     eventually("the pods of web", 30, || {
-        cluster.reply("alice", "GET", "/api/v1/namespaces/team/pods/web-1", &[], None) == "200"
+        cluster.reply(
+            "alice",
+            "GET",
+            &format!("/api/v1/namespaces/team/pods/{web}-1"),
+            &[],
+            None,
+        ) == "200"
     });
-    cluster
+    (cluster, web)
+}
+
+/// A Deployment of two replicas named `web`, as the JSON a client sends.
+fn web_json(web: &str) -> String {
+    format!(
+        r#"{{"apiVersion":"apps/v1","kind":"Deployment","metadata":{{"name":"{web}"}},"spec":{{"replicas":2,"selector":{{"matchLabels":{{"app":"{web}"}}}},"template":{{"metadata":{{"labels":{{"app":"{web}"}}}},"spec":{{"containers":[{{"name":"web","image":"mirror.gcr.io/library/busybox:1.36","command":["sleep","3600"]}}]}}}}}}}}"#
+    )
 }
 
 /// kubectl port-forward needs the Exec right on the Workload or Job that owns the pod (get alone reads it and
@@ -1964,7 +2004,8 @@ fn with_team_as(test: &str, host: bool) -> Cluster {
 /// browser's upgrade are refused. Each decision is in the audit log.
 #[test]
 fn access_port_forward_needs_the_run_right_on_the_owning_workload() {
-    let cluster = with_team("kube-forward-access");
+    let (cluster, web) = with_team("kube-forward-access");
+    let (web0, web1) = (format!("{web}-0"), format!("{web}-1"));
     let pod = |name: &str| format!("/api/v1/namespaces/team/pods/{name}/portforward");
     // (curl is let wait 2 s: a session that is upgraded stays until its client or its idle time ends it.)
     let ask = |who: &str, method: &str, name: &str, headers: &[&str]| {
@@ -1972,31 +2013,32 @@ fn access_port_forward_needs_the_run_right_on_the_owning_workload() {
     };
     // bob may get the pod and forwards nothing: refused before the upgrade is looked at, either way kubectl asks.
     assert_eq!(
-        cluster.reply("bob", "GET", "/api/v1/namespaces/team/pods/web-0", &[], None),
+        cluster.reply("bob", "GET", &format!("/api/v1/namespaces/team/pods/{web0}"), &[], None),
         "200"
     );
-    assert_eq!(ask("bob", "GET", "web-0", &FORWARD), "403");
+    assert_eq!(ask("bob", "GET", &web0, &FORWARD), "403");
     assert_eq!(
-        ask("bob", "POST", "web-0", &["Connection: Upgrade", "Upgrade: SPDY/3.1"]),
+        ask("bob", "POST", &web0, &["Connection: Upgrade", "Upgrade: SPDY/3.1"]),
         "403"
     );
     // carol may run in `team`: the WebSocket is upgraded, and without one it is a 400.
-    assert_eq!(ask("carol", "GET", "web-0", &FORWARD), "101");
-    assert_eq!(ask("carol", "GET", "web-1", &FORWARD), "101");
-    assert_eq!(ask("carol", "GET", "web-0", &[]), "400");
+    assert_eq!(ask("carol", "GET", &web0, &FORWARD), "101");
+    assert_eq!(ask("carol", "GET", &web1, &FORWARD), "101");
+    assert_eq!(ask("carol", "GET", &web0, &[]), "400");
     let plain = ["Connection: Upgrade", "Upgrade: websocket", "Sec-WebSocket-Version: 13"];
-    assert_eq!(ask("carol", "GET", "web-0", &plain), "400", "no SPDY protocol named");
+    assert_eq!(ask("carol", "GET", &web0, &plain), "400", "no SPDY protocol named");
     // A pod that is not there (a replica past the Deployment's two, an owner it has not, a name no pod has) is a 404.
-    for name in ["web-7", "nosuch-0", "web", "web-j0"] {
-        assert_eq!(ask("carol", "GET", name, &FORWARD), "404", "{name}");
+    for name in [format!("{web}-7"), "nosuch-0".into(), web.clone(), format!("{web}-j0")] {
+        assert_eq!(ask("carol", "GET", &name, &FORWARD), "404", "{name}");
     }
     // A browser's upgrade carries an Origin, which kubectl never sends.
     let browser = [&FORWARD[..], &["Origin: https://example.org"][..]].concat();
-    assert_eq!(ask("carol", "GET", "web-0", &browser), "403");
+    assert_eq!(ask("carol", "GET", &web0, &browser), "403");
 
     let audit = cluster.kith(&["audit"]);
     let of = |who: &str| -> Vec<&str> {
-        let ours = |line: &&str| line.contains("pod team/web-0") && line.split_whitespace().nth(1) == Some(who);
+        let ours =
+            |line: &&str| line.contains(&format!("pod team/{web0}")) && line.split_whitespace().nth(1) == Some(who);
         audit.lines().filter(ours).collect()
     };
     let (bob, carol) = (of("bob"), of("carol"));
@@ -2030,8 +2072,8 @@ fn access_port_forward_does_not_reach_a_node_workloads_host_unit() {
 /// caller is not counted against her, and a session that ends frees its place.
 #[test]
 fn access_port_forward_sessions_are_bounded_per_caller() {
-    let cluster = with_team("kube-forward-bound");
-    let pod = "/api/v1/namespaces/team/pods/web-0/portforward";
+    let (cluster, web) = with_team("kube-forward-bound");
+    let pod = format!("/api/v1/namespaces/team/pods/{web}-0/portforward");
     // (As many as kithd allows a caller, held open: curl lets go of a 101, openssl keeps the connection while its stdin is.)
     let mut asked = format!("GET {pod} HTTP/1.1\r\nHost: kith\r\n");
     asked.extend(FORWARD.iter().map(|header| format!("{header}\r\n")));
@@ -2073,42 +2115,50 @@ fn access_port_forward_sessions_are_bounded_per_caller() {
         })
         .collect();
     eventually("a ninth session of carol's is refused", 10, || {
-        cluster.reply_in(2, "carol", "GET", pod, &FORWARD, None) == "429"
+        cluster.reply_in(2, "carol", "GET", &pod, &FORWARD, None) == "429"
     });
     // Another caller's own: bob, who may not forward, is still refused for that and not for her sessions.
-    assert_eq!(cluster.reply_in(2, "bob", "GET", pod, &FORWARD, None), "403");
+    assert_eq!(cluster.reply_in(2, "bob", "GET", &pod, &FORWARD, None), "403");
     for session in &mut held {
         session.kill().unwrap();
         session.wait().unwrap();
     }
     eventually("carol's places are free again", 10, || {
-        cluster.reply_in(2, "carol", "GET", pod, &FORWARD, None) == "101"
+        cluster.reply_in(2, "carol", "GET", &pod, &FORWARD, None) == "101"
     });
 }
 
-/// One test at a time runs `with_running`'s unit: its systemd name (`w_team_tool_0_main`) is the same in every cluster
-/// here, and a kithd that sets it up kills the one another test's kithd runs (exit 137, restarts, a pod that is Pending).
-fn alone() -> std::sync::MutexGuard<'static, ()> {
-    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+/// A Workload name no other test or run shares: a unit's systemd name (`w_team_NAME_0_main`) and container id are made
+/// from it, and a kithd that sets up a name another kithd runs kills that one's unit (exit 137, restarts, a pod that is
+/// Pending). The process id tells runs (lanes) apart, the counter tests of one run; short, for the 52-character limit.
+fn unique(base: &str) -> String {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    format!(
+        "{base}{:x}x{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
-/// `with_team`, and a Workload `tool` of one exec unit that runs on this host, shown to kubectl as a Deployment
-/// (the images of the others are empty, so their pods are never Running, and kubectl asks no port of a pod that is not);
-/// None where this host's cgroup takes no container.
-fn with_running(test: &str, host: bool) -> Option<Cluster> {
-    let cluster = with_team_as(test, host);
-    let sent = r#"{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"tool","namespace":"team"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"tool"}},"template":{"metadata":{"labels":{"app":"tool"}},"spec":{"containers":[{"name":"main","image":"busybox:1.36"}]}}}}"#;
+/// `with_team`, and a Workload of one exec unit that runs on this host (its unique name returned), shown to kubectl
+/// as a Deployment (the images of the others are empty, so their pods are never Running, and kubectl asks no port of a
+/// pod that is not); None where this host's cgroup takes no container.
+fn with_running(test: &str, host: bool) -> Option<(Cluster, String)> {
+    let (cluster, _web) = with_team_as(test, host);
+    let name = unique("tool");
+    let sent = format!(
+        r#"{{"apiVersion":"apps/v1","kind":"Deployment","metadata":{{"name":"{name}","namespace":"team"}},"spec":{{"replicas":1,"selector":{{"matchLabels":{{"app":"{name}"}}}},"template":{{"metadata":{{"labels":{{"app":"{name}"}}}},"spec":{{"containers":[{{"name":"main","image":"busybox:1.36"}}]}}}}}}}}"#
+    );
     let tool = format!(
-        "apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: tool\n  namespace: team\n  annotations:\n    {}: '{sent}'\nspec:\n  replicas: 1\n  template:\n    exec:\n      - name: main\n        command: [sleep, '3600']\n",
+        "apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: {name}\n  namespace: team\n  annotations:\n    {}: '{sent}'\nspec:\n  replicas: 1\n  template:\n    exec:\n      - name: main\n        command: [sleep, '3600']\n",
         "kube.kith.dev/sent"
     );
     cluster.write("tool.yaml", &tool);
     cluster.kith(&["apply", "-f", "tool.yaml"]);
-    // A host whose cgroup takes no container (CI's runner, delegated or not) never runs tool-0: skip, as exec does.
+    // A host whose cgroup takes no container (CI's runner, delegated or not) never runs the tool: skip, as exec does.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let held = cluster.held("workload/team/tool");
+        let held = cluster.held(&format!("workload/team/{name}"));
         if held["status"]["containers"][0]["state"] == "running" {
             break;
         }
@@ -2123,13 +2173,13 @@ fn with_running(test: &str, host: bool) -> Option<Cluster> {
             );
             return None;
         }
-        assert!(Instant::now() < deadline, "tool-0 to run: not within 60 s\n{status}");
+        assert!(Instant::now() < deadline, "{name}-0 to run: not within 60 s\n{status}");
         std::thread::sleep(Duration::from_millis(250));
     }
-    Some(cluster)
+    Some((cluster, name))
 }
 
-/// A `kubectl port-forward` of `team`'s tool-0, as carol; it ends with this.
+/// A `kubectl port-forward` of `team`'s NAME-0, as carol; it ends with this.
 struct Forward(Child);
 
 impl Drop for Forward {
@@ -2141,7 +2191,7 @@ impl Drop for Forward {
 
 /// kubectl forwards a port of this host (with `host`, a pod that is not made reaches the host's loopback) as carol, who
 /// may run in `team`: the local port, once kubectl says it listens.
-fn forward(cluster: &Cluster, remote: u16) -> (Forward, u16) {
+fn forward(cluster: &Cluster, tool: &str, remote: u16) -> (Forward, u16) {
     let local = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let carol = cluster.as_("carol");
     let ports = format!("{local}:{remote}");
@@ -2152,7 +2202,7 @@ fn forward(cluster: &Cluster, remote: u16) -> (Forward, u16) {
             "127.0.0.1",
             "-n",
             "team",
-            "pod/tool-0",
+            &format!("pod/{tool}-0"),
             &ports,
         ])
         .current_dir(&cluster.dir)
@@ -2205,11 +2255,10 @@ fn workflows_kubectl_port_forward_carries_bytes_both_ways() {
         eprintln!("skipped: no delegated cgroup here");
         return;
     }
-    let _alone = alone();
-    let Some(cluster) = with_running("kube-forward-bytes", true) else {
+    let Some((cluster, tool)) = with_running("kube-forward-bytes", true) else {
         return;
     };
-    let (_forward, local) = forward(&cluster, echo());
+    let (_forward, local) = forward(&cluster, &tool, echo());
     let mut stream = near(local);
     stream.write_all(b"hello").unwrap();
     let mut hello = [0u8; 5];
@@ -2237,11 +2286,10 @@ fn workflows_kubectl_port_forward_ends_a_silent_stream_and_bounds_its_streams() 
         eprintln!("skipped: no delegated cgroup here");
         return;
     }
-    let _alone = alone();
-    let Some(cluster) = with_running("kube-forward-bound-streams", true) else {
+    let Some((cluster, tool)) = with_running("kube-forward-bound-streams", true) else {
         return;
     };
-    let (_forward, local) = forward(&cluster, echo());
+    let (_forward, local) = forward(&cluster, &tool, echo());
     let mut silent = near(local);
     let began = Instant::now();
     let mut one = [0u8; 1];
@@ -2278,11 +2326,10 @@ fn workflows_kubectl_port_forward_does_not_reach_the_host_through_a_pod_that_is_
         eprintln!("skipped: no delegated cgroup here");
         return;
     }
-    let _alone = alone();
-    let Some(cluster) = with_running("kube-forward-not-made", false) else {
+    let Some((cluster, tool)) = with_running("kube-forward-not-made", false) else {
         return;
     };
-    let (_forward, local) = forward(&cluster, echo());
+    let (_forward, local) = forward(&cluster, &tool, echo());
     let mut stream = near(local);
     let _ = stream.write_all(b"hello");
     let mut back = [0u8; 5];
@@ -2297,8 +2344,8 @@ fn workflows_kubectl_port_forward_does_not_reach_the_host_through_a_pod_that_is_
 /// every 10 s, and a ping is a frame heard.)
 #[test]
 fn access_port_forward_ends_a_session_that_hears_nothing() {
-    let cluster = with_team("kube-forward-idle-session");
-    let pod = "/api/v1/namespaces/team/pods/web-0/portforward";
+    let (cluster, web) = with_team("kube-forward-idle-session");
+    let pod = format!("/api/v1/namespaces/team/pods/{web}-0/portforward");
     let mut asked = format!("GET {pod} HTTP/1.1\r\nHost: kith\r\n");
     asked.extend(FORWARD.iter().map(|header| format!("{header}\r\n")));
     asked.push_str("\r\n");
@@ -2359,11 +2406,10 @@ fn workflows_kubectl_port_forward_asks_the_right_again_for_each_connection() {
         eprintln!("skipped: no delegated cgroup here");
         return;
     }
-    let _alone = alone();
-    let Some(cluster) = with_running("kube-forward-recheck", true) else {
+    let Some((cluster, tool)) = with_running("kube-forward-recheck", true) else {
         return;
     };
-    let (_forward, local) = forward(&cluster, echo());
+    let (_forward, local) = forward(&cluster, &tool, echo());
     let mut first = near(local);
     first.write_all(b"hello").unwrap();
     let mut back = [0u8; 5];
