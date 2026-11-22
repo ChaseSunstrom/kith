@@ -40,7 +40,8 @@ EOF
             # What the node's default routes are before the plug (the late card's network, its own
             # slirp on 10.0.3.0/24, gives a router and a name server of its own: neither may be taken).
             read_net netbefore || fail "$net"
-            routes_before=$(printf '%s\n' "$net" | grep '^default:' || true)
+            # ($net is the log as JSON, its lines joined by \n: the words are picked out.)
+            routes_before=$(printf '%s\n' "$net" | grep -o 'default: [a-z0-9]* [0-9A-F]*' | sort || true)
             [ -n "$routes_before" ] || fail "the node has no default route before the plug: $net"
             # (A different network from the boot card's, whose slirp is on 10.0.2.0/24, and a lease
             # with a router and a name server: restrict=on would give neither.)
@@ -69,7 +70,7 @@ EOF
             # The late card's lease named a router (10.0.3.2) and a name server (10.0.3.3): the node
             # has both from the boot card, so the late card's are not used (the resolv.conf below
             # lists 10.0.2.3 alone), and the default routes are what they were.
-            [ "$(printf '%s\n' "$net" | grep '^default:' || true)" = "$routes_before" ] || fail "the late card changed the default routes: before: $routes_before; after: $net"
+            [ "$(printf '%s\n' "$net" | grep -o 'default: [a-z0-9]* [0-9A-F]*' | sort || true)" = "$routes_before" ] || fail "the late card changed the default routes: before: $routes_before; after: $net"
             grep -aq "kithd: init: $late has 10.0.3.[0-9]*/24 by DHCP" "$work/n1.log" || fail "the late card $late did not take a lease of the 10.0.3.0/24 network: $(grep -a 'by DHCP' "$work/n1.log")"
             [ "$(printf '%s\n' "$net" | grep -o 'resolv: [0-9.]*' | sort -u)" = 'resolv: 10.0.2.3' ] || fail "/run/resolv.conf does not list the DHCP server alone: $net; kithd said: $(grep -a 'kithd: init:' "$work/n1.log")"
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
