@@ -233,7 +233,8 @@ spec:
   one replica of the machine. The hypervisor opens kithd's own hard link to the image (in
   `<state>/vm-images`, which no container mounts, made at every start), so a container that
   shares the Volume cannot swap the image for a link to a node's file. A Volume on another file
-  system than the state directory's (an encrypted one) holds no machine's disk.
+  system than the state directory's, and an encrypted Volume, holds no machine's disk: the unit's
+  note says so and the machine does not start.
 - kithd supervises the hypervisor; the serial console (`console=ttyS0`) is the unit's log: `kith
   logs Workload/windows --unit machine`. `hypervisor: qemu` (default, with KVM) or
   `cloudHypervisor`; the node needs `qemu-system-x86_64` (`-aarch64` on arm64) or

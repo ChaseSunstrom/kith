@@ -408,13 +408,18 @@ pub fn wipes(store: &Store, me: &str) -> Vec<Dir> {
     mine.map(|(_, vol)| vol.dir).collect()
 }
 
+/// Whether the namespace and the name of `dir` are each one plain path part (a directory's name).
+fn named(dir: &Dir) -> bool {
+    let plain = |part: &str| !matches!(part, "" | "." | "..") && !part.contains(['/', '\0']);
+    plain(&dir.namespace) && plain(&dir.name)
+}
+
 /// Remove the data of the Volume `dir`: `<state>/volumes/<namespace>/<name>` and what is in it,
 /// and nothing beside it. A part of that path that is a symbolic link is refused, and so is
 /// one that would leave the state directory; links inside it are removed, never followed. Not
 /// there is done.
 pub fn wipe(state: &Path, dir: &Dir) -> Result<(), String> {
-    let plain = |part: &str| !matches!(part, "" | "." | "..") && !part.contains(['/', '\0']);
-    if dir.namespace == SYSTEM || !plain(&dir.namespace) || !plain(&dir.name) {
+    if dir.namespace == SYSTEM || !named(dir) {
         return Err(format!(
             "Volume {}/{} has no directory of its own to remove",
             dir.namespace, dir.name
@@ -774,8 +779,7 @@ impl VolumeDir {
 /// Where kithd keeps the links to the VM disk images of the Volume `dir`, as `state` (canonical)
 /// has it: `<state>/vm-images/<namespace>/<name>`, which no container mounts (T-1283).
 pub fn images(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
-    let plain = |part: &str| !matches!(part, "" | "." | "..") && !part.contains(['/', '\0']);
-    if !plain(&dir.namespace) || !plain(&dir.name) {
+    if !named(dir) {
         return Err(format!(
             "Volume {}/{} has no name to keep images under",
             dir.namespace, dir.name

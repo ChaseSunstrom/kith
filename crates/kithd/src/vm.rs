@@ -121,6 +121,12 @@ pub fn resolve(
         let dir = volumes
             .get(name)
             .ok_or_else(|| format!("disks: volume {name} is not on this node"))?;
+        // (An encrypted Volume is its own file system, where kithd has no link to make: see `make_images`.)
+        if dir.encrypted {
+            return Err(format!(
+                "disks: volume {name} is encrypted, and a VM disk cannot live in an encrypted Volume (or in one on another file system than the state directory's)"
+            ));
+        }
         // (A shared Volume of another node is mounted into a container, and no file of it is a disk.)
         if dir.node != me {
             return Err(format!(
@@ -191,25 +197,34 @@ pub fn make_images(state: &Path, images: &[Image]) -> Result<(), String> {
         // one that is there): a container that swaps the Volume's file for a link afterwards
         // changes nothing the hypervisor opens (T-1283). Another file system than the state
         // directory's (an encrypted Volume's) has no link to make: refused.
-        // ponytail: kept until the Volume is wiped (`volumes::wipe`), where its blocks go too.
+        // ponytail: kept until the next start or the Volume's wipe (`volumes::wipe`), where its blocks go too.
         let kept = crate::volumes::images(&state.canonicalize().map_err(|e| said(&e))?, dir)?;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&kept)
             .map_err(|e| said(&e))?;
-        let to = kept.join(file);
-        match std::fs::remove_file(&to) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(said(&e)),
-            _ => {}
-        }
+        // (Linked under a name of its own and renamed over the final one, so a start at the same
+        // time never finds the machine's link missing.)
+        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temp = kept.join(format!(
+            ".link-{}-{}",
+            std::process::id(),
+            MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&temp);
         let from = format!("/proc/self/fd/{}", found.as_raw_fd());
-        nix::unistd::linkat(None, Path::new(&from), None, to.as_path(), nix::fcntl::AtFlags::AT_SYMLINK_FOLLOW).map_err(|e| {
+        nix::unistd::linkat(None, Path::new(&from), None, temp.as_path(), nix::fcntl::AtFlags::AT_SYMLINK_FOLLOW).map_err(|e| {
             said(&format!(
                 "cannot link it into {} ({e}): a Volume on another file system than the state directory's holds no VM disk",
                 kept.display()
             ))
         })?;
+        let renamed = std::fs::rename(&temp, kept.join(file));
+        // (Where the final name is a link to that very file already, rename does nothing and the
+        // temporary name stays: removed either way.)
+        let _ = std::fs::remove_file(&temp);
+        renamed.map_err(|e| said(&e))?;
     }
     Ok(())
 }
@@ -579,7 +594,43 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read(&outside).unwrap(), b"mine");
+
+        // The wipe of the Volume takes kithd's link with it (it would keep the blocks), and no
+        // temporary name of a start is left in the directory.
+        let kept = state.join("vm-images/default/home");
+        std::fs::remove_file(&image).unwrap();
+        std::fs::write(&image, b"guest").unwrap();
+        make_images(&state, &images).unwrap();
+        let left: Vec<_> = std::fs::read_dir(&kept)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["disk.img"], "{left:?}");
+        crate::volumes::wipe(&state, &volumes["home"]).unwrap();
+        assert!(!kept.exists() && !state.join("volumes/default/home").exists());
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A VM disk cannot be in an encrypted Volume (its own file system: no link of kithd's to make),
+    /// and the machine is refused before it starts, with that said.
+    #[test]
+    fn a_vm_disk_in_an_encrypted_volume_is_refused_at_placement() {
+        let dir = crate::volumes::Dir {
+            namespace: "default".into(),
+            name: "home".into(),
+            path: "data".into(),
+            node: "a".into(),
+            encrypted: true,
+        };
+        let unit = vm(json!({ "name": "vm", "memory": "1Gi", "disks": [{ "volume": "home", "size": "1Mi" }] }));
+        let said = resolve(
+            &unit,
+            Path::new("/state"),
+            "a",
+            &BTreeMap::from([("home".to_string(), dir)]),
+        )
+        .unwrap_err();
+        assert!(said.contains("encrypted") && said.contains("home"), "{said}");
     }
 
     /// A confidential template's machine is started with its memory encrypted by what the

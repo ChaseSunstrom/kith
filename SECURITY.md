@@ -545,8 +545,9 @@ image without following a link (`O_NOFOLLOW`, `O_PATH`), refuses what is no regu
 and hard-links that very file into `<state>/vm-images/<namespace>/<volume>/` (mode 0700, no
 container mounts it) at every start; the hypervisor is given that link. A container of the
 Volume that swaps the image for a link to a node's file after the check changes nothing the
-hypervisor opens. The link keeps the image's blocks until the Volume is wiped. A Volume on
-another file system than the state directory's (an encrypted one) holds no VM disk.
+hypervisor opens. The link keeps the image's blocks until the next start or the wipe. A Volume on
+another file system than the state directory's, and an encrypted Volume, holds no VM disk: the
+machine is refused at placement, with that said.
 
 **A hole in the part that reads the network** (TLS, HTTP, the APIs, DNS, ingress, the
 Service proxy) is, after the split, the cluster's data and every request on the root
