@@ -432,21 +432,7 @@ pub fn verify(signed: &mut Signed, digest: &str, who: &Identity) -> std::result:
 fn timestamp(signed: &mut Signed, tsa: &[CertificateDer]) -> std::result::Result<i64, String> {
     let mut earliest: Option<i64> = None;
     for der in &signed.stamps {
-        let mut refused = Vec::new();
-        let mut time = None;
-        for root in tsa {
-            match stamped(der, signed, root) {
-                Ok(at) => {
-                    time = Some(at);
-                    break;
-                }
-                Err(why) => refused.push(why),
-            }
-        }
-        let at = time.ok_or_else(|| {
-            refused.dedup();
-            refused.join("; ")
-        })?;
+        let at = stamped(der, signed, tsa)?;
         earliest = Some(earliest.map_or(at, |so_far| so_far.min(at)));
     }
     let time = earliest.ok_or("it has no timestamp")?;
@@ -651,11 +637,29 @@ fn stamp(der: &[u8]) -> Option<Stamp<'_>> {
     })
 }
 
-/// Whether the timestamp `der` is of `signed`'s signature, by a certificate that chains to `tsa`
-/// for timestamping at the time it gives; that time.
-fn stamped(der: &[u8], signed: &Signed, tsa: &CertificateDer) -> std::result::Result<i64, String> {
+#[cfg(test)]
+thread_local! {
+    /// How many times a timestamp's signer was searched for on this thread (a test counts them).
+    static SIGNER_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the timestamp `der` is of `signed`'s signature, by a certificate that chains to one
+/// of the roots `tsa` for timestamping at the time it gives; that time. The cheap checks (what
+/// it is of) come first, and the signer is found once, whatever the roots: only the chain is
+/// tried per root.
+fn stamped(der: &[u8], signed: &Signed, tsa: &[CertificateDer]) -> std::result::Result<i64, String> {
     limits(der).map_err(|why| format!("its timestamp {why}"))?;
     let read = stamp(der).ok_or("its timestamp cannot be read")?;
+    // The imprint is a hash of this signature (the one the timestamp is for).
+    if read.imprint != sha256(&signed.signature) {
+        return Err("its timestamp is of another signature".into());
+    }
+    // The attributes are of this content.
+    if ring::digest::digest(read.algorithm, read.content).as_ref() != read.message_digest {
+        return Err("its timestamp's signed attributes are not of its content".into());
+    }
+    #[cfg(test)]
+    SIGNER_SEARCHES.with(|n| n.set(n.get() + 1));
     let carried: Vec<CertificateDer> = read.certs.iter().map(|der| CertificateDer::from(*der)).collect();
     // The signer is the certificate whose key signed the attributes.
     let algorithms = [
@@ -676,34 +680,33 @@ fn stamped(der: &[u8], signed: &Signed, tsa: &CertificateDer) -> std::result::Re
         .ok_or("its timestamp's signature is not by its certificate's key")?;
     let leaf = webpki::EndEntityCert::try_from(signer)
         .map_err(|e| format!("its timestamp's certificate cannot be read ({e})"))?;
-    // The attributes are of this content.
-    if ring::digest::digest(read.algorithm, read.content).as_ref() != read.message_digest {
-        return Err("its timestamp's signed attributes are not of its content".into());
-    }
-    // The signer chains to the TSA's root, for timestamping, when it says.
-    let anchor =
-        webpki::anchor_from_trusted_cert(tsa).map_err(|_| "the timestamp authority's root is no certificate")?;
+    // The signer chains to one of the TSA's roots, for timestamping, when it says.
     let others: Vec<CertificateDer> = carried.iter().filter(|der| *der != signer).cloned().collect();
     let at = u64::try_from(read.time).map_err(|_| "its timestamp is of before 1970")?;
     let when = UnixTime::since_unix_epoch(std::time::Duration::from_secs(at));
     let usage = webpki::KeyUsage::required(TIME_STAMPING);
     let chain = [webpki::ring::ECDSA_P256_SHA256, webpki::ring::ECDSA_P384_SHA384];
-    if let Err(e) = leaf.verify_for_usage(&chain, &[anchor], &others, when, usage, None, None) {
-        return Err(match e {
-            webpki::Error::CertNotValidYet { .. } | webpki::Error::CertExpired { .. } => {
-                format!("its timestamp is of {at}, outside its authority's certificate's time")
-            }
-            webpki::Error::RequiredEkuNotFoundContext(_) => {
-                "its timestamp's certificate is not for timestamping".into()
-            }
-            e => format!("its timestamp is not from the authority named ({e:?})"),
-        });
+    let mut refused: Vec<String> = Vec::new();
+    for root in tsa {
+        let Ok(anchor) = webpki::anchor_from_trusted_cert(root) else {
+            refused.push("the timestamp authority's root is no certificate".into());
+            continue;
+        };
+        match leaf.verify_for_usage(&chain, &[anchor], &others, when, usage.clone(), None, None) {
+            Ok(_) => return Ok(read.time),
+            Err(e) => refused.push(match e {
+                webpki::Error::CertNotValidYet { .. } | webpki::Error::CertExpired { .. } => {
+                    format!("its timestamp is of {at}, outside its authority's certificate's time")
+                }
+                webpki::Error::RequiredEkuNotFoundContext(_) => {
+                    "its timestamp's certificate is not for timestamping".into()
+                }
+                e => format!("its timestamp is not from the authority named ({e:?})"),
+            }),
+        }
     }
-    // The imprint is a hash of this signature (the one the timestamp is for).
-    if read.imprint != sha256(&signed.signature) {
-        return Err("its timestamp is of another signature".into());
-    }
-    Ok(read.time)
+    refused.dedup();
+    Err(refused.join("; "))
 }
 
 /// That what was signed says it is a signature of the image `digest` (and not, say, an
@@ -1760,6 +1763,30 @@ pub(crate) mod tests {
         let other = v2(&made, &cert, &key, Some(b"another signature"), 60, "");
         let said = refused_under(&other, &rule_from(&who, &tsa.root));
         assert!(said.contains("is of another signature"), "{said}");
+    }
+
+    /// A stamp of another signature is refused before any signature check (no signer search),
+    /// and a good one's signer is searched for once, however many roots the rule gives.
+    #[test]
+    fn the_imprint_check_runs_first() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let (one, two) = (Authority::new(), Authority::new());
+        let rule = identity(&with_tsa(&who, &[&one.root, &two.root, &tsa.root])).unwrap();
+        let searches = || SIGNER_SEARCHES.with(|n| n.get());
+
+        let before = searches();
+        let other = v2(&made, &cert, &key, Some(b"another signature"), 60, "");
+        let said = refused_under(&other, &rule);
+        assert!(said.contains("is of another signature"), "{said}");
+        assert_eq!(searches(), before, "a wrong imprint was refused after a signer search");
+
+        let before = searches();
+        let mut signed = super::bundle(v2(&made, &cert, &key, None, 60, "").to_string().as_bytes()).unwrap();
+        verify(&mut signed, DIGEST, &rule).unwrap();
+        assert_eq!(searches() - before, 1, "the signer was searched for once per stamp, not per root");
     }
 
     /// A timestamp at a time the TSA's certificate is not valid at (after it, and before it) is
