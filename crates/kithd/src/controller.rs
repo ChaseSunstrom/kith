@@ -3472,12 +3472,28 @@ fn held_volume(volume: crate::volumes::VolumeDir) -> (PathBuf, Option<kith_runti
 /// as they are big, and waits on the root part's helper for up to a minute; on kithd's one async
 /// thread either would stop the API and every other unit (T-1274). A panic in `create` is an
 /// error, as for `Direct::create` a failure is.
+///
+/// A stop drops the start's future while the create runs, and the create goes on to its end: a
+/// task of its own takes the result, and when no one is left to take it hands it to `undo`
+/// (a delete of the container, which the root part's book holds as made) instead of dropping it.
 async fn blocking_create<T: Send + 'static>(
     create: impl FnOnce() -> Result<T, String> + Send + 'static,
+    undo: impl FnOnce(T) + Send + 'static,
 ) -> Result<T, String> {
-    tokio::task::spawn_blocking(create)
+    let (send, receive) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let made = tokio::task::spawn_blocking(create)
+            .await
+            .map_err(|e| format!("making the container failed: {e}"))
+            .and_then(|made| made);
+        if let Err(Ok(orphan)) = send.send(made) {
+            // (Off this thread too: a delete waits on the helper as a create does.)
+            let _ = tokio::task::spawn_blocking(move || undo(orphan)).await;
+        }
+    });
+    receive
         .await
-        .map_err(|e| format!("making the container failed: {e}"))?
+        .map_err(|_| "making the container was cut short".to_string())?
 }
 
 /// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
@@ -3751,16 +3767,27 @@ async fn start(
             kith_runtime::timeline::mark("image");
             let (out, err) = (log("out")?, log("err")?);
             let (shared, runtime, id, unit) = (shared.clone(), runtime.clone(), id.to_string(), unit.clone());
-            let created = blocking_create(move || {
-                let root = crate::root_part::Direct::today(&shared.pods, Some(&*runtime));
-                root.create(crate::root_part::Create {
-                    id: &id,
-                    image: &image,
-                    unit: &unit,
-                    out,
-                    err,
-                })
-            })
+            let (undo_shared, undo_runtime, undo_id) = (shared.clone(), runtime.clone(), id.clone());
+            let created = blocking_create(
+                move || {
+                    let root = crate::root_part::Direct::today(&shared.pods, Some(&*runtime));
+                    root.create(crate::root_part::Create {
+                        id: &id,
+                        image: &image,
+                        unit: &unit,
+                        out,
+                        err,
+                    })
+                },
+                // Made, and no start left to take it (a stop dropped it): deleted, as a start
+                // that fails is, so no container is left that no slot knows.
+                move |handle| {
+                    let root = crate::root_part::Direct::today(&undo_shared.pods, Some(&*undo_runtime));
+                    if let Err((_, e)) = root.delete(handle, &undo_id) {
+                        eprintln!("kithd: {undo_id}: made as kithd stopped, and not deleted: {e}");
+                    }
+                },
+            )
             .await;
             // The runtime says what the container would be; here whose word refused it.
             created.map_err(node_root_refusal)
@@ -5108,10 +5135,13 @@ mod tests {
                     ticking.fetch_add(1, Ordering::SeqCst);
                 }
             });
-            let made = blocking_create(|| {
-                std::thread::sleep(Duration::from_millis(400));
-                Ok::<_, String>(7)
-            })
+            let made = blocking_create(
+                || {
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok::<_, String>(7)
+                },
+                |_| {},
+            )
             .await;
             ticker.abort();
             assert_eq!(made, Ok(7));
@@ -5126,8 +5156,47 @@ mod tests {
     /// A create that panics is an error the start returns, not a panic of kithd's.
     #[tokio::test]
     async fn a_create_that_panics_is_an_error() {
-        let made: Result<(), String> = blocking_create(|| panic!("the chown walk broke")).await;
-        assert!(made.is_err(), "{made:?}");
+        let made: Result<(), String> = blocking_create(|| panic!("the chown walk broke"), |_| {}).await;
+        let why = made.unwrap_err();
+        assert!(
+            why.contains("panicked") && why.contains("the chown walk broke"),
+            "{why}"
+        );
+    }
+
+    /// A stop drops the start while the create runs: what the create makes is deleted, not left
+    /// made with no slot to know it (T-1274).
+    #[tokio::test]
+    async fn a_create_whose_start_was_dropped_is_deleted() {
+        let (made, deleted) = (
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicBool::new(false)),
+        );
+        let (made_in, deleted_in) = (made.clone(), deleted.clone());
+        let start = tokio::spawn(blocking_create(
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                made_in.store(true, Ordering::SeqCst);
+                Ok::<_, String>(7)
+            },
+            move |handle| {
+                assert_eq!(handle, 7);
+                deleted_in.store(true, Ordering::SeqCst);
+            },
+        ));
+        // (Mid-create: the closure is running, its result not yet made.)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!made.load(Ordering::SeqCst));
+        start.abort();
+        let _ = start.await;
+        for _ in 0..100 {
+            if deleted.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(made.load(Ordering::SeqCst), "the create ran to its end");
+        assert!(deleted.load(Ordering::SeqCst), "what it made was deleted");
     }
 
     /// The runtime is handed the descriptor a volume directory is held by, and the path it was
