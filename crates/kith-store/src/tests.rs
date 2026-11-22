@@ -1625,6 +1625,91 @@ fn forgotten_key_refused_write_is_in_no_log_entry() {
 /// A store brought in over one that holds a NodeKey the new one lacks: the log, which has the
 /// write of that key still, is dropped up to the Import as it is applied, with no restart.
 /// (kithd brings a store in only where there is none; this holds for a caller that does not.)
+/// The format a node must read to read `command`: the one that brought its variant. A kithd
+/// that does not know a variant reads its entry as a reading error (serde_json), so the leader
+/// sends one only once every member reads that format (the marks, raft.rs). No wildcard: a
+/// variant added, renamed or removed stops this compiling until it is placed here, and the
+/// test below then holds FORMAT to the newest of them (T-0219).
+fn came_in(command: &Command) -> u32 {
+    match command {
+        Command::Apply { .. }
+        | Command::Delete { .. }
+        | Command::Rollback { .. }
+        | Command::Status { .. }
+        | Command::Patch { .. }
+        | Command::Report { .. }
+        | Command::Import { .. } => 1,
+        Command::Mark => 2,
+        Command::MarkSigned => 3,
+        // (A signed entry runs only once the store keeps nonces: format 3. What it carries came in when it did.)
+        Command::Signed { command, .. } => 3.max(came_in(command)),
+        Command::MarkChecked => 4,
+    }
+}
+
+/// Every Command variant is mapped to the format that brought it, the newest is FORMAT, and
+/// that format has its fixture: a build that adds a variant must raise FORMAT and check in
+/// `fixtures/format-N`, or this fails (an old node would read the variant as an error).
+#[test]
+fn every_command_has_a_format() {
+    let one = || vec![("Config/default/a".to_string(), None)];
+    let samples = [
+        Command::Apply {
+            resources: vec![],
+            at: 1,
+        },
+        Command::Delete { key: "k".into() },
+        Command::Rollback {
+            key: "k".into(),
+            to: 1,
+            at: 1,
+        },
+        Command::Status { statuses: one() },
+        Command::Patch { statuses: vec![] },
+        Command::Report {
+            node: "n".into(),
+            statuses: one(),
+        },
+        Command::Import {
+            store: Store::default(),
+        },
+        Command::Mark,
+        signed("ann", 1000, 1, Command::Mark),
+        Command::MarkSigned,
+        Command::MarkChecked,
+    ];
+    let newest = samples.iter().map(came_in).max().unwrap();
+    assert_eq!(
+        newest,
+        crate::FORMAT,
+        "a variant came in at a format other than FORMAT: raise FORMAT"
+    );
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/format-{}", crate::FORMAT));
+    assert!(
+        fixture.join("log.redb").exists(),
+        "{} is not checked in",
+        fixture.display()
+    );
+    // The log's own mark for each of the marks says the same format.
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    for mark in samples
+        .iter()
+        .filter(|c| matches!(c, Command::Mark | Command::MarkSigned | Command::MarkChecked))
+    {
+        let scratch = Scratch::new();
+        std::fs::write(scratch.0.join("snapshot.json"), r#"{"format":1}"#).unwrap();
+        let log = Log::open(&scratch.0.join("log.redb")).unwrap();
+        let log_id = LogId::new(CommittedLeaderId::new(1, 1), 1);
+        log.put([Entry {
+            log_id,
+            payload: EntryPayload::Normal(mark.clone()),
+        }])
+        .unwrap();
+        drop(log);
+        assert_eq!(formats(&scratch.0).0, came_in(mark), "{mark:?}");
+    }
+}
+
 #[test]
 fn import_over_a_key_scrubs_the_log() {
     let runtime = tokio::runtime::Builder::new_current_thread()

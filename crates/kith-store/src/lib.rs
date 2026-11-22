@@ -113,10 +113,17 @@ pub fn header(header: &str) -> Result<Header<'_>, String> {
 
 /// A file in a format this build does not know is refused, never read as if it were its own.
 fn known(format: u32, file: &Path) -> Result<(), String> {
-    if format > FORMAT {
+    refuse_newer(file, format, FORMAT)
+}
+
+/// The same for the other files of a node's state (audit, volume keys, the lock record, the
+/// image index), each with its own number: `format` is the file's, `reads` the newest this build
+/// reads of that kind. A file with no number is format 1, and read.
+pub fn refuse_newer(file: &Path, format: u32, reads: u32) -> Result<(), String> {
+    if format > reads {
         let file = file.display();
         return Err(format!(
-            "{file} is in format {format} and this kithd reads up to format {FORMAT}: start the kithd that wrote it, or a newer one"
+            "{file} is in format {format} and this kithd reads up to format {reads}: start the kithd that wrote it, or a newer one"
         ));
     }
     Ok(())

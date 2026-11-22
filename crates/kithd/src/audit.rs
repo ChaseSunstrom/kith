@@ -15,6 +15,10 @@ use std::sync::Mutex;
 const CAP: u64 = 4 << 20;
 /// How many moved-aside files are kept: `audit.log.1` (the newest) to `audit.log.4`.
 const KEPT: u32 = 4;
+/// The format of an entry, written as its `"format"` (an entry with none is 1). It goes up when
+/// a build writes what an earlier one would misread; a file with an entry of a newer one is
+/// refused by [`Audit::tail`] (T-0219).
+pub const FORMAT: u32 = 1;
 /// Most lines one read gives.
 pub const MOST: u64 = 1000;
 
@@ -79,7 +83,7 @@ impl Audit {
         };
         let what: Vec<String> = what.iter().map(short).collect();
         let mut line = serde_json::json!({
-            "at": at, "who": who.to_string(), "verb": verb, "what": what, "ok": outcome.is_ok(),
+            "format": FORMAT, "at": at, "who": who.to_string(), "verb": verb, "what": what, "ok": outcome.is_ok(),
         });
         if let Err(why) = outcome {
             line["error"] = short(&why).into();
@@ -108,10 +112,18 @@ impl Audit {
         let lines = lines.min(MOST);
         let read = |path: &std::path::Path, lines: u64| -> std::io::Result<Vec<serde_json::Value>> {
             let (text, _) = crate::api::log_chunk(path, None, Some(lines))?;
-            Ok(text
+            let entries: Vec<serde_json::Value> = text
                 .lines()
                 .filter_map(|line| serde_json::from_str(line).ok())
-                .collect())
+                .collect();
+            // (Refused, not skipped: an entry this kithd cannot read is not one it may drop.)
+            for entry in &entries {
+                let format = entry["format"]
+                    .as_u64()
+                    .map_or(1, |format| u32::try_from(format).unwrap_or(u32::MAX));
+                kith_store::refuse_newer(path, format, FORMAT).map_err(std::io::Error::other)?;
+            }
+            Ok(entries)
         };
         let mut entries = read(&log.path, lines)?;
         for n in 1..=KEPT {
@@ -145,6 +157,31 @@ fn rotate(path: &std::path::Path) {
 mod tests {
     use super::*;
     use crate::access::Caller;
+
+    /// An entry carries the format it is written in, and a file with an entry of a newer format
+    /// than this kithd reads is refused, not read as if it were its own (T-0219).
+    #[test]
+    fn state_file_format_audit_newer_is_refused() {
+        let path = std::env::temp_dir().join(format!("kith-audit-format-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let audit = Audit::new(path.clone());
+        audit.record(&Caller::Admin, "apply", vec!["Workload/default/a".into()], Ok(()));
+        assert_eq!(audit.tail(10).unwrap()[0]["format"], FORMAT);
+        // (A line with no number is from before: format 1, and read.)
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text += "{\"at\":1,\"who\":\"x\",\"verb\":\"old\",\"what\":[],\"ok\":true}\n";
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(audit.tail(10).unwrap().len(), 2);
+        text += &format!("{{\"format\":{},\"at\":2}}\n", FORMAT + 1);
+        std::fs::write(&path, text).unwrap();
+        let said = audit.tail(10).unwrap_err().to_string();
+        let newer = FORMAT + 1;
+        assert!(
+            said.contains(&format!("format {newer}")) && said.contains(&format!("up to format {FORMAT}")),
+            "{said}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn audit_entries_are_kept_in_order() {

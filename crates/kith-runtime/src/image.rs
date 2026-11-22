@@ -30,6 +30,9 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::SystemTime;
 
+/// The newest format of a `refs/` note this build reads (and writes): a note with no number is 1.
+pub const INDEX_FORMAT: u32 = 1;
+
 #[derive(Clone)]
 pub struct ImageStore {
     root: PathBuf,
@@ -611,6 +614,25 @@ impl ImageStore {
         Ok(self.root.join("refs").join(name))
     }
 
+    /// A note a newer kithd wrote (its `format` is past [`INDEX_FORMAT`]) is refused, with the
+    /// format said, not taken for no note; one with no `format` is format 1 (T-0219).
+    fn refuse_newer_note(&self, reference: &Reference) -> Result<()> {
+        let file = self.ref_file(reference)?;
+        let saved: Option<serde_json::Value> = fs::read(&file)
+            .ok()
+            .and_then(|saved| serde_json::from_slice(&saved).ok());
+        let format = saved
+            .and_then(|saved| saved["format"].as_u64())
+            .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX));
+        if format > INDEX_FORMAT {
+            return err(format!(
+                "{} is in format {format} and this kithd reads up to format {INDEX_FORMAT}: start the kithd that wrote it, or a newer one",
+                file.display()
+            ));
+        }
+        Ok(())
+    }
+
     /// The image `reference` resolved to last time, if it is still unpacked here.
     fn cached(&self, reference: &Reference) -> Option<Image> {
         let saved = fs::read(self.ref_file(reference).ok()?).ok()?;
@@ -687,6 +709,7 @@ impl ImageStore {
             .await
             .ctx("locking the images")?
             .ctx("locking the images")?;
+        self.refuse_newer_note(&reference)?;
         let here = self.cached(&reference);
         let signed = |image: &Image| keys.is_empty() || keys.iter().any(|key| image.signed_by.contains(&key.id));
         if own.is_none()
@@ -833,7 +856,7 @@ impl ImageStore {
         };
         // Remember the answer. Written whole, then renamed: a reader sees the old one or the new one.
         let saved = serde_json::json!({
-            "digest": image.digest, "entrypoint": image.entrypoint, "cmd": image.cmd,
+            "format": INDEX_FORMAT, "digest": image.digest, "entrypoint": image.entrypoint, "cmd": image.cmd,
             "env": image.env, "workingDir": image.working_dir, "user": image.user, "signedBy": image.signed_by,
         });
         // Best effort: the image is here either way, and without the note the next pull just asks again.
