@@ -2299,6 +2299,68 @@ mod tests {
         }
     }
 
+    /// A Unit as the serving part reads it off the --split socket: every field set to something
+    /// other than its default, so a field renamed, dropped, retyped or added without a line here
+    /// changes what the root part reads and fails the pin. (`Mount::held` is not serialized: it
+    /// crosses as a descriptor.)
+    fn full_unit_json() -> serde_json::Value {
+        serde_json::json!({
+            "command": ["/bin/app"],
+            "args": ["--serve"],
+            "env": [["K", "V"]],
+            "working_dir": "/srv",
+            "memory_bytes": 1048576,
+            "cpu_millis": 500,
+            "devices": ["/dev/dri/card0"],
+            "dmem": [["drm/0000:03:00.0/vram", 4096]],
+            "mounts": [{
+                "host": "/h", "container": "/c", "read_only": true, "give": true, "part": "data"
+            }],
+            "user": 1000,
+            "non_root": true,
+            "no_node_root": true,
+            "drop": ["NET_RAW"],
+            "unconfined": true,
+            "allow": ["mount"],
+            "nested": true,
+            "as_image": true,
+            "writable": true,
+            "netns": "/run/netns/p",
+            "hostname": "web",
+            "host_users": true,
+            "project": 7,
+            "namespace": "team-a",
+        })
+    }
+
+    #[test]
+    fn a_units_wire_form_is_pinned() {
+        let want = full_unit_json();
+        // Every field is read under the name the literal gives (`namespace` has a default, so
+        // a rename there shows as an empty one)...
+        let unit: Unit = serde_json::from_value(want.clone()).unwrap();
+        assert_eq!(unit.namespace, "team-a");
+        assert_eq!(unit.mounts[0].part.as_deref(), Some("data"));
+        // ... and what is written is exactly the literal: no field more or less, none renamed,
+        // and what the serving part writes reads back as the same unit.
+        let sent = serde_json::to_vec(&unit).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&sent).unwrap(), want);
+        let back: Unit = serde_json::from_slice(&sent).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), want);
+    }
+
+    #[test]
+    fn a_unit_from_before_a_field_still_reads() {
+        // Only `namespace` has been added with a default: a unit with every older field and no
+        // namespace reads, as one with none named.
+        let mut old = full_unit_json();
+        old.as_object_mut().unwrap().remove("namespace");
+        let unit: Unit = serde_json::from_value(old).unwrap();
+        assert_eq!(unit.namespace, "");
+        assert_eq!(unit.command, ["/bin/app"]);
+        assert_eq!(unit.project, Some(7));
+    }
+
     /// A unit's namespace keys the give pool's shares: refused unless a name of the form every
     /// namespace has (or empty), and a unit without one deserializes to empty.
     #[test]
