@@ -868,12 +868,16 @@ async fn members_only(
             let raft = path.starts_with("/v1/raft/");
             let mut answer = next.run(request).await;
             if raft {
-                let current =
-                    kith_store::format_of(&shared.store.lock().expect("nothing panics holding the store").store);
-                answer.headers_mut().insert(
-                    crate::raft::READS,
-                    crate::raft::reads(current, crate::os::on_trial()).into(),
-                );
+                // (The store is locked only on trial: off it the answer is this build's format.)
+                let trial = crate::os::on_trial();
+                let current = if trial {
+                    kith_store::format_of(&shared.store.lock().expect("nothing panics holding the store").store)
+                } else {
+                    kith_store::FORMAT
+                };
+                answer
+                    .headers_mut()
+                    .insert(crate::raft::READS, crate::raft::reads(current, trial).into());
             }
             return answer;
         }
